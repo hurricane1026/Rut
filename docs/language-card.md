@@ -2811,3 +2811,14 @@ syntax and Json carrier. The validator requires `exp`/audience as a local resour
 policy, while `iss`, `sub` and `iat` need not be present. Callers must trust the
 response source before validating or projecting its identity. No OAuth grants,
 OIDC session, automatic identity propagation or new language keyword is added.
+
+### Introspection issuer/client binding
+
+`introspection.requireBinding(document, issuer, clientId)` is an ordinary library
+helper applied after `requireActive`. Both trusted expected strings must be
+nonempty (503 otherwise). Exact decoded top-level `iss` and `client_id` string
+matches return the same Json; absent, malformed or mismatching fields return
+challenged 401. Case, URI spelling and prefixes are not normalized. This does not
+change which metadata the base validator requires, authenticate arbitrary Json,
+or replace audience/scope checks. See
+[the binding example and contract](oauth-introspection.md#optional-issuer-and-oauth-client-binding).

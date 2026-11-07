@@ -1286,3 +1286,18 @@ execution. See the `/active-reports` route in
 [jwt-group-policies.rut](../examples/jwt-group-policies.rut). This is signed-claim
 authorization, not live group revocation: token contents remain valid until the
 existing signature/time/revocation policy rejects them.
+
+## Introspection issuer and client restrictions
+
+Opaque-token routes can additionally call `introspection.requireBinding` after
+`requireActive` to require exact trusted `iss` and `client_id` metadata. Missing,
+wrong-type or mismatching fields deny with challenged 401; empty configured
+bindings return 503. The opt-in policy leaves the base introspection profile
+unchanged. Service credentials and downstream identity headers cannot substitute
+for token metadata. The shipped bound route composes subject and scope checks
+before forwarding within existing compiler limits. See
+[the binding contract](oauth-introspection.md#optional-issuer-and-oauth-client-binding).
+
+The native-loaded integration matrix covers verified TLS, HTTP/1 and HTTP/2,
+source removal, exact/escaped comparisons, invalid metadata/configuration and no
+upstream forwarding on failure, for epoll and io_uring.

@@ -42,7 +42,8 @@ def main():
                 received.append((self.path, dict(self.headers), raw, token))
             now = int(time.time())
             body = dict(active=True, exp=now + 3600, aud=['other-api', 'reports-api'],
-                        scope='reports:read reports:write', sub='subject-' + token)
+                        scope='reports:read reports:write', sub='subject-' + token,
+                        iss='https://issuer.example', client_id='reports-client')
             updates = {
                 'inactive': dict(active=False), 'revoked': dict(active=not revoked.is_set()),
                 'expired': dict(exp=now - 1), 'future-nbf': dict(nbf=now + 3600),
@@ -50,6 +51,21 @@ def main():
                 'bad-audience': dict(aud=['reports-api', 7]), 'typed-active': dict(active='true'),
                 'typed-exp': dict(exp=str(now + 3600)), 'typed-scope': dict(scope=['reports:read']),
                 'wrong-scope': dict(scope='reports:reader'), 'wrong-type': dict(token_type='MAC'),
+                'wrong-issuer': dict(iss='https://other.example'),
+                'issuer-case': dict(iss='https://ISSUER.example'),
+                'issuer-suffix': dict(iss='https://issuer.example/'),
+                'wrong-client': dict(client_id='another-client'),
+                'service-client': dict(client_id='client'),
+                'client-case': dict(client_id='Reports-client'),
+                'client-prefix': dict(client_id='reports-client-extra'),
+                'empty-issuer': dict(iss=''), 'typed-issuer': dict(iss=True),
+                'array-issuer': dict(iss=['https://issuer.example']),
+                'null-issuer': dict(iss=None),
+                'empty-client': dict(client_id=''), 'typed-client': dict(client_id=42),
+                'object-client': dict(client_id={'id': 'reports-client'}),
+                'null-client': dict(client_id=None),
+                'nul-issuer': dict(iss='https://issuer.example\x00'),
+                'nul-client': dict(client_id='reports-client\x00'),
                 'no-subject': dict(sub=''),
                 'typed-subject': dict(sub=True), 'unsafe-subject': dict(sub='alice\r\nInjected: yes'),
             }
@@ -60,7 +76,21 @@ def main():
                 del body['scope']
             if token == 'no-subject':
                 del body['sub']
+            if token == 'no-issuer':
+                del body['iss']
+            if token == 'no-client':
+                del body['client_id']
             data = json.dumps(body).encode()
+            if token == 'escaped-binding':
+                data = data.replace(b'issuer.example', b'issu\\u0065r.example')
+                data = data.replace(b'reports-client', b'reports-clie\\u006et')
+            if token == 'escaped-binding-names':
+                data = data.replace(b'"iss"', b'"i\\u0073s"')
+                data = data.replace(b'"client_id"', b'"client\\u005fid"')
+            if token == 'duplicate-client':
+                data = data[:-1] + b', "client_id":"other"}'
+            if token == 'aliased-issuer':
+                data = data[:-1] + b', "i\\u0073s":"https://other.example"}'
             if token == 'malformed':
                 data = b'{'
             elif token == 'duplicate':
@@ -86,6 +116,8 @@ def main():
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Set-Cookie', 'service-secret=must-not-leak')
                 self.send_header('X-Consumer-ID', 'header-must-not-supply-identity')
+                self.send_header('X-Token-Issuer', 'https://issuer.example')
+                self.send_header('X-OAuth-Client-ID', 'reports-client')
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 self.wfile.write(data)
@@ -141,10 +173,24 @@ route GET "{path}" {{
     return 204
 }}
 '''
+            for path, issuer, client in (
+                    ('/empty-issuer', '', 'reports-client'),
+                    ('/empty-client', 'https://issuer.example', '')):
+                source += f'''
+route GET "{path}" {{
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else {{ return 503 }}
+    let document = introspection.requireActive(reply, "reports-api")
+    let bound = introspection.requireBinding(document, {json.dumps(issuer)}, {json.dumps(client)})
+    return 204
+}}
+'''
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, INTROSPECTION_AUTH=service_auth, INTROSPECTION_ENDPOINT=json.dumps(endpoint),
-                       WRONG_TLS=json.dumps(dict(endpoint, serverName='wrong.invalid')))
+                       WRONG_TLS=json.dumps(dict(endpoint, serverName='wrong.invalid')),
+                       TOKEN_ISSUER='https://issuer.example', TOKEN_CLIENT_ID='reports-client')
             with log.open('wb') as output:
                 process = subprocess.Popen([args.server, '0', str(program), '--backend', args.backend,
                                             '--shards', '2', '--no-pin', '--drain', '0'],
@@ -172,7 +218,9 @@ route GET "{path}" {{
                         try:
                             connection.request('GET', path, headers={
                                 'Authorization': 'Bearer ' + token if authorization is None else authorization,
-                                'X-Consumer-ID': 'forged', 'Cookie': 'client-secret=must-not-leak'})
+                                'X-Consumer-ID': 'forged', 'Cookie': 'client-secret=must-not-leak',
+                                'X-Token-Issuer': 'https://issuer.example',
+                                'X-OAuth-Client-ID': 'reports-client'})
                             response = connection.getresponse()
                             return response.status, dict(response.headers), response.read()
                         finally:
@@ -209,6 +257,41 @@ route GET "{path}" {{
                             assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
                         elif expected == 401:
                             assert 'invalid_token' in headers.get('WWW-Authenticate', '')
+                    # Binding is opt-in: active metadata without issuer/client still works
+                    # on the original route, but cannot reach the bound route's upstream.
+                    for token in ('no-issuer', 'no-client', 'wrong-issuer', 'wrong-client'):
+                        assert request(token)[0] == 200
+                    for token in ('valid', 'escaped-binding', 'escaped-binding-names'):
+                        status, headers, data = request(token, '/bound-reports')
+                        assert (status, data) == (200, ('subject-' + token).encode()), (token, status, data)
+                        assert 'Set-Cookie' not in headers and 'X-Consumer-ID' not in headers
+                        assert 'Authorization' not in forwarded[-1]
+                    for token in ('wrong-issuer', 'issuer-case', 'issuer-suffix',
+                                  'wrong-client', 'service-client', 'client-case', 'client-prefix',
+                                  'empty-issuer', 'typed-issuer', 'array-issuer', 'null-issuer',
+                                  'empty-client', 'typed-client', 'object-client', 'null-client',
+                                  'no-issuer', 'no-client', 'nul-issuer', 'nul-client',
+                                  'inactive', 'expired', 'wrong-audience',
+                                  'no-subject', 'typed-subject', 'unsafe-subject'):
+                        before = len(forwarded)
+                        status, headers, data = request(token, '/bound-reports')
+                        assert status == 401, (token, status, data)
+                        assert 'invalid_token' in headers.get('WWW-Authenticate', '')
+                        assert len(forwarded) == before
+                    for token, expected in (('wrong-scope', 403), ('duplicate-client', 503),
+                                            ('aliased-issuer', 503), ('malformed', 503),
+                                            ('unavailable', 503)):
+                        before = len(forwarded)
+                        status, headers, data = request(token, '/bound-reports')
+                        assert status == expected, (token, status, data)
+                        assert len(forwarded) == before
+                        if expected == 403:
+                            assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
+                    for path in ('/empty-issuer', '/empty-client'):
+                        before = len(forwarded)
+                        assert request('valid', path)[0] == 503
+                        assert len(forwarded) == before
+                        assert request(authorization='', path=path)[0] == 401
                     for path, token in (('/timeout', 'slow'), ('/wrong-tls', 'valid'),
                                         ('/bad-service', 'valid'), ('/bad-config', 'valid')):
                         before = len(forwarded)
@@ -227,47 +310,53 @@ route GET "{path}" {{
                     def frame(kind, flags, stream, data=b''):
                         return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
 
-                    with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
-                        block = b'\x82\x86\x04\x08/reports\x01\x09localhost\x0f\x08\x09Bearer h2'
-                        sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
+                    for h2_path in ('/reports', '/bound-reports'):
+                        with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
+                            block = (b'\x82\x86\x04' + bytes((len(h2_path),)) + h2_path.encode() +
+                                     b'\x01\x09localhost\x0f\x08\x09Bearer h2')
+                            sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
 
-                        def exact(length):
+                            def exact(length):
+                                data = b''
+                                while len(data) < length:
+                                    part = sock.recv(length - len(data))
+                                    assert part, 'HTTP/2 closed before introspection completed'
+                                    data += part
+                                return data
+
                             data = b''
-                            while len(data) < length:
-                                part = sock.recv(length - len(data))
-                                assert part, 'HTTP/2 closed before introspection completed'
-                                data += part
-                            return data
-
-                        data = b''
-                        while True:
-                            header = exact(9)
-                            payload = exact(int.from_bytes(header[:3], 'big'))
-                            kind, flags = header[3], header[4]
-                            stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
-                            if kind == 4 and not flags & 1:
-                                sock.sendall(frame(4, 1, 0))
-                            assert kind != 7, payload
-                            if stream != 1:
-                                continue
-                            assert kind != 3, payload
-                            if kind == 0:
-                                data += payload
-                            if kind in (0, 1) and flags & 1:
-                                break
-                        assert data == b'subject-h2', data
+                            while True:
+                                header = exact(9)
+                                payload = exact(int.from_bytes(header[:3], 'big'))
+                                kind, flags = header[3], header[4]
+                                stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
+                                if kind == 4 and not flags & 1:
+                                    sock.sendall(frame(4, 1, 0))
+                                assert kind != 7, payload
+                                if stream != 1:
+                                    continue
+                                assert kind != 3, payload
+                                if kind == 0:
+                                    data += payload
+                                if kind in (0, 1) and flags & 1:
+                                    break
+                            assert data == b'subject-h2', data
                     # Duplicate Authorization must fail before contacting the AS.
-                    before = len(received)
-                    with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
-                        sock.sendall(b'GET /reports HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer valid\r\nAuthorization: Bearer valid\r\n\r\n')
-                        assert b' 401 ' in sock.recv(4096)
-                    assert len(received) == before
+                    for path in ('/reports', '/bound-reports'):
+                        before = len(received)
+                        with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
+                            wire = (f'GET {path} HTTP/1.1\r\nHost: test\r\n'
+                                    'Authorization: Bearer valid\r\n'
+                                    'Authorization: Bearer valid\r\n\r\n').encode()
+                            sock.sendall(wire)
+                            assert b' 401 ' in sock.recv(4096)
+                        assert len(received) == before
                     for path, headers, _, token in received:
                         assert path == '/introspect'
                         assert not any(key.lower() in ('cookie', 'x-consumer-id') for key in headers)
                         assert headers['Authorization'] in (service_auth, 'Bearer wrong-service')
                     assert service_auth.encode() not in log.read_bytes()
-                    print(f'PASS: {args.backend} authenticated RFC 7662 requests, strict metadata, scope, revocation and isolation')
+                    print(f'PASS: {args.backend} authenticated RFC 7662 requests, strict metadata, issuer/client binding, scope, revocation and isolation')
                 finally:
                     if process.poll() is None:
                         process.terminate()
