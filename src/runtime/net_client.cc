@@ -310,6 +310,12 @@ bool NetClientWorker::connected(Slot& s) {
     if (!init_tls_client_context(s.tls, s.endpoint.tls, false)) return failed(s);
     auto ssl = create_tls_client_ssl(s.tls, s.fd, s.endpoint.tls.server_name);
     if (!ssl) return failed(s);
+    // This is a protocol-neutral TCP transport. HTTP clients configure their
+    // own ALPN offer, but arbitrary TCP peers must not see an HTTP protocol.
+    if (SSL_set_alpn_protos(ssl.value(), nullptr, 0) != 0) {
+        SSL_free(ssl.value());
+        return failed(s);
+    }
     s.ssl = ssl.value();
     s.step = handshake;
     return false;

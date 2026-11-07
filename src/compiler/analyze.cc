@@ -5870,7 +5870,12 @@ static bool hir_has_resumable_call(const HirExpr& value, u32 depth = 0) {
 static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
                                                   const HirRoute* route,
                                                   Span span) {
-    const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body);
+    // The normalized value body can discard an unused binding initializer.
+    // Inspect the retained lexical body when deciding whether this helper has
+    // resumable effects, so dead result values do not erase the operation.
+    const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body) ||
+                          (fn.lexical_body_index < fn.exprs.len &&
+                           hir_has_resumable_call(fn.exprs[fn.lexical_body_index]));
     const bool kStringBody = hir_has_string_construction(fn.body);
     if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
     if (fn.lexical_body_index >= fn.exprs.len)

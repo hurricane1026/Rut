@@ -23,7 +23,9 @@ def main():
     parser.add_argument('--backend', required=True, choices=('epoll', 'io_uring'))
     args = parser.parse_args()
     requests = []
+    tls_alpn = []
     active = set()
+    received_datagrams = []
     lock = threading.Lock()
 
     class Handler(socketserver.BaseRequestHandler):
@@ -40,6 +42,8 @@ def main():
                     data += chunk
                 with lock:
                     requests.append(data)
+                    if isinstance(self.request, ssl.SSLSocket):
+                        tls_alpn.append((data, self.request.selected_alpn_protocol()))
                 if data == b'eof\r\n':
                     return
                 if data == b'slow\r\n':
@@ -79,6 +83,7 @@ def main():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     cert = Path(args.testdata) / 'localhost_cert.pem'
     context.load_cert_chain(str(cert), str(Path(args.testdata) / 'localhost_key.pem'))
+    context.set_alpn_protocols(['http/1.1'])
     secure.socket = context.wrap_socket(secure.socket, server_side=True)
     for server in (plain, secure):
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -87,10 +92,56 @@ def main():
     stopped = threading.Event()
     udp_socket.settimeout(.05)
 
+    # Observe the wire offer directly. Python's ssl API only exposes the
+    # negotiated protocol, which cannot distinguish no offer from no overlap.
+    alpn_offers = []
+
+    class ClientHelloProbe(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.settimeout(3)
+
+            def exact(length):
+                data = b''
+                while len(data) < length:
+                    part = self.request.recv(length - len(data))
+                    if not part:
+                        raise EOFError()
+                    data += part
+                return data
+
+            try:
+                header = exact(5)
+                assert header[0] == 22
+                body = exact(int.from_bytes(header[3:5], 'big'))
+                assert body[0] == 1
+                hello = body[4:]
+                offset = 2 + 32
+                offset += 1 + hello[offset]
+                offset += 2 + int.from_bytes(hello[offset:offset + 2], 'big')
+                offset += 1 + hello[offset]
+                ext_length = int.from_bytes(hello[offset:offset + 2], 'big')
+                offset += 2
+                end = offset + ext_length
+                offered = None
+                while offset < end:
+                    kind = int.from_bytes(hello[offset:offset + 2], 'big')
+                    size = int.from_bytes(hello[offset + 2:offset + 4], 'big')
+                    value = hello[offset + 4:offset + 4 + size]
+                    if kind == 16:
+                        offered = value
+                    offset += 4 + size
+                alpn_offers.append(offered)
+            except (EOFError, OSError, AssertionError):
+                alpn_offers.append(b'invalid-clienthello')
+
+    probe = Server(('127.0.0.1', 0), ClientHelloProbe)
+    threading.Thread(target=probe.serve_forever, daemon=True).start()
+
     def datagrams():
         while not stopped.is_set():
             try:
                 data, address = udp_socket.recvfrom(16384)
+                received_datagrams.append(data)
                 if data == b'slow':
                     continue
                 udp_socket.sendto(b'x' * 9000 if data == b'large' else b'x' * 8192 if data == b'maximum' else data, address)
@@ -107,6 +158,16 @@ def main():
             module = root / 'clients/redis.rut'
             module.write_bytes((Path(__file__).parent.parent / 'examples/clients/redis.rut').read_bytes())
             source = 'import "clients/redis.rut"\n'
+            source += '''
+func emit(_ socket: UdpSocket) -> bool {
+    let sent = socket.send("helper", 1000)
+    true
+}
+func closeUnused(_ connection: TcpConnection) -> bool {
+    let closed = connection.close()
+    true
+}
+'''
             for path, policy in (('tcp', 'TCP'), ('tls', 'TLS')):
                 source += f'''
 route GET "/{path}" {{
@@ -125,6 +186,13 @@ route GET "/{path}" {{
 }}
 '''
             source += '''
+route GET "/tls-alpn-probe" {
+    let pending = tcp(env("TLS_PROBE"), 1000)
+    guard let connection = pending else { return 503 }
+    return 500
+}
+'''
+            source += '''
 route GET "/redis" {
     let pending = tcp(env("TCP"), 1000)
     guard let connection = pending else { return 503 }
@@ -140,6 +208,22 @@ route POST "/udp" {
     let pendingRead = socket.receive(8192, 1000)
     guard let reply = pendingRead else { return 503 }
     return response(200, body: reply)
+}
+route GET "/udp-helper" {
+    let pending = udp(env("UDP"), 1000)
+    guard let socket = pending else { return 503 }
+    let result = emit(socket)
+    return 204
+}
+route GET "/close-helper" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let result = closeUnused(connection)
+    let pendingRead = alias.receive(64, 1000)
+    let failure = netError()
+    guard failure != -4 else { return 204 }
+    return 500
 }
 route GET "/mixed" {
     guard let message = json.parse("{\\"method\\":\\"GET\\"}") else { return 503 }
@@ -215,6 +299,8 @@ route GET "/limit" {
             env = dict(os.environ, TCP=json.dumps(dict(address='127.0.0.1', port=plain.server_address[1])),
                        TLS=json.dumps(dict(address='127.0.0.1', port=secure.server_address[1], tls=True,
                                            caFile=str(cert), serverName='localhost')),
+                       TLS_PROBE=json.dumps(dict(address='127.0.0.1', port=probe.server_address[1], tls=True,
+                                                 caFile=str(cert), serverName='localhost')),
                        WRONG_TLS=json.dumps(dict(address='127.0.0.1', port=secure.server_address[1], tls=True,
                                                  caFile=str(cert), serverName='wrong.invalid')),
                        UDP=json.dumps(dict(address='127.0.0.1', port=udp_socket.getsockname()[1])),
@@ -255,6 +341,10 @@ route GET "/limit" {
 
                 for path in ('/tcp', '/tls'):
                     assert request(path) == (200, b'hello\r\n'), path
+                assert any(data == b'hello\r\n' and protocol is None
+                           for data, protocol in tls_alpn), tls_alpn
+                assert request('/tls-alpn-probe')[0] == 503
+                assert alpn_offers == [None], alpn_offers
                 redis_result = request('/redis')
                 assert redis_result == (200, b'+PONG\r\n'), (redis_result, requests, log.read_text(errors="replace"))
                 for body in (b'\x00\xff\r\nhello', b'', b'x' * 8000):
@@ -262,6 +352,9 @@ route GET "/limit" {
                     assert result == (200, body), (len(body), result[0], len(result[1]))
                 assert request('/udp', b'maximum') == (200, b'x' * 8192)
                 assert request('/udp', b'large')[0] == 503
+                assert request('/udp-helper') == (204, b'')
+                assert b'helper' in received_datagrams, received_datagrams
+                assert request('/close-helper') == (204, b'')
                 assert request('/mixed') == (200, b'TAIL')
                 assert request('/wrong-tls')[0] == 503
                 assert request('/timeout')[0] == 504
@@ -329,6 +422,8 @@ route GET "/limit" {
         for server in (plain, secure):
             server.shutdown()
             server.server_close()
+        probe.shutdown()
+        probe.server_close()
     return 0
 
 
