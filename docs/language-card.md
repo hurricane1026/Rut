@@ -2832,9 +2832,15 @@ Basic service authorization and the AS's default scope. Bind and unwrap its
 an upstream Bearer header only after strict status/JSON/token/type/expiry/scope
 checks. Service token failures return 503; downstream authentication is explicit.
 `req.set` replaces Authorization only in the selected authorized forwarding arm.
-No syntax, builtin or runtime change is added. There is no token cache or refresh
-flow. See [the contract](upstream-oauth.md) and
-[example](../examples/upstream-oauth.rut).
+`oauth_client.clientCredentialsForScope(auth, scopes)` adds an explicit trusted
+scope list using `oauthClientCredentialsRequest(scopes: str, serviceAuthorization: str) -> Json?`.
+The builtin accepts at most 1024 scope bytes with strict single-space ASCII scope
+grammar and at most 2048 visible ASCII bytes of Basic service authorization;
+invalid input returns nil and the source helper responds 503. Reserved form bytes
+are percent-encoded, preserving order, duplicates and case. The required response
+scope check remains mandatory. No keyword, dependency, token cache or refresh flow
+is added. See [the contract](upstream-oauth.md), [default example](../examples/upstream-oauth.rut)
+and [scoped example](../examples/upstream-oauth-scoped.rut).
 
 ### OAuth authorization-server revocation client
 

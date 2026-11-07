@@ -3525,7 +3525,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 if (inst.op == rir::Opcode::JsonOp) {
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
-                        kJsonOp == json::Op::OauthIntrospectionValid) {
+                        kJsonOp == json::Op::OauthIntrospectionValid ||
+                        kJsonOp == json::Op::OauthClientCredentialsRequest) {
                         if (inst.operand_count != 2 || inst.extra_operands ||
                             inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
                             !fn.values || !fn.values[inst.result.id].type)
@@ -3539,7 +3540,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                                 return {nullptr, nullptr, false};
                         }
                         const auto* result = fn.values[inst.result.id].type;
-                        if (kJsonOp == json::Op::OauthIntrospectionRequest) {
+                        if (kJsonOp == json::Op::OauthIntrospectionRequest ||
+                            kJsonOp == json::Op::OauthClientCredentialsRequest) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||
                                 result->struct_def || result->inner->kind != rir::TypeKind::Str ||
                                 result->inner->inner || result->inner->struct_def)

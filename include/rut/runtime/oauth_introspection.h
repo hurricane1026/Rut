@@ -12,6 +12,11 @@ namespace rut {
 // this call; service authorization comes from trusted configuration. No I/O.
 bool oauth_introspection_request(Str token, Str service_authorization, json::Writer& output);
 
+// Explicit RFC 6749 client-credentials scopes, at most 1024 ASCII bytes using
+// the strict scope-list grammar. Only configured Basic service auth is accepted.
+// Caller-owned output; no I/O, allocation or retained input views.
+bool oauth_client_credentials_request(Str scopes, Str service_authorization, json::Writer& output);
+
 // Metadata validation, not signature verification. Accept only a trusted HTTPS
 // introspection response: active=true, future integer exp, exact aud membership,
 // optional nonfuture nbf/iat, optional valid scope list and Bearer token_type.

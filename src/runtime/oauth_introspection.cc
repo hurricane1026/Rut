@@ -1,6 +1,7 @@
 #include "rut/runtime/oauth_introspection.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/types.h"
 #include "rut/runtime/auth.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
@@ -15,27 +16,24 @@ bool date_value(json::Document& doc, u32 node, i64& value) {
     return node != json::kNone && doc.nodes[node].kind == json::Kind::Number &&
            json::integer(doc.raw(node), value) && value >= 0;
 }
-}  // namespace
-
-bool oauth_introspection_request(Str token, Str service_authorization, json::Writer& output) {
-    if (token.len > 1024 || !bearer_key_valid(token) || !service_authorization.ptr ||
-        service_authorization.len > 2048)
-        return false;
-    const bool kBasic = service_authorization.len > 6 &&
-                        http_header_name_eq_ci(service_authorization.ptr, 6, "Basic ", 6);
-    const bool kBearer = service_authorization.len > 7 &&
-                         http_header_name_eq_ci(service_authorization.ptr, 7, "Bearer ", 7);
+bool service_authorization_valid(Str authorization, bool allow_bearer) {
+    if (!authorization.ptr || authorization.len > 2048) return false;
+    const bool kBasic =
+        authorization.len > 6 && http_header_name_eq_ci(authorization.ptr, 6, "Basic ", 6);
+    const bool kBearer = allow_bearer && authorization.len > 7 &&
+                         http_header_name_eq_ci(authorization.ptr, 7, "Bearer ", 7);
     if (!kBasic && !kBearer) return false;
-    for (u32 i = 0; i < service_authorization.len; ++i) {
-        const auto kByte = static_cast<u8>(service_authorization.ptr[i]);
+    for (u32 i = 0; i < authorization.len; ++i) {
+        const auto kByte = static_cast<u8>(authorization.ptr[i]);
         if (kByte < 0x20 || kByte > 0x7e) return false;
     }
-    char body[4096];
-    json::Writer form{body, sizeof(body)};
-    form.text(lit_str("token="));
+    return true;
+}
+
+void form_value(Str value, json::Writer& form) {
     constexpr char kHex[] = "0123456789ABCDEF";
-    for (u32 i = 0; i < token.len; ++i) {
-        const auto kByte = static_cast<u8>(token.ptr[i]);
+    for (u32 i = 0; i < value.len; ++i) {
+        const auto kByte = static_cast<u8>(value.ptr[i]);
         if ((kByte >= 'a' && kByte <= 'z') || (kByte >= 'A' && kByte <= 'Z') ||
             (kByte >= '0' && kByte <= '9') || kByte == '-' || kByte == '.' || kByte == '_' ||
             kByte == '~') {
@@ -46,17 +44,42 @@ bool oauth_introspection_request(Str token, Str service_authorization, json::Wri
             form.put(kHex[kByte & 15]);
         }
     }
-    form.text(lit_str("&token_type_hint=access_token"));
-    if (!form.ok) return false;
+}
+
+bool form_request(Str body, Str authorization, json::Writer& output) {
     output.text(
         lit_str("{\"method\":\"POST\",\"headers\":{\"Content-Type\":"
                 "\"application/x-www-form-urlencoded\",\"Accept\":\"application/json\","
                 "\"Authorization\":"));
-    if (!json::quote(service_authorization, output)) return false;
+    if (!json::quote(authorization, output)) return false;
     output.text(lit_str("},\"body\":"));
-    if (!json::quote({body, form.len}, output)) return false;
+    if (!json::quote(body, output)) return false;
     output.put('}');
     return output.ok;
+}
+}  // namespace
+
+bool oauth_introspection_request(Str token, Str service_authorization, json::Writer& output) {
+    if (token.len > 1024 || !bearer_key_valid(token) ||
+        !service_authorization_valid(service_authorization, true))
+        return false;
+    char body[4096];
+    json::Writer form{body, sizeof(body)};
+    form.text(lit_str("token="));
+    form_value(token, form);
+    form.text(lit_str("&token_type_hint=access_token"));
+    return form.ok && form_request({body, form.len}, service_authorization, output);
+}
+
+bool oauth_client_credentials_request(Str scopes, Str service_authorization, json::Writer& output) {
+    if (scopes.len > 1024 || !jwt_scope_list_valid(scopes) ||
+        !service_authorization_valid(service_authorization, false))
+        return false;
+    char body[4096];
+    json::Writer form{body, sizeof(body)};
+    form.text(lit_str("grant_type=client_credentials&scope="));
+    form_value(scopes, form);
+    return form.ok && form_request({body, form.len}, service_authorization, output);
 }
 
 bool oauth_introspection_valid(json::Document& doc, Str claims, Str audience, i64 unix_seconds) {

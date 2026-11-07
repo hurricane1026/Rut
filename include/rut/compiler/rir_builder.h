@@ -1092,7 +1092,8 @@ struct Builder {
                               u32 count,
                               SourceLoc loc = {}) {
         const bool kIntrospectionRequest =
-            op == static_cast<u32>(json::Op::OauthIntrospectionRequest);
+            op == static_cast<u32>(json::Op::OauthIntrospectionRequest) ||
+            op == static_cast<u32>(json::Op::OauthClientCredentialsRequest);
         const bool kIntrospectionValid = op == static_cast<u32>(json::Op::OauthIntrospectionValid);
         if (kIntrospectionRequest || kIntrospectionValid) {
             if (count != 2 || !args || !val_has_type(args[0], TypeKind::Str) ||

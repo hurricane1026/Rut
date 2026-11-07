@@ -28,7 +28,7 @@ whether a competing open-source edition includes them.
 | OAuth2 revocation client | **Bounded AS-client profile implemented** | Configured authenticated RFC 7009 form POST, status-only 200 acknowledgement, identical known/unknown-token client success, no-store logout response and end-to-end introspection refusal after AS revocation. See [the contract](oauth-revocation.md). AS ownership/durability/replication, public clients and local JWT invalidation remain separate. |
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
-| Upstream OAuth token | **Per-request client credentials profile implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Scope negotiation, resource/audience parameters, token exchange, caching and refresh coordination remain outside this profile. |
+| Upstream OAuth token | **Per-request client credentials profile implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope or explicit bounded configured scopes, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Provider-specific scope negotiation, resource/audience parameters, token exchange, caching and refresh coordination remain outside this profile. |
 | mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity, two-pin credential rotation and two-Consumer certificate mapping helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
@@ -1305,7 +1305,10 @@ upstream forwarding on failure, for epoll and io_uring.
 
 ## Upstream OAuth client credentials
 
-`oauth_client.clientCredentials` constructs a fixed client-credentials form request;
+`oauth_client.clientCredentials` constructs the default-scope client-credentials
+form request; `clientCredentialsForScope` adds a bounded trusted scope list with
+strict grammar and native percent-encoding. Caller scope headers/query parameters
+do not control the scoped example. Invalid configuration fails before a call;
 `oauth_client.authorization` accepts a completed trusted token endpoint result
 only after Bearer grammar/type, positive integer expiry, explicit exact scope and
 absence of OAuth errors succeed. Downstream credentials authenticate separately.

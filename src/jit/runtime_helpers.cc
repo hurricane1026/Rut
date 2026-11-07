@@ -2767,7 +2767,8 @@ extern "C" void rut_helper_json(void* conn,
     if (op > static_cast<u32>(json::Op::Sha256HexValid) &&
         op != static_cast<u32>(json::Op::JwtVerifyEs256) &&
         op != static_cast<u32>(json::Op::OauthIntrospectionRequest) &&
-        op != static_cast<u32>(json::Op::OauthIntrospectionValid))
+        op != static_cast<u32>(json::Op::OauthIntrospectionValid) &&
+        op != static_cast<u32>(json::Op::OauthClientCredentialsRequest))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2777,6 +2778,8 @@ extern "C" void rut_helper_json(void* conn,
     const auto operation = static_cast<json::Op>(op);
     if (operation == json::Op::OauthIntrospectionRequest) {
         if (!oauth_introspection_request({a, a_len}, {b, b_len}, writer)) return;
+    } else if (operation == json::Op::OauthClientCredentialsRequest) {
+        if (!oauth_client_credentials_request({a, a_len}, {b, b_len}, writer)) return;
     } else if (operation == json::Op::OauthIntrospectionValid) {
         struct timespec now{};
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
