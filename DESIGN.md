@@ -10326,3 +10326,13 @@ cache expiry, refresh or distributed state; existing request arenas and callout
 cancellation own temporary secrets. No compiler/runtime ABI, builtin or dependency
 is added. See [the profile](docs/upstream-oauth.md) for its default-scope contract,
 relative lifetime limits and two-backend native validation.
+
+### Authorization-server revocation client
+
+An ordinary source helper composes the existing bounded token/hint form builder
+and fixed HTTPS calls with RFC 7009 status-only acknowledgement. The AS owns
+client/token ownership checks and authoritative revocation state; per-request
+introspection observes that state without a local allow cache. Gateway timeout
+or disconnect does not roll back a possibly committed AS mutation. No automatic
+retry, persistent gateway state, grammar or runtime ABI is added. See
+[the profile](docs/oauth-revocation.md) and its two-backend native lifecycle tests.

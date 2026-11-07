@@ -25,6 +25,7 @@ whether a competing open-source edition includes them.
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
 | Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
 | OAuth2 introspection | **Bounded per-request profile implemented** | Authenticated RFC 7662 form POST over fixed verified HTTPS; exact active/expiry/audience and optional time/scope/token-type/subject checks; explicit scope and identity mapping; no cached allows, so remote revocation applies on the next request; fail-closed outage and native-loaded two-backend HTTP/1 + HTTP/2 tests. See [the contract](oauth-introspection.md). Cached refresh/invalidation, discovery and other endpoint client-auth methods remain outside this profile. |
+| OAuth2 revocation client | **Bounded AS-client profile implemented** | Configured authenticated RFC 7009 form POST, status-only 200 acknowledgement, identical known/unknown-token client success, no-store logout response and end-to-end introspection refusal after AS revocation. See [the contract](oauth-revocation.md). AS ownership/durability/replication, public clients and local JWT invalidation remain separate. |
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
 | Upstream OAuth token | **Per-request client credentials profile implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Scope negotiation, resource/audience parameters, token exchange, caching and refresh coordination remain outside this profile. |
@@ -1316,3 +1317,17 @@ Independent TLS/native tests execute after source/module removal on epoll and
 io_uring, including HTTP/2, malformed/error responses, timeout, cancellation,
 concurrent fresh tokens, credential separation and secret-safe logging. See
 [the bounded profile and limitations](upstream-oauth.md).
+
+## Authorization-server token revocation
+
+`oauth_revocation.revokeRequest` reuses the bounded token/hint form builder with
+a fixed HTTPS revocation endpoint and separate Basic service credentials.
+`requireSuccess` accepts completed status 200 without parsing its body. The
+example returns 204/no-store for known, unknown and previously revoked tokens;
+errors/timeouts remain 503 without automatic retry or a rollback claim. Existing
+per-request introspection observes the AS's revoked state on the next request.
+
+Native-loaded two-backend TLS tests retain source/module-removal evidence and
+cover protocol fields, credential separation, transport limits, HTTP/2,
+concurrency, disconnect/timeout uncertainty and no secret logging. See
+[the profile and state boundary](oauth-revocation.md).

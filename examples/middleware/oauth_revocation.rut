@@ -1,0 +1,18 @@
+// The bounded RFC 7662 form builder also emits the RFC 7009 token + hint form.
+// Only the trusted endpoint changes. Never use a downstream credential as service auth.
+func revokeRequest(_ authorization: str, _ serviceAuthorization: str) -> Json {
+    guard serviceAuthorization.hasPrefix("Basic ") && serviceAuthorization != "Basic " else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard let token = bearerToken(authorization) else { respond denied }
+    guard let message = oauthIntrospectionRequest(token, serviceAuthorization) else { respond 503 }
+    message
+}
+
+// RFC 7009 success covers both revoked and unrecognized tokens. Ignore the
+// response body; completed transport + status 200 is the only success signal.
+func requireSuccess(_ reply: Json) -> bool {
+    guard json.bool(json.get(reply, "/ok").or(reply)).or(false) &&
+        json.int(json.get(reply, "/status").or(reply)).or(0) == 200 else { respond 503 }
+    true
+}
