@@ -172,6 +172,12 @@ func twice(_ result: bool) -> bool { result && result }
 func first(_ left: bool, _ right: bool) -> bool {
     if right { left } else { left }
 }
+func firstCode(_ code: i32, _ ignored: bool) -> i32 { code }
+func failClosedRead(_ connection: TcpConnection) -> bool {
+    let pending = connection.receive(64, 1000)
+    let failureCode = netError()
+    failureCode == -4
+}
 '''
             for path, policy in (('tcp', 'TCP'), ('tls', 'TLS')):
                 source += f'''
@@ -261,6 +267,30 @@ route GET "/ordered-close-arguments" {
     let failure = netError()
     guard failure != -4 else { return 204 }
     return 500
+}
+route GET "/capture-net-error-argument" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let closed = connection.close()
+    guard closed else { return 500 }
+    let captured = firstCode(netError() + 0, failClosedRead(alias))
+    guard captured == 0 else { return 500 }
+    let afterClose = netError()
+    guard afterClose == -4 else { return 501 }
+    return 204
+}
+route GET "/capture-net-error-local" {
+    let pending = tcp(env("TCP"), 1000)
+    guard let connection = pending else { return 503 }
+    let alias = connection
+    let saved = netError()
+    let closed = connection.close()
+    let pendingRead = alias.receive(64, 1000)
+    let current = netError()
+    guard saved == 0 else { return 500 }
+    guard current == -4 else { return 501 }
+    return 204
 }
 route GET "/mixed" {
     guard let message = json.parse("{\\"method\\":\\"GET\\"}") else { return 503 }
@@ -395,6 +425,9 @@ route GET "/limit" {
                 assert request('/ignored-close-argument') == (204, b'')
                 assert request('/reused-close-argument') == (204, b'')
                 assert request('/ordered-close-arguments') == (204, b'')
+                captured_error = request('/capture-net-error-argument')
+                assert captured_error == (204, b''), captured_error
+                assert request('/capture-net-error-local') == (204, b'')
                 assert request('/mixed') == (200, b'TAIL')
                 assert request('/wrong-tls')[0] == 503
                 assert request('/timeout')[0] == 504

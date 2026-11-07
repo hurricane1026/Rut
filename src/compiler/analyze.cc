@@ -5867,6 +5867,23 @@ static bool hir_has_resumable_call(const HirExpr& value, u32 depth = 0) {
     return false;
 }
 
+static bool hir_has_net_error_query(const HirExpr& value, u32 depth = 0) {
+    if (value.kind == HirExprKind::BoundValue) return false;
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::JsonOp &&
+        value.int_value == static_cast<i64>(json::Op::NetError))
+        return true;
+    if (value.lhs && hir_has_net_error_query(*value.lhs, depth + 1)) return true;
+    if (value.rhs && hir_has_net_error_query(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && hir_has_net_error_query(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            hir_has_net_error_query(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
                                                   const HirRoute* route,
                                                   Span span) {
@@ -5952,9 +5969,11 @@ struct LexicalCallArguments {
     FrontendResult<void> bind(HirExpr& value) {
         // Resumable operations need a lexical initializer in ordinary routes
         // too, so helper substitution cannot discard or duplicate their effects.
+        // netError is a state observation rather than a resumable operation,
+        // but its value must still be captured before later arguments run.
         if (route == nullptr ||
             (!uses_lexical_values(route) && !hir_has_string_construction(value) &&
-             !hir_has_resumable_call(value)))
+             !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
         if (is_ws_borrowed_type(value.type) && kEvaluated)
