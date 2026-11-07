@@ -2835,3 +2835,16 @@ checks. Service token failures return 503; downstream authentication is explicit
 No syntax, builtin or runtime change is added. There is no token cache or refresh
 flow. See [the contract](upstream-oauth.md) and
 [example](../examples/upstream-oauth.rut).
+
+### OAuth authorization-server revocation client
+
+`oauth_revocation.revokeRequest(authorization, serviceAuthorization)` builds the
+bounded percent-encoded token/access-token-hint form using trusted Basic service
+credentials. Send it with `httpCall` to a fixed verified HTTPS revocation policy.
+`oauth_revocation.requireSuccess(reply)` accepts completed status 200, regardless
+of admitted body contents, and otherwise responds 503. The example returns the
+same empty 204/no-store response for revoked and unknown tokens. Invalid client
+Bearer syntax returns 401 before a call with valid service configuration.
+There is no automatic retry, local blacklist or rollback on timeout/disconnect.
+See [the contract](oauth-revocation.md) and
+[example](../examples/oauth-revocation.rut). No syntax, builtin or ABI is added.
