@@ -359,7 +359,10 @@ struct MirFunction {
     Str path{};
     Str name{};
     static constexpr u32 kMaxLocals = 16;
-    static constexpr u32 kMaxBlocks = 16;
+    // Eight supported route guards can consume two blocks each, before the
+    // entry, callout continuation and final match arms. Leave bounded room for
+    // authentication + external authorization composition accepted by HIR.
+    static constexpr u32 kMaxBlocks = 32;
     // Nested JSON decoding and subsequent struct field checks need bounded
     // temporaries for each pointer operation and decoded field.
     static constexpr u32 kMaxWaits = kMaxRouteWaits;

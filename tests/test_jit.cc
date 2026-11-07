@@ -29953,3 +29953,46 @@ route GET "/call" {
     rir.destroy();
     pool.destroy();
 }
+
+TEST(jit, http_call_frame_excludes_block_local_values_after_last_call) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("frame_bound"), lit("/call"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto policy =
+        V(b.emit_const_str(lit("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\","
+                               "\"caFile\":\"/missing.pem\",\"path\":\"/check\"}")));
+    auto request = V(b.emit_const_str(lit("{\"method\":\"GET\"}")));
+    auto timeout = V(b.emit_const_i32(100));
+    const ValueId args[] = {policy, request, timeout};
+    V(b.emit_json(static_cast<u32>(json::Op::HttpCall), TypeKind::Str, true, args, 3));
+    // More than 8 KiB if every SSA string receives a frame slot. These values
+    // cannot span a later call and should not prevent this handler from running.
+    for (u32 i = 0; i < 600; ++i) V(b.emit_const_str(lit("post-call validation")));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(rir::verify_module(tc.mod).ok);
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_frame_bound"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    auto* ctx = conn->reset_jit_ctx();
+    const auto wire = lit("GET /call HTTP/1.1\r\nHost: test\r\n\r\n");
+    const auto result = HandlerResult::unpack(
+        handler(conn.get(), ctx, reinterpret_cast<const u8*>(wire.ptr), wire.len, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    CHECK(ctx->load_slot<u64>(0) != 0);
+    conn->json_arena.destroy();
+    engine.shutdown();
+    pool.destroy();
+    tc.destroy();
+}

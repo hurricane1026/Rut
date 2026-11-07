@@ -2,6 +2,7 @@
 
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/http_call_profile.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/verifier.h"
@@ -144,6 +145,7 @@ struct Ctx {
     // values and the exact continuation without replaying earlier effects.
     LLVMValueRef call_frame = nullptr;
     LLVMTypeRef call_frame_type = nullptr;
+    u32 call_frame_fields[1024]{};
     LLVMValueRef call_dispatch = nullptr;
     u32 call_state = 0;
     u32 current_block = 0;
@@ -815,17 +817,17 @@ struct Ctx {
 
     void set_value(rir::ValueId id, LLVMValueRef val) {
         if (id.id < value_map_cap) value_map[id.id] = val;
-        if (call_frame && id.id < cur_fn->value_count) {
+        if (call_frame && id.id < cur_fn->value_count && call_frame_fields[id.id] != 0) {
             auto ptr = LLVMBuildStructGEP2(
-                builder, call_frame_type, call_frame, id.id + 3, "call.value.ptr");
+                builder, call_frame_type, call_frame, call_frame_fields[id.id], "call.value.ptr");
             LLVMBuildStore(builder, val, ptr);
         }
     }
 
     LLVMValueRef get_value(rir::ValueId id) {
-        if (call_frame && id.id < cur_fn->value_count) {
+        if (call_frame && id.id < cur_fn->value_count && call_frame_fields[id.id] != 0) {
             auto ptr = LLVMBuildStructGEP2(
-                builder, call_frame_type, call_frame, id.id + 3, "call.value.ptr");
+                builder, call_frame_type, call_frame, call_frame_fields[id.id], "call.value.ptr");
             return LLVMBuildLoad2(builder, map_type(cur_fn->values[id.id].type), ptr, "call.value");
         }
         if (id.id < value_map_cap) return value_map[id.id];
@@ -3174,7 +3176,9 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         MmapArena arena;
         ~MapStorage() { arena.destroy(); }
     } maps;
-    if ((fn.value_cap > 512 || fn.block_cap > 64) && !maps.arena.init(4096)) return false;
+    const bool kHasCalls = rir::function_uses_http_call(fn);
+    if ((fn.value_cap > 512 || fn.block_cap > 64 || kHasCalls) && !maps.arena.init(4096))
+        return false;
     c.value_map =
         fn.value_cap <= 512 ? small_values : maps.arena.alloc_array<LLVMValueRef>(fn.value_cap);
     c.block_map =
@@ -3225,13 +3229,75 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.call_frame_type = nullptr;
     c.call_dispatch = nullptr;
     c.call_state = 0;
-    if (rir::function_uses_http_call(fn)) {
+    if (kHasCalls) {
+        // Retain every value that precedes a reachable call, conservatively
+        // including unused values. Values produced after the final call need
+        // no suspension storage. Keep Phi values in the frame as well: their
+        // incoming edges already select/store them without replay on resume.
+        // The runtime's 8 KiB frame bound remains unchanged.
+        auto* reaches_call = maps.arena.alloc_array<u8>(fn.block_count);
+        if (!reaches_call) return false;
+        for (u32 bi = 0; bi < fn.block_count; ++bi) {
+            reaches_call[bi] = 0;
+            for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ++ii)
+                if (rir::is_http_call(fn.blocks[bi].insts[ii])) reaches_call[bi] = 1;
+        }
+        auto successors_call = [&](const rir::Block& block) {
+            const auto* term = block.terminator();
+            if (!term) return false;
+            if (term->op == rir::Opcode::Jmp)
+                return reaches_call[term->imm.block_targets[0].id] != 0;
+            if (term->op == rir::Opcode::Br)
+                return reaches_call[term->imm.block_targets[0].id] != 0 ||
+                       reaches_call[term->imm.block_targets[1].id] != 0;
+            return false;
+        };
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (u32 bi = fn.block_count; bi > 0; --bi) {
+                if (!reaches_call[bi - 1] && successors_call(fn.blocks[bi - 1])) {
+                    reaches_call[bi - 1] = 1;
+                    changed = true;
+                }
+            }
+        }
+        for (u32 vi = 0; vi < fn.value_count; ++vi) c.call_frame_fields[vi] = 0;
+        for (u32 bi = 0; bi < fn.block_count; ++bi) {
+            const auto& block = fn.blocks[bi];
+            bool later_call = successors_call(block);
+            for (u32 ii = block.inst_count; ii > 0; --ii) {
+                const auto& inst = block.insts[ii - 1];
+                if (inst.result != rir::kNoValue && (later_call || inst.op == rir::Opcode::Phi))
+                    c.call_frame_fields[inst.result.id] = 1;
+                if (rir::is_http_call(inst)) later_call = true;
+            }
+        }
+        // RIR block IDs need not be in definition order. Retain cross-block
+        // operands too, so emitting a consumer never needs a not-yet-emitted
+        // LLVM SSA producer. Block-local values after the last call stay local.
+        for (u32 bi = 0; bi < fn.block_count; ++bi) {
+            const auto& block = fn.blocks[bi];
+            for (u32 ii = 0; ii < block.inst_count; ++ii) {
+                const auto& inst = block.insts[ii];
+                for (u32 oi = 0; oi < inst.operand_count; ++oi) {
+                    const auto kId = inst.operand(oi);
+                    if (kId != rir::kNoValue && fn.values[kId.id].def_block.id != bi)
+                        c.call_frame_fields[kId.id] = 1;
+                }
+            }
+        }
         LLVMTypeRef fields[1027]{};
         fields[0] = c.i32_ty;
         fields[1] = c.ptr_ty;
         fields[2] = c.i32_ty;
-        for (u32 i = 0; i < fn.value_count; ++i) fields[i + 3] = c.map_type(fn.values[i].type);
-        c.call_frame_type = LLVMStructTypeInContext(c.llvm_ctx, fields, fn.value_count + 3, 0);
+        u32 field_count = 3;
+        for (u32 vi = 0; vi < fn.value_count; ++vi) {
+            if (c.call_frame_fields[vi] == 0) continue;
+            c.call_frame_fields[vi] = field_count;
+            fields[field_count++] = c.map_type(fn.values[vi].type);
+        }
+        c.call_frame_type = LLVMStructTypeInContext(c.llvm_ctx, fields, field_count, 0);
         auto entry = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "call.entry");
         LLVMMoveBasicBlockBefore(entry, c.block_map[fn.blocks[0].id.id]);
         auto dispatch = LLVMAppendBasicBlockInContext(c.llvm_ctx, func, "call.dispatch");

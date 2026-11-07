@@ -47226,3 +47226,33 @@ TEST(frontend, http_call_profile_requires_static_destinations_and_rejects_ambigu
         rejected.destroy();
     }
 }
+
+TEST(frontend, mir_accepts_full_guard_chain_before_match) {
+    const char* src = R"rut(
+route GET "/x" {
+    let value = req.header("X-Value").or("")
+    guard value != "1" else { return 401 }
+    guard value != "2" else { return 402 }
+    guard value != "3" else { return 403 }
+    guard value != "4" else { return 404 }
+    guard value != "5" else { return 405 }
+    guard value != "6" else { return 406 }
+    guard value != "7" else { return 407 }
+    guard value != "8" else { return 408 }
+    match value { "ok" => return 200 _ => return 403 }
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK(mir->functions[0].blocks.len > 16u);
+    FrontendRirModule rir{};
+    CHECK(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
