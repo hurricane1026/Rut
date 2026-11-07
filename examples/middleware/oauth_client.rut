@@ -1,0 +1,31 @@
+import "introspection.rut"
+
+// Construct headers with JSON escaping; never interpolate raw credentials.
+func clientCredentialsMessage(_ serviceAuthorization: str) -> Json {
+    guard let quoted = json.encode(serviceAuthorization) else { nil }
+    guard let headers = json.parse("{\"Content-Type\":\"application/x-www-form-urlencoded\",\"Accept\":\"application/json\",\"Authorization\":" + quoted + "}") else { nil }
+    json.value({method: "POST", headers: headers, body: "grant_type=client_credentials"})
+}
+
+// Trusted, pre-encoded HTTP Basic service credentials. The AS supplies this
+// client's default scope; downstream input never selects a grant or credential.
+func clientCredentials(_ serviceAuthorization: str) -> Json {
+    guard serviceAuthorization.hasPrefix("Basic ") && serviceAuthorization != "Basic " else { respond 503 }
+    guard let built = clientCredentialsMessage(serviceAuthorization) else { respond 503 }
+    built
+}
+
+// Only consume a completed httpCall response from the configured HTTPS AS.
+// No caching: expiry is checked as positive integer lifetime metadata at receipt.
+func authorization(_ reply: Json, _ requiredScope: str) -> str {
+    guard requiredScope != "" else { respond 503 }
+    guard let document = introspection.replyDocument(reply) else { respond 503 }
+    let token = json.string(json.get(document, "/access_token").or(document)).or("")
+    let kind = json.string(json.get(document, "/token_type").or(document)).or("")
+    let lifetime = json.int(json.get(document, "/expires_in").or(document)).or(0)
+    let checked = bearerToken(kind + " " + token).or("")
+    guard lifetime > 0 && json.get(document, "/error") == nil &&
+        !kind.contains(" ") && !token.isEmpty && checked == token &&
+        jwtHasScope(document, requiredScope) else { respond 503 }
+    "Bearer " + token
+}

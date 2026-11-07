@@ -2822,3 +2822,16 @@ challenged 401. Case, URI spelling and prefixes are not normalized. This does no
 change which metadata the base validator requires, authenticate arbitrary Json,
 or replace audience/scope checks. See
 [the binding example and contract](oauth-introspection.md#optional-issuer-and-oauth-client-binding).
+
+### Upstream OAuth client credentials
+
+Import `middleware/oauth_client.rut`. `oauth_client.clientCredentials(auth)`
+constructs a `grant_type=client_credentials` form POST using trusted configured
+Basic service authorization and the AS's default scope. Bind and unwrap its
+`httpCall` result, then `oauth_client.authorization(reply, requiredScope)` returns
+an upstream Bearer header only after strict status/JSON/token/type/expiry/scope
+checks. Service token failures return 503; downstream authentication is explicit.
+`req.set` replaces Authorization only in the selected authorized forwarding arm.
+No syntax, builtin or runtime change is added. There is no token cache or refresh
+flow. See [the contract](upstream-oauth.md) and
+[example](../examples/upstream-oauth.rut).
