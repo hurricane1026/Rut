@@ -169,12 +169,15 @@ bool jwt_certificate_bound(json::Document& document, Str claims, Str certificate
     if (!document.string(kThumbprint, thumbprint) || thumbprint.len != 43) return false;
 
     u8 digest[32]{};
-    const auto nibble = [](char value) -> u8 {
+    const auto kNibble = [](char value) -> u8 {
         return static_cast<u8>(value <= '9' ? value - '0' : value - 'a' + 10);
     };
-    for (u32 i = 0; i < 32; ++i)
-        digest[i] = static_cast<u8>((nibble(certificate_sha256.ptr[2 * i]) << 4) |
-                                    nibble(certificate_sha256.ptr[2 * i + 1]));
+    const char* hex = certificate_sha256.ptr;
+    for (u32 i = 0; i < 32; ++i) {
+        const u8 kHigh = kNibble(*hex++);
+        const u8 kLow = kNibble(*hex++);
+        digest[i] = static_cast<u8>((kHigh << 4) | kLow);
+    }
     u8 encoded[45]{};
     u32 length = 0;
     if (!rut_crypto_base64_encode_v1(digest, sizeof(digest), encoded, sizeof(encoded), &length) ||
