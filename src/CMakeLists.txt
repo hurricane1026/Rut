@@ -147,6 +147,7 @@ add_library(rut_runtime STATIC
     runtime/jwt_hs256.cc
     runtime/https_fetch.cc
     runtime/forward_auth.cc
+    runtime/net_client.cc
     runtime/http_call.cc
     runtime/oauth_introspection.cc
     runtime/jwt_rs256.cc

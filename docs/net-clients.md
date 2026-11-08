@@ -1,0 +1,133 @@
+# TCP and UDP client primitives
+
+Rut exposes request-scoped `TcpConnection` and `UdpSocket` values so ordinary
+`.rut` libraries can implement client protocols. Runtime primitives contain no
+Redis, Memcached or other application protocol logic. No new keywords, external
+client libraries, coroutines or LLVM runtime dependency are introduced.
+
+The executable [TCP/UDP example](../examples/tcp-udp-clients.rut) imports a small
+[Redis RESP2 PING client](../examples/clients/redis.rut) written in Rut. It is a
+protocol-library example, not a complete Redis driver.
+
+## Endpoint configuration
+
+`tcp(policy, timeoutMs) -> TcpConnection?` connects a TCP client.
+`udp(policy, timeoutMs) -> UdpSocket?` creates a UDP client connected to one peer.
+Both take a policy JSON string resolved at compile/load time and a literal
+1–60000 ms timeout. Configuration may come from `env(...)`.
+
+Plain TCP or UDP:
+
+```json
+{"address":"127.0.0.1","port":6379}
+```
+
+Verified TCP TLS:
+
+```json
+{"address":"127.0.0.1","port":6380,"tls":true,"caFile":"/certs/ca.pem","serverName":"redis.internal"}
+```
+
+Address is a fixed IPv4 literal and port 1–65535. TLS uses the existing pinned
+static OpenSSL, requires both CA and server identity, and never falls back to
+plaintext. Unknown/duplicate fields, controls/NUL, missing fields, invalid ranges
+and inconsistent TLS fields reject compilation. UDP rejects all TLS fields.
+Policy is at most 2048 bytes. There is no DNS, listener/server API, Unix socket,
+DTLS, client certificate or application ALPN selection in this profile. Remote
+addresses cannot be selected from request data. A UDP socket sends only to and
+receives only from its configured peer; there is no arbitrary `sendTo`/`bind` API.
+
+## Operations
+
+| Operation | Result | Semantics |
+| --- | --- | --- |
+| `connection.send(data, timeoutMs)` | `i32?` | Send all Bytes or str bytes; return byte count. TCP failure may follow a partial write. UDP performs exactly one datagram send, including an empty one. |
+| `connection.receive(maxBytes, timeoutMs)` | `Bytes?` | TCP: return some available bytes, up to maxBytes. Empty success means EOF. UDP: return one whole datagram, which may be empty. |
+| `connection.readExactly(count, timeoutMs)` | `Bytes?` | TCP only; accumulate exactly count bytes. Count zero succeeds empty; early EOF fails. |
+| `connection.readLine(maxBytes, timeoutMs)` | `Bytes?` | TCP only; accumulate through LF, retaining LF and any preceding CR. Missing LF within maxBytes or truncated EOF fails. |
+| `connection.close()` | `bool` | Invalidate the handle immediately and schedule socket cleanup; false for an invalid/already-closed handle. |
+
+Read counts are unwrapped i32 values, checked at runtime: receive/readLine accept
+1–8192 and readExactly 0–8192. Send payloads are at most 8192 bytes. Counts may
+come from protocol parsing. Timeout is always a literal 1–60000 ms. TCP keeps
+surplus bytes in a bounded connection buffer for later operations. UDP never
+silently truncates a larger datagram: it fails the operation and closes the
+socket. This differs from ordinary stream receive, which can return a prefix.
+A successful UDP send only confirms local socket acceptance, not peer receipt.
+
+Bind asynchronous results before unwrapping, as for `httpCall`:
+
+```rut
+let pending = tcp(env("SERVICE_ENDPOINT"), 1000)
+guard let connection = pending else { return 503 }
+let pendingSend = connection.send(b"PING\r\n", 1000)
+guard let sent = pendingSend else { return 503 }
+let pendingRead = connection.readLine(128, 1000)
+guard let reply = pendingRead else { return 503 }
+let closed = connection.close()
+return response(200, body: reply)
+```
+
+Dynamic `Bytes` response locals use the existing bounded body serializer without
+UTF-8 conversion. Binary NUL and non-UTF-8 bytes are preserved. A raw network
+response is not an authorization decision: protocol libraries must validate the
+reply before admitting or forwarding traffic.
+
+## Failures and ownership
+
+Nil means the operation failed; `netError() -> i32` reports the most recent
+completed network operation in the current handler invocation:
+
+- `0`: success;
+- `-1`: transport/TLS/EOF-framing/truncation failure;
+- `-2`: deadline exceeded;
+- `-3`: session capacity exhausted;
+- `-4`: invalid handle, generation or operation/count.
+
+Read `netError()` immediately on the failure path, before another operation.
+Result-storage exhaustion also reports `-3`. It does not persist across yields
+on its own: bind its value if needed later.
+This is a deliberately small initial error profile. It does not distinguish all
+OS errors or imply that a failed write had no remote effects. No network command
+is automatically retried. After send success or partial/unknown send, timeout or
+cancellation does not undo server-side execution. Application protocol logic
+must choose whether any retry is safe.
+
+Handles belong to one HTTP request/HTTP2 stream generation and owner shard.
+They can be passed to helpers/imported libraries but cannot access another
+request's sockets. Aliases refer to the same connection; closing one invalidates
+all. Handles expose no descriptor or constructor. Normal handler completion,
+early denial, forwarding, reset/close and shutdown all release remaining sockets.
+Successful TCP/UDP opens followed by asynchronous HTTP calls retain their sockets
+across the HTTP continuation. Returned byte views own request-arena storage and
+survive later reads and suspension. Native-loaded code/config does not depend on
+live importing source files.
+
+Every I/O operation has one monotonic deadline, including setup for connect;
+progress cannot extend it. Each connection supports one operation at a time.
+There are at most 16 live sessions per shard; an independent bounded nonblocking
+worker owns all socket/TLS work, including CA loading. The shard suspends using
+the existing timer continuation (polling up to 10 ms). Worker storage is mmap
+backed and is scrubbed/joined on shutdown. No kernel I/O retains a request-owned
+pointer. The existing outbound continuation also bounds the saved complete HTTP
+request and generated value frame to 8192 bytes each, within the 256 KiB request budget.
+Consequently a maximum-size HTTP body plus its headers can exceed snapshot
+capacity even though an individual send allows 8192 bytes. Runtime-owned sockets
+are not yet pooled across HTTP requests.
+
+This first client profile inherits outbound-call restrictions: at most 16
+sequential network/HTTP operations per handler, no explicit wait, timer or
+WebSocket handler, and no specialized password/forward-auth prefix in the same
+handler. HTTP/2 retains its existing single suspended-stream restriction.
+Use a let binding even for close when its Boolean result is ignored. Streaming
+subscriptions, background sessions, general parser loops/Bytes indexing and
+cross-request pooling remain separate follow-ups, not current capabilities.
+
+## Validation
+
+`test_net_clients.py` exercises both epoll and io_uring with actual local TCP,
+verified TLS and UDP peers. It checks imported protocol helpers/native source
+removal, byte-fragmented line/exact reads and surplus buffering, binary/empty/
+maximum-size datagrams, oversize rejection, trust failure, timeout, cancellation,
+concurrent calls, HTTP/2, TCP sessions retained across HTTP-call suspension and automatic close. Runtime unit tests check strict policy
+validation, bounded session capacity and handle owner/generation/close isolation.

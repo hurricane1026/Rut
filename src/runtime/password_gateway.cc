@@ -15,7 +15,10 @@ namespace {
 thread_local PasswordGateway* current_gateway = nullptr;
 thread_local void* current_connection = nullptr;
 thread_local u32 current_stream = 0;
+thread_local bool current_pending = false;
+thread_local i32 current_net_error = 0;
 }  // namespace
+static u64 auth_request_generation(void* connection);
 PasswordHandlerScope::PasswordHandlerScope(PasswordGateway* gateway,
                                            void* connection,
                                            u32 stream_id)
@@ -24,12 +27,24 @@ PasswordHandlerScope::PasswordHandlerScope(PasswordGateway* gateway,
       previous_stream(current_stream) {
     if (!gateway && !current_gateway) return;
     engaged = true;
+    previous_pending = current_pending;
+    previous_net_error = current_net_error;
+    current_pending = false;
+    current_net_error = 0;
     current_gateway = gateway;
     current_connection = connection;
     current_stream = stream_id;
 }
 PasswordHandlerScope::~PasswordHandlerScope() {
     if (!engaged) return;
+    if (!current_pending && current_gateway && current_connection) {
+        const auto generation = auth_request_generation(current_connection);
+        if (generation)
+            current_gateway->net_clients.cancel(
+                static_cast<ConnectionBase*>(current_connection)->id, generation);
+    }
+    current_pending = previous_pending;
+    current_net_error = previous_net_error;
     current_gateway = previous_gateway;
     current_connection = previous_connection;
     current_stream = previous_stream;
@@ -47,9 +62,17 @@ core::Expected<void, Error> PasswordGateway::start() {
         forward_auth.stop();
         worker.stop();
     }
-    return calls;
+    if (!calls) return calls;
+    auto net = net_clients.start();
+    if (!net) {
+        http_calls.stop();
+        forward_auth.stop();
+        worker.stop();
+    }
+    return net;
 }
 void PasswordGateway::stop() {
+    net_clients.stop();
     http_calls.stop();
     forward_auth.stop();
     for (auto& entry : entries) {
@@ -59,6 +82,7 @@ void PasswordGateway::stop() {
     worker.stop();
 }
 void PasswordGateway::cancel(u32 connection) {
+    net_clients.cancel(connection);
     http_calls.cancel(connection);
     forward_auth.cancel(connection);
     for (auto& entry : entries) {
@@ -68,6 +92,7 @@ void PasswordGateway::cancel(u32 connection) {
     }
 }
 void PasswordGateway::cancel_request(u32 connection, u64 generation) {
+    net_clients.cancel(connection, generation);
     http_calls.cancel(connection, generation);
     forward_auth.cancel(connection, generation);
     for (auto& entry : entries) {
@@ -179,7 +204,42 @@ HttpCallReply http_call_for_request(void* connection,
     const auto generation = auth_request_generation(connection);
     if (!generation) return {};
     const auto& conn = *static_cast<ConnectionBase*>(connection);
-    return current_gateway->http_calls.call(
+    auto reply = current_gateway->http_calls.call(
         conn.id, generation, endpoint, request, monotonic_us() / 1000, timeout_ms);
+    if (reply.status == NetReply::kPending) current_pending = true;
+    return reply;
+}
+NetReply net_call_for_request(void* connection,
+                              NetOp operation,
+                              u32 handle,
+                              const NetEndpoint* endpoint,
+                              Str bytes,
+                              i32 amount,
+                              u32 timeout_ms) {
+    const auto generation = auth_request_generation(connection);
+    if (!generation) {
+        current_net_error = -4;
+        return {};
+    }
+    auto reply = current_gateway->net_clients.call(static_cast<ConnectionBase*>(connection)->id,
+                                                   generation,
+                                                   operation,
+                                                   handle,
+                                                   endpoint,
+                                                   bytes,
+                                                   amount,
+                                                   monotonic_us() / 1000,
+                                                   timeout_ms);
+    if (reply.status == NetReply::kPending)
+        current_pending = true;
+    else
+        current_net_error = reply.status;
+    return reply;
+}
+i32 net_error_for_request(void* connection) {
+    return auth_request_generation(connection) ? current_net_error : -4;
+}
+void net_set_error_for_request(void* connection, i32 status) {
+    if (auth_request_generation(connection)) current_net_error = status;
 }
 }  // namespace rut

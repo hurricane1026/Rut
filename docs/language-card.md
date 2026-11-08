@@ -1130,11 +1130,15 @@ guard let r1 else { return 502 }
 guard let resp = any(wait(h1, 5s)) else { return 504 }   // timeout race
 wait(2s)                                                  // sleep
 
-// Raw TCP/UDP
-guard let conn = tcp("redis:6379") else { return 502 }
-defer conn.close()                             // ⏳ (no defer in parser yet)
-conn.send("PING\r\n")
-guard let data = conn.recv(maxSize: 4kb) else { return 502 }
+// TCP/UDP clients — fixed endpoints, request-owned handles (implemented).
+// See net-clients.md for bounds, UDP and TLS policies.
+let pending = tcp(env("SERVICE_ENDPOINT"), 1000)
+guard let conn = pending else { return 502 }
+let pendingSend = conn.send(b"PING\r\n", 1000)
+guard let sent = pendingSend else { return 502 }
+let pendingRead = conn.readLine(128, 1000)
+guard let data = pendingRead else { return 502 }
+let closed = conn.close()                       // also automatic on terminal exit
 
 // Bandwidth limit (inside handler, before the I/O)
 throttle(downstream: 100kb per 1s, burst: 256kb)
@@ -2854,3 +2858,30 @@ Bearer syntax returns 401 before a call with valid service configuration.
 There is no automatic retry, local blacklist or rollback on timeout/disconnect.
 See [the contract](oauth-revocation.md) and
 [example](../examples/oauth-revocation.rut). No syntax, builtin or ABI is added.
+
+## Request-scoped TCP and UDP clients
+
+`tcp(policy, timeoutMs) -> TcpConnection?` and
+`udp(policy, timeoutMs) -> UdpSocket?` expose generic client I/O for ordinary
+`.rut` protocol libraries. Endpoint policy is fixed at compile/load time:
+`{"address":"127.0.0.1","port":6379}`; TCP may add verified TLS with `tls:true`,
+`caFile` and `serverName`. UDP is connected to one configured peer.
+
+Unwrapped handles provide `send(Bytes-or-str, timeoutMs) -> i32?`,
+`receive(maxBytes, timeoutMs) -> Bytes?` and `close() -> bool`. TCP additionally
+provides `readExactly(count, timeoutMs)` and `readLine(maxBytes, timeoutMs)`, both
+returning optional Bytes. Line reads include LF; surplus bytes remain buffered.
+Each operation is bounded to 8192 bytes and a literal 1–60000 ms timeout.
+UDP preserves empty datagrams and fails oversized messages without truncation.
+Bind before optional guard. Handles can be typed helper parameters and belong
+to the current request/stream; automatic cleanup handles every terminal exit.
+`netError()` exposes the immediate failure status. There is no automatic retry.
+The existing `httpCall` continuation restrictions also apply.
+
+Dynamic `response(200, body: local)` additionally accepts an unwrapped Bytes
+local, preserving arbitrary octets through the existing bounded serializer.
+See [the full contract](net-clients.md),
+[the executable example](../examples/tcp-udp-clients.rut) and
+[the Redis PING library](../examples/clients/redis.rut). Generic TCP listeners,
+unrestricted destinations, persistent pools, DNS and general-purpose Bytes
+parsing/iteration are not introduced by this profile.

@@ -19,6 +19,18 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 extern "C" {
 void* rut_helper_http_call_frame(
     void* conn, void* ctx, rut::u64 size, const rut::u8* request, rut::u32 length);
+rut::u64 rut_helper_net_call(void* connection,
+                             rut::u32 operation,
+                             rut::u32 handle,
+                             const char* data,
+                             rut::u32 data_length,
+                             rut::i32 amount,
+                             rut::u32 timeout,
+                             rut::u8* has,
+                             rut::u32* scalar,
+                             const char** out,
+                             rut::u32* length);
+rut::i32 rut_helper_net_error(void* connection);
 rut::u64 rut_helper_http_call(void* conn,
                               const char* policy,
                               rut::u32 policy_len,

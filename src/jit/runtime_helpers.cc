@@ -379,6 +379,64 @@ extern "C" void* rut_helper_http_call_frame(
     __builtin_memcpy(ctx.slots(), static_cast<const void*>(&frame), sizeof(HttpCallFrameHeader*));
     return frame;
 }
+extern "C" u64 rut_helper_net_call(void* connection,
+                                   u32 operation,
+                                   u32 handle,
+                                   const char* data,
+                                   u32 data_length,
+                                   i32 amount,
+                                   u32 timeout,
+                                   u8* has,
+                                   u32* scalar,
+                                   const char** out,
+                                   u32* length) {
+    *has = 0;
+    *scalar = 0;
+    *out = nullptr;
+    *length = 0;
+    if (!connection || operation > static_cast<u32>(NetOp::Close)) return 0;
+    const auto op = static_cast<NetOp>(operation);
+    NetEndpoint endpoint;
+    const bool opening = op == NetOp::Tcp || op == NetOp::Udp;
+    if (opening && !net_endpoint({data, data_length}, op == NetOp::Udp, endpoint)) {
+        net_set_error_for_request(connection, -4);
+        return 0;
+    }
+    auto reply = net_call_for_request(connection,
+                                      op,
+                                      handle,
+                                      opening ? &endpoint : nullptr,
+                                      opening ? Str{} : Str{data, data_length},
+                                      amount,
+                                      timeout);
+    if (reply.status == NetReply::kPending)
+        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    if (reply.status != 0) return 0;
+    *scalar = reply.scalar;
+    if (reply.length) {
+        auto& arena = static_cast<ConnectionBase*>(connection)->json_arena;
+        if (!arena.backend.pool || (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > 262144 - reply.length) {
+            net_set_error_for_request(connection, -3);
+            return 0;
+        }
+        auto* storage = static_cast<char*>(arena.alloc(reply.length));
+        if (!storage) {
+            net_set_error_for_request(connection, -3);
+            return 0;
+        }
+        __builtin_memcpy(storage, reply.bytes, reply.length);
+        *out = storage;
+        *length = reply.length;
+    } else
+        *out = "";
+    *has = 1;
+    return 0;
+}
+extern "C" i32 rut_helper_net_error(void* connection) {
+    return net_error_for_request(connection);
+}
+
 extern "C" u64 rut_helper_http_call(void* connection,
                                     const char* policy,
                                     u32 policy_len,

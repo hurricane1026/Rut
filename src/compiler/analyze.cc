@@ -16,6 +16,7 @@
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_call.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/password.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/rs256_policy.h"
@@ -267,6 +268,8 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::TcpConnection:
+        case HirTypeKind::UdpSocket:
         case HirTypeKind::Bytes:
         case HirTypeKind::IP:
         case HirTypeKind::Json:
@@ -370,7 +373,8 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
         type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
         type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
         type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response ||
-        is_ws_borrowed_type(type) || is_ws_enum_type(type) || type == HirTypeKind::Bytes;
+        is_ws_borrowed_type(type) || is_ws_enum_type(type) || type == HirTypeKind::Bytes ||
+        type == HirTypeKind::TcpConnection || type == HirTypeKind::UdpSocket;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -2003,6 +2007,8 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq(lit_str("Bytes"))) return HirTypeKind::Bytes;
+    if (name.eq(lit_str("TcpConnection"))) return HirTypeKind::TcpConnection;
+    if (name.eq(lit_str("UdpSocket"))) return HirTypeKind::UdpSocket;
     if (name.eq({"Method", 6})) return HirTypeKind::Method;
     if (name.eq(lit_str("IP"))) return HirTypeKind::IP;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
@@ -4857,6 +4863,61 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         }
     }
 
+    if (expr.name.eq(lit_str("send")) || expr.name.eq(lit_str("receive")) ||
+        expr.name.eq(lit_str("readExactly")) || expr.name.eq(lit_str("readLine")) ||
+        expr.name.eq(lit_str("close"))) {
+        const auto saved = route->exprs.len;
+        const auto saved_guards = route->guards.len;
+        auto receiver = receiver_override
+                            ? FrontendResult<HirExpr>(*receiver_override)
+                            : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (receiver && (receiver->type == HirTypeKind::TcpConnection ||
+                         receiver->type == HirTypeKind::UdpSocket)) {
+            constexpr auto detail = lit_str(
+                "network methods require an unwrapped connection, bounded bytes/amount and literal "
+                "timeoutMs (1...60000)");
+            const bool closing = expr.name.eq(lit_str("close"));
+            const bool sending = expr.name.eq(lit_str("send"));
+            if (!route || route->is_timer || receiver->may_nil || receiver->may_error ||
+                expr.args.len != (closing ? 0u : 2u))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            if (closing)
+                return make_json_op(json::Op::NetClose,
+                                    HirTypeKind::Bool,
+                                    false,
+                                    &receiver.value(),
+                                    nullptr,
+                                    nullptr,
+                                    expr.span,
+                                    route);
+            auto value = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            auto timeout = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+            if (!value || !timeout || value->may_nil || value->may_error ||
+                timeout->kind != HirExprKind::IntLit || timeout->int_value < 1 ||
+                timeout->int_value > 60000 ||
+                (sending ? value->type != HirTypeKind::Bytes && value->type != HirTypeKind::Str
+                         : value->type != HirTypeKind::I32))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            auto op = sending                             ? json::Op::NetSend
+                      : expr.name.eq(lit_str("receive"))  ? json::Op::NetReceive
+                      : expr.name.eq(lit_str("readLine")) ? json::Op::NetReadLine
+                                                          : json::Op::NetReadExactly;
+            if (receiver->type == HirTypeKind::UdpSocket && op != json::Op::NetSend &&
+                op != json::Op::NetReceive)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            return make_json_op(op,
+                                sending ? HirTypeKind::I32 : HirTypeKind::Bytes,
+                                true,
+                                &receiver.value(),
+                                &value.value(),
+                                &timeout.value(),
+                                expr.span,
+                                route);
+        }
+        route->exprs.len = saved;
+        route->guards.len = saved_guards;
+    }
+
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident) {
         const u32 probe_saved_exprs = route->exprs.len;
         const u32 probe_saved_guards = route->guards.len;
@@ -5787,10 +5848,51 @@ static bool uses_lexical_values(const HirRoute* route) {
     return route != nullptr && (route->is_ws_callback || route->is_lexical_helper);
 }
 
+static bool hir_has_resumable_call(const HirExpr& value, u32 depth = 0) {
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::JsonOp &&
+        (value.int_value == static_cast<i64>(json::Op::HttpCall) ||
+         (value.int_value >= static_cast<i64>(json::Op::NetTcp) &&
+          value.int_value <= static_cast<i64>(json::Op::NetClose))))
+        return true;
+    if (value.kind == HirExprKind::BoundValue) return false;
+    if (value.lhs && hir_has_resumable_call(*value.lhs, depth + 1)) return true;
+    if (value.rhs && hir_has_resumable_call(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && hir_has_resumable_call(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            hir_has_resumable_call(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
+static bool hir_has_net_error_query(const HirExpr& value, u32 depth = 0) {
+    if (value.kind == HirExprKind::BoundValue) return false;
+    if (depth > 128) return true;
+    if (value.kind == HirExprKind::JsonOp &&
+        value.int_value == static_cast<i64>(json::Op::NetError))
+        return true;
+    if (value.lhs && hir_has_net_error_query(*value.lhs, depth + 1)) return true;
+    if (value.rhs && hir_has_net_error_query(*value.rhs, depth + 1)) return true;
+    for (u32 i = 0; i < value.args.len; ++i)
+        if (value.args[i] && hir_has_net_error_query(*value.args[i], depth + 1)) return true;
+    for (u32 i = 0; i < value.field_inits.len; ++i)
+        if (value.field_inits[i].value &&
+            hir_has_net_error_query(*value.field_inits[i].value, depth + 1))
+            return true;
+    return false;
+}
+
 static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
                                                   const HirRoute* route,
                                                   Span span) {
-    const bool kLexical = uses_lexical_values(route);
+    // The normalized value body can discard an unused binding initializer.
+    // Inspect the retained lexical body when deciding whether this helper has
+    // resumable effects, so dead result values do not erase the operation.
+    const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body) ||
+                          (fn.lexical_body_index < fn.exprs.len &&
+                           hir_has_resumable_call(fn.exprs[fn.lexical_body_index]));
     const bool kStringBody = hir_has_string_construction(fn.body);
     if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
     if (fn.lexical_body_index >= fn.exprs.len)
@@ -5865,8 +5967,13 @@ struct LexicalCallArguments {
     FixedVec<HirExpr*, AstExpr::kMaxArgs + 1> initializers;
 
     FrontendResult<void> bind(HirExpr& value) {
+        // Resumable operations need a lexical initializer in ordinary routes
+        // too, so helper substitution cannot discard or duplicate their effects.
+        // netError is a state observation rather than a resumable operation,
+        // but its value must still be captured before later arguments run.
         if (route == nullptr ||
-            (!uses_lexical_values(route) && !hir_has_string_construction(value)))
+            (!uses_lexical_values(route) && !hir_has_string_construction(value) &&
+             !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
         if (is_ws_borrowed_type(value.type) && kEvaluated)
@@ -12760,6 +12867,43 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if ((expr.name.eq(lit_str("tcp")) || expr.name.eq(lit_str("udp"))) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto detail =
+            lit_str("tcp/udp expects a fixed endpoint policy and literal timeoutMs (1...60000)");
+        if (!route || route->is_timer || expr.args.len != 2 || pipe_lhs || first_arg_override)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        auto policy = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        auto timeout = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        const bool datagram = expr.name.eq(lit_str("udp"));
+        NetEndpoint endpoint;
+        if (!policy || !timeout || policy->kind != HirExprKind::StrLit ||
+            !net_endpoint(policy->str_value, datagram, endpoint) ||
+            timeout->kind != HirExprKind::IntLit || timeout->int_value < 1 ||
+            timeout->int_value > 60000)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        return make_json_op(datagram ? json::Op::NetUdp : json::Op::NetTcp,
+                            datagram ? HirTypeKind::UdpSocket : HirTypeKind::TcpConnection,
+                            true,
+                            &policy.value(),
+                            &timeout.value(),
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+    if (expr.name.eq(lit_str("netError")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (!route || route->is_timer || expr.args.len || pipe_lhs || first_arg_override)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        return make_json_op(json::Op::NetError,
+                            HirTypeKind::I32,
+                            false,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            expr.span,
+                            route);
+    }
     if (expr.name.eq(lit_str("httpCall")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail = lit_str(
@@ -17082,11 +17226,12 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             }
         }
         if (body == nullptr || body->may_nil || body->may_error ||
-            (body->type != HirTypeKind::Str && body->type != HirTypeKind::Json))
+            (body->type != HirTypeKind::Str && body->type != HirTypeKind::Json &&
+             body->type != HirTypeKind::Bytes))
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 stmt.span,
-                lit_str("response body must name an unwrapped str or Json local"));
+                lit_str("response body must name an unwrapped str, Bytes or Json local"));
         if (route->waits.len != 0 || route->for_loops.len != 0)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,

@@ -85,6 +85,8 @@
     X(rut_helper_signed_request_valid)                \
     X(rut_helper_forward_auth_header)                 \
     X(rut_helper_http_call_frame)                     \
+    X(rut_helper_net_call)                            \
+    X(rut_helper_net_error)                           \
     X(rut_helper_http_call)                           \
     X(rut_helper_password_verify_header)              \
     X(rut_helper_jwt_claims_valid_with_lifetime)      \

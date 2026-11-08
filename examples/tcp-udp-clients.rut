@@ -1,0 +1,23 @@
+import "clients/redis.rut"
+listen :8080
+
+route GET "/redis-ping" {
+    let pending = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = pending else { return 503 }
+    let pendingReply = redis.ping(connection)
+    guard let reply = pendingReply else { return 503 }
+    match reply == b"+PONG\r\n" {
+        true => { return 204 }
+        _ => { return 502 }
+    }
+}
+
+route POST "/udp-echo" {
+    let pending = udp(env("UDP_ENDPOINT"), 1000)
+    guard let socket = pending else { return 503 }
+    let pendingSend = socket.send(req.bodyBytes, 1000)
+    guard let sent = pendingSend else { return 503 }
+    let pendingRead = socket.receive(8192, 1000)
+    guard let reply = pendingRead else { return 503 }
+    return response(200, body: reply)
+}

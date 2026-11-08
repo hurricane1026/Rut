@@ -1,10 +1,63 @@
 #pragma once
 #include "rut/compiler/password_profile.h"
 #include "rut/runtime/http_call.h"
+#include "rut/runtime/net_client.h"
 
 namespace rut::rir {
+inline bool is_net_call(const Instruction& inst) {
+    return inst.op == Opcode::JsonOp && inst.imm.i32_val >= static_cast<i32>(json::Op::NetTcp) &&
+           inst.imm.i32_val <= static_cast<i32>(json::Op::NetClose);
+}
 inline bool is_http_call(const Instruction& inst) {
-    return inst.op == Opcode::JsonOp && inst.imm.i32_val == static_cast<i32>(json::Op::HttpCall);
+    return inst.op == Opcode::JsonOp &&
+           (inst.imm.i32_val == static_cast<i32>(json::Op::HttpCall) || is_net_call(inst));
+}
+inline bool net_call_profile_valid(const Function& fn, const Instruction& inst) {
+    const auto op = static_cast<json::Op>(inst.imm.i32_val);
+    const bool open = op == json::Op::NetTcp || op == json::Op::NetUdp;
+    const bool close = op == json::Op::NetClose;
+    const bool scalar = open || op == json::Op::NetSend;
+    if (inst.operand_count != (close  ? 1u
+                               : open ? 2u
+                                      : 3u) ||
+        inst.extra_operands || inst.result == kNoValue || inst.result.id >= fn.value_count)
+        return false;
+    const auto* type = fn.values[inst.result.id].type;
+    if (!type || type->struct_def) return false;
+    if (close) {
+        if (type->kind != TypeKind::Bool || type->inner) return false;
+    } else if (type->kind != TypeKind::Optional || !type->inner ||
+               type->inner->kind != (scalar ? TypeKind::I32 : TypeKind::Str) ||
+               type->inner->inner || type->inner->struct_def)
+        return false;
+    const Instruction* definitions[3]{};
+    for (u32 i = 0; i < inst.operand_count; ++i) {
+        const auto id = inst.operand(i);
+        if (id == kNoValue || id.id >= fn.value_count) return false;
+        const auto& value = fn.values[id.id];
+        const auto wanted =
+            (open && i == 0) || (op == json::Op::NetSend && i == 1) ? TypeKind::Str : TypeKind::I32;
+        if (!value.type || value.type->kind != wanted || value.type->inner ||
+            value.type->struct_def || value.def_block.id >= fn.block_count ||
+            !fn.blocks[value.def_block.id].insts ||
+            value.def_inst >= fn.blocks[value.def_block.id].inst_count)
+            return false;
+        definitions[i] = &fn.blocks[value.def_block.id].insts[value.def_inst];
+        if (definitions[i]->result != id) return false;
+    }
+    if (open) {
+        NetEndpoint endpoint;
+        if (definitions[0]->op != Opcode::ConstStr ||
+            !net_endpoint(definitions[0]->imm.str_val, op == json::Op::NetUdp, endpoint))
+            return false;
+    }
+    if (!close) {
+        const auto* timeout = definitions[inst.operand_count - 1];
+        if (timeout->op != Opcode::ConstI32 || timeout->imm.i32_val < 1 ||
+            timeout->imm.i32_val > 60000)
+            return false;
+    }
+    return true;
 }
 inline bool function_uses_http_call(const Function& fn) {
     if (!fn.blocks) return false;
@@ -33,6 +86,10 @@ inline bool http_call_profile_valid(const Function& fn) {
                 inst.op == Opcode::ResumeEventResult || inst.op == Opcode::WsMessageField)
                 return false;
             if (!is_http_call(inst)) continue;
+            if (is_net_call(inst)) {
+                if (++calls > 16 || !net_call_profile_valid(fn, inst)) return false;
+                continue;
+            }
             if (++calls > 16 || inst.operand_count != 3 || inst.extra_operands ||
                 inst.result == kNoValue || inst.result.id >= fn.value_count)
                 return false;

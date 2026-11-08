@@ -2067,6 +2067,128 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::NetError) {
+                LLVMTypeRef params[] = {c.ptr_ty};
+                auto type = LLVMFunctionType(c.i32_ty, params, 1, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_net_error");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_net_error", type);
+                LLVMValueRef args[] = {c.param_conn};
+                c.set_value(inst.result,
+                            LLVMBuildCall2(c.builder, type, helper, args, 1, "net.error"));
+                break;
+            }
+            if (rir::is_net_call(inst)) {
+                const bool opening = kJsonOp == json::Op::NetTcp || kJsonOp == json::Op::NetUdp;
+                const bool closing = kJsonOp == json::Op::NetClose;
+                const bool sending = kJsonOp == json::Op::NetSend;
+                const bool scalar_result = opening || sending;
+                auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+                auto poll = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "net.poll");
+                auto pending = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "net.pending");
+                auto ready = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "net.ready");
+                const u32 state = ++c.call_state;
+                LLVMAddCase(c.call_dispatch, LLVMConstInt(c.i32_ty, state, 0), poll);
+                LLVMBuildBr(c.builder, poll);
+                LLVMPositionBuilderAtEnd(c.builder, poll);
+                auto has = LLVMBuildAlloca(c.builder, c.i8_ty, "net.has");
+                auto scalar = LLVMBuildAlloca(c.builder, c.i32_ty, "net.scalar");
+                auto out = LLVMBuildAlloca(c.builder, c.ptr_ty, "net.bytes");
+                auto length = LLVMBuildAlloca(c.builder, c.i32_ty, "net.length");
+                auto data = opening   ? c.get_value(inst.operand(0))
+                            : sending ? c.get_value(inst.operand(1))
+                                      : LLVMGetUndef(c.str_ty);
+                auto handle = opening ? LLVMConstInt(c.i32_ty, 0, 0) : c.get_value(inst.operand(0));
+                auto timeout = closing ? LLVMConstInt(c.i32_ty, 1, 0)
+                                       : c.get_value(inst.operand(opening ? 1 : 2));
+                auto amount = opening || closing || sending ? LLVMConstInt(c.i32_ty, 0, 0)
+                                                            : c.get_value(inst.operand(1));
+                LLVMTypeRef params[] = {c.ptr_ty,
+                                        c.i32_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.i32_ty,
+                                        c.i32_ty,
+                                        c.i32_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty,
+                                        c.ptr_ty};
+                auto type = LLVMFunctionType(c.i64_ty, params, 11, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_net_call");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_net_call", type);
+                LLVMValueRef args[] = {
+                    c.param_conn,
+                    LLVMConstInt(c.i32_ty,
+                                 static_cast<u32>(kJsonOp) - static_cast<u32>(json::Op::NetTcp),
+                                 0),
+                    handle,
+                    opening || sending ? LLVMBuildExtractValue(c.builder, data, 0, "net.data")
+                                       : LLVMConstNull(c.ptr_ty),
+                    opening || sending ? LLVMBuildExtractValue(c.builder, data, 1, "net.size")
+                                       : LLVMConstInt(c.i32_ty, 0, 0),
+                    amount,
+                    timeout,
+                    has,
+                    scalar,
+                    out,
+                    length};
+                auto reply = LLVMBuildCall2(c.builder, type, helper, args, 11, "net.reply");
+                auto waiting =
+                    LLVMBuildICmp(c.builder,
+                                  LLVMIntEQ,
+                                  LLVMBuildTrunc(c.builder, reply, c.i32_ty, "net.status"),
+                                  LLVMConstInt(c.i32_ty, 0x80000000u, 0),
+                                  "net.waiting");
+                LLVMBuildCondBr(c.builder, waiting, pending, ready);
+                LLVMPositionBuilderAtEnd(c.builder, pending);
+                auto pc =
+                    LLVMBuildStructGEP2(c.builder, c.call_frame_type, c.call_frame, 0, "net.pc");
+                LLVMBuildStore(c.builder, LLVMConstInt(c.i32_ty, state, 0), pc);
+                auto ms =
+                    LLVMBuildLShr(c.builder, reply, LLVMConstInt(c.i64_ty, 32, 0), "net.retry");
+                auto packed =
+                    LLVMBuildOr(c.builder,
+                                LLVMBuildShl(c.builder, ms, LLVMConstInt(c.i64_ty, 8, 0), "net.ms"),
+                                c.make_result_yield(0, static_cast<u8>(YieldKind::Timer), 0),
+                                "net.yield");
+                c.emit_parse_unprime();
+                c.emit_time_unlatch();
+                LLVMBuildRet(c.builder, packed);
+                LLVMPositionBuilderAtEnd(c.builder, ready);
+                auto scalar_value = LLVMBuildLoad2(c.builder, c.i32_ty, scalar, "net.value");
+                if (closing) {
+                    c.set_value(inst.result,
+                                LLVMBuildICmp(c.builder,
+                                              LLVMIntNE,
+                                              scalar_value,
+                                              LLVMConstInt(c.i32_ty, 0, 0),
+                                              "net.closed"));
+                } else {
+                    auto result = LLVMGetUndef(scalar_result ? c.opt_i32_ty : c.opt_str_ty);
+                    result =
+                        LLVMBuildInsertValue(c.builder,
+                                             result,
+                                             LLVMBuildLoad2(c.builder, c.i8_ty, has, "net.present"),
+                                             0,
+                                             "net.result");
+                    result = LLVMBuildInsertValue(
+                        c.builder,
+                        result,
+                        scalar_result ? scalar_value
+                                      : LLVMBuildLoad2(c.builder, c.ptr_ty, out, "net.out"),
+                        1,
+                        "net.result");
+                    if (!scalar_result)
+                        result = LLVMBuildInsertValue(
+                            c.builder,
+                            result,
+                            LLVMBuildLoad2(c.builder, c.i32_ty, length, "net.len"),
+                            2,
+                            "net.result");
+                    c.set_value(inst.result, result);
+                }
+                break;
+            }
             if (kJsonOp == json::Op::HttpCall) {
                 auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
                 auto poll = LLVMAppendBasicBlockInContext(c.llvm_ctx, parent, "http.call.poll");

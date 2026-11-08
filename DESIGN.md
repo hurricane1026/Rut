@@ -3743,6 +3743,12 @@ Behavior:
 
 #### 3.4.12 TCP/UDP I/O
 
+The current bounded source client profile is documented in
+[net-clients.md](docs/net-clients.md). It implements fixed-endpoint TCP/TLS and
+connected UDP with request-scoped handles. The broader syntax below remains a
+target sketch; arbitrary runtime addresses, defer and submit/wait sockets are
+not current guarantees.
+
 Raw TCP and UDP access for protocols beyond HTTP (Redis, StatsD, syslog, etc.).
 Same async safety model — compiler generates yield points, io_uring/epoll backend.
 
@@ -4196,9 +4202,11 @@ import { cors, securityHeaders } from "stdlib/security.rut"
 
 #### 3.4.21 No FFI
 
-Rutlang has no general `extern func` or user-defined FFI mechanism. The gateway only communicates via
-HTTP. External systems (Redis, databases, LDAP, HSM) are accessed through HTTP
-calls to proxy services.
+Rutlang has no general `extern func` or user-defined FFI mechanism. External
+services can be accessed through bounded HTTP calls or the generic request-owned
+TCP/TLS and UDP client primitives. Application protocols such as Redis belong in
+ordinary Rut libraries; the runtime supplies network I/O and resource ownership,
+without a dedicated native builtin per protocol or business operation.
 
 The bounded `import Crypto` system module is provided by the compiler and binds
 to the statically linked C crypto ABI. Its Rut functions retain the same bounds,
@@ -10343,3 +10351,29 @@ introspection observes that state without a local allow cache. Gateway timeout
 or disconnect does not roll back a possibly committed AS mutation. No automatic
 retry, persistent gateway state, grammar or runtime ABI is added. See
 [the profile](docs/oauth-revocation.md) and its two-backend native lifecycle tests.
+
+### Bounded source TCP and UDP clients
+
+The implemented client surface is `tcp(policy, timeoutMs)` / `udp(policy,
+timeoutMs)`, returning distinct request-owned TcpConnection/UdpSocket handles.
+These are ordinary calls, without new keywords, and coexist with the existing
+HTTP continuation. The earlier TCP/UDP sketches involving unrestricted runtime
+addresses, defer, UDP bind/sendTo, submit/wait and arbitrary parsing loops remain
+target designs. The current [net client contract](docs/net-clients.md) is narrower.
+
+Generic runtime transport performs nonblocking connect, optional verified TLS,
+full send, bounded receive/exact/line reads and connected UDP datagram I/O.
+Application framing, commands, authentication and policy belong in ordinary Rut
+libraries; no Redis-specific native operation is added. A source Redis RESP2 PING
+helper demonstrates this split. Endpoint identity/trust is compile/load-time
+configuration, while send payloads and bounded read counts may be dynamic.
+
+Opaque source handle types lower to owner/generation-validated scalar tokens.
+A bounded worker owns descriptors, TLS contexts and surplus input independently
+of request memory. The shard only copies commands/results and yields through
+existing continuations. Handler scope retains sessions on pending outbound calls
+and cancels them on terminal exits; reset and shutdown retain their existing
+request-generation lifecycle. TCP remains a stream and UDP remains datagrams,
+including empty-message and oversize/truncation semantics. Dynamic response Bytes
+locals reuse bounded body serialization. Pooling across requests, richer result
+errors, general byte parsers and message subscriptions remain follow-ups.

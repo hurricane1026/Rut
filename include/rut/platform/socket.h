@@ -58,6 +58,14 @@ inline int stream_socket() {
 #endif
 }
 
+inline int datagram_socket() {
+#ifdef __APPLE__
+    return prepare_or_close(socket(AF_INET, SOCK_DGRAM, 0));
+#else
+    return socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#endif
+}
+
 inline int accept_nonblocking(int listener) {
 #ifdef __APPLE__
     return prepare_or_close(accept(listener, nullptr, nullptr));
