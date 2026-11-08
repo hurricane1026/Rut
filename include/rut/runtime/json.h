@@ -75,6 +75,8 @@ enum class Op : u8 {
     BytesReadI32LE,
     BytesReadI64BE,
     BytesReadI64LE,
+    ParseInt,
+    ParseInt64,
 };
 
 // Compiler-only raw-byte intrinsics share the existing optional scalar carrier.

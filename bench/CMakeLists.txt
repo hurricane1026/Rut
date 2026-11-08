@@ -128,3 +128,12 @@ endif()
 # payload validation/sequence semantics while removing Python strided copies.
 add_library(bench_ws_mask SHARED EXCLUDE_FROM_ALL bench_ws_mask.cc)
 target_compile_options(bench_ws_mask PRIVATE -O3 -fno-exceptions -fno-rtti)
+
+# Decimal parser microbenchmark; libc only, no external parser dependency.
+add_executable(bench_parse_integer bench_parse_integer.cc)
+target_include_directories(bench_parse_integer PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_options(bench_parse_integer PRIVATE -O3 -DNDEBUG)
+set_target_properties(bench_parse_integer PROPERTIES LINKER_LANGUAGE C)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(bench_parse_integer PRIVATE -Wl,--as-needed)
+endif()

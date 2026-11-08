@@ -21,6 +21,7 @@
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
 #include "rut/runtime/oauth_introspection.h"
+#include "rut/runtime/parse_integer.h"
 #include "rut/runtime/password_gateway.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -2983,4 +2984,15 @@ extern "C" void rut_helper_resp_body(
     c.jit_response_head = parsed.ok && parsed.req.method == HttpMethod::HEAD;
     c.jit_response_body = {ptr, len};
     c.jit_response_body_valid = ptr != nullptr && len <= SlicePool::kSliceSize;
+}
+
+extern "C" rut::u8 rut_helper_parse_int(const char* data,
+                                        rut::u32 length,
+                                        rut::u32 bits,
+                                        rut::i64* output) {
+    if (!output) return 0;
+    *output = 0;
+    if (bits == 32) return rut::parse_integer<false>({data, length}, *output);
+    if (bits == 64) return rut::parse_integer<true>({data, length}, *output);
+    return 0;
 }

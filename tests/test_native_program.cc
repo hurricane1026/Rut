@@ -2618,6 +2618,52 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, decimal_integer_parsing_survives_source_removal_and_handles_websockets) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+func decode(_ bytes: Bytes) { parseInt64(bytes) }
+func first(_ value: i32, _ ignored: i32) -> i32 { value }
+route POST "/body" {
+    guard let number = decode(req.bodyBytes) else { return 400 }
+    guard number == -9223372036854775808 else { return 422 }
+    guard parseInt("2147483648") == nil else { return 500 }
+    guard parseInt64("9223372036854775808") == nil else { return 500 }
+    guard first(parseInt("+42").or(0), parseInt("bad").or(1)) == 42 else { return 500 }
+    return 204
+}
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard let number = parseInt(message.payload) else { message.drop() }
+    guard number == -2147483648 else { message.drop() }
+    message.forward()
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    CHECK_EQ(
+        invoke(
+            owner.p->config.routes[0],
+            "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 20\r\n\r\n-9223372036854775808")
+            .status_code,
+        204u);
+    CHECK_EQ(
+        invoke(
+            owner.p->config.routes[0],
+            "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 20\r\n\r\n-9223372036854775809")
+            .status_code,
+        400u);
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    const auto* number = reinterpret_cast<const u8*>("-2147483648");
+    CHECK(handler(nullptr, WsOpcode::Text, number, 11, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, number, 11, true) == WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Text, reinterpret_cast<const u8*>("2147483648"), 10, true) ==
+          WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
+}
+
 TEST(native_program, builtin_bytes_integer_reads_work_in_helpers_and_websocket_callbacks) {
     Source source;
     REQUIRE(source.append(R"rut(

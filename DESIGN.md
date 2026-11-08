@@ -4157,6 +4157,22 @@ This is the current implementation contract. A future language-level scope chapt
 
 #### 3.4.20 Type Conversion
 
+**Implemented text integer parsing:** `parseInt(str|Bytes) -> i32?` and
+`parseInt64(str|Bytes) -> i64?` are pure builtins. They consume the full span,
+accept ASCII `[+-]?[0-9]+` including leading/signed zeros, and return `nil`
+on malformed input or signed overflow. They neither trim nor parse prefixes;
+NUL and CRLF are ordinary invalid bytes. No allocation, I/O, connection state,
+JSON scratch or input padding is needed. Results work in HTTP routes, inlined
+helpers and WebSocket callbacks, with shared JIT/native semantics. User bindings
+shadow the builtin names. Integer parsing does not introduce an `i64` annotation
+or an unsigned type. The kernel specializes by result width and digit count,
+using scalar arithmetic for short inputs and bounded eight/four-digit SWAR for
+longer inputs. See [contract, research and benchmarks](docs/parse-integers.md).
+
+The remaining conversion/domain APIs below are design targets unless marked
+implemented in the language card (`parseFloat`, `as`, `as?`, IP/CIDR/Duration
+parsing remain pending).
+
 `as` is for value-to-value conversion, not text parsing.
 
 - infallible conversions stay as `as`
