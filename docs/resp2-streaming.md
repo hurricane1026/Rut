@@ -1,6 +1,7 @@
 # Incremental RESP2 decoding
 
-Import [clients/resp2-stream.rut](../examples/clients/resp2-stream.rut). The parser
+Import [clients/resp2-stream.rut](../examples/clients/resp2-stream.rut) or the
+shared [clients/resp2.rut](../examples/clients/resp2.rut). The parser
 is ordinary Rut using bounded collection, checked Bytes views and owned buffer
 concatenation. The runtime contains no Redis parser or protocol callback.
 
@@ -95,3 +96,8 @@ frames at every byte position through real TCP reads. They also exercise delayed
 receive, completed-state no-I/O, timeout, truncated EOF, binary data, nested/null
 arrays, integer limits, 64 nodes, invalid/oversized headers and source removal.
 Both epoll and io_uring run at O0 and O2.
+
+[Request builders and GET/SET](resp2-commands.md) use a separate bounded scalar
+receive helper with a one-node parser work limit and four receive attempts.
+The generic `resp2Receive` API and the two-read streaming example keep their
+existing contracts.

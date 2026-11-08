@@ -1097,6 +1097,14 @@ struct Builder {
              !val_has_type(args[1], TypeKind::I32) ||
              result != (bytes_read.wide ? TypeKind::I64 : TypeKind::I32) || !optional))
             return err(RirError::InvalidState);
+        const bool kFormat = op == static_cast<u32>(json::Op::FormatInt);
+        const bool kBytes = op == static_cast<u32>(json::Op::BytesFromString);
+        if ((kFormat || kBytes) &&
+            (count != 1 || !args || result != TypeKind::Str || optional != kFormat ||
+             (kBytes ? !val_has_type(args[0], TypeKind::Str)
+                     : !val_has_type(args[0], TypeKind::I32) &&
+                           !val_has_type(args[0], TypeKind::I64))))
+            return err(RirError::InvalidState);
         const bool bytes_slice = op == static_cast<u32>(json::Op::BytesSlice);
         const bool bytes_find = op == static_cast<u32>(json::Op::BytesFind);
         const bool bytes_concat = op == static_cast<u32>(json::Op::BytesConcat);

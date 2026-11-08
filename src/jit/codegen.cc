@@ -2206,6 +2206,40 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::BytesFromString) {
+                c.set_value(inst.result, c.get_value(inst.operands[0]));
+                break;
+            }
+            if (kJsonOp == json::Op::FormatInt) {
+                auto value = c.get_value(inst.operands[0]);
+                if (c.cur_fn->values[inst.operands[0].id].type->kind == rir::TypeKind::I32)
+                    value = LLVMBuildSExt(c.builder, value, c.i64_ty, "format.i64");
+                LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.i64_ty, c.ptr_ty, c.ptr_ty};
+                const auto kType = LLVMFunctionType(c.i8_ty, params, 5, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_format_int");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_format_int", kType);
+                const auto kPointer = LLVMBuildAlloca(c.builder, c.ptr_ty, "format.ptr");
+                const auto kLength = LLVMBuildAlloca(c.builder, c.i32_ty, "format.len");
+                LLVMValueRef args[] = {c.param_conn, c.param_arena, value, kPointer, kLength};
+                const auto kHas = LLVMBuildCall2(c.builder, kType, helper, args, 5, "format.has");
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder, result, kHas, 0, "");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, kPointer, "format.data"),
+                    1,
+                    "");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, kLength, "format.size"),
+                    2,
+                    "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::BytesConcat) {
                 const auto left = c.get_value(inst.operands[0]);
                 const auto right = c.get_value(inst.operands[1]);
@@ -3960,7 +3994,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
                     !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst) ||
-                    !rir::valid_collected_instruction(fn, inst))
+                    !rir::valid_collected_instruction(fn, inst) ||
+                    !rir::valid_bytes_construction(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);

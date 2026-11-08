@@ -3044,6 +3044,17 @@ struct shapes; optional/error leaves and nested collections are absent. See
 [the full contract](bounded-parsing.md), [RESP2 library](../examples/clients/resp2.rut)
 and [executable example](../examples/resp2-decoder.rut).
 
+## Decimal output and explicit Bytes views
+
+`formatInt(value) -> str?` emits canonical signed decimal from an unwrapped i32
+or inferred i64, including both signed limits. It owns the actual digits in the
+invocation arena; allocation/storage failure returns nil. `Bytes(str) -> Bytes`
+exposes an immutable exact byte view without allocation, validation or transcoding;
+`Bytes(Bytes)` is identity. Optional inputs must be unwrapped and ordinary user
+bindings shadow these builtins. Direct calls are supported; pipe/UFCS forms are
+absent. There is no implicit numeric/text conversion or Bytes `+` operator.
+See [bounded command construction](resp2-commands.md).
+
 ## Incremental byte buffers and parsing
 
 `concatBytes(left, right, maxBytes) -> Bytes?` copies two unwrapped Bytes into a

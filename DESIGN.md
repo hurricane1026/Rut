@@ -10575,3 +10575,26 @@ are references, not new resumable effects. Pure parser temporary growth does not
 increase the 8 KiB continuation frame or request snapshot budget. Compiler SSA
 and compact bitset scratch have independent finite limits. See
 [streaming contracts and validation](docs/resp2-streaming.md).
+
+
+### Binary request construction and typed Redis results
+
+`formatInt` owns canonical signed i32/i64 decimal digits in the invocation arena;
+`Bytes(str)` is an explicit immutable view with unchanged byte content/lifetime.
+Ordinary Rut builds RESP2 array/bulk headers and exact binary arguments using
+`concatBytes`, checking promised argument count and the existing byte limits.
+No language keyword, protocol runtime opcode or dependency is introduced.
+
+Request-scoped GET and plain SET return closed typed result variants. Missing
+values and framed server errors are distinct from request, transport and reply
+failure. Scalar framing/token decoding uses a one-node work limit with four
+bounded receives. Transport/reply failure captures its code before invalidating
+the handle; valid server errors permit another command. Nothing retries a write
+or extends socket ownership beyond the existing request/shard generation.
+
+Shared RESP2 source keeps the conservative import-depth bound. Concrete nominal
+IDs in imported signatures/expressions and nested record/variant fields relocate
+by visible name, preserving sibling/namespace composition. An arena-backed sorted
+chunk directory accelerates compiler node-pointer rebasing; bound references do
+not repeatedly traverse their owning initializer during named-error walks. See
+[the contracts and validation](docs/resp2-commands.md).

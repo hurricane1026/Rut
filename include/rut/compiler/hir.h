@@ -585,7 +585,8 @@ inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
         value.kind == HirExprKind::CollectedCount || value.kind == HirExprKind::CollectedGet)
         return true;
     if (value.kind == HirExprKind::JsonOp &&
-        value.int_value == static_cast<i64>(json::Op::BytesConcat))
+        (value.int_value == static_cast<i64>(json::Op::BytesConcat) ||
+         value.int_value == static_cast<i64>(json::Op::FormatInt)))
         return true;
     if (value.kind == HirExprKind::BoundValue) return false;
     if (value.lhs && hir_has_string_construction(*value.lhs, depth + 1)) return true;

@@ -16,6 +16,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_call.h"
 #include "rut/runtime/http_parser.h"
@@ -3058,4 +3059,12 @@ extern "C" const char* rut_helper_bytes_concat(void* conn,
     auto* storage = static_cast<rut::SliceArena*>(arena);
     if (!storage && conn) storage = &static_cast<rut::ConnectionBase*>(conn)->json_arena;
     return rut::concat_bytes(storage, {left, left_len}, {right, right_len}, limit);
+}
+
+extern "C" rut::u8 rut_helper_format_int(
+    void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size) {
+    if (!out_ptr || !out_size) return 0;
+    char buffer[20];
+    const rut::Str kText = rut::format_integer(value, buffer);
+    return rut_helper_str_concat(conn, arena, &kText, 1, out_ptr, out_size);
 }

@@ -30821,3 +30821,81 @@ TEST(jit, bytes_concat_rir_requires_exact_operand_and_optional_result_shapes) {
     CHECK_FALSE(codegen(tc.mod).ok);
     tc.destroy();
 }
+
+TEST(jit, bytes_construction_validates_direct_rir_operand_and_result_shapes) {
+    for (const auto op : {json::Op::FormatInt, json::Op::BytesFromString}) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder builder;
+        builder.init(&tc.mod);
+        auto* fn = V(builder.create_function(lit("construction"), lit("/"), 'G'));
+        const auto entry = V(builder.create_block(fn, lit("entry")));
+        builder.set_insert_point(fn, entry);
+        const auto number = V(builder.emit_const_i32(42));
+        const auto text = V(builder.emit_const_str(lit("42")));
+        const bool kFormat = op == json::Op::FormatInt;
+        const auto input = kFormat ? number : text;
+        const auto wrong = kFormat ? text : number;
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, nullptr, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &input, 0));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, !kFormat, &input, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::I32, kFormat, &input, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &wrong, 1));
+        const auto result =
+            V(builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &input, 1));
+        VOK(builder.emit_ret_status(204));
+        CHECK(verify_module(tc.mod).ok);
+        auto cg = codegen(tc.mod);
+        REQUIRE(cg.ok);
+        LLVMDisposeModule(cg.mod);
+        LLVMContextDispose(cg.ctx);
+        auto& instruction = fn->blocks[entry.id].insts[2];
+        REQUIRE(instruction.op == Opcode::JsonOp);
+        instruction.operand_count = 0;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operand_count = 1;
+        instruction.operands[0] = wrong;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operands[0] = input;
+        const auto* saved = fn->values[result.id].type;
+        fn->values[result.id].type = fn->values[number.id].type;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        fn->values[result.id].type = saved;
+        tc.destroy();
+    }
+}
+
+TEST(helpers, integer_formatting_owns_output_and_reports_arena_exhaustion) {
+    const char* output = reinterpret_cast<const char*>(1);
+    u32 length = 999;
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, &output, &length), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(length, 0u);
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, nullptr, &length), 0u);
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, &output, nullptr), 0u);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    REQUIRE(rut_helper_format_int(nullptr, &arena, -9223372036854775807LL - 1, &output, &length));
+    const Str retained{output, length};
+    CHECK(retained.eq(lit("-9223372036854775808")));
+    REQUIRE(rut_helper_format_int(nullptr, &arena, 0, &output, &length));
+    CHECK((Str{output, length}.eq(lit("0"))));
+    CHECK(retained.eq(lit("-9223372036854775808")));
+    arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    CHECK_EQ(rut_helper_format_int(nullptr, &arena, 123, &output, &length), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(length, 0u);
+    for (auto* slice : held) pool.free(slice);
+    arena.destroy();
+    pool.destroy();
+}

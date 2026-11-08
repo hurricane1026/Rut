@@ -154,3 +154,8 @@ partial TCP receive into a complete frame or introduce I/O inside parser steps.
 Bytes across receives, distinguishes NeedMore/Complete/Invalid, and preserves
 pipelined remainders. `resp2Receive` performs one receive only while NeedMore;
 callers choose a finite read budget under the existing operation/frame limits.
+
+[RESP2 command builders and GET/SET](resp2-commands.md) now compose binary-safe
+requests, typed command results and bounded scalar replies. Callers can reuse
+one handle for sequential commands in the same request. Transport/reply failure
+poisons the handle; this does not introduce cross-request pooling or write retries.

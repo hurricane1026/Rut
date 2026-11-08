@@ -47834,3 +47834,117 @@ route POST "/" {
         CHECK_FALSE(analyze_file_heap(tree.value()));
     }
 }
+
+TEST(frontend, bytes_construction_requires_explicit_unwrapped_inputs) {
+    const char* expressions[] = {R"(formatInt())",
+                                 R"(formatInt(1, 2))",
+                                 R"(formatInt(true))",
+                                 R"(formatInt("1"))",
+                                 R"(formatInt(b"1"))",
+                                 R"(formatInt(parseInt("1")))",
+                                 R"(Bytes())",
+                                 R"(Bytes(1))",
+                                 R"(Bytes(true))",
+                                 R"(Bytes("x", "y"))",
+                                 R"(Bytes(req.header("X")))",
+                                 R"(Bytes(formatInt(1)))",
+                                 R"(b"x" + "y")",
+                                 R"("x" + b"y")",
+                                 R"(b"x" + 1)",
+                                 R"(Bytes(b"x"[0]))",
+                                 R"(1 | formatInt(2))",
+                                 R"("x" | Bytes("y"))"};
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string("route POST \"/\" { let value = ") + expression + " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    auto lexed = lex(lit(R"rut(
+func formatInt(_ text: str) -> i32 => 7
+route GET "/" { guard formatInt("x") == 7 else { return 500 } return 204 }
+)rut"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, integer_format_and_explicit_bytes_view_lower_with_bounded_concat) {
+    const auto source = lit(R"rut(
+route POST "/" {
+    guard let value = parseInt64(req.bodyBytes) else { return 400 }
+    guard let text = formatInt(value) else { return 503 }
+    let bytes = Bytes(text)
+    guard let packet = concatBytes(b"$", Bytes(bytes), 128) else { return 413 }
+    return response(200, body: packet)
+}
+)rut");
+    auto ts = lex(source);
+    REQUIRE(ts);
+    auto ast = parse_file_heap(ts.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, sibling_imports_relocate_nominal_record_and_variant_shapes) {
+    const std::string directory = std::filesystem::temp_directory_path().string() +
+                                  "/rut_nominal_imports_" +
+                                  std::to_string(static_cast<unsigned long long>(::getpid()));
+    std::filesystem::create_directories(directory);
+    {
+        std::ofstream out(directory + "/padding.rut");
+        out << "struct Padding { marker: i32 }\nvariant PaddingKind { absent }\n";
+    }
+    {
+        std::ofstream out(directory + "/types.rut");
+        out << R"rut(
+struct Inner { value: i32 }
+struct Box { inner: Inner }
+variant Answer { found(Box), missing }
+func make(_ value: i32) -> Box { Box(inner: Inner(value: value)) }
+func echo(_ value: Box) -> Box { value }
+func answer(_ value: Box) -> Answer { Answer.found(value) }
+)rut";
+    }
+    for (bool namespaced : {false, true}) {
+        const std::string prefix = namespaced ? "lib." : "";
+        const std::string imports =
+            std::string("import \"padding.rut\"\n") +
+            (namespaced ? "import * as lib from \"types.rut\"\n" : "import \"types.rut\"\n");
+        const std::string source =
+            imports + "route GET \"/\" { let box = " + prefix + "echo(" + prefix +
+            "make(7)) guard box.inner.value == 7 else { return 500 } let result = " + prefix +
+            "answer(box) match result { .found(item) => if item.inner.value == 7 { return 204 } "
+            "else { return 500 } .missing => return 404 } }";
+        SourceBudget budget{};
+        auto hir =
+            analyze_source_with_path_and_budget(source.c_str(), directory + "/main.rut", budget);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(*hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+        delete hir.value();
+        SourceBudget invalid_budget{};
+        const std::string invalid_source = imports + "route GET \"/\" { let wrong = " + prefix +
+                                           "echo(" + prefix + "Inner(value: 7)) return 204 }";
+        auto invalid = analyze_source_with_path_and_budget(
+            invalid_source.c_str(), directory + "/main.rut", invalid_budget);
+        CHECK_FALSE(invalid);
+        if (invalid) delete invalid.value();
+    }
+    std::filesystem::remove_all(directory);
+}

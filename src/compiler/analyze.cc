@@ -14380,6 +14380,35 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
     }
 
+    if ((expr.name.eq(lit_str("formatInt")) || expr.name.eq(lit_str("Bytes"))) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        const bool kBytes = expr.name.eq(lit_str("Bytes"));
+        constexpr auto kDetail = lit_str(
+            "formatInt expects one unwrapped i32/i64; Bytes expects one unwrapped str or Bytes");
+        if (!route || pipe_lhs || first_arg_override || expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        auto value = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->may_nil || value->may_error ||
+            (kBytes ? value->type != HirTypeKind::Str && value->type != HirTypeKind::Bytes
+                    : value->type != HirTypeKind::I32 && value->type != HirTypeKind::I64))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        if (kBytes && value->type == HirTypeKind::Bytes) return value.value();
+        if (kBytes && value->kind == HirExprKind::StrLit) {
+            value->kind = HirExprKind::BytesLit;
+            value->type = HirTypeKind::Bytes;
+            return value.value();
+        }
+        return make_json_op(kBytes ? json::Op::BytesFromString : json::Op::FormatInt,
+                            kBytes ? HirTypeKind::Bytes : HirTypeKind::Str,
+                            !kBytes,
+                            &value.value(),
+                            nullptr,
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
     if (expr.name.eq(lit_str("concatBytes")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto kDetail =
@@ -14515,7 +14544,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     if (operation > json::Op::Stringify && operation != json::Op::BytesAt &&
                         !json::bytes_read_spec(operation).width &&
                         operation != json::Op::BytesSlice && operation != json::Op::BytesFind &&
-                        operation != json::Op::BytesConcat && operation != json::Op::ParseInt &&
+                        operation != json::Op::BytesConcat && operation != json::Op::FormatInt &&
+                        operation != json::Op::BytesFromString && operation != json::Op::ParseInt &&
                         operation != json::Op::ParseInt64)
                         return false;
                     break;
@@ -15297,6 +15327,9 @@ static FrontendResult<void> collect_named_error_cases_ast(
 
 static FrontendResult<void> collect_named_error_cases(
     const HirExpr& expr, FixedVec<RouteNamedErrorCase, HirVariant::kMaxCases>& cases) {
+    // The owning initializer is visited through its let/local. A BoundValue is
+    // a reference, not another copy of that initializer's expression graph.
+    if (expr.kind == HirExprKind::BoundValue) return {};
     if (expr.kind == HirExprKind::Error && expr.error_variant_index == 0xffffffffu &&
         expr.str_value.len != 0) {
         if (!push_named_error_case(cases, expr.str_value))
@@ -15354,6 +15387,7 @@ static void patch_named_error_variant(
             }
         }
     }
+    if (expr->kind == HirExprKind::BoundValue) return;
     if (expr->lhs != nullptr) patch_named_error_variant(expr->lhs, variant_index, cases);
     if (expr->rhs != nullptr) patch_named_error_variant(expr->rhs, variant_index, cases);
     for (u32 i = 0; i < expr->field_inits.len; i++) {
@@ -15370,6 +15404,7 @@ static void patch_error_variant_refs(HirExpr* expr, u32 variant_index) {
     if (expr->may_error && expr->error_variant_index == 0xffffffffu &&
         expr->type != HirTypeKind::Variant)
         expr->error_variant_index = variant_index;
+    if (expr->kind == HirExprKind::BoundValue) return;
     if (expr->lhs != nullptr) patch_error_variant_refs(expr->lhs, variant_index);
     if (expr->rhs != nullptr) patch_error_variant_refs(expr->rhs, variant_index);
     for (u32 i = 0; i < expr->field_inits.len; i++) {
@@ -17906,6 +17941,33 @@ static FrontendResult<void> validate_imported_selected_names(
     return {};
 }
 
+// Nominal IDs are module-local. Sibling imports can insert unrelated types
+// before a library, so refresh IDs by their exported name before interning shapes.
+static void remap_imported_shape_ids(const ImportedModuleInfo& imported,
+                                     const HirModule& target,
+                                     HirTypeKind type,
+                                     u32& variant,
+                                     u32& structure,
+                                     u32 tuple_len,
+                                     const HirTypeKind* tuple_types,
+                                     u32* tuple_variants,
+                                     u32* tuple_structs) {
+    const auto remap = [&](HirTypeKind kind, u32& vi, u32& si) {
+        if (kind == HirTypeKind::Struct && si < imported.module->structs.len) {
+            const Str name = import_visible_name(imported, imported.module->structs[si].name);
+            const u32 found = find_struct_index(target, name);
+            if (found < target.structs.len) si = found;
+        }
+        if (kind == HirTypeKind::Variant && vi < imported.module->variants.len) {
+            const Str name = import_visible_name(imported, imported.module->variants[vi].name);
+            const u32 found = find_variant_index(target, name);
+            if (found < target.variants.len) vi = found;
+        }
+    };
+    remap(type, variant, structure);
+    for (u32 i = 0; i < tuple_len; ++i) remap(tuple_types[i], tuple_variants[i], tuple_structs[i]);
+}
+
 static FrontendResult<void> merge_imported_functions(
     HirModule* mod, const FixedVec<ImportedModuleInfo, AstFile::kMaxItems>& imports) {
     const ImportedModuleInfo* current_import = nullptr;
@@ -17952,8 +18014,26 @@ static FrontendResult<void> merge_imported_functions(
     };
     auto refresh_imported_function_signature_shapes = [&](HirFunction* fn,
                                                           Span span) -> FrontendResult<void> {
+        remap_imported_shape_ids(*current_import,
+                                 *mod,
+                                 fn->return_type,
+                                 fn->return_variant_index,
+                                 fn->return_struct_index,
+                                 fn->return_tuple_len,
+                                 fn->return_tuple_types,
+                                 fn->return_tuple_variant_indices,
+                                 fn->return_tuple_struct_indices);
         for (u32 pi = 0; pi < fn->params.len; pi++) {
             auto& param = fn->params[pi];
+            remap_imported_shape_ids(*current_import,
+                                     *mod,
+                                     param.type,
+                                     param.variant_index,
+                                     param.struct_index,
+                                     param.tuple_len,
+                                     param.tuple_types,
+                                     param.tuple_variant_indices,
+                                     param.tuple_struct_indices);
             if (param.type == HirTypeKind::Collected) {
                 auto shape = refresh_collection_shape(param.shape_index, span);
                 if (!shape) return core::make_unexpected(shape.error());
@@ -18025,6 +18105,15 @@ static FrontendResult<void> merge_imported_functions(
         return {};
     };
     auto refresh_imported_expr_shape = [&](HirExpr* expr, Span span) -> FrontendResult<void> {
+        remap_imported_shape_ids(*current_import,
+                                 *mod,
+                                 expr->type,
+                                 expr->variant_index,
+                                 expr->struct_index,
+                                 expr->tuple_len,
+                                 expr->tuple_types,
+                                 expr->tuple_variant_indices,
+                                 expr->tuple_struct_indices);
         if (expr->type == HirTypeKind::Collected) {
             auto shape = refresh_collection_shape(expr->shape_index, span);
             if (!shape) return core::make_unexpected(shape.error());
@@ -18511,6 +18600,73 @@ static FrontendResult<void> merge_imported_simple_decls(
                     FrontendError::UnsupportedSyntax, imported.span, imported_alias.name);
             if (!mod->type_aliases.push(imported_alias))
                 return frontend_error(FrontendError::TooManyItems, imported.span);
+        }
+    }
+    for (u32 ii = 0; ii < imports.len; ++ii) {
+        const auto& imported = imports[ii];
+        for (u32 si = 0; si < imported.module->structs.len; ++si) {
+            const auto& source = imported.module->structs[si];
+            const u32 destination =
+                find_struct_index(*mod, import_visible_name(imported, source.name));
+            if (destination >= mod->structs.len) continue;
+            auto& structure = mod->structs[destination];
+            for (u32 fi = 0; fi < structure.fields.len; ++fi) {
+                auto& field = structure.fields[fi];
+                if (field.is_error_type) continue;
+                remap_imported_shape_ids(imported,
+                                         *mod,
+                                         field.type,
+                                         field.variant_index,
+                                         field.struct_index,
+                                         field.tuple_len,
+                                         field.tuple_types,
+                                         field.tuple_variant_indices,
+                                         field.tuple_struct_indices);
+                auto shape = intern_hir_type_shape(mod,
+                                                   field.type,
+                                                   field.generic_index,
+                                                   field.variant_index,
+                                                   field.struct_index,
+                                                   field.tuple_len,
+                                                   field.tuple_types,
+                                                   field.tuple_variant_indices,
+                                                   field.tuple_struct_indices,
+                                                   imported.span);
+                if (!shape) return core::make_unexpected(shape.error());
+                field.shape_index = shape.value();
+            }
+        }
+        for (u32 vi = 0; vi < imported.module->variants.len; ++vi) {
+            const auto& source = imported.module->variants[vi];
+            const u32 destination =
+                find_variant_index(*mod, import_visible_name(imported, source.name));
+            if (destination >= mod->variants.len) continue;
+            auto& variant = mod->variants[destination];
+            for (u32 ci = 0; ci < variant.cases.len; ++ci) {
+                auto& c = variant.cases[ci];
+                if (!c.has_payload) continue;
+                remap_imported_shape_ids(imported,
+                                         *mod,
+                                         c.payload_type,
+                                         c.payload_variant_index,
+                                         c.payload_struct_index,
+                                         c.payload_tuple_len,
+                                         c.payload_tuple_types,
+                                         c.payload_tuple_variant_indices,
+                                         c.payload_tuple_struct_indices);
+                auto shape = intern_hir_type_shape(mod,
+                                                   c.payload_type,
+                                                   c.payload_generic_index,
+                                                   c.payload_variant_index,
+                                                   c.payload_struct_index,
+                                                   c.payload_tuple_len,
+                                                   c.payload_tuple_types,
+                                                   c.payload_tuple_variant_indices,
+                                                   c.payload_tuple_struct_indices,
+                                                   imported.span);
+                if (!shape) return core::make_unexpected(shape.error());
+                c.payload_shape_index = shape.value();
+            }
         }
     }
     return {};

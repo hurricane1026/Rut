@@ -621,3 +621,6 @@ extern "C" const char* rut_helper_bytes_concat(void* conn,
                                                const char* right,
                                                rut::u32 right_len,
                                                rut::i32 limit);
+
+extern "C" rut::u8 rut_helper_format_int(
+    void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size);

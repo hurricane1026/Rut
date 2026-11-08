@@ -121,6 +121,25 @@ inline bool valid_bytes_field(const Function& fn, const Instruction& inst) {
            !result->inner->inner && !result->inner->struct_def;
 }
 
+inline bool valid_bytes_construction(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::JsonOp) return true;
+    const auto kOp = static_cast<json::Op>(inst.imm.i32_val);
+    if (kOp != json::Op::FormatInt && kOp != json::Op::BytesFromString) return true;
+    if (inst.operand_count != 1 || inst.extra_operands || !fn.values ||
+        inst.operands[0] == kNoValue || inst.operands[0].id >= fn.value_count ||
+        inst.result == kNoValue || inst.result.id >= fn.value_count)
+        return false;
+    const Type* input = fn.values[inst.operands[0].id].type;
+    const Type* result = fn.values[inst.result.id].type;
+    if (!input || input->inner || input->struct_def || !result || result->struct_def) return false;
+    if (kOp == json::Op::BytesFromString)
+        return input->kind == TypeKind::Str && result->kind == TypeKind::Str && !result->inner;
+    return (input->kind == TypeKind::I32 || input->kind == TypeKind::I64) &&
+           result->kind == TypeKind::Optional && result->inner &&
+           result->inner->kind == TypeKind::Str && !result->inner->inner &&
+           !result->inner->struct_def;
+}
+
 inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
     if (inst.op != Opcode::JsonOp) return true;
     const auto op = static_cast<json::Op>(inst.imm.i32_val);
@@ -1034,6 +1053,9 @@ inline VerifyResult verify_function(const Function* fn,
                         summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
             }
             if (!valid_collected_instruction(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidStringOperation, function_index, bi, ii);
+            if (!valid_bytes_construction(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidStringOperation, function_index, bi, ii);
             if (!valid_integer_parse(*fn, inst))
