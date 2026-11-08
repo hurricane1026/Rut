@@ -1,0 +1,10 @@
+// Signature verification comes first; this binds verified token metadata to the
+// certificate actually authenticated by TLS, never a forwarded header or pin.
+func requireMtls(_ verifiedDocument: Json) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard let fingerprint = req.tlsClientCertSha256 else { respond denied }
+    guard jwtCertificateBound(verifiedDocument, fingerprint) else { respond denied }
+    verifiedDocument
+}
+

@@ -45856,6 +45856,36 @@ TEST(frontend, jwt_group_user_function_can_shadow_the_builtin) {
     REQUIRE(analyze_file_heap(ast.value()));
 }
 
+TEST(frontend, jwt_certificate_binding_requires_unwrapped_json_and_one_string) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { if jwtCertificateBound("{}", "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { if jwtCertificateBound(json.parse("{}"), "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtCertificateBound(doc, 1) { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtCertificateBound(doc) { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtCertificateBound(doc, req.header("X-Certificate")) { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { if jwtCertificateBound() { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtCertificateBound(doc, "pin", "extra") { return 200 } else { return 403 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, jwt_certificate_binding_user_function_can_shadow_the_builtin) {
+    auto tokens = lex(lit(
+        "func jwtCertificateBound(_ claims: str, _ required: str) -> bool => claims == required\n"
+        "route GET \"/\" { if jwtCertificateBound(\"read\", \"read\") { return 200 } else { return "
+        "403 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, literal_response_headers_decode_quotes_and_reject_escaped_controls) {
     const char* source = R"rut(route GET "/" {
         return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})

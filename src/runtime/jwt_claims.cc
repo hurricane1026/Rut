@@ -1,6 +1,8 @@
 #include "rut/runtime/jwt_claims.h"
 
 #include "rut/common/types.h"
+#include "rut/runtime/auth.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 
 namespace rut {
@@ -146,6 +148,48 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     if (!document.string(kScope, decoded) || decoded.len == 0) return false;
     bool found = false;
     return scope_list_matches({document.scratch, decoded.len}, required, found) && found;
+}
+
+bool jwt_certificate_bound(json::Document& document, Str claims, Str certificate_sha256) {
+    if (!sha256_hex_format_valid(certificate_sha256) || claims.ptr == nullptr ||
+        !document.parse(claims) || document.nodes[0].kind != json::Kind::Object)
+        return false;
+    const u32 kConfirmation = member(document, lit_str("cnf"));
+    if (kConfirmation == json::kNone || document.nodes[kConfirmation].kind != json::Kind::Object)
+        return false;
+    const u32 kThumbprint = document.nodes[kConfirmation].child;
+    // This profile admits one confirmation method and never falls back to
+    // another key/certificate claim when the certificate binding is missing.
+    if (kThumbprint == json::kNone || document.nodes[kThumbprint].next != json::kNone) return false;
+    json::Writer key{document.scratch};
+    if (!document.string(document.nodes[kThumbprint].key, key) ||
+        !Str{document.scratch, key.len}.eq(lit_str("x5t#S256")))
+        return false;
+    json::Writer thumbprint{document.scratch};
+    if (!document.string(kThumbprint, thumbprint) || thumbprint.len != 43) return false;
+
+    u8 digest[32]{};
+    const auto kNibble = [](char value) -> u8 {
+        return static_cast<u8>(value <= '9' ? value - '0' : value - 'a' + 10);
+    };
+    const char* hex = certificate_sha256.ptr;
+    for (u32 i = 0; i < 32; ++i) {
+        const u8 kHigh = kNibble(*hex++);
+        const u8 kLow = kNibble(*hex++);
+        digest[i] = static_cast<u8>((kHigh << 4) | kLow);
+    }
+    u8 encoded[45]{};
+    u32 length = 0;
+    if (!rut_crypto_base64_encode_v1(digest, sizeof(digest), encoded, sizeof(encoded), &length) ||
+        length != 44 || encoded[43] != '=')
+        return false;
+    for (u32 i = 0; i < 43; ++i) {
+        if (encoded[i] == '+') encoded[i] = '-';
+        if (encoded[i] == '/') encoded[i] = '_';
+    }
+    // Comparing the canonical encoding also rejects nonzero unused padding
+    // bits, standard Base64 alphabet, padding, whitespace and truncation.
+    return rut_crypto_equal_v1(encoded, reinterpret_cast<const u8*>(document.scratch), 43) != 0;
 }
 
 bool jwt_has_group(json::Document& document, Str claims, Str required) {

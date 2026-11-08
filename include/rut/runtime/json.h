@@ -80,6 +80,7 @@ enum class Op : u8 {
     OauthTokenExchangeRequest,
     BytesSlice,
     BytesFind,
+    JwtCertificateBound,
 };
 
 // Compiler-only raw-byte reads share the existing optional scalar carrier.

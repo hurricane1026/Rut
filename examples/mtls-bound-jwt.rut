@@ -1,0 +1,16 @@
+// Start with mandatory --tls-client-ca, --tls-cert and --tls-key.
+// JWT_BINDING_KEY/ISSUER/AUDIENCE are trusted resource-server configuration.
+// The issuer must sign cnf.x5t#S256 for the client's actual DER certificate.
+import "middleware/auth.rut"
+import "middleware/jwt_binding.rut"
+
+route GET "/private" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_BINDING_KEY"))
+    let bound = jwt_binding.requireMtls(document)
+    let identity = auth.jwtIdentity(bound, env("JWT_BINDING_ISSUER"), env("JWT_BINDING_AUDIENCE"), "mtls-jwt")
+    let subject = identity.consumerId
+    guard jwtHasScope(bound, "reports:read") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    return response(200, body: subject)
+}

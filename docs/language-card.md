@@ -2928,6 +2928,22 @@ There is no automatic retry, local blacklist or rollback on timeout/disconnect.
 See [the contract](oauth-revocation.md) and
 [example](../examples/oauth-revocation.rut). No syntax, builtin or ABI is added.
 
+## mTLS-bound JWT policy
+
+`jwtCertificateBound(document: Json, fingerprint: str) -> bool` compares the
+strict `cnf.x5t#S256` claim with a canonical lowercase SHA-256 certificate
+fingerprint. Both inputs must be unwrapped; malformed input returns false.
+This is metadata validation, not signature or TLS verification.
+
+Import `middleware/jwt_binding.rut` and call `jwt_binding.requireMtls(document)`
+after signature verification. It uses only `req.tlsClientCertSha256` from the
+verified TLS connection and returns the same Json on success; missing/mismatched
+binding returns challenged 401. Apply issuer/audience/time/subject and scope
+policies separately. Cleartext and ordinary TLS cannot supply identity through
+headers. This adds an ordinary builtin using the existing Json carrier, with no
+keyword or dependency. See [the contract](mtls-bound-jwt.md) and
+[example](../examples/mtls-bound-jwt.rut).
+
 ## Request-scoped TCP and UDP clients
 
 `tcp(policy, timeoutMs) -> TcpConnection?` and

@@ -696,3 +696,80 @@ TEST(oauth_client, token_exchange_has_fixed_types_and_strict_policy) {
         scratch, lit_str("subject"), lit_str("Basic YTpi"), kPolicy, short_output));
     CHECK(!short_output.ok);
 }
+
+TEST(jwt_claims, certificate_binding_requires_exact_canonical_confirmation) {
+    json::Document scratch;
+    const Str fingerprint =
+        lit_str("0000000000000000000000000000000000000000000000000000000000000000");
+    const Str valid =
+        lit_str(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})");
+    CHECK(jwt_certificate_bound(scratch, valid, fingerprint));
+    CHECK(jwt_certificate_bound(
+        scratch,
+        lit_str(R"({"c\u006ef":{"x5t#S25\u0036":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})"),
+        fingerprint));
+    CHECK(jwt_certificate_bound(
+        scratch,
+        lit_str(R"({"cnf":{"x5t#S256":"__________________________________________8"}})"),
+        lit_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")));
+    CHECK(jwt_certificate_bound(
+        scratch,
+        lit_str(
+            R"({"cnf":{"x5t#S256":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"},"sub":"alice"})"),
+        lit_str("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")));
+    CHECK(jwt_certificate_bound(
+        scratch,
+        lit_str(R"({"cnf":{"x5t#S256":"\u0041AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})"),
+        fingerprint));
+    CHECK(!jwt_certificate_bound(
+        scratch,
+        lit_str(R"({"cnf":{"x5t#S256":"//////////////////////////////////////////8"}})"),
+        lit_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")));
+    CHECK(!jwt_certificate_bound(
+        scratch,
+        lit_str(R"({"cnf":{"x5t#S256":"__________________________________________9"}})"),
+        lit_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")));
+    const Str invalid[] = {
+        lit_str("{}"),
+        lit_str("[]"),
+        lit_str("null"),
+        lit_str("broken"),
+        lit_str(R"({"cnf":null})"),
+        lit_str(R"({"cnf":[]})"),
+        lit_str(R"({"cnf":{}})"),
+        lit_str(R"({"cnf":{"x5t":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})"),
+        lit_str(R"({"cnf":{"x5t#S256":null}})"),
+        lit_str(R"({"cnf":{"x5t#S256":["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]}})"),
+        lit_str(R"({"cnf":{"x5t#S256":""}})"),
+        lit_str(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}})"),
+        lit_str(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"}})"),
+        lit_str(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"}})"),
+        lit_str(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\u0000"}})"),
+        lit_str(
+            R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","jkt":"other"}})"),
+        lit_str(
+            R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","x5t#S25\u0036":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})"),
+        lit_str(
+            R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"c\u006ef":{}})"),
+        lit_str(R"({"nested":{"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}})"),
+    };
+    for (Str claims : invalid) CHECK(!jwt_certificate_bound(scratch, claims, fingerprint));
+    CHECK(!jwt_certificate_bound(scratch, {nullptr, 1}, fingerprint));
+    CHECK(!jwt_certificate_bound(scratch, valid, {nullptr, 64}));
+    CHECK(!jwt_certificate_bound(scratch, valid, lit_str("")));
+    CHECK(!jwt_certificate_bound(
+        scratch,
+        valid,
+        lit_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")));
+    CHECK(!jwt_certificate_bound(
+        scratch,
+        valid,
+        lit_str("A000000000000000000000000000000000000000000000000000000000000000")));
+    char changed[64];
+    for (u32 index = 0; index < 64; ++index) {
+        for (u32 i = 0; i < 64; ++i) changed[i] = '0';
+        changed[index] = '1';
+        CHECK(!jwt_certificate_bound(scratch, valid, {changed, 64}));
+    }
+    CHECK(jwt_certificate_bound(scratch, valid, fingerprint));
+}
