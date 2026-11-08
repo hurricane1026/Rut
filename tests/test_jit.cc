@@ -30602,3 +30602,61 @@ TEST(jit, exchange_oauth_request_executes_and_validates_shapes) {
         CHECK(!hir);
     }
 }
+
+TEST(jit, jwt_certificate_binding_uses_canonical_thumbprint_metadata) {
+    const char* source = R"rut(route GET "/binding" {
+    guard let claims = json.parse(req.header("X-Claims").or("")) else { return 400 }
+    guard jwtCertificateBound(claims, req.header("X-Fingerprint").or("")) else { return 401 }
+    return 204
+})rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const auto check = [&](const char* claims, const char* fingerprint, u16 status) {
+        arena.reset();
+        char request[2048];
+        const int length = snprintf(
+            request,
+            sizeof(request),
+            "GET /binding HTTP/1.1\r\nHost: localhost\r\nX-Claims: %s\r\nX-Fingerprint: %s\r\n\r\n",
+            claims,
+            fingerprint);
+        REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(request));
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(length),
+                                                          &arena));
+        CHECK_EQ(result.status_code, status);
+    };
+    const char* claims = R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}})";
+    check(claims, "0000000000000000000000000000000000000000000000000000000000000000", 204);
+    check(claims, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 401);
+    check(claims, "", 401);
+    check("{}", "0000000000000000000000000000000000000000000000000000000000000000", 401);
+    check(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}})",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          401);
+    check(R"({"cnf":{"x5t#S256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","jkt":"other"}})",
+          "0000000000000000000000000000000000000000000000000000000000000000",
+          401);
+    rir.destroy();
+}

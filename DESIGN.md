@@ -10501,3 +10501,17 @@ ownership and cannot escape request/callback lifetimes. Existing outbound
 continuation storage retains live sliced values across a subsequent read.
 JIT/native HTTP and WebSocket execution share this contract. See
 [Bytes fields](docs/bytes-fields.md) for bounds, empty values and validation.
+
+
+### Certificate-bound JWT resource policy
+
+The resource-server profile admits exactly `cnf.x5t#S256` and binds verified JWT
+metadata to the verified TLS connection's SHA-256 certificate fingerprint. The
+runtime converts the canonical hex digest to canonical unpadded Base64url and
+compares exact bytes with the existing constant-time primitive. It uses bounded
+JSON scratch and stack buffers, with no heap allocation, I/O or retained views.
+The builtin reuses the existing JSON operation carrier; the opcode is appended
+so existing operation numbers stay stable. Signature/claims/scope policy remains
+explicit, and the ordinary helper fails closed with challenged 401 when TLS or
+confirmation evidence is missing. No token issuance, proxy-header trust, DPoP or
+persistent revocation is implied. See [the contract](docs/mtls-bound-jwt.md).
