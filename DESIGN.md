@@ -10388,3 +10388,22 @@ request-generation lifecycle. TCP remains a stream and UDP remains datagrams,
 including empty-message and oversize/truncation semantics. Dynamic response Bytes
 locals reuse bounded body serialization. Pooling across requests, richer result
 errors, general byte parsers and message subscriptions remain follow-ups.
+
+### Read-only Bytes subscripts
+
+`bytes[index]` is a custom, read-only subscript on an unwrapped `Bytes` receiver
+and an unwrapped `i32` index. It yields `i32?`: present values are unsigned raw
+octets 0–255, and negative or out-of-range indices yield nil. Positions start at
+zero; NUL yields a present zero. Lookup does not decode UTF-8, allocate storage,
+perform I/O or change the last network error. The receiver and index are
+evaluated once, receiver first. This follows Swift's custom-subscript syntax
+and optional-result model; Bytes is not an alias for Swift's Array or Data.
+Array/string indexing, range subscripts, mutation and user-defined subscript
+declarations remain absent.
+
+The parser retains receiver/index operands, and analysis requires exact Bytes
+and i32 source types before lowering a checked optional scalar intrinsic through
+the existing expression pipeline. Code generation checks the bounds before
+forming/loading the address and zero-extends the selected byte. JIT and native
+artifacts share this lowering, including HTTP request bodies, WebSocket payloads,
+helper-produced byte values and TCP/UDP results retained across continuations.

@@ -55,6 +55,7 @@ enum class VerifyIssueCode : u8 {
     InvalidWsMessageField,
     InvalidWsOutput,
     InvalidPhi,
+    InvalidBytesSubscript,
 };
 
 struct VerifyIssue {
@@ -75,8 +76,27 @@ struct VerifySummary {
     u32 branch_edge_count = 0;
 };
 
-// Shared boundary validation for the bounded String operations. Codegen also
+// Shared boundary validation for Bytes lookup and bounded String operations. Codegen also
 // checks direct RIR clients before indexing operands or allocating LLVM arrays.
+inline bool valid_bytes_subscript(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::JsonOp || inst.imm.i32_val != static_cast<i32>(json::Op::BytesAt))
+        return true;
+    const auto kType = [&](ValueId id) -> const Type* {
+        return id != kNoValue && id.id < fn.value_count && fn.values ? fn.values[id.id].type
+                                                                     : nullptr;
+    };
+    const auto kExact = [&](ValueId id, TypeKind kind) {
+        const Type* type = kType(id);
+        return type && type->kind == kind && !type->inner && !type->struct_def;
+    };
+    const Type* result = kType(inst.result);
+    return inst.operand_count == 2 && !inst.extra_operands &&
+           kExact(inst.operands[0], TypeKind::Str) && kExact(inst.operands[1], TypeKind::I32) &&
+           result && result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
+           result->inner->kind == TypeKind::I32 && !result->inner->inner &&
+           !result->inner->struct_def;
+}
+
 inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
     if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate) return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
@@ -939,6 +959,9 @@ inline VerifyResult verify_function(const Function* fn,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
             }
+            if (!valid_bytes_subscript(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidBytesSubscript, function_index, bi, ii);
             if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;
             auto exact_type = [&](ValueId id, TypeKind kind) {
                 if (id == kNoValue || id.id >= fn->value_count || fn->values == nullptr)

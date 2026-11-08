@@ -63,6 +63,8 @@ enum class Op : u8 {
     NetClose,
     NetError,
     OauthClientCredentialsResourceRequest,
+    // Compiler intrinsic; raw Bytes lookup, not JSON parsing.
+    BytesAt,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;

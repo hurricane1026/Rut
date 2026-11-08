@@ -119,9 +119,12 @@ This first client profile inherits outbound-call restrictions: at most 16
 sequential network/HTTP operations per handler, no explicit wait, timer or
 WebSocket handler, and no specialized password/forward-auth prefix in the same
 handler. HTTP/2 retains its existing single suspended-stream restriction.
-Use a let binding even for close when its Boolean result is ignored. Streaming
-subscriptions, background sessions, general parser loops/Bytes indexing and
-cross-request pooling remain separate follow-ups, not current capabilities.
+Use a let binding even for close when its Boolean result is ignored. Unwrapped
+read results support `bytes[index] -> i32?`: a zero-based i32 index yields an
+unsigned octet (0–255), or nil for a negative/out-of-range index. This lookup
+does not perform I/O or change `netError()`. Streaming subscriptions, background
+sessions, general parser loops, Bytes slices and cross-request pooling remain
+separate follow-ups, not current capabilities.
 
 ## Validation
 

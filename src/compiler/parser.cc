@@ -1242,6 +1242,25 @@ struct Parser {
         if (!base) return core::make_unexpected(base.error());
         AstExpr expr = base.value();
         while (true) {
+            if (take(TokenType::LBracket)) {
+                NestedDelimiterGuard nested(this);
+                auto index = parse_expr();
+                if (!index) return core::make_unexpected(index.error());
+                auto closing = expect(TokenType::RBracket);
+                if (!closing) return core::make_unexpected(closing.error());
+                auto receiver = alloc_expr(expr);
+                if (!receiver) return core::make_unexpected(receiver.error());
+                auto operand = alloc_expr(index.value());
+                if (!operand) return core::make_unexpected(operand.error());
+                AstExpr subscript{};
+                subscript.kind = AstExprKind::Subscript;
+                subscript.lhs = receiver.value();
+                subscript.rhs = operand.value();
+                subscript.span =
+                    Span{expr.span.start, closing.value()->end, expr.span.line, expr.span.col};
+                expr = subscript;
+                continue;
+            }
             if (expr.kind == AstExprKind::Ident && expr.type_args.len == 0 &&
                 cur().type == TokenType::Lt) {
                 const u32 saved_pos = pos;

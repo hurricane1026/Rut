@@ -2067,6 +2067,44 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::BytesAt) {
+                auto bytes = c.get_value(inst.operands[0]);
+                auto index = c.get_value(inst.operands[1]);
+                auto pointer = LLVMBuildExtractValue(c.builder, bytes, 0, "bytes.ptr");
+                auto length = LLVMBuildExtractValue(c.builder, bytes, 1, "bytes.len");
+                // Unsigned comparison rejects negative i32 indices as well.
+                auto in_bounds =
+                    LLVMBuildICmp(c.builder, LLVMIntULT, index, length, "bytes.bounds");
+                auto nonnull = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "bytes.nonnull");
+                auto valid = LLVMBuildAnd(c.builder, in_bounds, nonnull, "bytes.valid");
+                auto origin = LLVMGetInsertBlock(c.builder);
+                auto function = LLVMGetBasicBlockParent(origin);
+                auto load = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "bytes.load");
+                auto merge = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "bytes.merge");
+                LLVMBuildCondBr(c.builder, valid, load, merge);
+                LLVMPositionBuilderAtEnd(c.builder, load);
+                auto address =
+                    LLVMBuildGEP2(c.builder, c.i8_ty, pointer, &index, 1, "bytes.address");
+                auto byte = LLVMBuildLoad2(c.builder, c.i8_ty, address, "bytes.byte");
+                auto number = LLVMBuildZExt(c.builder, byte, c.i32_ty, "bytes.number");
+                LLVMBuildBr(c.builder, merge);
+                LLVMPositionBuilderAtEnd(c.builder, merge);
+                auto payload = LLVMBuildPhi(c.builder, c.i32_ty, "bytes.result");
+                LLVMValueRef values[] = {LLVMConstInt(c.i32_ty, 0, 0), number};
+                LLVMBasicBlockRef blocks[] = {origin, load};
+                LLVMAddIncoming(payload, values, blocks, 2);
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder,
+                                              result,
+                                              LLVMBuildZExt(c.builder, valid, c.i8_ty, "bytes.has"),
+                                              0,
+                                              "");
+                result = LLVMBuildInsertValue(c.builder, result, payload, 1, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::NetError) {
                 LLVMTypeRef params[] = {c.ptr_ty};
                 auto type = LLVMFunctionType(c.i32_ty, params, 1, 0);
@@ -3587,7 +3625,9 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
-                if (!rir::valid_string_instruction(fn, inst)) return {nullptr, nullptr, false};
+                if (!rir::valid_string_instruction(fn, inst) ||
+                    !rir::valid_bytes_subscript(fn, inst))
+                    return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
                     if (kIndex >= rir_mod.cache_instance_count ||

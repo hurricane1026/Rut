@@ -190,7 +190,8 @@ route GET "/{path}" {{
     guard let line = pendingLine else {{ return 503 }}
     let pendingTail = connection.readExactly(4, 1000)
     guard let tail = pendingTail else {{ return 503 }}
-    guard tail == b"TAIL" else {{ return 500 }}
+    guard tail == b"TAIL" && line[0].or(-1) == 104 &&
+        tail[tail.count - 1].or(-1) == 76 && tail[tail.count] == nil else {{ return 500 }}
     let closed = connection.close()
     guard closed else {{ return 500 }}
     return response(200, body: line)
@@ -218,6 +219,7 @@ route POST "/udp" {
     guard let sent = pendingSend else { return 503 }
     let pendingRead = socket.receive(8192, 1000)
     guard let reply = pendingRead else { return 503 }
+    guard reply[-1] == nil && reply[reply.count] == nil else { return 500 }
     return response(200, body: reply)
 }
 route GET "/udp-helper" {

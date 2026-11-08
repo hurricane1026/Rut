@@ -10906,6 +10906,28 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.str_value = retained.value();
         return out;
     }
+    if (expr.kind == AstExprKind::Subscript && expr.lhs && expr.rhs) {
+        auto receiver = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (!receiver) return core::make_unexpected(receiver.error());
+        if (receiver->type != HirTypeKind::Bytes || receiver->may_nil || receiver->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.lhs->span,
+                                  lit_str("subscript requires an unwrapped Bytes value"));
+        auto index = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        if (!index) return core::make_unexpected(index.error());
+        if (index->type != HirTypeKind::I32 || index->may_nil || index->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("Bytes subscript requires an unwrapped i32 index"));
+        return make_json_op(json::Op::BytesAt,
+                            HirTypeKind::I32,
+                            true,
+                            &receiver.value(),
+                            &index.value(),
+                            nullptr,
+                            expr.span,
+                            route);
+    }
     if (expr.kind == AstExprKind::ObjectLit) {
         return frontend_error(
             FrontendError::UnsupportedSyntax,

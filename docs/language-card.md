@@ -2896,4 +2896,33 @@ See [the full contract](net-clients.md),
 [the executable example](../examples/tcp-udp-clients.rut) and
 [the Redis PING library](../examples/clients/redis.rut). Generic TCP listeners,
 unrestricted destinations, persistent pools, DNS and general-purpose Bytes
-parsing/iteration are not introduced by this profile.
+parsing/iteration are not introduced by this profile. Single-byte subscripting
+is supported separately below.
+
+## Bytes subscripts
+
+`bytes[index] -> i32?` reads one raw octet using a zero-based, unwrapped `i32`
+index. The receiver must be an unwrapped `Bytes`. A present result is in 0–255;
+negative indices and indices greater than or equal to `bytes.count` return nil.
+An empty Bytes has no valid index. NUL is the present value 0, never absence;
+no UTF-8 decoding or signed-byte conversion takes place.
+
+```rut
+route POST "/resp" {
+    let bytes = req.bodyBytes
+    guard let kind = bytes[0] else { return 400 }
+    guard kind == 43 else { return 422 } // ASCII '+': RESP simple string
+    let last = bytes[bytes.count - 1].or(-1)
+    guard last == 10 else { return 400 } // LF
+    return 204
+}
+```
+
+Subscripts work on byte literals, helper results, `req.bodyBytes`, WebSocket
+payloads and unwrapped TCP/UDP read results. Receiver and index are evaluated
+once in source order. Use `guard let`, `if let`, a nil test or `.or(...)` before
+using the optional byte as an integer. This is the custom read-only Bytes
+subscript contract, not Swift Array subscripting: Swift custom subscripts can
+[return optional values](https://docs.swift.org/swift-book/documentation/the-swift-programming-language/subscripts/).
+No string/array subscripts, subscript assignment, ranges/slices, or new numeric
+types are added.

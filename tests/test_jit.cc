@@ -12,6 +12,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
+#include "rut/compiler/verifier.h"
 #include "rut/jit/art_jit_codegen.h"
 #include "rut/jit/codegen.h"
 #include "rut/jit/handler_abi.h"
@@ -482,6 +483,59 @@ TEST(jit, websocket_body_rejects_http_reads_and_keeps_borrowed_llvm_context_aliv
     CHECK_FALSE(codegen_ws_body(tc.mod, context).ok);
     CHECK(LLVMInt32TypeInContext(context) != nullptr);
     LLVMContextDispose(context);
+    tc.destroy();
+}
+
+TEST(jit, bytes_subscripts_execute_without_arena_and_reject_malformed_rir) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder builder;
+    builder.init(&tc.mod);
+    auto* fn = V(builder.create_function(lit("bytes_subscript"), lit("/"), 'G'));
+    const auto entry = V(builder.create_block(fn, lit("entry")));
+    builder.set_insert_point(fn, entry);
+    auto body = V(builder.emit_req_body());
+    auto index = V(builder.emit_const_i32(1));
+    const ValueId args[] = {body, index};
+    const auto op = static_cast<u32>(json::Op::BytesAt);
+    CHECK(!builder.emit_json(op, TypeKind::I32, true, nullptr, 2));
+    CHECK(!builder.emit_json(op, TypeKind::I32, true, args, 1));
+    CHECK(!builder.emit_json(op, TypeKind::I32, false, args, 2));
+    CHECK(!builder.emit_json(op, TypeKind::Str, true, args, 2));
+    const ValueId wrong[] = {index, body};
+    CHECK(!builder.emit_json(op, TypeKind::I32, true, wrong, 2));
+    const auto byte = V(builder.emit_json(op, TypeKind::I32, true, args, 2));
+    const auto type = V(builder.make_type(TypeKind::I32));
+    const auto number = V(builder.emit_opt_unwrap(byte, type));
+    const auto base = V(builder.emit_const_i32(200));
+    VOK(builder.emit_ret_status(V(builder.emit_arith(Opcode::Add, base, number))));
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_bytes_subscript"));
+    REQUIRE(handler);
+    const char wire[] = "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n\0\xff";
+    auto result = HandlerResult::unpack(
+        handler(nullptr, nullptr, reinterpret_cast<const u8*>(wire), sizeof(wire) - 1, nullptr));
+    CHECK_EQ(result.status_code, 455u);
+    auto& instruction = fn->blocks[entry.id].insts[2];
+    REQUIRE(instruction.op == Opcode::JsonOp);
+    instruction.operand_count = 1;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.operand_count = 2;
+    instruction.operands[1] = body;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.operands[1] = index;
+    const auto* original_type = fn->values[byte.id].type;
+    fn->values[byte.id].type = type;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    fn->values[byte.id].type = original_type;
+    engine.shutdown();
     tc.destroy();
 }
 

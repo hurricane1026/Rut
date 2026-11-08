@@ -9319,6 +9319,71 @@ route GET "/ws" { return websocket(ws) { message in
     rir.destroy();
 }
 
+TEST(frontend, bytes_subscripts_lower_checked_optional_reads) {
+    const char* source = R"rut(
+func byteOrMissing(_ bytes: Bytes, _ index: i32) -> i32 => bytes[index].or(-1)
+func marker() -> Bytes => b"\x00\xff\x80"
+route POST "/body" {
+    let bytes = req.bodyBytes
+    let index = bytes.count - 1
+    guard let value = bytes[index] else { return 400 }
+    guard value == 255 && byteOrMissing(bytes, -1) == -1 else { return 403 }
+    guard bytes[bytes.count] == nil else { return 500 }
+    return 200
+}
+route GET "/literal" {
+    guard let value = marker()[1] else { return 400 }
+    guard value == 255 && b"\x00"[0].or(-1) == 0 else { return 403 }
+    return 200
+}
+upstream backend
+route GET "/ws" { return websocket(backend) { message in
+    guard let value = message.payload[0] else { message.drop() }
+    guard value == 255 else { message.drop() }
+    message.forward()
+} }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::JsonOp));
+    rir.destroy();
+}
+
+TEST(frontend, bytes_subscripts_reject_wrong_types_optional_operands_and_unsupported_forms) {
+    const char* expressions[] = {"\"text\"[0]",
+                                 "[1, 2][0]",
+                                 "42[0]",
+                                 "b\"x\"[true]",
+                                 "b\"x\"[\"0\"]",
+                                 "b\"x\"[2147483648]",
+                                 "b\"x\"[b\"x\"[0]]",
+                                 "b\"x\"[]",
+                                 "b\"x\"[0, 1]",
+                                 "b\"x\"[0...1]",
+                                 "b\"x\"[0] = 1"};
+    for (const char* expression : expressions) {
+        std::string source = "route GET \"/\" { let value = ";
+        source += expression;
+        source += " return 200 }";
+        auto lexed = lex(lit(source.c_str()));
+        if (!lexed) continue;
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) continue;
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir);
+    }
+}
+
 TEST(frontend, payload_bytes_literals_outlive_the_decoded_ast_pool) {
     const char* source = R"rut(func marker() -> Bytes => b"\x00\xff\x80"
 route GET "/" { guard marker().count == 3 else { return 403 } return 200 })rut";
