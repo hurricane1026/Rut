@@ -39,6 +39,31 @@ func requireScope(_ document: Json, _ scope: str) -> Json {
     document
 }
 
+// Validate a configured single permission with the shared OAuth scope grammar.
+// This constructs policy JSON, not authenticated AS metadata.
+func scopePolicyValid(_ scope: str) -> bool {
+    guard let policy = json.value({scope: scope}) else { false }
+    jwtHasScope(policy, scope)
+}
+
+// Apply only after requireActive over the authenticated AS reply. Validate both
+// configured permissions before OR can short-circuit on an allowed permission.
+func requireEitherScope(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard scopePolicyValid(first) && scopePolicyValid(second) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasScope(document, first) || jwtHasScope(document, second) else { respond denied }
+    document
+}
+
+func requireBothScopes(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard scopePolicyValid(first) && scopePolicyValid(second) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasScope(document, first) && jwtHasScope(document, second) else { respond denied }
+    document
+}
+
 // Exact metadata comparison only: this cannot authenticate caller-supplied JSON.
 func bindingMatches(_ document: Json, _ issuer: str, _ clientId: str) -> bool {
     issuer != "" && clientId != "" && json.kind(document).or("") == "object" &&

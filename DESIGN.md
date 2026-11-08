@@ -10334,6 +10334,17 @@ at the AS are visible on the next request. Required expiry/audience are local
 resource policy; optional issuer, subject and issuance time are not fabricated
 to make the response resemble JWT claims. See [the contract](docs/oauth-introspection.md).
 
+### Introspection scope composition
+
+The ordinary introspection library offers two-token scope union/intersection
+policies after authenticated active/expiry/audience validation. Both configured
+single scope tokens are validated with the existing scope parser before OR/AND
+membership can succeed; malformed configuration and bounded arena failures fail
+closed with 503. Insufficient permission retains the Bearer 403 challenge.
+Successful metadata can feed issuer/client binding and subject projection without
+changing identity. No compiler/runtime ABI, external dependency or cached allow
+state is introduced. See [the contract](docs/oauth-introspection.md#composable-two-permission-authorization).
+
 ### Introspection issuer/client binding
 
 The ordinary introspection library optionally binds already validated AS metadata
