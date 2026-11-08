@@ -10342,6 +10342,17 @@ scope. The append-only operation preserves previous operation IDs and the generi
 C ABI. No keyword or dependency is added. See [the profile](docs/upstream-oauth.md)
 for ownership, relative lifetime limits and two-backend native validation.
 
+The existing request builtin also accepts a third string for a single configured
+HTTPS resource identifier (RFC 8707). It appends an operation without changing old
+operation IDs or the generic helper C ABI. Construction validates bounded URI
+syntax and percent-encodes each form field independently under the existing 4096
+body limit. The URI is never fetched or used for backend selection. Scope-only
+requests remain unchanged. This profile excludes other URI schemes, userinfo,
+fragments and multiple resources; it preserves accepted identifier bytes without
+normalization. AS issuance and upstream token validation enforce the resource's
+audience restriction; the gateway does not infer opaque token validity from the
+request parameter. See [the contract](docs/upstream-oauth.md#configured-target-resource).
+
 ### Authorization-server revocation client
 
 An ordinary source helper composes the existing bounded token/hint form builder

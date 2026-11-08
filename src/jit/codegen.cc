@@ -3648,12 +3648,15 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                         kJsonOp == json::Op::OauthIntrospectionValid ||
-                        kJsonOp == json::Op::OauthClientCredentialsRequest) {
-                        if (inst.operand_count != 2 || inst.extra_operands ||
+                        kJsonOp == json::Op::OauthClientCredentialsRequest ||
+                        kJsonOp == json::Op::OauthClientCredentialsResourceRequest) {
+                        const u32 kCount =
+                            kJsonOp == json::Op::OauthClientCredentialsResourceRequest ? 3u : 2u;
+                        if (inst.operand_count != kCount || inst.extra_operands ||
                             inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
                             !fn.values || !fn.values[inst.result.id].type)
                             return {nullptr, nullptr, false};
-                        for (u32 oi = 0; oi < 2; ++oi) {
+                        for (u32 oi = 0; oi < kCount; ++oi) {
                             const auto kId = inst.operand(oi);
                             if (kId == rir::kNoValue || kId.id >= fn.value_count ||
                                 !fn.values[kId.id].type ||
@@ -3663,7 +3666,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         }
                         const auto* result = fn.values[inst.result.id].type;
                         if (kJsonOp == json::Op::OauthIntrospectionRequest ||
-                            kJsonOp == json::Op::OauthClientCredentialsRequest) {
+                            kJsonOp == json::Op::OauthClientCredentialsRequest ||
+                            kJsonOp == json::Op::OauthClientCredentialsResourceRequest) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||
                                 result->struct_def || result->inner->kind != rir::TypeKind::Str ||
                                 result->inner->inner || result->inner->struct_def)

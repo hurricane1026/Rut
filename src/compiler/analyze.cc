@@ -13837,12 +13837,16 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
          expr.name.eq(lit_str("oauthIntrospectionValid")) ||
          expr.name.eq(lit_str("oauthClientCredentialsRequest"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
-        if (expr.args.len != 2 || !expr.args[0] || !expr.args[1])
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         const bool kScoped = expr.name.eq(lit_str("oauthClientCredentialsRequest"));
+        const bool kResource = kScoped && expr.args.len == 3;
+        const u32 kCount = kResource ? 3u : 2u;
+        if (expr.args.len != kCount)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         const bool kRequest = kScoped || expr.name.eq(lit_str("oauthIntrospectionRequest"));
-        HirExpr values[2]{};
-        for (u32 i = 0; i < 2; ++i) {
+        HirExpr values[3]{};
+        for (u32 i = 0; i < kCount; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             auto value = analyze_builtin_arg(*expr.args[i]);
             if (!value) return core::make_unexpected(value.error());
             const auto kExpected = i == 0 && !kRequest ? HirTypeKind::Json : HirTypeKind::Str;
@@ -13851,14 +13855,15 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
             values[i] = value.value();
         }
-        return make_json_op(kScoped    ? json::Op::OauthClientCredentialsRequest
+        return make_json_op(kResource  ? json::Op::OauthClientCredentialsResourceRequest
+                            : kScoped  ? json::Op::OauthClientCredentialsRequest
                             : kRequest ? json::Op::OauthIntrospectionRequest
                                        : json::Op::OauthIntrospectionValid,
                             kRequest ? HirTypeKind::Json : HirTypeKind::Bool,
                             kRequest,
                             &values[0],
                             &values[1],
-                            nullptr,
+                            kResource ? &values[2] : nullptr,
                             expr.span,
                             route);
     }

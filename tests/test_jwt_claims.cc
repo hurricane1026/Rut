@@ -451,3 +451,139 @@ TEST(oauth_client, scoped_form_encoding_rejects_injection_and_bounds) {
     CHECK(!oauth_client_credentials_request(lit_str("read"), lit_str("Basic YTpi"), short_output));
     CHECK(!short_output.ok);
 }
+
+TEST(oauth_client, resource_request_preserves_identifier_and_rejects_unsafe_uris) {
+    char bytes[8192], decoded[4096];
+    json::Document document;
+    const auto kResource =
+        lit_str("https://api.example.test/reports?tenant=a+b&scope=write%2Fread");
+    json::Writer output{bytes};
+    REQUIRE(oauth_client_credentials_request(
+        lit_str("read write"), lit_str("Basic YTpi"), kResource, output));
+    REQUIRE(document.parse({bytes, output.len}));
+    json::Writer body{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), body));
+    CHECK((Str{decoded, body.len}.eq(
+        lit_str("grant_type=client_credentials&scope=read%20write&resource=https%3A%2F%2Fapi."
+                "example.test%2Freports%3Ftenant%3Da%2Bb%26scope%3Dwrite%252Fread"))));
+    const Str kValid[] = {lit_str("https://api.example.test"),
+                          lit_str("HTTPS://API.Example.test:8443/a%23b"),
+                          lit_str("https://127.0.0.1:443/"),
+                          lit_str("https://[::1]/a"),
+                          lit_str("https://[2001:db8::1]:65535/?a=b?c=d"),
+                          lit_str("https://api.example.test/!$&'()*+,;=:@~_-.09")};
+    for (const Str kUri : kValid) {
+        json::Writer writer{bytes};
+        CHECK(
+            oauth_client_credentials_request(lit_str("read"), lit_str("Basic YTpi"), kUri, writer));
+    }
+    const Str kInvalid[] = {lit_str(""),
+                            lit_str("/relative"),
+                            lit_str("//api.example.test/"),
+                            lit_str("http://api.example.test/"),
+                            lit_str("urn:example:reports"),
+                            lit_str("https://"),
+                            lit_str("https:///path"),
+                            lit_str("https://?x=y"),
+                            lit_str("https://user:secret@api.example.test/"),
+                            lit_str("https://api.example.test/#"),
+                            lit_str("https://api.example.test/a#b"),
+                            lit_str("https://api.example.test/white space"),
+                            lit_str("https://api.example.test/\\path"),
+                            lit_str("https://api.example.test/\r\n"),
+                            lit_str("https://api.example.test/\x7f"),
+                            lit_str("https://api.example.test/r\xc3\xa9"),
+                            lit_str("https://api.example.test/%"),
+                            lit_str("https://api.example.test/%2"),
+                            lit_str("https://api.example.test/%zz"),
+                            lit_str("https://api.example.test/[]"),
+                            lit_str("https://api.example.test/\""),
+                            lit_str("https://api.example.test/<>"),
+                            lit_str("https://api.example.test/{}"),
+                            lit_str("https://api.example.test/|"),
+                            lit_str("https://api.example.test/`"),
+                            lit_str("https://[::1"),
+                            lit_str("https://[bad]/"),
+                            lit_str("https://[::1\0evil]/"),
+                            lit_str("https://[::1]extra/"),
+                            lit_str("https://[::1]:/"),
+                            lit_str("https://[::1]:0/"),
+                            lit_str("https://host:/"),
+                            lit_str("https://host:65536/"),
+                            lit_str("https://host:999999999999/"),
+                            lit_str("https://host:-1/"),
+                            lit_str("https://host:x/"),
+                            lit_str("https://-host/"),
+                            lit_str("https://host-/"),
+                            lit_str("https://host..test/"),
+                            lit_str("https://host./"),
+                            lit_str("https://ho_st/"),
+                            {"https://host/\0tail", 18},
+                            {nullptr, 12}};
+    for (const Str kUri : kInvalid) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_client_credentials_request(
+            lit_str("read"), lit_str("Basic YTpi"), kUri, writer));
+        CHECK_EQ(writer.len, 0u);
+    }
+    char hostname[262];
+    __builtin_memcpy(hostname, "https://", 8);
+    for (u32 i = 0; i < 254; ++i) hostname[8 + i] = i == 63 || i == 127 || i == 191 ? '.' : 'a';
+    json::Writer label_limit{bytes};
+    CHECK(oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {hostname, 71}, label_limit));
+    hostname[71] = 'a';  // A 64-byte label, without a trailing dot.
+    json::Writer label_over{bytes};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {hostname, 72}, label_over));
+    hostname[71] = '.';
+    json::Writer host_limit{bytes};
+    CHECK(oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {hostname, 261}, host_limit));
+    json::Writer host_over{bytes};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {hostname, 262}, host_over));
+    char maximum[1025];
+    __builtin_memcpy(maximum, "https://host/", 13);
+    for (u32 i = 13; i < sizeof(maximum); ++i) maximum[i] = 'a';
+    json::Writer limit{bytes};
+    CHECK(oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {maximum, 1024}, limit));
+    json::Writer oversized{bytes};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), {maximum, 1025}, oversized));
+    char scope[1024];
+    for (auto& byte : scope) byte = '&';
+    for (u32 i = 13; i < 1024; ++i) maximum[i] = '&';
+    // 36-byte prefix + 3072-byte encoded scope + 10-byte resource prefix +
+    // 21-byte encoded URI authority + 957 path bytes = the 4096-byte body limit.
+    for (u32 i = 13; i < 1024; ++i) maximum[i] = 'a';
+    json::Writer exact{bytes};
+    REQUIRE(oauth_client_credentials_request(
+        {scope, sizeof(scope)}, lit_str("Basic YTpi"), {maximum, 970}, exact));
+    REQUIRE(document.parse({bytes, exact.len}));
+    json::Writer exact_body{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), exact_body));
+    CHECK_EQ(exact_body.len, 4096u);
+    json::Writer one_over{bytes};
+    CHECK(!oauth_client_credentials_request(
+        {scope, sizeof(scope)}, lit_str("Basic YTpi"), {maximum, 971}, one_over));
+    CHECK_EQ(one_over.len, 0u);
+    for (u32 i = 13; i < 1024; ++i) maximum[i] = '&';
+    json::Writer exhausted{bytes};
+    CHECK(!oauth_client_credentials_request(
+        {scope, sizeof(scope)}, lit_str("Basic YTpi"), {maximum, 1024}, exhausted));
+    CHECK_EQ(exhausted.len,
+             0u);  // Combined encoded body exceeds the existing 4096-byte callout bound.
+    json::Writer bad_scope{bytes};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read  write"), lit_str("Basic YTpi"), kResource, bad_scope));
+    json::Writer bad_auth{bytes};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read"), lit_str("Bearer forbidden"), kResource, bad_auth));
+    char tiny[8];
+    json::Writer short_output{tiny, sizeof(tiny)};
+    CHECK(!oauth_client_credentials_request(
+        lit_str("read"), lit_str("Basic YTpi"), kResource, short_output));
+    CHECK(!short_output.ok);
+}
