@@ -2883,6 +2883,25 @@ of a valid audience. Other schemes and multiple resource parameters are unsuppor
 See [the resource contract](upstream-oauth.md#configured-target-resource) and
 [example](../examples/upstream-oauth-resource.rut).
 
+### Upstream OAuth access-token exchange
+
+`oauthTokenExchangeRequest(subjectToken: str, serviceAuthorization: str, policy: Json) -> Json?`
+constructs a fixed RFC 8693 access-token request. `policy` is exactly
+`{scope: str, resource: str}` using trusted configuration; unwrap fallible JSON
+construction before calling. Subject, scope and HTTPS resource are bounded to
+1024 bytes each, Basic service auth to 2048 bytes, and encoded body to 4096 bytes.
+Unknown/duplicate policy fields or invalid input return nil.
+
+`oauth_client.tokenExchange(authorization, serviceAuth, policy)` extracts a singleton
+Bearer subject (401 on syntax failure) and responds 503 on construction failure.
+Send the result to a fixed verified HTTPS AS using `httpCall`, then call
+`oauth_client.exchangeAuthorization(reply, requiredScope)`. It accepts only exact
+access-token `issued_token_type`, followed by the shared strict Bearer/expiry/scope
+response policy. AS/response failures return 503 without forwarding. The AS owns
+subject validation and exchange authorization; the upstream owns audience checks.
+No actor token, cache, refresh, new keyword or dependency is added. See
+[the contract](oauth-token-exchange.md) and [example](../examples/upstream-oauth-exchange.rut).
+
 ### OAuth authorization-server revocation client
 
 `oauth_revocation.revokeRequest(authorization, serviceAuthorization)` builds the

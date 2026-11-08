@@ -13905,35 +13905,41 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if ((expr.name.eq(lit_str("oauthIntrospectionRequest")) ||
          expr.name.eq(lit_str("oauthIntrospectionValid")) ||
-         expr.name.eq(lit_str("oauthClientCredentialsRequest"))) &&
+         expr.name.eq(lit_str("oauthClientCredentialsRequest")) ||
+         expr.name.eq(lit_str("oauthTokenExchangeRequest"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         const bool kScoped = expr.name.eq(lit_str("oauthClientCredentialsRequest"));
+        const bool kExchange = expr.name.eq(lit_str("oauthTokenExchangeRequest"));
         const bool kResource = kScoped && expr.args.len == 3;
-        const u32 kCount = kResource ? 3u : 2u;
+        const u32 kCount = kResource || kExchange ? 3u : 2u;
         if (expr.args.len != kCount)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
-        const bool kRequest = kScoped || expr.name.eq(lit_str("oauthIntrospectionRequest"));
+        const bool kRequest =
+            kExchange || kScoped || expr.name.eq(lit_str("oauthIntrospectionRequest"));
         HirExpr values[3]{};
         for (u32 i = 0; i < kCount; ++i) {
             if (!expr.args[i])
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             auto value = analyze_builtin_arg(*expr.args[i]);
             if (!value) return core::make_unexpected(value.error());
-            const auto kExpected = i == 0 && !kRequest ? HirTypeKind::Json : HirTypeKind::Str;
+            const auto kExpected = (i == 0 && !kRequest) || (i == 2 && kExchange)
+                                       ? HirTypeKind::Json
+                                       : HirTypeKind::Str;
             if (value->type != kExpected || value->may_nil || value->may_error)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
             values[i] = value.value();
         }
-        return make_json_op(kResource  ? json::Op::OauthClientCredentialsResourceRequest
-                            : kScoped  ? json::Op::OauthClientCredentialsRequest
-                            : kRequest ? json::Op::OauthIntrospectionRequest
-                                       : json::Op::OauthIntrospectionValid,
+        return make_json_op(kExchange   ? json::Op::OauthTokenExchangeRequest
+                            : kResource ? json::Op::OauthClientCredentialsResourceRequest
+                            : kScoped   ? json::Op::OauthClientCredentialsRequest
+                            : kRequest  ? json::Op::OauthIntrospectionRequest
+                                        : json::Op::OauthIntrospectionValid,
                             kRequest ? HirTypeKind::Json : HirTypeKind::Bool,
                             kRequest,
                             &values[0],
                             &values[1],
-                            kResource ? &values[2] : nullptr,
+                            kResource || kExchange ? &values[2] : nullptr,
                             expr.span,
                             route);
     }

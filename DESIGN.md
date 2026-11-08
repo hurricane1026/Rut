@@ -10373,6 +10373,24 @@ normalization. AS issuance and upstream token validation enforce the resource's
 audience restriction; the gateway does not infer opaque token validity from the
 request parameter. See [the contract](docs/upstream-oauth.md#configured-target-resource).
 
+### Upstream OAuth access-token exchange
+
+A fixed-profile RFC 8693 AS client exchanges a singleton Bearer subject token for
+an upstream access token. The bounded constructor shares existing form encoding,
+Basic credential validation, scope grammar and HTTPS resource admission. An exact
+scope/resource Json policy fits the existing three-argument JSON helper ABI;
+unknown/duplicate fields fail instead of exposing arbitrary grant/actor parameters.
+Frontend Json typing and strict RIR shapes use an appended operation, preserving
+old IDs without a keyword or dependency addition.
+
+Source helpers require an exact access-token issued type before the shared token
+metadata policy. The common document policy avoids repeated parsing and stays
+within existing function/route guard limits. This does not authenticate arbitrary
+JSON. The AS authenticates the service and subject and decides exchange rights;
+the upstream enforces audience. Results remain request-owned, with no cached
+allow, retries, refresh or persistent revocation linkage. See
+[the contract](docs/oauth-token-exchange.md) for protocol bounds and native lifecycle tests.
+
 ### Authorization-server revocation client
 
 An ordinary source helper composes the existing bounded token/hint form builder

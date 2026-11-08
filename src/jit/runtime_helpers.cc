@@ -2828,7 +2828,8 @@ extern "C" void rut_helper_json(void* conn,
         op != static_cast<u32>(json::Op::OauthIntrospectionRequest) &&
         op != static_cast<u32>(json::Op::OauthIntrospectionValid) &&
         op != static_cast<u32>(json::Op::OauthClientCredentialsRequest) &&
-        op != static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest))
+        op != static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest) &&
+        op != static_cast<u32>(json::Op::OauthTokenExchangeRequest))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2842,6 +2843,9 @@ extern "C" void rut_helper_json(void* conn,
         if (!oauth_client_credentials_request({a, a_len}, {b, b_len}, writer)) return;
     } else if (operation == json::Op::OauthClientCredentialsResourceRequest) {
         if (!oauth_client_credentials_request({a, a_len}, {b, b_len}, {c, c_len}, writer)) return;
+    } else if (operation == json::Op::OauthTokenExchangeRequest) {
+        if (!oauth_token_exchange_request(document, {a, a_len}, {b, b_len}, {c, c_len}, writer))
+            return;
     } else if (operation == json::Op::OauthIntrospectionValid) {
         struct timespec now{};
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||

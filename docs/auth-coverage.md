@@ -28,7 +28,7 @@ whether a competing open-source edition includes them.
 | OAuth2 revocation client | **Bounded AS-client profile implemented** | Configured authenticated RFC 7009 form POST, status-only 200 acknowledgement, identical known/unknown-token client success, no-store logout response and end-to-end introspection refusal after AS revocation. See [the contract](oauth-revocation.md). AS ownership/durability/replication, public clients and local JWT invalidation remain separate. |
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
-| Upstream OAuth token | **Per-request client credentials profile implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope or explicit bounded configured scopes, a single configured HTTPS resource indicator, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Other URI schemes/multiple resources, provider-specific audience parameters, token exchange, caching and refresh coordination remain outside this profile. |
+| Upstream OAuth token | **Per-request client credentials and access-token exchange profiles implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope or explicit bounded configured scopes, a single configured HTTPS resource indicator, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Other URI schemes/multiple resources, provider-specific audience parameters, actor tokens/other token types, caching and refresh coordination remain outside these profiles. See [token exchange](oauth-token-exchange.md) for fixed access-token types and strict issued-token validation. |
 | mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity, two-pin credential rotation and two-Consumer certificate mapping helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
@@ -1336,3 +1336,14 @@ Native-loaded two-backend TLS tests retain source/module-removal evidence and
 cover protocol fields, credential separation, transport limits, HTTP/2,
 concurrency, disconnect/timeout uncertainty and no secret logging. See
 [the profile and state boundary](oauth-revocation.md).
+
+## Access-token exchange client
+
+`oauth_client.tokenExchange` constructs a bounded RFC 8693 request with fixed
+access-token subject/requested types, a trusted Basic service credential and an
+exact two-field configured scope/resource policy. `exchangeAuthorization` checks
+issued_token_type before the shared Bearer/lifetime/granted-scope/error policy.
+The AS authenticates subjects and authorizes exchanges; the upstream enforces
+issued-token audience. Two-backend TLS/native HTTP/1+HTTP/2 tests cover malformed
+credentials/configuration, type confusion, subject isolation, cancellation and
+fail-closed AS errors after source/module removal. See [the profile](oauth-token-exchange.md).

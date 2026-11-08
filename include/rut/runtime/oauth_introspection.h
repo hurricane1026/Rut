@@ -24,6 +24,15 @@ bool oauth_client_credentials_request(Str scopes,
                                       Str resource,
                                       json::Writer& output);
 
+// Fixed RFC 8693 access-token -> access-token request. policy_json is exactly
+// {"scope": string, "resource": string}; scratch may retain its borrowed view
+// until the next parse. Existing subject/scope/resource/auth/body bounds apply.
+bool oauth_token_exchange_request(json::Document& scratch,
+                                  Str subject_token,
+                                  Str service_authorization,
+                                  Str policy_json,
+                                  json::Writer& output);
+
 // Metadata validation, not signature verification. Accept only a trusted HTTPS
 // introspection response: active=true, future integer exp, exact aud membership,
 // optional nonfuture nbf/iat, optional valid scope list and Bearer token_type.

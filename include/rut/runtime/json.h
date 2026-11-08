@@ -77,6 +77,7 @@ enum class Op : u8 {
     BytesReadI64LE,
     ParseInt,
     ParseInt64,
+    OauthTokenExchangeRequest,
 };
 
 // Compiler-only raw-byte intrinsics share the existing optional scalar carrier.

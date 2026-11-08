@@ -1,0 +1,21 @@
+// TOKEN_ENDPOINT: fixed verified HTTPS policy for a trusted token-exchange AS.
+// TOKEN_SERVICE_AUTH, UPSTREAM_SCOPE, UPSTREAM_RESOURCE: trusted configuration.
+// The AS must validate subjects and authorize this service's exchange policy.
+import "middleware/oauth_client.rut"
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+route GET "/exchanged-reports" {
+    guard let policy = json.value({scope: env("UPSTREAM_SCOPE"), resource: env("UPSTREAM_RESOURCE")}) else { return 503 }
+    let message = oauth_client.tokenExchange(req.authorization.or(""), env("TOKEN_SERVICE_AUTH"), policy)
+    let pending = httpCall(env("TOKEN_ENDPOINT"), message, 1000)
+    guard let reply = pending else { return 503 }
+    let authorization = oauth_client.exchangeAuthorization(reply, "reports:read")
+    match authorization.isEmpty {
+        false => {
+            req.set("Authorization", authorization)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 503 }
+    }
+}
