@@ -221,15 +221,17 @@ NetReply net_call_for_request(void* connection,
         current_net_error = -4;
         return {};
     }
-    auto reply = current_gateway->net_clients.call(static_cast<ConnectionBase*>(connection)->id,
-                                                   generation,
-                                                   operation,
-                                                   handle,
-                                                   endpoint,
-                                                   bytes,
-                                                   amount,
-                                                   monotonic_us() / 1000,
-                                                   timeout_ms);
+    auto reply =
+        current_gateway->net_clients.call(static_cast<ConnectionBase*>(connection)->id,
+                                          generation,
+                                          operation,
+                                          handle,
+                                          endpoint,
+                                          bytes,
+                                          amount,
+                                          monotonic_us() / 1000,
+                                          timeout_ms,
+                                          static_cast<ConnectionBase*>(connection)->request_config);
     if (reply.status == NetReply::kPending)
         current_pending = true;
     else

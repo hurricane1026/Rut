@@ -54,6 +54,13 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
             bit = 16;
             value = endpoint.tls.server_name;
             cap = sizeof(endpoint.tls.server_name);
+        } else if (name.eq(lit_str("poolIdleMs"))) {
+            bit = 32;
+            i64 number = 0;
+            if (datagram || doc.nodes[n].kind != json::Kind::Number ||
+                !json::integer(doc.raw(n), number) || number < 1 || number > 60000)
+                return false;
+            endpoint.pool_idle_ms = static_cast<u32>(number);
         } else
             return false;
         if (seen & bit) return false;
@@ -102,6 +109,13 @@ void NetClientWorker::stop() {
     slots = nullptr;
     started = false;
 }
+void NetClientWorker::adopt_config(const void* config) {
+    if (pool_config == config) return;
+    pool_config = config;
+    // Epoch zero disables reuse. Never wrap into an old pool generation.
+    const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
+    __atomic_store_n(&pool_epoch, epoch == ~u64(0) ? 0 : epoch ? epoch + 1 : 0, __ATOMIC_RELEASE);
+}
 void NetClientWorker::cancel(u32 owner, u64 generation) {
     if (!started) return;
     for (u32 i = 0; i < kCapacity; ++i) {
@@ -119,7 +133,8 @@ NetReply NetClientWorker::call(u32 owner,
                                Str bytes,
                                i32 amount,
                                u64 now,
-                               u32 timeout) {
+                               u32 timeout,
+                               const void* config) {
     NetReply reply;
     if (!started || !generation || !now || !timeout || timeout > 60000) return reply;
     const bool opening = operation == NetOp::Tcp || operation == NetOp::Udp;
@@ -159,7 +174,10 @@ NetReply NetClientWorker::call(u32 owner,
                 reply = s.reply;
                 OPENSSL_cleanse(&s.reply, sizeof(s.reply));
                 __atomic_store_n(
-                    &s.phase, static_cast<u32>(reply.status ? Cancelled : Idle), __ATOMIC_RELEASE);
+                    &s.phase,
+                    static_cast<u32>(reply.status || operation == NetOp::Release ? Cancelled
+                                                                                 : Idle),
+                    __ATOMIC_RELEASE);
                 return reply;
             }
             reply.status = NetReply::kPending;
@@ -186,6 +204,8 @@ NetReply NetClientWorker::call(u32 owner,
         found->generation = generation;
         found->token = ++next_token;
         found->datagram = operation == NetOp::Udp;
+        found->pool_epoch =
+            config == pool_config ? __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE) : 0;
     }
     auto& s = *found;
     if (amount < 0 || amount > static_cast<i32>(kMaxBytes) || bytes.len > kMaxBytes ||
@@ -223,6 +243,79 @@ void NetClientWorker::close(Slot& s) {
     OPENSSL_cleanse(s.buffer, sizeof(s.buffer));
     OPENSSL_cleanse(&s.reply, sizeof(s.reply));
 }
+void NetClientWorker::close(Parked& p) {
+    if (p.ssl) SSL_free(p.ssl);
+    destroy_tls_client_context(p.tls);
+    if (p.fd >= 0) ::close(p.fd);
+    p = {};
+}
+bool NetClientWorker::clean(int fd, SSL* ssl) {
+    if (fd < 0 || (ssl && (SSL_pending(ssl) || SSL_has_pending(ssl)))) return false;
+    pollfd probe{fd, POLLIN, 0};
+    if (poll(&probe, 1, 0) != 0) return false;
+    char byte;
+    const auto result = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    return result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+}
+void NetClientWorker::sweep(u64 now) {
+    const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE);
+    for (auto& p : parked)
+        if (p.fd >= 0 && (!now || !epoch || p.epoch != epoch || now < p.since ||
+                          now - p.since >= p.endpoint.pool_idle_ms))
+            close(p);
+}
+bool NetClientWorker::borrow(Slot& s) {
+    if (!s.endpoint.pool_idle_ms || !s.pool_epoch ||
+        s.pool_epoch != __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE))
+        return false;
+    for (auto& p : parked) {
+        if (p.fd < 0 || p.epoch != s.pool_epoch ||
+            (p.endpoint.port != s.endpoint.port ||
+             p.endpoint.pool_idle_ms != s.endpoint.pool_idle_ms ||
+             p.endpoint.tls.enabled != s.endpoint.tls.enabled ||
+             __builtin_strcmp(p.endpoint.address, s.endpoint.address) != 0 ||
+             __builtin_strcmp(p.endpoint.tls.ca, s.endpoint.tls.ca) != 0 ||
+             __builtin_strcmp(p.endpoint.tls.server_name, s.endpoint.tls.server_name) != 0 ||
+             __builtin_strcmp(p.endpoint.tls.cert, s.endpoint.tls.cert) != 0 ||
+             __builtin_strcmp(p.endpoint.tls.key, s.endpoint.tls.key) != 0))
+            continue;
+        const u64 now = jwt_monotonic_ms();
+        if (!now || now < p.since || now - p.since >= p.endpoint.pool_idle_ms ||
+            !clean(p.fd, p.ssl)) {
+            close(p);
+            continue;
+        }
+        s.fd = p.fd;
+        s.tls = p.tls;
+        s.ssl = p.ssl;
+        p = {};
+        return true;
+    }
+    return false;
+}
+bool NetClientWorker::release(Slot& s) {
+    // This check cannot establish application framing. The explicit caller must
+    // have consumed exactly one complete reply and restored its protocol state.
+    if (!s.datagram && s.endpoint.pool_idle_ms && s.pool_epoch &&
+        s.pool_epoch == __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE) && !s.buffered && !s.eof &&
+        clean(s.fd, s.ssl)) {
+        for (auto& p : parked) {
+            if (p.fd >= 0) continue;
+            p.endpoint = s.endpoint;
+            p.epoch = s.pool_epoch;
+            p.since = jwt_monotonic_ms();
+            p.fd = s.fd;
+            p.tls = s.tls;
+            p.ssl = s.ssl;
+            s.fd = -1;
+            s.tls = {};
+            s.ssl = nullptr;
+            return success(s, 1);
+        }
+    }
+    close(s);
+    return success(s, 0);
+}
 void* NetClientWorker::entry(void* pointer) {
     static_cast<NetClientWorker*>(pointer)->run();
     return nullptr;
@@ -230,6 +323,7 @@ void* NetClientWorker::entry(void* pointer) {
 void NetClientWorker::run() {
     const timespec idle{0, 1000000};
     while (!__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
+        sweep(jwt_monotonic_ms());
         for (u32 i = 0; i < kCapacity; ++i) {
             auto& s = slots[i];
             const auto phase = __atomic_load_n(&s.phase, __ATOMIC_ACQUIRE);
@@ -248,6 +342,17 @@ void NetClientWorker::run() {
                                                  __ATOMIC_ACQ_REL,
                                                  __ATOMIC_ACQUIRE))
                     continue;
+                if (s.operation == NetOp::Tcp && borrow(s)) {
+                    success(s, s.token);
+                    u32 running = Running;
+                    __atomic_compare_exchange_n(&s.phase,
+                                                &running,
+                                                static_cast<u32>(Done),
+                                                false,
+                                                __ATOMIC_RELEASE,
+                                                __ATOMIC_RELAXED);
+                    continue;
+                }
                 s.offset = 0;
                 s.step = s.operation == NetOp::Tcp || s.operation == NetOp::Udp ? begin_connect
                          : s.operation == NetOp::Send                           ? write
@@ -260,7 +365,7 @@ void NetClientWorker::run() {
                 complete = true;
             } else {
                 // One bounded nonblocking step per worker turn.
-                complete = s.step(s);
+                complete = s.operation == NetOp::Release ? release(s) : s.step(s);
             }
             if (!complete) continue;
             OPENSSL_cleanse(s.pending, sizeof(s.pending));
@@ -275,6 +380,7 @@ void NetClientWorker::run() {
         nanosleep(&idle, nullptr);
     }
     for (u32 i = 0; i < kCapacity; ++i) close(slots[i]);
+    for (auto& p : parked) close(p);
 }
 bool NetClientWorker::success(Slot& s, u32 scalar) {
     s.reply.status = 0;

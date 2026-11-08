@@ -2969,7 +2969,7 @@ local, preserving arbitrary octets through the existing bounded serializer.
 See [the full contract](net-clients.md),
 [the executable example](../examples/tcp-udp-clients.rut) and
 [the Redis PING library](../examples/clients/redis.rut). Generic TCP listeners,
-unrestricted destinations, persistent pools, DNS and general-purpose streaming
+unrestricted destinations, DNS and general-purpose streaming
 parsing/iteration are not introduced by this profile. Single-byte subscripting
 is supported separately below.
 
@@ -3104,3 +3104,18 @@ mismatching confirmation fails with challenged 401; forwarded certificate header
 cannot satisfy it. Uses the existing `jwtCertificateBound` primitive; no language
 or native ABI change is added. See [the contract](oauth-introspection.md#optional-mtls-certificate-binding)
 and [the runnable example](../examples/mtls-introspection.rut).
+
+## Explicit TCP/TLS connection pooling
+
+TCP policy accepts optional `poolIdleMs: 1...60000` (UDP rejects it).
+`tcp(policy, timeoutMs)` may borrow a matching idle transport; the returned
+`TcpConnection` still belongs to the current request/stream and has a fresh token.
+After consuming a complete reply in reusable protocol state, bind
+`let returned = connection.release()`. This TCP-only resumable method returns
+bool, invalidates all aliases, and either parks a clean transport or closes it.
+`close()` always destroys; request completion and cancellation do not auto-pool.
+There are sixteen idle entries per shard worker, independent of sixteen active
+leases; endpoint/TLS identity and configuration epoch isolate pools. Reload
+retires idle transports and prevents old-config leases returning into new pools.
+No command replay or application-state reset is performed. See
+[pooling ownership and limits](net-clients.md#explicit-cross-request-tcptls-pooling).

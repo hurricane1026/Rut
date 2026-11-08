@@ -84,6 +84,7 @@ enum class Op : u8 {
     BytesConcat,
     FormatInt,
     BytesFromString,
+    NetRelease,
 };
 
 // Compiler-only raw-byte reads share the existing optional scalar carrier.

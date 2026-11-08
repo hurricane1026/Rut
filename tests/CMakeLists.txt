@@ -4453,6 +4453,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             set_tests_properties(test_parse_integers_${backend}_opt${parse_opt} PROPERTIES
                 LABELS "integration;network" TIMEOUT 60 SKIP_RETURN_CODE 77)
         endforeach()
+        foreach(pool_opt 0 2)
+            add_test(NAME test_net_client_pooling_${backend}_opt${pool_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_net_client_pooling.py
+                    --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR}
+                    --backend ${backend} --opt ${pool_opt})
+            set_tests_properties(test_net_client_pooling_${backend}_opt${pool_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        endforeach()
         foreach(command_opt 0 2)
             add_test(NAME test_resp2_commands_${backend}_opt${command_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_resp2_commands.py

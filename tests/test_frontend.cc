@@ -47948,3 +47948,56 @@ func answer(_ value: Box) -> Answer { Answer.found(value) }
     }
     std::filesystem::remove_all(directory);
 }
+
+TEST(frontend, tcp_release_is_resumable_verified_and_tcp_only) {
+    const char* source = R"rut(
+func park(_ connection: TcpConnection) -> bool { connection.release() }
+route GET "/" {
+    let opening = tcp("{\"address\":\"127.0.0.1\",\"port\":1234,\"poolIdleMs\":1000}", 100)
+    guard let connection = opening else { return 503 }
+    let released = park(connection)
+    guard released else { return 502 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    u32 releases = 0;
+    for (u32 b = 0; b < fn.block_count; ++b)
+        for (u32 i = 0; i < fn.blocks[b].inst_count; ++i) {
+            auto& inst = fn.blocks[b].insts[i];
+            if (inst.op != rir::Opcode::JsonOp ||
+                inst.imm.i32_val != static_cast<i32>(json::Op::NetRelease))
+                continue;
+            ++releases;
+            CHECK(rir::is_net_call(inst));
+            CHECK(rir::http_call_profile_valid(fn));
+            const u32 count = inst.operand_count;
+            inst.operand_count = 0;
+            CHECK(!rir::http_call_profile_valid(fn));
+            inst.operand_count = count;
+        }
+    CHECK_EQ(releases, 1u);
+    rir.destroy();
+    const char* invalid[] = {
+        R"rut(route GET "/" { let p = udp("{\"address\":\"127.0.0.1\",\"port\":1}",100) guard let c = p else { return 503 } let r = c.release() return 200 })rut",
+        R"rut(route GET "/" { let p = tcp("{\"address\":\"127.0.0.1\",\"port\":1}",100) let r = p.release() return 200 })rut",
+        R"rut(route GET "/" { let p = tcp("{\"address\":\"127.0.0.1\",\"port\":1}",100) guard let c = p else { return 503 } let r = c.release(1) return 200 })rut"};
+    for (const char* input : invalid) {
+        auto ts = lex(lit(input));
+        REQUIRE(ts);
+        auto file = parse_file_heap(ts.value());
+        REQUIRE(file);
+        CHECK(!analyze_file_heap(file.value()));
+    }
+}

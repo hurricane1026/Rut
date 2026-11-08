@@ -20,12 +20,13 @@ func exampleSetStatus(_ result: RedisSetResult) -> i32 {
         _ => 502
     }
 }
-// Configuration is the existing fixed TCP/TLS endpoint policy JSON.
+// Fixed TCP/TLS endpoint policy; add poolIdleMs (1...60000) for cross-request reuse.
+// Plain GET/SET restore protocol state. Failed replies already close the handle.
 route POST "/get" {
     let pendingOpen = tcp(env("REDIS_ENDPOINT"), 1000)
     guard let connection = pendingOpen else { return 503 }
     let result = redisGet(connection, req.bodyBytes)
-    let closed = connection.close()
+    let closed = connection.release()
     let status = exampleGetStatus(result)
     guard status != 404 else { return 404 }
     guard status != 413 else { return 413 }
@@ -37,7 +38,7 @@ route POST "/set" {
     let pendingOpen = tcp(env("REDIS_ENDPOINT"), 1000)
     guard let connection = pendingOpen else { return 503 }
     let result = redisSet(connection, b"example-key", req.bodyBytes)
-    let closed = connection.close()
+    let closed = connection.release()
     let status = exampleSetStatus(result)
     guard status != 413 else { return 413 }
     guard status != 504 else { return 504 }

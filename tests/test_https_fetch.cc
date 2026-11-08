@@ -917,3 +917,194 @@ TEST(net_client, bounded_sessions_validate_owner_generation_close_and_cancel) {
     REQUIRE(worker.start().has_value());
     worker.stop();
 }
+
+namespace {
+struct PoolOrigin {
+    int listener = -1;
+    int peers[64]{};
+    u32 count = 0;
+    u16 port = 0;
+    PoolOrigin() {
+        for (auto& peer : peers) peer = -1;
+    }
+    ~PoolOrigin() {
+        for (auto peer : peers)
+            if (peer >= 0) ::close(peer);
+        if (listener >= 0) ::close(listener);
+    }
+    bool init() {
+        listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (listener < 0 ||
+            bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+            listen(listener, 32))
+            return false;
+        socklen_t size = sizeof(address);
+        if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size)) return false;
+        port = ntohs(address.sin_port);
+        return true;
+    }
+    int accept_one() {
+        pollfd ready{listener, POLLIN, 0};
+        if (count == 64 || poll(&ready, 1, 1000) != 1) return -1;
+        const int fd = accept(listener, nullptr, nullptr);
+        if (fd >= 0) peers[count++] = fd;
+        return fd;
+    }
+    bool no_connect() {
+        pollfd ready{listener, POLLIN, 0};
+        return poll(&ready, 1, 0) == 0;
+    }
+};
+NetReply pool_call(NetClientWorker& worker,
+                   NetOp op,
+                   u32 owner,
+                   u64 generation,
+                   u32 handle,
+                   const NetEndpoint* endpoint = nullptr,
+                   const void* config = nullptr,
+                   i32 amount = 0) {
+    NetReply reply;
+    for (u32 i = 0; i < 2000; ++i) {
+        reply = worker.call(
+            owner, generation, op, handle, endpoint, {}, amount, jwt_monotonic_ms(), 1500, config);
+        if (reply.status != NetReply::kPending) return reply;
+        usleep(1000);
+    }
+    return reply;
+}
+}  // namespace
+
+TEST(net_client, explicit_pool_leases_fence_aliases_and_retired_configuration) {
+    PoolOrigin origin;
+    REQUIRE(origin.init());
+    NetClientWorker worker;
+    REQUIRE(worker.start().has_value());
+    NetEndpoint endpoint;
+    REQUIRE(net_endpoint(
+        lit_str(R"({"address":"127.0.0.1","port":1,"poolIdleMs":1000})"), false, endpoint));
+    endpoint.port = origin.port;
+    int config_a = 0, config_b = 0;
+    worker.adopt_config(&config_a);
+    auto first = pool_call(worker, NetOp::Tcp, 1, 1, 0, &endpoint, &config_a);
+    REQUIRE(first.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    auto released = pool_call(worker, NetOp::Release, 1, 1, first.scalar);
+    CHECK_EQ(released.status, 0);
+    CHECK_EQ(released.scalar, 1u);
+    CHECK_EQ(pool_call(worker, NetOp::Send, 1, 1, first.scalar).status, -4);
+    worker.cancel(1, 1);  // completion must not kill a detached pooled transport
+    auto second = pool_call(worker, NetOp::Tcp, 2, 7, 0, &endpoint, &config_a);
+    REQUIRE(second.status == 0);
+    CHECK(second.scalar != first.scalar);
+    CHECK(origin.no_connect());
+    CHECK_EQ(pool_call(worker, NetOp::Close, 1, 1, second.scalar).status, -4);
+    CHECK_EQ(pool_call(worker, NetOp::Close, 2, 8, second.scalar).status, -4);
+    worker.adopt_config(&config_b);
+    // An active request under the retired config can finish, but cannot park.
+    CHECK_EQ(pool_call(worker, NetOp::Release, 2, 7, second.scalar).scalar, 0u);
+    auto third = pool_call(worker, NetOp::Tcp, 3, 1, 0, &endpoint, &config_b);
+    REQUIRE(third.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 3, 1, third.scalar).scalar, 1u);
+    worker.adopt_config(&config_a);
+    auto fourth = pool_call(worker, NetOp::Tcp, 4, 1, 0, &endpoint, &config_a);
+    REQUIRE(fourth.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    worker.cancel(4, 1);  // cancellation never implicitly returns an active lease
+    usleep(10000);
+    auto fifth = pool_call(worker, NetOp::Tcp, 5, 1, 0, &endpoint, &config_a);
+    REQUIRE(fifth.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    worker.stop();
+}
+
+TEST(net_client, pool_discards_buffered_eof_expired_and_unconfigured_transports) {
+    PoolOrigin origin;
+    REQUIRE(origin.init());
+    NetClientWorker worker;
+    REQUIRE(worker.start().has_value());
+    NetEndpoint endpoint;
+    REQUIRE(net_endpoint(
+        lit_str(R"({"address":"127.0.0.1","port":1,"poolIdleMs":20})"), false, endpoint));
+    endpoint.port = origin.port;
+    auto first = pool_call(worker, NetOp::Tcp, 1, 1, 0, &endpoint);
+    REQUIRE(first.status == 0);
+    const int peer = origin.accept_one();
+    REQUIRE(peer >= 0);
+    REQUIRE(send(peer, "OK\r\nJUNK", 8, MSG_NOSIGNAL) == 8);
+    auto line = pool_call(worker, NetOp::ReadLine, 1, 1, first.scalar, nullptr, nullptr, 64);
+    REQUIRE(line.status == 0);
+    CHECK_EQ(line.length, 4u);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 1, 1, first.scalar).scalar, 0u);
+    auto second = pool_call(worker, NetOp::Tcp, 2, 1, 0, &endpoint);
+    REQUIRE(second.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 2, 1, second.scalar).scalar, 1u);
+    usleep(40000);
+    auto third = pool_call(worker, NetOp::Tcp, 3, 1, 0, &endpoint);
+    REQUIRE(third.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 3, 1, third.scalar).scalar, 1u);
+    ::close(origin.peers[2]);
+    origin.peers[2] = -1;
+    usleep(5000);
+    auto fourth = pool_call(worker, NetOp::Tcp, 4, 1, 0, &endpoint);
+    REQUIRE(fourth.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 4, 1, fourth.scalar).scalar, 1u);
+    endpoint.pool_idle_ms = 0;
+    auto fifth = pool_call(worker, NetOp::Tcp, 5, 1, 0, &endpoint);
+    REQUIRE(fifth.status == 0);
+    REQUIRE(origin.accept_one() >= 0);
+    CHECK_EQ(pool_call(worker, NetOp::Release, 5, 1, fifth.scalar).scalar, 0u);
+    worker.stop();
+}
+
+TEST(net_client, pool_policy_is_tcp_only_strict_and_bounded) {
+    NetEndpoint endpoint;
+    const char* invalid[] = {R"({"address":"127.0.0.1","port":1,"poolIdleMs":0})",
+                             R"({"address":"127.0.0.1","port":1,"poolIdleMs":60001})",
+                             R"({"address":"127.0.0.1","port":1,"poolIdleMs":1.5})",
+                             R"({"address":"127.0.0.1","port":1,"poolIdleMs":"1000"})",
+                             R"({"address":"127.0.0.1","port":1,"poolIdleMs":1,"poolIdleMs":2})"};
+    for (const char* input : invalid) CHECK(!net_endpoint(text(input), false, endpoint));
+    CHECK(!net_endpoint(
+        lit_str(R"({"address":"127.0.0.1","port":1,"poolIdleMs":1})"), true, endpoint));
+    CHECK(net_endpoint(
+        lit_str(R"({"address":"127.0.0.1","port":1,"poolIdleMs":60000})"), false, endpoint));
+}
+
+TEST(net_client, idle_pool_capacity_does_not_consume_live_lease_slots) {
+    PoolOrigin origin;
+    REQUIRE(origin.init());
+    NetClientWorker worker;
+    REQUIRE(worker.start().has_value());
+    NetEndpoint endpoint;
+    REQUIRE(net_endpoint(
+        lit_str(R"({"address":"127.0.0.1","port":1,"poolIdleMs":5000})"), false, endpoint));
+    endpoint.port = origin.port;
+    u32 handles[NetClientWorker::kCapacity]{};
+    for (u32 i = 0; i < NetClientWorker::kCapacity; ++i) {
+        auto result = pool_call(worker, NetOp::Tcp, i + 1, 1, 0, &endpoint);
+        REQUIRE(result.status == 0);
+        handles[i] = result.scalar;
+        REQUIRE(origin.accept_one() >= 0);
+    }
+    for (u32 i = 0; i < NetClientWorker::kCapacity; ++i)
+        CHECK_EQ(pool_call(worker, NetOp::Release, i + 1, 1, handles[i]).scalar, 1u);
+    // Change an endpoint-key component: all parked entries remain in their own
+    // pool while all sixteen live slots can still be independently leased.
+    endpoint.pool_idle_ms = 4000;
+    for (u32 i = 0; i < NetClientWorker::kCapacity; ++i) {
+        auto result = pool_call(worker, NetOp::Tcp, i + 1, 2, 0, &endpoint);
+        REQUIRE(result.status == 0);
+        handles[i] = result.scalar;
+        REQUIRE(origin.accept_one() >= 0);
+    }
+    for (u32 i = 0; i < NetClientWorker::kCapacity; ++i)
+        CHECK_EQ(pool_call(worker, NetOp::Release, i + 1, 2, handles[i]).scalar, 0u);
+    worker.stop();
+}

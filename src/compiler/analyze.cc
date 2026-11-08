@@ -5008,7 +5008,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
 
     if (expr.name.eq(lit_str("send")) || expr.name.eq(lit_str("receive")) ||
         expr.name.eq(lit_str("readExactly")) || expr.name.eq(lit_str("readLine")) ||
-        expr.name.eq(lit_str("close"))) {
+        expr.name.eq(lit_str("close")) || expr.name.eq(lit_str("release"))) {
         const auto saved = route->exprs.len;
         const auto saved_guards = route->guards.len;
         auto receiver = receiver_override
@@ -5019,13 +5019,15 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             constexpr auto detail = lit_str(
                 "network methods require an unwrapped connection, bounded bytes/amount and literal "
                 "timeoutMs (1...60000)");
-            const bool closing = expr.name.eq(lit_str("close"));
+            const bool releasing = expr.name.eq(lit_str("release"));
+            const bool closing = expr.name.eq(lit_str("close")) || releasing;
             const bool sending = expr.name.eq(lit_str("send"));
             if (!route || route->is_timer || receiver->may_nil || receiver->may_error ||
-                expr.args.len != (closing ? 0u : 2u))
+                expr.args.len != (closing ? 0u : 2u) ||
+                (releasing && receiver->type != HirTypeKind::TcpConnection))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
             if (closing)
-                return make_json_op(json::Op::NetClose,
+                return make_json_op(releasing ? json::Op::NetRelease : json::Op::NetClose,
                                     HirTypeKind::Bool,
                                     false,
                                     &receiver.value(),
@@ -5996,7 +5998,8 @@ static bool hir_has_resumable_call(const HirExpr& value, u32 depth = 0) {
     if (value.kind == HirExprKind::JsonOp &&
         (value.int_value == static_cast<i64>(json::Op::HttpCall) ||
          (value.int_value >= static_cast<i64>(json::Op::NetTcp) &&
-          value.int_value <= static_cast<i64>(json::Op::NetClose))))
+          value.int_value <= static_cast<i64>(json::Op::NetClose)) ||
+         value.int_value == static_cast<i64>(json::Op::NetRelease)))
         return true;
     if (value.kind == HirExprKind::BoundValue) return false;
     if (value.lhs && hir_has_resumable_call(*value.lhs, depth + 1)) return true;

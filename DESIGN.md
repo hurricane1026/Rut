@@ -10598,3 +10598,23 @@ by visible name, preserving sibling/namespace composition. An arena-backed sorte
 chunk directory accelerates compiler node-pointer rebasing; bound references do
 not repeatedly traverse their owning initializer during named-error walks. See
 [the contracts and validation](docs/resp2-commands.md).
+
+
+### Explicit client transport pooling
+
+`tcp` policy may enable `poolIdleMs` (1–60000); UDP remains unpooled. A request
+owns a fresh, generation-fenced lease token. `TcpConnection.release() -> bool`
+explicitly parks a clean TCP/TLS transport after protocol validation, invalidating
+aliases; rejection closes instead. `close()` and automatic terminal cleanup always
+destroy active leases. No write replay is added. Release uses the existing
+resumable callout ABI and counts toward its sixteen-operation budget.
+
+The existing per-shard nonblocking worker exclusively owns a separate bounded
+sixteen-entry idle pool, including SSL/context ownership. No request pointer or
+arena survives return. Exact endpoint, TLS identity/trust path, idle policy and
+monotonic config epoch determine eligibility. Config adoption advances the epoch;
+old idle entries are swept and old leases cannot return into new policy pools.
+Idle deadlines and nonblocking pending-input/EOF checks run before reuse; TLS
+control input is conservatively rejected. Application framing and session-state
+restoration remain the protocol library's responsibility. Shutdown joins the
+worker and reclaims both active and idle sockets on either I/O backend.

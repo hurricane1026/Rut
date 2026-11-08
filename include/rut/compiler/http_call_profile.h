@@ -5,8 +5,10 @@
 
 namespace rut::rir {
 inline bool is_net_call(const Instruction& inst) {
-    return inst.op == Opcode::JsonOp && inst.imm.i32_val >= static_cast<i32>(json::Op::NetTcp) &&
-           inst.imm.i32_val <= static_cast<i32>(json::Op::NetClose);
+    return inst.op == Opcode::JsonOp &&
+           ((inst.imm.i32_val >= static_cast<i32>(json::Op::NetTcp) &&
+             inst.imm.i32_val <= static_cast<i32>(json::Op::NetClose)) ||
+            inst.imm.i32_val == static_cast<i32>(json::Op::NetRelease));
 }
 inline bool is_http_call(const Instruction& inst) {
     return inst.op == Opcode::JsonOp &&
@@ -15,7 +17,7 @@ inline bool is_http_call(const Instruction& inst) {
 inline bool net_call_profile_valid(const Function& fn, const Instruction& inst) {
     const auto op = static_cast<json::Op>(inst.imm.i32_val);
     const bool open = op == json::Op::NetTcp || op == json::Op::NetUdp;
-    const bool close = op == json::Op::NetClose;
+    const bool close = op == json::Op::NetClose || op == json::Op::NetRelease;
     const bool scalar = open || op == json::Op::NetSend;
     if (inst.operand_count != (close  ? 1u
                                : open ? 2u

@@ -12,6 +12,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 #include <atomic>
@@ -2471,7 +2472,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             }
             if (rir::is_net_call(inst)) {
                 const bool opening = kJsonOp == json::Op::NetTcp || kJsonOp == json::Op::NetUdp;
-                const bool closing = kJsonOp == json::Op::NetClose;
+                const bool releasing = kJsonOp == json::Op::NetRelease;
+                const bool closing = kJsonOp == json::Op::NetClose || releasing;
                 const bool sending = kJsonOp == json::Op::NetSend;
                 const bool scalar_result = opening || sending;
                 auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
@@ -2490,7 +2492,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                             : sending ? c.get_value(inst.operand(1))
                                       : LLVMGetUndef(c.str_ty);
                 auto handle = opening ? LLVMConstInt(c.i32_ty, 0, 0) : c.get_value(inst.operand(0));
-                auto timeout = closing ? LLVMConstInt(c.i32_ty, 1, 0)
+                auto timeout = closing ? LLVMConstInt(c.i32_ty, releasing ? 1000 : 1, 0)
                                        : c.get_value(inst.operand(opening ? 1 : 2));
                 auto amount = opening || closing || sending ? LLVMConstInt(c.i32_ty, 0, 0)
                                                             : c.get_value(inst.operand(1));
@@ -2510,9 +2512,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_net_call", type);
                 LLVMValueRef args[] = {
                     c.param_conn,
-                    LLVMConstInt(c.i32_ty,
-                                 static_cast<u32>(kJsonOp) - static_cast<u32>(json::Op::NetTcp),
-                                 0),
+                    LLVMConstInt(
+                        c.i32_ty,
+                        releasing ? static_cast<u32>(rut::NetOp::Release)
+                                  : static_cast<u32>(kJsonOp) - static_cast<u32>(json::Op::NetTcp),
+                        0),
                     handle,
                     opening || sending ? LLVMBuildExtractValue(c.builder, data, 0, "net.data")
                                        : LLVMConstNull(c.ptr_ty),

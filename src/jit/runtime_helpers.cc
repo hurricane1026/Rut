@@ -23,6 +23,7 @@
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/parse_integer.h"
 #include "rut/runtime/password_gateway.h"
@@ -398,7 +399,7 @@ extern "C" u64 rut_helper_net_call(void* connection,
     *scalar = 0;
     *out = nullptr;
     *length = 0;
-    if (!connection || operation > static_cast<u32>(NetOp::Close)) return 0;
+    if (!connection || operation > static_cast<u32>(NetOp::Release)) return 0;
     const auto op = static_cast<NetOp>(operation);
     NetEndpoint endpoint;
     const bool opening = op == NetOp::Tcp || op == NetOp::Udp;

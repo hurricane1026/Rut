@@ -104,7 +104,9 @@ No command is automatically retried. A failed send may follow a partial write;
 a missing/malformed acknowledgement can follow an executed SET. The application
 must decide whether retrying is safe. Normal request completion, cancellation and
 shutdown retain the transport's existing cleanup rules. Connections are still
-scoped to one request/shard generation; this adds no cross-request pool.
+scoped to one request/shard generation. With `poolIdleMs` configured, the caller
+may explicitly `release()` after a validated GET/SET result to reuse the transport
+in a later request; see [pooling](net-clients.md#explicit-cross-request-tcptls-pooling).
 
 The 8192-byte frame/send limit is independent of the existing 8192-byte saved
 HTTP request limit. An HTTP body plus its headers can exceed snapshot capacity

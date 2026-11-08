@@ -26,7 +26,8 @@ static bool hir_has_http_call(const HirExpr& expr, u32 depth = 0) {
     if (expr.kind == HirExprKind::JsonOp &&
         (expr.int_value == static_cast<i64>(json::Op::HttpCall) ||
          (expr.int_value >= static_cast<i64>(json::Op::NetTcp) &&
-          expr.int_value <= static_cast<i64>(json::Op::NetClose))))
+          expr.int_value <= static_cast<i64>(json::Op::NetClose)) ||
+         expr.int_value == static_cast<i64>(json::Op::NetRelease)))
         return true;
     if (expr.lhs && hir_has_http_call(*expr.lhs, depth + 1)) return true;
     if (expr.rhs && hir_has_http_call(*expr.rhs, depth + 1)) return true;
