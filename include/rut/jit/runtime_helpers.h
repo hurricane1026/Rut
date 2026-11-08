@@ -17,6 +17,8 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 // data. JIT'd code passes raw request bytes; helpers parse as needed.
 
 extern "C" {
+// Strict signed decimal parsing. Always initializes output, including on failure.
+rut::u8 rut_helper_parse_int(const char* data, rut::u32 length, rut::u32 bits, rut::i64* output);
 void* rut_helper_http_call_frame(
     void* conn, void* ctx, rut::u64 size, const rut::u8* request, rut::u32 length);
 rut::u64 rut_helper_net_call(void* connection,

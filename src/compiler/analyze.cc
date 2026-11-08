@@ -14168,6 +14168,27 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
     }
 
+    if ((expr.name.eq(lit_str("parseInt")) || expr.name.eq(lit_str("parseInt64"))) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto detail = lit_str("parseInt/parseInt64 expects one unwrapped str or Bytes");
+        if (!route || expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        auto value = analyze_builtin_arg(*expr.args[0]);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->may_nil || value->may_error ||
+            (value->type != HirTypeKind::Str && value->type != HirTypeKind::Bytes))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        const bool wide = expr.name.eq(lit_str("parseInt64"));
+        return make_json_op(wide ? json::Op::ParseInt64 : json::Op::ParseInt,
+                            wide ? HirTypeKind::I64 : HirTypeKind::I32,
+                            true,
+                            &value.value(),
+                            nullptr,
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
     // `i64(x)` — Swift-initializer-style conversion builtin. A user binding
     // or function named `i64` shadows it (same rule as the bitwise
     // namespace). Identity on i64, fold on literals, WidenI64 (sign-extend)

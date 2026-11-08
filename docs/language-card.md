@@ -217,10 +217,35 @@ match e {
 protocol Hashable { func hash() -> u64 }
 User impl Hashable { func hash() -> u64 => fnv64(self.id) }  // Type impl Protocol (NOT impl T: P)
 
-parseInt("42")        // ⏳ i32? — parse APIs for text (parseFloat, IP.parse,
-                      //         CIDR.parse, Duration.parse) all pending
+parseInt("42")             // i32? — strict decimal, str or Bytes
+parseInt64(b"9223372036854775807")  // i64? — inferred wide result
+// ⏳ parseFloat, IP.parse, CIDR.parse and Duration.parse remain pending
 200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
+
+## Decimal integer parsing
+
+`parseInt(value)` returns `i32?`; `parseInt64(value)` returns `i64?`.
+Both accept an unwrapped `str` or `Bytes`, without imports, allocation or text
+conversion. The **entire** input must match `[+-]?[0-9]+` and fit the signed
+result range. Leading zeros and signed zero are accepted. Empty input, spaces,
+CRLF, embedded NUL, non-ASCII digits, suffixes, fractions, exponents and overflow
+return `nil`; there is no trimming, wrapping, clamping or partial parsing.
+They do not modify `netError()`. Ordinary user functions can shadow these names.
+
+```swift
+route POST "/number" {
+    guard let count = parseInt(req.query("count").or("20")) else { return 400 }
+    guard let sequence = parseInt64(req.bodyBytes) else { return 400 }
+    guard count > 0 && sequence >= 0 else { return 422 }
+    return 204
+}
+```
+
+Use `guard let`, `if let`, `== nil` or `.or(...)` to handle failure. The existing
+`i64(...)` builtin widens an `i32`; it does not parse text. Source-level `i64`
+type annotations and unsigned 64-bit results remain unsupported. See
+[the parsing contract and performance study](parse-integers.md).
 
 ## Process access log
 

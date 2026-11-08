@@ -1,0 +1,7 @@
+// No imports: both text and raw network Bytes can be parsed directly.
+route POST "/sequence" {
+    let count = parseInt(req.query("count").or("20")).or(20)
+    guard let sequence = parseInt64(req.bodyBytes) else { return 400 }
+    guard count > 0 && sequence >= 0 else { return 422 }
+    return 204
+}

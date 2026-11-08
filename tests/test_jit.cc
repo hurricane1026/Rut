@@ -539,6 +539,83 @@ TEST(jit, bytes_subscripts_execute_without_arena_and_reject_malformed_rir) {
     tc.destroy();
 }
 
+TEST(jit, decimal_integer_parsing_initializes_failures_and_validates_rir_shapes) {
+    i64 value = 123;
+    CHECK_EQ(rut_helper_parse_int(nullptr, 10, 64, &value), 0u);
+    CHECK_EQ(value, 0);
+    CHECK_EQ(rut_helper_parse_int("42", 2, 16, &value), 0u);
+    CHECK_EQ(value, 0);
+    CHECK_EQ(rut_helper_parse_int("42", 2, 64, nullptr), 0u);
+    const bool widths[] = {false, true};
+    for (bool wide : widths) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder builder;
+        builder.init(&tc.mod);
+        auto* fn = V(builder.create_function(lit("decimal"), lit("/"), 'G'));
+        const auto entry = V(builder.create_block(fn, lit("entry")));
+        builder.set_insert_point(fn, entry);
+        const auto body = V(builder.emit_req_body());
+        const auto op = static_cast<u32>(wide ? json::Op::ParseInt64 : json::Op::ParseInt);
+        const auto kind = wide ? TypeKind::I64 : TypeKind::I32;
+        CHECK(!builder.emit_json(op, kind, true, &body, 0));
+        CHECK(!builder.emit_json(op, kind, false, &body, 1));
+        CHECK(!builder.emit_json(op, wide ? TypeKind::I32 : TypeKind::I64, true, &body, 1));
+        const auto result = V(builder.emit_json(op, kind, true, &body, 1));
+        const auto missing = V(builder.emit_opt_is_nil(result));
+        const auto ok = V(builder.emit_const_i32(204));
+        const auto bad = V(builder.emit_const_i32(400));
+        VOK(builder.emit_ret_status(V(builder.emit_select(missing, bad, ok))));
+        CHECK(verify_module(tc.mod).ok);
+        auto cg = codegen(tc.mod);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_decimal"));
+        REQUIRE(handler);
+        const char* inputs[] = {"+42",
+                                "-2147483648",
+                                "2147483648",
+                                "-9223372036854775808",
+                                "9223372036854775808",
+                                "42x",
+                                "",
+                                "42\r\n"};
+        const u32 expected32[] = {204, 204, 400, 400, 400, 400, 400, 400};
+        const u32 expected64[] = {204, 204, 204, 204, 400, 400, 400, 400};
+        for (u32 i = 0; i < 8; ++i) {
+            std::string wire = "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: ";
+            wire += std::to_string(strlen(inputs[i]));
+            wire += "\r\n\r\n";
+            wire += inputs[i];
+            CHECK_EQ(HandlerResult::unpack(handler(nullptr,
+                                                   nullptr,
+                                                   reinterpret_cast<const u8*>(wire.data()),
+                                                   wire.size(),
+                                                   nullptr))
+                         .status_code,
+                     wide ? expected64[i] : expected32[i]);
+        }
+        auto& instruction = fn->blocks[entry.id].insts[1];
+        instruction.operand_count = 0;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operand_count = 1;
+        instruction.operands[0] = ok;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operands[0] = body;
+        const auto* saved = fn->values[result.id].type;
+        fn->values[result.id].type = fn->values[ok.id].type;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        fn->values[result.id].type = saved;
+        engine.shutdown();
+        tc.destroy();
+    }
+}
+
 TEST(jit, builtin_bytes_integer_reads_execute_and_validate_scalar_shapes) {
     struct Reader {
         json::Op operation;

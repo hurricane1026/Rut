@@ -130,6 +130,34 @@ add_library(rut_crypto STATIC
 target_include_directories(rut_crypto PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_crypto PUBLIC rut_crypto_rsa_core)
 
+# Integer parsing is selected independently of HTTP scanning so CI can compare
+# candidates before changing the measured portable default. ISA flags stay local.
+set(RUT_INTEGER_ARCH "portable" CACHE STRING "Integer parser: portable, sse2, avx2, avx512, neon")
+set_property(CACHE RUT_INTEGER_ARCH PROPERTY STRINGS portable sse2 avx2 avx512 neon)
+add_library(rut_integer_parser STATIC runtime/parse_integer.cc)
+target_include_directories(rut_integer_parser PUBLIC ${PROJECT_SOURCE_DIR}/include)
+if(RUT_INTEGER_ARCH MATCHES "^(sse2|avx2|avx512)$")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        message(FATAL_ERROR "RUT_INTEGER_ARCH=${RUT_INTEGER_ARCH} requires x86_64")
+    endif()
+    if(RUT_INTEGER_ARCH STREQUAL "sse2")
+        target_compile_options(rut_integer_parser PRIVATE -msse2)
+    elseif(RUT_INTEGER_ARCH STREQUAL "avx2")
+        target_compile_options(rut_integer_parser PRIVATE -mavx2)
+    else()
+        target_compile_options(rut_integer_parser PRIVATE -mavx512f -mavx512bw)
+    endif()
+elseif(RUT_INTEGER_ARCH STREQUAL "neon")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        message(FATAL_ERROR "RUT_INTEGER_ARCH=neon requires aarch64")
+    endif()
+elseif(NOT RUT_INTEGER_ARCH STREQUAL "portable")
+    message(FATAL_ERROR "Unknown RUT_INTEGER_ARCH '${RUT_INTEGER_ARCH}'")
+endif()
+string(TOUPPER "${RUT_INTEGER_ARCH}" RUT_INTEGER_ARCH_UPPER)
+target_compile_definitions(rut_integer_parser PRIVATE "RUT_INTEGER_ARCH_${RUT_INTEGER_ARCH_UPPER}=1")
+message(STATUS "Integer parser: ${RUT_INTEGER_ARCH}")
+
 add_library(rut_runtime STATIC
     runtime/hash.cc
     runtime/password.cc
@@ -200,6 +228,7 @@ target_include_directories(rut_runtime PUBLIC
 # runtime itself is warn_unused_result-clean.
 target_compile_options(rut_runtime PRIVATE -Werror=unused-result)
 target_link_libraries(rut_runtime PUBLIC
+    rut_integer_parser
     rut_crypto
     zstd_compress
     ssl

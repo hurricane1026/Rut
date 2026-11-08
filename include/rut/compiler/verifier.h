@@ -56,6 +56,7 @@ enum class VerifyIssueCode : u8 {
     InvalidWsOutput,
     InvalidPhi,
     InvalidBytesSubscript,
+    InvalidIntegerParse,
 };
 
 struct VerifyIssue {
@@ -95,6 +96,23 @@ inline bool valid_bytes_read(const Function& fn, const Instruction& inst) {
            kExact(inst.operands[0], TypeKind::Str) && kExact(inst.operands[1], TypeKind::I32) &&
            result && result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
            result->inner->kind == (spec.wide ? TypeKind::I64 : TypeKind::I32) &&
+           !result->inner->inner && !result->inner->struct_def;
+}
+
+inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::JsonOp) return true;
+    const auto op = static_cast<json::Op>(inst.imm.i32_val);
+    if (op != json::Op::ParseInt && op != json::Op::ParseInt64) return true;
+    if (inst.operand_count != 1 || inst.extra_operands) return false;
+    const auto type_of = [&](ValueId id) -> const Type* {
+        return id != kNoValue && id.id < fn.value_count && fn.values ? fn.values[id.id].type
+                                                                     : nullptr;
+    };
+    const Type* input = type_of(inst.operands[0]);
+    const Type* result = type_of(inst.result);
+    return input && input->kind == TypeKind::Str && !input->inner && !input->struct_def && result &&
+           result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
+           result->inner->kind == (op == json::Op::ParseInt64 ? TypeKind::I64 : TypeKind::I32) &&
            !result->inner->inner && !result->inner->struct_def;
 }
 
@@ -960,6 +978,9 @@ inline VerifyResult verify_function(const Function* fn,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
             }
+            if (!valid_integer_parse(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidIntegerParse, function_index, bi, ii);
             if (!valid_bytes_read(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidBytesSubscript, function_index, bi, ii);

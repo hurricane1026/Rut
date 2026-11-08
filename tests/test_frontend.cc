@@ -9384,6 +9384,70 @@ TEST(frontend, bytes_subscripts_reject_wrong_types_optional_operands_and_unsuppo
     }
 }
 
+TEST(frontend, decimal_integer_builtins_preserve_optional_width_and_accept_bytes) {
+    const char* expressions[] = {"parseInt(\"42\")",
+                                 "parseInt(b\"42\")",
+                                 "parseInt64(\"42\")",
+                                 "parseInt64(req.bodyBytes)",
+                                 "\"42\" | parseInt(_)",
+                                 "b\"42\" | parseInt64(_)"};
+    for (u32 i = 0; i < 6; ++i) {
+        std::string source = "route POST \"/\" { let value = ";
+        source += expressions[i];
+        source += " guard let number = value else { return 400 } return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        const auto& result = hir->routes[0].locals[0];
+        CHECK(result.may_nil);
+        CHECK(result.type == (i == 2 || i == 3 || i == 5 ? HirTypeKind::I64 : HirTypeKind::I32));
+        ast.reset();
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, decimal_integer_builtins_require_one_unwrapped_text_or_bytes_argument) {
+    const char* expressions[] = {"parseInt()",
+                                 "parseInt(\"1\", \"2\")",
+                                 "parseInt(1)",
+                                 "parseInt(true)",
+                                 "parseInt64(i64(1))",
+                                 "parseInt(req.query(\"n\"))",
+                                 "parseInt(\"1\") + 1",
+                                 "parseInt64(nil)"};
+    for (const auto* expression : expressions) {
+        std::string source = "route GET \"/\" { let value = ";
+        source += expression;
+        source += " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* source = R"rut(
+func parseInt(_ value: i32) -> i32 { value + 1 }
+func parseInt64(_ value: i32) -> i32 { value + 2 }
+route GET "/" {
+    guard parseInt(1) == 2 else { return 500 }
+    guard parseInt64(1) == 3 else { return 500 }
+    return 204
+})rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, bytes_integer_methods_are_builtin_and_keep_exact_scalar_types) {
     const char* names[] = {"readU16BE",
                            "readU16LE",

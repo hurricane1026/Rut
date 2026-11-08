@@ -1097,6 +1097,12 @@ struct Builder {
              !val_has_type(args[1], TypeKind::I32) ||
              result != (bytes_read.wide ? TypeKind::I64 : TypeKind::I32) || !optional))
             return err(RirError::InvalidState);
+        const bool parse_int = op == static_cast<u32>(json::Op::ParseInt);
+        const bool parse_int64 = op == static_cast<u32>(json::Op::ParseInt64);
+        if ((parse_int || parse_int64) &&
+            (count != 1 || !args || !val_has_type(args[0], TypeKind::Str) || !optional ||
+             result != (parse_int64 ? TypeKind::I64 : TypeKind::I32)))
+            return err(RirError::InvalidState);
         const bool kResource =
             op == static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest);
         const bool kIntrospectionRequest =

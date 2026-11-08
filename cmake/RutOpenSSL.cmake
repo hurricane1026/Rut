@@ -39,7 +39,11 @@ rut_openssl_compiler_environment(_rut_openssl_cc _rut_openssl_cflags
 
 ExternalProject_Add(rut_openssl
     PREFIX "${_rut_openssl_prefix}"
-    URL https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+    # The release asset ID is a stable API path used only if the release URL fails.
+    URL
+        https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+        https://api.github.com/repos/openssl/openssl/releases/assets/598377651
+    HTTP_HEADER "Accept: application/octet-stream"
     URL_HASH SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
     CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
         "CC=${_rut_openssl_cc}" "AR=${CMAKE_AR}" "RANLIB=${CMAKE_RANLIB}"

@@ -2067,6 +2067,28 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::ParseInt || kJsonOp == json::Op::ParseInt64) {
+                const bool wide = kJsonOp == json::Op::ParseInt64;
+                const auto text = c.get_value(inst.operands[0]);
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty};
+                const auto type = LLVMFunctionType(c.i8_ty, params, 4, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_parse_int");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_parse_int", type);
+                const auto output = LLVMBuildAlloca(c.builder, c.i64_ty, "integer.output");
+                LLVMValueRef args[] = {LLVMBuildExtractValue(c.builder, text, 0, "integer.ptr"),
+                                       LLVMBuildExtractValue(c.builder, text, 1, "integer.len"),
+                                       LLVMConstInt(c.i32_ty, wide ? 64 : 32, 0),
+                                       output};
+                const auto has = LLVMBuildCall2(c.builder, type, helper, args, 4, "integer.has");
+                auto payload = LLVMBuildLoad2(c.builder, c.i64_ty, output, "integer.value");
+                if (!wide) payload = LLVMBuildTrunc(c.builder, payload, c.i32_ty, "integer.i32");
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder, result, has, 0, "");
+                result = LLVMBuildInsertValue(c.builder, result, payload, 1, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             const auto bytes_read = json::bytes_read_spec(kJsonOp);
             if (bytes_read.width) {
                 auto bytes = c.get_value(inst.operands[0]);
@@ -3656,7 +3678,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
-                if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst))
+                if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
+                    !rir::valid_integer_parse(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);
