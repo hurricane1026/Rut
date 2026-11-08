@@ -15,6 +15,9 @@ from pathlib import Path
 TLA2TOOLS_URL = (
     "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
 )
+TLA2TOOLS_FALLBACK_URL = (
+    "https://api.github.com/repos/tlaplus/tlaplus/releases/assets/184694200"
+)
 TLA2TOOLS_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
 
@@ -39,6 +42,7 @@ def acquire(
     max_time: float = 30,
     retries: int = 3,
     curl: str = "curl",
+    fallback_urls: tuple[str, ...] = (),
 ) -> None:
     """Download *url* and atomically publish it to *destination* on hash match.
 
@@ -54,39 +58,49 @@ def acquire(
     os.close(fd)
     staging = Path(staging_name)
     try:
-        command = [
-            curl,
-            "--fail",
-            "--location",
-            "--retry",
-            str(retries),
-            "--retry-all-errors",
-            "--connect-timeout",
-            str(connect_timeout),
-            "--max-time",
-            str(max_time),
-            "--output",
-            str(staging),
-            url,
-        ]
-        # Do not capture stderr: curl diagnostics and its distinct exit status
-        # remain visible to CI. The staging file is always ours to remove.
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            raise AcquisitionError(
-                f"curl failed with exit status {result.returncode}", result.returncode
-            )
+        last_error: AcquisitionError | None = None
+        for candidate_index, candidate in enumerate((url, *fallback_urls)):
+            command = [
+                curl,
+                "--fail",
+                "--location",
+                "--retry",
+                str(retries),
+                "--retry-all-errors",
+                "--connect-timeout",
+                str(connect_timeout),
+                "--max-time",
+                str(max_time),
+                "--output",
+                str(staging),
+            ]
+            if candidate_index > 0:
+                command.extend(["--header", "Accept: application/octet-stream"])
+            command.append(candidate)
+            # Do not capture stderr: curl diagnostics and its distinct exit
+            # status remain visible to CI. Each source gets the existing
+            # bounded retry policy; the fallback is attempted only on transfer
+            # failure, never after receiving bytes with the wrong hash.
+            result = subprocess.run(command, check=False)
+            if result.returncode != 0:
+                last_error = AcquisitionError(
+                    f"curl failed with exit status {result.returncode}", result.returncode
+                )
+                continue
 
-        digest = hashlib.sha256()
-        with staging.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        actual = digest.hexdigest()
-        if actual != expected_sha256:
-            raise ChecksumError(
-                f"checksum mismatch: expected {expected_sha256}, got {actual}"
-            )
-        os.replace(staging, destination)
+            digest = hashlib.sha256()
+            with staging.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            actual = digest.hexdigest()
+            if actual != expected_sha256:
+                raise ChecksumError(
+                    f"checksum mismatch: expected {expected_sha256}, got {actual}"
+                )
+            os.replace(staging, destination)
+            return
+        assert last_error is not None
+        raise last_error
     finally:
         try:
             staging.unlink()
@@ -99,7 +113,12 @@ def main() -> int:
     parser.add_argument("destination", type=Path)
     args = parser.parse_args()
     try:
-        acquire(TLA2TOOLS_URL, args.destination, TLA2TOOLS_SHA256)
+        acquire(
+            TLA2TOOLS_URL,
+            args.destination,
+            TLA2TOOLS_SHA256,
+            fallback_urls=(TLA2TOOLS_FALLBACK_URL,),
+        )
     except ChecksumError as exc:
         print(f"tla2tools acquisition checksum failure: {exc}", file=sys.stderr, flush=True)
         return 2

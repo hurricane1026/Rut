@@ -29,6 +29,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     payload = PAYLOAD
     mode = "valid"
     requests = 0
+    paths: list[str] = []
+    fallback_accept: str | None = None
     lock = threading.Lock()
     stall_release = threading.Event()
 
@@ -38,6 +40,21 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         with self.lock:
             type(self).requests += 1
+            type(self).paths.append(self.path)
+            if self.path.endswith("/fallback"):
+                type(self).fallback_accept = self.headers.get("Accept")
+        if self.mode == "primary-fails" and self.path.endswith("/primary"):
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.mode == "partial-primary" and self.path.endswith("/primary"):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(self.payload) + 1))
+            self.end_headers()
+            self.wfile.write(self.payload[:1])
+            self.wfile.flush()
+            return
         if self.mode == "retry":
             self.send_response(503)
             self.send_header("Content-Length", "0")
@@ -52,7 +69,9 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             type(self).stall_release.wait(timeout=30)
             return
         self.send_response(200)
-        if self.mode == "truncated-then-valid" and type(self).requests > 1:
+        if self.mode in ("primary-fails", "partial-primary"):
+            body = self.payload
+        elif self.mode == "truncated-then-valid" and type(self).requests > 1:
             body = self.payload
         else:
             body = self.payload if self.mode == "valid" else self.payload[:-3]
@@ -73,6 +92,8 @@ class Loopback(unittest.TestCase):
         os.environ["no_proxy"] = "127.0.0.1,localhost"
         Fixture.mode = "valid"
         Fixture.requests = 0
+        Fixture.paths = []
+        Fixture.fallback_accept = None
         Fixture.stall_release = threading.Event()
         self.server = socketserver.TCPServer(("127.0.0.1", 0), Fixture)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -136,7 +157,79 @@ class Loopback(unittest.TestCase):
         self.assertEqual(destination.read_bytes(), PAYLOAD)
         self.assertEqual(Fixture.requests, 2)
 
+    def test_failed_primary_uses_fallback_and_sends_binary_accept(self) -> None:
+        Fixture.mode = "primary-fails"
+        destination = self.tmp / "tools.jar"
+        acquire(
+            self.url + "/primary",
+            destination,
+            hashlib.sha256(PAYLOAD).hexdigest(),
+            retries=0,
+            fallback_urls=(self.url + "/fallback",),
+        )
+        self.assertEqual(destination.read_bytes(), PAYLOAD)
+        self.assertEqual(Fixture.paths, ["/artifact/primary", "/artifact/fallback"])
+        self.assertEqual(Fixture.fallback_accept, "application/octet-stream")
+
+    def test_wrong_primary_hash_does_not_try_fallback(self) -> None:
+        destination = self.tmp / "tools.jar"
+        with self.assertRaises(ChecksumError):
+            acquire(
+                self.url,
+                destination,
+                "0" * 64,
+                retries=0,
+                fallback_urls=(self.url + "/fallback",),
+            )
+        self.assertFalse(destination.exists())
+        self.assertEqual(Fixture.paths, ["/artifact"])
+        self.assertEqual(list(self.tmp.glob("*.part")), [])
+
+    def test_partial_primary_is_replaced_by_verified_fallback(self) -> None:
+        Fixture.mode = "partial-primary"
+        destination = self.tmp / "tools.jar"
+        acquire(
+            self.url + "/primary",
+            destination,
+            hashlib.sha256(PAYLOAD).hexdigest(),
+            max_time=1,
+            retries=0,
+            fallback_urls=(self.url + "/fallback",),
+        )
+        self.assertEqual(destination.read_bytes(), PAYLOAD)
+        self.assertEqual(Fixture.paths, ["/artifact/primary", "/artifact/fallback"])
+        self.assertEqual(Fixture.fallback_accept, "application/octet-stream")
+        self.assertEqual(list(self.tmp.glob("*.part")), [])
+
+    def test_last_fallback_curl_status_is_preserved(self) -> None:
+        Fixture.mode = "primary-fails"
+        TLSReset.requests = 0
+        tls_server = socketserver.TCPServer(("127.0.0.1", 0), TLSReset)
+        tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
+        tls_thread.start()
+        tls_url = f"https://127.0.0.1:{tls_server.server_address[1]}/artifact"
+        try:
+            with self.assertRaises(AcquisitionError) as failure:
+                acquire(
+                    self.url + "/primary",
+                    self.tmp / "tools.jar",
+                    hashlib.sha256(PAYLOAD).hexdigest(),
+                    retries=0,
+                    fallback_urls=(tls_url,),
+                )
+            self.assertEqual(failure.exception.returncode, 35)
+            self.assertEqual(Fixture.paths, ["/artifact/primary"])
+            self.assertEqual(TLSReset.requests, 1)
+            self.assertFalse((self.tmp / "tools.jar").exists())
+            self.assertEqual(list(self.tmp.glob("*.part")), [])
+        finally:
+            tls_server.shutdown()
+            tls_server.server_close()
+            tls_thread.join(timeout=2)
+            self.assertFalse(tls_thread.is_alive())
+
     def test_retry_policy_exhausts_at_most_four_requests(self) -> None:
+        TLSReset.requests = 0
         tls_server = socketserver.TCPServer(("127.0.0.1", 0), TLSReset)
         tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
         tls_thread.start()
