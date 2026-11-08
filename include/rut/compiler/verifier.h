@@ -99,6 +99,27 @@ inline bool valid_bytes_read(const Function& fn, const Instruction& inst) {
            !result->inner->inner && !result->inner->struct_def;
 }
 
+inline bool valid_bytes_field(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::JsonOp) return true;
+    const auto kOp = static_cast<json::Op>(inst.imm.i32_val);
+    if (kOp != json::Op::BytesSlice && kOp != json::Op::BytesFind) return true;
+    if (inst.operand_count != 3 || inst.extra_operands) return false;
+    const auto kExact = [&](ValueId id, TypeKind kind) {
+        if (id == kNoValue || id.id >= fn.value_count || !fn.values) return false;
+        const Type* type = fn.values[id.id].type;
+        return type && type->kind == kind && !type->inner && !type->struct_def;
+    };
+    if (!kExact(inst.operands[0], TypeKind::Str) ||
+        !kExact(inst.operands[1], kOp == json::Op::BytesSlice ? TypeKind::I32 : TypeKind::Str) ||
+        !kExact(inst.operands[2], TypeKind::I32) || inst.result == kNoValue ||
+        inst.result.id >= fn.value_count || !fn.values)
+        return false;
+    const Type* result = fn.values[inst.result.id].type;
+    return result && result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
+           result->inner->kind == (kOp == json::Op::BytesSlice ? TypeKind::Str : TypeKind::I32) &&
+           !result->inner->inner && !result->inner->struct_def;
+}
+
 inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
     if (inst.op != Opcode::JsonOp) return true;
     const auto op = static_cast<json::Op>(inst.imm.i32_val);
@@ -981,7 +1002,7 @@ inline VerifyResult verify_function(const Function* fn,
             if (!valid_integer_parse(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidIntegerParse, function_index, bi, ii);
-            if (!valid_bytes_read(*fn, inst))
+            if (!valid_bytes_read(*fn, inst) || !valid_bytes_field(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidBytesSubscript, function_index, bi, ii);
             if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;

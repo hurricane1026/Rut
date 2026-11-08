@@ -2618,6 +2618,68 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, bytes_fields_extract_protocol_values_and_preserve_binary_payloads) {
+    for (u8 optimization : {0, 2}) {
+        Source source;
+        REQUIRE(source.append(R"rut(
+func numberField(_ bytes: Bytes) -> Bytes {
+    guard let end = bytes.find(b"\r\n") else { nil }
+    bytes.slice(1, end)
+}
+route POST "/number" {
+    guard let field = numberField(req.bodyBytes) else { return 400 }
+    guard let number = parseInt(field) else { return 400 }
+    guard number == 123 else { return 422 }
+    guard b"abc".find(b"", 3).or(-1) == 3 else { return 500 }
+    guard b"abc".find(b"c", 2).or(-1) == 2 else { return 500 }
+    return 204
+}
+route GET "/bounds" {
+    guard b"abc".find(b"", -1) == nil else { return 500 }
+    guard let empty = b"".slice(0, 0) else { return 500 }
+    guard empty.isEmpty else { return 500 }
+    guard b"abc".slice(2, 1) == nil else { return 500 }
+    guard b"abc".slice(-1, 1) == nil else { return 500 }
+    guard b"abc".slice(0, 2147483647) == nil else { return 500 }
+    return 204
+}
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard let end = message.payload.find(b"\x00") else { message.drop() }
+    guard let field = message.payload.slice(0, end) else { message.drop() }
+    guard field == b"\xff" else { message.drop() }
+    message.forward()
+} }
+)rut"));
+        Program owner;
+        REQUIRE(owner.p);
+        REQUIRE(load(source, *owner.p, optimization));
+        REQUIRE_EQ(unlink(source.path), 0);
+        REQUIRE_EQ(owner.p->config.route_count, 3u);
+        const auto& route = owner.p->config.routes[0];
+        CHECK_EQ(invoke(route,
+                        "POST /number HTTP/1.1\r\nHost: test\r\nContent-Length: 6\r\n\r\n$123\r\n")
+                     .status_code,
+                 204u);
+        CHECK_EQ(invoke(route,
+                        "POST /number HTTP/1.1\r\nHost: test\r\nContent-Length: 6\r\n\r\n$12x\r\n")
+                     .status_code,
+                 400u);
+        CHECK_EQ(invoke(owner.p->config.routes[1], "GET /bounds HTTP/1.1\r\nHost: test\r\n\r\n")
+                     .status_code,
+                 204u);
+        const auto handler = owner.p->config.routes[2].ws_frame_handler;
+        REQUIRE(handler);
+        const Str payloads[] = {{"\xff\0", 2}, {"\xff", 1}, {"\0", 1}, {nullptr, 0}};
+        for (u32 i = 0; i < 4; ++i)
+            CHECK(handler(nullptr,
+                          WsOpcode::Binary,
+                          reinterpret_cast<const u8*>(payloads[i].ptr),
+                          payloads[i].len,
+                          true) == (i == 0 ? WsFrameAction::Forward : WsFrameAction::Drop));
+    }
+}
+
 TEST(native_program, decimal_integer_parsing_survives_source_removal_and_handles_websockets) {
     Source source;
     REQUIRE(source.append(R"rut(

@@ -1097,6 +1097,14 @@ struct Builder {
              !val_has_type(args[1], TypeKind::I32) ||
              result != (bytes_read.wide ? TypeKind::I64 : TypeKind::I32) || !optional))
             return err(RirError::InvalidState);
+        const bool bytes_slice = op == static_cast<u32>(json::Op::BytesSlice);
+        const bool bytes_find = op == static_cast<u32>(json::Op::BytesFind);
+        if ((bytes_slice || bytes_find) &&
+            (count != 3 || !args || !val_has_type(args[0], TypeKind::Str) ||
+             !val_has_type(args[1], bytes_slice ? TypeKind::I32 : TypeKind::Str) ||
+             !val_has_type(args[2], TypeKind::I32) || !optional ||
+             result != (bytes_slice ? TypeKind::Str : TypeKind::I32)))
+            return err(RirError::InvalidState);
         const bool parse_int = op == static_cast<u32>(json::Op::ParseInt);
         const bool parse_int64 = op == static_cast<u32>(json::Op::ParseInt64);
         if ((parse_int || parse_int64) &&

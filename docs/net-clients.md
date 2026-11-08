@@ -123,7 +123,7 @@ Use a let binding even for close when its Boolean result is ignored. Unwrapped
 read results support `bytes[index] -> i32?`: a zero-based i32 index yields an
 unsigned octet (0–255), or nil for a negative/out-of-range index. This lookup
 does not perform I/O or change `netError()`. Streaming subscriptions, background
-sessions, general parser loops, Bytes slices and cross-request pooling remain
+sessions, general parser loops and cross-request pooling remain
 separate follow-ups, not current capabilities.
 
 The [built-in Bytes methods](binary-integers.md) decode fixed-width integer
@@ -139,3 +139,8 @@ removal, byte-fragmented line/exact reads and surplus buffering, binary/empty/
 maximum-size datagrams, oversize rejection, trust failure, timeout, cancellation,
 concurrent calls, HTTP/2, TCP sessions retained across HTTP-call suspension and automatic close. Runtime unit tests check strict policy
 validation, bounded session capacity and handle owner/generation/close isolation.
+
+[Bytes field extraction](bytes-fields.md) provides checked `slice(start, end)` and
+`find(delimiter[, start])` methods. For a CRLF-terminated decimal field, locate
+CRLF, slice off the protocol prefix/terminator, then use `parseInt`/`parseInt64`.
+A slice retained across another network operation keeps the original read bytes.

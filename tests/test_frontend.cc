@@ -9384,6 +9384,73 @@ TEST(frontend, bytes_subscripts_reject_wrong_types_optional_operands_and_unsuppo
     }
 }
 
+TEST(frontend, bytes_fields_preserve_optional_types_and_compose_with_integer_parsing) {
+    const char* source = R"rut(
+func field(_ bytes: Bytes, _ start: i32, _ end: i32) -> Bytes => bytes.slice(start, end)
+protocol Finder { func find(_ index: i32) -> i32 }
+i32 impl Finder { func find(self: i32, _ index: i32) -> i32 => self + index }
+route POST "/field" {
+    let data = req.bodyBytes
+    guard let end = data.find(b"\r\n") else { return 400 }
+    guard let text = field(data, 1, end) else { return 400 }
+    guard let value = parseInt(text) else { return 400 }
+    guard value == 123 else { return 422 }
+    guard data.find(b"\r\n", end).or(-1) == end else { return 500 }
+    guard (3).find(1) == 4 else { return 500 }
+    return response(200, body: text)
+}
+upstream backend
+route GET "/ws" { return websocket(backend) { message in
+    guard let end = message.payload.find(b"\x00") else { message.drop() }
+    guard let payloadField = message.payload.slice(0, end) else { message.drop() }
+    message.forward(payloadField)
+} }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, bytes_fields_reject_wrong_types_and_optional_operands) {
+    const char* expressions[] = {R"(b"x".slice())",
+                                 R"(b"x".slice(0))",
+                                 R"(b"x".slice(0, 1, 2))",
+                                 R"(b"x".slice(true, 1))",
+                                 R"(b"x".slice(0, "1"))",
+                                 R"(b"x".slice(0, i64(1)))",
+                                 R"(b"x".slice(b"x"[0], 1))",
+                                 R"(b"x".slice(0, 1).slice(0, 1))",
+                                 R"(b"x".find())",
+                                 R"(b"x".find("x"))",
+                                 R"(b"x".find(120))",
+                                 R"(b"x".find(b"x", true))",
+                                 R"(b"x".find(b"x", i64(0)))",
+                                 R"(b"x".find(b"x", b"x"[0]))",
+                                 R"(b"x".find(b"x", 0, 1))",
+                                 R"(b"x".find(b"x".slice(0, 1)))",
+                                 R"("x".slice(0, 1))",
+                                 R"(b"x".find(b"x") + 1)"};
+    for (const auto* expression : expressions) {
+        const std::string source =
+            std::string("route GET \"/\" { let value = ") + expression + " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, decimal_integer_builtins_preserve_optional_width_and_accept_bytes) {
     const char* expressions[] = {"parseInt(\"42\")",
                                  "parseInt(b\"42\")",
