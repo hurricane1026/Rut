@@ -3073,7 +3073,7 @@ Unwrapped String concatenation and the byte-exact `hasPrefix`, `hasSuffix`,
 owns bytes in the existing bounded arena and stops on allocation failure. Text
 publication still checks UTF-8 and message/frame limits; known invalid literal
 components and a proven minimum output exceeding a limit are compile errors.
-General source interpolation and Bytes concatenation remain unsupported.
+General source interpolation and Bytes `+` concatenation remain unsupported.
 
 `message.payload` projects an immutable `Bytes` view of the complete payload,
 regardless of message kind. It borrows the runtime message buffer for the
@@ -10310,12 +10310,12 @@ and malformed/unavailable decisions fail closed. No OPA configuration syntax or
 Rego engine is added. See [the executable contract](docs/opa-authorization.md).
 
 MIR reserves 32 blocks for the existing eight route guards, call continuations
-and terminal control. Callout codegen conservatively persists values preceding
-a reachable later call, all Phi results, and cross-block operands. Block-local
-values created after the last reachable call use ordinary LLVM SSA storage.
-This keeps response JSON validation out of the suspension frame without raising
-its 8 KiB runtime bound or replaying earlier effects. Cross-block storage retains
-support for RIR block IDs that are not in producer order.
+and terminal control. Callout codegen persists only values live across a call,
+including arguments reused during polling and edge-specific Phi inputs. Other
+values use ordinary LLVM SSA storage. This keeps pure validation/parser work
+out of the suspension frame without raising its 8 KiB runtime bound or replaying
+earlier effects. Dependency-aware emission supports RIR block IDs that are not
+in producer order.
 
 
 ### OAuth2 introspection resource policy
@@ -10555,6 +10555,23 @@ C++ standard-library allocation, protocol parser or external dependency.
 Steps reject I/O, request/response state, cache, randomness and nested collection,
 including effects hidden in otherwise unused lexical bindings. Runtime function
 values and general source loops remain absent. The first consumer is a pure Rut
-RESP2 complete-buffer decoder with a typed preorder node result. Streamed network
-parsing and compact verified backedges are later work; see
-[the contract and limits](docs/bounded-parsing.md).
+RESP2 complete-buffer decoder with a typed preorder node result. Incremental
+feeds now compose existing TCP receives; compact verified backedges remain
+later work. See [the contract and limits](docs/bounded-parsing.md).
+
+### Incremental parser state across network suspension
+
+`concatBytes(Bytes, Bytes, i32) -> Bytes?` owns a fresh bounded binary buffer,
+without mutation or text conversion. Existing SliceArena budgets and pool
+allocation remain the only runtime storage mechanism. A pure Rut RESP2 framing
+cursor retains pending aggregates, exact bulk boundaries and CRLF search
+position across feeds. NeedMore, Complete and Invalid are distinct; complete
+prefixes decode to typed tokens and preserve remaining pipelined bytes.
+
+Finite `resp2Receive` compositions use existing TCP operations and deadlines.
+Continuation liveness preserves only values crossing suspension, including the
+arguments reused by polling and edge-specific phi inputs. Already-bound values
+are references, not new resumable effects. Pure parser temporary growth does not
+increase the 8 KiB continuation frame or request snapshot budget. Compiler SSA
+and compact bitset scratch have independent finite limits. See
+[streaming contracts and validation](docs/resp2-streaming.md).

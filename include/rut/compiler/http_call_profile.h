@@ -71,7 +71,7 @@ inline bool function_uses_http_call(const Function& fn) {
 inline bool http_call_profile_valid(const Function& fn) {
     if (!function_uses_http_call(fn)) return true;
     if (fn.is_timer || fn.yield_count || fn.route_pattern.len == 0 || function_uses_password(fn) ||
-        !fn.values || fn.value_count > 1024)
+        !fn.values || fn.value_count > 1048576)
         return false;
     u32 calls = 0;
     for (u32 b = 0; b < fn.block_count; ++b) {

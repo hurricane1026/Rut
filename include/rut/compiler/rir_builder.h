@@ -1099,11 +1099,12 @@ struct Builder {
             return err(RirError::InvalidState);
         const bool bytes_slice = op == static_cast<u32>(json::Op::BytesSlice);
         const bool bytes_find = op == static_cast<u32>(json::Op::BytesFind);
-        if ((bytes_slice || bytes_find) &&
+        const bool bytes_concat = op == static_cast<u32>(json::Op::BytesConcat);
+        if ((bytes_slice || bytes_find || bytes_concat) &&
             (count != 3 || !args || !val_has_type(args[0], TypeKind::Str) ||
              !val_has_type(args[1], bytes_slice ? TypeKind::I32 : TypeKind::Str) ||
              !val_has_type(args[2], TypeKind::I32) || !optional ||
-             result != (bytes_slice ? TypeKind::Str : TypeKind::I32)))
+             result != (bytes_find ? TypeKind::I32 : TypeKind::Str)))
             return err(RirError::InvalidState);
         const bool parse_int = op == static_cast<u32>(json::Op::ParseInt);
         const bool parse_int64 = op == static_cast<u32>(json::Op::ParseInt64);

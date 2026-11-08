@@ -19,6 +19,7 @@
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/json.h"
 #include <deque>
 #include <string>
 
@@ -582,6 +583,9 @@ inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
     if (depth > 128) return true;
     if (value.kind == HirExprKind::StringConcat || value.kind == HirExprKind::CollectBytes ||
         value.kind == HirExprKind::CollectedCount || value.kind == HirExprKind::CollectedGet)
+        return true;
+    if (value.kind == HirExprKind::JsonOp &&
+        value.int_value == static_cast<i64>(json::Op::BytesConcat))
         return true;
     if (value.kind == HirExprKind::BoundValue) return false;
     if (value.lhs && hir_has_string_construction(*value.lhs, depth + 1)) return true;

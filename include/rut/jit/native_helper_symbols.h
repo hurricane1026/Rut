@@ -36,6 +36,7 @@
     X(rut_helper_req_remote_addr)                     \
     X(rut_helper_req_content_length)                  \
     X(rut_helper_parse_int)                           \
+    X(rut_helper_bytes_concat)                        \
     X(rut_helper_bytes_find)                          \
     X(rut_helper_collect_new)                         \
     X(rut_helper_collect_push)                        \

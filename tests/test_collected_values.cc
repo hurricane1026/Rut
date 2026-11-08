@@ -1,3 +1,4 @@
+#include "rut/runtime/bytes_concat.h"
 #include "rut/runtime/collected_values.h"
 #include "test.h"
 
@@ -68,6 +69,43 @@ TEST(collected_values, exhausted_pool_never_exposes_a_partly_copied_record) {
     CHECK_EQ(first->ptr[0], 'x');
     arena.destroy();
     pool.destroy();
+}
+
+TEST(bytes_concat, guarded_binary_views_are_copied_and_limits_fail_closed) {
+    const auto page = static_cast<u32>(sysconf(_SC_PAGESIZE));
+    auto* memory = static_cast<char*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(memory != MAP_FAILED);
+    REQUIRE_EQ(mprotect(memory + page, page, PROT_NONE), 0);
+    char* tail = memory + page - 2;
+    tail[0] = '\0';
+    tail[1] = static_cast<char>(0xff);
+    SlicePool pool;
+    REQUIRE(pool.init(2));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const char* first = concat_bytes(&arena, {"a", 1}, {tail, 2}, 3);
+    REQUIRE(first);
+    REQUIRE_EQ(mprotect(memory, page, PROT_NONE), 0);
+    CHECK((Str{first, 3}.eq({"a\0\xff", 3})));
+    const char* second = concat_bytes(&arena, {first, 3}, {first, 3}, 6);
+    REQUIRE(second);
+    CHECK(
+        (Str{second, 6}.eq({"a\0\xff"
+                            "a\0\xff",
+                            6})));
+    CHECK(first != second);
+    CHECK(concat_bytes(&arena, {first, 3}, {first, 3}, 5) == nullptr);
+    CHECK(concat_bytes(&arena, {nullptr, 1}, {}, 8192) == nullptr);
+    CHECK(concat_bytes(&arena, {}, {}, 0) == nullptr);
+    CHECK(concat_bytes(&arena, {}, {}, 8193) == nullptr);
+    CHECK(concat_bytes(&arena, {}, {}, 8192) != nullptr);
+    char maximum[8192]{};
+    CHECK(concat_bytes(&arena, {maximum, sizeof(maximum)}, {}, 8192) != nullptr);
+    CHECK(concat_bytes(&arena, {maximum, sizeof(maximum)}, {"x", 1}, 8192) == nullptr);
+    arena.destroy();
+    pool.destroy();
+    CHECK_EQ(munmap(memory, page * 2), 0);
 }
 
 int main(int argc, char** argv) {

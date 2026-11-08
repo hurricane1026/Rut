@@ -4211,6 +4211,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
 
 static bool mir_has_http_call(const MirValue& value, u32 depth = 0) {
     if (depth > 128) return true;
+    if (value.kind == MirValueKind::BoundValue) return false;
     if (value.kind == MirValueKind::JsonOp &&
         (value.int_value == static_cast<i64>(json::Op::HttpCall) ||
          (value.int_value >= static_cast<i64>(json::Op::NetTcp) &&

@@ -102,7 +102,8 @@ inline bool valid_bytes_read(const Function& fn, const Instruction& inst) {
 inline bool valid_bytes_field(const Function& fn, const Instruction& inst) {
     if (inst.op != Opcode::JsonOp) return true;
     const auto kOp = static_cast<json::Op>(inst.imm.i32_val);
-    if (kOp != json::Op::BytesSlice && kOp != json::Op::BytesFind) return true;
+    if (kOp != json::Op::BytesSlice && kOp != json::Op::BytesFind && kOp != json::Op::BytesConcat)
+        return true;
     if (inst.operand_count != 3 || inst.extra_operands) return false;
     const auto kExact = [&](ValueId id, TypeKind kind) {
         if (id == kNoValue || id.id >= fn.value_count || !fn.values) return false;
@@ -116,7 +117,7 @@ inline bool valid_bytes_field(const Function& fn, const Instruction& inst) {
         return false;
     const Type* result = fn.values[inst.result.id].type;
     return result && result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
-           result->inner->kind == (kOp == json::Op::BytesSlice ? TypeKind::Str : TypeKind::I32) &&
+           result->inner->kind == (kOp == json::Op::BytesFind ? TypeKind::I32 : TypeKind::Str) &&
            !result->inner->inner && !result->inner->struct_def;
 }
 

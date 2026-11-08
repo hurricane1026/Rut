@@ -4445,6 +4445,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             set_tests_properties(test_parse_integers_${backend}_opt${parse_opt} PROPERTIES
                 LABELS "integration;network" TIMEOUT 60 SKIP_RETURN_CODE 77)
         endforeach()
+        foreach(stream_opt 0 2)
+            add_test(NAME test_incremental_resp2_${backend}_opt${stream_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_incremental_resp2.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --backend ${backend} --opt ${stream_opt})
+            set_tests_properties(test_incremental_resp2_${backend}_opt${stream_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 240 SKIP_RETURN_CODE 77)
+        endforeach()
         foreach(parsing_opt 0 2)
             add_test(NAME test_bounded_parsing_${backend}_opt${parsing_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_bounded_parsing.py

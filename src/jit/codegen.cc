@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/call_liveness.h"
 #include "rut/compiler/http_call_profile.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
@@ -146,7 +147,8 @@ struct Ctx {
     // values and the exact continuation without replaying earlier effects.
     LLVMValueRef call_frame = nullptr;
     LLVMTypeRef call_frame_type = nullptr;
-    u32 call_frame_fields[1024]{};
+    u32* call_frame_fields = nullptr;
+    LLVMValueRef* call_phi_incoming = nullptr;
     LLVMValueRef call_dispatch = nullptr;
     u32 call_state = 0;
     u32 current_block = 0;
@@ -847,7 +849,11 @@ struct Ctx {
             if (inst.op != rir::Opcode::Phi) continue;
             for (u32 incoming = 0; incoming < 2; ++incoming) {
                 if (inst.imm.block_targets[incoming].id != current_block) continue;
-                set_value(inst.result, get_value(inst.operands[incoming]));
+                auto value = get_value(inst.operands[incoming]);
+                if (call_frame_fields[inst.result.id])
+                    set_value(inst.result, value);
+                else
+                    call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + incoming] = value;
             }
         }
     }
@@ -2200,6 +2206,42 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::BytesConcat) {
+                const auto left = c.get_value(inst.operands[0]);
+                const auto right = c.get_value(inst.operands[1]);
+                const auto left_len = LLVMBuildExtractValue(c.builder, left, 1, "concat.left.len");
+                const auto right_len =
+                    LLVMBuildExtractValue(c.builder, right, 1, "concat.right.len");
+                LLVMTypeRef parameters[] = {
+                    c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.i32_ty};
+                const auto type = LLVMFunctionType(c.ptr_ty, parameters, 7, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_bytes_concat");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_bytes_concat", type);
+                LLVMValueRef arguments[] = {c.param_conn,
+                                            c.param_arena,
+                                            LLVMBuildExtractValue(c.builder, left, 0, ""),
+                                            left_len,
+                                            LLVMBuildExtractValue(c.builder, right, 0, ""),
+                                            right_len,
+                                            c.get_value(inst.operands[2])};
+                const auto pointer =
+                    LLVMBuildCall2(c.builder, type, helper, arguments, 7, "concat.bytes");
+                const auto has = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "concat.has");
+                auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+                result = LLVMBuildInsertValue(c.builder, result, pointer, 1, "");
+                const auto length =
+                    LLVMBuildSelect(c.builder,
+                                    has,
+                                    LLVMBuildAdd(c.builder, left_len, right_len, ""),
+                                    LLVMConstInt(c.i32_ty, 0, 0),
+                                    "concat.length");
+                result = LLVMBuildInsertValue(c.builder, result, length, 2, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::BytesSlice) {
                 const auto kBytes = c.get_value(inst.operands[0]);
                 const auto kStart = c.get_value(inst.operands[1]);
@@ -3201,7 +3243,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::Phi: {
-            if (c.call_frame) break;  // incoming edges store the selected value
+            if (c.call_frame && c.call_frame_fields[inst.result.id]) break;
             LLVMValueRef value = LLVMBuildPhi(
                 c.builder, c.map_type(c.cur_fn->values[inst.result.id].type), "merge.value");
             c.set_value(inst.result, value);
@@ -3672,70 +3714,20 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.call_dispatch = nullptr;
     c.call_state = 0;
     if (kHasCalls) {
-        // Retain every value that precedes a reachable call, conservatively
-        // including unused values. Values produced after the final call need
-        // no suspension storage. Keep Phi values in the frame as well: their
-        // incoming edges already select/store them without replay on resume.
-        // The runtime's 8 KiB frame bound remains unchanged.
-        auto* reaches_call = maps.arena.alloc_array<u8>(fn.block_count);
-        if (!reaches_call) return false;
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            reaches_call[bi] = 0;
-            for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ++ii)
-                if (rir::is_http_call(fn.blocks[bi].insts[ii])) reaches_call[bi] = 1;
-        }
-        auto successors_call = [&](const rir::Block& block) {
-            const auto* term = block.terminator();
-            if (!term) return false;
-            if (term->op == rir::Opcode::Jmp)
-                return reaches_call[term->imm.block_targets[0].id] != 0;
-            if (term->op == rir::Opcode::Br)
-                return reaches_call[term->imm.block_targets[0].id] != 0 ||
-                       reaches_call[term->imm.block_targets[1].id] != 0;
+        c.call_frame_fields = maps.arena.alloc_array<u32>(fn.value_count);
+        c.call_phi_incoming = maps.arena.alloc_array<LLVMValueRef>(fn.value_count * 2);
+        if (!c.call_frame_fields || !c.call_phi_incoming ||
+            !rir::call_live_values(fn, maps.arena, c.call_frame_fields))
             return false;
-        };
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (u32 bi = fn.block_count; bi > 0; --bi) {
-                if (!reaches_call[bi - 1] && successors_call(fn.blocks[bi - 1])) {
-                    reaches_call[bi - 1] = 1;
-                    changed = true;
-                }
-            }
-        }
-        for (u32 vi = 0; vi < fn.value_count; ++vi) c.call_frame_fields[vi] = 0;
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            const auto& block = fn.blocks[bi];
-            bool later_call = successors_call(block);
-            for (u32 ii = block.inst_count; ii > 0; --ii) {
-                const auto& inst = block.insts[ii - 1];
-                if (inst.result != rir::kNoValue && (later_call || inst.op == rir::Opcode::Phi))
-                    c.call_frame_fields[inst.result.id] = 1;
-                if (rir::is_http_call(inst)) later_call = true;
-            }
-        }
-        // RIR block IDs need not be in definition order. Retain cross-block
-        // operands too, so emitting a consumer never needs a not-yet-emitted
-        // LLVM SSA producer. Block-local values after the last call stay local.
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            const auto& block = fn.blocks[bi];
-            for (u32 ii = 0; ii < block.inst_count; ++ii) {
-                const auto& inst = block.insts[ii];
-                for (u32 oi = 0; oi < inst.operand_count; ++oi) {
-                    const auto kId = inst.operand(oi);
-                    if (kId != rir::kNoValue && fn.values[kId.id].def_block.id != bi)
-                        c.call_frame_fields[kId.id] = 1;
-                }
-            }
-        }
-        LLVMTypeRef fields[1027]{};
+        auto* fields = maps.arena.alloc_array<LLVMTypeRef>(1027);
+        if (!fields) return false;
         fields[0] = c.i32_ty;
         fields[1] = c.ptr_ty;
         fields[2] = c.i32_ty;
         u32 field_count = 3;
         for (u32 vi = 0; vi < fn.value_count; ++vi) {
             if (c.call_frame_fields[vi] == 0) continue;
+            if (field_count == 1027) return false;
             c.call_frame_fields[vi] = field_count;
             fields[field_count++] = c.map_type(fn.values[vi].type);
         }
@@ -3849,7 +3841,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
     // Block IDs are allocation order, not SSA definition order: inlined
     // optional helpers may append a producer after their outer consumer.
-    // Emit non-frame blocks only when cross-block inputs exist. Phi incoming
+    // Emit blocks only when non-spilled cross-block inputs exist. Phi incoming
     // edges are resolved separately, breaking loop-carried dependencies.
     auto* emitted = fn.block_cap <= 64 ? small_emitted : maps.arena.alloc_array<u8>(fn.block_count);
     if (!emitted) return false;
@@ -3860,16 +3852,37 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             if (emitted[i]) continue;
             const auto& blk = fn.blocks[i];
             bool ready = true;
-            if (!c.call_frame) {
+            {
                 for (u32 ii = 0; ii < blk.inst_count && ready; ++ii) {
                     const auto& inst = blk.insts[ii];
                     if (inst.op == rir::Opcode::Phi) continue;
                     for (u32 oi = 0; oi < inst.operand_count; ++oi) {
                         const auto kId = inst.operand(oi);
                         if (kId == rir::kNoValue || kId.id >= fn.value_count) return false;
-                        if (fn.values[kId.id].def_block.id != blk.id.id && !c.value_map[kId.id]) {
+                        if (fn.values[kId.id].def_block.id != blk.id.id && !c.value_map[kId.id] &&
+                            !(c.call_frame && c.call_frame_fields[kId.id])) {
                             ready = false;
                             break;
+                        }
+                    }
+                }
+            }
+            if (c.call_frame && ready) {
+                const auto* term = blk.terminator();
+                const u32 edges = term && term->op == rir::Opcode::Br    ? 2u
+                                  : term && term->op == rir::Opcode::Jmp ? 1u
+                                                                         : 0u;
+                for (u32 edge = 0; edge < edges && ready; ++edge) {
+                    const auto& next = fn.blocks[term->imm.block_targets[edge].id];
+                    for (u32 ii = 0; ii < next.inst_count && ready; ++ii) {
+                        const auto& phi = next.insts[ii];
+                        if (phi.op != rir::Opcode::Phi) continue;
+                        for (u32 incoming = 0; incoming < 2; ++incoming) {
+                            if (phi.imm.block_targets[incoming].id != blk.id.id) continue;
+                            const auto id = phi.operands[incoming];
+                            if (fn.values[id.id].def_block.id != blk.id.id && !c.value_map[id.id] &&
+                                !c.call_frame_fields[id.id])
+                                ready = false;
                         }
                     }
                 }
@@ -3879,11 +3892,12 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
             LLVMPositionBuilderAtEnd(c.builder, c.block_map[blk.id.id]);
             for (u32 j = 0; j < blk.inst_count; ++j) {
                 const auto& inst = blk.insts[j];
-                if (!c.call_frame && inst.op != rir::Opcode::Phi) {
+                if (inst.op != rir::Opcode::Phi) {
                     for (u32 oi = 0; oi < inst.operand_count; ++oi) {
                         const auto kId = inst.operand(oi);
                         if (kId == rir::kNoValue || kId.id >= fn.value_count ||
-                            !c.value_map[kId.id])
+                            (!c.value_map[kId.id] &&
+                             !(c.call_frame && c.call_frame_fields[kId.id])))
                             return false;
                     }
                 }
@@ -3903,8 +3917,14 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ++ii) {
             const auto& inst = block.insts[ii];
-            if (inst.op != rir::Opcode::Phi || c.call_frame) continue;
-            LLVMValueRef values[] = {c.get_value(inst.operands[0]), c.get_value(inst.operands[1])};
+            if (inst.op != rir::Opcode::Phi ||
+                (c.call_frame && c.call_frame_fields[inst.result.id]))
+                continue;
+            LLVMValueRef values[] = {
+                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2]
+                             : c.get_value(inst.operands[0]),
+                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + 1]
+                             : c.get_value(inst.operands[1])};
             LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
                                             exits[inst.imm.block_targets[1].id]};
             if (!values[0] || !values[1] || !incoming[0] || !incoming[1]) return false;

@@ -117,9 +117,10 @@ protocol value with kind 2; it is not treated as successful command execution.
 See the [HTTP example](../examples/resp2-decoder.rut).
 
 This decoder consumes a complete buffer. A TCP `receive` returns only some
-available bytes and is not evidence that a complete reply has arrived. Incremental
-`NeedMore` state, network iteration, connection pooling, request command building
-and a complete Redis driver remain separate work.
+available bytes and is not evidence that a complete reply has arrived. [Incremental parsing](resp2-streaming.md) now provides NeedMore/Complete/Invalid
+state, buffered feeds and bounded composition with TCP receives. Connection
+pooling, unrestricted network iteration, command building and a complete Redis
+driver remain separate work.
 
 ## Validation
 

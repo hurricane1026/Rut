@@ -6036,7 +6036,9 @@ static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
     const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body) ||
                           (fn.lexical_body_index < fn.exprs.len &&
                            hir_has_resumable_call(fn.exprs[fn.lexical_body_index]));
-    const bool kStringBody = hir_has_string_construction(fn.body);
+    const bool kStringBody = hir_has_string_construction(fn.body) ||
+                             fn.body.type == HirTypeKind::Struct ||
+                             fn.body.type == HirTypeKind::Tuple;
     if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
     if (fn.lexical_body_index >= fn.exprs.len)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -6050,6 +6052,12 @@ static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
 static bool call_argument_needs_evaluation(const HirExpr& value, u32 depth = 0) {
     if (depth > 128) return true;
     if (value.kind == HirExprKind::BoundValue) return false;
+    // Repeated projections of a constructed record/tuple must share one
+    // evaluation rather than expanding the full constructor for every field.
+    if (value.kind == HirExprKind::StructInit || value.kind == HirExprKind::Tuple ||
+        (value.kind == HirExprKind::IfElse &&
+         (value.type == HirTypeKind::Struct || value.type == HirTypeKind::Tuple)))
+        return true;
     switch (value.kind) {
         case HirExprKind::BoolLit:
         case HirExprKind::IntLit:
@@ -14372,6 +14380,33 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         }
     }
 
+    if (expr.name.eq(lit_str("concatBytes")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto kDetail =
+            lit_str("concatBytes expects two unwrapped Bytes and an i32 byte limit");
+        if (!route || pipe_lhs || first_arg_override || expr.args.len != 3)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr values[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->may_nil || value->may_error ||
+                value->type != (i == 2 ? HirTypeKind::I32 : HirTypeKind::Bytes))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            values[i] = value.value();
+        }
+        return make_json_op(json::Op::BytesConcat,
+                            HirTypeKind::Bytes,
+                            true,
+                            &values[0],
+                            &values[1],
+                            &values[2],
+                            expr.span,
+                            route);
+    }
+
     if (expr.name.eq(lit_str("collectBytes")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto kDetail = lit_str(
@@ -14480,7 +14515,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     if (operation > json::Op::Stringify && operation != json::Op::BytesAt &&
                         !json::bytes_read_spec(operation).width &&
                         operation != json::Op::BytesSlice && operation != json::Op::BytesFind &&
-                        operation != json::Op::ParseInt && operation != json::Op::ParseInt64)
+                        operation != json::Op::BytesConcat && operation != json::Op::ParseInt &&
+                        operation != json::Op::ParseInt64)
                         return false;
                     break;
                 }

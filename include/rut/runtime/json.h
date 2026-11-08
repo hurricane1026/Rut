@@ -81,6 +81,7 @@ enum class Op : u8 {
     BytesSlice,
     BytesFind,
     JwtCertificateBound,
+    BytesConcat,
 };
 
 // Compiler-only raw-byte reads share the existing optional scalar carrier.

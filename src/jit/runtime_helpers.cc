@@ -10,6 +10,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
+#include "rut/runtime/bytes_concat.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection.h"
@@ -3045,4 +3046,16 @@ extern "C" const void* rut_helper_collect_get(const void* collection,
                                               rut::u32 width) {
     return collection ? static_cast<const rut::CollectedValues*>(collection)->get(index, width)
                       : nullptr;
+}
+
+extern "C" const char* rut_helper_bytes_concat(void* conn,
+                                               void* arena,
+                                               const char* left,
+                                               rut::u32 left_len,
+                                               const char* right,
+                                               rut::u32 right_len,
+                                               rut::i32 limit) {
+    auto* storage = static_cast<rut::SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<rut::ConnectionBase*>(conn)->json_arena;
+    return rut::concat_bytes(storage, {left, left_len}, {right, right_len}, limit);
 }

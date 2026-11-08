@@ -149,3 +149,8 @@ A slice retained across another network operation keeps the original read bytes.
 immutable typed result collections. The [RESP2 library](../examples/clients/resp2.rut)
 uses these generic primitives to validate nested replies; it does not turn a
 partial TCP receive into a complete frame or introduce I/O inside parser steps.
+
+[Incremental RESP2 framing](resp2-streaming.md) retains parser state and owned
+Bytes across receives, distinguishes NeedMore/Complete/Invalid, and preserves
+pipelined remainders. `resp2Receive` performs one receive only while NeedMore;
+callers choose a finite read budget under the existing operation/frame limits.

@@ -22,6 +22,7 @@ static_assert(MirModule::kMaxFunctions >= HirModule::kMaxRoutes + HirModule::kMa
 namespace {
 static bool hir_has_http_call(const HirExpr& expr, u32 depth = 0) {
     if (depth > 128) return true;
+    if (expr.kind == HirExprKind::BoundValue) return false;
     if (expr.kind == HirExprKind::JsonOp &&
         (expr.int_value == static_cast<i64>(json::Op::HttpCall) ||
          (expr.int_value >= static_cast<i64>(json::Op::NetTcp) &&

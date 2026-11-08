@@ -613,3 +613,11 @@ extern "C" rut::i32 rut_helper_collect_count(const void* collection);
 extern "C" const void* rut_helper_collect_get(const void* collection,
                                               rut::i32 index,
                                               rut::u32 width);
+
+extern "C" const char* rut_helper_bytes_concat(void* conn,
+                                               void* arena,
+                                               const char* left,
+                                               rut::u32 left_len,
+                                               const char* right,
+                                               rut::u32 right_len,
+                                               rut::i32 limit);

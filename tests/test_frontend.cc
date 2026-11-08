@@ -47787,3 +47787,50 @@ route POST "/" { let result = collectBytes(req.bodyBytes, 0, 8, hidden) return 2
         CHECK_FALSE(analyze_file_heap(ast.value()));
     }
 }
+
+TEST(frontend, bytes_concat_is_a_bounded_optional_binary_operation) {
+    const char* source = R"rut(
+func join(_ prefix: Bytes, _ data: Bytes, _ limit: i32) { concatBytes(prefix, data, limit) }
+func item(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) {
+    guard let value = concatBytes(b"x", bytes, 8192) else { nil }
+    (state, value, true)
+}
+route POST "/collected" {
+    guard let values = collectBytes(req.bodyBytes, 0, 1, item) else { return 413 }
+    guard values.count == 1 else { return 500 }
+    return 204
+}
+route POST "/" {
+    guard let result = join(b"\x00\xff", req.bodyBytes, 8192) else { return 413 }
+    return response(200, body: result)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+    const char* invalid[] = {
+        "concatBytes(\"a\", b\"b\", 32)",
+        "concatBytes(b\"a\", b\"b\", true)",
+        "concatBytes(b\"a\", b\"b\")",
+        "concatBytes(b\"a\", parseInt(\"2\"), 32)",
+        "b\"a\" | concatBytes(b\"b\", b\"c\", 32)",
+    };
+    for (const char* expression : invalid) {
+        const std::string code =
+            std::string("route POST \"/\" { let value = ") + expression + " return 204 }";
+        auto ts = lex(lit(code.c_str()));
+        REQUIRE(ts);
+        auto tree = parse_file_heap(ts.value());
+        REQUIRE(tree);
+        CHECK_FALSE(analyze_file_heap(tree.value()));
+    }
+}

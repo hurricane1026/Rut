@@ -198,7 +198,8 @@ and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
 request body as Bytes under the same buffering/lifetime rules as `req.body`.
 Checked single-byte [subscripts](#bytes-subscripts) and
 [field slice/search methods](#bytes-field-extraction) are supported. There is no
-implicit text conversion, ordering, concatenation or regex API for Bytes.
+implicit text conversion, ordering, `+` concatenation or regex API for Bytes.
+Bounded owned concatenation is available with `concatBytes` below.
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
@@ -1040,7 +1041,7 @@ return websocket(chat) { message in
     if let label = messageLabel(message) { message.forward(label) }
     else { message.drop() }
 }
-// General source interpolation, mutable local syntax and Bytes concatenation
+// General source interpolation, mutable local syntax and Bytes `+` concatenation
 // are not introduced here. Checked Bytes slicing is available as described below. Non-response statement effects inside ordinary helpers
 // remain unsupported in HTTP and WebSocket alike. No alternate WS-only syntax.
 
@@ -3042,6 +3043,21 @@ cache, randomness and nested collection. State/items use concrete scalar/plain
 struct shapes; optional/error leaves and nested collections are absent. See
 [the full contract](bounded-parsing.md), [RESP2 library](../examples/clients/resp2.rut)
 and [executable example](../examples/resp2-decoder.rut).
+
+## Incremental byte buffers and parsing
+
+`concatBytes(left, right, maxBytes) -> Bytes?` copies two unwrapped Bytes into a
+new immutable invocation-owned buffer. The unwrapped i32 limit must be 1–8192;
+invalid bounds or arena/pool exhaustion return nil. There is no text conversion
+or mutation, and previous views survive subsequent appends and network reads.
+This ordinary builtin supports direct calls; pipe/UFCS forms are absent.
+
+The [incremental RESP2 library](resp2-streaming.md) composes this with
+`collectBytes`: `resp2Stream`, `resp2Feed` and `resp2Receive` retain bounded state
+across reads. Status 0 means NeedMore, 1 Complete, -1 Invalid. Completed frames
+provide typed tokens and exact pipelined remainder bytes. NeedMore at EOF fails.
+Network/HTTP operation, arena and verifier budgets still apply; callers choose a
+finite read budget. This does not introduce source loops or persistent sessions.
 
 ## Built-in Bytes integer reads
 

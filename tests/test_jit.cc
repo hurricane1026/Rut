@@ -30290,6 +30290,50 @@ TEST(jit, http_call_frame_excludes_block_local_values_after_last_call) {
     tc.destroy();
 }
 
+TEST(jit, http_call_frame_excludes_dead_values_before_and_after_call) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("frame_bound"), lit("/call"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    for (u32 i = 0; i < 1200; ++i) V(b.emit_const_str(lit("dead parsing temporary")));
+    auto policy =
+        V(b.emit_const_str(lit("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\","
+                               "\"caFile\":\"/missing.pem\",\"path\":\"/check\"}")));
+    auto request = V(b.emit_const_str(lit("{\"method\":\"GET\"}")));
+    auto timeout = V(b.emit_const_i32(100));
+    const ValueId args[] = {policy, request, timeout};
+    V(b.emit_json(static_cast<u32>(json::Op::HttpCall), TypeKind::Str, true, args, 3));
+    // More than 8 KiB if every SSA string receives a frame slot. These values
+    // cannot span a later call and should not prevent this handler from running.
+    for (u32 i = 0; i < 600; ++i) V(b.emit_const_str(lit("post-call validation")));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(rir::verify_module(tc.mod).ok);
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_frame_bound"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    auto* ctx = conn->reset_jit_ctx();
+    const auto wire = lit("GET /call HTTP/1.1\r\nHost: test\r\n\r\n");
+    const auto result = HandlerResult::unpack(
+        handler(conn.get(), ctx, reinterpret_cast<const u8*>(wire.ptr), wire.len, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    CHECK(ctx->load_slot<u64>(0) != 0);
+    conn->json_arena.destroy();
+    engine.shutdown();
+    pool.destroy();
+    tc.destroy();
+}
+
 TEST(jit, oauth_introspection_builtins_execute_and_reject_malformed_rir) {
     TestContext tc;
     REQUIRE(tc.init());
@@ -30745,6 +30789,34 @@ TEST(jit, collected_rir_validates_capacity_element_shapes_and_checked_get) {
     auto& get = fn->blocks[entry.id].insts[7];
     REQUIRE(get.op == Opcode::ArrayGet);
     get.operands[1] = wrong;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
+}
+
+TEST(jit, bytes_concat_rir_requires_exact_operand_and_optional_result_shapes) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("concat_shape"), lit("/"), 'P'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    const auto left = V(b.emit_const_str(lit("a")));
+    const auto right = V(b.emit_const_str(lit("b")));
+    const auto limit = V(b.emit_const_i32(2));
+    ValueId args[] = {left, right, limit};
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::Str, false, args, 3));
+    CHECK_FALSE(b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::I32, true, args, 3));
+    V(b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::Str, true, args, 3));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_module(tc.mod).ok);
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    LLVMDisposeModule(cg.mod);
+    LLVMContextDispose(cg.ctx);
+    fn->blocks[entry.id].insts[3].operands[1] = limit;
     CHECK_FALSE(verify_module(tc.mod).ok);
     CHECK_FALSE(codegen(tc.mod).ok);
     tc.destroy();
