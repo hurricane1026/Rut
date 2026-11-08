@@ -587,3 +587,112 @@ TEST(oauth_client, resource_request_preserves_identifier_and_rejects_unsafe_uris
         lit_str("read"), lit_str("Basic YTpi"), kResource, short_output));
     CHECK(!short_output.ok);
 }
+
+TEST(oauth_client, token_exchange_has_fixed_types_and_strict_policy) {
+    const auto kPolicy = lit_str(
+        R"({"scope":"read write a+b&x=y","resource":"https://api.example.test/a?b=c+d&x=%2F"})");
+    char bytes[8192], decoded[4096];
+    json::Document scratch, document;
+    json::Writer output{bytes};
+    REQUIRE(oauth_token_exchange_request(
+        scratch, lit_str("subject+/=="), lit_str("Basic YTpi"), kPolicy, output));
+    REQUIRE(document.parse({bytes, output.len}));
+    json::Writer body{decoded, sizeof(decoded)};
+    REQUIRE(document.string(document.pointer(lit_str("/body")), body));
+    CHECK((Str{decoded, body.len}.eq(
+        lit_str("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"
+                "&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"
+                "&requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token"
+                "&subject_token=subject%2B%2F%3D%3D&scope=read%20write%20a%2Bb%26x%3Dy"
+                "&resource=https%3A%2F%2Fapi.example.test%2Fa%3Fb%3Dc%2Bd%26x%3D%252F"))));
+    const Str kBadSubject[] = {lit_str(""),
+                               lit_str("a b"),
+                               lit_str("a&scope=admin"),
+                               lit_str("a=b"),
+                               lit_str("a\r\n"),
+                               lit_str("a\0b"),
+                               lit_str("t\xc3\xa9"),
+                               {nullptr, 1}};
+    for (const Str kSubject : kBadSubject) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_token_exchange_request(
+            scratch, kSubject, lit_str("Basic YTpi"), kPolicy, writer));
+        CHECK_EQ(writer.len, 0u);
+    }
+    const Str kBadPolicy[] = {
+        lit_str(""),
+        lit_str("{"),
+        lit_str("[]"),
+        lit_str("null"),
+        lit_str("{}"),
+        lit_str(R"({"scope":"read"})"),
+        lit_str(R"({"resource":"https://api.test/"})"),
+        lit_str(R"({"scope":"read","resource":"https://api.test/","actor_token":"forged"})"),
+        lit_str(R"({"scope":"read","resource":"https://api.test/","audience":"forged"})"),
+        lit_str(
+            R"({"scope":"read","resource":"https://api.test/","requested_token_type":"id_token"})"),
+        lit_str(R"({"scope":"read","resource":"https://api.test/","scope":"admin"})"),
+        lit_str(R"({"scope":"read","resource":"https://api.test/","\u0073cope":"admin"})"),
+        lit_str(R"({"scope":["read"],"resource":"https://api.test/"})"),
+        lit_str(R"({"scope":"read","resource":null})"),
+        lit_str(R"({"scope":"read  write","resource":"https://api.test/"})"),
+        lit_str(R"({"scope":"read","resource":"https://api.test/#fragment"})"),
+        lit_str(R"({"scope":"read","resource":"https://[::1\u0000evil]/"})"),
+        {nullptr, 1}};
+    for (const Str kConfig : kBadPolicy) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_token_exchange_request(
+            scratch, lit_str("subject"), lit_str("Basic YTpi"), kConfig, writer));
+        CHECK_EQ(writer.len, 0u);
+    }
+    char subject[1025];
+    for (auto& byte : subject) byte = 'a';
+    json::Writer maximum{bytes};
+    CHECK(oauth_token_exchange_request(
+        scratch, {subject, 1024}, lit_str("Basic YTpi"), kPolicy, maximum));
+    json::Writer oversized{bytes};
+    CHECK(!oauth_token_exchange_request(
+        scratch, {subject, 1025}, lit_str("Basic YTpi"), kPolicy, oversized));
+    const Str kBadAuth[] = {lit_str("Bearer forbidden"), lit_str("Basic "), lit_str("Basic a\r\n")};
+    for (const Str kAuth : kBadAuth) {
+        json::Writer writer{bytes};
+        CHECK(!oauth_token_exchange_request(scratch, lit_str("subject"), kAuth, kPolicy, writer));
+    }
+    char policy[4096];
+    json::Writer config{policy, sizeof(policy)};
+    config.text(lit_str("{\"scope\":\""));
+    for (u32 i = 0; i < 1024; ++i) config.put('&');
+    config.text(lit_str("\",\"resource\":\"https://api.test/\"}"));
+    json::Writer accepted_scope{bytes};
+    CHECK(oauth_token_exchange_request(
+        scratch, lit_str("s"), lit_str("Basic YTpi"), {policy, config.len}, accepted_scope));
+    json::Writer exhausted{bytes};
+    CHECK(!oauth_token_exchange_request(
+        scratch, {subject, 1024}, lit_str("Basic YTpi"), {policy, config.len}, exhausted));
+    CHECK_EQ(exhausted.len, 0u);
+    json::Writer resource_config{policy, sizeof(policy)};
+    resource_config.text(lit_str("{\"scope\":\"read\",\"resource\":\"https://host/"));
+    for (u32 i = 13; i < 1024; ++i) resource_config.put('a');
+    resource_config.text(lit_str("\"}"));
+    json::Writer resource_limit{bytes};
+    CHECK(oauth_token_exchange_request(scratch,
+                                       lit_str("s"),
+                                       lit_str("Basic YTpi"),
+                                       {policy, resource_config.len},
+                                       resource_limit));
+    // Extend the decoded identifier by one byte while keeping policy JSON valid.
+    policy[resource_config.len - 2] = 'a';
+    policy[resource_config.len - 1] = '"';
+    policy[resource_config.len] = '}';
+    json::Writer resource_over{bytes};
+    CHECK(!oauth_token_exchange_request(scratch,
+                                        lit_str("s"),
+                                        lit_str("Basic YTpi"),
+                                        {policy, resource_config.len + 1},
+                                        resource_over));
+    char tiny[8];
+    json::Writer short_output{tiny, sizeof(tiny)};
+    CHECK(!oauth_token_exchange_request(
+        scratch, lit_str("subject"), lit_str("Basic YTpi"), kPolicy, short_output));
+    CHECK(!short_output.ok);
+}

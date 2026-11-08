@@ -1104,7 +1104,8 @@ struct Builder {
              result != (parse_int64 ? TypeKind::I64 : TypeKind::I32)))
             return err(RirError::InvalidState);
         const bool kResource =
-            op == static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest);
+            op == static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest) ||
+            op == static_cast<u32>(json::Op::OauthTokenExchangeRequest);
         const bool kIntrospectionRequest =
             op == static_cast<u32>(json::Op::OauthIntrospectionRequest) ||
             op == static_cast<u32>(json::Op::OauthClientCredentialsRequest) || kResource;

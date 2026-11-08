@@ -3742,9 +3742,13 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                         kJsonOp == json::Op::OauthIntrospectionValid ||
                         kJsonOp == json::Op::OauthClientCredentialsRequest ||
-                        kJsonOp == json::Op::OauthClientCredentialsResourceRequest) {
+                        kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
+                        kJsonOp == json::Op::OauthTokenExchangeRequest) {
                         const u32 kCount =
-                            kJsonOp == json::Op::OauthClientCredentialsResourceRequest ? 3u : 2u;
+                            (kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
+                             kJsonOp == json::Op::OauthTokenExchangeRequest)
+                                ? 3u
+                                : 2u;
                         if (inst.operand_count != kCount || inst.extra_operands ||
                             inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
                             !fn.values || !fn.values[inst.result.id].type)
@@ -3760,7 +3764,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         const auto* result = fn.values[inst.result.id].type;
                         if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsRequest ||
-                            kJsonOp == json::Op::OauthClientCredentialsResourceRequest) {
+                            kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
+                            kJsonOp == json::Op::OauthTokenExchangeRequest) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||
                                 result->struct_def || result->inner->kind != rir::TypeKind::Str ||
                                 result->inner->inner || result->inner->struct_def)

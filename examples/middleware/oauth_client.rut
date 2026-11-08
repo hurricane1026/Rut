@@ -27,17 +27,37 @@ func clientCredentialsForResource(_ serviceAuthorization: str, _ scopes: str, _ 
     built
 }
 
-// Only consume a completed httpCall response from the configured HTTPS AS.
-// No caching: expiry is checked as positive integer lifetime metadata at receipt.
-func authorization(_ reply: Json, _ requiredScope: str) -> str {
-    guard requiredScope != "" else { respond 503 }
-    guard let document = introspection.replyDocument(reply) else { respond 503 }
+// Metadata policy only; callers must first authenticate/parse the AS response.
+func authorizationDocument(_ document: Json, _ requiredScope: str) -> str {
     let token = json.string(json.get(document, "/access_token").or(document)).or("")
     let kind = json.string(json.get(document, "/token_type").or(document)).or("")
     let lifetime = json.int(json.get(document, "/expires_in").or(document)).or(0)
     let checked = bearerToken(kind + " " + token).or("")
-    guard lifetime > 0 && json.get(document, "/error") == nil &&
+    guard requiredScope != "" && lifetime > 0 && json.get(document, "/error") == nil &&
         !kind.contains(" ") && !token.isEmpty && checked == token &&
         jwtHasScope(document, requiredScope) else { respond 503 }
     "Bearer " + token
+}
+
+// Only consume a completed httpCall response from the configured HTTPS AS.
+// No caching: expiry is checked as positive integer lifetime metadata at receipt.
+func authorization(_ reply: Json, _ requiredScope: str) -> str {
+    guard let document = introspection.replyDocument(reply) else { respond 503 }
+    authorizationDocument(document, requiredScope)
+}
+
+// Exchange a caller's singleton Bearer access token under trusted AS policy.
+func tokenExchange(_ authorization: str, _ serviceAuthorization: str, _ policy: Json) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard let token = bearerToken(authorization) else { respond denied }
+    guard let message = oauthTokenExchangeRequest(token, serviceAuthorization, policy) else { respond 503 }
+    message
+}
+
+// Only an OAuth access token may enter the normal Bearer/expiry/scope policy.
+func exchangeAuthorization(_ reply: Json, _ requiredScope: str) -> str {
+    guard let document = introspection.replyDocument(reply) else { respond 503 }
+    guard json.string(json.get(document, "/issued_token_type").or(document)).or("") == "urn:ietf:params:oauth:token-type:access_token" else { respond 503 }
+    authorizationDocument(document, requiredScope)
 }

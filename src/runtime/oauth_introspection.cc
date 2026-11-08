@@ -188,6 +188,47 @@ bool oauth_client_credentials_request(Str scopes,
     return form.ok && form_request({body, form.len}, service_authorization, output);
 }
 
+bool oauth_token_exchange_request(json::Document& scratch,
+                                  Str subject_token,
+                                  Str service_authorization,
+                                  Str policy_json,
+                                  json::Writer& output) {
+    if (subject_token.len > 1024 || !bearer_key_valid(subject_token) ||
+        !service_authorization_valid(service_authorization, false) || !scratch.parse(policy_json) ||
+        scratch.nodes[0].kind != json::Kind::Object)
+        return false;
+    char scopes[1024], resource[1024];
+    json::Writer scope_value{scopes, sizeof(scopes)}, resource_value{resource, sizeof(resource)};
+    u32 seen = 0;
+    for (u32 node = scratch.nodes[0].child; node != json::kNone; node = scratch.nodes[node].next) {
+        json::Writer key{scratch.scratch};
+        if (!scratch.string(scratch.nodes[node].key, key)) return false;
+        const Str kName{scratch.scratch, key.len};
+        const u32 kBit = kName.eq(lit_str("scope")) ? 1u : kName.eq(lit_str("resource")) ? 2u : 0u;
+        if (!kBit || (seen & kBit)) return false;
+        seen |= kBit;
+        if (!scratch.string(node, kBit == 1 ? scope_value : resource_value)) return false;
+    }
+    if (seen != 3 || !jwt_scope_list_valid({scopes, scope_value.len}) ||
+        !resource_identifier_valid({resource, resource_value.len}))
+        return false;
+    char body[4096];
+    json::Writer form{body, sizeof(body)};
+    form.text(lit_str("grant_type="));
+    form_value(lit_str("urn:ietf:params:oauth:grant-type:token-exchange"), form);
+    form.text(lit_str("&subject_token_type="));
+    form_value(lit_str("urn:ietf:params:oauth:token-type:access_token"), form);
+    form.text(lit_str("&requested_token_type="));
+    form_value(lit_str("urn:ietf:params:oauth:token-type:access_token"), form);
+    form.text(lit_str("&subject_token="));
+    form_value(subject_token, form);
+    form.text(lit_str("&scope="));
+    form_value({scopes, scope_value.len}, form);
+    form.text(lit_str("&resource="));
+    form_value({resource, resource_value.len}, form);
+    return form.ok && form_request({body, form.len}, service_authorization, output);
+}
+
 bool oauth_introspection_valid(json::Document& doc, Str claims, Str audience, i64 unix_seconds) {
     if (!audience.ptr || !audience.len || audience.len > 1024 || unix_seconds <= 0 ||
         !doc.parse(claims) || doc.nodes[0].kind != json::Kind::Object)
