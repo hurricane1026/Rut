@@ -2067,14 +2067,23 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
-            if (kJsonOp == json::Op::BytesAt) {
+            const auto bytes_read = json::bytes_read_spec(kJsonOp);
+            if (bytes_read.width) {
                 auto bytes = c.get_value(inst.operands[0]);
                 auto index = c.get_value(inst.operands[1]);
                 auto pointer = LLVMBuildExtractValue(c.builder, bytes, 0, "bytes.ptr");
                 auto length = LLVMBuildExtractValue(c.builder, bytes, 1, "bytes.len");
-                // Unsigned comparison rejects negative i32 indices as well.
-                auto in_bounds =
-                    LLVMBuildICmp(c.builder, LLVMIntULT, index, length, "bytes.bounds");
+                auto width = LLVMConstInt(c.i32_ty, bytes_read.width, 0);
+                auto enough = LLVMBuildICmp(c.builder, LLVMIntUGE, length, width, "bytes.enough");
+                auto last = LLVMBuildSub(c.builder, length, width, "bytes.last");
+                auto in_bounds = LLVMBuildICmp(c.builder, LLVMIntULE, index, last, "bytes.bounds");
+                auto nonnegative = LLVMBuildICmp(c.builder,
+                                                 LLVMIntSGE,
+                                                 index,
+                                                 LLVMConstInt(c.i32_ty, 0, 0),
+                                                 "bytes.nonnegative");
+                in_bounds = LLVMBuildAnd(c.builder, in_bounds, enough, "bytes.complete");
+                in_bounds = LLVMBuildAnd(c.builder, in_bounds, nonnegative, "bytes.offset.valid");
                 auto nonnull = LLVMBuildICmp(
                     c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "bytes.nonnull");
                 auto valid = LLVMBuildAnd(c.builder, in_bounds, nonnull, "bytes.valid");
@@ -2086,12 +2095,34 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 LLVMPositionBuilderAtEnd(c.builder, load);
                 auto address =
                     LLVMBuildGEP2(c.builder, c.i8_ty, pointer, &index, 1, "bytes.address");
-                auto byte = LLVMBuildLoad2(c.builder, c.i8_ty, address, "bytes.byte");
-                auto number = LLVMBuildZExt(c.builder, byte, c.i32_ty, "bytes.number");
+                auto integer_type = bytes_read.wide ? c.i64_ty : c.i32_ty;
+                auto number = LLVMConstInt(integer_type, 0, 0);
+                for (u32 i = 0; i < bytes_read.width; ++i) {
+                    auto byte_offset = LLVMConstInt(c.i32_ty, i, 0);
+                    auto byte_address = LLVMBuildGEP2(
+                        c.builder, c.i8_ty, address, &byte_offset, 1, "bytes.byte.address");
+                    auto byte = LLVMBuildLoad2(c.builder, c.i8_ty, byte_address, "bytes.byte");
+                    auto octet = LLVMBuildZExt(c.builder, byte, integer_type, "bytes.octet");
+                    const u32 shift = (bytes_read.little_endian ? i : bytes_read.width - i - 1) * 8;
+                    if (shift)
+                        octet = LLVMBuildShl(c.builder,
+                                             octet,
+                                             LLVMConstInt(integer_type, shift, 0),
+                                             "bytes.shifted");
+                    number = LLVMBuildOr(c.builder, number, octet, "bytes.number");
+                }
+                if (bytes_read.is_signed && bytes_read.width == 2) {
+                    auto narrow = LLVMIntTypeInContext(c.llvm_ctx, 16);
+                    number =
+                        LLVMBuildSExt(c.builder,
+                                      LLVMBuildTrunc(c.builder, number, narrow, "bytes.signed16"),
+                                      integer_type,
+                                      "bytes.signed");
+                }
                 LLVMBuildBr(c.builder, merge);
                 LLVMPositionBuilderAtEnd(c.builder, merge);
-                auto payload = LLVMBuildPhi(c.builder, c.i32_ty, "bytes.result");
-                LLVMValueRef values[] = {LLVMConstInt(c.i32_ty, 0, 0), number};
+                auto payload = LLVMBuildPhi(c.builder, integer_type, "bytes.result");
+                LLVMValueRef values[] = {LLVMConstInt(integer_type, 0, 0), number};
                 LLVMBasicBlockRef blocks[] = {origin, load};
                 LLVMAddIncoming(payload, values, blocks, 2);
                 const auto* result_type = c.cur_fn->values[inst.result.id].type;
@@ -3625,8 +3656,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
-                if (!rir::valid_string_instruction(fn, inst) ||
-                    !rir::valid_bytes_subscript(fn, inst))
+                if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);

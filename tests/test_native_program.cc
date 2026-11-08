@@ -2618,6 +2618,43 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 
+TEST(native_program, builtin_bytes_integer_reads_work_in_helpers_and_websocket_callbacks) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+func decode(_ bytes: Bytes, _ offset: i32) { bytes.readU32BE(offset) }
+route POST "/body" {
+    guard let value = decode(req.bodyBytes, 1) else { return 400 }
+    guard value == 4294967295 else { return 422 }
+    guard req.bodyBytes.readI64BE(0) == nil else { return 500 }
+    return 204
+}
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard let value = message.payload.readI64LE(0) else { message.drop() }
+    guard value == i64(-1) else { message.drop() }
+    message.forward()
+} }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    std::string request = "POST /body HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\n";
+    request.append("\0\xff\xff\xff\xff", 5);
+    CHECK_EQ(invoke(owner.p->config.routes[0], request).status_code, 204u);
+    CHECK_EQ(
+        invoke(owner.p->config.routes[0], "POST /body HTTP/1.1\r\nHost: test\r\n\r\n").status_code,
+        400u);
+    const auto handler = owner.p->config.routes[1].ws_frame_handler;
+    REQUIRE(handler);
+    const char payload[] = "\xff\xff\xff\xff\xff\xff\xff\xff";
+    CHECK(handler(nullptr, WsOpcode::Binary, reinterpret_cast<const u8*>(payload), 8, true) ==
+          WsFrameAction::Forward);
+    CHECK(handler(nullptr, WsOpcode::Binary, reinterpret_cast<const u8*>(payload), 7, true) ==
+          WsFrameAction::Drop);
+    CHECK(handler(nullptr, WsOpcode::Binary, nullptr, 0, true) == WsFrameAction::Drop);
+}
+
 TEST(native_program, websocket_message_type_guards_survive_compiler_exit) {
     Source source;
     REQUIRE(

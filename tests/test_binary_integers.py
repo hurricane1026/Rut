@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Check imported Rut integer readers against Python's independent struct codec."""
+"""Check built-in Bytes integer readers against Python's independent struct codec."""
 import argparse
 import http.client
 from pathlib import Path
 import random
 import re
-import shutil
 import struct
 import subprocess
 import tempfile
@@ -23,7 +22,7 @@ def main():
         ('U32', 'I', 32, False), ('I32', 'i', 32, True),
         ('I64', 'q', 64, True),
     ]
-    source = 'import "binary.rut"\n'
+    source = ''
     offset_expression = '-1'
     for offset in (0, 1, 2, 3, 4, 8, -1, -2147483648, 2147483647):
         offset_expression = f'if text == "{offset}" {{ {offset} }} else {{ {offset_expression} }}'
@@ -37,15 +36,13 @@ route POST "/{name}" {{
     guard let expectedJson = json.parse(req.header("X-Expected").or("")) else {{ return 400 }}
     guard let expected = json.int(expectedJson) else {{ return 400 }}
     let position = offset(req.header("X-Offset").or("0"))
-    guard let value = binary.{name}(req.bodyBytes, position) else {{ return 400 }}
+    guard let value = req.bodyBytes.{name}(position) else {{ return 400 }}
     guard {expression} == expected else {{ return 422 }}
     return 204
 }}
 '''
     with tempfile.TemporaryDirectory(prefix='rut-binary-integers-') as directory:
         root = Path(directory)
-        module = root / 'binary.rut'
-        shutil.copyfile(Path(__file__).resolve().parent.parent / 'examples/clients/binary.rut', module)
         program, log = root / 'gateway.rut', root / 'gateway.log'
         program.write_text(source)
         with log.open('wb') as output:
@@ -68,9 +65,8 @@ route POST "/{name}" {{
                     raise AssertionError(data.decode(errors='replace'))
                 time.sleep(.02)
             assert port, log.read_text(errors='replace')
-            # The loaded native artifact must own everything needed by the readers.
+            # Built-in reads must keep working after the source is removed.
             program.unlink()
-            module.unlink()
 
             def request(name, body, expected, offset=0):
                 connection = http.client.HTTPConnection('127.0.0.1', port, timeout=4)

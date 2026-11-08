@@ -2927,15 +2927,14 @@ subscript contract, not Swift Array subscripting: Swift custom subscripts can
 No string/array subscripts, subscript assignment, ranges/slices, or new numeric
 types are added.
 
-## Binary integer helpers
+## Built-in Bytes integer reads
 
-The ordinary [binary library](../examples/clients/binary.rut) combines Bytes
-into fixed-width integers, with explicit byte order and byte offsets:
+Bytes has built-in methods for fixed-width integer reads, with explicit byte
+order and byte offsets. No import is required:
 
 ```rut
-import "clients/binary.rut"
 route POST "/number" {
-    guard let value = binary.readU16BE(req.bodyBytes, 0) else { return 400 }
+    guard let value = req.bodyBytes.readU16BE(0) else { return 400 }
     guard value == 300 else { return 422 } // bytes 0x01,0x2c
     return 204
 }
@@ -2946,6 +2945,7 @@ route POST "/number" {
 (most significant byte first) and LE (least significant byte first) support
 unaligned zero-based i32 offsets. Signed reads use two's complement. Negative
 offsets or incomplete input return nil without advancing a cursor or doing I/O.
-Unsigned 32-bit values retain the full 0–4294967295 range. These are source
-helpers, not new numeric types: unsigned 64-bit decoding and source i64
+Unsigned 32-bit values retain the full 0–4294967295 range. These methods operate
+on unwrapped Bytes and take one unwrapped i32 offset. They do not add numeric
+types: unsigned 64-bit decoding and source i64
 annotations remain absent. See [ranges and complete semantics](binary-integers.md).

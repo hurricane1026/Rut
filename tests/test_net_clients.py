@@ -157,9 +157,7 @@ def main():
             (root / 'clients').mkdir()
             module = root / 'clients/redis.rut'
             module.write_bytes((Path(__file__).parent.parent / 'examples/clients/redis.rut').read_bytes())
-            binary = root / 'clients/binary.rut'
-            binary.write_bytes((Path(__file__).parent.parent / 'examples/clients/binary.rut').read_bytes())
-            source = 'import "clients/redis.rut"\nimport "clients/binary.rut"\n'
+            source = 'import "clients/redis.rut"\n'
             source += '''
 func emit(_ socket: UdpSocket) -> bool {
     let sent = socket.send("helper", 1000)
@@ -192,7 +190,7 @@ route GET "/{path}" {{
     guard let line = pendingLine else {{ return 503 }}
     let pendingTail = connection.readExactly(4, 1000)
     guard let tail = pendingTail else {{ return 503 }}
-    guard tail == b"TAIL" && binary.readU16BE(line, 0).or(-1) == 26725 &&
+    guard tail == b"TAIL" && line.readU16BE(0).or(-1) == 26725 &&
         tail[tail.count - 1].or(-1) == 76 && tail[tail.count] == nil else {{ return 500 }}
     let closed = connection.close()
     guard closed else {{ return 500 }}
@@ -400,7 +398,6 @@ route GET "/limit" {
                 assert port, log.read_text(errors='replace')
                 program.unlink()
                 module.unlink()
-                binary.unlink()
 
                 def request(path, body=None):
                     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=4)

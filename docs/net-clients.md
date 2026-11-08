@@ -126,8 +126,8 @@ does not perform I/O or change `netError()`. Streaming subscriptions, background
 sessions, general parser loops, Bytes slices and cross-request pooling remain
 separate follow-ups, not current capabilities.
 
-The ordinary [binary library](binary-integers.md) decodes fixed-width integer
-fields from these Bytes with big/little endian helpers. Acquire a complete TCP
+The [built-in Bytes methods](binary-integers.md) decode fixed-width integer
+fields with big/little endian reads, such as `bytes.readU16BE(0)`. Acquire a complete TCP
 field before decoding (for example with `readExactly`); decoding itself does
 not perform I/O. UDP fields use offsets in a complete received datagram.
 

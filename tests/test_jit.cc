@@ -539,6 +539,80 @@ TEST(jit, bytes_subscripts_execute_without_arena_and_reject_malformed_rir) {
     tc.destroy();
 }
 
+TEST(jit, builtin_bytes_integer_reads_execute_and_validate_scalar_shapes) {
+    struct Reader {
+        json::Op operation;
+        bool wide;
+        i64 expected;
+    };
+    const Reader readers[] = {{json::Op::BytesReadU16BE, false, 65535},
+                              {json::Op::BytesReadU16LE, false, 65535},
+                              {json::Op::BytesReadI16BE, false, -1},
+                              {json::Op::BytesReadI16LE, false, -1},
+                              {json::Op::BytesReadU32BE, true, 4294967295},
+                              {json::Op::BytesReadU32LE, true, 4294967295},
+                              {json::Op::BytesReadI32BE, false, -1},
+                              {json::Op::BytesReadI32LE, false, -1},
+                              {json::Op::BytesReadI64BE, true, -1},
+                              {json::Op::BytesReadI64LE, true, -1}};
+    for (const auto& reader : readers) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder builder;
+        builder.init(&tc.mod);
+        auto* fn = V(builder.create_function(lit("bytes_integer"), lit("/"), 'G'));
+        const auto entry = V(builder.create_block(fn, lit("entry")));
+        builder.set_insert_point(fn, entry);
+        auto body = V(builder.emit_req_body());
+        auto offset = V(builder.emit_const_i32(0));
+        const ValueId args[] = {body, offset};
+        const auto op = static_cast<u32>(reader.operation);
+        const auto kind = reader.wide ? TypeKind::I64 : TypeKind::I32;
+        CHECK(!builder.emit_json(op, kind, true, args, 1));
+        CHECK(!builder.emit_json(op, kind, false, args, 2));
+        CHECK(!builder.emit_json(op, reader.wide ? TypeKind::I32 : TypeKind::I64, true, args, 2));
+        const auto result = V(builder.emit_json(op, kind, true, args, 2));
+        const auto type = V(builder.make_type(kind));
+        const auto value = V(builder.emit_opt_unwrap(result, type));
+        const auto expected = reader.wide
+                                  ? V(builder.emit_const_i64(reader.expected))
+                                  : V(builder.emit_const_i32(static_cast<i32>(reader.expected)));
+        const auto equal = V(builder.emit_cmp(Opcode::CmpEq, value, expected));
+        const auto ok = V(builder.emit_const_i32(204));
+        const auto bad = V(builder.emit_const_i32(500));
+        VOK(builder.emit_ret_status(V(builder.emit_select(equal, ok, bad))));
+        CHECK(verify_module(tc.mod).ok);
+        auto cg = codegen(tc.mod);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_bytes_integer"));
+        REQUIRE(handler);
+        const char wire[] =
+            "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 8\r\n\r\n"
+            "\xff\xff\xff\xff\xff\xff\xff\xff";
+        CHECK_EQ(
+            HandlerResult::unpack(
+                handler(
+                    nullptr, nullptr, reinterpret_cast<const u8*>(wire), sizeof(wire) - 1, nullptr))
+                .status_code,
+            204u);
+        auto& instruction = fn->blocks[entry.id].insts[2];
+        instruction.operands[1] = body;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operands[1] = offset;
+        const auto* saved = fn->values[result.id].type;
+        fn->values[result.id].type = type;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        fn->values[result.id].type = saved;
+        engine.shutdown();
+        tc.destroy();
+    }
+}
+
 TEST(jit, bytes_count_reads_the_full_raw_length_without_text_decoding) {
     TestContext tc;
     REQUIRE(tc.init());

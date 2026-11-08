@@ -78,9 +78,10 @@ struct VerifySummary {
 
 // Shared boundary validation for Bytes lookup and bounded String operations. Codegen also
 // checks direct RIR clients before indexing operands or allocating LLVM arrays.
-inline bool valid_bytes_subscript(const Function& fn, const Instruction& inst) {
-    if (inst.op != Opcode::JsonOp || inst.imm.i32_val != static_cast<i32>(json::Op::BytesAt))
-        return true;
+inline bool valid_bytes_read(const Function& fn, const Instruction& inst) {
+    if (inst.op != Opcode::JsonOp) return true;
+    const auto spec = json::bytes_read_spec(static_cast<json::Op>(inst.imm.i32_val));
+    if (!spec.width) return true;
     const auto kType = [&](ValueId id) -> const Type* {
         return id != kNoValue && id.id < fn.value_count && fn.values ? fn.values[id.id].type
                                                                      : nullptr;
@@ -93,8 +94,8 @@ inline bool valid_bytes_subscript(const Function& fn, const Instruction& inst) {
     return inst.operand_count == 2 && !inst.extra_operands &&
            kExact(inst.operands[0], TypeKind::Str) && kExact(inst.operands[1], TypeKind::I32) &&
            result && result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
-           result->inner->kind == TypeKind::I32 && !result->inner->inner &&
-           !result->inner->struct_def;
+           result->inner->kind == (spec.wide ? TypeKind::I64 : TypeKind::I32) &&
+           !result->inner->inner && !result->inner->struct_def;
 }
 
 inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
@@ -959,7 +960,7 @@ inline VerifyResult verify_function(const Function* fn,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
             }
-            if (!valid_bytes_subscript(*fn, inst))
+            if (!valid_bytes_read(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidBytesSubscript, function_index, bi, ii);
             if (inst.op != Opcode::JwtClaimsValidWithLifetime) continue;
