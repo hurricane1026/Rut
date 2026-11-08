@@ -50,6 +50,7 @@ fi
 printf '| Architecture | Build | Execution |\n| --- | --- | --- |\n' > "$output/summary.md"
 ran_avx512=0
 for arch in "${arches[@]}"; do
+  rm -f -- "$output/bench-$arch.csv" "$output/test-$arch.log"
   flags=()
   case $arch in
     sse2) flags=(-DRUT_INTEGER_ARCH_SSE2=1 -msse2) ;;

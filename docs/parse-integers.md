@@ -91,8 +91,8 @@ taskset -c 2 /var/tmp/bench_parse_integer
 ```
 
 The same target is available as `bench_parse_integer` in CMake. Its driver and
-kernel are both optimized, including when the surrounding build tree is Debug. Omit the x86 flag
-when building on another architecture. The benchmark itself has only libc and
+kernel are both optimized, including when the surrounding build tree is Debug.
+Omit the x86 flag when building on another architecture. The benchmark itself has only libc and
 project-header dependencies.
 
 A separate candidate comparison on the same host included length-only scalar,
@@ -193,4 +193,31 @@ tests. With Clang 22 on the i7-10700, initial 16–19-digit i64 runs measured ab
 8.0 ns for SSE2 and 7.6 ns for AVX2, against about 10 ns for the same run's inline
 portable kernel. These are exploratory measurements from a different compiler
 than the GCC table above; use the CI artifacts for comparisons on each runner.
-AVX-512 and NEON execution results must come from their native CI jobs.
+
+### First native CI results
+
+[Run 42462791552](https://github.com/hurricane1026/Rut/actions/runs/42462791552)
+(commit `4574ea58c`, Clang 20.1.2) required actual AVX-512 execution. All x86
+candidates and both ARM candidates passed, each with 596,009 oracle/bounds
+checks. This includes the protected-page tests for AVX-512 masked loads and NEON
+loads; neither architecture was emulated or skipped.
+
+Selected-runtime times for **64-bit parsing**, ns/call:
+
+| Native runner | Candidate | 1–3 digits | 8–10 digits | 16–19 digits | Mixed 1–19 digits |
+| --- | --- | ---: | ---: | ---: | ---: |
+| AMD EPYC 9V74 | portable | 4.87 | 5.66 | 7.42 | 6.97 |
+| AMD EPYC 9V74 | SSE2 | 4.26 | 5.48 | 5.48 | 6.48 |
+| AMD EPYC 9V74 | AVX2 | 4.26 | 5.51 | 5.35 | 6.46 |
+| AMD EPYC 9V74 | AVX-512BW | 3.70 | 5.05 | 5.31 | 6.35 |
+| Neoverse-N2 | portable | 5.43 | 8.09 | 9.41 | 11.03 |
+| Neoverse-N2 | NEON | 5.54 | 8.67 | 8.35 | 10.72 |
+
+The AVX2/AVX-512 long-value difference is under 1% in this run, so these results
+do not establish a universal winner. NEON helps long values on this runner but
+regresses some other corpora. Default selection stays portable pending broader
+workload evidence. Do not compare x86 and ARM ns/call as an ISA-only effect:
+these are different machines. Even short scalar-only paths vary with code
+layout, compiler optimization and hosted-runner noise. Use the artifacts' full
+32/64-bit CSVs and metadata rather than treating one best-of-five sample as a
+stable regression threshold.
