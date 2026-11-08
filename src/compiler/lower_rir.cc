@@ -120,6 +120,8 @@ struct FlatMirShape {
     MirTypeKind type = MirTypeKind::Unknown;
     u32 variant_index = 0xffffffffu;
     u32 struct_index = 0xffffffffu;
+    MirTypeKind collected_element = MirTypeKind::Unknown;
+    u32 collected_struct_index = 0xffffffffu;
     u32 tuple_len = 0;
     MirTypeKind tuple_types[kMaxMirTupleSlots]{};
     u32 tuple_variant_indices[kMaxMirTupleSlots]{};
@@ -500,6 +502,12 @@ static bool expand_flat_shape(const MirModule& mir, u32 shape_index, FlatMirShap
     out->variant_index = shape.variant_index;
     out->struct_index = shape.struct_index;
     out->tuple_len = shape.tuple_len;
+    if (shape.type == MirTypeKind::Collected) {
+        if (shape.collected_elem_shape_index >= mir.type_shapes.len) return false;
+        const auto& element = mir.type_shapes[shape.collected_elem_shape_index];
+        out->collected_element = element.type;
+        out->collected_struct_index = element.struct_index;
+    }
     if (shape.type != MirTypeKind::Tuple) return true;
     for (u32 i = 0; i < shape.tuple_len; i++) {
         const u32 elem_index = shape.tuple_elem_shape_indices[i];
@@ -700,6 +708,17 @@ static FrontendResult<const rir::Type*> rir_type_for_flat_shape(
     const rir::StructDef* const* user_struct_defs,
     rir::Builder& b,
     Span span) {
+    if (shape.type == MirTypeKind::Collected) {
+        FlatMirShape element{};
+        element.type = shape.collected_element;
+        element.struct_index = shape.collected_struct_index;
+        auto inner = rir_type_for_flat_shape(
+            element, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
+        if (!inner) return core::make_unexpected(inner.error());
+        auto array = b.make_type(rir::TypeKind::Array, inner.value());
+        if (!array) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        return array.value();
+    }
     return rir_type_for_shape(shape.type,
                               shape.variant_index,
                               shape.struct_index,
@@ -1306,6 +1325,130 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             shape, variant_infos, tuple_infos, tuple_info_count, user_struct_defs, b, span);
     };
 
+    if (value.kind == MirValueKind::CollectBytes || value.kind == MirValueKind::CollectedCount ||
+        value.kind == MirValueKind::CollectedGet) {
+        if (!value.lhs) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const auto kMaterialize = [&](const MirValue& source) {
+            return materialize_value(source,
+                                     mir,
+                                     variant_infos,
+                                     tuple_infos,
+                                     tuple_info_count,
+                                     error_scalar_infos,
+                                     error_variant_infos,
+                                     error_struct_infos,
+                                     user_struct_defs,
+                                     b,
+                                     locals,
+                                     local_count,
+                                     span);
+        };
+        const rir::SourceLoc location{span.line, span.col};
+        auto input = kMaterialize(*value.lhs);
+        if (!input) return core::make_unexpected(input.error());
+        if (value.kind == MirValueKind::CollectedCount) {
+            auto result = b.emit_array_len(input.value(), location);
+            if (!result) return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return result.value();
+        }
+        if (!value.rhs) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto state = kMaterialize(*value.rhs);
+        if (!state) return core::make_unexpected(state.error());
+        if (value.kind == MirValueKind::CollectedGet) {
+            auto result = b.emit_array_get(input.value(), state.value(), location);
+            if (!result) return frontend_error(FrontendError::UnsupportedSyntax, span);
+            return result.value();
+        }
+        if (value.args.len != 1 || !value.args[0] || value.int_value < 1 || value.int_value > 64)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto array_type = rir_type_for_flat_shape(resolved_shape(mir, value),
+                                                  variant_infos,
+                                                  tuple_infos,
+                                                  tuple_info_count,
+                                                  user_struct_defs,
+                                                  b,
+                                                  span);
+        if (!array_type || array_type.value()->kind != rir::TypeKind::Array)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto allocated = b.emit_array_new(
+            array_type.value()->inner, static_cast<u32>(value.int_value), location);
+        if (!allocated) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto fail = b.create_block(b.cur_func, lit("collect.fail"));
+        auto success = b.create_block(b.cur_func, lit("collect.success"));
+        auto merge = b.create_block(b.cur_func, lit("collect.merge"));
+        auto first = b.create_block(b.cur_func, lit("collect.first"));
+        if (!fail || !success || !merge || !first)
+            return frontend_error(FrontendError::OutOfMemory, span);
+        auto missing = b.emit_opt_is_nil(allocated.value(), location);
+        if (!missing || !b.emit_br(missing.value(), fail.value(), first.value(), location))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        b.set_insert_point(b.cur_func, first.value());
+        auto array = b.emit_opt_unwrap(allocated.value(), array_type.value(), location);
+        if (!array) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        const rir::Builder::ValueBinding input_binding{value.lhs, input.value(), b.value_bindings};
+        // Compile the fixed work budget to a forward-only graph. The existing
+        // automaton verifier therefore proves termination without a trusted
+        // backedge annotation or hidden runtime callback/function pointer.
+        for (u32 iteration = 0; iteration < static_cast<u32>(value.int_value); ++iteration) {
+            const rir::Builder::ValueBinding state_binding{
+                value.rhs, state.value(), &input_binding};
+            const auto* previous = b.value_bindings;
+            b.value_bindings = &state_binding;
+            auto stepped = kMaterialize(*value.args[0]);
+            b.value_bindings = previous;
+            if (!stepped) return core::make_unexpected(stepped.error());
+            const rir::Type* step_type = b.cur_func->values[stepped->id].type;
+            rir::ValueId step = stepped.value();
+            if (step_type && step_type->kind == rir::TypeKind::Optional) {
+                auto present = b.create_block(b.cur_func, lit("collect.present"));
+                auto absent = b.emit_opt_is_nil(step, location);
+                if (!present || !absent ||
+                    !b.emit_br(absent.value(), fail.value(), present.value(), location))
+                    return frontend_error(FrontendError::UnsupportedSyntax, span);
+                b.set_insert_point(b.cur_func, present.value());
+                step_type = step_type->inner;
+                auto unwrapped = b.emit_opt_unwrap(step, step_type, location);
+                if (!unwrapped) return frontend_error(FrontendError::UnsupportedSyntax, span);
+                step = unwrapped.value();
+            }
+            if (!step_type || step_type->kind != rir::TypeKind::Struct || !step_type->struct_def ||
+                step_type->struct_def->field_count != 3)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            const auto* fields = step_type->struct_def->fields();
+            auto next_state = b.emit_struct_field(step, fields[0].name, fields[0].type, location);
+            auto item = b.emit_struct_field(step, fields[1].name, fields[1].type, location);
+            auto done = b.emit_struct_field(step, fields[2].name, fields[2].type, location);
+            if (!next_state || !item || !done)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            auto stored = b.emit_array_push(array.value(), item.value(), location);
+            auto committed = b.create_block(b.cur_func, lit("collect.committed"));
+            auto next = iteration + 1 == static_cast<u32>(value.int_value)
+                            ? fail
+                            : b.create_block(b.cur_func, lit("collect.next"));
+            if (!stored || !committed || !next ||
+                !b.emit_br(stored.value(), committed.value(), fail.value(), location))
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            b.set_insert_point(b.cur_func, committed.value());
+            if (!b.emit_br(done.value(), success.value(), next.value(), location))
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            if (iteration + 1 < static_cast<u32>(value.int_value))
+                b.set_insert_point(b.cur_func, next.value());
+            state = next_state.value();
+        }
+        b.set_insert_point(b.cur_func, fail.value());
+        auto nil = b.emit_opt_nil(array_type.value(), location);
+        if (!nil || !b.emit_jmp(merge.value(), location))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        b.set_insert_point(b.cur_func, success.value());
+        auto wrapped = b.emit_opt_wrap(array.value(), location);
+        if (!wrapped || !b.emit_jmp(merge.value(), location))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        b.set_insert_point(b.cur_func, merge.value());
+        auto result =
+            b.emit_phi(nil.value(), fail.value(), wrapped.value(), success.value(), location);
+        if (!result) return frontend_error(FrontendError::UnsupportedSyntax, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::BoundValue) {
         if (value.lhs == nullptr || value.type != value.lhs->type ||
             value.may_nil != value.lhs->may_nil || value.may_error != value.lhs->may_error)
@@ -3356,7 +3499,8 @@ static FrontendResult<rir::ValueId> materialize_local_init(
 
     if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
         local_shape.type != MirTypeKind::I64 && local_shape.type != MirTypeKind::Str &&
-        local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct)
+        local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct &&
+        local_shape.type != MirTypeKind::Collected)
         return frontend_error(FrontendError::UnsupportedSyntax, local.span);
 
     auto inner = make_inner_type(local_shape, local.span);
@@ -4086,8 +4230,11 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
                                               bool internal_strict_local_response_propagation) {
     for (u32 i = 0; i < mir.functions.len; ++i)
         if (!mir.functions[i].values.ok()) return frontend_error(FrontendError::OutOfMemory);
+    // Reserve the complete tuple-lowering table as well as user types and
+    // their error carriers. Several differently typed collectors can share
+    // one module; tuple materialization must not exhaust an eight-slot tail.
     if (!out.init(mir.functions.len == 0 ? 1 : mir.functions.len,
-                  mir.variants.len * 2 + mir.structs.len + 8))
+                  mir.variants.len * 2 + mir.structs.len * 2 + 64 + 8))
         return frontend_error(FrontendError::OutOfMemory);
 
     rir::Builder b;

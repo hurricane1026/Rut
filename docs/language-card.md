@@ -3022,6 +3022,27 @@ existing bounded byte search; neither operation allocates, performs I/O or chang
 contract. These custom Bytes methods use existing call syntax; Swift collection
 range syntax is not added. See [the full contract](bytes-fields.md).
 
+## Bounded buffer parsing
+
+`collectBytes(input, initialState, maxItems, step) -> Collected<Item>?` scans a
+complete Bytes buffer with a literal 1–64 step budget. `step` is a compile-time
+named ordinary function taking `(Bytes, State)` and returning `(State, Item,
+bool)?`. A true Boolean completes after including that item; nil, exhausted
+budget or storage failure returns nil for the whole result.
+
+`Collected<T>` is an immutable, invocation-owned result type. Unwrap it before
+using `.count -> i32` or `.get(i32) -> T?`. Negative/out-of-range indices return
+nil. Typed helper parameters/returns and local annotations preserve the exact
+element type. str/Bytes leaves in collected records are copied into the existing
+bounded arena. This does not add general Array mutation, source `for` loops,
+function values, recursion or streaming network reads.
+
+The step must be synchronous and independent of request/response state, I/O,
+cache, randomness and nested collection. State/items use concrete scalar/plain
+struct shapes; optional/error leaves and nested collections are absent. See
+[the full contract](bounded-parsing.md), [RESP2 library](../examples/clients/resp2.rut)
+and [executable example](../examples/resp2-decoder.rut).
+
 ## Built-in Bytes integer reads
 
 Bytes has built-in methods for fixed-width integer reads, with explicit byte

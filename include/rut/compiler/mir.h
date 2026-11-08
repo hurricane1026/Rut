@@ -120,6 +120,9 @@ enum class MirValueKind : u8 {
     WsMessageField,
     LetIn,
     BoundValue,
+    CollectBytes,
+    CollectedCount,
+    CollectedGet,
     WsForward,  // lhs payload, int_value Text/Binary wire opcode; produces an action
     WsClose,    // lhs code, rhs reason; produces an action
 };
@@ -136,6 +139,7 @@ enum class MirTypeKind : u8 {
     Method,
     ByteSize,
     IP,
+    Collected,
 };
 
 struct MirTypeShape {
@@ -146,6 +150,7 @@ struct MirTypeShape {
     u32 variant_index = 0xffffffffu;
     u32 struct_index = 0xffffffffu;
     u32 tuple_len = 0;
+    u32 collected_elem_shape_index = 0xffffffffu;
     u32 tuple_elem_shape_indices[kMaxMirTupleSlots]{};
 };
 

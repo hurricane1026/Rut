@@ -97,6 +97,53 @@ struct StructDef {
     const FieldDef* fields() const { return reinterpret_cast<const FieldDef*>(this + 1); }
 };
 
+struct CollectedElementLayout {
+    u32 width = 0;
+    u32 alignment = 1;
+    u32 strings = 0;
+};
+inline bool collected_element_layout(const Type* type, CollectedElementLayout* out, u32 depth = 0) {
+    if (!type || !out || depth > 8 || type->inner) return false;
+    *out = {};
+    if (type->kind == TypeKind::Bool && !type->struct_def) {
+        out->width = 1;
+        return true;
+    }
+    if (type->kind == TypeKind::I32 && !type->struct_def) {
+        out->width = out->alignment = 4;
+        return true;
+    }
+    if (type->kind == TypeKind::I64 && !type->struct_def) {
+        out->width = out->alignment = 8;
+        return true;
+    }
+    if (type->kind == TypeKind::Str && !type->struct_def) {
+        out->width = sizeof(Str);
+        out->alignment = alignof(Str);
+        out->strings = 1;
+        return true;
+    }
+    if (type->kind != TypeKind::Struct || !type->struct_def || !type->struct_def->field_count ||
+        type->struct_def->field_count > 8)
+        return false;
+    for (u32 i = 0; i < type->struct_def->field_count; ++i) {
+        CollectedElementLayout field{};
+        if (!collected_element_layout(type->struct_def->fields()[i].type, &field, depth + 1))
+            return false;
+        if (field.alignment > out->alignment) out->alignment = field.alignment;
+        out->width = (out->width + field.alignment - 1) & ~(field.alignment - 1);
+        out->width += field.width;
+        out->strings += field.strings;
+        if (out->width > 512 || out->strings > 16) return false;
+    }
+    out->width = (out->width + out->alignment - 1) & ~(out->alignment - 1);
+    return out->width <= 512;
+}
+inline bool collected_element_type(const Type* type) {
+    CollectedElementLayout layout{};
+    return collected_element_layout(type, &layout);
+}
+
 // ── Values (SSA) ────────────────────────────────────────────────────
 // Index-based SSA: %0, %1, %2... are indices into the function's value
 // table. This is cache-friendly, trivially serializable, and works
@@ -253,7 +300,7 @@ enum class Opcode : u8 {
     StructCreate,  // %r = struct.create Name {...}  → Struct
     BodyParse,     // %r = body.parse TypeName       → T
     ArrayLen,      // %r = array.len %arr            → i32
-    ArrayGet,      // %r = array.get %arr, %idx      → T
+    ArrayGet,      // %r = array.get %arr, %idx      → Optional(T)
 
     // ── Optional operations ──
     OptNil,     // %r = opt.nil                    → Optional(T)
@@ -317,6 +364,8 @@ enum class Opcode : u8 {
     Phi,
     WsForward,  // Str carrier operand; Text/Binary opcode immediate; I32 action
     WsClose,    // I32 code and Str reason operands; I32 action
+    ArrayNew,   // optional collection storage, bounded capacity
+    ArrayPush,  // private collector initialization; returns success
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

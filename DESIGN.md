@@ -10527,3 +10527,34 @@ fingerprint comes exclusively from `req.tlsClientCertSha256`; its absence fails
 closed. Confirmation is checked before subject/scope forwarding. No builtin,
 allocator, configuration lifecycle or runtime ABI is changed. See
 [the protocol contract](docs/oauth-introspection.md#optional-mtls-certificate-binding).
+
+### Bounded buffer parsing and collected results
+
+`collectBytes(Bytes, State, literalLimit, namedStep)` is a compile-time parser
+composition form using ordinary call syntax. The statically selected synchronous
+step returns `(State, Item, bool)?`; each successful step commits one item, and
+true completes the collection. The literal 1–64 limit bounds execution even
+when user state makes no progress. Nil, work exhaustion and storage failure
+produce no result, never a partial collection.
+
+`Collected<T>` preserves its concrete element shape through helper signatures,
+imports, HIR/MIR/RIR and native code. `.count` and checked `.get(i32)` are the only
+read surface. Published collections are immutable. Before committing an item,
+the existing SliceArena owns every string/byte leaf, including nested record
+leaves; source and scratch views cannot escape into a returned record. Existing
+aggregate and contiguous arena bounds remain unchanged.
+
+The initial lowering expands at most 64 steps into a forward-only graph, so the
+native automaton verifier's existing termination checks remain applicable.
+Collection accesses participate in reached branch semantics; missing values are
+never speculatively dereferenced through guard continuations. Explicit typed RIR
+operations validate capacity, element layout, operand/result shapes and checked
+access before JIT/native emission. The collection runtime has no LLVM dependency,
+C++ standard-library allocation, protocol parser or external dependency.
+
+Steps reject I/O, request/response state, cache, randomness and nested collection,
+including effects hidden in otherwise unused lexical bindings. Runtime function
+values and general source loops remain absent. The first consumer is a pure Rut
+RESP2 complete-buffer decoder with a typed preorder node result. Streamed network
+parsing and compact verified backedges are later work; see
+[the contract and limits](docs/bounded-parsing.md).

@@ -2066,6 +2066,138 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
             break;
         }
+        case rir::Opcode::ArrayNew: {
+            const auto* element = c.cur_fn->values[inst.result.id].type->inner->inner;
+            const auto element_type = c.map_type(element);
+            LLVMValueRef offsets[16]{};
+            LLVMValueRef path[10]{};
+            path[0] = LLVMConstInt(c.i32_ty, 0, 0);
+            u32 strings = 0;
+            const auto describe = [&](auto&& self, const rir::Type* type, u32 depth) -> bool {
+                if (depth >= 10) return false;
+                if (type->kind == rir::TypeKind::Str) {
+                    if (strings == 16) return false;
+                    const auto address =
+                        LLVMConstGEP2(element_type, LLVMConstNull(c.ptr_ty), path, depth);
+                    offsets[strings++] = LLVMConstPtrToInt(address, c.i32_ty);
+                } else if (type->kind == rir::TypeKind::Struct) {
+                    for (u32 i = 0; i < type->struct_def->field_count; ++i) {
+                        path[depth] = LLVMConstInt(c.i32_ty, i, 0);
+                        if (!self(self, type->struct_def->fields()[i].type, depth + 1))
+                            return false;
+                    }
+                }
+                return true;
+            };
+            LLVMValueRef offset_pointer = LLVMConstNull(c.ptr_ty);
+            // Shapes with excessive text leaves fail allocation without
+            // constructing a malformed descriptor or partially visible array.
+            const bool described = describe(describe, element, 1);
+            if (described && strings) {
+                const auto type = LLVMArrayType(c.i32_ty, strings);
+                offset_pointer = LLVMAddGlobal(c.llvm_mod, type, "collect.string.offsets");
+                LLVMSetInitializer(offset_pointer, LLVMConstArray(c.i32_ty, offsets, strings));
+                LLVMSetGlobalConstant(offset_pointer, 1);
+                LLVMSetLinkage(offset_pointer, LLVMPrivateLinkage);
+            }
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.ptr_ty, parameters, 6, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_new");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_new", type);
+            LLVMValueRef arguments[] = {
+                c.param_conn,
+                c.param_arena,
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, ""),
+                LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
+                offset_pointer,
+                LLVMConstInt(c.i32_ty, described ? strings : 17, 0)};
+            const auto pointer =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 6, "collect.new");
+            const auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "collect.allocated");
+            auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+            result = LLVMBuildInsertValue(c.builder, result, pointer, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
+        case rir::Opcode::ArrayPush: {
+            const auto* element = c.cur_fn->values[inst.operands[0].id].type->inner;
+            const auto element_type = c.map_type(element);
+            const auto temporary = LLVMBuildAlloca(c.builder, element_type, "collect.item");
+            LLVMBuildStore(c.builder, c.get_value(inst.operands[1]), temporary);
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.i8_ty, parameters, 3, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_push");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_push", type);
+            LLVMValueRef arguments[] = {
+                c.get_value(inst.operands[0]),
+                temporary,
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, "")};
+            const auto committed =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 3, "collect.push");
+            c.set_value(inst.result,
+                        LLVMBuildICmp(c.builder,
+                                      LLVMIntNE,
+                                      committed,
+                                      LLVMConstInt(c.i8_ty, 0, 0),
+                                      "collect.committed"));
+            break;
+        }
+        case rir::Opcode::ArrayLen: {
+            LLVMTypeRef parameters[] = {c.ptr_ty};
+            const auto type = LLVMFunctionType(c.i32_ty, parameters, 1, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_count");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_count", type);
+            LLVMValueRef arguments[] = {c.get_value(inst.operands[0])};
+            c.set_value(inst.result,
+                        LLVMBuildCall2(c.builder, type, helper, arguments, 1, "collect.count"));
+            break;
+        }
+        case rir::Opcode::ArrayGet: {
+            const auto* result_type = c.cur_fn->values[inst.result.id].type;
+            const auto element_type = c.map_type(result_type->inner);
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.i32_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.ptr_ty, parameters, 3, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_get");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_get", type);
+            LLVMValueRef arguments[] = {
+                c.get_value(inst.operands[0]),
+                c.get_value(inst.operands[1]),
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, "")};
+            const auto pointer =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 3, "collect.get");
+            const auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "collect.present");
+            const auto origin = LLVMGetInsertBlock(c.builder);
+            const auto function = LLVMGetBasicBlockParent(origin);
+            const auto load = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "collect.load");
+            const auto merge =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "collect.get.merge");
+            LLVMBuildCondBr(c.builder, has, load, merge);
+            LLVMPositionBuilderAtEnd(c.builder, load);
+            const auto loaded = LLVMBuildLoad2(c.builder, element_type, pointer, "collect.value");
+            LLVMBuildBr(c.builder, merge);
+            LLVMPositionBuilderAtEnd(c.builder, merge);
+            const auto payload = LLVMBuildPhi(c.builder, element_type, "collect.result");
+            LLVMValueRef values[] = {LLVMConstNull(element_type), loaded};
+            LLVMBasicBlockRef blocks[] = {origin, load};
+            LLVMAddIncoming(payload, values, blocks, 2);
+            auto result = LLVMGetUndef(c.map_type(result_type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+            if (result_type->inner->kind == rir::TypeKind::Str) {
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, payload, 0, ""), 1, "");
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, payload, 1, ""), 2, "");
+            } else {
+                result = LLVMBuildInsertValue(c.builder, result, payload, 1, "");
+            }
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
             if (kJsonOp == json::Op::BytesSlice) {
@@ -3013,8 +3145,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
             } else {
                 LLVMTypeRef payload_ty = LLVMStructGetTypeAtIndex(out_ty, 1);
-                opt = LLVMBuildInsertValue(
-                    c.builder, opt, LLVMGetUndef(payload_ty), 1, "opt.nil.payload");
+                const auto* optional_type = c.cur_fn->values[inst.result.id].type;
+                const auto payload = optional_type->inner->kind == rir::TypeKind::Array
+                                         ? LLVMConstNull(payload_ty)
+                                         : LLVMGetUndef(payload_ty);
+                opt = LLVMBuildInsertValue(c.builder, opt, payload, 1, "opt.nil.payload");
             }
             c.set_value(inst.result, opt);
             break;
@@ -3478,6 +3613,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     LLVMBasicBlockRef small_blocks[64]{};
     // LLVM's opaque mutable block handles are required by LLVMAddIncoming.
     LLVMBasicBlockRef small_exits[64]{};  // NOLINT(misc-const-correctness)
+    u8 small_emitted[64]{};
     struct MapStorage {
         MmapArena arena;
         ~MapStorage() { arena.destroy(); }
@@ -3711,24 +3847,55 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         if (kNeedsTimeUnlatch) c.emit_time_unlatch();
     }
 
-    // Emit instructions block by block.
-    for (u32 i = 0; i < fn.block_count; i++) {
-        auto& blk = fn.blocks[i];
-        c.current_block = blk.id.id;
-        LLVMBasicBlockRef bb = c.block_map[blk.id.id];
-        LLVMPositionBuilderAtEnd(c.builder, bb);
-
-        for (u32 j = 0; j < blk.inst_count; j++) {
-            emit_instruction(c, blk.insts[j]);
+    // Block IDs are allocation order, not SSA definition order: inlined
+    // optional helpers may append a producer after their outer consumer.
+    // Emit non-frame blocks only when cross-block inputs exist. Phi incoming
+    // edges are resolved separately, breaking loop-carried dependencies.
+    auto* emitted = fn.block_cap <= 64 ? small_emitted : maps.arena.alloc_array<u8>(fn.block_count);
+    if (!emitted) return false;
+    u32 emitted_count = 0;
+    while (emitted_count < fn.block_count) {
+        bool progress = false;
+        for (u32 i = 0; i < fn.block_count; ++i) {
+            if (emitted[i]) continue;
+            const auto& blk = fn.blocks[i];
+            bool ready = true;
+            if (!c.call_frame) {
+                for (u32 ii = 0; ii < blk.inst_count && ready; ++ii) {
+                    const auto& inst = blk.insts[ii];
+                    if (inst.op == rir::Opcode::Phi) continue;
+                    for (u32 oi = 0; oi < inst.operand_count; ++oi) {
+                        const auto kId = inst.operand(oi);
+                        if (kId == rir::kNoValue || kId.id >= fn.value_count) return false;
+                        if (fn.values[kId.id].def_block.id != blk.id.id && !c.value_map[kId.id]) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!ready) continue;
+            c.current_block = blk.id.id;
+            LLVMPositionBuilderAtEnd(c.builder, c.block_map[blk.id.id]);
+            for (u32 j = 0; j < blk.inst_count; ++j) {
+                const auto& inst = blk.insts[j];
+                if (!c.call_frame && inst.op != rir::Opcode::Phi) {
+                    for (u32 oi = 0; oi < inst.operand_count; ++oi) {
+                        const auto kId = inst.operand(oi);
+                        if (kId == rir::kNoValue || kId.id >= fn.value_count ||
+                            !c.value_map[kId.id])
+                            return false;
+                    }
+                }
+                emit_instruction(c, inst);
+            }
+            if (!blk.terminator()) LLVMBuildUnreachable(c.builder);
+            exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+            emitted[i] = 1;
+            ++emitted_count;
+            progress = true;
         }
-
-        // If block has no terminator, add unreachable (shouldn't happen in valid RIR).
-        if (!blk.terminator()) {
-            LLVMBuildUnreachable(c.builder);
-        }
-        // Helpers may split LLVM blocks internally. A RIR edge leaves the
-        // helper's continuation, not necessarily its original entry block.
-        exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+        if (!progress) return false;
     }
     // Resolve incoming edges after every producer and helper continuation is
     // available; RIR block IDs need not be in dependency order.
@@ -3772,7 +3939,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
-                    !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst))
+                    !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst) ||
+                    !rir::valid_collected_instruction(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);

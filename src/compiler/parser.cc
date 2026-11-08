@@ -4186,18 +4186,26 @@ struct Parser {
             if (!cond) return core::make_unexpected(cond.error());
             auto lbrace = expect(TokenType::LBrace);
             if (!lbrace) return core::make_unexpected(lbrace.error());
+            const bool kNestedThen = cur().type == TokenType::LBrace;
+            if (!kNestedThen) --pos;  // Retain lets and guards in the arm.
             auto then_stmt = parse_func_body_stmt();
             if (!then_stmt) return core::make_unexpected(then_stmt.error());
-            auto rbrace = expect(TokenType::RBrace);
-            if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (kNestedThen) {
+                auto closing = expect(TokenType::RBrace);
+                if (!closing) return core::make_unexpected(closing.error());
+            }
             auto kw_else = expect(TokenType::KwElse);
             if (!kw_else) return core::make_unexpected(kw_else.error());
             auto else_lbrace = expect(TokenType::LBrace);
             if (!else_lbrace) return core::make_unexpected(else_lbrace.error());
+            const bool kNestedElse = cur().type == TokenType::LBrace;
+            if (!kNestedElse) --pos;
             auto else_stmt = parse_func_body_stmt();
             if (!else_stmt) return core::make_unexpected(else_stmt.error());
-            auto else_rbrace = expect(TokenType::RBrace);
-            if (!else_rbrace) return core::make_unexpected(else_rbrace.error());
+            if (kNestedElse) {
+                auto closing = expect(TokenType::RBrace);
+                if (!closing) return core::make_unexpected(closing.error());
+            }
             AstStatement stmt{};
             stmt.kind = AstStmtKind::If;
             stmt.bind_value = is_let;
@@ -4210,7 +4218,7 @@ struct Parser {
             stmt.then_stmt = then_ptr.value();
             stmt.else_stmt = else_ptr.value();
             stmt.span =
-                Span{cond->span.start, else_rbrace.value()->end, cond->span.line, cond->span.col};
+                Span{cond->span.start, else_stmt->span.end, cond->span.line, cond->span.col};
             return stmt;
         }
         if (take(TokenType::KwMatch)) {

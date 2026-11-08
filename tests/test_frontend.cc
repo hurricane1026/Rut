@@ -47682,3 +47682,108 @@ route GET "/" { let result = label(req.http11).close() return 200 }
     REQUIRE(hir->routes.len == 1);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
+
+TEST(frontend, bounded_collections_keep_element_shapes_in_helpers_and_native_ir) {
+    const char* source = R"rut(
+func step(_ bytes: Bytes, _ position: i32) -> (i32, i32, bool) {
+    guard let value = bytes[position] else { nil }
+    (position + 1, value, position + 1 == bytes.count)
+}
+func decode(_ bytes: Bytes) -> Collected<i32> { collectBytes(bytes, 0, 64, step) }
+func first(_ values: Collected<i32>) -> i32 { values.get(0).or(-1) }
+route POST "/" {
+    guard let values = decode(req.bodyBytes) else { return 400 }
+    guard first(values) == 97 && values.count == 3 else { return 422 }
+    guard values.get(-1) == nil && values.get(3) == nil else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayNew));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayPush));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayGet));
+    rir.destroy();
+}
+
+TEST(frontend, bounded_collections_reject_unbounded_calls_and_wrong_collection_types) {
+    const char* prefix = R"rut(
+func step(_ bytes: Bytes, _ state: i32) -> (i32, i32, bool) { (state, 42, true) }
+func bytesStep(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) { (state, bytes, true) }
+func first(_ values: Collected<i32>) -> i32 { values.get(0).or(-1) }
+)rut";
+    const char* expressions[] = {
+        "collectBytes(b\"x\", 0, 0, step)",
+        "collectBytes(b\"x\", 0, 65, step)",
+        "collectBytes(b\"x\", 0, req.bodyBytes.count, step)",
+        "collectBytes(\"x\", 0, 1, step)",
+        "collectBytes(b\"x\", true, 1, step)",
+        "collectBytes(b\"x\", 0, 1, missing)",
+        "collectBytes(b\"x\", 0, 1)",
+        "collectBytes(b\"x\", 0, 1, step).get(0)",
+        "first(collectBytes(b\"x\", 0, 1, bytesStep))",
+    };
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string(prefix) + "route POST \"/\" { let value = " + expression + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* tails[] = {
+        "let result = values.get(true)",
+        "let result = values[0]",
+        "let result = values.append(42)",
+        "let result = values.unknown",
+        "let result: Collected<Bytes> = values",
+        "let result = first(bytes)",
+    };
+    for (const char* tail : tails) {
+        const std::string source = std::string(prefix) + R"rut(route POST "/" {
+            guard let values = collectBytes(req.bodyBytes, 0, 8, step) else { return 400 }
+            guard let bytes = collectBytes(req.bodyBytes, 0, 8, bytesStep) else { return 400 }
+            )rut" + tail + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, bounded_collection_steps_cannot_hide_network_or_request_access) {
+    const char* bodies[] = {
+        "let ignored = netError()\nguard state == state else { nil }\n(state, bytes, true)",
+        "let ignored = tcp(\"{\\\"address\\\":\\\"127.0.0.1\\\",\\\"port\\\":6379}\", 1000)\nguard "
+        "state == state else { nil }\n(state, bytes, true)",
+        "(state, req.bodyBytes, true)",
+        "let ignored = collectBytes(bytes, 0, 1, leaf)\nguard state == state else { nil }\n(state, "
+        "bytes, true)",
+    };
+    for (const char* body : bodies) {
+        const std::string source = std::string(R"rut(
+func leaf(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) { (state, bytes, true) }
+func hidden(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) {
+)rut") + body + R"rut(
+}
+route POST "/" { let result = collectBytes(req.bodyBytes, 0, 8, hidden) return 204 }
+)rut";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}

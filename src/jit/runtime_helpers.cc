@@ -11,6 +11,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/crypto_c.h"
@@ -3019,4 +3020,29 @@ extern "C" rut::i32 rut_helper_bytes_find(const char* data,
     const auto* found =
         static_cast<const char*>(memmem(data + start, kRemaining, delimiter, delimiter_length));
     return found ? static_cast<i32>(found - data) : -1;
+}
+
+extern "C" void* rut_helper_collect_new(void* conn,
+                                        void* arena,
+                                        rut::u32 width,
+                                        rut::u32 capacity,
+                                        const rut::u32* offsets,
+                                        rut::u32 strings) {
+    auto* storage = static_cast<rut::SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<rut::ConnectionBase*>(conn)->json_arena;
+    return rut::CollectedValues::create(storage, width, capacity, offsets, strings);
+}
+extern "C" rut::u8 rut_helper_collect_push(void* collection, const void* value, rut::u32 width) {
+    return collection && static_cast<rut::CollectedValues*>(collection)->append(value, width);
+}
+extern "C" rut::i32 rut_helper_collect_count(const void* collection) {
+    return collection
+               ? static_cast<rut::i32>(static_cast<const rut::CollectedValues*>(collection)->count)
+               : 0;
+}
+extern "C" const void* rut_helper_collect_get(const void* collection,
+                                              rut::i32 index,
+                                              rut::u32 width) {
+    return collection ? static_cast<const rut::CollectedValues*>(collection)->get(index, width)
+                      : nullptr;
 }

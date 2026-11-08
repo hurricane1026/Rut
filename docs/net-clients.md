@@ -144,3 +144,8 @@ validation, bounded session capacity and handle owner/generation/close isolation
 `find(delimiter[, start])` methods. For a CRLF-terminated decimal field, locate
 CRLF, slice off the protocol prefix/terminator, then use `parseInt`/`parseInt64`.
 A slice retained across another network operation keeps the original read bytes.
+
+[Bounded parsing](bounded-parsing.md) adds synchronous complete-buffer scans and
+immutable typed result collections. The [RESP2 library](../examples/clients/resp2.rut)
+uses these generic primitives to validate nested replies; it does not turn a
+partial TCP receive into a complete frame or introduce I/O inside parser steps.

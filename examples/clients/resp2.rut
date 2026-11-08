@@ -1,0 +1,77 @@
+// RESP2 decoding uses generic bounded collection; the runtime has no Redis logic.
+// Kinds: 1 simple string, 2 error, 3 integer, 4 bulk string, 5 array,
+//        6 null bulk string, 7 null array. Arrays are preorder nodes.
+struct Resp2State {
+    offset: i32
+    pending: i32
+}
+struct Resp2Token {
+    kind: i32
+    data: Bytes
+    next: i32
+    children: i32
+}
+func resp2Select(_ condition: bool, _ yes: i32, _ no: i32) -> i32 {
+    if condition { yes } else { no }
+}
+func resp2Emit(_ state: Resp2State, _ token: Resp2Token) -> (Resp2State, Resp2Token, bool) {
+    let pending = state.pending - 1 + token.children
+    guard pending > -1 && !(pending > 64) else { nil }
+    (Resp2State(offset: token.next, pending: pending), token, pending == 0)
+}
+func resp2Bulk(_ bytes: Bytes, _ state: Resp2State, _ length: i32, _ start: i32) -> (Resp2State, Resp2Token, bool) {
+    guard length > -1 && !(length > bytes.count - start - 2) else { nil }
+    let end = start + length
+    guard bytes.slice(end, end + 2) == b"\r\n" else { nil }
+    guard let payload = bytes.slice(start, end) else { nil }
+    resp2Emit(state, Resp2Token(kind: 4, data: payload, next: end + 2, children: 0))
+}
+func resp2Length(_ bytes: Bytes, _ state: Resp2State, _ prefix: i32, _ text: Bytes, _ next: i32) -> (Resp2State, Resp2Token, bool) {
+    if text == b"-1" {
+        let kind = resp2Select(prefix == 36, 6, 7)
+        resp2Emit(state, Resp2Token(kind: kind, data: b"", next: next, children: 0))
+    } else {
+        guard let first = text[0] else { nil }
+        guard first > 47 && first < 58 else { nil }
+        guard let length = parseInt(text) else { nil }
+        if prefix == 36 {
+            resp2Bulk(bytes, state, length, next)
+        } else {
+            guard !(length > 64) else { nil }
+            resp2Emit(state, Resp2Token(kind: 5, data: b"", next: next, children: length))
+        }
+    }
+}
+func resp2Step(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
+    guard state.pending > 0 else { nil }
+    guard let prefix = bytes[state.offset] else { nil }
+    guard let lineEnd = bytes.find(b"\r\n", state.offset + 1) else { nil }
+    guard let text = bytes.slice(state.offset + 1, lineEnd) else { nil }
+    let next = lineEnd + 2
+    if prefix == 43 || prefix == 45 {
+        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+        let kind = resp2Select(prefix == 43, 1, 2)
+        resp2Emit(state, Resp2Token(kind: kind, data: text, next: next, children: 0))
+    } else {
+        if prefix == 58 {
+            guard parseInt64(text) != nil else { nil }
+            resp2Emit(state, Resp2Token(kind: 3, data: text, next: next, children: 0))
+        } else {
+            guard prefix == 36 || prefix == 42 else { nil }
+            resp2Length(bytes, state, prefix, text, next)
+        }
+    }
+}
+// Decode one complete value, rejecting trailing bytes and truncated aggregates.
+// A nesting chain consumes one node per level and is bounded by the same limit.
+func decodeResp2(_ bytes: Bytes) {
+    guard let tokens = collectBytes(bytes, Resp2State(offset: 0, pending: 1), 64, resp2Step) else { nil }
+    guard let last = tokens.get(tokens.count - 1) else { nil }
+    guard last.next == bytes.count else { nil }
+    tokens
+}
+
+func resp2Integer(_ token: Resp2Token) {
+    guard token.kind == 3 else { nil }
+    parseInt64(token.data)
+}

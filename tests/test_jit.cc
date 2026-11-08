@@ -30660,3 +30660,92 @@ TEST(jit, jwt_certificate_binding_uses_canonical_thumbprint_metadata) {
           401);
     rir.destroy();
 }
+
+TEST(helpers, collected_values_own_string_leaves_and_never_publish_failed_items) {
+    struct Record {
+        Str text;
+        i64 number;
+    };
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const u32 offsets[] = {__builtin_offsetof(Record, text)};
+    void* collection = rut_helper_collect_new(nullptr, &arena, sizeof(Record), 2, offsets, 1);
+    REQUIRE(collection);
+    char bytes[] = {'a', '\0', static_cast<char>(0xff)};
+    Record record{{bytes, 3}, -9223372036854775807LL - 1};
+    CHECK(rut_helper_collect_push(collection, &record, sizeof(record)));
+    bytes[0] = 'z';
+    const auto* first =
+        static_cast<const Record*>(rut_helper_collect_get(collection, 0, sizeof(record)));
+    REQUIRE(first);
+    CHECK(first->text.eq({"a\0\xff", 3}));
+    CHECK_EQ(first->number, record.number);
+    CHECK_EQ(rut_helper_collect_count(collection), 1);
+    CHECK(rut_helper_collect_get(collection, -1, sizeof(record)) == nullptr);
+    CHECK(rut_helper_collect_get(collection, 1, sizeof(record)) == nullptr);
+    CHECK(rut_helper_collect_get(collection, 0, sizeof(record) - 1) == nullptr);
+    record.text = {nullptr, 1};
+    CHECK_FALSE(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(collection), 1);
+    record.text = {nullptr, 0};
+    CHECK(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_FALSE(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(collection), 2);
+    CHECK(rut_helper_collect_new(nullptr, &arena, 0, 1, nullptr, 0) == nullptr);
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 65, offsets, 1) == nullptr);
+    const u32 bad[] = {sizeof(Record), 1};
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 1, bad, 1) == nullptr);
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 1, bad + 1, 1) == nullptr);
+    CHECK_FALSE(rut_helper_collect_push(nullptr, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(nullptr), 0);
+    CHECK(rut_helper_collect_get(nullptr, 0, sizeof(record)) == nullptr);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(jit, collected_rir_validates_capacity_element_shapes_and_checked_get) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder builder;
+    builder.init(&tc.mod);
+    auto* fn = V(builder.create_function(lit("collection"), lit("/"), 'P'));
+    const auto entry = V(builder.create_block(fn, lit("entry")));
+    builder.set_insert_point(fn, entry);
+    const auto* integer = V(builder.make_type(TypeKind::I32));
+    CHECK_FALSE(builder.emit_array_new(integer, 0));
+    CHECK_FALSE(builder.emit_array_new(integer, 65));
+    const auto allocation = V(builder.emit_array_new(integer, 2));
+    const auto* array_type = fn->values[allocation.id].type->inner;
+    const auto array = V(builder.emit_opt_unwrap(allocation, array_type));
+    const auto value = V(builder.emit_const_i32(42));
+    const auto wrong = V(builder.emit_const_str(lit("bad")));
+    CHECK_FALSE(builder.emit_array_push(array, wrong));
+    CHECK_FALSE(builder.emit_array_get(array, wrong));
+    V(builder.emit_array_push(array, value));
+    V(builder.emit_array_len(array));
+    const auto index = V(builder.emit_const_i32(0));
+    V(builder.emit_array_get(array, index));
+    VOK(builder.emit_ret_status(204));
+    REQUIRE(verify_module(tc.mod).ok);
+    auto result = codegen(tc.mod);
+    REQUIRE(result.ok);
+    LLVMDisposeModule(result.mod);
+    LLVMContextDispose(result.ctx);
+    auto& instruction = fn->blocks[entry.id].insts[0];
+    instruction.imm.i32_val = 65;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.imm.i32_val = 2;
+    instruction.operand_count = 1;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.operand_count = 0;
+    auto& get = fn->blocks[entry.id].insts[7];
+    REQUIRE(get.op == Opcode::ArrayGet);
+    get.operands[1] = wrong;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
+}

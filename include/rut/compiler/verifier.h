@@ -836,6 +836,39 @@ inline bool verify_phi_types_equal(const Type* first, const Type* second, u32 de
            second->struct_def == nullptr;
 }
 
+inline bool valid_collected_instruction(const Function& fn, const Instruction& inst) {
+    const bool allocation = inst.op == Opcode::ArrayNew;
+    const bool push = inst.op == Opcode::ArrayPush;
+    const bool count = inst.op == Opcode::ArrayLen;
+    const bool get = inst.op == Opcode::ArrayGet;
+    if (!allocation && !push && !count && !get) return true;
+    if (!fn.values || inst.result == kNoValue || inst.result.id >= fn.value_count ||
+        inst.extra_operands ||
+        inst.operand_count != (allocation ? 0u
+                               : count    ? 1u
+                                          : 2u))
+        return false;
+    for (u32 i = 0; i < inst.operand_count; ++i)
+        if (inst.operands[i] == kNoValue || inst.operands[i].id >= fn.value_count) return false;
+    const Type* result = fn.values[inst.result.id].type;
+    if (!result || result->struct_def) return false;
+    const Type* array = allocation ? result->inner : fn.values[inst.operands[0].id].type;
+    if (!array || array->kind != TypeKind::Array || array->struct_def ||
+        !collected_element_type(array->inner))
+        return false;
+    if (allocation)
+        return result->kind == TypeKind::Optional && inst.imm.i32_val >= 1 &&
+               inst.imm.i32_val <= 64;
+    if (count) return result->kind == TypeKind::I32 && !result->inner;
+    const Type* second = fn.values[inst.operands[1].id].type;
+    if (push)
+        return result->kind == TypeKind::Bool && !result->inner &&
+               verify_phi_types_equal(array->inner, second);
+    return second && second->kind == TypeKind::I32 && !second->inner && !second->struct_def &&
+           result->kind == TypeKind::Optional &&
+           verify_phi_types_equal(result->inner, array->inner);
+}
+
 inline bool verify_phi(const Function& fn, u32 block_index, u32 inst_index) {
     const Block& block = fn.blocks[block_index];
     const Instruction& inst = block.insts[inst_index];
@@ -999,6 +1032,9 @@ inline VerifyResult verify_function(const Function* fn,
                     return verify_fail(
                         summary, VerifyIssueCode::InvalidStrLength, function_index, bi, ii);
             }
+            if (!valid_collected_instruction(*fn, inst))
+                return verify_fail(
+                    summary, VerifyIssueCode::InvalidStringOperation, function_index, bi, ii);
             if (!valid_integer_parse(*fn, inst))
                 return verify_fail(
                     summary, VerifyIssueCode::InvalidIntegerParse, function_index, bi, ii);

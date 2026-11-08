@@ -1242,6 +1242,47 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_array_new(const Type* element, u32 capacity, SourceLoc loc = {}) {
+        if (!collected_element_type(element) || capacity < 1 || capacity > 64)
+            return err(RirError::InvalidState);
+        const auto* array = TRY(make_type(TypeKind::Array, element));
+        const auto* optional = TRY(make_type(TypeKind::Optional, array));
+        auto [inst, vid] = TRY(emit(Opcode::ArrayNew, optional, loc));
+        inst->imm.i32_val = static_cast<i32>(capacity);
+        return vid;
+    }
+
+    Result<ValueId> emit_array_push(ValueId array, ValueId item, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array) || !valid_val(item) ||
+            !types_equal(cur_func->values[array.id].type->inner, cur_func->values[item.id].type))
+            return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::ArrayPush, TRY(make_type(TypeKind::Bool)), loc));
+        inst->operands[0] = array;
+        inst->operands[1] = item;
+        inst->operand_count = 2;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_len(ValueId array, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array)) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::ArrayLen, TRY(make_type(TypeKind::I32)), loc));
+        inst->operands[0] = array;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_get(ValueId array, ValueId index, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array) || !val_has_type(index, TypeKind::I32))
+            return err(RirError::InvalidState);
+        const auto* optional =
+            TRY(make_type(TypeKind::Optional, cur_func->values[array.id].type->inner));
+        auto [inst, vid] = TRY(emit(Opcode::ArrayGet, optional, loc));
+        inst->operands[0] = array;
+        inst->operands[1] = index;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     Result<ValueId> emit_phi(ValueId first,
                              BlockId first_block,
                              ValueId second,
