@@ -1091,6 +1091,12 @@ struct Builder {
                               const ValueId* args,
                               u32 count,
                               SourceLoc loc = {}) {
+        const auto bytes_read = json::bytes_read_spec(static_cast<json::Op>(op));
+        if (bytes_read.width &&
+            (count != 2 || !args || !val_has_type(args[0], TypeKind::Str) ||
+             !val_has_type(args[1], TypeKind::I32) ||
+             result != (bytes_read.wide ? TypeKind::I64 : TypeKind::I32) || !optional))
+            return err(RirError::InvalidState);
         const bool kResource =
             op == static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest);
         const bool kIntrospectionRequest =

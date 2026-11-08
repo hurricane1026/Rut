@@ -4863,6 +4863,54 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         }
     }
 
+    struct BytesReader {
+        Str name;
+        json::Op operation;
+    };
+    constexpr BytesReader bytes_readers[] = {
+        {lit_str("readU16BE"), json::Op::BytesReadU16BE},
+        {lit_str("readU16LE"), json::Op::BytesReadU16LE},
+        {lit_str("readI16BE"), json::Op::BytesReadI16BE},
+        {lit_str("readI16LE"), json::Op::BytesReadI16LE},
+        {lit_str("readU32BE"), json::Op::BytesReadU32BE},
+        {lit_str("readU32LE"), json::Op::BytesReadU32LE},
+        {lit_str("readI32BE"), json::Op::BytesReadI32BE},
+        {lit_str("readI32LE"), json::Op::BytesReadI32LE},
+        {lit_str("readI64BE"), json::Op::BytesReadI64BE},
+        {lit_str("readI64LE"), json::Op::BytesReadI64LE},
+    };
+    for (const auto& reader : bytes_readers) {
+        if (!expr.name.eq(reader.name)) continue;
+        const u32 saved_exprs = route->exprs.len;
+        const u32 saved_guards = route->guards.len;
+        auto receiver = receiver_override
+                            ? FrontendResult<HirExpr>(*receiver_override)
+                            : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (receiver && receiver->type == HirTypeKind::Bytes) {
+            constexpr auto detail =
+                lit_str("Bytes integer reads require unwrapped Bytes and one unwrapped i32 offset");
+            if (receiver->may_nil || receiver->may_error || expr.args.len != 1)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            auto offset = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!offset) return core::make_unexpected(offset.error());
+            if (offset->type != HirTypeKind::I32 || offset->may_nil || offset->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+            const auto spec = json::bytes_read_spec(reader.operation);
+            return make_json_op(reader.operation,
+                                spec.wide ? HirTypeKind::I64 : HirTypeKind::I32,
+                                true,
+                                &receiver.value(),
+                                &offset.value(),
+                                nullptr,
+                                expr.span,
+                                route);
+        }
+        // Keep ordinary user-defined methods/UFCS available on other types.
+        route->exprs.len = saved_exprs;
+        route->guards.len = saved_guards;
+        break;
+    }
+
     if (expr.name.eq(lit_str("send")) || expr.name.eq(lit_str("receive")) ||
         expr.name.eq(lit_str("readExactly")) || expr.name.eq(lit_str("readLine")) ||
         expr.name.eq(lit_str("close"))) {
@@ -10905,6 +10953,28 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.type = HirTypeKind::Bytes;
         out.str_value = retained.value();
         return out;
+    }
+    if (expr.kind == AstExprKind::Subscript && expr.lhs && expr.rhs) {
+        auto receiver = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (!receiver) return core::make_unexpected(receiver.error());
+        if (receiver->type != HirTypeKind::Bytes || receiver->may_nil || receiver->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.lhs->span,
+                                  lit_str("subscript requires an unwrapped Bytes value"));
+        auto index = analyze_expr(*expr.rhs, route, mod, locals, local_count, binding);
+        if (!index) return core::make_unexpected(index.error());
+        if (index->type != HirTypeKind::I32 || index->may_nil || index->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.rhs->span,
+                                  lit_str("Bytes subscript requires an unwrapped i32 index"));
+        return make_json_op(json::Op::BytesAt,
+                            HirTypeKind::I32,
+                            true,
+                            &receiver.value(),
+                            &index.value(),
+                            nullptr,
+                            expr.span,
+                            route);
     }
     if (expr.kind == AstExprKind::ObjectLit) {
         return frontend_error(

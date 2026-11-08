@@ -10388,3 +10388,43 @@ request-generation lifecycle. TCP remains a stream and UDP remains datagrams,
 including empty-message and oversize/truncation semantics. Dynamic response Bytes
 locals reuse bounded body serialization. Pooling across requests, richer result
 errors, general byte parsers and message subscriptions remain follow-ups.
+
+### Read-only Bytes subscripts
+
+`bytes[index]` is a custom, read-only subscript on an unwrapped `Bytes` receiver
+and an unwrapped `i32` index. It yields `i32?`: present values are unsigned raw
+octets 0–255, and negative or out-of-range indices yield nil. Positions start at
+zero; NUL yields a present zero. Lookup does not decode UTF-8, allocate storage,
+perform I/O or change the last network error. The receiver and index are
+evaluated once, receiver first. This follows Swift's custom-subscript syntax
+and optional-result model; Bytes is not an alias for Swift's Array or Data.
+Array/string indexing, range subscripts, mutation and user-defined subscript
+declarations remain absent.
+
+The parser retains receiver/index operands, and analysis requires exact Bytes
+and i32 source types before lowering a checked optional scalar intrinsic through
+the existing expression pipeline. Code generation checks the bounds before
+forming/loading the address and zero-extends the selected byte. JIT and native
+artifacts share this lowering, including HTTP request bodies, WebSocket payloads,
+helper-produced byte values and TCP/UDP results retained across continuations.
+
+### Built-in Bytes integer reads
+
+Bytes exposes built-in big/little endian methods such as `bytes.readU16BE(offset)`;
+no import, new keyword or external dependency is required. The methods expose unsigned
+16-bit reads as optional i32, unsigned 32-bit reads as optional i64, signed
+16/32-bit reads as optional i32, and signed 64-bit reads as optional i64. Signed
+decoding uses two's complement; unsigned 32-bit values use i64 so the entire
+0–4294967295 range remains representable.
+
+Each method requires an unwrapped Bytes receiver and one unwrapped zero-based
+i32 offset. Negative offsets and incomplete fields yield nil. Code generation
+checks `length >= width` and `0 <= offset <= length - width` before forming or
+loading addresses, then assembles octets without aligned-load assumptions.
+JIT and native compilation share the same optional scalar lowering and RIR
+validation. Reads support unaligned offsets, never advance a cursor and
+have no I/O or network-error side effects. Host byte order has no effect.
+The methods' result types supply i64 values without introducing source i64
+annotations. The full unsigned 64-bit range requires a future numeric design;
+these methods neither add a u64 type nor silently represent that range as
+negative i64 values. Streaming reads and serializers remain separate concerns.

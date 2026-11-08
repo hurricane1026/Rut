@@ -63,7 +63,56 @@ enum class Op : u8 {
     NetClose,
     NetError,
     OauthClientCredentialsResourceRequest,
+    // Compiler intrinsic; raw Bytes lookup, not JSON parsing.
+    BytesAt,
+    BytesReadU16BE,
+    BytesReadU16LE,
+    BytesReadI16BE,
+    BytesReadI16LE,
+    BytesReadU32BE,
+    BytesReadU32LE,
+    BytesReadI32BE,
+    BytesReadI32LE,
+    BytesReadI64BE,
+    BytesReadI64LE,
 };
+
+// Compiler-only raw-byte intrinsics share the existing optional scalar carrier.
+// Width zero means this is not a Bytes read; no JSON parsing is involved.
+struct BytesReadSpec {
+    u32 width = 0;
+    bool little_endian = false;
+    bool is_signed = false;
+    bool wide = false;
+};
+inline constexpr BytesReadSpec bytes_read_spec(Op op) {
+    switch (op) {
+        case Op::BytesAt:
+            return {1, false, false, false};
+        case Op::BytesReadU16BE:
+            return {2, false, false, false};
+        case Op::BytesReadU16LE:
+            return {2, true, false, false};
+        case Op::BytesReadI16BE:
+            return {2, false, true, false};
+        case Op::BytesReadI16LE:
+            return {2, true, true, false};
+        case Op::BytesReadU32BE:
+            return {4, false, false, true};
+        case Op::BytesReadU32LE:
+            return {4, true, false, true};
+        case Op::BytesReadI32BE:
+            return {4, false, true, false};
+        case Op::BytesReadI32LE:
+            return {4, true, true, false};
+        case Op::BytesReadI64BE:
+            return {8, false, true, true};
+        case Op::BytesReadI64LE:
+            return {8, true, true, true};
+        default:
+            return {};
+    }
+}
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;
 inline constexpr u32 kMaxDepth = 64;

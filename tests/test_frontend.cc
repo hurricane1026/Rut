@@ -9319,6 +9319,141 @@ route GET "/ws" { return websocket(ws) { message in
     rir.destroy();
 }
 
+TEST(frontend, bytes_subscripts_lower_checked_optional_reads) {
+    const char* source = R"rut(
+func byteOrMissing(_ bytes: Bytes, _ index: i32) -> i32 => bytes[index].or(-1)
+func marker() -> Bytes => b"\x00\xff\x80"
+route POST "/body" {
+    let bytes = req.bodyBytes
+    let index = bytes.count - 1
+    guard let value = bytes[index] else { return 400 }
+    guard value == 255 && byteOrMissing(bytes, -1) == -1 else { return 403 }
+    guard bytes[bytes.count] == nil else { return 500 }
+    return 200
+}
+route GET "/literal" {
+    guard let value = marker()[1] else { return 400 }
+    guard value == 255 && b"\x00"[0].or(-1) == 0 else { return 403 }
+    return 200
+}
+upstream backend
+route GET "/ws" { return websocket(backend) { message in
+    guard let value = message.payload[0] else { message.drop() }
+    guard value == 255 else { message.drop() }
+    message.forward()
+} }
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::JsonOp));
+    rir.destroy();
+}
+
+TEST(frontend, bytes_subscripts_reject_wrong_types_optional_operands_and_unsupported_forms) {
+    const char* expressions[] = {"\"text\"[0]",
+                                 "[1, 2][0]",
+                                 "42[0]",
+                                 "b\"x\"[true]",
+                                 "b\"x\"[\"0\"]",
+                                 "b\"x\"[2147483648]",
+                                 "b\"x\"[b\"x\"[0]]",
+                                 "b\"x\"[]",
+                                 "b\"x\"[0, 1]",
+                                 "b\"x\"[0...1]",
+                                 "b\"x\"[0] = 1"};
+    for (const char* expression : expressions) {
+        std::string source = "route GET \"/\" { let value = ";
+        source += expression;
+        source += " return 200 }";
+        auto lexed = lex(lit(source.c_str()));
+        if (!lexed) continue;
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) continue;
+        auto hir = analyze_file_heap(ast.value());
+        CHECK_FALSE(hir);
+    }
+}
+
+TEST(frontend, bytes_integer_methods_are_builtin_and_keep_exact_scalar_types) {
+    const char* names[] = {"readU16BE",
+                           "readU16LE",
+                           "readI16BE",
+                           "readI16LE",
+                           "readU32BE",
+                           "readU32LE",
+                           "readI32BE",
+                           "readI32LE",
+                           "readI64BE",
+                           "readI64LE"};
+    for (u32 i = 0; i < 10; ++i) {
+        std::string source = "route POST \"/\" { let value = req.bodyBytes.";
+        source += names[i];
+        source += "(0) guard let number = value else { return 400 } return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE(hir->routes[0].locals.len > 0);
+        const auto& result = hir->routes[0].locals[0];
+        CHECK(result.type == (i == 4 || i == 5 || i >= 8 ? HirTypeKind::I64 : HirTypeKind::I32));
+        CHECK(result.may_nil);
+        ast.reset();
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, bytes_integer_methods_reject_wrong_offsets_and_preserve_ordinary_ufcs) {
+    const char* expressions[] = {"b\"ab\".readU16BE()",
+                                 "b\"ab\".readU16BE(0, 1)",
+                                 "b\"ab\".readU16BE(true)",
+                                 "b\"ab\".readU16BE(\"0\")",
+                                 "b\"ab\".readU16BE(i64(0))",
+                                 "b\"ab\".readU16BE(b\"x\"[0])",
+                                 "b\"ab\".readU16BE(0) + 1",
+                                 "\"ab\".readU16BE(0)",
+                                 "b\"ab\".readU64BE(0)"};
+    for (const char* expression : expressions) {
+        std::string source = "route GET \"/\" { let value = ";
+        source += expression;
+        source += " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* source = R"rut(
+protocol Reader { func readU16BE(_ offset: i32) -> i32 }
+i32 impl Reader { func readU16BE(self: i32, _ offset: i32) -> i32 => self + offset }
+route GET "/" {
+    guard (1).readU16BE(2) == 3 else { return 500 }
+    guard b"\x01\x2c".readU16BE(0).or(0) == 300 else { return 500 }
+    return 204
+})rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
 TEST(frontend, payload_bytes_literals_outlive_the_decoded_ast_pool) {
     const char* source = R"rut(func marker() -> Bytes => b"\x00\xff\x80"
 route GET "/" { guard marker().count == 3 else { return 403 } return 200 })rut";

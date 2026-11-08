@@ -199,6 +199,8 @@ enum class AstExprKind : u8 {
     // Exact bytes, currently accepted only by message.forward(b"...").
     // Decoded into AstFile's shared bounded byte-literal storage.
     BytesLit,
+    // Read-only Bytes subscript: lhs is the receiver, rhs is the index.
+    Subscript,
 };
 
 struct AstTypeRef {
