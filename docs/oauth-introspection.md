@@ -96,6 +96,53 @@ AS outage, wrong certificate identity, immediate revocation, concurrency and
 credential/identity non-propagation on epoll and io_uring. It does not run a full
 OAuth provider. Existing callout tests cover reset/disconnect cancellation.
 
+## Composable two-permission authorization
+
+After `requireActive`, route policy can require either or both of two trusted
+permissions:
+
+```rut
+let active = introspection.requireActive(reply, "reports-api")
+let authorized = introspection.requireEitherScope(active, "reports:read", "reports:write")
+```
+
+For a route that needs both permissions, replace the second line with:
+
+```rut
+let authorized = introspection.requireBothScopes(active, "reports:read", "reports:write")
+```
+
+The shipped example exposes `/read-or-write-reports` and `/read-and-write-reports`.
+Both helpers return the same checked metadata on success, allowing subsequent
+issuer/client binding, subject projection and explicit credential stripping.
+Neither helper authenticates arbitrary JSON: use only the authenticated AS reply
+already admitted by `requireActive`, never request JSON or identity headers.
+
+Each configured permission must be one nonempty, case-sensitive OAuth scope token
+using the shared [RFC 6749 scope grammar](https://www.rfc-editor.org/rfc/rfc6749#section-3.3).
+Both configuration values are checked before membership is evaluated; an invalid
+second value cannot hide behind an allowed first branch. Empty tokens, lists,
+whitespace, quotes, backslashes and non-ASCII bytes produce 503. Request-arena
+construction failure also fails closed with 503. Equal valid permissions are
+allowed and reduce to a single membership check semantically.
+
+Missing permission returns 403 with `WWW-Authenticate: Bearer
+error="insufficient_scope"`, following the existing
+[Bearer error profile](https://www.rfc-editor.org/rfc/rfc6750#section-3.1).
+Matching is exact after JSON decoding: case and prefixes do not match, while
+repeated granted tokens do not add permissions. Missing AS scope fails permission
+checks; malformed scope metadata is still rejected by `requireActive` with 401,
+and duplicate/aliased JSON keys or AS/transport errors retain their existing 503
+behavior. The entire granted list is validated by the shared primitive, so a
+matching prefix cannot conceal malformed trailing scope bytes.
+
+These are ordinary Rut helpers using bounded request-arena JSON construction and
+the existing scope primitive. No keyword, builtin, native ABI, dependency, cache,
+permission negotiation or persistent policy registry is added. Integration tests
+exercise both policies, malformed trusted configuration, escaped/duplicate JSON,
+invalid/insufficient tokens, non-forwarding denials, HTTP/2, duplicate credentials
+and source/module removal under epoll and io_uring.
+
 ## Optional issuer and OAuth client binding
 
 `introspection.requireBinding(document, expectedIssuer, expectedClientId)` adds

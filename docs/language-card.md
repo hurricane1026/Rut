@@ -2841,6 +2841,18 @@ policy, while `iss`, `sub` and `iat` need not be present. Callers must trust the
 response source before validating or projecting its identity. No OAuth grants,
 OIDC session, automatic identity propagation or new language keyword is added.
 
+### Introspection scope combinations
+
+After `introspection.requireActive`, `requireEitherScope(document, first, second)`
+requires at least one configured permission; `requireBothScopes(document, first,
+second)` requires both. Success preserves the metadata Json. Both configuration
+values must be single valid OAuth scope tokens; invalid configuration or bounded
+policy construction failure returns 503 before membership evaluation. Missing
+permissions return challenged 403. Case/prefix matching and request-header scope
+selection are unavailable; malformed AS metadata still fails the active policy.
+These are ordinary library helpers with no new syntax or ABI. See
+[the two-permission contract](oauth-introspection.md#composable-two-permission-authorization).
+
 ### Introspection issuer/client binding
 
 `introspection.requireBinding(document, issuer, clientId)` is an ordinary library

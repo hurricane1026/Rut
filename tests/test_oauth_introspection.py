@@ -51,6 +51,14 @@ def main():
                 'bad-audience': dict(aud=['reports-api', 7]), 'typed-active': dict(active='true'),
                 'typed-exp': dict(exp=str(now + 3600)), 'typed-scope': dict(scope=['reports:read']),
                 'wrong-scope': dict(scope='reports:reader'), 'wrong-type': dict(token_type='MAC'),
+                'read-only': dict(scope='reports:read'), 'write-only': dict(scope='reports:write'),
+                'scope-case': dict(scope='Reports:read Reports:write'),
+                'scope-prefix': dict(scope='reports:reader reports:writer'),
+                'scope-repeated': dict(scope='reports:read reports:read reports:write'),
+                'scope-bad-suffix': dict(scope='reports:read reports:write\t'),
+                'scope-double-space': dict(scope='reports:read  reports:write'),
+                'scope-nul': dict(scope='reports:read\x00 reports:write'),
+                'scope-empty': dict(scope=''), 'scope-null': dict(scope=None),
                 'wrong-issuer': dict(iss='https://other.example'),
                 'issuer-case': dict(iss='https://ISSUER.example'),
                 'issuer-suffix': dict(iss='https://issuer.example/'),
@@ -87,6 +95,11 @@ def main():
             if token == 'escaped-binding-names':
                 data = data.replace(b'"iss"', b'"i\\u0073s"')
                 data = data.replace(b'"client_id"', b'"client\\u005fid"')
+            if token == 'escaped-scope':
+                data = data.replace(b'reports:read', b'reports:r\\u0065ad')
+                data = data.replace(b'"scope"', b'"sc\\u006fpe"')
+            if token == 'duplicate-scope':
+                data = data[:-1] + b', "sc\\u006fpe":"reports:write"}'
             if token == 'duplicate-client':
                 data = data[:-1] + b', "client_id":"other"}'
             if token == 'aliased-issuer':
@@ -186,11 +199,49 @@ route GET "{path}" {{
     return 204
 }}
 '''
+            scope_configuration = {}
+            invalid_scope_paths = []
+            # A valid first branch must never hide an invalid second OR policy.
+            for index, (first, second) in enumerate((
+                    ('', 'reports:write'), ('reports:read', ''),
+                    ('reports:read reports:write', 'reports:write'),
+                    ('reports:read', 'reports:write extra'),
+                    ('reports:read', 'reports:write\t'),
+                    ('reports:read', 'bad"scope'),
+                    ('reports:read', 'bad\\scope'),
+                    ('reports:read', 'réports:write'))):
+                scope_configuration[f'SCOPE_FIRST_{index}'] = first
+                scope_configuration[f'SCOPE_SECOND_{index}'] = second
+                for helper in ('requireEitherScope', 'requireBothScopes'):
+                    path = f'/scope-policy-{index}-{helper}'
+                    invalid_scope_paths.append(path)
+                    source += f'''
+route GET "{path}" {{
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else {{ return 503 }}
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.{helper}(document, env("SCOPE_FIRST_{index}"), env("SCOPE_SECOND_{index}"))
+    return 204
+}}
+'''
+            for helper in ('requireEitherScope', 'requireBothScopes'):
+                source += f'''
+route GET "/same-scope-{helper}" {{
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else {{ return 503 }}
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.{helper}(document, "reports:read", "reports:read")
+    return 204
+}}
+'''
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, INTROSPECTION_AUTH=service_auth, INTROSPECTION_ENDPOINT=json.dumps(endpoint),
                        WRONG_TLS=json.dumps(dict(endpoint, serverName='wrong.invalid')),
-                       TOKEN_ISSUER='https://issuer.example', TOKEN_CLIENT_ID='reports-client')
+                       TOKEN_ISSUER='https://issuer.example', TOKEN_CLIENT_ID='reports-client',
+                       **scope_configuration)
             with log.open('wb') as output:
                 process = subprocess.Popen([args.server, '0', str(program), '--backend', args.backend,
                                             '--shards', '2', '--no-pin', '--drain', '0'],
@@ -287,6 +338,45 @@ route GET "{path}" {{
                         assert len(forwarded) == before
                         if expected == 403:
                             assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
+                    scope_paths = ('/read-or-write-reports', '/read-and-write-reports')
+                    for index, path in enumerate(scope_paths):
+                        for token, expected in (
+                                ('valid', 200), ('read-only', 200 if index == 0 else 403),
+                                ('write-only', 200 if index == 0 else 403),
+                                ('scope-repeated', 200), ('escaped-scope', 200),
+                                ('scope-case', 403), ('scope-prefix', 403), ('no-scope', 403),
+                                ('scope-empty', 401), ('scope-null', 401),
+                                ('typed-scope', 401), ('scope-bad-suffix', 401),
+                                ('scope-double-space', 401), ('scope-nul', 401),
+                                ('duplicate-scope', 503), ('inactive', 401),
+                                ('expired', 401), ('wrong-audience', 401), ('unavailable', 503)):
+                            before = len(forwarded)
+                            status, headers, data = request(token, path)
+                            assert status == expected, (path, token, status, data)
+                            if expected == 200:
+                                assert data == ('subject-' + token).encode()
+                                assert len(forwarded) == before + 1
+                                assert 'Authorization' not in forwarded[-1]
+                                assert forwarded[-1]['X-Consumer-ID'] == 'subject-' + token
+                            else:
+                                assert len(forwarded) == before
+                                if expected in (401, 403):
+                                    error = 'invalid_token' if expected == 401 else 'insufficient_scope'
+                                    assert error in headers.get('WWW-Authenticate', '')
+                        before = len(received)
+                        assert request(path=path, authorization='')[0] == 401
+                        assert len(received) == before
+                    for path in invalid_scope_paths:
+                        before = len(forwarded)
+                        status, headers, data = request('valid', path)
+                        assert status == 503, (path, status, data)
+                        assert 'WWW-Authenticate' not in headers
+                        assert len(forwarded) == before
+                    for helper in ('requireEitherScope', 'requireBothScopes'):
+                        assert request('read-only', '/same-scope-' + helper)[0] == 204
+                        status, headers, _ = request('write-only', '/same-scope-' + helper)
+                        assert status == 403
+                        assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
                     for path in ('/empty-issuer', '/empty-client'):
                         before = len(forwarded)
                         assert request('valid', path)[0] == 503
@@ -307,10 +397,21 @@ route GET "{path}" {{
                         results = list(workers.map(lambda i: request('user-' + str(i)), range(4)))
                     for i, (status, _, data) in enumerate(results):
                         assert (status, data) == (200, f'subject-user-{i}'.encode()), (i, status, data)
+                    # Concurrent requests must retain their own permission result and identity.
+                    with ThreadPoolExecutor(max_workers=4) as workers:
+                        results = list(workers.map(
+                            lambda i: request('read-only' if i % 2 else 'valid', scope_paths[1]),
+                            range(8)))
+                    for i, (status, headers, data) in enumerate(results):
+                        if i % 2:
+                            assert status == 403, (i, status, data)
+                            assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
+                        else:
+                            assert (status, data) == (200, b'subject-valid'), (i, status, data)
                     def frame(kind, flags, stream, data=b''):
                         return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
 
-                    for h2_path in ('/reports', '/bound-reports'):
+                    for h2_path in ('/reports', '/bound-reports', *scope_paths):
                         with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
                             block = (b'\x82\x86\x04' + bytes((len(h2_path),)) + h2_path.encode() +
                                      b'\x01\x09localhost\x0f\x08\x09Bearer h2')
@@ -342,7 +443,7 @@ route GET "{path}" {{
                                     break
                             assert data == b'subject-h2', data
                     # Duplicate Authorization must fail before contacting the AS.
-                    for path in ('/reports', '/bound-reports'):
+                    for path in ('/reports', '/bound-reports', *scope_paths):
                         before = len(received)
                         with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
                             wire = (f'GET {path} HTTP/1.1\r\nHost: test\r\n'
@@ -356,7 +457,7 @@ route GET "{path}" {{
                         assert not any(key.lower() in ('cookie', 'x-consumer-id') for key in headers)
                         assert headers['Authorization'] in (service_auth, 'Bearer wrong-service')
                     assert service_auth.encode() not in log.read_bytes()
-                    print(f'PASS: {args.backend} authenticated RFC 7662 requests, strict metadata, issuer/client binding, scope, revocation and isolation')
+                    print(f'PASS: {args.backend} authenticated RFC 7662 requests, strict metadata, issuer/client binding, either/both scope policy, revocation and isolation')
                 finally:
                     if process.poll() is None:
                         process.terminate()

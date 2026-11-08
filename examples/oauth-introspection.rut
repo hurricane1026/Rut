@@ -41,3 +41,39 @@ route GET "/bound-reports" {
         }
     }
 }
+
+// Permissions are trusted route policy, never selected by request headers.
+route GET "/read-or-write-reports" {
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.requireEitherScope(document, "reports:read", "reports:write")
+    let subject = introspection.subject(authorized)
+    match subject != "" {
+        true => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 401 }
+    }
+}
+
+// Permissions are trusted route policy, never selected by request headers.
+route GET "/read-and-write-reports" {
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.requireBothScopes(document, "reports:read", "reports:write")
+    let subject = introspection.subject(authorized)
+    match subject != "" {
+        true => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 401 }
+    }
+}
