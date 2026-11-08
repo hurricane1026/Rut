@@ -17,6 +17,12 @@ on:
         options:
           - ci
           - docker-launch-diagnostic
+          - integer-parser
+      require_avx512:
+        description: 'Require AVX-512 execution for the integer-parser diagnostic'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
@@ -825,3 +831,44 @@ jobs:
             build/tests/test_https_fetch \
             build/tests/test_jwt_rs256 \
             build/tests/test_public_key
+
+  integer-parser:
+    name: Integer parser (${{ matrix.arch }})
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci' || inputs.mode == 'integer-parser'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20
+      - name: Check every integer parser candidate and benchmark
+        env:
+          CXX: clang++-20
+          RUT_REQUIRE_AVX512: ${{ matrix.arch == 'x86' && inputs.require_avx512 && '1' || '0' }}
+        run: scripts/check_parse_integer_arch.sh build/integer-parser
+      - name: Publish architecture summary
+        if: always()
+        run: |
+          if [[ -f build/integer-parser/summary.md ]]; then
+            cat build/integer-parser/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integer-parser-${{ matrix.arch }}
+          path: |
+            build/integer-parser/environment.txt
+            build/integer-parser/summary.md
+            build/integer-parser/test-*.log
+            build/integer-parser/bench-*.csv
+          if-no-files-found: error

@@ -2992,7 +2992,7 @@ extern "C" rut::u8 rut_helper_parse_int(const char* data,
                                         rut::i64* output) {
     if (!output) return 0;
     *output = 0;
-    if (bits == 32) return rut::parse_integer<false>({data, length}, *output);
-    if (bits == 64) return rut::parse_integer<true>({data, length}, *output);
+    if (bits == 32) return rut::parse_integer32({data, length}, *output);
+    if (bits == 64) return rut::parse_integer64({data, length}, *output);
     return 0;
 }

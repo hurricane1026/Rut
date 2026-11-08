@@ -4167,7 +4167,11 @@ helpers and WebSocket callbacks, with shared JIT/native semantics. User bindings
 shadow the builtin names. Integer parsing does not introduce an `i64` annotation
 or an unsigned type. The kernel specializes by result width and digit count,
 using scalar arithmetic for short inputs and bounded eight/four-digit SWAR for
-longer inputs. See [contract, research and benchmarks](docs/parse-integers.md).
+longer inputs by default. `RUT_INTEGER_ARCH` also selects SSE2, AVX2, AVX-512F+BW
+or AArch64 NEON candidates at compile time; their ISA flags are isolated in the
+parser library. Vector candidates reduce eight/sixteen digit blocks while
+sharing the same validation contract, with native per-architecture CI tests and
+benchmarks. See [contract, research and benchmarks](docs/parse-integers.md).
 
 The remaining conversion/domain APIs below are design targets unless marked
 implemented in the language card (`parseFloat`, `as`, `as?`, IP/CIDR/Duration

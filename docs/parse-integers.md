@@ -68,7 +68,9 @@ Release microbenchmark flags: `-O3 -DNDEBUG -march=x86-64-v2 -std=c++23`.
 Each corpus has 4,096 deterministic entries, 512 traversals per trial, five
 trials; the table reports the best ns/call. Results are checked against an
 independent per-digit cutoff parser before timing, and checksums are consumed.
-All rows measure the signed **64-bit** parser, including the i32-sized corpus.
+The initial table below measures the signed **64-bit** portable kernel, including
+the i32-sized corpus. The current benchmark emits separate 32-bit and 64-bit rows
+and additionally compares the selected runtime architecture.
 
 | Corpus | Per-digit cutoff | Rut kernel | Speedup |
 | --- | ---: | ---: | ---: |
@@ -83,11 +85,13 @@ Reproduce from the repository root:
 
 ```bash
 g++ -O3 -DNDEBUG -march=x86-64-v2 -std=c++23 -Iinclude \
-    bench/bench_parse_integer.cc -o /var/tmp/bench_parse_integer
+    bench/bench_parse_integer.cc src/runtime/parse_integer.cc \
+    -o /var/tmp/bench_parse_integer
 taskset -c 2 /var/tmp/bench_parse_integer
 ```
 
-The same target is available as `bench_parse_integer` in CMake. Omit the x86 flag
+The same target is available as `bench_parse_integer` in CMake. Its driver and
+kernel are both optimized, including when the surrounding build tree is Debug. Omit the x86 flag
 when building on another architecture. The benchmark itself has only libc and
 project-header dependencies.
 
@@ -104,8 +108,8 @@ wins on every CPU, input distribution or batch size.
 These are warm microbenchmarks including a non-inlined function call, not
 end-to-end client or gateway throughput. The shipped benchmark reproduces the
 baseline/kernel comparison; the optional external-library/ISA candidates are
-research measurements, not build dependencies. ARM and big-endian performance
-have not been measured.
+research measurements, not build dependencies. The initial study did not measure ARM or big-endian performance; native arm64
+measurements are now collected by the architecture CI job below.
 
 ### Validation
 
@@ -116,3 +120,77 @@ coverage includes width inference, optional handling, type/arity errors, user
 shadowing, pipes, and malformed RIR rejection. Runtime coverage exercises text
 and Bytes through JIT/native HTTP and WebSocket paths, and HTTP integration at
 optimization levels 0 and 2 for epoll and io_uring.
+
+## Architecture candidates and CI
+
+The default remains `RUT_INTEGER_ARCH=portable` while collecting native results.
+`RUT_INTEGER_ARCH` is independent of the HTTP scanner's `SIMD_ARCH`: choosing a
+scanner ISA does not silently change numeric parsing. No per-call CPUID or
+function-pointer dispatch is added. Only `rut_integer_parser` receives the
+selected ISA compiler flags; the rest of the runtime keeps its baseline.
+
+| `RUT_INTEGER_ARCH` | Required ISA | Digit reduction | Bounded loads |
+| --- | --- | --- | --- |
+| `portable` | ordinary integer operations | 8/4-digit SWAR | memcpy after length check |
+| `sse2` | x86-64 SSE2 | widen bytes, paired multiply-add, pack, reduce 4-digit groups | exact 8/16 bytes |
+| `avx2` | AVX2 target, including SSSE3 | VEX-encoded byte multiply-add, then word multiply-add | exact 8/16 bytes |
+| `avx512` | AVX-512F + AVX-512BW | masked byte load/subtract/validation, paired multiply-add | byte mask selects exactly 8/16 bytes |
+| `neon` | AArch64 Advanced SIMD | widening byte multiply and pairwise reductions | exact 8/16 bytes |
+
+The shared parser handles signs, leading zeros, scalar tails and exact signed
+limits. Vector candidates can reduce sixteen digits in one block; short inputs
+still use the scalar path. AVX2 intentionally uses 128-bit VEX operations: one
+signed i64 has at most nineteen significant digits, so a 32-byte load would need
+padding or copying without adding useful digit lanes. AVX-512's byte masks allow
+a fault-suppressing load without padding. VL, DQ, IFMA and VBMI are not required.
+Instruction requirements follow the [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html)
+and [Arm NEON reference](https://arm-software.github.io/acle/neon_intrinsics/advsimd.html).
+
+SVE/batch conversion remains a separate experiment: single i32/i64 fields fit
+within sixteen digits plus a short tail, while SVE becomes more interesting
+when validating or decoding multiple fields. No unmeasured SVE speedup is
+claimed by the NEON candidate.
+
+Select a runtime candidate with CMake, for example:
+
+```bash
+cmake -S . -B build-avx512 -DRUT_INTEGER_ARCH=avx512
+cmake --build build-avx512 --target test_parse_integer bench_parse_integer
+```
+
+Run this binary only on hardware and an OS that enable F+BW. This is compile-time
+selection, not a portable executable containing automatic ISA fallbacks.
+
+For a lightweight native comparison without LLVM, TLS or other dependencies:
+
+```bash
+CXX=clang++ scripts/check_parse_integer_arch.sh /var/tmp/rut-integer-results
+```
+
+The script compiles all candidates for the host architecture. It always compiles
+AVX-512 on x86, even when execution is unsupported. A separate baseline probe uses
+CPU/OS-aware feature detection before launching ISA-specific executables. Only
+the parser object receives ISA flags; the benchmark driver and independent
+oracle are compiled once at baseline. Each executed candidate runs all strict
+parser tests, including protected-page boundaries, followed by both i32 and i64
+corpora. CSV columns are `bits,corpus,implementation,ns_per_call,checksum`.
+
+CI's **Integer parser (x86)** and **Integer parser (arm64)** jobs run the script
+natively on `ubuntu-24.04` and `ubuntu-24.04-arm`. Build and correctness failures
+fail CI. Performance is informational until stable machine-specific baselines
+exist. Artifacts contain CPU/compiler metadata, correctness logs, CSV timings
+and an explicit per-ISA execution summary. An unavailable ISA is **not run**, not
+a correctness pass. Standard hosted runner labels do not guarantee AVX-512, so
+actual capability is probed on every run.
+
+The `integer-parser` workflow-dispatch mode runs only these focused jobs.
+Setting the `require_avx512` input makes the x86 diagnostic fail unless AVX-512
+actually executes; the script equivalent is `RUT_REQUIRE_AVX512=1`. This allows a
+hardware-specific validation request to distinguish a real run from a skip.
+
+New sixteen-digit SSE2/AVX2 candidates passed local oracle and protected-page
+tests. With Clang 22 on the i7-10700, initial 16–19-digit i64 runs measured about
+8.0 ns for SSE2 and 7.6 ns for AVX2, against about 10 ns for the same run's inline
+portable kernel. These are exploratory measurements from a different compiler
+than the GCC table above; use the CI artifacts for comparisons on each runner.
+AVX-512 and NEON execution results must come from their native CI jobs.

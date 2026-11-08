@@ -35,6 +35,9 @@ void compare(rut::test::TestCase* _tc, Str text) {
         CHECK_EQ(wide ? parse_integer<true>(text, actual) : parse_integer<false>(text, actual),
                  valid);
         CHECK_EQ(actual, expected);
+        actual = 123;
+        CHECK_EQ(wide ? parse_integer64(text, actual) : parse_integer32(text, actual), valid);
+        CHECK_EQ(actual, expected);
     }
 }
 }  // namespace
@@ -152,5 +155,8 @@ TEST(parse_integer, spans_can_end_at_an_unreadable_page) {
 }
 
 int main(int argc, char** argv) {
+    rut::test::out("Integer parser architecture: ");
+    rut::test::out(parse_integer_arch());
+    rut::test::out("\n");
     return rut::test::run_all(argc, argv);
 }

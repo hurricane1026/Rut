@@ -130,7 +130,16 @@ add_library(bench_ws_mask SHARED EXCLUDE_FROM_ALL bench_ws_mask.cc)
 target_compile_options(bench_ws_mask PRIVATE -O3 -fno-exceptions -fno-rtti)
 
 # Decimal parser microbenchmark; libc only, no external parser dependency.
+# Keep the kernel optimized even in a Debug tree, while the benchmark driver
+# retains baseline ISA flags. Never apply the candidate ISA to the oracle.
+add_library(rut_integer_parser_bench STATIC ${PROJECT_SOURCE_DIR}/src/runtime/parse_integer.cc)
+target_include_directories(rut_integer_parser_bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_compile_options(rut_integer_parser_bench PRIVATE -O3 -DNDEBUG
+    "$<TARGET_PROPERTY:rut_integer_parser,COMPILE_OPTIONS>")
+target_compile_definitions(rut_integer_parser_bench PRIVATE
+    "$<TARGET_PROPERTY:rut_integer_parser,COMPILE_DEFINITIONS>")
 add_executable(bench_parse_integer bench_parse_integer.cc)
+target_link_libraries(bench_parse_integer PRIVATE rut_integer_parser_bench)
 target_include_directories(bench_parse_integer PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_options(bench_parse_integer PRIVATE -O3 -DNDEBUG)
 set_target_properties(bench_parse_integer PROPERTIES LINKER_LANGUAGE C)

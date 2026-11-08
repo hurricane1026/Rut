@@ -4103,6 +4103,7 @@ set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
 
 # Strict decimal parser has no LLVM or external-library dependencies.
 add_executable(test_parse_integer test_parse_integer.cc)
+target_link_libraries(test_parse_integer PRIVATE rut_integer_parser)
 target_include_directories(test_parse_integer PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_parse_integer COMMAND test_parse_integer)
 set_tests_properties(test_parse_integer PROPERTIES LABELS "unit")

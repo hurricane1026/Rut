@@ -35,12 +35,17 @@ inline bool digits4(const char* data, u32& result) {
     return true;
 }
 
+struct PortableDigits {
+    static constexpr bool kBlock16 = false;
+    static bool read8(const char* data, u32& result) { return digits8(data, result); }
+};
+
 }  // namespace integer_detail
 
 // Strict decimal conversion of the entire non-owning span. No allocation,
 // terminator, padding, alignment, locale or CPU feature requirements. On failure
 // the output is unchanged. Wide selects the signed 64-bit rather than 32-bit range.
-template <bool Wide>
+template <bool Wide, class Digits = integer_detail::PortableDigits>
 inline bool parse_integer(Str text, i64& output) {
     if (!text.ptr || !text.len) return false;
     const char* data = text.ptr;
@@ -68,9 +73,18 @@ inline bool parse_integer(Str text, i64& output) {
             }
         }
         if (length > (Wide ? 19u : 10u)) return false;
+        if constexpr (Digits::kBlock16) {
+            if (length >= 16) {
+                u64 block;
+                if (!Digits::read16(data, block)) return false;
+                number = block;
+                data += 16;
+                length -= 16;
+            }
+        }
         while (length >= 8) {
             u32 block;
-            if (!integer_detail::digits8(data, block)) return false;
+            if (!Digits::read8(data, block)) return false;
             number = number * 100000000 + block;
             data += 8;
             length -= 8;
@@ -95,5 +109,11 @@ inline bool parse_integer(Str text, i64& output) {
     output = __builtin_bit_cast(i64, negative ? u64(0) - number : number);
     return true;
 }
+
+// Compile-time selected runtime entry points. The implementation translation
+// unit alone receives ISA flags; callers retain the normal deployment baseline.
+bool parse_integer32(Str text, i64& output);
+bool parse_integer64(Str text, i64& output);
+const char* parse_integer_arch();
 
 }  // namespace rut
