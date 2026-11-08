@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/http_call_profile.h"
@@ -2067,6 +2068,98 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
         }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::BytesSlice) {
+                const auto kBytes = c.get_value(inst.operands[0]);
+                const auto kStart = c.get_value(inst.operands[1]);
+                const auto kEnd = c.get_value(inst.operands[2]);
+                const auto kPointer = LLVMBuildExtractValue(c.builder, kBytes, 0, "slice.ptr");
+                const auto kLength = LLVMBuildExtractValue(c.builder, kBytes, 1, "slice.len");
+                const auto kZero = LLVMConstInt(c.i32_ty, 0, 0);
+                auto valid =
+                    LLVMBuildICmp(c.builder, LLVMIntSGE, kStart, kZero, "slice.start.valid");
+                valid = LLVMBuildAnd(
+                    c.builder,
+                    valid,
+                    LLVMBuildICmp(c.builder, LLVMIntSGE, kEnd, kStart, "slice.ordered"),
+                    "slice.range.valid");
+                valid = LLVMBuildAnd(
+                    c.builder,
+                    valid,
+                    LLVMBuildICmp(c.builder, LLVMIntULE, kEnd, kLength, "slice.end.valid"),
+                    "slice.bounds");
+                const auto kEmpty =
+                    LLVMBuildICmp(c.builder, LLVMIntEQ, kLength, kZero, "slice.empty");
+                const auto kNonnull = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, kPointer, LLVMConstNull(c.ptr_ty), "slice.nonnull");
+                valid = LLVMBuildAnd(c.builder,
+                                     valid,
+                                     LLVMBuildOr(c.builder, kEmpty, kNonnull, "slice.storage"),
+                                     "slice.valid");
+                // Only form an offset address after checking the complete range.
+                const auto kOrigin = LLVMGetInsertBlock(c.builder);
+                const auto kFunction = LLVMGetBasicBlockParent(kOrigin);
+                const auto kView =
+                    LLVMAppendBasicBlockInContext(c.llvm_ctx, kFunction, "slice.view");
+                const auto kMerge =
+                    LLVMAppendBasicBlockInContext(c.llvm_ctx, kFunction, "slice.merge");
+                LLVMBuildCondBr(c.builder, valid, kView, kMerge);
+                LLVMPositionBuilderAtEnd(c.builder, kView);
+                const auto kBase =
+                    LLVMBuildSelect(c.builder,
+                                    kNonnull,
+                                    kPointer,
+                                    c.make_global_str(lit_str(""), "slice.empty.data"),
+                                    "slice.base");
+                auto offset = kStart;
+                const auto kAddress =
+                    LLVMBuildGEP2(c.builder, c.i8_ty, kBase, &offset, 1, "slice.address");
+                const auto kCount = LLVMBuildSub(c.builder, kEnd, kStart, "slice.count");
+                LLVMBuildBr(c.builder, kMerge);
+                LLVMPositionBuilderAtEnd(c.builder, kMerge);
+                const auto kOutPtr = LLVMBuildPhi(c.builder, c.ptr_ty, "slice.result.ptr");
+                const auto kOutLen = LLVMBuildPhi(c.builder, c.i32_ty, "slice.result.len");
+                LLVMValueRef pointers[] = {LLVMConstNull(c.ptr_ty), kAddress};
+                LLVMValueRef lengths[] = {kZero, kCount};
+                LLVMBasicBlockRef blocks[] = {kOrigin, kView};
+                LLVMAddIncoming(kOutPtr, pointers, blocks, 2);
+                LLVMAddIncoming(kOutLen, lengths, blocks, 2);
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder,
+                                              result,
+                                              LLVMBuildZExt(c.builder, valid, c.i8_ty, "slice.has"),
+                                              0,
+                                              "");
+                result = LLVMBuildInsertValue(c.builder, result, kOutPtr, 1, "");
+                result = LLVMBuildInsertValue(c.builder, result, kOutLen, 2, "");
+                c.set_value(inst.result, result);
+                break;
+            }
+            if (kJsonOp == json::Op::BytesFind) {
+                const auto kBytes = c.get_value(inst.operands[0]);
+                const auto kDelimiter = c.get_value(inst.operands[1]);
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.i32_ty};
+                const auto kType = LLVMFunctionType(c.i32_ty, params, 5, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_bytes_find");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_bytes_find", kType);
+                LLVMValueRef args[] = {
+                    LLVMBuildExtractValue(c.builder, kBytes, 0, "find.ptr"),
+                    LLVMBuildExtractValue(c.builder, kBytes, 1, "find.len"),
+                    LLVMBuildExtractValue(c.builder, kDelimiter, 0, "find.delimiter"),
+                    LLVMBuildExtractValue(c.builder, kDelimiter, 1, "find.width"),
+                    c.get_value(inst.operands[2])};
+                const auto kOffset =
+                    LLVMBuildCall2(c.builder, kType, helper, args, 5, "find.offset");
+                const auto kHas = LLVMBuildICmp(
+                    c.builder, LLVMIntSGE, kOffset, LLVMConstInt(c.i32_ty, 0, 0), "find.present");
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildZExt(c.builder, kHas, c.i8_ty, "find.has"), 0, "");
+                result = LLVMBuildInsertValue(c.builder, result, kOffset, 1, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::ParseInt || kJsonOp == json::Op::ParseInt64) {
                 const bool wide = kJsonOp == json::Op::ParseInt64;
                 const auto text = c.get_value(inst.operands[0]);
@@ -3679,7 +3772,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
-                    !rir::valid_integer_parse(fn, inst))
+                    !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);

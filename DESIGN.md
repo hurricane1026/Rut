@@ -10466,3 +10466,27 @@ The methods' result types supply i64 values without introducing source i64
 annotations. The full unsigned 64-bit range requires a future numeric design;
 these methods neither add a u64 type nor silently represent that range as
 negative i64 values. Streaming reads and serializers remain separate concerns.
+
+
+### Checked Bytes field extraction
+
+Bytes has custom built-in `slice(start, end) -> Bytes?` and
+`find(delimiter[, start]) -> i32?` methods, using ordinary method-call syntax.
+Both require unwrapped Bytes inputs and i32 indices. Slice accepts only
+`0 <= start <= end <= count`, returning an immutable, zero-copy half-open view.
+Equal bounds return present empty Bytes; invalid bounds return nil without
+clamping. Find searches exact binary delimiters at or after start and returns
+an absolute byte offset or nil. Start defaults to zero and must be in `[0,count]`;
+an empty delimiter matches at start. NUL and high-bit bytes are ordinary data.
+These methods compose transport `readLine` results with strict decimal parsing
+without introducing UTF-8 conversion, general range syntax or a protocol parser.
+
+Slice uses checked LLVM address formation and an optional Bytes carrier; find
+uses the existing bounded libc byte search through an allowlisted pure helper.
+Both avoid allocation and I/O and preserve `netError()`. The compiler validates
+intrinsic operand/result types in the builder, verifier and direct codegen path.
+Arguments retain source-order, single evaluation. Views inherit the input's
+ownership and cannot escape request/callback lifetimes. Existing outbound
+continuation storage retains live sliced values across a subsequent read.
+JIT/native HTTP and WebSocket execution share this contract. See
+[Bytes fields](docs/bytes-fields.md) for bounds, empty values and validation.

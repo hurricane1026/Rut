@@ -78,9 +78,11 @@ enum class Op : u8 {
     ParseInt,
     ParseInt64,
     OauthTokenExchangeRequest,
+    BytesSlice,
+    BytesFind,
 };
 
-// Compiler-only raw-byte intrinsics share the existing optional scalar carrier.
+// Compiler-only raw-byte reads share the existing optional scalar carrier.
 // Width zero means this is not a Bytes read; no JSON parsing is involved.
 struct BytesReadSpec {
     u32 width = 0;

@@ -19,6 +19,12 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 extern "C" {
 // Strict signed decimal parsing. Always initializes output, including on failure.
 rut::u8 rut_helper_parse_int(const char* data, rut::u32 length, rut::u32 bits, rut::i64* output);
+// Raw byte search; returns an absolute byte offset, or -1 for missing/invalid input.
+rut::i32 rut_helper_bytes_find(const char* data,
+                               rut::u32 length,
+                               const char* delimiter,
+                               rut::u32 delimiter_length,
+                               rut::i32 start);
 void* rut_helper_http_call_frame(
     void* conn, void* ctx, rut::u64 size, const rut::u8* request, rut::u32 length);
 rut::u64 rut_helper_net_call(void* connection,

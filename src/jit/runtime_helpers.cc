@@ -3000,3 +3000,19 @@ extern "C" rut::u8 rut_helper_parse_int(const char* data,
     if (bits == 64) return rut::parse_integer64({data, length}, *output);
     return 0;
 }
+
+extern "C" rut::i32 rut_helper_bytes_find(const char* data,
+                                          rut::u32 length,
+                                          const char* delimiter,
+                                          rut::u32 delimiter_length,
+                                          rut::i32 start) {
+    if (start < 0 || static_cast<u32>(start) > length || length > 0x7fffffffu ||
+        (!data && length) || (!delimiter && delimiter_length))
+        return -1;
+    if (!delimiter_length) return start;
+    const u32 kRemaining = length - static_cast<u32>(start);
+    if (delimiter_length > kRemaining) return -1;
+    const auto* found =
+        static_cast<const char*>(memmem(data + start, kRemaining, delimiter, delimiter_length));
+    return found ? static_cast<i32>(found - data) : -1;
+}

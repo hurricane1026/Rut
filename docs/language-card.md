@@ -196,7 +196,8 @@ Equality, inequality and generic `Eq` compare exact bytes, including NUL and
 non-UTF-8 bytes. Helpers may accept/return Bytes, imports preserve its type,
 and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
 request body as Bytes under the same buffering/lifetime rules as `req.body`.
-Checked single-byte [subscripts](#bytes-subscripts) are supported. There is no
+Checked single-byte [subscripts](#bytes-subscripts) and
+[field slice/search methods](#bytes-field-extraction) are supported. There is no
 implicit text conversion, ordering, concatenation or regex API for Bytes.
 
 ```swift
@@ -1039,8 +1040,8 @@ return websocket(chat) { message in
     if let label = messageLabel(message) { message.forward(label) }
     else { message.drop() }
 }
-// General source interpolation, mutable local syntax and Bytes slicing/concatenation
-// are not introduced here. Non-response statement effects inside ordinary helpers
+// General source interpolation, mutable local syntax and Bytes concatenation
+// are not introduced here. Checked Bytes slicing is available as described below. Non-response statement effects inside ordinary helpers
 // remain unsupported in HTTP and WebSocket alike. No alternate WS-only syntax.
 
 // connection: borrowed WebSocketConnection. remoteAddr: IP, remotePort: i32,
@@ -2939,7 +2940,7 @@ local, preserving arbitrary octets through the existing bounded serializer.
 See [the full contract](net-clients.md),
 [the executable example](../examples/tcp-udp-clients.rut) and
 [the Redis PING library](../examples/clients/redis.rut). Generic TCP listeners,
-unrestricted destinations, persistent pools, DNS and general-purpose Bytes
+unrestricted destinations, persistent pools, DNS and general-purpose streaming
 parsing/iteration are not introduced by this profile. Single-byte subscripting
 is supported separately below.
 
@@ -2968,8 +2969,30 @@ once in source order. Use `guard let`, `if let`, a nil test or `.or(...)` before
 using the optional byte as an integer. This is the custom read-only Bytes
 subscript contract, not Swift Array subscripting: Swift custom subscripts can
 [return optional values](https://docs.swift.org/swift-book/documentation/the-swift-programming-language/subscripts/).
-No string/array subscripts, subscript assignment, ranges/slices, or new numeric
-types are added.
+No string/array subscripts, subscript assignment, range syntax, or new numeric
+types are added. Checked Bytes slice methods are supported separately below.
+
+## Bytes field extraction
+
+`data.slice(start, end) -> Bytes?` extracts a checked half-open byte range:
+`0 <= start <= end <= data.count`. Invalid bounds return nil; equal bounds yield
+present empty Bytes. `data.find(delimiter[, start]) -> i32?` returns the first
+exact match's absolute byte offset at or after start (default zero), or nil.
+Starts must be between zero and count inclusive; an empty delimiter matches at
+start. Receivers/delimiters are unwrapped Bytes and indices are unwrapped i32.
+NUL/high-bit bytes remain binary. There is no implicit str conversion.
+
+```rut
+guard let end = line.find(b"\r\n") else { return 400 }
+guard let digits = line.slice(1, end) else { return 400 }
+guard let count = parseInt(digits) else { return 400 }
+```
+
+Slice is a zero-copy immutable view with its input's lifetime. Find reuses the
+existing bounded byte search; neither operation allocates, performs I/O or changes
+`netError()`. Ordinary helper, HTTP, WebSocket and native execution share the same
+contract. These custom Bytes methods use existing call syntax; Swift collection
+range syntax is not added. See [the full contract](bytes-fields.md).
 
 ## Built-in Bytes integer reads
 

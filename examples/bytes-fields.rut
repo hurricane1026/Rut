@@ -1,0 +1,21 @@
+// Extract a RESP-style decimal length without decoding raw bytes as text.
+func lengthField(_ line: Bytes) -> i32 {
+    guard line[0].or(-1) == 36 else { nil } // '$'
+    guard let end = line.find(b"\r\n") else { nil }
+    guard let digits = line.slice(1, end) else { nil }
+    parseInt(digits)
+}
+
+route POST "/length" {
+    guard let length = lengthField(req.bodyBytes) else { return 400 }
+    guard length >= 0 && length <= 8192 else { return 422 }
+    return 204
+}
+
+// Return the raw field before the first NUL; high-bit bytes stay unchanged.
+route POST "/field" {
+    let data = req.bodyBytes
+    guard let end = data.find(b"\x00") else { return 400 }
+    guard let field = data.slice(0, end) else { return 400 }
+    return response(200, body: field)
+}

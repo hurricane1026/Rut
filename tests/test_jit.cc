@@ -539,6 +539,91 @@ TEST(jit, bytes_subscripts_execute_without_arena_and_reject_malformed_rir) {
     tc.destroy();
 }
 
+TEST(jit, bytes_find_checks_raw_spans_and_protected_page_boundaries) {
+    CHECK_EQ(rut_helper_bytes_find(nullptr, 0, nullptr, 0, 0), 0);
+    CHECK_EQ(rut_helper_bytes_find(nullptr, 1, "x", 1, 0), -1);
+    CHECK_EQ(rut_helper_bytes_find("x", 1, nullptr, 1, 0), -1);
+    CHECK_EQ(rut_helper_bytes_find("x", 1, "", 0, -1), -1);
+    CHECK_EQ(rut_helper_bytes_find("x", 1, "", 0, 2), -1);
+    CHECK_EQ(rut_helper_bytes_find("x", 1, "", 0, 1), 1);
+    CHECK_EQ(rut_helper_bytes_find("aaaaa", 5, "aaa", 3, 1), 1);
+    CHECK_EQ(rut_helper_bytes_find("\xff\0\xff", 3, "\0\xff", 2, 0), 1);
+    const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto* memory = static_cast<char*>(
+        mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(memory != MAP_FAILED);
+    REQUIRE_EQ(mprotect(memory + page, page, PROT_NONE), 0);
+    char* end = memory + page;
+    for (u32 width = 1; width <= 64; ++width) {
+        memset(end - width, 'a', width);
+        end[-1] = 'b';
+        CHECK_EQ(rut_helper_bytes_find(end - width, width, "ab", 2, 0),
+                 width > 1 ? static_cast<i32>(width - 2) : -1);
+        CHECK_EQ(rut_helper_bytes_find(end - width, width, end - width, width, 0), 0);
+        CHECK_EQ(rut_helper_bytes_find(end - width, width, "c", 1, 0), -1);
+        CHECK_EQ(rut_helper_bytes_find(end - width, width, end, 0, width), static_cast<i32>(width));
+    }
+    CHECK_EQ(munmap(memory, page * 2), 0);
+}
+
+TEST(jit, bytes_field_intrinsics_reject_malformed_rir) {
+    for (const auto op : {json::Op::BytesSlice, json::Op::BytesFind}) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder builder;
+        builder.init(&tc.mod);
+        auto* fn = V(builder.create_function(lit("bytes_field"), lit("/"), 'G'));
+        const auto entry = V(builder.create_block(fn, lit("entry")));
+        builder.set_insert_point(fn, entry);
+        const auto data = V(builder.emit_req_body());
+        const auto zero = V(builder.emit_const_i32(0));
+        const ValueId args[] = {data, op == json::Op::BytesSlice ? zero : data, zero};
+        const auto kind = op == json::Op::BytesSlice ? TypeKind::Str : TypeKind::I32;
+        CHECK(!builder.emit_json(static_cast<u32>(op), kind, true, nullptr, 3));
+        CHECK(!builder.emit_json(static_cast<u32>(op), kind, true, args, 2));
+        CHECK(!builder.emit_json(static_cast<u32>(op), kind, false, args, 3));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Bool, true, args, 3));
+        const auto field = V(builder.emit_json(static_cast<u32>(op), kind, true, args, 3));
+        const auto missing = V(builder.emit_opt_is_nil(field));
+        const auto ok = V(builder.emit_const_i32(204));
+        const auto bad = V(builder.emit_const_i32(400));
+        VOK(builder.emit_ret_status(V(builder.emit_select(missing, bad, ok))));
+        REQUIRE(verify_module(tc.mod).ok);
+        auto cg = codegen(tc.mod);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_bytes_field"));
+        REQUIRE(handler);
+        const char request[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+        CHECK_EQ(HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(request),
+                                               sizeof(request) - 1,
+                                               nullptr))
+                     .status_code,
+                 204u);
+        auto& instruction = fn->blocks[entry.id].insts[2];
+        REQUIRE(instruction.op == Opcode::JsonOp);
+        instruction.operand_count = 2;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operand_count = 3;
+        instruction.operands[2] = data;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operands[2] = zero;
+        const auto* saved = fn->values[field.id].type;
+        fn->values[field.id].type = fn->values[zero.id].type;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        fn->values[field.id].type = saved;
+        engine.shutdown();
+        tc.destroy();
+    }
+}
+
 TEST(jit, decimal_integer_parsing_initializes_failures_and_validates_rir_shapes) {
     i64 value = 123;
     CHECK_EQ(rut_helper_parse_int(nullptr, 10, 64, &value), 0u);

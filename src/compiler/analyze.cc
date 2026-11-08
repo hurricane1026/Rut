@@ -4863,6 +4863,50 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         }
     }
 
+    if (expr.name.eq(lit_str("slice")) || expr.name.eq(lit_str("find"))) {
+        const u32 kSavedExprs = route->exprs.len;
+        const u32 kSavedGuards = route->guards.len;
+        auto receiver = receiver_override
+                            ? FrontendResult<HirExpr>(*receiver_override)
+                            : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (receiver && receiver->type == HirTypeKind::Bytes) {
+            const bool kSlicing = expr.name.eq(lit_str("slice"));
+            constexpr auto kDetail = lit_str(
+                "Bytes fields require unwrapped values: slice(i32 start, i32 end) or "
+                "find(Bytes delimiter[, i32 start])");
+            if (receiver->may_nil || receiver->may_error ||
+                (kSlicing ? expr.args.len != 2 : expr.args.len < 1 || expr.args.len > 2))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            auto first = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+            if (!first) return core::make_unexpected(first.error());
+            if (first->may_nil || first->may_error ||
+                first->type != (kSlicing ? HirTypeKind::I32 : HirTypeKind::Bytes))
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            HirExpr last{};
+            last.kind = HirExprKind::IntLit;
+            last.type = HirTypeKind::I32;
+            last.span = expr.span;
+            if (expr.args.len == 2) {
+                auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+                if (!value) return core::make_unexpected(value.error());
+                last = value.value();
+            }
+            if (last.type != HirTypeKind::I32 || last.may_nil || last.may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+            return make_json_op(kSlicing ? json::Op::BytesSlice : json::Op::BytesFind,
+                                kSlicing ? HirTypeKind::Bytes : HirTypeKind::I32,
+                                true,
+                                &receiver.value(),
+                                &first.value(),
+                                &last,
+                                expr.span,
+                                route);
+        }
+        // Names remain available to ordinary methods/UFCS on other types.
+        route->exprs.len = kSavedExprs;
+        route->guards.len = kSavedGuards;
+    }
+
     struct BytesReader {
         Str name;
         json::Op operation;
