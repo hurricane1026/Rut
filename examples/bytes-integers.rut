@@ -1,0 +1,14 @@
+import "clients/binary.rut"
+
+// POST the two bytes 0x01,0x2c for big endian, or 0x2c,0x01 for little endian.
+route POST "/big-endian" {
+    guard let value = binary.readU16BE(req.bodyBytes, 0) else { return 400 }
+    guard value == 300 else { return 422 }
+    return 204
+}
+
+route POST "/little-endian" {
+    guard let value = binary.readU16LE(req.bodyBytes, 0) else { return 400 }
+    guard value == 300 else { return 422 }
+    return 204
+}

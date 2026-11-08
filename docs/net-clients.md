@@ -126,6 +126,11 @@ does not perform I/O or change `netError()`. Streaming subscriptions, background
 sessions, general parser loops, Bytes slices and cross-request pooling remain
 separate follow-ups, not current capabilities.
 
+The ordinary [binary library](binary-integers.md) decodes fixed-width integer
+fields from these Bytes with big/little endian helpers. Acquire a complete TCP
+field before decoding (for example with `readExactly`); decoding itself does
+not perform I/O. UDP fields use offsets in a complete received datagram.
+
 ## Validation
 
 `test_net_clients.py` exercises both epoll and io_uring with actual local TCP,

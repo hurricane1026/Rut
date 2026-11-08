@@ -196,8 +196,8 @@ Equality, inequality and generic `Eq` compare exact bytes, including NUL and
 non-UTF-8 bytes. Helpers may accept/return Bytes, imports preserve its type,
 and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
 request body as Bytes under the same buffering/lifetime rules as `req.body`.
-There is no implicit text conversion, ordering, concatenation, indexing or
-regex API for Bytes.
+Checked single-byte [subscripts](#bytes-subscripts) are supported. There is no
+implicit text conversion, ordering, concatenation or regex API for Bytes.
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
@@ -2926,3 +2926,26 @@ subscript contract, not Swift Array subscripting: Swift custom subscripts can
 [return optional values](https://docs.swift.org/swift-book/documentation/the-swift-programming-language/subscripts/).
 No string/array subscripts, subscript assignment, ranges/slices, or new numeric
 types are added.
+
+## Binary integer helpers
+
+The ordinary [binary library](../examples/clients/binary.rut) combines Bytes
+into fixed-width integers, with explicit byte order and byte offsets:
+
+```rut
+import "clients/binary.rut"
+route POST "/number" {
+    guard let value = binary.readU16BE(req.bodyBytes, 0) else { return 400 }
+    guard value == 300 else { return 422 } // bytes 0x01,0x2c
+    return 204
+}
+```
+
+`readU16BE/LE` and `readI16BE/LE` return `i32?`; `readI32BE/LE` also return
+`i32?`. `readU32BE/LE` and `readI64BE/LE` return inferred `i64?`. Both BE
+(most significant byte first) and LE (least significant byte first) support
+unaligned zero-based i32 offsets. Signed reads use two's complement. Negative
+offsets or incomplete input return nil without advancing a cursor or doing I/O.
+Unsigned 32-bit values retain the full 0–4294967295 range. These are source
+helpers, not new numeric types: unsigned 64-bit decoding and source i64
+annotations remain absent. See [ranges and complete semantics](binary-integers.md).

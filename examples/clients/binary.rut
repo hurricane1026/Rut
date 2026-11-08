@@ -1,0 +1,69 @@
+// Checked integer decoding from immutable Bytes. Offsets are zero-based.
+// BE = big endian, LE = little endian. Missing input returns nil.
+// u16 values use i32; u32 values use inferred i64. Signed reads use two's complement.
+func readU16BE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard offset >= 0 && offset <= bytes.count - 2 else { nil }
+    guard let high = bytes[offset] else { nil }
+    guard let low = bytes[offset + 1] else { nil }
+    high * 256 + low
+}
+
+func readU16LE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard offset >= 0 && offset <= bytes.count - 2 else { nil }
+    guard let low = bytes[offset] else { nil }
+    guard let high = bytes[offset + 1] else { nil }
+    high * 256 + low
+}
+
+func readI16BE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard let value = readU16BE(bytes, offset) else { nil }
+    if value >= 32768 { value - 65536 } else { value }
+}
+
+func readI16LE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard let value = readU16LE(bytes, offset) else { nil }
+    if value >= 32768 { value - 65536 } else { value }
+}
+
+// No i64 source annotations are required: widening determines the result type.
+func readU32BE(_ bytes: Bytes, _ offset: i32) {
+    guard offset >= 0 && offset <= bytes.count - 4 else { nil }
+    guard let high = readU16BE(bytes, offset) else { nil }
+    guard let low = readU16BE(bytes, offset + 2) else { nil }
+    i64(high) * i64(65536) + i64(low)
+}
+
+func readU32LE(_ bytes: Bytes, _ offset: i32) {
+    guard offset >= 0 && offset <= bytes.count - 4 else { nil }
+    guard let low = readU16LE(bytes, offset) else { nil }
+    guard let high = readU16LE(bytes, offset + 2) else { nil }
+    i64(high) * i64(65536) + i64(low)
+}
+
+func readI32BE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard offset >= 0 && offset <= bytes.count - 4 else { nil }
+    guard let high = readI16BE(bytes, offset) else { nil }
+    guard let low = readU16BE(bytes, offset + 2) else { nil }
+    high * 65536 + low
+}
+
+func readI32LE(_ bytes: Bytes, _ offset: i32) -> i32 {
+    guard offset >= 0 && offset <= bytes.count - 4 else { nil }
+    guard let low = readU16LE(bytes, offset) else { nil }
+    guard let high = readI16LE(bytes, offset + 2) else { nil }
+    high * 65536 + low
+}
+
+func readI64BE(_ bytes: Bytes, _ offset: i32) {
+    guard offset >= 0 && offset <= bytes.count - 8 else { nil }
+    guard let high = readI32BE(bytes, offset) else { nil }
+    guard let low = readU32BE(bytes, offset + 4) else { nil }
+    i64(high) * 4294967296 + low
+}
+
+func readI64LE(_ bytes: Bytes, _ offset: i32) {
+    guard offset >= 0 && offset <= bytes.count - 8 else { nil }
+    guard let low = readU32LE(bytes, offset) else { nil }
+    guard let high = readI32LE(bytes, offset + 4) else { nil }
+    i64(high) * 4294967296 + low
+}
