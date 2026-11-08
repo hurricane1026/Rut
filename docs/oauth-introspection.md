@@ -176,3 +176,44 @@ empty binding configuration, subject/audience/expiry/scope failures, service
 credential separation, spoofed headers and upstream non-forwarding on rejection.
 It runs on epoll and io_uring with existing timeout/revocation/isolation cases.
 No builtin, runtime ABI, dependency, cache or provider-specific discovery is added.
+
+## Optional mTLS certificate binding
+
+For opaque certificate-bound access tokens, call
+`introspection.requireMtls(document)` after `requireActive` over the response
+from the configured authenticated HTTPS authorization server. This implements the
+resource-server comparison in [RFC 8705 section 3.2](https://www.rfc-editor.org/rfc/rfc8705#section-3.2).
+The AS supplies top-level `cnf` with `x5t#S256`: the canonical unpadded base64url
+SHA-256 digest of the client's DER certificate. The helper compares it with
+`req.tlsClientCertSha256` from this connection's verified client certificate,
+using the existing bounded `jwtCertificateBound` primitive. Despite that
+primitive's name, its confirmation-object validation also applies to introspection
+JSON. A missing TLS identity is passed as an empty fingerprint and fails closed.
+
+See [mtls-introspection.rut](../examples/mtls-introspection.rut). Start the gateway
+with `--tls-cert`, `--tls-key` and mandatory `--tls-client-ca`; the configured CA
+bundle must trust the client certificate. The helper does not trust certificate
+headers from a terminating proxy. Plain HTTP and server-only TLS cannot satisfy
+it, even when the caller sends a correct fingerprint header. The server's own
+certificate and the introspection service credential cannot supply client identity.
+
+Missing, malformed, mismatching or ambiguous confirmation methods return 401 with
+`Bearer error="invalid_token"`; only the single `x5t#S256` method is accepted.
+Malformed JSON or duplicate decoded AS member names retain the response parser's
+503 behavior. Active state, expiry and audience remain mandatory before binding;
+subject and scope authorization follow it. Insufficient permission remains 403.
+The example replaces every spoofed Consumer ID only after all checks succeed,
+strips Authorization and Cookie before forwarding, and returns no AS token body
+or cookies to the caller. Header removal affects forwarding, not original auth reads.
+
+This is an opt-in resource policy. Existing bearer introspection routes keep their
+behavior. It adds no token issuance, AS client-certificate authentication, cache,
+certificate renewal, CRL/OCSP or persistent revocation store. Each request still
+introspects; an AS revocation takes effect on its next response. A stolen opaque
+token therefore fails when presented with a different otherwise trusted certificate.
+
+`test_mtls_introspection` exercises both epoll and io_uring with two shards,
+HTTP/1 and HTTP/2, two certificates sharing a key but having different DER,
+source/module removal, spoofed identity/certificate headers, absent TLS client
+identity, malformed confirmation metadata, authorization failures, AS errors,
+timeout/disconnect cleanup, concurrent connection isolation and revocation.

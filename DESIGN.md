@@ -10515,3 +10515,15 @@ so existing operation numbers stay stable. Signature/claims/scope policy remains
 explicit, and the ordinary helper fails closed with challenged 401 when TLS or
 confirmation evidence is missing. No token issuance, proxy-header trust, DPoP or
 persistent revocation is implied. See [the contract](docs/mtls-bound-jwt.md).
+
+
+### Introspection certificate confirmation policy
+
+The ordinary Rut `introspection.requireMtls` helper reuses `jwtCertificateBound`
+on metadata returned by `requireActive` from a trusted HTTPS introspection
+endpoint. RFC 8705 uses the same top-level `cnf.x5t#S256` confirmation structure
+for JWT claims and opaque-token introspection responses. The trusted connection
+fingerprint comes exclusively from `req.tlsClientCertSha256`; its absence fails
+closed. Confirmation is checked before subject/scope forwarding. No builtin,
+allocator, configuration lifecycle or runtime ABI is changed. See
+[the protocol contract](docs/oauth-introspection.md#optional-mtls-certificate-binding).

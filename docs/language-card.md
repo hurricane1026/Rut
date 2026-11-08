@@ -3044,3 +3044,15 @@ Unsigned 32-bit values retain the full 0–4294967295 range. These methods opera
 on unwrapped Bytes and take one unwrapped i32 offset. They do not add numeric
 types: unsigned 64-bit decoding and source i64
 annotations remain absent. See [ranges and complete semantics](binary-integers.md).
+
+
+### Certificate-bound opaque-token introspection
+
+`introspection.requireMtls(document)` in `middleware/introspection.rut` returns
+the same authenticated AS metadata after matching its `cnf.x5t#S256` to
+`req.tlsClientCertSha256`. Call `requireActive` first, then apply this opt-in policy
+before subject/scope authorization. Missing client TLS identity, malformed or
+mismatching confirmation fails with challenged 401; forwarded certificate headers
+cannot satisfy it. Uses the existing `jwtCertificateBound` primitive; no language
+or native ABI change is added. See [the contract](oauth-introspection.md#optional-mtls-certificate-binding)
+and [the runnable example](../examples/mtls-introspection.rut).
