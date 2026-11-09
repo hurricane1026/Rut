@@ -1,0 +1,137 @@
+import "resp2-command.rut"
+import "resp2.rut"
+
+variant RedisGetResult {
+    value(Bytes)
+    missing
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+variant RedisSetResult {
+    ok
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+// Scalar commands need at most one completed RESP2 node per feed. Sharing the
+// generic step with a one-item budget avoids expanding the 64-node array path.
+func redisScalarFeed(_ stream: Resp2Stream, _ chunk: Bytes) {
+    guard stream.cursor.status == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+    guard let steps = collectBytes(bytes, stream.cursor, 1, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(0) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
+func redisReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let pending = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        redisScalarFeed(stream, chunk)
+    } else { stream }
+}
+// Four receives are the explicit reply-read budget. Each uses a 1000 ms
+// operation deadline. These helpers never resend a command; failures poison the handle below.
+func redisReadTwice(_ connection: TcpConnection, _ initial: Resp2Stream) {
+    let pendingFirst = redisReceive(connection, initial)
+    guard let first = pendingFirst else { nil }
+    let pendingSecond = redisReceive(connection, first)
+    guard let second = pendingSecond else { nil }
+    second
+}
+func redisReadFour(_ connection: TcpConnection, _ initial: Resp2Stream) {
+    let pendingFirst = redisReadTwice(connection, initial)
+    guard let first = pendingFirst else { nil }
+    let pendingSecond = redisReadTwice(connection, first)
+    guard let second = pendingSecond else { nil }
+    second
+}
+// GET and plain SET have scalar replies. Bound token decoding to one item;
+// a nested aggregate, trailing reply or incomplete frame fails closed.
+func redisScalarReply(_ stream: Resp2Stream) {
+    guard resp2Finished(stream) else { nil }
+    guard let values = collectBytes(stream.bytes, Resp2State(offset: 0, pending: 1), 1, resp2Step) else { nil }
+    guard let root = values.get(0) else { nil }
+    guard root.next == stream.bytes.count else { nil }
+    root
+}
+func redisReply(_ connection: TcpConnection) {
+    guard let initial = resp2Stream(8192) else { nil }
+    let pending = redisReadFour(connection, initial)
+    guard let stream = pending else { nil }
+    redisScalarReply(stream)
+}
+func redisGetReadFailure(_ code: i32) -> RedisGetResult {
+    if code == 0 { RedisGetResult.replyFailure } else { RedisGetResult.transportFailure(code) }
+}
+func redisSetReadFailure(_ code: i32) -> RedisSetResult {
+    if code == 0 { RedisSetResult.replyFailure } else { RedisSetResult.transportFailure(code) }
+}
+func redisGetMustClose(_ result: RedisGetResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisSetMustClose(_ result: RedisSetResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisGetFinish(_ connection: TcpConnection, _ result: RedisGetResult) -> RedisGetResult {
+    if redisGetMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func redisSetFinish(_ connection: TcpConnection, _ result: RedisSetResult) -> RedisSetResult {
+    if redisSetMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func redisGetExecute(_ connection: TcpConnection, _ key: Bytes) {
+    guard let request = resp2GetRequest(key) else { RedisGetResult.requestFailure }
+    let pendingSend = connection.send(request, 1000)
+    guard let sent = pendingSend else { RedisGetResult.transportFailure(netError()) }
+    let pendingRead = redisReply(connection)
+    guard let reply = pendingRead else { redisGetReadFailure(netError()) }
+    if reply.kind == 4 {
+        RedisGetResult.value(reply.data)
+    } else {
+        if reply.kind == 6 {
+            RedisGetResult.missing
+        } else {
+            guard reply.kind == 2 else { RedisGetResult.replyFailure }
+            RedisGetResult.serverError(reply.data)
+        }
+    }
+}
+func redisSetExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) {
+    guard let request = resp2SetRequest(key, value) else { RedisSetResult.requestFailure }
+    let pendingSend = connection.send(request, 1000)
+    guard let sent = pendingSend else { RedisSetResult.transportFailure(netError()) }
+    let pendingRead = redisReply(connection)
+    guard let reply = pendingRead else { redisSetReadFailure(netError()) }
+    if reply.kind == 1 && reply.data == b"OK" {
+        RedisSetResult.ok
+    } else {
+        guard reply.kind == 2 else { RedisSetResult.replyFailure }
+        RedisSetResult.serverError(reply.data)
+    }
+}
+
+func redisGet(_ connection: TcpConnection, _ key: Bytes) -> RedisGetResult {
+    let result = redisGetExecute(connection, key)
+    redisGetFinish(connection, result)
+}
+func redisSet(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) -> RedisSetResult {
+    let result = redisSetExecute(connection, key, value)
+    redisSetFinish(connection, result)
+}

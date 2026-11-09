@@ -1,0 +1,47 @@
+// Binary-safe command construction, using only generic bounded byte primitives.
+struct Resp2Command {
+    packet: Bytes
+    expected: i32
+    written: i32
+    limit: i32
+}
+func resp2DecimalLine(_ prefix: Bytes, _ value: i32, _ limit: i32) {
+    guard let digits = formatInt(value) else { nil }
+    guard let start = concatBytes(prefix, Bytes(digits), limit) else { nil }
+    concatBytes(start, b"\r\n", limit)
+}
+func resp2Command(_ argumentCount: i32, _ maxBytes: i32) {
+    guard argumentCount > 0 && argumentCount < 64 && maxBytes > 0 && !(maxBytes > 8192) else { nil }
+    guard let header = resp2DecimalLine(b"*", argumentCount, maxBytes) else { nil }
+    Resp2Command(packet: header, expected: argumentCount, written: 0, limit: maxBytes)
+}
+func resp2BulkArgument(_ payload: Bytes, _ limit: i32) {
+    guard let header = resp2DecimalLine(b"$", payload.count, limit) else { nil }
+    guard let content = concatBytes(header, payload, limit) else { nil }
+    concatBytes(content, b"\r\n", limit)
+}
+func resp2Argument(_ command: Resp2Command, _ payload: Bytes) {
+    guard command.expected > 0 && command.expected < 64 && command.written > -1 &&
+        command.written < command.expected && command.limit > 0 && !(command.limit > 8192) else { nil }
+    guard let argument = resp2BulkArgument(payload, command.limit - command.packet.count) else { nil }
+    guard let packet = concatBytes(command.packet, argument, command.limit) else { nil }
+    Resp2Command(packet: packet, expected: command.expected, written: command.written + 1, limit: command.limit)
+}
+func resp2Request(_ command: Resp2Command) {
+    guard command.expected > 0 && command.expected < 64 && command.written == command.expected &&
+        command.limit > 0 && !(command.limit > 8192) && !(command.packet.count > command.limit) else { nil }
+    command.packet
+}
+func resp2GetRequest(_ key: Bytes) {
+    guard let initial = resp2Command(2, 8192) else { nil }
+    guard let named = resp2Argument(initial, b"GET") else { nil }
+    guard let keyed = resp2Argument(named, key) else { nil }
+    resp2Request(keyed)
+}
+func resp2SetRequest(_ key: Bytes, _ value: Bytes) {
+    guard let initial = resp2Command(3, 8192) else { nil }
+    guard let named = resp2Argument(initial, b"SET") else { nil }
+    guard let keyed = resp2Argument(named, key) else { nil }
+    guard let valued = resp2Argument(keyed, value) else { nil }
+    resp2Request(valued)
+}

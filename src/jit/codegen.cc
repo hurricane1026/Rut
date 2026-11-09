@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/call_liveness.h"
 #include "rut/compiler/http_call_profile.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
@@ -11,6 +12,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
 #include <atomic>
@@ -146,7 +148,8 @@ struct Ctx {
     // values and the exact continuation without replaying earlier effects.
     LLVMValueRef call_frame = nullptr;
     LLVMTypeRef call_frame_type = nullptr;
-    u32 call_frame_fields[1024]{};
+    u32* call_frame_fields = nullptr;
+    LLVMValueRef* call_phi_incoming = nullptr;
     LLVMValueRef call_dispatch = nullptr;
     u32 call_state = 0;
     u32 current_block = 0;
@@ -847,7 +850,11 @@ struct Ctx {
             if (inst.op != rir::Opcode::Phi) continue;
             for (u32 incoming = 0; incoming < 2; ++incoming) {
                 if (inst.imm.block_targets[incoming].id != current_block) continue;
-                set_value(inst.result, get_value(inst.operands[incoming]));
+                auto value = get_value(inst.operands[incoming]);
+                if (call_frame_fields[inst.result.id])
+                    set_value(inst.result, value);
+                else
+                    call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + incoming] = value;
             }
         }
     }
@@ -2066,8 +2073,210 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
             break;
         }
+        case rir::Opcode::ArrayNew: {
+            const auto* element = c.cur_fn->values[inst.result.id].type->inner->inner;
+            const auto element_type = c.map_type(element);
+            LLVMValueRef offsets[16]{};
+            LLVMValueRef path[10]{};
+            path[0] = LLVMConstInt(c.i32_ty, 0, 0);
+            u32 strings = 0;
+            const auto describe = [&](auto&& self, const rir::Type* type, u32 depth) -> bool {
+                if (depth >= 10) return false;
+                if (type->kind == rir::TypeKind::Str) {
+                    if (strings == 16) return false;
+                    const auto address =
+                        LLVMConstGEP2(element_type, LLVMConstNull(c.ptr_ty), path, depth);
+                    offsets[strings++] = LLVMConstPtrToInt(address, c.i32_ty);
+                } else if (type->kind == rir::TypeKind::Struct) {
+                    for (u32 i = 0; i < type->struct_def->field_count; ++i) {
+                        path[depth] = LLVMConstInt(c.i32_ty, i, 0);
+                        if (!self(self, type->struct_def->fields()[i].type, depth + 1))
+                            return false;
+                    }
+                }
+                return true;
+            };
+            LLVMValueRef offset_pointer = LLVMConstNull(c.ptr_ty);
+            // Shapes with excessive text leaves fail allocation without
+            // constructing a malformed descriptor or partially visible array.
+            const bool described = describe(describe, element, 1);
+            if (described && strings) {
+                const auto type = LLVMArrayType(c.i32_ty, strings);
+                offset_pointer = LLVMAddGlobal(c.llvm_mod, type, "collect.string.offsets");
+                LLVMSetInitializer(offset_pointer, LLVMConstArray(c.i32_ty, offsets, strings));
+                LLVMSetGlobalConstant(offset_pointer, 1);
+                LLVMSetLinkage(offset_pointer, LLVMPrivateLinkage);
+            }
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.ptr_ty, parameters, 6, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_new");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_new", type);
+            LLVMValueRef arguments[] = {
+                c.param_conn,
+                c.param_arena,
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, ""),
+                LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
+                offset_pointer,
+                LLVMConstInt(c.i32_ty, described ? strings : 17, 0)};
+            const auto pointer =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 6, "collect.new");
+            const auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "collect.allocated");
+            auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+            result = LLVMBuildInsertValue(c.builder, result, pointer, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
+        case rir::Opcode::ArrayPush: {
+            const auto* element = c.cur_fn->values[inst.operands[0].id].type->inner;
+            const auto element_type = c.map_type(element);
+            const auto temporary = LLVMBuildAlloca(c.builder, element_type, "collect.item");
+            LLVMBuildStore(c.builder, c.get_value(inst.operands[1]), temporary);
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.i8_ty, parameters, 3, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_push");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_push", type);
+            LLVMValueRef arguments[] = {
+                c.get_value(inst.operands[0]),
+                temporary,
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, "")};
+            const auto committed =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 3, "collect.push");
+            c.set_value(inst.result,
+                        LLVMBuildICmp(c.builder,
+                                      LLVMIntNE,
+                                      committed,
+                                      LLVMConstInt(c.i8_ty, 0, 0),
+                                      "collect.committed"));
+            break;
+        }
+        case rir::Opcode::ArrayLen: {
+            LLVMTypeRef parameters[] = {c.ptr_ty};
+            const auto type = LLVMFunctionType(c.i32_ty, parameters, 1, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_count");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_count", type);
+            LLVMValueRef arguments[] = {c.get_value(inst.operands[0])};
+            c.set_value(inst.result,
+                        LLVMBuildCall2(c.builder, type, helper, arguments, 1, "collect.count"));
+            break;
+        }
+        case rir::Opcode::ArrayGet: {
+            const auto* result_type = c.cur_fn->values[inst.result.id].type;
+            const auto element_type = c.map_type(result_type->inner);
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.i32_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.ptr_ty, parameters, 3, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_collect_get");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_collect_get", type);
+            LLVMValueRef arguments[] = {
+                c.get_value(inst.operands[0]),
+                c.get_value(inst.operands[1]),
+                LLVMBuildIntCast2(c.builder, LLVMSizeOf(element_type), c.i32_ty, 0, "")};
+            const auto pointer =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 3, "collect.get");
+            const auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "collect.present");
+            const auto origin = LLVMGetInsertBlock(c.builder);
+            const auto function = LLVMGetBasicBlockParent(origin);
+            const auto load = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "collect.load");
+            const auto merge =
+                LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "collect.get.merge");
+            LLVMBuildCondBr(c.builder, has, load, merge);
+            LLVMPositionBuilderAtEnd(c.builder, load);
+            const auto loaded = LLVMBuildLoad2(c.builder, element_type, pointer, "collect.value");
+            LLVMBuildBr(c.builder, merge);
+            LLVMPositionBuilderAtEnd(c.builder, merge);
+            const auto payload = LLVMBuildPhi(c.builder, element_type, "collect.result");
+            LLVMValueRef values[] = {LLVMConstNull(element_type), loaded};
+            LLVMBasicBlockRef blocks[] = {origin, load};
+            LLVMAddIncoming(payload, values, blocks, 2);
+            auto result = LLVMGetUndef(c.map_type(result_type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+            if (result_type->inner->kind == rir::TypeKind::Str) {
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, payload, 0, ""), 1, "");
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildExtractValue(c.builder, payload, 1, ""), 2, "");
+            } else {
+                result = LLVMBuildInsertValue(c.builder, result, payload, 1, "");
+            }
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::JsonOp: {
             const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+            if (kJsonOp == json::Op::BytesFromString) {
+                c.set_value(inst.result, c.get_value(inst.operands[0]));
+                break;
+            }
+            if (kJsonOp == json::Op::FormatInt) {
+                auto value = c.get_value(inst.operands[0]);
+                if (c.cur_fn->values[inst.operands[0].id].type->kind == rir::TypeKind::I32)
+                    value = LLVMBuildSExt(c.builder, value, c.i64_ty, "format.i64");
+                LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.i64_ty, c.ptr_ty, c.ptr_ty};
+                const auto kType = LLVMFunctionType(c.i8_ty, params, 5, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_format_int");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_format_int", kType);
+                const auto kPointer = LLVMBuildAlloca(c.builder, c.ptr_ty, "format.ptr");
+                const auto kLength = LLVMBuildAlloca(c.builder, c.i32_ty, "format.len");
+                LLVMValueRef args[] = {c.param_conn, c.param_arena, value, kPointer, kLength};
+                const auto kHas = LLVMBuildCall2(c.builder, kType, helper, args, 5, "format.has");
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder, result, kHas, 0, "");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, kPointer, "format.data"),
+                    1,
+                    "");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, kLength, "format.size"),
+                    2,
+                    "");
+                c.set_value(inst.result, result);
+                break;
+            }
+            if (kJsonOp == json::Op::BytesConcat) {
+                const auto left = c.get_value(inst.operands[0]);
+                const auto right = c.get_value(inst.operands[1]);
+                const auto left_len = LLVMBuildExtractValue(c.builder, left, 1, "concat.left.len");
+                const auto right_len =
+                    LLVMBuildExtractValue(c.builder, right, 1, "concat.right.len");
+                LLVMTypeRef parameters[] = {
+                    c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.i32_ty};
+                const auto type = LLVMFunctionType(c.ptr_ty, parameters, 7, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_bytes_concat");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_bytes_concat", type);
+                LLVMValueRef arguments[] = {c.param_conn,
+                                            c.param_arena,
+                                            LLVMBuildExtractValue(c.builder, left, 0, ""),
+                                            left_len,
+                                            LLVMBuildExtractValue(c.builder, right, 0, ""),
+                                            right_len,
+                                            c.get_value(inst.operands[2])};
+                const auto pointer =
+                    LLVMBuildCall2(c.builder, type, helper, arguments, 7, "concat.bytes");
+                const auto has = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "concat.has");
+                auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+                result = LLVMBuildInsertValue(
+                    c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+                result = LLVMBuildInsertValue(c.builder, result, pointer, 1, "");
+                const auto length =
+                    LLVMBuildSelect(c.builder,
+                                    has,
+                                    LLVMBuildAdd(c.builder, left_len, right_len, ""),
+                                    LLVMConstInt(c.i32_ty, 0, 0),
+                                    "concat.length");
+                result = LLVMBuildInsertValue(c.builder, result, length, 2, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::BytesSlice) {
                 const auto kBytes = c.get_value(inst.operands[0]);
                 const auto kStart = c.get_value(inst.operands[1]);
@@ -2263,7 +2472,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             }
             if (rir::is_net_call(inst)) {
                 const bool opening = kJsonOp == json::Op::NetTcp || kJsonOp == json::Op::NetUdp;
-                const bool closing = kJsonOp == json::Op::NetClose;
+                const bool releasing = kJsonOp == json::Op::NetRelease;
+                const bool closing = kJsonOp == json::Op::NetClose || releasing;
                 const bool sending = kJsonOp == json::Op::NetSend;
                 const bool scalar_result = opening || sending;
                 auto parent = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
@@ -2282,7 +2492,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                             : sending ? c.get_value(inst.operand(1))
                                       : LLVMGetUndef(c.str_ty);
                 auto handle = opening ? LLVMConstInt(c.i32_ty, 0, 0) : c.get_value(inst.operand(0));
-                auto timeout = closing ? LLVMConstInt(c.i32_ty, 1, 0)
+                auto timeout = closing ? LLVMConstInt(c.i32_ty, releasing ? 1000 : 1, 0)
                                        : c.get_value(inst.operand(opening ? 1 : 2));
                 auto amount = opening || closing || sending ? LLVMConstInt(c.i32_ty, 0, 0)
                                                             : c.get_value(inst.operand(1));
@@ -2302,9 +2512,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_net_call", type);
                 LLVMValueRef args[] = {
                     c.param_conn,
-                    LLVMConstInt(c.i32_ty,
-                                 static_cast<u32>(kJsonOp) - static_cast<u32>(json::Op::NetTcp),
-                                 0),
+                    LLVMConstInt(
+                        c.i32_ty,
+                        releasing ? static_cast<u32>(rut::NetOp::Release)
+                                  : static_cast<u32>(kJsonOp) - static_cast<u32>(json::Op::NetTcp),
+                        0),
                     handle,
                     opening || sending ? LLVMBuildExtractValue(c.builder, data, 0, "net.data")
                                        : LLVMConstNull(c.ptr_ty),
@@ -3013,8 +3225,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
             } else {
                 LLVMTypeRef payload_ty = LLVMStructGetTypeAtIndex(out_ty, 1);
-                opt = LLVMBuildInsertValue(
-                    c.builder, opt, LLVMGetUndef(payload_ty), 1, "opt.nil.payload");
+                const auto* optional_type = c.cur_fn->values[inst.result.id].type;
+                const auto payload = optional_type->inner->kind == rir::TypeKind::Array
+                                         ? LLVMConstNull(payload_ty)
+                                         : LLVMGetUndef(payload_ty);
+                opt = LLVMBuildInsertValue(c.builder, opt, payload, 1, "opt.nil.payload");
             }
             c.set_value(inst.result, opt);
             break;
@@ -3066,7 +3281,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::Phi: {
-            if (c.call_frame) break;  // incoming edges store the selected value
+            if (c.call_frame && c.call_frame_fields[inst.result.id]) break;
             LLVMValueRef value = LLVMBuildPhi(
                 c.builder, c.map_type(c.cur_fn->values[inst.result.id].type), "merge.value");
             c.set_value(inst.result, value);
@@ -3478,6 +3693,7 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     LLVMBasicBlockRef small_blocks[64]{};
     // LLVM's opaque mutable block handles are required by LLVMAddIncoming.
     LLVMBasicBlockRef small_exits[64]{};  // NOLINT(misc-const-correctness)
+    u8 small_emitted[64]{};
     struct MapStorage {
         MmapArena arena;
         ~MapStorage() { arena.destroy(); }
@@ -3536,70 +3752,20 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
     c.call_dispatch = nullptr;
     c.call_state = 0;
     if (kHasCalls) {
-        // Retain every value that precedes a reachable call, conservatively
-        // including unused values. Values produced after the final call need
-        // no suspension storage. Keep Phi values in the frame as well: their
-        // incoming edges already select/store them without replay on resume.
-        // The runtime's 8 KiB frame bound remains unchanged.
-        auto* reaches_call = maps.arena.alloc_array<u8>(fn.block_count);
-        if (!reaches_call) return false;
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            reaches_call[bi] = 0;
-            for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ++ii)
-                if (rir::is_http_call(fn.blocks[bi].insts[ii])) reaches_call[bi] = 1;
-        }
-        auto successors_call = [&](const rir::Block& block) {
-            const auto* term = block.terminator();
-            if (!term) return false;
-            if (term->op == rir::Opcode::Jmp)
-                return reaches_call[term->imm.block_targets[0].id] != 0;
-            if (term->op == rir::Opcode::Br)
-                return reaches_call[term->imm.block_targets[0].id] != 0 ||
-                       reaches_call[term->imm.block_targets[1].id] != 0;
+        c.call_frame_fields = maps.arena.alloc_array<u32>(fn.value_count);
+        c.call_phi_incoming = maps.arena.alloc_array<LLVMValueRef>(fn.value_count * 2);
+        if (!c.call_frame_fields || !c.call_phi_incoming ||
+            !rir::call_live_values(fn, maps.arena, c.call_frame_fields))
             return false;
-        };
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (u32 bi = fn.block_count; bi > 0; --bi) {
-                if (!reaches_call[bi - 1] && successors_call(fn.blocks[bi - 1])) {
-                    reaches_call[bi - 1] = 1;
-                    changed = true;
-                }
-            }
-        }
-        for (u32 vi = 0; vi < fn.value_count; ++vi) c.call_frame_fields[vi] = 0;
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            const auto& block = fn.blocks[bi];
-            bool later_call = successors_call(block);
-            for (u32 ii = block.inst_count; ii > 0; --ii) {
-                const auto& inst = block.insts[ii - 1];
-                if (inst.result != rir::kNoValue && (later_call || inst.op == rir::Opcode::Phi))
-                    c.call_frame_fields[inst.result.id] = 1;
-                if (rir::is_http_call(inst)) later_call = true;
-            }
-        }
-        // RIR block IDs need not be in definition order. Retain cross-block
-        // operands too, so emitting a consumer never needs a not-yet-emitted
-        // LLVM SSA producer. Block-local values after the last call stay local.
-        for (u32 bi = 0; bi < fn.block_count; ++bi) {
-            const auto& block = fn.blocks[bi];
-            for (u32 ii = 0; ii < block.inst_count; ++ii) {
-                const auto& inst = block.insts[ii];
-                for (u32 oi = 0; oi < inst.operand_count; ++oi) {
-                    const auto kId = inst.operand(oi);
-                    if (kId != rir::kNoValue && fn.values[kId.id].def_block.id != bi)
-                        c.call_frame_fields[kId.id] = 1;
-                }
-            }
-        }
-        LLVMTypeRef fields[1027]{};
+        auto* fields = maps.arena.alloc_array<LLVMTypeRef>(1027);
+        if (!fields) return false;
         fields[0] = c.i32_ty;
         fields[1] = c.ptr_ty;
         fields[2] = c.i32_ty;
         u32 field_count = 3;
         for (u32 vi = 0; vi < fn.value_count; ++vi) {
             if (c.call_frame_fields[vi] == 0) continue;
+            if (field_count == 1027) return false;
             c.call_frame_fields[vi] = field_count;
             fields[field_count++] = c.map_type(fn.values[vi].type);
         }
@@ -3711,24 +3877,77 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         if (kNeedsTimeUnlatch) c.emit_time_unlatch();
     }
 
-    // Emit instructions block by block.
-    for (u32 i = 0; i < fn.block_count; i++) {
-        auto& blk = fn.blocks[i];
-        c.current_block = blk.id.id;
-        LLVMBasicBlockRef bb = c.block_map[blk.id.id];
-        LLVMPositionBuilderAtEnd(c.builder, bb);
-
-        for (u32 j = 0; j < blk.inst_count; j++) {
-            emit_instruction(c, blk.insts[j]);
+    // Block IDs are allocation order, not SSA definition order: inlined
+    // optional helpers may append a producer after their outer consumer.
+    // Emit blocks only when non-spilled cross-block inputs exist. Phi incoming
+    // edges are resolved separately, breaking loop-carried dependencies.
+    auto* emitted = fn.block_cap <= 64 ? small_emitted : maps.arena.alloc_array<u8>(fn.block_count);
+    if (!emitted) return false;
+    u32 emitted_count = 0;
+    while (emitted_count < fn.block_count) {
+        bool progress = false;
+        for (u32 i = 0; i < fn.block_count; ++i) {
+            if (emitted[i]) continue;
+            const auto& blk = fn.blocks[i];
+            bool ready = true;
+            {
+                for (u32 ii = 0; ii < blk.inst_count && ready; ++ii) {
+                    const auto& inst = blk.insts[ii];
+                    if (inst.op == rir::Opcode::Phi) continue;
+                    for (u32 oi = 0; oi < inst.operand_count; ++oi) {
+                        const auto kId = inst.operand(oi);
+                        if (kId == rir::kNoValue || kId.id >= fn.value_count) return false;
+                        if (fn.values[kId.id].def_block.id != blk.id.id && !c.value_map[kId.id] &&
+                            !(c.call_frame && c.call_frame_fields[kId.id])) {
+                            ready = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (c.call_frame && ready) {
+                const auto* term = blk.terminator();
+                const u32 edges = term && term->op == rir::Opcode::Br    ? 2u
+                                  : term && term->op == rir::Opcode::Jmp ? 1u
+                                                                         : 0u;
+                for (u32 edge = 0; edge < edges && ready; ++edge) {
+                    const auto& next = fn.blocks[term->imm.block_targets[edge].id];
+                    for (u32 ii = 0; ii < next.inst_count && ready; ++ii) {
+                        const auto& phi = next.insts[ii];
+                        if (phi.op != rir::Opcode::Phi) continue;
+                        for (u32 incoming = 0; incoming < 2; ++incoming) {
+                            if (phi.imm.block_targets[incoming].id != blk.id.id) continue;
+                            const auto id = phi.operands[incoming];
+                            if (fn.values[id.id].def_block.id != blk.id.id && !c.value_map[id.id] &&
+                                !c.call_frame_fields[id.id])
+                                ready = false;
+                        }
+                    }
+                }
+            }
+            if (!ready) continue;
+            c.current_block = blk.id.id;
+            LLVMPositionBuilderAtEnd(c.builder, c.block_map[blk.id.id]);
+            for (u32 j = 0; j < blk.inst_count; ++j) {
+                const auto& inst = blk.insts[j];
+                if (inst.op != rir::Opcode::Phi) {
+                    for (u32 oi = 0; oi < inst.operand_count; ++oi) {
+                        const auto kId = inst.operand(oi);
+                        if (kId == rir::kNoValue || kId.id >= fn.value_count ||
+                            (!c.value_map[kId.id] &&
+                             !(c.call_frame && c.call_frame_fields[kId.id])))
+                            return false;
+                    }
+                }
+                emit_instruction(c, inst);
+            }
+            if (!blk.terminator()) LLVMBuildUnreachable(c.builder);
+            exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+            emitted[i] = 1;
+            ++emitted_count;
+            progress = true;
         }
-
-        // If block has no terminator, add unreachable (shouldn't happen in valid RIR).
-        if (!blk.terminator()) {
-            LLVMBuildUnreachable(c.builder);
-        }
-        // Helpers may split LLVM blocks internally. A RIR edge leaves the
-        // helper's continuation, not necessarily its original entry block.
-        exits[blk.id.id] = LLVMGetInsertBlock(c.builder);
+        if (!progress) return false;
     }
     // Resolve incoming edges after every producer and helper continuation is
     // available; RIR block IDs need not be in dependency order.
@@ -3736,8 +3955,14 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
         const auto& block = fn.blocks[bi];
         for (u32 ii = 0; ii < block.inst_count; ++ii) {
             const auto& inst = block.insts[ii];
-            if (inst.op != rir::Opcode::Phi || c.call_frame) continue;
-            LLVMValueRef values[] = {c.get_value(inst.operands[0]), c.get_value(inst.operands[1])};
+            if (inst.op != rir::Opcode::Phi ||
+                (c.call_frame && c.call_frame_fields[inst.result.id]))
+                continue;
+            LLVMValueRef values[] = {
+                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2]
+                             : c.get_value(inst.operands[0]),
+                c.call_frame ? c.call_phi_incoming[static_cast<u64>(inst.result.id) * 2 + 1]
+                             : c.get_value(inst.operands[1])};
             LLVMBasicBlockRef incoming[] = {exits[inst.imm.block_targets[0].id],
                                             exits[inst.imm.block_targets[1].id]};
             if (!values[0] || !values[1] || !incoming[0] || !incoming[1]) return false;
@@ -3772,7 +3997,9 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 const rir::Instruction& inst = block.insts[ii];
                 has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
-                    !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst))
+                    !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst) ||
+                    !rir::valid_collected_instruction(fn, inst) ||
+                    !rir::valid_bytes_construction(fn, inst))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::CacheGet || inst.op == rir::Opcode::CacheSet) {
                     const u32 kIndex = static_cast<u32>(inst.imm.i32_val);

@@ -146,6 +146,26 @@ TEST(node_pool, pipeline_rejects_failed_owner_storage_as_out_of_memory) {
     storage.destroy();
 }
 
+TEST(node_pool, address_index_distinguishes_pools_and_rejects_uncommitted_slots) {
+    NodePool<u64> left, right;
+    for (u32 i = 0; i < 32769; ++i) {
+        REQUIRE(left.push(i));
+        if (i % 3 == 0) REQUIRE(right.push(i + 1));
+    }
+    for (u32 i = left.len; i > 0; --i) {
+        CHECK_EQ(left.index_of(&left[i - 1]), i - 1);
+        CHECK_EQ(right.index_of(&left[i - 1]), 0xffffffffu);
+    }
+    CHECK_EQ(left.index_of(&left[left.len - 1] + 1), 0xffffffffu);
+    const auto* misaligned =
+        reinterpret_cast<const u64*>(reinterpret_cast<const u8*>(&left[31]) + 1);
+    CHECK_EQ(left.index_of(misaligned), 0xffffffffu);
+    NodePool<u64> copied(left);
+    REQUIRE(copied.ok());
+    CHECK_EQ(copied.index_of(&copied[copied.len - 1]), copied.len - 1);
+    CHECK_EQ(copied.index_of(&left[0]), 0xffffffffu);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

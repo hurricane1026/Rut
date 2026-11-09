@@ -1,0 +1,2 @@
+// Compatibility entry point; complete and incremental RESP2 APIs share one module.
+import "resp2.rut"

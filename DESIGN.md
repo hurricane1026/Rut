@@ -3073,7 +3073,7 @@ Unwrapped String concatenation and the byte-exact `hasPrefix`, `hasSuffix`,
 owns bytes in the existing bounded arena and stops on allocation failure. Text
 publication still checks UTF-8 and message/frame limits; known invalid literal
 components and a proven minimum output exceeding a limit are compile errors.
-General source interpolation and Bytes concatenation remain unsupported.
+General source interpolation and Bytes `+` concatenation remain unsupported.
 
 `message.payload` projects an immutable `Bytes` view of the complete payload,
 regardless of message kind. It borrows the runtime message buffer for the
@@ -10310,12 +10310,12 @@ and malformed/unavailable decisions fail closed. No OPA configuration syntax or
 Rego engine is added. See [the executable contract](docs/opa-authorization.md).
 
 MIR reserves 32 blocks for the existing eight route guards, call continuations
-and terminal control. Callout codegen conservatively persists values preceding
-a reachable later call, all Phi results, and cross-block operands. Block-local
-values created after the last reachable call use ordinary LLVM SSA storage.
-This keeps response JSON validation out of the suspension frame without raising
-its 8 KiB runtime bound or replaying earlier effects. Cross-block storage retains
-support for RIR block IDs that are not in producer order.
+and terminal control. Callout codegen persists only values live across a call,
+including arguments reused during polling and edge-specific Phi inputs. Other
+values use ordinary LLVM SSA storage. This keeps pure validation/parser work
+out of the suspension frame without raising its 8 KiB runtime bound or replaying
+earlier effects. Dependency-aware emission supports RIR block IDs that are not
+in producer order.
 
 
 ### OAuth2 introspection resource policy
@@ -10527,3 +10527,94 @@ fingerprint comes exclusively from `req.tlsClientCertSha256`; its absence fails
 closed. Confirmation is checked before subject/scope forwarding. No builtin,
 allocator, configuration lifecycle or runtime ABI is changed. See
 [the protocol contract](docs/oauth-introspection.md#optional-mtls-certificate-binding).
+
+### Bounded buffer parsing and collected results
+
+`collectBytes(Bytes, State, literalLimit, namedStep)` is a compile-time parser
+composition form using ordinary call syntax. The statically selected synchronous
+step returns `(State, Item, bool)?`; each successful step commits one item, and
+true completes the collection. The literal 1–64 limit bounds execution even
+when user state makes no progress. Nil, work exhaustion and storage failure
+produce no result, never a partial collection.
+
+`Collected<T>` preserves its concrete element shape through helper signatures,
+imports, HIR/MIR/RIR and native code. `.count` and checked `.get(i32)` are the only
+read surface. Published collections are immutable. Before committing an item,
+the existing SliceArena owns every string/byte leaf, including nested record
+leaves; source and scratch views cannot escape into a returned record. Existing
+aggregate and contiguous arena bounds remain unchanged.
+
+The initial lowering expands at most 64 steps into a forward-only graph, so the
+native automaton verifier's existing termination checks remain applicable.
+Collection accesses participate in reached branch semantics; missing values are
+never speculatively dereferenced through guard continuations. Explicit typed RIR
+operations validate capacity, element layout, operand/result shapes and checked
+access before JIT/native emission. The collection runtime has no LLVM dependency,
+C++ standard-library allocation, protocol parser or external dependency.
+
+Steps reject I/O, request/response state, cache, randomness and nested collection,
+including effects hidden in otherwise unused lexical bindings. Runtime function
+values and general source loops remain absent. The first consumer is a pure Rut
+RESP2 complete-buffer decoder with a typed preorder node result. Incremental
+feeds now compose existing TCP receives; compact verified backedges remain
+later work. See [the contract and limits](docs/bounded-parsing.md).
+
+### Incremental parser state across network suspension
+
+`concatBytes(Bytes, Bytes, i32) -> Bytes?` owns a fresh bounded binary buffer,
+without mutation or text conversion. Existing SliceArena budgets and pool
+allocation remain the only runtime storage mechanism. A pure Rut RESP2 framing
+cursor retains pending aggregates, exact bulk boundaries and CRLF search
+position across feeds. NeedMore, Complete and Invalid are distinct; complete
+prefixes decode to typed tokens and preserve remaining pipelined bytes.
+
+Finite `resp2Receive` compositions use existing TCP operations and deadlines.
+Continuation liveness preserves only values crossing suspension, including the
+arguments reused by polling and edge-specific phi inputs. Already-bound values
+are references, not new resumable effects. Pure parser temporary growth does not
+increase the 8 KiB continuation frame or request snapshot budget. Compiler SSA
+and compact bitset scratch have independent finite limits. See
+[streaming contracts and validation](docs/resp2-streaming.md).
+
+
+### Binary request construction and typed Redis results
+
+`formatInt` owns canonical signed i32/i64 decimal digits in the invocation arena;
+`Bytes(str)` is an explicit immutable view with unchanged byte content/lifetime.
+Ordinary Rut builds RESP2 array/bulk headers and exact binary arguments using
+`concatBytes`, checking promised argument count and the existing byte limits.
+No language keyword, protocol runtime opcode or dependency is introduced.
+
+Request-scoped GET and plain SET return closed typed result variants. Missing
+values and framed server errors are distinct from request, transport and reply
+failure. Scalar framing/token decoding uses a one-node work limit with four
+bounded receives. Transport/reply failure captures its code before invalidating
+the handle; valid server errors permit another command. Nothing retries a write
+or extends socket ownership beyond the existing request/shard generation.
+
+Shared RESP2 source keeps the conservative import-depth bound. Concrete nominal
+IDs in imported signatures/expressions and nested record/variant fields relocate
+by visible name, preserving sibling/namespace composition. An arena-backed sorted
+chunk directory accelerates compiler node-pointer rebasing; bound references do
+not repeatedly traverse their owning initializer during named-error walks. See
+[the contracts and validation](docs/resp2-commands.md).
+
+
+### Explicit client transport pooling
+
+`tcp` policy may enable `poolIdleMs` (1–60000); UDP remains unpooled. A request
+owns a fresh, generation-fenced lease token. `TcpConnection.release() -> bool`
+explicitly parks a clean TCP/TLS transport after protocol validation, invalidating
+aliases; rejection closes instead. `close()` and automatic terminal cleanup always
+destroy active leases. No write replay is added. Release uses the existing
+resumable callout ABI and counts toward its sixteen-operation budget.
+
+The existing per-shard nonblocking worker exclusively owns a separate bounded
+sixteen-entry idle pool, including SSL/context ownership. No request pointer or
+arena survives return. Exact endpoint, TLS identity/trust path, idle policy and
+monotonic config epoch determine eligibility. Config adoption advances the epoch;
+old idle entries are swept and old leases cannot return into new policy pools.
+Idle deadlines and nonblocking pending-input/EOF checks run before reuse; TLS
+control input is conservatively rejected. Application framing and session-state
+restoration remain the protocol library's responsibility. Shutdown joins the
+worker and reclaims both active and idle sockets on either I/O backend.

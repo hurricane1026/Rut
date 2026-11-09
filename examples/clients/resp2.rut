@@ -1,0 +1,232 @@
+// RESP2 decoding uses generic bounded collection; the runtime has no Redis logic.
+// Kinds: 1 simple string, 2 error, 3 integer, 4 bulk string, 5 array,
+//        6 null bulk string, 7 null array. Arrays are preorder nodes.
+struct Resp2State {
+    offset: i32
+    pending: i32
+}
+struct Resp2Token {
+    kind: i32
+    data: Bytes
+    next: i32
+    children: i32
+}
+func resp2Select(_ condition: bool, _ yes: i32, _ no: i32) -> i32 {
+    if condition { yes } else { no }
+}
+func resp2Emit(_ state: Resp2State, _ token: Resp2Token) -> (Resp2State, Resp2Token, bool) {
+    let pending = state.pending - 1 + token.children
+    guard pending > -1 && !(pending > 64) else { nil }
+    (Resp2State(offset: token.next, pending: pending), token, pending == 0)
+}
+func resp2Bulk(_ bytes: Bytes, _ state: Resp2State, _ length: i32, _ start: i32) -> (Resp2State, Resp2Token, bool) {
+    guard length > -1 && !(length > bytes.count - start - 2) else { nil }
+    let end = start + length
+    guard bytes.slice(end, end + 2) == b"\r\n" else { nil }
+    guard let payload = bytes.slice(start, end) else { nil }
+    resp2Emit(state, Resp2Token(kind: 4, data: payload, next: end + 2, children: 0))
+}
+func resp2Length(_ bytes: Bytes, _ state: Resp2State, _ prefix: i32, _ text: Bytes, _ next: i32) -> (Resp2State, Resp2Token, bool) {
+    if text == b"-1" {
+        let kind = resp2Select(prefix == 36, 6, 7)
+        resp2Emit(state, Resp2Token(kind: kind, data: b"", next: next, children: 0))
+    } else {
+        guard let first = text[0] else { nil }
+        guard first > 47 && first < 58 else { nil }
+        guard let length = parseInt(text) else { nil }
+        if prefix == 36 {
+            resp2Bulk(bytes, state, length, next)
+        } else {
+            guard !(length > 64) else { nil }
+            resp2Emit(state, Resp2Token(kind: 5, data: b"", next: next, children: length))
+        }
+    }
+}
+func resp2Step(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
+    guard state.pending > 0 else { nil }
+    guard let prefix = bytes[state.offset] else { nil }
+    guard let lineEnd = bytes.find(b"\r\n", state.offset + 1) else { nil }
+    guard let text = bytes.slice(state.offset + 1, lineEnd) else { nil }
+    let next = lineEnd + 2
+    if prefix == 43 || prefix == 45 {
+        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+        let kind = resp2Select(prefix == 43, 1, 2)
+        resp2Emit(state, Resp2Token(kind: kind, data: text, next: next, children: 0))
+    } else {
+        if prefix == 58 {
+            guard parseInt64(text) != nil else { nil }
+            resp2Emit(state, Resp2Token(kind: 3, data: text, next: next, children: 0))
+        } else {
+            guard prefix == 36 || prefix == 42 else { nil }
+            resp2Length(bytes, state, prefix, text, next)
+        }
+    }
+}
+// Decode one complete value, rejecting trailing bytes and truncated aggregates.
+// A nesting chain consumes one node per level and is bounded by the same limit.
+func decodeResp2(_ bytes: Bytes) {
+    guard let tokens = collectBytes(bytes, Resp2State(offset: 0, pending: 1), 64, resp2Step) else { nil }
+    guard let last = tokens.get(tokens.count - 1) else { nil }
+    guard last.next == bytes.count else { nil }
+    tokens
+}
+
+func resp2Integer(_ token: Resp2Token) {
+    guard token.kind == 3 else { nil }
+    parseInt64(token.data)
+}
+
+// Incremental framing shares this module to keep client import depth bounded.
+
+// status: 0 NeedMore, 1 Complete, -1 Invalid. State is invocation-scoped.
+struct Resp2Cursor {
+    offset: i32
+    pending: i32
+    nodes: i32
+    status: i32
+    search: i32
+    bulkEnd: i32
+    limit: i32
+}
+struct Resp2Stream {
+    bytes: Bytes
+    cursor: Resp2Cursor
+}
+func resp2Stream(_ maxBytes: i32) {
+    guard maxBytes > 0 && !(maxBytes > 8192) else { nil }
+    Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 1, nodes: 0,
+        status: 0, search: 1, bulkEnd: -1, limit: maxBytes))
+}
+func resp2StreamPair(_ cursor: Resp2Cursor, _ done: bool) -> (Resp2Cursor, Resp2Cursor, bool) {
+    (cursor, cursor, done)
+}
+func resp2StreamStop(_ state: Resp2Cursor, _ status: i32, _ search: i32, _ bulkEnd: i32) -> (Resp2Cursor, Resp2Cursor, bool) {
+    resp2StreamPair(Resp2Cursor(offset: state.offset, pending: state.pending, nodes: state.nodes,
+        status: status, search: search, bulkEnd: bulkEnd, limit: state.limit), true)
+}
+func resp2StreamAdvance(_ state: Resp2Cursor, _ offset: i32, _ children: i32) -> (Resp2Cursor, Resp2Cursor, bool) {
+    let pending = state.pending - 1 + children
+    let nodes = state.nodes + 1
+    if pending < 0 || nodes + pending > 64 {
+        resp2StreamStop(state, -1, state.search, state.bulkEnd)
+    } else {
+        resp2StreamPair(Resp2Cursor(offset: offset, pending: pending, nodes: nodes,
+            status: resp2Select(pending == 0, 1, 0), search: offset + 1, bulkEnd: -1, limit: state.limit), pending == 0)
+    }
+}
+func resp2StreamBulk(_ bytes: Bytes, _ state: Resp2Cursor, _ end: i32) -> (Resp2Cursor, Resp2Cursor, bool) {
+    if bytes.count < end + 2 {
+        resp2StreamStop(state, 0, state.search, end)
+    } else {
+        if bytes.slice(end, end + 2) == b"\r\n" {
+            resp2StreamAdvance(state, end + 2, 0)
+        } else {
+            resp2StreamStop(state, -1, state.search, end)
+        }
+    }
+}
+func resp2StreamLength(_ bytes: Bytes, _ state: Resp2Cursor, _ prefix: i32, _ text: Bytes, _ next: i32) -> (Resp2Cursor, Resp2Cursor, bool) {
+    if text == b"-1" {
+        resp2StreamAdvance(state, next, 0)
+    } else {
+        guard let first = text[0] else { resp2StreamStop(state, -1, state.search, -1) }
+        guard first > 47 && first < 58 else { resp2StreamStop(state, -1, state.search, -1) }
+        guard let length = parseInt(text) else { resp2StreamStop(state, -1, state.search, -1) }
+        if prefix == 36 {
+            if length > state.limit - next - 2 {
+                resp2StreamStop(state, -1, state.search, -1)
+            } else {
+                resp2StreamBulk(bytes, state, next + length)
+            }
+        } else {
+            if length > 64 {
+                resp2StreamStop(state, -1, state.search, -1)
+            } else {
+                resp2StreamAdvance(state, next, length)
+            }
+        }
+    }
+}
+func resp2StreamStep(_ bytes: Bytes, _ state: Resp2Cursor) -> (Resp2Cursor, Resp2Cursor, bool) {
+    if state.bulkEnd > -1 {
+        resp2StreamBulk(bytes, state, state.bulkEnd)
+    } else {
+        if state.offset == bytes.count {
+            resp2StreamStop(state, 0, state.search, -1)
+        } else {
+            guard let prefix = bytes[state.offset] else { resp2StreamStop(state, -1, state.search, -1) }
+            guard prefix == 43 || prefix == 45 || prefix == 58 || prefix == 36 || prefix == 42 else {
+                resp2StreamStop(state, -1, state.search, -1)
+            }
+            guard let end = bytes.find(b"\r\n", state.search) else {
+                resp2StreamStop(state, 0, max(state.offset + 1, bytes.count - 1), -1)
+            }
+            let text = bytes.slice(state.offset + 1, end).or(b"")
+            let next = end + 2
+            if prefix == 43 || prefix == 45 {
+                if text.find(b"\r") != nil || text.find(b"\n") != nil {
+                    resp2StreamStop(state, -1, state.search, -1)
+                } else {
+                    resp2StreamAdvance(state, next, 0)
+                }
+            } else {
+                if prefix == 58 {
+                    if parseInt64(text) == nil {
+                        resp2StreamStop(state, -1, state.search, -1)
+                    } else {
+                        resp2StreamAdvance(state, next, 0)
+                    }
+                } else {
+                    resp2StreamLength(bytes, state, prefix, text, next)
+                }
+            }
+        }
+    }
+}
+func resp2StreamFinish(_ bytes: Bytes, _ cursor: Resp2Cursor) {
+    // A full buffer which still needs input can never complete under this limit.
+    let status = resp2Select(cursor.status == 0 && bytes.count == cursor.limit, -1, cursor.status)
+    let final = Resp2Cursor(offset: cursor.offset, pending: cursor.pending, nodes: cursor.nodes,
+        status: status, search: cursor.search, bulkEnd: cursor.bulkEnd, limit: cursor.limit)
+    Resp2Stream(bytes: bytes, cursor: final)
+}// Empty feeds preserve NeedMore. Completed/invalid states reject further feeds;
+// consume the completed frame and start a new parser for its remainder instead.
+func resp2Feed(_ stream: Resp2Stream, _ chunk: Bytes) {
+    let state = stream.cursor
+    guard state.status == 0 && state.limit > 0 && !(state.limit > 8192) else { nil }
+    guard state.offset > -1 && !(state.offset > stream.bytes.count) && state.nodes > -1 && state.nodes < 64 &&
+        state.pending > 0 && !(state.pending > 64) && !(state.nodes + state.pending > 64) else { nil }
+    guard state.search > state.offset && !(state.search > stream.bytes.count + 1) &&
+        state.bulkEnd > -2 && !(state.bulkEnd > state.limit - 2) else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, state.limit) else { nil }
+    guard let steps = collectBytes(bytes, state, 64, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(steps.count - 1) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
+
+func resp2Result(_ stream: Resp2Stream) {
+    guard stream.cursor.status == 1 else { nil }
+    guard let frame = stream.bytes.slice(0, stream.cursor.offset) else { nil }
+    decodeResp2(frame)
+}
+func resp2Remainder(_ stream: Resp2Stream) {
+    guard stream.cursor.status == 1 else { nil }
+    stream.bytes.slice(stream.cursor.offset, stream.bytes.count)
+}
+// EOF succeeds only after a complete single frame; NeedMore at EOF is truncation.
+func resp2Finished(_ stream: Resp2Stream) -> bool {
+    stream.cursor.status == 1 && stream.cursor.offset == stream.bytes.count
+}
+
+// Perform at most one receive. Completed/invalid parsers perform no I/O.
+// Call sites choose a finite read budget under the existing callout limit.
+func resp2Receive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let pending = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        resp2Feed(stream, chunk)
+    } else {
+        stream
+    }
+}

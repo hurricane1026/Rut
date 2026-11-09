@@ -1,0 +1,13 @@
+import "clients/resp2.rut"
+route POST "/validate" {
+    guard let tokens = decodeResp2(req.bodyBytes) else { return 400 }
+    guard tokens.count > 0 else { return 500 }
+    return 204
+}
+route POST "/bulk" {
+    guard let tokens = decodeResp2(req.bodyBytes) else { return 400 }
+    guard let root = tokens.get(0) else { return 500 }
+    guard root.kind == 4 else { return 422 }
+    let payload = root.data
+    return response(200, body: payload)
+}

@@ -19,6 +19,7 @@
 #include "rut/compiler/diagnostic.h"
 #include "rut/compiler/node_pool.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/json.h"
 #include <deque>
 #include <string>
 
@@ -261,6 +262,9 @@ enum class HirExprKind : u8 {
     // different local with a coincidentally equal slot index.
     LetIn,
     BoundValue,
+    CollectBytes,  // lhs input, rhs initial state, args[0] synchronous step
+    CollectedCount,
+    CollectedGet,
     WsForward,  // lhs payload, int_value Text/Binary wire opcode; produces an action
     WsClose,    // lhs code, rhs reason; produces an action
 };
@@ -306,6 +310,7 @@ enum class HirTypeKind : u8 {
     WebSocketClose,
     TcpConnection,
     UdpSocket,
+    Collected,  // immutable bounded result collection; element shape below
 };
 
 constexpr bool is_ws_enum_type(HirTypeKind type) {
@@ -576,7 +581,13 @@ struct HirExpr {
 // and call-site evaluation even when pure scalar trees can still be substituted.
 inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
     if (depth > 128) return true;
-    if (value.kind == HirExprKind::StringConcat) return true;
+    if (value.kind == HirExprKind::StringConcat || value.kind == HirExprKind::CollectBytes ||
+        value.kind == HirExprKind::CollectedCount || value.kind == HirExprKind::CollectedGet)
+        return true;
+    if (value.kind == HirExprKind::JsonOp &&
+        (value.int_value == static_cast<i64>(json::Op::BytesConcat) ||
+         value.int_value == static_cast<i64>(json::Op::FormatInt)))
+        return true;
     if (value.kind == HirExprKind::BoundValue) return false;
     if (value.lhs && hir_has_string_construction(*value.lhs, depth + 1)) return true;
     if (value.rhs && hir_has_string_construction(*value.rhs, depth + 1)) return true;

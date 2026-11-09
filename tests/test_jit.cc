@@ -30290,6 +30290,50 @@ TEST(jit, http_call_frame_excludes_block_local_values_after_last_call) {
     tc.destroy();
 }
 
+TEST(jit, http_call_frame_excludes_dead_values_before_and_after_call) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("frame_bound"), lit("/call"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    for (u32 i = 0; i < 1200; ++i) V(b.emit_const_str(lit("dead parsing temporary")));
+    auto policy =
+        V(b.emit_const_str(lit("{\"address\":\"127.0.0.1\",\"serverName\":\"localhost\","
+                               "\"caFile\":\"/missing.pem\",\"path\":\"/check\"}")));
+    auto request = V(b.emit_const_str(lit("{\"method\":\"GET\"}")));
+    auto timeout = V(b.emit_const_i32(100));
+    const ValueId args[] = {policy, request, timeout};
+    V(b.emit_json(static_cast<u32>(json::Op::HttpCall), TypeKind::Str, true, args, 3));
+    // More than 8 KiB if every SSA string receives a frame slot. These values
+    // cannot span a later call and should not prevent this handler from running.
+    for (u32 i = 0; i < 600; ++i) V(b.emit_const_str(lit("post-call validation")));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(rir::verify_module(tc.mod).ok);
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_frame_bound"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto conn = std::make_unique<Connection>();
+    conn->json_arena.backend.pool = &pool;
+    auto* ctx = conn->reset_jit_ctx();
+    const auto wire = lit("GET /call HTTP/1.1\r\nHost: test\r\n\r\n");
+    const auto result = HandlerResult::unpack(
+        handler(conn.get(), ctx, reinterpret_cast<const u8*>(wire.ptr), wire.len, nullptr));
+    CHECK_EQ(result.status_code, 204u);
+    CHECK(ctx->load_slot<u64>(0) != 0);
+    conn->json_arena.destroy();
+    engine.shutdown();
+    pool.destroy();
+    tc.destroy();
+}
+
 TEST(jit, oauth_introspection_builtins_execute_and_reject_malformed_rir) {
     TestContext tc;
     REQUIRE(tc.init());
@@ -30659,4 +30703,199 @@ TEST(jit, jwt_certificate_binding_uses_canonical_thumbprint_metadata) {
           "0000000000000000000000000000000000000000000000000000000000000000",
           401);
     rir.destroy();
+}
+
+TEST(helpers, collected_values_own_string_leaves_and_never_publish_failed_items) {
+    struct Record {
+        Str text;
+        i64 number;
+    };
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const u32 offsets[] = {__builtin_offsetof(Record, text)};
+    void* collection = rut_helper_collect_new(nullptr, &arena, sizeof(Record), 2, offsets, 1);
+    REQUIRE(collection);
+    char bytes[] = {'a', '\0', static_cast<char>(0xff)};
+    Record record{{bytes, 3}, -9223372036854775807LL - 1};
+    CHECK(rut_helper_collect_push(collection, &record, sizeof(record)));
+    bytes[0] = 'z';
+    const auto* first =
+        static_cast<const Record*>(rut_helper_collect_get(collection, 0, sizeof(record)));
+    REQUIRE(first);
+    CHECK(first->text.eq({"a\0\xff", 3}));
+    CHECK_EQ(first->number, record.number);
+    CHECK_EQ(rut_helper_collect_count(collection), 1);
+    CHECK(rut_helper_collect_get(collection, -1, sizeof(record)) == nullptr);
+    CHECK(rut_helper_collect_get(collection, 1, sizeof(record)) == nullptr);
+    CHECK(rut_helper_collect_get(collection, 0, sizeof(record) - 1) == nullptr);
+    record.text = {nullptr, 1};
+    CHECK_FALSE(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(collection), 1);
+    record.text = {nullptr, 0};
+    CHECK(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_FALSE(rut_helper_collect_push(collection, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(collection), 2);
+    CHECK(rut_helper_collect_new(nullptr, &arena, 0, 1, nullptr, 0) == nullptr);
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 65, offsets, 1) == nullptr);
+    const u32 bad[] = {sizeof(Record), 1};
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 1, bad, 1) == nullptr);
+    CHECK(rut_helper_collect_new(nullptr, &arena, sizeof(Record), 1, bad + 1, 1) == nullptr);
+    CHECK_FALSE(rut_helper_collect_push(nullptr, &record, sizeof(record)));
+    CHECK_EQ(rut_helper_collect_count(nullptr), 0);
+    CHECK(rut_helper_collect_get(nullptr, 0, sizeof(record)) == nullptr);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(jit, collected_rir_validates_capacity_element_shapes_and_checked_get) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder builder;
+    builder.init(&tc.mod);
+    auto* fn = V(builder.create_function(lit("collection"), lit("/"), 'P'));
+    const auto entry = V(builder.create_block(fn, lit("entry")));
+    builder.set_insert_point(fn, entry);
+    const auto* integer = V(builder.make_type(TypeKind::I32));
+    CHECK_FALSE(builder.emit_array_new(integer, 0));
+    CHECK_FALSE(builder.emit_array_new(integer, 65));
+    const auto allocation = V(builder.emit_array_new(integer, 2));
+    const auto* array_type = fn->values[allocation.id].type->inner;
+    const auto array = V(builder.emit_opt_unwrap(allocation, array_type));
+    const auto value = V(builder.emit_const_i32(42));
+    const auto wrong = V(builder.emit_const_str(lit("bad")));
+    CHECK_FALSE(builder.emit_array_push(array, wrong));
+    CHECK_FALSE(builder.emit_array_get(array, wrong));
+    V(builder.emit_array_push(array, value));
+    V(builder.emit_array_len(array));
+    const auto index = V(builder.emit_const_i32(0));
+    V(builder.emit_array_get(array, index));
+    VOK(builder.emit_ret_status(204));
+    REQUIRE(verify_module(tc.mod).ok);
+    auto result = codegen(tc.mod);
+    REQUIRE(result.ok);
+    LLVMDisposeModule(result.mod);
+    LLVMContextDispose(result.ctx);
+    auto& instruction = fn->blocks[entry.id].insts[0];
+    instruction.imm.i32_val = 65;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.imm.i32_val = 2;
+    instruction.operand_count = 1;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    instruction.operand_count = 0;
+    auto& get = fn->blocks[entry.id].insts[7];
+    REQUIRE(get.op == Opcode::ArrayGet);
+    get.operands[1] = wrong;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
+}
+
+TEST(jit, bytes_concat_rir_requires_exact_operand_and_optional_result_shapes) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("concat_shape"), lit("/"), 'P'));
+    const auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    const auto left = V(b.emit_const_str(lit("a")));
+    const auto right = V(b.emit_const_str(lit("b")));
+    const auto limit = V(b.emit_const_i32(2));
+    ValueId args[] = {left, right, limit};
+    CHECK_FALSE(
+        b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::Str, false, args, 3));
+    CHECK_FALSE(b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::I32, true, args, 3));
+    V(b.emit_json(static_cast<u32>(json::Op::BytesConcat), TypeKind::Str, true, args, 3));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_module(tc.mod).ok);
+    auto cg = codegen(tc.mod);
+    REQUIRE(cg.ok);
+    LLVMDisposeModule(cg.mod);
+    LLVMContextDispose(cg.ctx);
+    fn->blocks[entry.id].insts[3].operands[1] = limit;
+    CHECK_FALSE(verify_module(tc.mod).ok);
+    CHECK_FALSE(codegen(tc.mod).ok);
+    tc.destroy();
+}
+
+TEST(jit, bytes_construction_validates_direct_rir_operand_and_result_shapes) {
+    for (const auto op : {json::Op::FormatInt, json::Op::BytesFromString}) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder builder;
+        builder.init(&tc.mod);
+        auto* fn = V(builder.create_function(lit("construction"), lit("/"), 'G'));
+        const auto entry = V(builder.create_block(fn, lit("entry")));
+        builder.set_insert_point(fn, entry);
+        const auto number = V(builder.emit_const_i32(42));
+        const auto text = V(builder.emit_const_str(lit("42")));
+        const bool kFormat = op == json::Op::FormatInt;
+        const auto input = kFormat ? number : text;
+        const auto wrong = kFormat ? text : number;
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, nullptr, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &input, 0));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, !kFormat, &input, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::I32, kFormat, &input, 1));
+        CHECK(!builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &wrong, 1));
+        const auto result =
+            V(builder.emit_json(static_cast<u32>(op), TypeKind::Str, kFormat, &input, 1));
+        VOK(builder.emit_ret_status(204));
+        CHECK(verify_module(tc.mod).ok);
+        auto cg = codegen(tc.mod);
+        REQUIRE(cg.ok);
+        LLVMDisposeModule(cg.mod);
+        LLVMContextDispose(cg.ctx);
+        auto& instruction = fn->blocks[entry.id].insts[2];
+        REQUIRE(instruction.op == Opcode::JsonOp);
+        instruction.operand_count = 0;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operand_count = 1;
+        instruction.operands[0] = wrong;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        instruction.operands[0] = input;
+        const auto* saved = fn->values[result.id].type;
+        fn->values[result.id].type = fn->values[number.id].type;
+        CHECK_FALSE(verify_module(tc.mod).ok);
+        CHECK_FALSE(codegen(tc.mod).ok);
+        fn->values[result.id].type = saved;
+        tc.destroy();
+    }
+}
+
+TEST(helpers, integer_formatting_owns_output_and_reports_arena_exhaustion) {
+    const char* output = reinterpret_cast<const char*>(1);
+    u32 length = 999;
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, &output, &length), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(length, 0u);
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, nullptr, &length), 0u);
+    CHECK_EQ(rut_helper_format_int(nullptr, nullptr, 42, &output, nullptr), 0u);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    REQUIRE(rut_helper_format_int(nullptr, &arena, -9223372036854775807LL - 1, &output, &length));
+    const Str retained{output, length};
+    CHECK(retained.eq(lit("-9223372036854775808")));
+    REQUIRE(rut_helper_format_int(nullptr, &arena, 0, &output, &length));
+    CHECK((Str{output, length}.eq(lit("0"))));
+    CHECK(retained.eq(lit("-9223372036854775808")));
+    arena.destroy();
+    u8* held[8]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    CHECK_EQ(rut_helper_format_int(nullptr, &arena, 123, &output, &length), 0u);
+    CHECK(output == nullptr);
+    CHECK_EQ(length, 0u);
+    for (auto* slice : held) pool.free(slice);
+    arena.destroy();
+    pool.destroy();
 }

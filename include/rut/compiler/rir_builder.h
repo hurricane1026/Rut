@@ -1097,13 +1097,22 @@ struct Builder {
              !val_has_type(args[1], TypeKind::I32) ||
              result != (bytes_read.wide ? TypeKind::I64 : TypeKind::I32) || !optional))
             return err(RirError::InvalidState);
+        const bool kFormat = op == static_cast<u32>(json::Op::FormatInt);
+        const bool kBytes = op == static_cast<u32>(json::Op::BytesFromString);
+        if ((kFormat || kBytes) &&
+            (count != 1 || !args || result != TypeKind::Str || optional != kFormat ||
+             (kBytes ? !val_has_type(args[0], TypeKind::Str)
+                     : !val_has_type(args[0], TypeKind::I32) &&
+                           !val_has_type(args[0], TypeKind::I64))))
+            return err(RirError::InvalidState);
         const bool bytes_slice = op == static_cast<u32>(json::Op::BytesSlice);
         const bool bytes_find = op == static_cast<u32>(json::Op::BytesFind);
-        if ((bytes_slice || bytes_find) &&
+        const bool bytes_concat = op == static_cast<u32>(json::Op::BytesConcat);
+        if ((bytes_slice || bytes_find || bytes_concat) &&
             (count != 3 || !args || !val_has_type(args[0], TypeKind::Str) ||
              !val_has_type(args[1], bytes_slice ? TypeKind::I32 : TypeKind::Str) ||
              !val_has_type(args[2], TypeKind::I32) || !optional ||
-             result != (bytes_slice ? TypeKind::Str : TypeKind::I32)))
+             result != (bytes_find ? TypeKind::I32 : TypeKind::Str)))
             return err(RirError::InvalidState);
         const bool parse_int = op == static_cast<u32>(json::Op::ParseInt);
         const bool parse_int64 = op == static_cast<u32>(json::Op::ParseInt64);
@@ -1239,6 +1248,47 @@ struct Builder {
         inst->operands[1] = then_val;
         inst->operands[2] = else_val;
         inst->operand_count = 3;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_new(const Type* element, u32 capacity, SourceLoc loc = {}) {
+        if (!collected_element_type(element) || capacity < 1 || capacity > 64)
+            return err(RirError::InvalidState);
+        const auto* array = TRY(make_type(TypeKind::Array, element));
+        const auto* optional = TRY(make_type(TypeKind::Optional, array));
+        auto [inst, vid] = TRY(emit(Opcode::ArrayNew, optional, loc));
+        inst->imm.i32_val = static_cast<i32>(capacity);
+        return vid;
+    }
+
+    Result<ValueId> emit_array_push(ValueId array, ValueId item, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array) || !valid_val(item) ||
+            !types_equal(cur_func->values[array.id].type->inner, cur_func->values[item.id].type))
+            return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::ArrayPush, TRY(make_type(TypeKind::Bool)), loc));
+        inst->operands[0] = array;
+        inst->operands[1] = item;
+        inst->operand_count = 2;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_len(ValueId array, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array)) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::ArrayLen, TRY(make_type(TypeKind::I32)), loc));
+        inst->operands[0] = array;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_array_get(ValueId array, ValueId index, SourceLoc loc = {}) {
+        if (!val_has_type(array, TypeKind::Array) || !val_has_type(index, TypeKind::I32))
+            return err(RirError::InvalidState);
+        const auto* optional =
+            TRY(make_type(TypeKind::Optional, cur_func->values[array.id].type->inner));
+        auto [inst, vid] = TRY(emit(Opcode::ArrayGet, optional, loc));
+        inst->operands[0] = array;
+        inst->operands[1] = index;
+        inst->operand_count = 2;
         return vid;
     }
 

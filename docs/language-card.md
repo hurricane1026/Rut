@@ -198,7 +198,8 @@ and ordinary HTTP locals can hold Bytes values. `req.bodyBytes` borrows the
 request body as Bytes under the same buffering/lifetime rules as `req.body`.
 Checked single-byte [subscripts](#bytes-subscripts) and
 [field slice/search methods](#bytes-field-extraction) are supported. There is no
-implicit text conversion, ordering, concatenation or regex API for Bytes.
+implicit text conversion, ordering, `+` concatenation or regex API for Bytes.
+Bounded owned concatenation is available with `concatBytes` below.
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
@@ -1040,7 +1041,7 @@ return websocket(chat) { message in
     if let label = messageLabel(message) { message.forward(label) }
     else { message.drop() }
 }
-// General source interpolation, mutable local syntax and Bytes concatenation
+// General source interpolation, mutable local syntax and Bytes `+` concatenation
 // are not introduced here. Checked Bytes slicing is available as described below. Non-response statement effects inside ordinary helpers
 // remain unsupported in HTTP and WebSocket alike. No alternate WS-only syntax.
 
@@ -2968,7 +2969,7 @@ local, preserving arbitrary octets through the existing bounded serializer.
 See [the full contract](net-clients.md),
 [the executable example](../examples/tcp-udp-clients.rut) and
 [the Redis PING library](../examples/clients/redis.rut). Generic TCP listeners,
-unrestricted destinations, persistent pools, DNS and general-purpose streaming
+unrestricted destinations, DNS and general-purpose streaming
 parsing/iteration are not introduced by this profile. Single-byte subscripting
 is supported separately below.
 
@@ -3022,6 +3023,53 @@ existing bounded byte search; neither operation allocates, performs I/O or chang
 contract. These custom Bytes methods use existing call syntax; Swift collection
 range syntax is not added. See [the full contract](bytes-fields.md).
 
+## Bounded buffer parsing
+
+`collectBytes(input, initialState, maxItems, step) -> Collected<Item>?` scans a
+complete Bytes buffer with a literal 1–64 step budget. `step` is a compile-time
+named ordinary function taking `(Bytes, State)` and returning `(State, Item,
+bool)?`. A true Boolean completes after including that item; nil, exhausted
+budget or storage failure returns nil for the whole result.
+
+`Collected<T>` is an immutable, invocation-owned result type. Unwrap it before
+using `.count -> i32` or `.get(i32) -> T?`. Negative/out-of-range indices return
+nil. Typed helper parameters/returns and local annotations preserve the exact
+element type. str/Bytes leaves in collected records are copied into the existing
+bounded arena. This does not add general Array mutation, source `for` loops,
+function values, recursion or streaming network reads.
+
+The step must be synchronous and independent of request/response state, I/O,
+cache, randomness and nested collection. State/items use concrete scalar/plain
+struct shapes; optional/error leaves and nested collections are absent. See
+[the full contract](bounded-parsing.md), [RESP2 library](../examples/clients/resp2.rut)
+and [executable example](../examples/resp2-decoder.rut).
+
+## Decimal output and explicit Bytes views
+
+`formatInt(value) -> str?` emits canonical signed decimal from an unwrapped i32
+or inferred i64, including both signed limits. It owns the actual digits in the
+invocation arena; allocation/storage failure returns nil. `Bytes(str) -> Bytes`
+exposes an immutable exact byte view without allocation, validation or transcoding;
+`Bytes(Bytes)` is identity. Optional inputs must be unwrapped and ordinary user
+bindings shadow these builtins. Direct calls are supported; pipe/UFCS forms are
+absent. There is no implicit numeric/text conversion or Bytes `+` operator.
+See [bounded command construction](resp2-commands.md).
+
+## Incremental byte buffers and parsing
+
+`concatBytes(left, right, maxBytes) -> Bytes?` copies two unwrapped Bytes into a
+new immutable invocation-owned buffer. The unwrapped i32 limit must be 1–8192;
+invalid bounds or arena/pool exhaustion return nil. There is no text conversion
+or mutation, and previous views survive subsequent appends and network reads.
+This ordinary builtin supports direct calls; pipe/UFCS forms are absent.
+
+The [incremental RESP2 library](resp2-streaming.md) composes this with
+`collectBytes`: `resp2Stream`, `resp2Feed` and `resp2Receive` retain bounded state
+across reads. Status 0 means NeedMore, 1 Complete, -1 Invalid. Completed frames
+provide typed tokens and exact pipelined remainder bytes. NeedMore at EOF fails.
+Network/HTTP operation, arena and verifier budgets still apply; callers choose a
+finite read budget. This does not introduce source loops or persistent sessions.
+
 ## Built-in Bytes integer reads
 
 Bytes has built-in methods for fixed-width integer reads, with explicit byte
@@ -3056,3 +3104,18 @@ mismatching confirmation fails with challenged 401; forwarded certificate header
 cannot satisfy it. Uses the existing `jwtCertificateBound` primitive; no language
 or native ABI change is added. See [the contract](oauth-introspection.md#optional-mtls-certificate-binding)
 and [the runnable example](../examples/mtls-introspection.rut).
+
+## Explicit TCP/TLS connection pooling
+
+TCP policy accepts optional `poolIdleMs: 1...60000` (UDP rejects it).
+`tcp(policy, timeoutMs)` may borrow a matching idle transport; the returned
+`TcpConnection` still belongs to the current request/stream and has a fresh token.
+After consuming a complete reply in reusable protocol state, bind
+`let returned = connection.release()`. This TCP-only resumable method returns
+bool, invalidates all aliases, and either parks a clean transport or closes it.
+`close()` always destroys; request completion and cancellation do not auto-pool.
+There are sixteen idle entries per shard worker, independent of sixteen active
+leases; endpoint/TLS identity and configuration epoch isolate pools. Reload
+retires idle transports and prevents old-config leases returning into new pools.
+No command replay or application-state reset is performed. See
+[pooling ownership and limits](net-clients.md#explicit-cross-request-tcptls-pooling).

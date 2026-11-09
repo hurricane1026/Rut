@@ -22,10 +22,12 @@ static_assert(MirModule::kMaxFunctions >= HirModule::kMaxRoutes + HirModule::kMa
 namespace {
 static bool hir_has_http_call(const HirExpr& expr, u32 depth = 0) {
     if (depth > 128) return true;
+    if (expr.kind == HirExprKind::BoundValue) return false;
     if (expr.kind == HirExprKind::JsonOp &&
         (expr.int_value == static_cast<i64>(json::Op::HttpCall) ||
          (expr.int_value >= static_cast<i64>(json::Op::NetTcp) &&
-          expr.int_value <= static_cast<i64>(json::Op::NetClose))))
+          expr.int_value <= static_cast<i64>(json::Op::NetClose)) ||
+         expr.int_value == static_cast<i64>(json::Op::NetRelease)))
         return true;
     if (expr.lhs && hir_has_http_call(*expr.lhs, depth + 1)) return true;
     if (expr.rhs && hir_has_http_call(*expr.rhs, depth + 1)) return true;
@@ -306,13 +308,14 @@ static MirTypeKind mir_type_kind(HirTypeKind kind) {
            : kind == HirTypeKind::I64 ? MirTypeKind::I64
            : (kind == HirTypeKind::Str || kind == HirTypeKind::Json || kind == HirTypeKind::Bytes)
                ? MirTypeKind::Str
-           : kind == HirTypeKind::Method   ? MirTypeKind::Method
-           : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
-           : kind == HirTypeKind::IP       ? MirTypeKind::IP
-           : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
-           : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
-           : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
-                                           : MirTypeKind::Unknown;
+           : kind == HirTypeKind::Method    ? MirTypeKind::Method
+           : kind == HirTypeKind::ByteSize  ? MirTypeKind::ByteSize
+           : kind == HirTypeKind::IP        ? MirTypeKind::IP
+           : kind == HirTypeKind::Variant   ? MirTypeKind::Variant
+           : kind == HirTypeKind::Tuple     ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Struct    ? MirTypeKind::Struct
+           : kind == HirTypeKind::Collected ? MirTypeKind::Collected
+                                            : MirTypeKind::Unknown;
 }
 
 static bool expand_hir_flat_shape(const HirModule& module,
@@ -365,10 +368,15 @@ static bool shape_carrier_ready(const MirModule& mir,
     const auto& shape = mir.type_shapes[shape_index];
     if (!shape.is_concrete) return false;
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
-        shape.type == MirTypeKind::Str || shape.type == MirTypeKind::Method)
+        shape.type == MirTypeKind::I64 || shape.type == MirTypeKind::Str ||
+        shape.type == MirTypeKind::Method)
         return true;
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
+    if (shape.type == MirTypeKind::Collected)
+        return shape.collected_elem_shape_index < mir.type_shapes.len &&
+               shape_carrier_ready(
+                   mir, shape.collected_elem_shape_index, struct_ready, variant_ready);
     if (shape.type == MirTypeKind::Variant)
         return shape.variant_index < mir.variants.len && variant_ready[shape.variant_index];
     if (shape.type != MirTypeKind::Tuple) return false;
@@ -389,7 +397,7 @@ static bool shape_slot_carrier_ready(const MirModule& mir,
     if (!shape.is_concrete) return false;
     if (shape.type == MirTypeKind::Method) return false;
     if (shape.type == MirTypeKind::Bool || shape.type == MirTypeKind::I32 ||
-        shape.type == MirTypeKind::Str)
+        shape.type == MirTypeKind::I64 || shape.type == MirTypeKind::Str)
         return true;
     if (shape.type == MirTypeKind::Struct)
         return shape.struct_index < mir.structs.len && struct_ready[shape.struct_index];
@@ -501,6 +509,49 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     v.shape_index = expr.shape_index;
     v.may_nil = expr.may_nil;
     v.may_error = expr.may_error;
+    if (expr.kind == HirExprKind::CollectBytes || expr.kind == HirExprKind::CollectedCount ||
+        expr.kind == HirExprKind::CollectedGet) {
+        if (!expr.lhs) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto input = mir_value(*expr.lhs, module, fn, ctx);
+        if (!input) return core::make_unexpected(input.error());
+        if (!fn->values.push(input.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        v.type = mir_type_kind(expr.type);
+        v.struct_index = expr.struct_index;
+        if (expr.kind == HirExprKind::CollectedCount) {
+            v.kind = MirValueKind::CollectedCount;
+            return v;
+        }
+        if (!expr.rhs) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto state = mir_value(*expr.rhs, module, fn, ctx);
+        if (!state) return core::make_unexpected(state.error());
+        if (!fn->values.push(state.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.rhs = &fn->values[fn->values.len - 1];
+        if (expr.kind == HirExprKind::CollectedGet) {
+            v.kind = MirValueKind::CollectedGet;
+            return v;
+        }
+        if (expr.args.len != 1 || !expr.args[0] || expr.int_value < 1 || expr.int_value > 64)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        ForLoopCtx input_binding = ctx ? *ctx : ForLoopCtx{};
+        input_binding.value_source = expr.lhs;
+        input_binding.value_target = v.lhs;
+        input_binding.value_parent = ctx;
+        ForLoopCtx state_binding = input_binding;
+        state_binding.value_source = expr.rhs;
+        state_binding.value_target = v.rhs;
+        state_binding.value_parent = &input_binding;
+        auto step = mir_value(*expr.args[0], module, fn, &state_binding);
+        if (!step) return core::make_unexpected(step.error());
+        if (!fn->values.push(step.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.args.push(&fn->values[fn->values.len - 1]);
+        v.kind = MirValueKind::CollectBytes;
+        v.int_value = expr.int_value;
+        return v;
+    }
     if (expr.kind == HirExprKind::LetIn) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -1179,9 +1230,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         MirValue* else_ptr = &fn->values[fn->values.len - 1];
         v.kind = MirValueKind::IfElse;
-        v.is_branch_conditional =
-            !expr.is_eager_fallback &&
-            (fn->is_ws_callback || hir_has_string_construction(expr) || hir_has_http_call(expr));
+        v.is_branch_conditional = !expr.is_eager_fallback &&
+                                  (fn->is_ws_callback || expr.type == HirTypeKind::Collected ||
+                                   hir_has_string_construction(expr) || hir_has_http_call(expr));
         v.type = mir_type_kind(expr.type);
         v.lhs = cond_ptr;
         v.rhs = then_ptr;
@@ -1408,6 +1459,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
     for (u32 i = 0; i < module.type_shapes.len; i++) {
         MirTypeShape shape{};
+        shape.collected_elem_shape_index = module.type_shapes[i].array_elem_shape_index;
         shape.type = mir_type_kind(module.type_shapes[i].type);
         shape.is_concrete = module.type_shapes[i].is_concrete;
         shape.generic_index = module.type_shapes[i].generic_index;

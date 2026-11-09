@@ -10,16 +10,20 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/auth.h"
+#include "rut/runtime/bytes_concat.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_call.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/http_tokens.h"
 #include "rut/runtime/jwt_claims.h"
 #include "rut/runtime/jwt_hs256.h"
+#include "rut/runtime/net_client.h"
 #include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/parse_integer.h"
 #include "rut/runtime/password_gateway.h"
@@ -395,7 +399,7 @@ extern "C" u64 rut_helper_net_call(void* connection,
     *scalar = 0;
     *out = nullptr;
     *length = 0;
-    if (!connection || operation > static_cast<u32>(NetOp::Close)) return 0;
+    if (!connection || operation > static_cast<u32>(NetOp::Release)) return 0;
     const auto op = static_cast<NetOp>(operation);
     NetEndpoint endpoint;
     const bool opening = op == NetOp::Tcp || op == NetOp::Udp;
@@ -3019,4 +3023,49 @@ extern "C" rut::i32 rut_helper_bytes_find(const char* data,
     const auto* found =
         static_cast<const char*>(memmem(data + start, kRemaining, delimiter, delimiter_length));
     return found ? static_cast<i32>(found - data) : -1;
+}
+
+extern "C" void* rut_helper_collect_new(void* conn,
+                                        void* arena,
+                                        rut::u32 width,
+                                        rut::u32 capacity,
+                                        const rut::u32* offsets,
+                                        rut::u32 strings) {
+    auto* storage = static_cast<rut::SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<rut::ConnectionBase*>(conn)->json_arena;
+    return rut::CollectedValues::create(storage, width, capacity, offsets, strings);
+}
+extern "C" rut::u8 rut_helper_collect_push(void* collection, const void* value, rut::u32 width) {
+    return collection && static_cast<rut::CollectedValues*>(collection)->append(value, width);
+}
+extern "C" rut::i32 rut_helper_collect_count(const void* collection) {
+    return collection
+               ? static_cast<rut::i32>(static_cast<const rut::CollectedValues*>(collection)->count)
+               : 0;
+}
+extern "C" const void* rut_helper_collect_get(const void* collection,
+                                              rut::i32 index,
+                                              rut::u32 width) {
+    return collection ? static_cast<const rut::CollectedValues*>(collection)->get(index, width)
+                      : nullptr;
+}
+
+extern "C" const char* rut_helper_bytes_concat(void* conn,
+                                               void* arena,
+                                               const char* left,
+                                               rut::u32 left_len,
+                                               const char* right,
+                                               rut::u32 right_len,
+                                               rut::i32 limit) {
+    auto* storage = static_cast<rut::SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<rut::ConnectionBase*>(conn)->json_arena;
+    return rut::concat_bytes(storage, {left, left_len}, {right, right_len}, limit);
+}
+
+extern "C" rut::u8 rut_helper_format_int(
+    void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size) {
+    if (!out_ptr || !out_size) return 0;
+    char buffer[20];
+    const rut::Str kText = rut::format_integer(value, buffer);
+    return rut_helper_str_concat(conn, arena, &kText, 1, out_ptr, out_size);
 }

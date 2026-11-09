@@ -601,3 +601,26 @@ extern "C" void rut_helper_json(void* conn,
                                 rut::i64* out_number);
 extern "C" void rut_helper_resp_body(
     void* conn, const char* ptr, rut::u32 len, const rut::u8* request, rut::u32 request_len);
+
+extern "C" void* rut_helper_collect_new(void* conn,
+                                        void* arena,
+                                        rut::u32 width,
+                                        rut::u32 capacity,
+                                        const rut::u32* offsets,
+                                        rut::u32 strings);
+extern "C" rut::u8 rut_helper_collect_push(void* collection, const void* value, rut::u32 width);
+extern "C" rut::i32 rut_helper_collect_count(const void* collection);
+extern "C" const void* rut_helper_collect_get(const void* collection,
+                                              rut::i32 index,
+                                              rut::u32 width);
+
+extern "C" const char* rut_helper_bytes_concat(void* conn,
+                                               void* arena,
+                                               const char* left,
+                                               rut::u32 left_len,
+                                               const char* right,
+                                               rut::u32 right_len,
+                                               rut::i32 limit);
+
+extern "C" rut::u8 rut_helper_format_int(
+    void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size);

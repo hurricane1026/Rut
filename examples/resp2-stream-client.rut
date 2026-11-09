@@ -1,0 +1,26 @@
+import "clients/resp2-stream.rut"
+
+func pongPayload(_ values: Collected<Resp2Token>) -> Bytes {
+    guard let reply = values.get(0) else { nil }
+    guard values.count == 1 && reply.kind == 1 && reply.data == b"PONG" else { nil }
+    reply.data
+}
+
+// RESP2_ENDPOINT is a fixed configured IPv4 TCP/TLS endpoint policy.
+// Two receives are this example's explicit read budget; NeedMore then fails.
+route GET "/ping" {
+    let opening = tcp(env("RESP2_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let sending = connection.send(b"*1\r\n$4\r\nPING\r\n", 1000)
+    guard let sent = sending else { return 502 }
+    guard let initial = resp2Stream(128) else { return 500 }
+    let first = resp2Receive(connection, initial)
+    guard let progress = first else { return 502 }
+    let second = resp2Receive(connection, progress)
+    guard let final = second else { return 502 }
+    guard resp2Finished(final) else { return 502 }
+    guard let values = resp2Result(final) else { return 502 }
+    guard let payload = pongPayload(values) else { return 502 }
+    let closed = connection.close()
+    return response(200, body: payload)
+}

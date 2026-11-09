@@ -47682,3 +47682,322 @@ route GET "/" { let result = label(req.http11).close() return 200 }
     REQUIRE(hir->routes.len == 1);
     CHECK_EQ(hir->routes[0].guards.len, 1u);
 }
+
+TEST(frontend, bounded_collections_keep_element_shapes_in_helpers_and_native_ir) {
+    const char* source = R"rut(
+func step(_ bytes: Bytes, _ position: i32) -> (i32, i32, bool) {
+    guard let value = bytes[position] else { nil }
+    (position + 1, value, position + 1 == bytes.count)
+}
+func decode(_ bytes: Bytes) -> Collected<i32> { collectBytes(bytes, 0, 64, step) }
+func first(_ values: Collected<i32>) -> i32 { values.get(0).or(-1) }
+route POST "/" {
+    guard let values = decode(req.bodyBytes) else { return 400 }
+    guard first(values) == 97 && values.count == 3 else { return 422 }
+    guard values.get(-1) == nil && values.get(3) == nil else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayNew));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayPush));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ArrayGet));
+    rir.destroy();
+}
+
+TEST(frontend, bounded_collections_reject_unbounded_calls_and_wrong_collection_types) {
+    const char* prefix = R"rut(
+func step(_ bytes: Bytes, _ state: i32) -> (i32, i32, bool) { (state, 42, true) }
+func bytesStep(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) { (state, bytes, true) }
+func first(_ values: Collected<i32>) -> i32 { values.get(0).or(-1) }
+)rut";
+    const char* expressions[] = {
+        "collectBytes(b\"x\", 0, 0, step)",
+        "collectBytes(b\"x\", 0, 65, step)",
+        "collectBytes(b\"x\", 0, req.bodyBytes.count, step)",
+        "collectBytes(\"x\", 0, 1, step)",
+        "collectBytes(b\"x\", true, 1, step)",
+        "collectBytes(b\"x\", 0, 1, missing)",
+        "collectBytes(b\"x\", 0, 1)",
+        "collectBytes(b\"x\", 0, 1, step).get(0)",
+        "first(collectBytes(b\"x\", 0, 1, bytesStep))",
+    };
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string(prefix) + "route POST \"/\" { let value = " + expression + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    const char* tails[] = {
+        "let result = values.get(true)",
+        "let result = values[0]",
+        "let result = values.append(42)",
+        "let result = values.unknown",
+        "let result: Collected<Bytes> = values",
+        "let result = first(bytes)",
+    };
+    for (const char* tail : tails) {
+        const std::string source = std::string(prefix) + R"rut(route POST "/" {
+            guard let values = collectBytes(req.bodyBytes, 0, 8, step) else { return 400 }
+            guard let bytes = collectBytes(req.bodyBytes, 0, 8, bytesStep) else { return 400 }
+            )rut" + tail + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, bounded_collection_steps_cannot_hide_network_or_request_access) {
+    const char* bodies[] = {
+        "let ignored = netError()\nguard state == state else { nil }\n(state, bytes, true)",
+        "let ignored = tcp(\"{\\\"address\\\":\\\"127.0.0.1\\\",\\\"port\\\":6379}\", 1000)\nguard "
+        "state == state else { nil }\n(state, bytes, true)",
+        "(state, req.bodyBytes, true)",
+        "let ignored = collectBytes(bytes, 0, 1, leaf)\nguard state == state else { nil }\n(state, "
+        "bytes, true)",
+    };
+    for (const char* body : bodies) {
+        const std::string source = std::string(R"rut(
+func leaf(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) { (state, bytes, true) }
+func hidden(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) {
+)rut") + body + R"rut(
+}
+route POST "/" { let result = collectBytes(req.bodyBytes, 0, 8, hidden) return 204 }
+)rut";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, bytes_concat_is_a_bounded_optional_binary_operation) {
+    const char* source = R"rut(
+func join(_ prefix: Bytes, _ data: Bytes, _ limit: i32) { concatBytes(prefix, data, limit) }
+func item(_ bytes: Bytes, _ state: i32) -> (i32, Bytes, bool) {
+    guard let value = concatBytes(b"x", bytes, 8192) else { nil }
+    (state, value, true)
+}
+route POST "/collected" {
+    guard let values = collectBytes(req.bodyBytes, 0, 1, item) else { return 413 }
+    guard values.count == 1 else { return 500 }
+    return 204
+}
+route POST "/" {
+    guard let result = join(b"\x00\xff", req.bodyBytes, 8192) else { return 413 }
+    return response(200, body: result)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+    const char* invalid[] = {
+        "concatBytes(\"a\", b\"b\", 32)",
+        "concatBytes(b\"a\", b\"b\", true)",
+        "concatBytes(b\"a\", b\"b\")",
+        "concatBytes(b\"a\", parseInt(\"2\"), 32)",
+        "b\"a\" | concatBytes(b\"b\", b\"c\", 32)",
+    };
+    for (const char* expression : invalid) {
+        const std::string code =
+            std::string("route POST \"/\" { let value = ") + expression + " return 204 }";
+        auto ts = lex(lit(code.c_str()));
+        REQUIRE(ts);
+        auto tree = parse_file_heap(ts.value());
+        REQUIRE(tree);
+        CHECK_FALSE(analyze_file_heap(tree.value()));
+    }
+}
+
+TEST(frontend, bytes_construction_requires_explicit_unwrapped_inputs) {
+    const char* expressions[] = {R"(formatInt())",
+                                 R"(formatInt(1, 2))",
+                                 R"(formatInt(true))",
+                                 R"(formatInt("1"))",
+                                 R"(formatInt(b"1"))",
+                                 R"(formatInt(parseInt("1")))",
+                                 R"(Bytes())",
+                                 R"(Bytes(1))",
+                                 R"(Bytes(true))",
+                                 R"(Bytes("x", "y"))",
+                                 R"(Bytes(req.header("X")))",
+                                 R"(Bytes(formatInt(1)))",
+                                 R"(b"x" + "y")",
+                                 R"("x" + b"y")",
+                                 R"(b"x" + 1)",
+                                 R"(Bytes(b"x"[0]))",
+                                 R"(1 | formatInt(2))",
+                                 R"("x" | Bytes("y"))"};
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string("route POST \"/\" { let value = ") + expression + " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    auto lexed = lex(lit(R"rut(
+func formatInt(_ text: str) -> i32 => 7
+route GET "/" { guard formatInt("x") == 7 else { return 500 } return 204 }
+)rut"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, integer_format_and_explicit_bytes_view_lower_with_bounded_concat) {
+    const auto source = lit(R"rut(
+route POST "/" {
+    guard let value = parseInt64(req.bodyBytes) else { return 400 }
+    guard let text = formatInt(value) else { return 503 }
+    let bytes = Bytes(text)
+    guard let packet = concatBytes(b"$", Bytes(bytes), 128) else { return 413 }
+    return response(200, body: packet)
+}
+)rut");
+    auto ts = lex(source);
+    REQUIRE(ts);
+    auto ast = parse_file_heap(ts.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+}
+
+TEST(frontend, sibling_imports_relocate_nominal_record_and_variant_shapes) {
+    const std::string directory = std::filesystem::temp_directory_path().string() +
+                                  "/rut_nominal_imports_" +
+                                  std::to_string(static_cast<unsigned long long>(::getpid()));
+    std::filesystem::create_directories(directory);
+    {
+        std::ofstream out(directory + "/padding.rut");
+        out << "struct Padding { marker: i32 }\nvariant PaddingKind { absent }\n";
+    }
+    {
+        std::ofstream out(directory + "/types.rut");
+        out << R"rut(
+struct Inner { value: i32 }
+struct Box { inner: Inner }
+variant Answer { found(Box), missing }
+func make(_ value: i32) -> Box { Box(inner: Inner(value: value)) }
+func echo(_ value: Box) -> Box { value }
+func answer(_ value: Box) -> Answer { Answer.found(value) }
+)rut";
+    }
+    for (bool namespaced : {false, true}) {
+        const std::string prefix = namespaced ? "lib." : "";
+        const std::string imports =
+            std::string("import \"padding.rut\"\n") +
+            (namespaced ? "import * as lib from \"types.rut\"\n" : "import \"types.rut\"\n");
+        const std::string source =
+            imports + "route GET \"/\" { let box = " + prefix + "echo(" + prefix +
+            "make(7)) guard box.inner.value == 7 else { return 500 } let result = " + prefix +
+            "answer(box) match result { .found(item) => if item.inner.value == 7 { return 204 } "
+            "else { return 500 } .missing => return 404 } }";
+        SourceBudget budget{};
+        auto hir =
+            analyze_source_with_path_and_budget(source.c_str(), directory + "/main.rut", budget);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(*hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+        delete hir.value();
+        SourceBudget invalid_budget{};
+        const std::string invalid_source = imports + "route GET \"/\" { let wrong = " + prefix +
+                                           "echo(" + prefix + "Inner(value: 7)) return 204 }";
+        auto invalid = analyze_source_with_path_and_budget(
+            invalid_source.c_str(), directory + "/main.rut", invalid_budget);
+        CHECK_FALSE(invalid);
+        if (invalid) delete invalid.value();
+    }
+    std::filesystem::remove_all(directory);
+}
+
+TEST(frontend, tcp_release_is_resumable_verified_and_tcp_only) {
+    const char* source = R"rut(
+func park(_ connection: TcpConnection) -> bool { connection.release() }
+route GET "/" {
+    let opening = tcp("{\"address\":\"127.0.0.1\",\"port\":1234,\"poolIdleMs\":1000}", 100)
+    guard let connection = opening else { return 503 }
+    let released = park(connection)
+    guard released else { return 502 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto& fn = rir.module.functions[0];
+    u32 releases = 0;
+    for (u32 b = 0; b < fn.block_count; ++b)
+        for (u32 i = 0; i < fn.blocks[b].inst_count; ++i) {
+            auto& inst = fn.blocks[b].insts[i];
+            if (inst.op != rir::Opcode::JsonOp ||
+                inst.imm.i32_val != static_cast<i32>(json::Op::NetRelease))
+                continue;
+            ++releases;
+            CHECK(rir::is_net_call(inst));
+            CHECK(rir::http_call_profile_valid(fn));
+            const u32 count = inst.operand_count;
+            inst.operand_count = 0;
+            CHECK(!rir::http_call_profile_valid(fn));
+            inst.operand_count = count;
+        }
+    CHECK_EQ(releases, 1u);
+    rir.destroy();
+    const char* invalid[] = {
+        R"rut(route GET "/" { let p = udp("{\"address\":\"127.0.0.1\",\"port\":1}",100) guard let c = p else { return 503 } let r = c.release() return 200 })rut",
+        R"rut(route GET "/" { let p = tcp("{\"address\":\"127.0.0.1\",\"port\":1}",100) let r = p.release() return 200 })rut",
+        R"rut(route GET "/" { let p = tcp("{\"address\":\"127.0.0.1\",\"port\":1}",100) guard let c = p else { return 503 } let r = c.release(1) return 200 })rut"};
+    for (const char* input : invalid) {
+        auto ts = lex(lit(input));
+        REQUIRE(ts);
+        auto file = parse_file_heap(ts.value());
+        REQUIRE(file);
+        CHECK(!analyze_file_heap(file.value()));
+    }
+}

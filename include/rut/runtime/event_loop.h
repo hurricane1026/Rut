@@ -452,6 +452,7 @@ public:
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
         if (cfg == health_armed_config) return false;
         health_armed_config = cfg;
+        if (password_gateway) password_gateway->net_clients.adopt_config(cfg);
         health_probe_sweep_cursor = 0;
         reset_backend_health();
         if (cfg != nullptr) {

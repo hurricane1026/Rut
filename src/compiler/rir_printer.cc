@@ -402,6 +402,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::OptWrap:
             buf.put_cstr("opt.wrap");
             break;
+        case Opcode::ArrayNew:
+            buf.put_cstr("array.new");
+            break;
+        case Opcode::ArrayPush:
+            buf.put_cstr("array.push");
+            break;
         case Opcode::ArrayLen:
             buf.put_cstr("array.len");
             break;
@@ -723,6 +729,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ConstI32:
         case Opcode::ConstStatus:
+        case Opcode::ArrayNew:
             buf.put(' ');
             buf.put_i32(inst.imm.i32_val);
             break;
