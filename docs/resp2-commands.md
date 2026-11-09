@@ -5,6 +5,10 @@
 They use generic Bytes operations, TCP/TLS transport and incremental framing;
 the runtime contains no Redis commands or application protocol parser.
 
+See [general Redis commands and SET options](redis-commands.md) for integer key
+commands, conditional/expiring SET, bounded aggregate responses and live Redis
+interoperability tests.
+
 ## Primitive formatting and views
 
 `formatInt(value) -> str?` emits canonical signed decimal for an unwrapped i32

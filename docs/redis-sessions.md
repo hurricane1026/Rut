@@ -141,8 +141,10 @@ and absence of replay after an executed SET. Physical connection identities and
 observed authentication/database state establish cross-request reuse across two
 users/databases and deauthentication before a generic borrower. Results survive
 subsequent RESET I/O. Source files are removed after startup; sibling nominal
-imports and namespace use are covered. CI covers epoll/io_uring at O0/O2 and verified TLS. This is protocol-fixture validation, not a live Redis installation
-or complete Redis-driver compatibility claim.
+imports and namespace use are covered. CI covers epoll/io_uring at O0/O2 and
+verified TLS. This suite uses a protocol fixture. The separate
+[general command suite](redis-commands.md) adds pinned real Redis TCP/TLS
+interoperability tests; neither suite claims complete Redis-driver support.
 
 Helper-heavy imports used to expand repeated local initializers recursively during
 HIR normalization. Profiling the RESP2 command module found about 10.88 million HIR

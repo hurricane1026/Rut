@@ -68,3 +68,65 @@ func resp2SelectRequest(_ database: i32) {
     resp2Request(selected)
 }
 func resp2ResetRequest() -> Bytes { b"*1\r\n$5\r\nRESET\r\n" }
+
+func resp2KeyRequest(_ name: Bytes, _ key: Bytes) {
+    guard let argument = resp2BulkArgument(name, 8192) else { nil }
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let prefix = concatBytes(b"*2\r\n", argument, 8192) else { nil }
+    concatBytes(prefix, keyed, 8192)
+}
+func resp2KeyNumberRequest(_ name: Bytes, _ key: Bytes, _ amount: i32) {
+    guard let digits = formatInt(amount) else { nil }
+    guard let named = resp2BulkArgument(name, 8192) else { nil }
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let numbered = resp2BulkArgument(Bytes(digits), 8192) else { nil }
+    guard let pair = concatBytes(named, keyed, 8192) else { nil }
+    guard let arguments = concatBytes(pair, numbered, 8192) else { nil }
+    concatBytes(b"*3\r\n", arguments, 8192)
+}
+// Closed choices prevent contradictory NX/XX or EX/PX combinations.
+variant RedisSetCondition { always absent present }
+variant RedisSetExpiry { none seconds(i32) milliseconds(i32) }
+func resp2SetCondition(_ condition: RedisSetCondition) -> Bytes {
+    match condition {
+        .always => b""
+        .absent => b"$2\r\nNX\r\n"
+        .present => b"$2\r\nXX\r\n"
+    }
+}
+func resp2SetExpiryNumber(_ unit: Bytes, _ amount: i32) {
+    guard amount > 0 else { nil }
+    guard let digits = formatInt(amount) else { nil }
+    guard let number = resp2BulkArgument(Bytes(digits), 8192) else { nil }
+    concatBytes(unit, number, 8192)
+}
+func resp2SetExpiry(_ expiry: RedisSetExpiry) {
+    match expiry {
+        .none => b""
+        .seconds(amount) => resp2SetExpiryNumber(b"$2\r\nEX\r\n", amount)
+        .milliseconds(amount) => resp2SetExpiryNumber(b"$2\r\nPX\r\n", amount)
+    }
+}
+func resp2SetArguments(_ key: Bytes, _ value: Bytes) {
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let valued = resp2BulkArgument(value, 8192) else { nil }
+    guard let pair = concatBytes(keyed, valued, 8192) else { nil }
+    concatBytes(b"$3\r\nSET\r\n", pair, 8192)
+}
+func resp2SetArgumentCount(_ conditional: Bytes, _ expiration: Bytes) -> i32 {
+    if expiration.count > 0 {
+        if conditional.count > 0 { 6 } else { 5 }
+    } else {
+        if conditional.count > 0 { 4 } else { 3 }
+    }
+}
+func resp2SetOptionsRequest(_ key: Bytes, _ value: Bytes, _ condition: RedisSetCondition, _ expiry: RedisSetExpiry) {
+    guard let arguments = resp2SetArguments(key, value) else { nil }
+    let conditional = resp2SetCondition(condition)
+    guard let expiration = resp2SetExpiry(expiry) else { nil }
+    let count = resp2SetArgumentCount(conditional, expiration)
+    guard let header = resp2DecimalLine(b"*", count, 8192) else { nil }
+    guard let prefix = concatBytes(header, arguments, 8192) else { nil }
+    guard let conditioned = concatBytes(prefix, conditional, 8192) else { nil }
+    concatBytes(conditioned, expiration, 8192)
+}
