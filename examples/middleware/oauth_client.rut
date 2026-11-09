@@ -28,15 +28,20 @@ func clientCredentialsForResource(_ serviceAuthorization: str, _ scopes: str, _ 
 }
 
 // Metadata policy only; callers must first authenticate/parse the AS response.
-func authorizationDocument(_ document: Json, _ requiredScope: str) -> str {
+func tokenAuthorizationDocument(_ document: Json) -> str {
     let token = json.string(json.get(document, "/access_token").or(document)).or("")
     let kind = json.string(json.get(document, "/token_type").or(document)).or("")
     let lifetime = json.int(json.get(document, "/expires_in").or(document)).or(0)
     let checked = bearerToken(kind + " " + token).or("")
-    guard requiredScope != "" && lifetime > 0 && json.get(document, "/error") == nil &&
-        !kind.contains(" ") && !token.isEmpty && checked == token &&
-        jwtHasScope(document, requiredScope) else { respond 503 }
+    guard lifetime > 0 && json.get(document, "/error") == nil &&
+        !kind.contains(" ") && !token.isEmpty && checked == token else { respond 503 }
     "Bearer " + token
+}
+
+// Single permission policy, retained for existing callers.
+func authorizationDocument(_ document: Json, _ requiredScope: str) -> str {
+    guard jwtHasScope(document, requiredScope) else { respond 503 }
+    tokenAuthorizationDocument(document)
 }
 
 // Only consume a completed httpCall response from the configured HTTPS AS.
@@ -60,4 +65,12 @@ func exchangeAuthorization(_ reply: Json, _ requiredScope: str) -> str {
     guard let document = introspection.replyDocument(reply) else { respond 503 }
     guard json.string(json.get(document, "/issued_token_type").or(document)).or("") == "urn:ietf:params:oauth:token-type:access_token" else { respond 503 }
     authorizationDocument(document, requiredScope)
+}
+
+// Require every permission in a trusted nonempty scope list (at most 1024 bytes).
+// AS grants may be reordered or wider, but a partial grant never forwards.
+func authorizationForScopes(_ reply: Json, _ requiredScopes: str) -> str {
+    guard let document = introspection.replyDocument(reply) else { respond 503 }
+    guard jwtHasAllScopes(document, requiredScopes) else { respond 503 }
+    tokenAuthorizationDocument(document)
 }

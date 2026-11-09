@@ -10528,6 +10528,7 @@ closed. Confirmation is checked before subject/scope forwarding. No builtin,
 allocator, configuration lifecycle or runtime ABI is changed. See
 [the protocol contract](docs/oauth-introspection.md#optional-mtls-certificate-binding).
 
+
 ### Bounded buffer parsing and collected results
 
 `collectBytes(Bytes, State, literalLimit, namedStep)` is a compile-time parser
@@ -10618,3 +10619,18 @@ Idle deadlines and nonblocking pending-input/EOF checks run before reuse; TLS
 control input is conservatively rejected. Application framing and session-state
 restoration remain the protocol library's responsibility. Shutdown joins the
 worker and reclaims both active and idle sockets on either I/O backend.
+
+
+### Complete scope-list authorization
+
+`jwtHasAllScopes(Json, str) -> bool` appends a JSON operation without renumbering
+existing opcodes. It reuses the shared OAuth scope grammar and exact membership
+matcher. Required policy is 1–1024 bytes and is copied to bounded stack storage
+before parsing so document scratch views cannot be invalidated. The JSON scope
+is decoded once, both lists are validated in full, then every required token must
+occur. Runtime cost is bounded by required-list and existing JSON byte limits;
+no heap allocation, retained views, I/O or shard-shared state is introduced.
+The compiler requires unwrapped Json/string operands and preserves user-name
+shadowing; JIT/native helper dispatch uses the existing scalar Boolean carrier.
+The ordinary Rut upstream OAuth helper composes this with the unchanged response
+metadata contract. See [language card](docs/language-card.md#requiring-a-complete-scope-list).

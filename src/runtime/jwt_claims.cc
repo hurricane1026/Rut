@@ -150,6 +150,33 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     return scope_list_matches({document.scratch, decoded.len}, required, found) && found;
 }
 
+bool jwt_has_all_scopes(json::Document& document, Str claims, Str required_scopes) {
+    constexpr u32 kMaxRequiredBytes = 1024;
+    if (required_scopes.len > kMaxRequiredBytes || !jwt_scope_list_valid(required_scopes))
+        return false;
+    // Preserve required bytes even when the caller borrowed document scratch.
+    char required[kMaxRequiredBytes];
+    for (u32 i = 0; i < required_scopes.len; ++i) required[i] = required_scopes.ptr[i];
+    if (claims.ptr == nullptr || !document.parse(claims) ||
+        document.nodes[0].kind != json::Kind::Object)
+        return false;
+    const u32 kScope = member(document, lit_str("scope"));
+    if (kScope == json::kNone) return false;
+    json::Writer decoded{document.scratch};
+    if (!document.string(kScope, decoded)) return false;
+    const Str kGranted{document.scratch, decoded.len};
+    if (!jwt_scope_list_valid(kGranted)) return false;
+    u32 start = 0;
+    for (u32 i = 0; i <= required_scopes.len; ++i) {
+        if (i != required_scopes.len && required[i] != ' ') continue;
+        bool found = false;
+        if (!scope_list_matches(kGranted, {required + start, i - start}, found) || !found)
+            return false;
+        start = i + 1;
+    }
+    return true;
+}
+
 bool jwt_certificate_bound(json::Document& document, Str claims, Str certificate_sha256) {
     if (!sha256_hex_format_valid(certificate_sha256) || claims.ptr == nullptr ||
         !document.parse(claims) || document.nodes[0].kind != json::Kind::Object)

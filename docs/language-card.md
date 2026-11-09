@@ -3105,6 +3105,7 @@ cannot satisfy it. Uses the existing `jwtCertificateBound` primitive; no languag
 or native ABI change is added. See [the contract](oauth-introspection.md#optional-mtls-certificate-binding)
 and [the runnable example](../examples/mtls-introspection.rut).
 
+
 ## Explicit TCP/TLS connection pooling
 
 TCP policy accepts optional `poolIdleMs: 1...60000` (UDP rejects it).
@@ -3119,3 +3120,31 @@ leases; endpoint/TLS identity and configuration epoch isolate pools. Reload
 retires idle transports and prevents old-config leases returning into new pools.
 No command replay or application-state reset is performed. See
 [pooling ownership and limits](net-clients.md#explicit-cross-request-tcptls-pooling).
+
+
+### Requiring a complete scope list
+
+`jwtHasAllScopes(verifiedDocument, requiredScopes) -> bool` checks every exact
+permission in a nonempty OAuth scope list. The required string is bounded to
+1024 bytes; the granted top-level `scope` string retains existing JSON bounds.
+Both lists must use the shared strict scope grammar: nonempty ASCII tokens
+separated by single spaces. Empty lists, leading/trailing/repeated spaces, tabs,
+controls, quotes, backslashes and non-ASCII bytes fail closed. Every list is
+validated in full, including suffixes after a match. JSON names and granted values
+are decoded before comparison. Matching is case-sensitive, with no prefix match;
+ordering and duplicate tokens do not affect the result. Extra granted permissions
+are allowed. A malformed/missing/non-string scope or duplicate JSON member returns
+false. The original `jwtHasScope` continues to accept exactly one token.
+
+This is metadata authorization, not signature or claims authentication. Apply it
+only to the document already admitted by signature and issuer/audience/time
+policy, or to an authenticated AS response. Keep required permissions in trusted
+route configuration. The operation is synchronous, has no I/O or heap allocation,
+retains no views and returns no optional value. User bindings can shadow its name.
+
+`oauth_client.authorizationForScopes(reply, requiredScopes)` applies this policy
+to a completed trusted HTTPS token-endpoint reply, then enforces the existing
+Bearer grammar/type, positive integer expiry and absence of OAuth errors. Any
+failure produces 503 without forwarding; only the returned Bearer header may
+replace downstream Authorization. See
+[upstream-oauth-all-scopes.rut](../examples/upstream-oauth-all-scopes.rut).

@@ -31,6 +31,11 @@ bool jwt_claims_valid_with_lifetime(json::Document& scratch,
 // verify signatures or claims policy. Invalid documents/tokens fail closed.
 bool jwt_has_scope(json::Document& scratch, Str claims, Str required);
 
+// Require every token in a nonempty configured OAuth scope list (at most 1024
+// bytes). Order/duplicates do not affect membership. Both whole lists are
+// validated; malformed or empty input fails closed. Metadata only, no allocation.
+bool jwt_has_all_scopes(json::Document& scratch, Str claims, Str required_scopes);
+
 // RFC 8705 cnf.x5t#S256 match against a verified TLS certificate's canonical
 // lowercase SHA-256 hex fingerprint. Metadata only, not JWT/peer verification.
 // Exactly one confirmation method is admitted. No allocation or retained views.
