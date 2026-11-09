@@ -4453,6 +4453,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             set_tests_properties(test_parse_integers_${backend}_opt${parse_opt} PROPERTIES
                 LABELS "integration;network" TIMEOUT 60 SKIP_RETURN_CODE 77)
         endforeach()
+        foreach(session_opt 0 2)
+            add_test(NAME test_redis_sessions_${backend}_opt${session_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_sessions.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --example ${PROJECT_SOURCE_DIR}/examples/redis-session-client.rut
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt ${session_opt})
+            set_tests_properties(test_redis_sessions_${backend}_opt${session_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77)
+        endforeach()
+        add_test(NAME test_redis_sessions_${backend}_tls
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_sessions.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --example ${PROJECT_SOURCE_DIR}/examples/redis-session-client.rut
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
+        set_tests_properties(test_redis_sessions_${backend}_tls PROPERTIES
+            LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77)
         foreach(pool_opt 0 2)
             add_test(NAME test_net_client_pooling_${backend}_opt${pool_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_net_client_pooling.py

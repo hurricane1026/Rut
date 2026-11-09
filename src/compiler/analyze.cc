@@ -6686,12 +6686,20 @@ static FrontendResult<void> instantiate_function_respond_guards(
     return {};
 }
 
+struct NormalizeLocalCache {
+    static constexpr u32 kCapacity = AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals;
+    HirExpr values[kCapacity]{};
+    bool ready[kCapacity]{};
+    u32 local_count = 0;
+};
+
 static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
                                               NodePool<HirExpr>& exprs,
                                               const HirLocal* locals,
                                               u32 local_count,
                                               u32 param_count,
-                                              const ExprValueBinding* bindings = nullptr) {
+                                              const ExprValueBinding* bindings = nullptr,
+                                              NormalizeLocalCache* local_cache = nullptr) {
     HirExpr out = expr;
     out.lhs = nullptr;
     out.rhs = nullptr;
@@ -6710,9 +6718,11 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
     if (expr.kind == HirExprKind::CollectBytes) {
         if (!expr.lhs || !expr.rhs || expr.args.len != 1 || !expr.args[0])
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto input = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        auto input = normalize_expr(
+            *expr.lhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!input) return core::make_unexpected(input.error());
-        auto state = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, bindings);
+        auto state = normalize_expr(
+            *expr.rhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!state) return core::make_unexpected(state.error());
         if (!exprs.push(input.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -6722,8 +6732,8 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
         out.rhs = &exprs[exprs.len - 1];
         const ExprValueBinding input_binding{expr.lhs, out.lhs, bindings};
         const ExprValueBinding state_binding{expr.rhs, out.rhs, &input_binding};
-        auto step =
-            normalize_expr(*expr.args[0], exprs, locals, local_count, param_count, &state_binding);
+        auto step = normalize_expr(
+            *expr.args[0], exprs, locals, local_count, param_count, &state_binding, local_cache);
         if (!step) return core::make_unexpected(step.error());
         if (!exprs.push(step.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&exprs[exprs.len - 1]))
@@ -6733,14 +6743,15 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
     if (expr.kind == HirExprKind::LetIn) {
         if (expr.lhs == nullptr || expr.rhs == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto initializer =
-            normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        auto initializer = normalize_expr(
+            *expr.lhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!initializer) return core::make_unexpected(initializer.error());
         if (!exprs.push(initializer.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* key = &exprs[exprs.len - 1];
         const ExprValueBinding kScoped{expr.lhs, key, bindings};
-        auto body = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, &kScoped);
+        auto body = normalize_expr(
+            *expr.rhs, exprs, locals, local_count, param_count, &kScoped, local_cache);
         if (!body) return core::make_unexpected(body.error());
         if (!exprs.push(body.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = key;
@@ -6751,13 +6762,32 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
-        return normalize_expr(
-            locals[expr.local_index].init, exprs, locals, local_count, param_count, bindings);
+        // This cache belongs to one function normalization and its local environment.
+        // Binding scopes can rebind the same source expression (notably LetIn and
+        // CollectBytes), so only reuse initializer expansions outside those scopes.
+        const bool kMemoize = bindings == nullptr && local_cache != nullptr &&
+                              expr.local_index < local_cache->local_count;
+        if (kMemoize && local_cache->ready[expr.local_index])
+            return local_cache->values[expr.local_index];
+        auto value = normalize_expr(locals[expr.local_index].init,
+                                    exprs,
+                                    locals,
+                                    local_count,
+                                    param_count,
+                                    bindings,
+                                    local_cache);
+        if (!value) return core::make_unexpected(value.error());
+        if (kMemoize) {
+            local_cache->values[expr.local_index] = value.value();
+            local_cache->ready[expr.local_index] = true;
+        }
+        return value;
     }
 
     if (expr.kind == HirExprKind::TupleSlot) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
-        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        auto lhs = normalize_expr(
+            *expr.lhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (lhs->type != HirTypeKind::Tuple)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
@@ -6776,20 +6806,27 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
     }
 
     if (expr.lhs != nullptr) {
-        auto lhs = normalize_expr(*expr.lhs, exprs, locals, local_count, param_count, bindings);
+        auto lhs = normalize_expr(
+            *expr.lhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!exprs.push(lhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &exprs[exprs.len - 1];
     }
     if (expr.rhs != nullptr) {
-        auto rhs = normalize_expr(*expr.rhs, exprs, locals, local_count, param_count, bindings);
+        auto rhs = normalize_expr(
+            *expr.rhs, exprs, locals, local_count, param_count, bindings, local_cache);
         if (!rhs) return core::make_unexpected(rhs.error());
         if (!exprs.push(rhs.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.rhs = &exprs[exprs.len - 1];
     }
     for (u32 i = 0; i < expr.field_inits.len; i++) {
-        auto val = normalize_expr(
-            *expr.field_inits[i].value, exprs, locals, local_count, param_count, bindings);
+        auto val = normalize_expr(*expr.field_inits[i].value,
+                                  exprs,
+                                  locals,
+                                  local_count,
+                                  param_count,
+                                  bindings,
+                                  local_cache);
         if (!val) return core::make_unexpected(val.error());
         if (!exprs.push(val.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr::FieldInit init{};
@@ -6799,7 +6836,8 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
     }
     for (u32 i = 0; i < expr.args.len; i++) {
-        auto arg = normalize_expr(*expr.args[i], exprs, locals, local_count, param_count, bindings);
+        auto arg = normalize_expr(
+            *expr.args[i], exprs, locals, local_count, param_count, bindings, local_cache);
         if (!arg) return core::make_unexpected(arg.error());
         if (!exprs.push(arg.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&exprs[exprs.len - 1]))
@@ -6816,7 +6854,10 @@ static FrontendResult<HirExpr> normalize_function_expr(const HirExpr& expr,
                                                        const HirLocal* locals,
                                                        u32 local_count,
                                                        u32 param_count) {
-    return normalize_expr(expr, fn->exprs, locals, local_count, param_count);
+    NormalizeLocalCache local_cache{};
+    local_cache.local_count =
+        local_count < NormalizeLocalCache::kCapacity ? local_count : NormalizeLocalCache::kCapacity;
+    return normalize_expr(expr, fn->exprs, locals, local_count, param_count, nullptr, &local_cache);
 }
 
 static FrontendResult<void> collect_function_response_effects(HirFunction* fn,

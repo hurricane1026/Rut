@@ -3148,3 +3148,14 @@ Bearer grammar/type, positive integer expiry and absence of OAuth errors. Any
 failure produces 503 without forwarding; only the returned Bearer header may
 replace downstream Authorization. See
 [upstream-oauth-all-scopes.rut](../examples/upstream-oauth-all-scopes.rut).
+
+## Authenticated Redis library sessions
+
+The ordinary Rut Redis library provides binary AUTH/SELECT builders and typed
+state-changing commands, plus `redisSessionGet` / `redisSessionSet`. Each session
+validates AUTH/SELECT before its business command, then acknowledges RESET before
+returning a clean TCP/TLS transport to the pool. This is library composition,
+with no new keyword, builtin or change to the sixteen-I/O profile. Status/setup
+replies have a two-receive bound; GET/SET keep four. RESET requires Redis 6.2+;
+failures close instead of sharing authentication/database state. See
+[session results, budgets and ownership](redis-sessions.md).

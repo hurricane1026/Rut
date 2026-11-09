@@ -10634,3 +10634,22 @@ The compiler requires unwrapped Json/string operands and preserves user-name
 shadowing; JIT/native helper dispatch uses the existing scalar Boolean carrier.
 The ordinary Rut upstream OAuth helper composes this with the unchanged response
 metadata contract. See [language card](docs/language-card.md#requiring-a-complete-scope-list).
+
+### Authenticated Redis session composition
+
+Ordinary Rut helpers pipeline only AUTH and SELECT, require both exact simple
+OK replies, then execute one GET/SET. Before a clean transport can re-enter the
+generic TCP/TLS pool, the helpers send RESET and validate its exact simple RESET
+acknowledgement. Redis 6.2+ RESET restores database zero and deauthenticates;
+unsupported or failed cleanup closes the lease. Every acquisition reinitializes
+identity/database, preventing a generic later borrower inheriting session state.
+Low-level state-changing commands close on any failure, including server errors.
+
+Initialization uses the existing incremental step with a two-node collection
+bound and two receives; status/RESET replies use two receives and GET/SET four.
+Together with open, failure-close branches and release, a session remains within
+the existing sixteen-operation profile. Results distinguish authentication,
+selection, business, transport/protocol and cleanup failure and retain owned Bytes
+across reset. SET execution can precede a cleanup failure; no replay is added.
+There are no runtime Redis fields/opcodes, new dependencies, keywords, loops or
+budget increases. See [the session contract](docs/redis-sessions.md).

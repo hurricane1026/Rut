@@ -80,8 +80,9 @@ GET rejects simple strings, integers and null arrays; SET rejects bulk `"OK"`,
 null values and other reply kinds. These choices follow the Redis
 [GET](https://redis.io/docs/latest/commands/get/) and
 [SET](https://redis.io/docs/latest/commands/set/) contracts for these basic forms.
-NX/XX/TTL/GET options, AUTH/SELECT, transactions, Pub/Sub and RESP3 are separate
-operations, not silently inferred by these helpers.
+NX/XX/TTL/GET options, transactions, Pub/Sub and RESP3 remain separate
+operations. [Authenticated sessions](redis-sessions.md) add explicit AUTH/SELECT
+and acknowledged RESET before pool return; plain GET/SET never infer them.
 
 Replies have a finite budget of four receives, each with a 1000 ms operation
 deadline. Already Complete/Invalid states perform no more reads. There is no

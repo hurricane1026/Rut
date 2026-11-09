@@ -1,0 +1,44 @@
+import "clients/redis-client.rut"
+
+func sessionValue(_ result: RedisSessionResult) -> Bytes {
+    match result { .value(data) => data _ => nil }
+}
+func sessionStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => 200
+        .missing => 404
+        .ok => 204
+        .requestFailure => 413
+        .transportFailure(code) => if code == -2 { 504 } else { 502 }
+        .cleanupFailure(code) => if code == -2 { 504 } else { 502 }
+        _ => 502
+    }
+}
+// Configure a standalone Redis 6.2+ endpoint with optional poolIdleMs, credentials
+// and database at load time. Each command authenticates/selects, then resets the
+// connection before releasing it, including on a complete business-command error.
+route POST "/get" {
+    guard let database = parseInt(env("REDIS_DATABASE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, req.bodyBytes)
+    let status = sessionStatus(result)
+    guard status != 404 else { return 404 }
+    guard status != 413 else { return 413 }
+    guard status != 504 else { return 504 }
+    guard let bytes = sessionValue(result) else { return 502 }
+    return response(200, body: bytes)
+}
+route POST "/set" {
+    guard let database = parseInt(env("REDIS_DATABASE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionSet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, b"example-key", req.bodyBytes)
+    let status = sessionStatus(result)
+    guard status != 413 else { return 413 }
+    guard status != 504 else { return 504 }
+    guard status == 204 else { return 502 }
+    return 204
+}

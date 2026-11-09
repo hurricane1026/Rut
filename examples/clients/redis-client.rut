@@ -135,3 +135,240 @@ func redisSet(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) -> Redi
     let result = redisSetExecute(connection, key, value)
     redisSetFinish(connection, result)
 }
+
+// Connection-changing commands close on every failure. They cannot leave a
+// prior identity/database available for accidental reuse after a failed change.
+variant RedisCommandResult {
+    ok
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+variant RedisInitializeResult {
+    ready
+    authError(Bytes)
+    databaseError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+variant RedisSessionResult {
+    value(Bytes)
+    missing
+    ok
+    authError(Bytes)
+    databaseError(Bytes)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+    resetError(Bytes)
+    cleanupFailure(i32)
+}
+func redisCommandSucceeded(_ result: RedisCommandResult) -> bool {
+    match result { .ok => true _ => false }
+}
+func redisCommandReadFailure(_ code: i32) -> RedisCommandResult {
+    if code == 0 { RedisCommandResult.replyFailure } else { RedisCommandResult.transportFailure(code) }
+}
+// Status replies use two receives. This leaves room for initialization, one
+// business command and acknowledged RESET + release under the 16-op profile.
+func redisCommandWire(_ connection: TcpConnection, _ request: Bytes, _ expected: Bytes) {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisCommandResult.transportFailure(netError()) }
+    guard let initial = resp2Stream(8192) else { RedisCommandResult.replyFailure }
+    let reading = redisReadTwice(connection, initial)
+    guard let stream = reading else { redisCommandReadFailure(netError()) }
+    guard let reply = redisScalarReply(stream) else { RedisCommandResult.replyFailure }
+    if reply.kind == 1 && reply.data == expected {
+        RedisCommandResult.ok
+    } else {
+        guard reply.kind == 2 else { RedisCommandResult.replyFailure }
+        RedisCommandResult.serverError(reply.data)
+    }
+}
+func redisCommandFinish(_ connection: TcpConnection, _ result: RedisCommandResult) -> RedisCommandResult {
+    if redisCommandSucceeded(result) { result } else {
+        let closed = connection.close()
+        result
+    }
+}
+func redisAuthExecute(_ connection: TcpConnection, _ password: Bytes) {
+    guard let request = resp2AuthRequest(password) else { RedisCommandResult.requestFailure }
+    redisCommandWire(connection, request, b"OK")
+}
+func redisAuth(_ connection: TcpConnection, _ password: Bytes) -> RedisCommandResult {
+    let result = redisAuthExecute(connection, password)
+    redisCommandFinish(connection, result)
+}
+func redisAuthUserExecute(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes) {
+    guard let request = resp2AuthUserRequest(username, password) else { RedisCommandResult.requestFailure }
+    redisCommandWire(connection, request, b"OK")
+}
+func redisAuthUser(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes) -> RedisCommandResult {
+    let result = redisAuthUserExecute(connection, username, password)
+    redisCommandFinish(connection, result)
+}
+func redisSelectExecute(_ connection: TcpConnection, _ database: i32) {
+    guard let request = resp2SelectRequest(database) else { RedisCommandResult.requestFailure }
+    redisCommandWire(connection, request, b"OK")
+}
+func redisSelect(_ connection: TcpConnection, _ database: i32) -> RedisCommandResult {
+    let result = redisSelectExecute(connection, database)
+    redisCommandFinish(connection, result)
+}
+func redisReset(_ connection: TcpConnection) -> RedisCommandResult {
+    let result = redisCommandWire(connection, resp2ResetRequest(), b"RESET")
+    redisCommandFinish(connection, result)
+}
+func redisInitializeSucceeded(_ result: RedisInitializeResult) -> bool {
+    match result { .ready => true _ => false }
+}
+func redisInitializeReadFailure(_ code: i32) -> RedisInitializeResult {
+    if code == 0 { RedisInitializeResult.replyFailure } else { RedisInitializeResult.transportFailure(code) }
+}
+func redisInitializeStream() -> Resp2Stream {
+    Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 2, nodes: 0,
+        status: 0, search: 1, bulkEnd: -1, limit: 8192))
+}
+func redisInitializeFeed(_ stream: Resp2Stream, _ chunk: Bytes) {
+    guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+    guard let steps = collectBytes(bytes, stream.cursor, 2, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(steps.count - 1) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
+func redisInitializeReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let pending = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        redisInitializeFeed(stream, chunk)
+    } else { stream }
+}
+func redisInitializeRead(_ connection: TcpConnection) {
+    let firstRead = redisInitializeReceive(connection, redisInitializeStream())
+    guard let first = firstRead else { nil }
+    let secondRead = redisInitializeReceive(connection, first)
+    guard let second = secondRead else { nil }
+    second
+}
+func redisInitializeValidate(_ stream: Resp2Stream) {
+    guard resp2Finished(stream) else { RedisInitializeResult.replyFailure }
+    guard let replies = collectBytes(stream.bytes, Resp2State(offset: 0, pending: 2), 2, resp2Step) else {
+        RedisInitializeResult.replyFailure
+    }
+    guard let auth = replies.get(0) else { RedisInitializeResult.replyFailure }
+    guard let selected = replies.get(1) else { RedisInitializeResult.replyFailure }
+    guard selected.next == stream.bytes.count else { RedisInitializeResult.replyFailure }
+    if auth.kind == 2 { RedisInitializeResult.authError(auth.data) } else {
+        guard auth.kind == 1 && auth.data == b"OK" else { RedisInitializeResult.replyFailure }
+        if selected.kind == 2 { RedisInitializeResult.databaseError(selected.data) } else {
+            guard selected.kind == 1 && selected.data == b"OK" else { RedisInitializeResult.replyFailure }
+            RedisInitializeResult.ready
+        }
+    }
+}
+// Only AUTH and SELECT are pipelined. A business command is never sent until
+// both replies have been consumed, validated and acknowledged with exact +OK.
+func redisInitializeWire(_ connection: TcpConnection, _ request: Bytes) {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisInitializeResult.transportFailure(netError()) }
+    let reading = redisInitializeRead(connection)
+    guard let stream = reading else { redisInitializeReadFailure(netError()) }
+    redisInitializeValidate(stream)
+}
+func redisInitializeExecute(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ database: i32) {
+    guard let auth = resp2AuthUserRequest(username, password) else { RedisInitializeResult.requestFailure }
+    guard let select = resp2SelectRequest(database) else { RedisInitializeResult.requestFailure }
+    guard let request = concatBytes(auth, select, 8192) else { RedisInitializeResult.requestFailure }
+    redisInitializeWire(connection, request)
+}
+func redisInitializeDefaultExecute(_ connection: TcpConnection, _ password: Bytes, _ database: i32) {
+    guard let auth = resp2AuthRequest(password) else { RedisInitializeResult.requestFailure }
+    guard let select = resp2SelectRequest(database) else { RedisInitializeResult.requestFailure }
+    guard let request = concatBytes(auth, select, 8192) else { RedisInitializeResult.requestFailure }
+    redisInitializeWire(connection, request)
+}
+func redisInitializeFinish(_ connection: TcpConnection, _ result: RedisInitializeResult) -> RedisInitializeResult {
+    if redisInitializeSucceeded(result) { result } else {
+        let closed = connection.close()
+        result
+    }
+}
+func redisInitialize(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ database: i32) -> RedisInitializeResult {
+    let result = redisInitializeExecute(connection, username, password, database)
+    redisInitializeFinish(connection, result)
+}
+func redisInitializeDefault(_ connection: TcpConnection, _ password: Bytes, _ database: i32) -> RedisInitializeResult {
+    let result = redisInitializeDefaultExecute(connection, password, database)
+    redisInitializeFinish(connection, result)
+}
+func redisSessionFromInitialize(_ result: RedisInitializeResult) -> RedisSessionResult {
+    match result {
+        .ready => RedisSessionResult.ok
+        .authError(data) => RedisSessionResult.authError(data)
+        .databaseError(data) => RedisSessionResult.databaseError(data)
+        .requestFailure => RedisSessionResult.requestFailure
+        .transportFailure(code) => RedisSessionResult.transportFailure(code)
+        .replyFailure => RedisSessionResult.replyFailure
+    }
+}
+func redisSessionFromGet(_ result: RedisGetResult) -> RedisSessionResult {
+    match result {
+        .value(data) => RedisSessionResult.value(data)
+        .missing => RedisSessionResult.missing
+        .serverError(data) => RedisSessionResult.serverError(data)
+        .requestFailure => RedisSessionResult.requestFailure
+        .transportFailure(code) => RedisSessionResult.transportFailure(code)
+        .replyFailure => RedisSessionResult.replyFailure
+    }
+}
+func redisSessionFromSet(_ result: RedisSetResult) -> RedisSessionResult {
+    match result {
+        .ok => RedisSessionResult.ok
+        .serverError(data) => RedisSessionResult.serverError(data)
+        .requestFailure => RedisSessionResult.requestFailure
+        .transportFailure(code) => RedisSessionResult.transportFailure(code)
+        .replyFailure => RedisSessionResult.replyFailure
+    }
+}
+func redisSessionAlreadyClosed(_ result: RedisSessionResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisSessionAfterReset(_ connection: TcpConnection, _ reset: RedisCommandResult, _ result: RedisSessionResult) -> RedisSessionResult {
+    match reset {
+        .ok => {
+            let returned = connection.release()
+            let code = netError()
+            if code == 0 { result } else { RedisSessionResult.cleanupFailure(code) }
+        }
+        .serverError(data) => RedisSessionResult.resetError(data)
+        .transportFailure(code) => RedisSessionResult.cleanupFailure(code)
+        _ => RedisSessionResult.cleanupFailure(0)
+    }
+}
+func redisSessionFinish(_ connection: TcpConnection, _ result: RedisSessionResult) -> RedisSessionResult {
+    if redisSessionAlreadyClosed(result) { result } else {
+        let reset = redisReset(connection)
+        redisSessionAfterReset(connection, reset, result)
+    }
+}
+// Each operation initializes its own identity/database and resets before return.
+// Together with tcp(), these helpers fit the existing sixteen-I/O profile.
+func redisSessionGet(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ database: i32, _ key: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let reply = redisGet(connection, key)
+    redisSessionFinish(connection, redisSessionFromGet(reply))
+}
+func redisSessionSet(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ database: i32, _ key: Bytes, _ value: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let reply = redisSet(connection, key, value)
+    redisSessionFinish(connection, redisSessionFromSet(reply))
+}

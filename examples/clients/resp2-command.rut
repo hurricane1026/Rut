@@ -45,3 +45,26 @@ func resp2SetRequest(_ key: Bytes, _ value: Bytes) {
     guard let valued = resp2Argument(keyed, value) else { nil }
     resp2Request(valued)
 }
+
+func resp2AuthRequest(_ password: Bytes) {
+    guard let initial = resp2Command(2, 8192) else { nil }
+    guard let named = resp2Argument(initial, b"AUTH") else { nil }
+    guard let secret = resp2Argument(named, password) else { nil }
+    resp2Request(secret)
+}
+func resp2AuthUserRequest(_ username: Bytes, _ password: Bytes) {
+    guard let initial = resp2Command(3, 8192) else { nil }
+    guard let named = resp2Argument(initial, b"AUTH") else { nil }
+    guard let user = resp2Argument(named, username) else { nil }
+    guard let secret = resp2Argument(user, password) else { nil }
+    resp2Request(secret)
+}
+func resp2SelectRequest(_ database: i32) {
+    guard database > -1 else { nil }
+    guard let digits = formatInt(database) else { nil }
+    guard let initial = resp2Command(2, 8192) else { nil }
+    guard let named = resp2Argument(initial, b"SELECT") else { nil }
+    guard let selected = resp2Argument(named, Bytes(digits)) else { nil }
+    resp2Request(selected)
+}
+func resp2ResetRequest() -> Bytes { b"*1\r\n$5\r\nRESET\r\n" }
