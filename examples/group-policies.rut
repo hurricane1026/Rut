@@ -1,0 +1,36 @@
+import "middleware/auth.rut"
+
+listen :8080
+
+// Trusted static memberships and credentials. Set both RUT_*_KEY variables
+// before compilation/loading; use TLS and replace the snapshot to revoke access.
+route GET "/either" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: env("RUT_ALICE_KEY"), credentials: "",
+            keyId: "alice-key", passwordId: "alice-password"),
+        auth.ConsumerCredentials(consumerId: "bob", key: env("RUT_BOB_KEY"), credentials: "",
+            keyId: "bob-key", passwordId: "bob-password"))
+    let allowed = auth.requireAnyGroup(identity, "reports", "operators",
+        auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "blocked"),
+        auth.ConsumerGroups(consumerId: "bob", first: "operators", second: ""))
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+// Deny first: membership in an allowed group cannot override "blocked".
+// Request identity/group headers never supply either membership record.
+route GET "/restricted" {
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: env("RUT_ALICE_KEY"), credentials: "",
+            keyId: "alice-key", passwordId: "alice-password"),
+        auth.ConsumerCredentials(consumerId: "bob", key: env("RUT_BOB_KEY"), credentials: "",
+            keyId: "bob-key", passwordId: "bob-password"))
+    let first = auth.ConsumerGroups(consumerId: "alice", first: "reports", second: "blocked")
+    let second = auth.ConsumerGroups(consumerId: "bob", first: "operators", second: "")
+    let checked = auth.denyGroup(identity, "blocked", first, second)
+    let allowed = auth.requireAnyGroup(checked, "reports", "operators", first, second)
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route "/" { return 404 }

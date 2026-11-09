@@ -1380,3 +1380,19 @@ trusted token-endpoint/Bearer/expiry/error policy, returning 503 without forward
 when any required permission is absent. No language keyword, dependency, I/O or
 cache is added. See [the contract](upstream-oauth.md#require-all-configured-permissions)
 and [the example](../examples/upstream-oauth-all-scopes.rut).
+
+## Credential rotation and group policy regression examples
+
+[credential-rotation.rut](../examples/credential-rotation.rut) demonstrates Basic
+and singleton custom-header credential windows, selected credential IDs and
+retiring the previous slot through a configuration change and restart.
+[group-policies.rut](../examples/group-policies.rut) demonstrates a two-group
+allow union and explicit deny-before-allow composition using trusted memberships.
+
+The JIT regression matrices exercise 220 rotation and 168 group-policy request
+combinations through the imported auth module. They cover disabled slots,
+configuration metadata, duplicate fields, canonical Basic encoding, spoofed
+identity/group headers, unknown Consumers and authentication-before-authorization
+behavior, including method-specific challenges and identity preservation.
+These examples reuse the existing static policies; dynamic credential and
+membership lifecycle remain outside their scope.
