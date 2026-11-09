@@ -31044,3 +31044,308 @@ TEST(jit, jwt_all_scopes_checks_exact_membership_of_every_required_token) {
     check(R"({"sc\u006fpe":"r\u0065ad write"})", "write read", 204);
     rir.destroy();
 }
+
+TEST(jit, basic_and_header_key_rotation_revoke_slots_and_preserve_identity) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/authentication.rut";
+    // Both helpers share slot lifecycle semantics but retain their wire profiles.
+    for (bool basic : {true, false}) {
+        const char* current = basic ? "user:new:password" : "new:secret";
+        const char* previous = basic ? "user:old:password" : "old:secret";
+        struct Config {
+            const char* current;
+            const char* previous;
+            const char* consumer;
+            const char* current_id;
+            const char* previous_id;
+            u16 current_status;
+            u16 previous_status;
+        };
+        const Config configs[] = {
+            {current, previous, "customer", "new-id", "old-id", 201, 202},
+            {current, "", "customer", "new-id", "old-id", 201, 401},
+            {"", previous, "customer", "new-id", "old-id", 401, 202},
+            {"", "", "customer", "new-id", "old-id", 503, 503},
+            {current, current, "customer", "new-id", "old-id", 201, 401},
+            {current, previous, "", "new-id", "old-id", 503, 503},
+            {current, "", "customer", "", "old-id", 503, 503},
+            {"", previous, "customer", "new-id", "", 503, 503},
+            // Disabled slots still need stable metadata.
+            {current, "", "customer", "new-id", "", 503, 503},
+            {"", previous, "customer", "", "old-id", 503, 503},
+        };
+        std::string source = "import \"middleware/auth.rut\"\n";
+        for (u32 i = 0; i < sizeof(configs) / sizeof(configs[0]); ++i) {
+            const auto& config = configs[i];
+            source += "route GET \"/" + std::to_string(i) + "\" {\n let identity = auth.";
+            source += basic ? "rotatingBasic(req.authorization.or(\"\"), "
+                            : "rotatingHeaderKey(req.uniqueHeader(\"X-API-Key\").or(\"\"), ";
+            for (const char* value : {config.current,
+                                      config.previous,
+                                      config.consumer,
+                                      config.current_id,
+                                      config.previous_id}) {
+                source += "\"" + std::string(value) + "\", ";
+            }
+            source.resize(source.size() - 2);
+            source += ")\n guard identity.consumerId == \"customer\" && identity.method == \"";
+            source += basic ? "basic" : "apiKey";
+            source += "\" else { return 500 }\n";
+            source += "if identity.credentialId == \"new-id\" { return 201 } else {\n";
+            source +=
+                "if identity.credentialId == \"old-id\" { return 202 } else { return 500 }\n}\n}\n";
+        }
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+        if (!hir)
+            std::fprintf(stderr,
+                         "credential rotation: %.*s at %u:%u\n",
+                         hir.error().detail.len,
+                         hir.error().detail.ptr,
+                         hir.error().span.line,
+                         hir.error().span.col);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        const char* basic_headers[] = {
+            "Authorization: Basic dXNlcjpuZXc6cGFzc3dvcmQ=\r\n",
+            "authorization: bAsIc   dXNlcjpvbGQ6cGFzc3dvcmQ=\r\n",
+            "",
+            "Authorization: \r\n",
+            "Authorization: Basic dXNlcjp3cm9uZw==\r\n",
+            "Authorization: Bearer dXNlcjpuZXc6cGFzc3dvcmQ=\r\n",
+            "Authorization: Basic dXNlcjpuZXc6cGFzc3dvcmR=\r\n",  // noncanonical pad bits
+            "Authorization: Basic dXNlcjpuZXc6cGFzc3dvcmQ\r\n",   // missing padding
+            "Authorization: Basic dXNlcjpuZXc6cGFzc3dvcmQ=\r\nauthorization: wrong\r\n",
+            "Authorization: wrong\r\nauthorization: Basic dXNlcjpvbGQ6cGFzc3dvcmQ=\r\n",
+            ("Authorization: Basic dXNlcjpuZXc6cGFzc3dvcmQ=\r\nauthorization: Basic "
+             "dXNlcjpuZXc6cGFzc3dvcmQ=\r\n"),
+        };
+        const char* key_headers[] = {
+            "X-API-Key: new:secret\r\n",
+            "x-api-key: old:secret\r\n",
+            "",
+            "X-API-Key: \r\n",
+            "X-API-Key: wrong\r\n",
+            "Authorization: Bearer new:secret\r\n",
+            "X-API-Key: new:secret-extra\r\n",
+            "X-API-Key: NEW:secret\r\n",
+            "X-API-Key: new:secret\r\nx-api-key: wrong\r\n",
+            "X-API-Key: wrong\r\nx-api-key: old:secret\r\n",
+            "X-API-Key: new:secret\r\nx-api-key: new:secret\r\n",
+        };
+        for (u32 i = 0; i < sizeof(configs) / sizeof(configs[0]); ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "handler_route_%u", i);
+            auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+            REQUIRE(handler);
+            for (u32 j = 0; j < sizeof(basic_headers) / sizeof(basic_headers[0]); ++j) {
+                // Spoofed metadata cannot affect identity or slot selection.
+                const std::string request =
+                    std::string("GET / HTTP/1.1\r\nHost: local\r\n") +
+                    (basic ? basic_headers[j] : key_headers[j]) +
+                    "X-Consumer-ID: attacker\r\nX-Credential-ID: attacker\r\n\r\n";
+                const auto result =
+                    HandlerResult::unpack(handler(nullptr,
+                                                  nullptr,
+                                                  reinterpret_cast<const u8*>(request.data()),
+                                                  static_cast<u32>(request.size()),
+                                                  nullptr));
+                const u16 expected = j == 0                             ? configs[i].current_status
+                                     : j == 1                           ? configs[i].previous_status
+                                     : configs[i].current_status == 503 ? 503
+                                                                        : 401;
+                CHECK(result.action == HandlerAction::ReturnStatus);
+                if (result.status_code != expected)
+                    std::fprintf(stderr,
+                                 "%s config %u request %u got %u expected %u\n",
+                                 basic ? "basic" : "header",
+                                 i,
+                                 j,
+                                 result.status_code,
+                                 expected);
+                CHECK_EQ(result.status_code, expected);
+                if (expected == 401) {
+                    REQUIRE(result.next_state != 0);
+                    REQUIRE(result.next_state <= rir.module.header_set_count);
+                    const auto& headers = rir.module.header_sets[result.next_state - 1];
+                    REQUIRE(headers.count == 1);
+                    CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                    CHECK(rir.module.header_values[headers.offset].eq(
+                        lit(basic ? "Basic realm=\"rut\"" : "ApiKey")));
+                } else {
+                    CHECK_EQ(result.next_state, 0u);
+                }
+            }
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+TEST(jit, consumer_group_union_and_deny_policies_fail_closed) {
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/group-policies.rut";
+    struct PolicyCase {
+        u32 mode;  // union, deny, deny then union
+        const char* first_group;
+        const char* second_group;
+        const char* first_id;
+        const char* first_slot;
+        const char* second_slot;
+        const char* second_id;
+        const char* third_slot;
+        const char* fourth_slot;
+        u16 alice_status;
+        u16 bob_status;
+    };
+    const PolicyCase policies[] = {
+        {0, "reports", "ops", "alice", "reports", "ops", "bob", "ops", "", 204, 204},
+        {0, "reports", "admins", "alice", "reports", "", "bob", "", "admins", 204, 204},
+        {0, "reports", "reports", "alice", "", "reports", "bob", "ops", "", 204, 403},
+        {0, "reports", "admins", "alice", "Reports", "", "bob", "reports-extra", "", 403, 403},
+        {0, "reports", "admins", "alice", "", "", "bob", "", "", 403, 403},
+        {0, "", "ops", "alice", "ops", "", "bob", "ops", "", 503, 503},
+        {0, "reports", "", "alice", "reports", "", "bob", "reports", "", 503, 503},
+        {0, "reports", "ops", "alice", "reports", "", "alice", "ops", "", 503, 503},
+        {0, "reports", "ops", "", "reports", "", "bob", "ops", "", 503, 503},
+        {0, "reports", "ops", "alice", "reports", "reports", "bob", "ops", "", 503, 503},
+        {0, "reports", "ops", "alice", "reports", "", "", "ops", "", 503, 503},
+        {0, "reports", "ops", "Alice", "reports", "", "carol", "ops", "", 403, 403},
+        {1, "blocked", "", "alice", "reports", "blocked", "bob", "ops", "", 403, 204},
+        {1, "blocked", "", "alice", "blocked", "reports", "bob", "blocked", "", 403, 403},
+        {1, "blocked", "", "alice", "reports", "", "bob", "", "", 204, 204},
+        {1, "blocked", "", "alice", "Blocked", "", "bob", "blocked-extra", "", 204, 204},
+        {1, "", "", "alice", "reports", "", "bob", "ops", "", 503, 503},
+        {1, "blocked", "", "alice", "reports", "", "alice", "ops", "", 503, 503},
+        {1, "blocked", "", "alice", "reports", "", "bob", "ops", "ops", 503, 503},
+        {1, "blocked", "", "alice", "reports", "", "carol", "ops", "", 204, 403},
+        {1, "blocked", "", "", "reports", "", "bob", "ops", "", 503, 503},
+        {1, "blocked", "", "alice", "reports", "", "", "ops", "", 503, 503},
+        {2, "reports", "ops", "alice", "reports", "blocked", "bob", "ops", "", 403, 204},
+        {2, "reports", "ops", "alice", "", "", "bob", "ops", "", 403, 204},
+    };
+    std::string source = "import \"middleware/auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        const auto& policy = policies[i];
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += R"rut(
+    let identity = auth.multiAuth(req.authorization.or(""),
+        auth.ConsumerCredentials(consumerId: "alice", key: "a", credentials: "alice:pass", keyId: "ak", passwordId: "ap"),
+        auth.ConsumerCredentials(consumerId: "bob", key: "b", credentials: "bob:pass", keyId: "bk", passwordId: "bp"))
+)rut";
+        source += "let first = auth.ConsumerGroups(consumerId: \"" + std::string(policy.first_id) +
+                  "\", first: \"" + policy.first_slot + "\", second: \"" + policy.second_slot +
+                  "\")\n";
+        source += "let second = auth.ConsumerGroups(consumerId: \"" +
+                  std::string(policy.second_id) + "\", first: \"" + policy.third_slot +
+                  "\", second: \"" + policy.fourth_slot + "\")\n";
+        if (policy.mode == 2)
+            source += "let checked = auth.denyGroup(identity, \"blocked\", first, second)\n";
+        source += "let allowed = auth.";
+        source += policy.mode == 1   ? "denyGroup(identity, \""
+                  : policy.mode == 2 ? "requireAnyGroup(checked, \""
+                                     : "requireAnyGroup(identity, \"";
+        source += policy.first_group;
+        source += "\", ";
+        if (policy.mode != 1) source += "\"" + std::string(policy.second_group) + "\", ";
+        source += R"rut(first, second)
+    guard allowed.consumerId == identity.consumerId &&
+          allowed.credentialId == identity.credentialId && allowed.method == identity.method
+          else { return 500 }
+    return 204
+}
+)rut";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "group policies: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    if (!mir)
+        std::fprintf(stderr,
+                     "group policy MIR: %.*s at %u:%u\n",
+                     mir.error().detail.len,
+                     mir.error().detail.ptr,
+                     mir.error().span.line,
+                     mir.error().span.col);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char* requests[] = {
+        "Authorization: Bearer a\r\n",
+        "Authorization: Bearer b\r\n",
+        "Authorization: Basic YWxpY2U6cGFzcw==\r\n",
+        "Authorization: Basic Ym9iOnBhc3M=\r\n",
+        "",
+        "Authorization: wrong\r\n",
+        "Authorization: Bearer a\r\nauthorization: Bearer b\r\n",
+    };
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        for (u32 j = 0; j < sizeof(requests) / sizeof(requests[0]); ++j) {
+            const std::string request =
+                std::string("GET / HTTP/1.1\r\nHost: local\r\n") + requests[j] +
+                "X-Consumer-ID: alice\r\nX-Consumer-Groups: reports,ops\r\n\r\n";
+            const auto result =
+                HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              static_cast<u32>(request.size()),
+                                              nullptr));
+            const u16 expected = j >= 4       ? 401
+                                 : j % 2 == 0 ? policies[i].alice_status
+                                              : policies[i].bob_status;
+            CHECK(result.action == HandlerAction::ReturnStatus);
+            if (result.status_code != expected)
+                std::fprintf(stderr,
+                             "group policy %u request %u got %u expected %u\n",
+                             i,
+                             j,
+                             result.status_code,
+                             expected);
+            CHECK_EQ(result.status_code, expected);
+            // Only authentication failure challenges; neither ACL nor config failure does.
+            if (expected == 401) {
+                REQUIRE(result.next_state != 0);
+                REQUIRE(result.next_state <= rir.module.header_set_count);
+                const auto& headers = rir.module.header_sets[result.next_state - 1];
+                CHECK_EQ(headers.count, 2u);
+                CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                CHECK(rir.module.header_values[headers.offset].eq(lit("Bearer")));
+                CHECK(rir.module.header_values[headers.offset + 1].eq(lit("Basic realm=\"rut\"")));
+            } else {
+                CHECK_EQ(result.next_state, 0u);
+            }
+        }
+    }
+    engine.shutdown();
+    rir.destroy();
+}
