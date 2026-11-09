@@ -101,3 +101,9 @@ Both epoll and io_uring run at O0 and O2.
 receive helper with a one-node parser work limit and four receive attempts.
 The generic `resp2Receive` API and the two-read streaming example keep their
 existing contracts.
+
+The shared `resp2Token(bytes, offset)` parser decodes one complete scalar/bulk
+node or array header; `resp2Step` retains aggregate bookkeeping. The
+[pipeline library](redis-pipeline.md) reuses the same token grammar and streaming
+cursor for an explicit number of response roots. Its aggregate byte/node/read
+bounds apply to the complete batch.

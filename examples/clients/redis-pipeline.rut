@@ -1,0 +1,110 @@
+import "resp2.rut"
+
+// A finite batch, not a transaction. Public record fields are validated again
+// before any bytes are sent. The reply is published only after every root.
+struct RedisPipeline { request: Bytes count: i32 }
+struct RedisPipelineReply { frame: Bytes count: i32 }
+variant RedisPipelineResult {
+    reply(RedisPipelineReply)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+struct RedisPipelineState {
+    offset: i32
+    pending: i32
+    reply: i32
+    start: i32
+    end: i32
+    index: i32
+    requests: bool
+}
+struct RedisPipelineToken {
+    value: Resp2Token
+    reply: i32
+    pending: i32
+    start: i32
+    end: i32
+}
+func redisPipeline() -> RedisPipeline { RedisPipeline(request: b"", count: 0) }
+func redisPipelineAdd(_ pipeline: RedisPipeline, _ request: Bytes) {
+    guard pipeline.count > -1 && pipeline.count < 8 &&
+        (pipeline.count != 0 || pipeline.request.count == 0) else { nil }
+    guard redisRequestValid(request) else { nil }
+    guard let packet = concatBytes(pipeline.request, request, 8192) else { nil }
+    RedisPipeline(request: packet, count: pipeline.count + 1)
+}
+// Each completed root starts a new reply index. Selected byte spans survive
+// later roots, so accessors validate the whole batch before returning a slice.
+func redisPipelineStep(_ bytes: Bytes, _ state: RedisPipelineState) -> (RedisPipelineState, RedisPipelineToken, bool) {
+    guard let value = resp2Token(bytes, state.offset) else { nil }
+    let root = state.pending == 0
+    let reply = state.reply + resp2Select(root, 1, 0)
+    let pending = resp2Select(root, 1, state.pending) - 1 + value.children
+    let start = resp2Select(root && reply == state.index, state.offset, state.start)
+    let end = resp2Select(pending == 0 && reply == state.index, value.next, state.end)
+    guard reply < 8 && pending > -1 && !(pending > 64) &&
+        (!state.requests || (root && value.kind == 5 && value.children > 0) || (!root && value.kind == 4)) else { nil }
+    (RedisPipelineState(offset: value.next, pending: pending, reply: reply, start: start, end: end,
+        index: state.index, requests: state.requests),
+        RedisPipelineToken(value: value, reply: reply, pending: pending, start: start, end: end),
+        value.next == bytes.count && pending == 0)
+}
+func redisPipelineScan(_ bytes: Bytes, _ count: i32, _ index: i32, _ requests: bool) {
+    guard bytes.count > 0 && !(bytes.count > 8192) && count > 0 && count < 9 && index > -2 && index < count else { nil }
+    let initial = RedisPipelineState(offset: 0, pending: 0, reply: -1, start: -1, end: -1, index: index, requests: requests)
+    guard let values = collectBytes(bytes, initial, 64, redisPipelineStep) else { nil }
+    guard let last = values.get(values.count - 1) else { nil }
+    guard last.reply == count - 1 && last.pending == 0 && last.value.next == bytes.count else { nil }
+    values
+}
+func redisPipelineValues(_ reply: RedisPipelineReply) {
+    redisPipelineScan(reply.frame, reply.count, -1, false)
+}
+func redisPipelineReply(_ reply: RedisPipelineReply, _ index: i32) {
+    guard index > -1 else { nil }
+    guard let values = redisPipelineScan(reply.frame, reply.count, index, false) else { nil }
+    guard let last = values.get(values.count - 1) else { nil }
+    guard last.start > -1 && !(last.end < last.start) else { nil }
+    reply.frame.slice(last.start, last.end)
+}
+func redisPipelineReadTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let readingFirst = resp2Receive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp2Receive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func redisPipelineRead(_ connection: TcpConnection, _ count: i32) {
+    guard count > 0 && count < 9 else { nil }
+    let initial = Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: count, nodes: 0,
+        status: 0, search: 1, bulkEnd: -1, limit: 8192))
+    let readingFirst = redisPipelineReadTwice(connection, initial)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisPipelineReadTwice(connection, first)
+    guard let stream = readingSecond else { nil }
+    guard resp2Finished(stream) else { nil }
+    stream.bytes
+}
+func redisPipelineReadFailure(_ code: i32) -> RedisPipelineResult {
+    if code == 0 { RedisPipelineResult.replyFailure } else { RedisPipelineResult.transportFailure(code) }
+}
+func redisPipelineWire(_ connection: TcpConnection, _ pipeline: RedisPipeline) -> RedisPipelineResult {
+    guard let valid = redisPipelineScan(pipeline.request, pipeline.count, -1, true) else { RedisPipelineResult.requestFailure }
+    let sending = connection.send(pipeline.request, 1000)
+    guard let sent = sending else { RedisPipelineResult.transportFailure(netError()) }
+    let reading = redisPipelineRead(connection, pipeline.count)
+    guard let frame = reading else { redisPipelineReadFailure(netError()) }
+    RedisPipelineResult.reply(RedisPipelineReply(frame: frame, count: pipeline.count))
+}
+func redisPipelineExecute(_ connection: TcpConnection, _ pipeline: RedisPipeline) -> RedisPipelineResult {
+    let result = redisPipelineWire(connection, pipeline)
+    match result {
+        .reply(reply) => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
