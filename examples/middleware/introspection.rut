@@ -80,3 +80,12 @@ func requireBinding(_ document: Json, _ issuer: str, _ clientId: str) -> Json {
     guard bindingMatches(document, issuer, clientId) else { respond denied }
     document
 }
+
+// RFC 8705: bind authenticated AS metadata to this TLS connection. Call only
+// after requireActive; request JSON and forwarded certificate headers are untrusted.
+func requireMtls(_ document: Json) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard jwtCertificateBound(document, req.tlsClientCertSha256.or("")) else { respond denied }
+    document
+}

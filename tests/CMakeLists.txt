@@ -4453,6 +4453,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
         set_tests_properties(test_mtls_jwt_binding_${backend} PROPERTIES
             LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME test_mtls_introspection_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_introspection.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
+        set_tests_properties(test_mtls_introspection_${backend} PROPERTIES
+            LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME test_oauth_introspection_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_oauth_introspection.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})

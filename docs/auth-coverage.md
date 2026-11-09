@@ -1348,3 +1348,21 @@ The AS authenticates subjects and authorizes exchanges; the upstream enforces
 issued-token audience. Two-backend TLS/native HTTP/1+HTTP/2 tests cover malformed
 credentials/configuration, type confusion, subject isolation, cancellation and
 fail-closed AS errors after source/module removal. See [the profile](oauth-token-exchange.md).
+
+
+## Certificate-bound opaque access tokens
+
+`introspection.requireMtls` composes RFC 8705 certificate confirmation with the
+existing authenticated RFC 7662 callout. It compares the AS's canonical
+`cnf.x5t#S256` with the verified TLS client certificate for this request; a stolen
+token presented with another trusted certificate fails. Active state, expiry,
+audience, subject and permission policies still apply before forwarding checked
+identity. Missing client identity or malformed/mismatching confirmation returns
+challenged 401, while AS/transport/parser failures retain 503. Existing bearer
+routes are unchanged. This reuses bounded confirmation validation, with no new
+builtin, dependency or runtime state.
+
+The native-loaded two-shard fixture covers both backends, HTTP/1+HTTP/2,
+source/module removal, two same-key/different-DER client certificates, spoofing,
+malformed metadata, permissions, revocation, timeout, cancellation and concurrency.
+See [the contract and limits](oauth-introspection.md#optional-mtls-certificate-binding).

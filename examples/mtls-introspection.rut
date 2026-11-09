@@ -1,0 +1,25 @@
+// Start with --tls-cert, --tls-key and mandatory --tls-client-ca.
+// INTROSPECTION_ENDPOINT is a fixed trusted HTTPS endpoint policy.
+// INTROSPECTION_AUTH is a separate trusted service credential.
+import "middleware/introspection.rut"
+upstream backend at "127.0.0.1:9000"
+
+route GET "/reports" {
+    req.remove("Authorization")
+    req.remove("Cookie")
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let active = introspection.requireActive(reply, "reports-api")
+    let bound = introspection.requireMtls(active)
+    let subject = introspection.subject(bound)
+    match jwtHasScope(bound, "reports:read") {
+        true => {
+            req.set("X-Consumer-ID", subject)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => {
+            return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+        }
+    }
+}
