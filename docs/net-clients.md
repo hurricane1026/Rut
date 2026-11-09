@@ -218,3 +218,8 @@ ignored helper arguments, aliases, dirty/EOF/TTL eviction, cancellation, timeout
 policy/TLS identity separation and shutdown cleanup. Runtime tests additionally
 cover config retirement, stale request generations and independent active/idle
 capacity. The peer is an independent fixture, not a Redis deployment.
+
+[Authenticated Redis sessions](redis-sessions.md) now compose AUTH/SELECT with one
+GET/SET and acknowledged RESET before generic pool return. They restore identity
+and database state without adding protocol logic to the transport or raising its
+sixteen-operation limit.
