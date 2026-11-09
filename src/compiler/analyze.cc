@@ -14170,7 +14170,8 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                             route);
     }
 
-    if ((expr.name.eq(lit_str("jwtHasScope")) || expr.name.eq(lit_str("jwtHasAllScopes"))) &&
+    if ((expr.name.eq(lit_str("jwtHasScope")) || expr.name.eq(lit_str("jwtHasAllScopes")) ||
+         expr.name.eq(lit_str("jwtHasAnyScope"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -14184,8 +14185,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                     FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
             values[i] = value.value();
         }
-        return make_json_op(expr.name.eq(lit_str("jwtHasAllScopes")) ? json::Op::JwtHasAllScopes
-                                                                     : json::Op::JwtHasScope,
+        return make_json_op(expr.name.eq(lit_str("jwtHasAllScopes"))  ? json::Op::JwtHasAllScopes
+                            : expr.name.eq(lit_str("jwtHasAnyScope")) ? json::Op::JwtHasAnyScope
+                                                                      : json::Op::JwtHasScope,
                             HirTypeKind::Bool,
                             false,
                             &values[0],

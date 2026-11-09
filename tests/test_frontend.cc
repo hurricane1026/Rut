@@ -48028,3 +48028,30 @@ TEST(frontend, jwt_all_scopes_user_function_can_shadow_the_builtin) {
     REQUIRE(ast);
     REQUIRE(analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, jwt_any_scope_requires_unwrapped_json_and_one_string) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { if jwtHasAnyScope("{}", "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { if jwtHasAnyScope(json.parse("{}"), "read") { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtHasAnyScope(doc, 1) { return 200 } else { return 403 } })rut",
+        R"rut(route GET "/" { guard let doc = json.parse("{}") else { return 400 } if jwtHasAnyScope(doc) { return 200 } else { return 403 } })rut",
+    };
+    for (const char* src : invalid) {
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, jwt_any_scope_user_function_can_shadow_the_builtin) {
+    auto tokens = lex(
+        lit("func jwtHasAnyScope(_ claims: str, _ required: str) -> bool => claims == required\n"
+            "route GET \"/\" { if jwtHasAnyScope(\"read\", \"read\") { return 200 } else { return "
+            "403 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}

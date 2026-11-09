@@ -36,6 +36,11 @@ bool jwt_has_scope(json::Document& scratch, Str claims, Str required);
 // validated; malformed or empty input fails closed. Metadata only, no allocation.
 bool jwt_has_all_scopes(json::Document& scratch, Str claims, Str required_scopes);
 
+// Require at least one exact token from a nonempty configured scope list
+// (at most 1024 bytes). Validate both whole lists before permitting a match.
+// Metadata only; callers must authenticate claims separately. No allocation.
+bool jwt_has_any_scope(json::Document& scratch, Str claims, Str required_scopes);
+
 // RFC 8705 cnf.x5t#S256 match against a verified TLS certificate's canonical
 // lowercase SHA-256 hex fingerprint. Metadata only, not JWT/peer verification.
 // Exactly one confirmation method is admitted. No allocation or retained views.

@@ -1,0 +1,41 @@
+import "middleware/header_auth.rut"
+
+listen :8080
+
+// Trusted compile-time configuration. Empty keys disable a slot; at least one
+// must remain enabled. Use TLS and replace the snapshot to rotate or revoke.
+func alice() -> header_auth.HeaderKeyConsumer {
+    header_auth.HeaderKeyConsumer(consumerId: "alice", key: env("ALICE_HEADER_KEY"), credentialId: "alice-key")
+}
+func bob() -> header_auth.HeaderKeyConsumer {
+    header_auth.HeaderKeyConsumer(consumerId: "bob", key: env("BOB_HEADER_KEY"), credentialId: "bob-key")
+}
+
+// Only absence of X-API-Key allows guest access. Empty, wrong or duplicate
+// fields must fail, even when Authorization/query/body contains a valid key.
+route GET "/optional" {
+    let identity = header_auth.multiHeaderKeyOrAnonymous(req.headerCount("X-API-Key"),
+        req.uniqueHeader("X-API-Key").or(""), alice(), bob(), "guest")
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+// Authentication and authorization are separate: a valid guest receives 403.
+route GET "/private" {
+    let identity = header_auth.multiHeaderKeyOrAnonymous(req.headerCount("X-API-Key"),
+        req.uniqueHeader("X-API-Key").or(""), alice(), bob(), "guest")
+    let allowed = header_auth.requireAnyConsumer(identity, "alice", "bob")
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+// Leading removal effects preserve the original presence evidence used by header_auth.
+route GET "/stripped" {
+    req.remove("X-API-Key")
+    let identity = header_auth.multiHeaderKeyOrAnonymous(req.headerCount("X-API-Key"),
+        req.uniqueHeader("X-API-Key").or(""), alice(), bob(), "guest")
+    let credentialId = identity.credentialId
+    return response(200, body: credentialId)
+}
+
+route "/" { return 404 }

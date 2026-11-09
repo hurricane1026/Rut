@@ -643,6 +643,12 @@ canonical spelling for common gateway tasks.
 
 ### M4：身份、安全与企业访问（清单 3、4）
 
+- [x] JWT/已认证内省元数据支持有界 scope 列表任一权限授权：`jwtHasAnyScope`；
+  完整校验两侧列表、精确匹配、配置错误与权限拒绝分离，Rut 策略保留原文档。
+
+- [x] 双 Consumer 自定义 Header Key 支持仅凭证缺失时匿名：完整配置先校验、
+  歧义凭证与重复字段拒绝、禁用槽和独立 guest 身份，后续授权可拒绝匿名访问。
+
 - [x] 静态 RS256 策略支持 `revokedJtis` 和 `issuedAfter`；验证通过后才发布 claims。
 - [x] 固定 IPv4、TLS 主机名与 CA 的有界远程 JWKS 获取、shard 独立缓存/刷新、
   最大年龄拒绝和取消回收；只导入预先批准 kid，不按 Token 触发请求。
