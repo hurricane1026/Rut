@@ -144,8 +144,13 @@ subsequent RESET I/O. Source files are removed after startup; sibling nominal
 imports and namespace use are covered. CI covers epoll/io_uring at O0/O2 and verified TLS. This is protocol-fixture validation, not a live Redis installation
 or complete Redis-driver compatibility claim.
 
-The current compiler has a high memory cost for helper-heavy imports. Local O0
-measurements used about 12 GiB peak RSS for the preceding Redis library and about
-20 GiB for this session library/test program; splitting test routes did not reduce
-the latter peak. Run these integration compilations serially on a host with enough
-memory. No compiler, runtime or operation budget has been increased here.
+Helper-heavy imports used to expand repeated local initializers recursively during
+HIR normalization. Profiling the RESP2 command module found about 10.88 million HIR
+expressions before the root module was merged, with the largest request helpers
+each expanding to about 5.06 million expressions. Normalization now reuses each
+successful local initializer expansion within its function, outside scoped
+expression bindings. The same module now uses about 1.48 million expressions and
+the full session integration test completed in a 14 GiB, no-swap memory cgroup with
+a 3.33 GiB peak. The cache does not apply inside `LetIn` or `CollectBytes` binding
+scopes. Tests still compile serially to keep peak use predictable. No runtime or
+operation budget has been increased.

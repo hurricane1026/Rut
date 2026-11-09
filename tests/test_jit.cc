@@ -3861,6 +3861,95 @@ route GET "/users" { if jwtAuth() == 200 { return 200 } else { return 500 } }
     rir.destroy();
 }
 
+TEST(jit, imported_repeated_local_expansion_is_bounded_and_preserves_scoped_values) {
+    const std::string dir = "/tmp/rut_jit_import_local_normalization_cache";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/helpers.rut", std::ios::binary);
+        out << "func expand(_ seed: i32) -> i32 {\n";
+        std::string previous = "seed";
+        for (u32 i = 0; i < 7; ++i) {
+            const std::string current = "step" + std::to_string(i);
+            out << "    let " << current << " = " << previous << " + " << previous << "\n";
+            previous = current;
+        }
+        out << "    " << previous << " + " << previous << "\n";
+        out << "}\n";
+        out << "func scoped() -> i32 {\n";
+        out << "    if let query = req.query(\"q\") { parseInt(query).or(-1) } else { 9 }\n";
+        out << "}\n";
+        out << "func step(_ bytes: Bytes, _ position: i32) -> (i32, i32, bool) {\n";
+        out << "    guard let value = bytes[position] else { nil }\n";
+        out << "    (position + 1, value, position + 1 == bytes.count)\n";
+        out << "}\n";
+        out << "func collect(_ bytes: Bytes) -> Collected<i32> {\n";
+        out << "    collectBytes(bytes, 0, 8, step)\n";
+        out << "}\n";
+    }
+    const auto src = R"rut(
+import "helpers.rut"
+route GET "/" {
+    let scopedValue = scoped()
+    let value = expand(1)
+    guard scopedValue == 9 || scopedValue == 7 else { return 500 }
+    guard let values = collect(b"ab") else { return 500 }
+    guard value == 256 && values.count == 2 && values.get(0).or(-1) == 97 && values.get(1).or(-1) == 98 else { return 500 }
+    if scopedValue == 9 { return 200 } else { return 201 }
+}
+)rut";
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    const HirFunction* imported = nullptr;
+    for (u32 i = 0; i < hir->functions.len; ++i) {
+        if (hir->functions[i].name.eq(lit("expand"))) {
+            imported = &hir->functions[i];
+            break;
+        }
+    }
+    REQUIRE(imported != nullptr);
+    CHECK(imported->exprs.len < 128);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const auto check_request = [handler, _tc](
+                                   const char* request, u32 size, i32 expected, SliceArena* arena) {
+        const auto result = HandlerResult::unpack(
+            handler(nullptr, nullptr, reinterpret_cast<const u8*>(request), size, arena));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, expected);
+    };
+    check_request(kGetApiRequest, sizeof(kGetApiRequest) - 1, 500, nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    check_request(kGetApiRequest, sizeof(kGetApiRequest) - 1, 200, &arena);
+    constexpr char kQueryRequest[] =
+        "GET /?q=7 HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n";
+    arena.reset();
+    check_request(kQueryRequest, sizeof(kQueryRequest) - 1, 201, &arena);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_import_relative_file_with_package_decl_merges_imported_function_symbols) {
     const std::string dir = "/tmp/rut_import_packaged_jit";
     std::filesystem::create_directories(dir);
