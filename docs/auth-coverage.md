@@ -1366,3 +1366,17 @@ The native-loaded two-shard fixture covers both backends, HTTP/1+HTTP/2,
 source/module removal, two same-key/different-DER client certificates, spoofing,
 malformed metadata, permissions, revocation, timeout, cancellation and concurrency.
 See [the contract and limits](oauth-introspection.md#optional-mtls-certificate-binding).
+
+
+## Complete required-scope list policy
+
+`jwtHasAllScopes` authorizes every permission in a trusted nonempty list, bounded
+to 1024 bytes, against the verified document's top-level scope. It validates both
+whole lists under the existing strict grammar before granting permission. Exact
+case-sensitive token membership accepts reordering/duplicates and rejects partial
+grants, malformed suffixes or missing metadata. It does not authenticate JSON.
+`oauth_client.authorizationForScopes` composes the primitive with the existing
+trusted token-endpoint/Bearer/expiry/error policy, returning 503 without forwarding
+when any required permission is absent. No language keyword, dependency, I/O or
+cache is added. See [the contract](upstream-oauth.md#require-all-configured-permissions)
+and [the example](../examples/upstream-oauth-all-scopes.rut).

@@ -773,3 +773,91 @@ TEST(jwt_claims, certificate_binding_requires_exact_canonical_confirmation) {
     }
     CHECK(jwt_certificate_bound(scratch, valid, fingerprint));
 }
+
+TEST(jwt_claims, all_scopes_require_the_complete_valid_list) {
+    json::Document scratch;
+    const Str kClaims = lit_str(R"({"scope":"read write admin"})");
+    const Str valid[] = {lit_str("read"),
+                         lit_str("write read"),
+                         lit_str("read write admin"),
+                         lit_str("read read write"),
+                         lit_str("admin write read")};
+    for (Str required : valid) CHECK(jwt_has_all_scopes(scratch, kClaims, required));
+    const Str invalid[] = {
+        lit_str(""),
+        lit_str("read delete"),
+        lit_str("Read write"),
+        lit_str("reader"),
+        lit_str(" read"),
+        lit_str("read "),
+        lit_str("read  write"),
+        lit_str("read\twrite"),
+        lit_str("read\n"),
+        lit_str("read\\write"),
+        lit_str("read\"write"),
+        lit_str("réad"),
+        {"read\0write", 10},
+        {nullptr, 1},
+    };
+    for (Str required : invalid) CHECK(!jwt_has_all_scopes(scratch, kClaims, required));
+    const Str malformed[] = {
+        lit_str(R"({"scope":"read write\t"})"),
+        lit_str(R"({"scope":"read  write"})"),
+        lit_str(R"({"scope":"read write "})"),
+        lit_str(R"({"scope":""})"),
+        lit_str(R"({"scope":["read","write"]})"),
+        lit_str(R"({"scope":null})"),
+        lit_str(R"({"scope":"read write","sc\u006fpe":"read write"})"),
+        lit_str(R"({"nested":{"scope":"read write"}})"),
+        lit_str("{}"),
+        lit_str("[]"),
+    };
+    for (Str claims : malformed) CHECK(!jwt_has_all_scopes(scratch, claims, lit_str("read write")));
+    CHECK(jwt_has_all_scopes(
+        scratch, lit_str(R"({"sc\u006fpe":"r\u0065ad write"})"), lit_str("write read")));
+    char required[1025];
+    for (char& byte : required) byte = 'a';
+    char claims[1040];
+    json::Writer output{claims};
+    output.text(lit_str("{\"scope\":\""));
+    output.text({required, 1024});
+    output.text(lit_str("\"}"));
+    CHECK(jwt_has_all_scopes(scratch, {claims, output.len}, {required, 1024}));
+    CHECK(!jwt_has_all_scopes(scratch, {claims, output.len}, {required, 1025}));
+    CHECK(!jwt_has_all_scopes(scratch, {nullptr, 1}, lit_str("read")));
+    // Scratch aliases are copied before parsing and member-name decoding.
+    for (u32 i = 0; i < 10; ++i) scratch.scratch[i] = "read write"[i];
+    CHECK(jwt_has_all_scopes(scratch, kClaims, {scratch.scratch, 10}));
+}
+
+TEST(jwt_claims, all_scopes_matches_independent_three_permission_set_oracle) {
+    constexpr Str kTokens[] = {lit_str("read"), lit_str("write"), lit_str("admin")};
+    json::Document scratch;
+    for (u32 granted = 0; granted < 8; ++granted) {
+        char claims[128];
+        json::Writer output{claims};
+        output.text(lit_str("{\"scope\":\""));
+        bool first = true;
+        for (u32 bit = 0; bit < 3; ++bit) {
+            if (!(granted & (1u << bit))) continue;
+            if (!first) output.put(' ');
+            first = false;
+            output.text(kTokens[bit]);
+        }
+        output.text(lit_str("\"}"));
+        for (u32 required = 1; required < 8; ++required) {
+            char scopes[64];
+            json::Writer policy{scopes};
+            first = true;
+            // Reverse ordering relative to the grant list.
+            for (u32 bit = 3; bit > 0; --bit) {
+                if (!(required & (1u << (bit - 1)))) continue;
+                if (!first) policy.put(' ');
+                first = false;
+                policy.text(kTokens[bit - 1]);
+            }
+            CHECK_EQ(jwt_has_all_scopes(scratch, {claims, output.len}, {scopes, policy.len}),
+                     (granted & required) == required);
+        }
+    }
+}

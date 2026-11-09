@@ -159,3 +159,31 @@ configuration; timeout; disconnected callers; fresh concurrent tokens and no
 secret logging or implicit token-endpoint response propagation. Unavailable
 io_uring is explicitly skipped with code 77. The fixture implements this protocol
 profile, not a full OAuth provider or a persistent authorization server.
+
+
+## Require all configured permissions
+
+`oauth_client.authorizationForScopes(reply, requiredScopes)` requires the AS's
+explicit granted `scope` to contain every permission in a trusted list of up to
+1024 bytes. This is a resource policy built on `jwtHasAllScopes`; it reuses the
+[RFC 6749 section 3.3](https://www.rfc-editor.org/rfc/rfc6749#section-3.3) grammar
+already used for outgoing scope requests. Reordering, duplicates and additional
+granted permissions are accepted; missing any required permission rejects the
+response with 503 before forwarding. Missing, malformed or ambiguous scope
+metadata and invalid/empty policy also fail closed. There is no partial-grant
+fallback and no implicit grant when scope is absent.
+
+The [all-scopes example](../examples/upstream-oauth-all-scopes.rut) uses the same
+trusted `UPSTREAM_SCOPE` snapshot for the client-credentials request and response
+policy. Caller headers and query parameters cannot choose permissions. Bearer
+token grammar/type, positive integer expiry, OAuth error and trusted-HTTPS checks
+remain mandatory; the original single-permission `authorization` helper retains
+its behavior. The new helper does not authenticate arbitrary JSON, cache tokens,
+retry a denied grant or decide which permissions the AS may issue.
+
+Native, frontend and JIT tests cover the primitive's exact set semantics, malformed
+whole lists, escaped JSON, the 1024-byte boundary and borrowed-scratch lifetime.
+The native-loaded two-shard HTTP fixture exercises the example after source/module
+removal on epoll and io_uring, including reordered/wider/partial grants, HTTP/2,
+credential separation and concurrent requests. Existing one-permission and
+resource-indicator routes remain in the same regression matrix.

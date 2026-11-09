@@ -2834,7 +2834,8 @@ extern "C" void rut_helper_json(void* conn,
         op != static_cast<u32>(json::Op::OauthClientCredentialsRequest) &&
         op != static_cast<u32>(json::Op::OauthClientCredentialsResourceRequest) &&
         op != static_cast<u32>(json::Op::OauthTokenExchangeRequest) &&
-        op != static_cast<u32>(json::Op::JwtCertificateBound))
+        op != static_cast<u32>(json::Op::JwtCertificateBound) &&
+        op != static_cast<u32>(json::Op::JwtHasAllScopes))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2866,6 +2867,9 @@ extern "C" void rut_helper_json(void* conn,
         view = {"", 0};
     } else if (operation == json::Op::JwtHasScope) {
         scalar = jwt_has_scope(document, {a, a_len}, {b, b_len}) ? 1 : 0;
+        view = {"", 0};
+    } else if (operation == json::Op::JwtHasAllScopes) {
+        scalar = jwt_has_all_scopes(document, {a, a_len}, {b, b_len}) ? 1 : 0;
         view = {"", 0};
     } else if (operation == json::Op::JwtCertificateBound) {
         scalar = jwt_certificate_bound(document, {a, a_len}, {b, b_len}) ? 1 : 0;

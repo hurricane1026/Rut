@@ -63,6 +63,12 @@ def main():
                 'typed-expiry': dict(expires_in='3600'), 'bool-expiry': dict(expires_in=True),
                 'fractional-expiry': dict(expires_in=1.5), 'overflow-expiry': dict(expires_in=2**63),
                 'narrow-scope': dict(scope='reports:read'),
+                'two-scopes': dict(scope='reports:read reports:write'),
+                'reordered-scopes': dict(scope='a+b/x=%& reports:write reports:read'),
+                'wider-scopes': dict(scope='admin ' + requested_scope),
+                'repeated-scopes': dict(scope=requested_scope + ' reports:read'),
+                'case-scope': dict(scope='Reports:read reports:write a+b/x=%&'),
+                'prefix-scope': dict(scope='reports:read reports:write a+b/x=%&extra'),
                 'wrong-scope': dict(scope='reports:reader'), 'typed-scope': dict(scope=['reports:read']),
                 'bad-scope': dict(scope='reports:read  reports:write'),
                 'error-field': dict(error='invalid_client'), 'null-error': dict(error=None),
@@ -94,7 +100,7 @@ def main():
                 status = 400
             if self.headers.get('Authorization') != service_auth:
                 status = 401
-            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent', 'narrow-scope', 'ignore-resource'):
+            if status == 200 and selected in ('valid', 'mixed-type', 'escaped-token', 'concurrent', 'narrow-scope', 'ignore-resource', 'two-scopes', 'reordered-scopes', 'wider-scopes', 'repeated-scopes'):
                 with lock:
                     issued.append(body['access_token'])
                     token_resources[body['access_token']] = None if selected == 'ignore-resource' else requested_resource
@@ -174,6 +180,8 @@ def main():
             scoped = (examples / 'upstream-oauth-scoped.rut').read_text()
             scoped = scoped[scoped.index('route GET'):]
             source += scoped
+            all_scopes = (examples / 'upstream-oauth-all-scopes.rut').read_text()
+            source += all_scopes[all_scopes.index('route GET'):]
             invalid_scopes = ('', ' reports:read', 'reports:read ', 'reports:read  write',
                               'reports:read\twrite', 'reports:read\nwrite', 'reports:read"',
                               'reports:read\\', 'réad', 'reports:read\x00', 'x' * 1025)
@@ -242,7 +250,7 @@ def main():
                             connection.close()
 
                     for authorization in ('', 'Basic YTpi', 'Bearer wrong', 'Bearer a b'):
-                        for path in ('/service-reports', '/scoped-reports', '/resource-reports'):
+                        for path in ('/service-reports', '/scoped-reports', '/resource-reports', '/all-scope-reports'):
                             assert request(path, authorization=authorization)[0] == 401
                         assert not calls and not forwarded
                     for selected in ('valid', 'mixed-type', 'escaped-token'):
@@ -258,6 +266,16 @@ def main():
                         before = len(calls)
                         assert request(path)[::2] == (200, b'upstream-ok')
                         assert len(calls) == before + 1 and calls[-1][2] == scoped_body
+                    for selected in ('valid', 'reordered-scopes', 'wider-scopes', 'repeated-scopes'):
+                        mode = selected
+                        before = len(calls)
+                        assert request('/all-scope-reports')[::2] == (200, b'upstream-ok')
+                        assert len(calls) == before + 1 and calls[-1][2] == scoped_body
+                    for selected in ('narrow-scope', 'two-scopes', 'case-scope', 'prefix-scope', 'bad-scope'):
+                        mode = selected
+                        before = len(forwarded)
+                        assert request('/all-scope-reports')[0] == 503, selected
+                        assert len(forwarded) == before
                     mode = 'narrow-scope'
                     assert request('/scoped-reports')[::2] == (200, b'upstream-ok')
                     mode = 'valid'
@@ -301,10 +319,11 @@ def main():
                            'redirect', 'unavailable', 'denied')
                     for selected in bad:
                         mode = selected
-                        before = len(forwarded)
-                        status, _, body = request()
-                        assert status == 503, (selected, status, body)
-                        assert len(forwarded) == before
+                        for path in ('/service-reports', '/all-scope-reports'):
+                            before = len(forwarded)
+                            status, _, body = request(path)
+                            assert status == 503, (path, selected, status, body)
+                            assert len(forwarded) == before
                     mode = 'valid'
                     for path in ('/bad-config', '/unsafe-config', '/wrong-tls', '/bad-service', '/empty-scope'):
                         before = len(forwarded)
@@ -322,7 +341,7 @@ def main():
                     before_forwarded = len(forwarded)
                     before_issued = len(issued)
                     with ThreadPoolExecutor(max_workers=4) as workers:
-                        results = list(workers.map(lambda i: request(('/service-reports', '/scoped-reports', '/resource-reports')[i % 3]), range(4)))
+                        results = list(workers.map(lambda i: request(('/service-reports', '/scoped-reports', '/resource-reports', '/all-scope-reports')[i % 4]), range(4)))
                     assert all((status, body) == (200, b'upstream-ok') for status, _, body in results), results
                     assert len(calls) == before + 4  # Every request gets a new token; no cached allow.
                     actual = {headers['Authorization'] for _, headers in forwarded[before_forwarded:]}
@@ -348,7 +367,7 @@ def main():
                         return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
 
                     # The same native policy also resumes into HTTP/2 forwarding.
-                    for path in (b'/service-reports', b'/scoped-reports', b'/resource-reports'):
+                    for path in (b'/service-reports', b'/scoped-reports', b'/resource-reports', b'/all-scope-reports'):
                         with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
                             auth = ('Bearer ' + caller_key).encode()
                             block = (b'\x82\x86\x04' + bytes((len(path),)) + path +
