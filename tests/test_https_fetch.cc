@@ -1,4 +1,5 @@
 #include "es256_fixture.h"
+#include "posix.h"
 #include "rs256_fixture.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
@@ -933,7 +934,7 @@ struct PoolOrigin {
         if (listener >= 0) ::close(listener);
     }
     bool init() {
-        listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        listener = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
