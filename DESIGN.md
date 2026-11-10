@@ -9088,6 +9088,96 @@ original reads, and no alternate credential source is tried. This is an ordinary
 bounded Rut helper with no new syntax, primitive, dependency or state. See
 `examples/optional-multi-header-key-auth.rut`.
 
+### Online JWT token permits
+
+The ordinary `jwt_session` module and `examples/jwt-session-auth.rut` compose
+pinned HS256 signature/claims verification with the existing authenticated Redis
+session library. The exact verified compact token is hashed with SHA-256 into a
+trusted 1–128-byte namespace; the resulting Redis key is at most 193 bytes. The
+raw token and JWT key are not forwarded to Redis. A token must be enrolled by a
+trusted external session owner, even if its signature and claims are valid.
+
+Only the terminal `.value(b"active")` result of `redisSessionGet` permits use;
+missing/other bulk values return challenged 401, while every initialization,
+protocol, transport, RESET or release failure returns 503. The root module maps
+the typed result to 1/0/-1, and `jwt_session.requireActiveStatus` rejects all other
+integers. This mapper/provenance obligation is explicit: caller-supplied status
+numbers do not authenticate a session. Verification precedes service I/O, and
+identity publication follows a successful GET and acknowledged cleanup. Existing
+import depth, inlining and finite I/O limits remain unchanged.
+
+There is no local positive cache or JWT-only offline allow. Permit deletion
+rejects the next authoritative lookup; already-admitted requests may finish.
+The external owner controls enrollment, finite permit expiry, namespace isolation,
+persistence and replication/failover, including stale or restored permits. This
+profile adds no login/refresh endpoint, cookie session, cross-node synchronization
+protocol, keyword, builtin or dependency. Its `POST /logout` verifies the same
+local token policy, then deletes only that token's derived permit through
+AUTH/SELECT/DEL/RESET. Canonical single-key counts 0 and 1 share empty 204/no-store
+after acknowledged cleanup. Failed or malformed acknowledgements and cleanup
+return 503, even when deletion may already have taken effect. Semantic reply
+failures poison the lease; the profile does not retry, restore permits, accept a
+query/body target, or invalidate other tokens with the same subject/jti. See
+`docs/jwt-sessions.md` for the exact contract and two-backend native/TLS evidence.
+
+### Trusted fixed-subject session issuance
+
+`POST /sessions` in the online JWT example accepts only an independent configured
+service Bearer key, distinct from its JWT signing key. Original singleton reads
+and process-shared peer-IP admission precede UUID generation and service I/O.
+Subject, issuer, audience, signing key, namespace, scope list and 300-second TTL
+are trusted configuration. The pure `jwt_session.issueHs256` helper retains a single token,
+its hash-derived key and exact signed expiry as Bytes. It does not narrow the
+expiry timestamp or let client metadata choose claims.
+
+Authenticated SET NX EXAT must return exact simple OK, and RESET/release must
+succeed before a no-store/no-cache token response. NX refusal or any fault returns
+503 without token publication. An applied SET followed by failed acknowledgement
+can leave an orphan only until its original signed expiry; no retry, overwrite
+or renewal is attempted. Native tests independently check the signed output,
+UUID, hash key, absolute expiry and subsequent access/logout across I/O resumes.
+This is trusted issuance, not end-user password login or an OAuth grant. The
+PBKDF2 prefix's prohibition on later network yields is retained. See
+`docs/jwt-sessions.md` for configuration and deployment ownership.
+
+### Online-session HS256 signing-key rotation
+
+The online session wrapper validates mandatory current and optional previous
+32–4096-byte keys, then evaluates both pinned HS256 decodes with independently
+owned claims and selects current first. Invalid nonempty slots and empty current
+are configuration errors even if another key could verify. The selected document
+must still pass issuer/audience/subject/time policy before the unchanged online
+permit check. Issuance always signs with current; the service issuer credential
+must differ from both slots.
+
+A grace-window token retains its exact compact bytes and permit key, and can
+still authenticate/logout through previous. Removing previous in a later adopted
+configuration rejects its signatures before Redis, without deleting/migrating
+permits or affecting new-key tokens. Existing generation readers may finish;
+configuration distribution and staged trust rollout are external responsibilities.
+The fixed two-key profile adds no key fetch or automatic retirement timer. Native
+sequential snapshots sharing one store test grace, retirement, current-only
+signing and fail-closed malformed configurations; in-process RCU is not newly
+claimed. See `docs/jwt-sessions.md`.
+
+### Scope-authorized online sessions
+
+Online issuance pins a trusted 1–1024-byte `SESSION_SCOPES` list into the existing
+seven-claim HS256 profile. Empty/malformed/oversize grant configuration returns
+nil and 503 before registration; token expiry, namespace, UUID and key rotation
+contracts are unchanged. No request metadata selects permissions.
+
+`GET /read` and `POST /write` reuse the full signature/claims/permit/cleanup flow,
+then apply exact `jwtHasScope` requirements for `orders:read` and `orders:write`.
+An active session with a missing, malformed or insufficient grant receives
+403/insufficient_scope; invalid or revoked tokens and service failures retain
+401/503 precedence. Success is empty 204/no-store. The identity-only `/private`
+route still publishes the verified subject without business permissions. Existing
+claims/permits are not upgraded by changing issuer configuration. Signed-fixture
+native tests, including old-key grace and issued read-only tokens, verify this
+composition without new syntax, builtins, dependencies or runtime state. See
+`docs/jwt-sessions.md`.
+
 ### Binding authenticated Consumer identities
 
 `identity_auth.requireSameConsumer(first, second, policyId)` combines two already-verified

@@ -1,0 +1,168 @@
+import "clients/redis-client.rut"
+import "middleware/jwt_session.rut"
+
+listen :8080
+
+// Map only a completed authenticated Redis session result. GET alone is not
+// enough: failed initialization/reset/release must prevent publishing an allow.
+func sessionPermitStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => if data == b"active" { 1 } else { 0 }
+        .missing => 0
+        _ => -1
+    }
+}
+
+// DEL is issued for exactly one key: only counts 0 and 1 are acknowledgements.
+// Missing and present permits deliberately share the same logout result.
+func sessionWriteReply(_ reply: Resp2Token, _ integerAck: bool) -> RedisSessionResult {
+    if reply.kind == 2 { RedisSessionResult.serverError(reply.data) } else {
+        if (integerAck && reply.kind == 3 && (reply.data == b"0" || reply.data == b"1")) ||
+            (!integerAck && reply.kind == 1 && reply.data == b"OK") {
+            RedisSessionResult.ok
+        } else { RedisSessionResult.replyFailure }
+    }
+}
+
+func sessionExecuteWrite(_ connection: TcpConnection, _ request: Bytes, _ integerAck: bool) -> RedisSessionResult {
+    guard request.count > 0 else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    let reading = redisReply(connection)
+    guard let reply = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    sessionWriteReply(reply, integerAck)
+}
+
+func sessionDelete(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                   _ database: i32, _ key: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let result = sessionExecuteWrite(connection, resp2KeyRequest(b"DEL", key).or(b""), true)
+    if redisSessionAlreadyClosed(result) {
+        // Semantic reply failures (e.g. DEL count 2) must poison the lease too.
+        let closed = connection.close()
+        result
+    } else { redisSessionFinish(connection, result) }
+}
+
+func sessionWriteSucceeded(_ result: RedisSessionResult) -> bool {
+    match result { .ok => true _ => false }
+}
+
+// Fresh registration is one atomic SET NX EXAT. Never publish a token on NX
+// refusal or before the shared authenticated session cleanup has succeeded.
+func sessionEnrollRequest(_ key: Bytes, _ expiry: Bytes) {
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let expiration = resp2BulkArgument(expiry, 8192) else { nil }
+    guard let prefix = concatBytes(b"*6\r\n$3\r\nSET\r\n", keyed, 8192) else { nil }
+    guard let arguments = concatBytes(prefix, b"$6\r\nactive\r\n$2\r\nNX\r\n$4\r\nEXAT\r\n", 8192) else { nil }
+    concatBytes(arguments, expiration, 8192)
+}
+
+func sessionEnroll(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                   _ database: i32, _ key: Bytes, _ expiry: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let result = sessionExecuteWrite(connection, sessionEnrollRequest(key, expiry).or(b""), false)
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        result
+    } else { redisSessionFinish(connection, result) }
+}
+
+// The AS/session owner must enroll each token before use. Read permits from a
+// trusted authoritative Redis 6.2+ service; use verified TLS in deployment.
+route GET "/private" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, key)
+    let active = jwt_session.requireActiveStatus(sessionPermitStatus(result))
+    // Publish a subject only after signature, claims and online permit checks.
+    guard let subject = json.string(json.get(document, "/sub").or(document)) else { return 503 }
+    return response(200, body: subject)
+}
+
+// Authorization follows signature/claims verification and an active online permit.
+route GET "/read" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, key)
+    let active = jwt_session.requireActiveStatus(sessionPermitStatus(result))
+    guard jwtHasScope(document, "orders:read") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+
+route POST "/write" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, key)
+    let active = jwt_session.requireActiveStatus(sessionPermitStatus(result))
+    guard jwtHasScope(document, "orders:write") else {
+        return response(403, headers: {"WWW-Authenticate": "Bearer error=\"insufficient_scope\""})
+    }
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+
+// A locally valid bearer token may revoke only its own exact permit, whether
+// that permit exists or not. This is self-service logout, not RFC 7009.
+route POST "/logout" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = sessionDelete(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, key)
+    guard sessionWriteSucceeded(result) else { return 503 }
+    let acknowledged = response(204)
+    acknowledged.set("Cache-Control", "no-store")
+    return acknowledged
+}
+
+// Trusted issuer control-plane credential, distinct from the JWT signing key.
+// Subject/issuer/audience/namespace/scopes are fixed configuration, not client input.
+@rateLimit(limit: 5, window: 1m, burst: 5, by: ip, scope: global)
+route POST "/sessions" {
+    guard Bytes(env("SESSION_ISSUE_KEY")).count >= 32 && env("SESSION_ISSUE_KEY") != env("JWT_SECRET") &&
+        env("SESSION_ISSUE_KEY") != env("JWT_PREVIOUS_SECRET") &&
+        (env("JWT_PREVIOUS_SECRET") == "" || (Bytes(env("JWT_PREVIOUS_SECRET")).count >= 32 &&
+            Bytes(env("JWT_PREVIOUS_SECRET")).count <= 4096)) &&
+        bearerMatches("Bearer " + env("SESSION_ISSUE_KEY"), env("SESSION_ISSUE_KEY")) else { return 503 }
+    guard bearerMatches(req.authorization.or(""), env("SESSION_ISSUE_KEY")) else {
+        return response(401, headers: {"WWW-Authenticate": "Bearer"})
+    }
+    let pendingId = uuid()
+    guard let tokenId = pendingId else { return 503 }
+    guard let issued = jwt_session.issueHs256(env("SESSION_SUBJECT"), env("JWT_ISSUER"),
+        env("JWT_AUDIENCE"), tokenId, env("JWT_SECRET"), env("JWT_SESSION_NAMESPACE"), env("SESSION_SCOPES")) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = sessionEnroll(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, issued.key, issued.expiry)
+    guard sessionWriteSucceeded(result) else { return 503 }
+    let token = issued.token
+    return response(200, body: token, headers: {
+        "Content-Type": "application/jwt", "Cache-Control": "no-store", "Pragma": "no-cache"
+    })
+}
+
+route "/" { return 404 }

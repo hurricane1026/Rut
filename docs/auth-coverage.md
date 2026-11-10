@@ -35,7 +35,7 @@ whether a competing open-source edition includes them.
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
-| Shared identity / sessions | Pending | Session lifecycle, fixation/CSRF defenses, rotation/revocation, shard ownership and explicit cross-node consistency |
+| Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
 
 `auth.rotatingBasic` provides a static current/previous Basic credential window
 for one configured Consumer. Both slots are evaluated, current wins a tie, and
@@ -1499,3 +1499,65 @@ identity/group headers, unknown Consumers and authentication-before-authorizatio
 behavior, including method-specific challenges and identity preservation.
 These examples reuse the existing static policies; dynamic credential and
 membership lifecycle remain outside their scope.
+
+## Online JWT session permits
+
+[jwt-session-auth.rut](../examples/jwt-session-auth.rut) now combines pinned HS256
+signature/claims verification with a per-request authenticated Redis permit.
+Only the exact bulk string `active` allows, after successful AUTH/SELECT/GET and
+acknowledged RESET/release. Missing permits reject with 401; service, parsing,
+timeout and cleanup failures reject with 503. Unknown tokens and store loss
+cannot fall back to local signature verification. Keys contain a trusted bounded
+namespace and SHA-256 of the complete token, not client-selected subject/jti keys.
+
+The trusted session owner can use `POST /sessions` with an independent configured
+issuer Bearer credential: UUID-backed fixed-subject HS256 issuance must complete
+atomic SET NX EXAT and acknowledged cleanup before publishing a token. The signed
+expiry and permit expiry match exactly; failed/NX-refused registration cannot
+publish or overwrite a token. The shipped peer-IP admission rule limits attempts.
+The gateway's `POST /logout` verifies
+the token before deleting only its own permit. Present/absent permits share empty
+204/no-store after an acknowledged canonical single-key DEL and RESET/release.
+Framing, service and cleanup failures return 503, including ambiguous failures
+after an applied deletion. Other same-subject/same-jti tokens remain independent.
+End-user password/OAuth login and renewal are separate. Revocation affects the
+next authoritative lookup, while
+already-admitted requests can finish. Persistence, stale-replica/rollback behavior
+and failover remain the operator's responsibility. There is no positive cache.
+The JIT mapper/bounds tests and registered epoll/io_uring O0/O2 and service-TLS
+native tests cover rejection, deletion/re-enrollment, source-unlinked execution,
+invalid-token non-I/O, same-jti token isolation, protocol faults and cleanup after
+a previously successful GET. See [the exact contract](jwt-sessions.md).
+
+### Online-session signing-key rotation
+
+The same online permit profile now accepts a validated current/previous HS256
+key pair with current-first claims selection. Current remains mandatory; an
+empty previous slot disables it, and every nonempty slot is 32–4096 bytes.
+Malformed configuration fails with 503 before lookup. Issuance uses only current,
+and the independent issuer credential cannot reuse either signing key.
+
+Existing old-key tokens retain their exact-token permits during grace, including
+logout. After adopting a snapshot that removes previous, old signatures fail
+before service I/O even if a permit exists. Registered native snapshot tests
+share one store across grace/retirement configurations, verify new signatures
+independently, preserve claims/expiry checks and cover invalid key slots. These
+are configuration-snapshot tests, not RCU or distributed rollout tests. See
+[the contract](jwt-sessions.md#hs256-signing-key-rotation).
+
+### Scope-authorized online sessions
+
+The trusted issuer now signs an explicitly configured `SESSION_SCOPES` list into
+the seven-claim token. Its 1–1024-byte complete OAuth grammar validates before
+any registration I/O. Client scope hints never select or enlarge the grant.
+`GET /read` and `POST /write` require separate exact permissions after signature,
+claims, active permit and acknowledged cleanup. Valid active but insufficient
+or malformed grants receive 403/insufficient_scope; revoked permits and service
+failures retain 401/503 precedence. Identity-only `/private` is unchanged.
+
+Native HTTP/1.0 and HTTP/1.1 matrices include independently signed grant shapes,
+whole-list/case/prefix failures, spoofed scope metadata, read-only issued tokens,
+logout and service/cleanup failures. Grace-period old-key tokens obey the same
+permissions. A malformed configured grant fails issuance before touching Redis;
+JIT tests also cover the 1024/1025-byte bound. See
+[scoped session policy](jwt-sessions.md#scope-authorization-for-online-sessions).

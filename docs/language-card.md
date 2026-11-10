@@ -14,15 +14,6 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 
 ## File anatomy
 
-Before LLVM code generation, every handler passes RIR structure and modeled
-wait-protocol checks. Yielding handlers also pass progress-cycle checks and
-bounded completion/cancel/close exploration for two consecutive waits. Invalid
-resume mappings, wait-arm mismatches, yielding progress cycles and exhausted
-verification budgets are compile failures. Known finite peer contracts can be
-attached through the compiler API for mutual-wait checks; unknown network peer
-behavior is not inferred. See
-[verification coverage](user-code-formal-verification.md#current-compiler-checks).
-
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
@@ -3229,12 +3220,94 @@ replies have a two-receive bound; GET/SET keep four. RESET requires Redis 6.2+;
 failures close instead of sharing authentication/database state. See
 [session results, budgets and ownership](redis-sessions.md).
 
-## Memcached library client
+## Online HS256 JWT session permits
 
-Import `"clients/memcache-client.rut"` from an example for bounded single-key
-GET, SET/ADD/REPLACE, DELETE and TOUCH. These are ordinary Rut functions over
-the existing TCP/TLS and Bytes surface. Typed results preserve misses, empty
-binary values, conditional non-storage and distinct failure classes. Successful
-commands allow explicit pool return; server/transport/framing errors close the
-handle. Four receives and 8192-byte request/reply bounds remain within the
-existing I/O profile. See [options, TTL limits and example](memcache-client.md).
+Import `middleware/jwt_session.rut` alongside `clients/redis-client.rut`.
+`documentHs256(token, secret, previousSecret, issuer, audience)` pins HS256 and verifies the
+existing strict claims policy before any lookup. Invalid tokens return 401;
+empty issuer/audience or invalid secrets return 503. Current is mandatory at
+32–4096 bytes; previous may be empty or within the same range. Validate both
+before selecting current-first pinned HS256 verification.
+`key(token, namespace) -> Bytes?` constructs the trusted 1–128-byte namespace,
+colon, and lowercase SHA-256 of the exact compact token. An invalid namespace or
+hash/storage failure returns nil. It hashes bytes and does not authenticate them.
+
+Use the example's `sessionPermitStatus` only with the terminal `redisSessionGet`
+result: exact `.value(b"active")` maps to 1, missing/other values to 0, every
+service/protocol/cleanup error to -1. `requireActiveStatus(status)` permits only
+1, returns challenged 401 for 0, and returns 503 for every other integer. Supplying
+1 manually does not prove a verified session. Authenticate before querying and
+wait for acknowledged Redis cleanup before publishing identity. Delete a permit
+to reject its next authoritative lookup; a missing permit never enables offline
+JWT-only fallback. Provisioning, persistence and failover are external policy.
+See [jwt-session-auth.rut](../examples/jwt-session-auth.rut) and
+[the full contract](jwt-sessions.md), including TLS and in-flight limitations.
+
+### Self-service JWT logout
+
+The [online session example](../examples/jwt-session-auth.rut) now provides
+`POST /logout`. Local HS256 signature/claims verification precedes Redis I/O;
+the key comes only from that exact Bearer token and trusted namespace. The
+example's `sessionDelete` composes authenticated initialization, one bounded DEL
+and acknowledged RESET/release. Only canonical integer 0/1 replies allow its
+terminal `.ok` result; only that completed result may reach
+`sessionWriteSucceeded`. Both present and already-absent permits receive empty
+204 plus `Cache-Control: no-store`. Invalid credentials receive 401; service,
+protocol and cleanup failures receive 503, even after deletion may have occurred.
+Other tokens for the same subject/jti are untouched. Query/body target selection,
+enrollment, automatic retries and cookie/OIDC logout are absent. See
+[ownership and ambiguous failure behavior](jwt-sessions.md#self-service-logout).
+
+### Trusted JWT issuance with online enrollment
+
+The [online session example](../examples/jwt-session-auth.rut) also exposes
+`POST /sessions`. Set an independent `SESSION_ISSUE_KEY` Bearer service key
+(32–4096 valid bytes, distinct from both signing-key slots) and `SESSION_SUBJECT`; both
+are load-time environment snapshots. Singleton Authorization verification and
+the process-shared five-attempt peer-IP limiter precede enrollment. Client
+metadata cannot choose claims, keys or expiry.
+
+`jwt_session.issueHs256(subject, issuer, audience, tokenId, secret, namespace, scopes)`
+returns optional `IssuedSession { token: str, key: Bytes, expiry: Bytes }`, using
+the fixed 300-second/seven-claim profile and the caller's once-generated UUID jti.
+The signed expiry is preserved as decimal Bytes without i32 narrowing.
+Authenticated `SET key active NX EXAT exp` and RESET/release must complete before
+200/application-jwt/no-store/no-cache token publication. NX refusal and every
+service/protocol/cleanup failure return 503 without a token, even if a bounded
+orphan permit was already written. The endpoint does not overwrite permits or
+renew tokens. This is trusted fixed-subject issuance, not a password/OAuth login.
+See [the full contract](jwt-sessions.md#trusted-fixed-subject-issuance-and-enrollment).
+
+### Online-session HS256 key rotation
+
+The example resolves mandatory `JWT_SECRET` and `JWT_PREVIOUS_SECRET` snapshots;
+set the latter to `""` when disabled. Current must contain 32–4096 bytes, and each
+nonempty previous slot must satisfy the same bound. Invalid configuration returns
+503 before lookup; a valid previous slot cannot replace an empty current slot.
+Both HS256 verifications run, with independently owned claims and current-first
+selection followed by the unchanged claims and permit policies. Issuance always
+signs with current. `SESSION_ISSUE_KEY` must differ from both signing keys.
+
+Old tokens keep their hash-derived permit keys during the grace period and can
+still log out. Removing the previous key rejects those signatures before Redis
+I/O under the adopted configuration, even with an active permit. There is no
+automatic key retirement, token rewriting or permit migration. Coordinate staged
+trust/configuration rollout and retain one issuer/audience trust domain. See
+[key rotation and in-flight limitations](jwt-sessions.md#hs256-signing-key-rotation).
+
+### Scoped online sessions
+
+Set trusted `SESSION_SCOPES` to a nonempty OAuth scope list of at most 1024 bytes.
+The complete list is validated before issuance; malformed/empty/oversize values
+return 503 without enrollment. The signed `scope` claim comes only from this
+configuration. Client headers, query and body cannot request additional grants.
+
+The example's `GET /read` and `POST /write` require exact `orders:read` and
+`orders:write`, respectively. Signature/claims verification, online permit lookup
+and acknowledged cleanup precede `jwtHasScope`. Invalid/revoked tokens retain
+401, service/cleanup errors retain 503, and missing or malformed grants receive
+403 with `Bearer error="insufficient_scope"`. Success is empty 204/no-store.
+Whole-list validity, case and exact tokens matter; no prefix/case folding or
+client metadata fallback occurs. A valid read-only session cannot write.
+Existing scope-less tokens remain identity-only on `/private`; issuer changes do
+not rewrite their claims or permits. See [the full policy](jwt-sessions.md#scope-authorization-for-online-sessions).

@@ -32284,3 +32284,362 @@ TEST(jit, bound_credentials_example_compiles) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, jwt_session_permits_require_exact_success_and_bounded_token_keys) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-session-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string original((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    const auto end = original.find("// The AS/session owner");
+    REQUIRE(end != std::string::npos);
+    // Exercise the example's actual typed result mapper and imported policies.
+    std::string source = original.substr(0, end);
+    struct Case {
+        const char* expression;
+        u16 status;
+        const char* challenge;
+    };
+    const Case cases[] = {
+        {"sessionPermitStatus(RedisSessionResult.value(b\"active\"))", 204, ""},
+        {"sessionPermitStatus(RedisSessionResult.value(b\"\"))",
+         401,
+         "Bearer error=\"invalid_token\""},
+        {"sessionPermitStatus(RedisSessionResult.value(b\"ACTIVE\"))",
+         401,
+         "Bearer error=\"invalid_token\""},
+        {"sessionPermitStatus(RedisSessionResult.value(b\"active\\x00\"))",
+         401,
+         "Bearer error=\"invalid_token\""},
+        {"sessionPermitStatus(RedisSessionResult.missing)", 401, "Bearer error=\"invalid_token\""},
+        {"sessionPermitStatus(RedisSessionResult.ok)", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.authError(b\"error\"))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.databaseError(b\"error\"))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.serverError(b\"error\"))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.requestFailure)", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.transportFailure(-2))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.transportFailure(0))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.replyFailure)", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.resetError(b\"error\"))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.cleanupFailure(-2))", 503, ""},
+        {"sessionPermitStatus(RedisSessionResult.cleanupFailure(0))", 503, ""},
+        {"2", 503, ""},
+        {"2147483647", 503, ""},
+        {"-2", 503, ""},
+    };
+    const u32 count = sizeof(cases) / sizeof(cases[0]);
+    for (u32 i = 0; i < count; ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += "let allowed = jwt_session.requireActiveStatus(" +
+                  std::string(cases[i].expression) +
+                  ")\nguard allowed else { return 500 }\nreturn 204\n}\n";
+    }
+    source += R"rut(
+route GET "/key" {
+    guard let key = jwt_session.key("abc", req.uniqueHeader("X-Namespace").or("")) else { return 503 }
+    guard key == Bytes(req.uniqueHeader("X-Key").or("")) else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "JWT sessions HIR: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection conn;
+    const auto run = [&](u32 index, const std::string& request, u16 status, const char* challenge) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", index);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        const auto result =
+            HandlerResult::unpack(handler(&conn,
+                                          nullptr,
+                                          reinterpret_cast<const u8*>(request.data()),
+                                          static_cast<u32>(request.size()),
+                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, status);
+        if (challenge[0]) {
+            REQUIRE(result.next_state != 0);
+            REQUIRE(result.next_state <= rir.module.header_set_count);
+            const auto& headers = rir.module.header_sets[result.next_state - 1];
+            CHECK_EQ(headers.count, 1u);
+            CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[headers.offset].eq(lit(challenge)));
+        } else {
+            CHECK_EQ(result.next_state, 0u);
+        }
+    };
+    for (u32 i = 0; i < count; ++i)
+        run(i, "GET / HTTP/1.1\r\nHost: local\r\n\r\n", cases[i].status, cases[i].challenge);
+    const std::string unicode = "\xc3\xa9";
+    std::string unicode_limit;
+    for (u32 i = 0; i < 64; ++i) unicode_limit += unicode;
+    for (const auto& prefix : {std::string(),
+                               std::string("issuer"),
+                               std::string(128, 'n'),
+                               std::string(129, 'n'),
+                               unicode_limit,
+                               unicode_limit + unicode}) {
+        const std::string expected =
+            prefix + ":ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        const std::string request = "GET /key HTTP/1.1\r\nHost: local\r\nX-Namespace: " + prefix +
+                                    "\r\nX-Key: " + expected + "\r\n\r\n";
+        run(count, request, prefix.empty() || prefix.size() > 128 ? 503 : 204, "");
+    }
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_session_writes_require_command_specific_acknowledgements) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-session-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    const std::string original((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    const auto end = original.find("// The AS/session owner");
+    REQUIRE(end != std::string::npos);
+    std::string source = original.substr(0, end);
+    struct ReplyCase {
+        i32 kind;
+        const char* data;
+        bool success;
+        bool integer_ack = true;
+    };
+    const ReplyCase replies[] = {
+        {3, "0", true},         {3, "1", true},          {3, "-1", false},
+        {3, "2", false},        {3, "01", false},        {3, "+1", false},
+        {3, "", false},         {3, "1\\x00", false},    {3, "9223372036854775807", false},
+        {1, "1", false},        {2, "1", false},         {4, "1", false},
+        {5, "1", false},        {6, "1", false},         {99, "1", false},
+        {1, "OK", true, false}, {1, "ok", false, false}, {1, "OK\\x00", false, false},
+        {3, "1", false, false}, {6, "", false, false},   {2, "ERR", false, false},
+    };
+    for (u32 i = 0; i < sizeof(replies) / sizeof(replies[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\nlet result = sessionWriteReply(";
+        source += "Resp2Token(kind: " + std::to_string(replies[i].kind) + ", data: b\"" +
+                  replies[i].data + "\", next: 0, children: 0), " +
+                  (replies[i].integer_ack ? "true" : "false") + ")\n";
+        source += "guard sessionWriteSucceeded(result) else { return 503 }\nreturn 204\n}\n";
+    }
+    const char* failures[] = {"value(b\"active\")",
+                              "missing",
+                              "authError(b\"error\")",
+                              "databaseError(b\"error\")",
+                              "serverError(b\"error\")",
+                              "requestFailure",
+                              "transportFailure(-2)",
+                              "replyFailure",
+                              "resetError(b\"error\")",
+                              "cleanupFailure(0)",
+                              "cleanupFailure(-2)"};
+    const u32 reply_count = sizeof(replies) / sizeof(replies[0]);
+    for (u32 i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
+        source += "route GET \"/failure-" + std::to_string(i) + "\" {\n";
+        source += "guard sessionWriteSucceeded(RedisSessionResult." + std::string(failures[i]) +
+                  ") else { return 503 }\nreturn 204\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char* request = "GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+    for (u32 i = 0; i < reply_count + sizeof(failures) / sizeof(failures[0]); ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(strlen(request)),
+                                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, i < reply_count && replies[i].success ? 204u : 503u);
+        CHECK_EQ(result.next_state, 0u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_session_rotation_validates_both_secret_slots_before_tokens) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-session-auth.rut";
+    struct Case {
+        u32 current;
+        u32 previous;
+        const char* issuer;
+        const char* audience;
+        u16 status;
+    };
+    const Case cases[] = {
+        {32, 0, "issuer", "gateway", 401},
+        {32, 32, "issuer", "gateway", 401},
+        {4096, 4096, "issuer", "gateway", 401},
+        {0, 32, "issuer", "gateway", 503},
+        {31, 32, "issuer", "gateway", 503},
+        {4097, 32, "issuer", "gateway", 503},
+        {32, 31, "issuer", "gateway", 503},
+        {32, 4097, "issuer", "gateway", 503},
+        {32, 0, "", "gateway", 503},
+        {32, 0, "issuer", "", 503},
+    };
+    // Keep each literal within its own lexer bound while testing 4097-byte config.
+    const auto secret = [](u32 count) {
+        if (count > 4096) return "\"" + std::string(4096, 'k') + "\" + \"k\"";
+        return "\"" + std::string(count, 'k') + "\"";
+    };
+    std::string source = "import \"middleware/jwt_session.rut\"\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source += "let document = jwt_session.documentHs256(\"\", " + secret(cases[i].current) +
+                  ", " + secret(cases[i].previous) + ", \"" + cases[i].issuer + "\", \"" +
+                  cases[i].audience + "\")\nreturn 204\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char* request = "GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(strlen(request)),
+                                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, cases[i].status);
+        if (cases[i].status == 401) {
+            REQUIRE(result.next_state != 0);
+            REQUIRE(result.next_state <= rir.module.header_set_count);
+            const auto& headers = rir.module.header_sets[result.next_state - 1];
+            CHECK_EQ(headers.count, 1u);
+            CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+            CHECK(rir.module.header_values[headers.offset].eq(lit("Bearer")));
+        } else {
+            CHECK_EQ(result.next_state, 0u);
+        }
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_session_issuance_rejects_invalid_scope_configuration) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-session-auth.rut";
+    struct Case {
+        std::string scope;
+        bool valid;
+    };
+    const Case cases[] = {
+        {"orders:read", true},
+        {"orders:read orders:write", true},
+        {"orders:read orders:read", true},
+        {std::string(1024, 'r'), true},
+        {"", false},
+        {" orders:read", false},
+        {"orders:read ", false},
+        {"orders:read  orders:write", false},
+        {"orders:read\\torders:write", false},
+        {"orders:read é", false},
+        {std::string(1025, 'r'), false},
+    };
+    std::string source = "import \"middleware/jwt_session.rut\"\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        source +=
+            "guard let issued = jwt_session.issueHs256(\"alice\", \"issuer\", \"gateway\", "
+            "\"fixture-id\", \"01234567890123456789012345678901\", \"namespace\", \"" +
+            cases[i].scope + "\") else { return 503 }\n";
+        source += "let token = issued.token\nreturn response(200, body: token)\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection conn;
+    const char* request = "GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        conn.reset();
+        conn.json_arena.backend.pool = &pool;
+        const auto result = HandlerResult::unpack(handler(&conn,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(strlen(request)),
+                                                          nullptr));
+        CHECK_EQ(result.status_code, cases[i].valid ? 200u : 503u);
+    }
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

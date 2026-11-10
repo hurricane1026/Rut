@@ -3990,6 +3990,26 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_bound_credentials_${binding_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(jwt_session_backend epoll io_uring)
+                foreach(jwt_session_opt 0 2)
+                    add_test(NAME test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_sessions.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR}
+                            --backend ${jwt_session_backend} --opt ${jwt_session_opt})
+                    set_tests_properties(test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                endforeach()
+                add_test(NAME test_jwt_sessions_${jwt_session_backend}_tls
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_sessions.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR}
+                        --backend ${jwt_session_backend} --opt 2 --tls)
+                set_tests_properties(test_jwt_sessions_${jwt_session_backend}_tls PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(password_backend epoll io_uring)
                 add_test(NAME test_password_login_${password_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_login.py
