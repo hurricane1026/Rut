@@ -31720,3 +31720,473 @@ route GET "/all" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, required_header_keys_reject_partial_duplicate_and_mixed_credentials) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/required-header-keys-auth.rut";
+    struct Policy {
+        const char* consumer;
+        const char* first;
+        const char* second;
+        const char* id;
+        bool valid;
+        bool strip = false;
+        bool forbid = false;
+    };
+    const Policy policies[] = {
+        {"orders", "service:secret", "application/key", "pair-id", true},
+        {"orders", "service:secret", "application/key", "pair-id", true, true},
+        {"orders", "service:secret", "application/key", "pair-id", true, false, true},
+        {"", "service:secret", "application/key", "pair-id", false},
+        {"orders", "", "application/key", "pair-id", false},
+        {"orders", "service:secret", "", "pair-id", false},
+        {"orders", "service:secret", "application/key", "", false},
+        {"orders", "service:secret", "service:secret", "pair-id", false},
+    };
+    std::string source = "import \"middleware/header_auth.rut\"\n";
+    for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+        const auto& policy = policies[i];
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        if (policy.strip)
+            source += "req.remove(\"X-Service-Key\")\nreq.remove(\"X-Application-Key\")\n";
+        source +=
+            "let identity = header_auth.requireBoth(req.uniqueHeader(\"X-Service-Key\").or(\"\"), "
+            "req.uniqueHeader(\"X-Application-Key\").or(\"\"), "
+            "header_auth.RequiredHeaderKeys(consumerId: \"" +
+            std::string(policy.consumer) + "\", firstKey: \"" + policy.first + "\", secondKey: \"" +
+            policy.second + "\", policyId: \"" + policy.id + "\"))\n";
+        if (policy.forbid)
+            source += "let allowed = header_auth.requireConsumer(identity, \"another-consumer\")\n";
+        source += R"rut(
+    guard identity.consumerId == "orders" && identity.credentialId == "pair-id" &&
+          identity.method == "apiKeyAndApiKey" else { return 500 }
+    return 204
+}
+)rut";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "required header keys: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    struct Field {
+        const char* value;
+        bool valid;
+        bool duplicate = false;
+    };
+    const Field first[] = {{nullptr, false},
+                           {"", false},
+                           {"wrong", false},
+                           {"service:secret", true},
+                           {"SERVICE:secret", false},
+                           {"application/key", false},
+                           {"service:secret,application/key", false},
+                           {"service:secret", false, true},
+                           {"wrong", false, true},
+                           {"", false, true},
+                           {"Bearer service:secret", false}};
+    const Field second[] = {{nullptr, false},
+                            {"", false},
+                            {"wrong", false},
+                            {"application/key", true},
+                            {"Application/key", false},
+                            {"service:secret", false},
+                            {"application/key,service:secret", false},
+                            {"application/key", false, true},
+                            {"wrong", false, true},
+                            {"", false, true},
+                            {"Bearer application/key", false}};
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (u32 i = 0; i < sizeof(policies) / sizeof(policies[0]); ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "handler_route_%u", i);
+            auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+            REQUIRE(handler);
+            for (const auto& a : first) {
+                for (const auto& b : second) {
+                    const std::string body =
+                        "X-Service-Key: service:secret\r\n"
+                        "X-Application-Key: application/key";
+                    std::string request =
+                        "GET /?service_key=service:secret&application_key=application/key " +
+                        std::string(version) + "\r\nHost: local\r\n";
+                    if (a.value) request += "X-Service-Key: " + std::string(a.value) + "\r\n";
+                    if (b.value) request += "x-application-key: " + std::string(b.value) + "\r\n";
+                    if (a.duplicate) request += "x-service-key: service:secret\r\n";
+                    if (b.duplicate) request += "X-Application-Key: application/key\r\n";
+                    request +=
+                        "Authorization: Bearer service:secret\r\nX-Consumer-ID: orders\r\n"
+                        "X-Credential-ID: pair-id\r\nContent-Length: " +
+                        std::to_string(body.size()) + "\r\n\r\n" + body;
+                    conn.reset();
+                    conn.json_arena.backend.pool = &pool;
+                    const auto result =
+                        HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(request.data()),
+                                                      static_cast<u32>(request.size()),
+                                                      nullptr));
+                    const u16 expected = !policies[i].valid     ? 503
+                                         : !a.valid || !b.valid ? 401
+                                         : policies[i].forbid   ? 403
+                                                                : 204;
+                    CHECK(result.action == HandlerAction::ReturnStatus);
+                    CHECK_EQ(result.status_code, expected);
+                    if (expected == 401) {
+                        REQUIRE(result.next_state != 0);
+                        REQUIRE(result.next_state <= rir.module.header_set_count);
+                        const auto& headers = rir.module.header_sets[result.next_state - 1];
+                        CHECK_EQ(headers.count, 1u);
+                        CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                        CHECK(rir.module.header_values[headers.offset].eq(lit("ApiKey")));
+                    } else {
+                        CHECK_EQ(result.next_state, 0u);
+                    }
+                    if (policies[i].strip) CHECK_EQ(conn.req_header_override_count, 2u);
+                }
+            }
+        }
+    }
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, required_header_keys_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/required-header-keys-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    // Keep this compile test independent of the invoking process's secrets.
+    for (const char* name : {"SERVICE_KEY", "APPLICATION_KEY"}) {
+        const std::string expression = "env(\"" + std::string(name) + "\")";
+        const auto offset = source.find(expression);
+        REQUIRE(offset != std::string::npos);
+        source.replace(offset, expression.size(), "\"" + std::string(name) + "-fixture\"");
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "required-header-keys example HIR: code %u, %.*s at %u:%u\n",
+                     static_cast<unsigned>(hir.error().code),
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bound_credentials_require_matching_authenticated_consumers) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/bound-credentials-auth.rut";
+    const char* source = R"rut(
+import "middleware/identity_auth.rut"
+func first() -> identity_auth.ConsumerCredentials {
+    identity_auth.ConsumerCredentials(consumerId: "alice", key: "", credentials: "alice:password",
+        keyId: "alice-bearer", passwordId: "alice-password")
+}
+func second() -> identity_auth.ConsumerCredentials {
+    identity_auth.ConsumerCredentials(consumerId: "bob", key: "", credentials: "bob:password",
+        keyId: "bob-bearer", passwordId: "bob-password")
+}
+func firstKey() -> identity_auth.HeaderKeyConsumer {
+    identity_auth.HeaderKeyConsumer(consumerId: "alice", key: "alice-key", credentialId: "alice-key-id")
+}
+func secondKey() -> identity_auth.HeaderKeyConsumer {
+    identity_auth.HeaderKeyConsumer(consumerId: "bob", key: "bob-key", credentialId: "bob-key-id")
+}
+route GET "/private" {
+    let password = identity_auth.multiAuth(req.authorization.or(""), first(), second())
+    let key = identity_auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""), firstKey(), secondKey())
+    let bound = identity_auth.requireSameConsumer(password, key, "password-and-key")
+    guard bound.consumerId == password.consumerId && bound.consumerId == key.consumerId &&
+        bound.credentialId == "password-and-key" && bound.method == "boundCredentials" else { return 500 }
+    return 204
+}
+route GET "/stripped" {
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    let password = identity_auth.multiAuth(req.authorization.or(""), first(), second())
+    let key = identity_auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""), firstKey(), secondKey())
+    let bound = identity_auth.requireSameConsumer(password, key, "password-and-key")
+    guard bound.consumerId == password.consumerId && bound.consumerId == key.consumerId &&
+        bound.credentialId == "password-and-key" && bound.method == "boundCredentials" else { return 500 }
+    return 204
+}
+route GET "/alice-only" {
+    let password = identity_auth.multiAuth(req.authorization.or(""), first(), second())
+    let key = identity_auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""), firstKey(), secondKey())
+    let bound = identity_auth.requireSameConsumer(password, key, "password-and-key")
+    let allowed = identity_auth.requireConsumer(bound, "alice")
+    return 204
+}
+route GET "/bad-policy" {
+    let password = identity_auth.multiAuth(req.authorization.or(""), first(), second())
+    let key = identity_auth.multiHeaderKey(req.uniqueHeader("X-API-Key").or(""), firstKey(), secondKey())
+    let bound = identity_auth.requireSameConsumer(password, key, "")
+    return 500
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    struct Credential {
+        const char* headers;
+        u8 owner;  // Independent fixture oracle: 0 invalid, 1 Alice, 2 Bob.
+    };
+    const Credential passwords[] = {
+        {"", 0},
+        {"Authorization:\r\n", 0},
+        {"Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\n", 1},
+        {"authorization: Basic Ym9iOnBhc3N3b3Jk\r\n", 2},
+        {"Authorization: Basic d3Jvbmc6cGFzc3dvcmQ=\r\n", 0},
+        {"Authorization: Bearer alice-key\r\n", 0},
+        {"Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\nauthorization: Basic Ym9iOnBhc3N3b3Jk\r\n",
+         0},
+        {"Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\nauthorization: Basic "
+         "YWxpY2U6cGFzc3dvcmQ=\r\n",
+         0},
+    };
+    const Credential keys[] = {
+        {"", 0},
+        {"X-API-Key:\r\n", 0},
+        {"X-API-Key: alice-key\r\n", 1},
+        {"x-api-key: bob-key\r\n", 2},
+        {"X-API-Key: wrong\r\n", 0},
+        {"X-API-Key: ALICE-KEY\r\n", 0},
+        {"X-API-Key: alice-key,bob-key\r\n", 0},
+        {"X-API-Key: alice-key\r\nx-api-key: bob-key\r\n", 0},
+        {"X-API-Key: alice-key\r\nx-api-key: alice-key\r\n", 0},
+    };
+    const char* paths[] = {"/private", "/stripped", "/alice-only", "/bad-policy"};
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (u32 i = 0; i < 4; ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "handler_route_%u", i);
+            auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+            REQUIRE(handler);
+            for (const auto& password : passwords) {
+                for (const auto& key : keys) {
+                    const std::string body =
+                        "Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\nX-API-Key: alice-key";
+                    const std::string request =
+                        "GET " + std::string(paths[i]) + "?api_key=alice-key " + version +
+                        "\r\nHost: local\r\n" + password.headers + key.headers +
+                        "X-Consumer-ID: alice\r\nX-Credential-ID: "
+                        "password-and-key\r\nContent-Length: " +
+                        std::to_string(body.size()) + "\r\n\r\n" + body;
+                    conn.reset();
+                    conn.json_arena.backend.pool = &pool;
+                    const auto result =
+                        HandlerResult::unpack(handler(&conn,
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(request.data()),
+                                                      static_cast<u32>(request.size()),
+                                                      nullptr));
+                    const u16 expected =
+                        password.owner == 0 || key.owner == 0                            ? 401
+                        : i == 3                                                         ? 503
+                        : password.owner != key.owner || (i == 2 && password.owner != 1) ? 403
+                                                                                         : 204;
+                    CHECK(result.action == HandlerAction::ReturnStatus);
+                    CHECK_EQ(result.status_code, expected);
+                    if (i == 1) CHECK_EQ(conn.req_header_override_count, 2u);
+                    if (expected == 401) {
+                        REQUIRE(result.next_state != 0);
+                        REQUIRE(result.next_state <= rir.module.header_set_count);
+                        const auto& headers = rir.module.header_sets[result.next_state - 1];
+                        CHECK_EQ(headers.count, password.owner == 0 ? 2u : 1u);
+                        for (u32 j = 0; j < headers.count; ++j)
+                            CHECK(rir.module.header_keys[headers.offset + j].eq(
+                                lit("WWW-Authenticate")));
+                        CHECK(rir.module.header_values[headers.offset].eq(
+                            password.owner == 0 ? lit("Bearer") : lit("ApiKey")));
+                    } else {
+                        CHECK_EQ(result.next_state, 0u);
+                    }
+                }
+            }
+        }
+    }
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bound_credentials_deny_guests_and_incomplete_identity_metadata) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/bound-credentials-auth.rut";
+    struct IdentityCase {
+        const char* first_id;
+        const char* first_credential;
+        const char* first_method;
+        const char* second_id;
+        const char* second_credential;
+        const char* second_method;
+        const char* policy;
+        u16 status;
+    };
+    const IdentityCase cases[] = {
+        {"alice", "password", "basic", "alice", "key", "apiKey", "pair", 204},
+        {"alice", "key", "apiKey", "alice", "password", "basic", "pair", 204},
+        {"alice", "certificate", "mtls", "alice", "token", "jwtRS256", "pair", 204},
+        {"alice", "a", "basic", "bob", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "Alice", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "alice-admin", "b", "apiKey", "pair", 403},
+        {"", "a", "basic", "alice", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "", "b", "apiKey", "pair", 403},
+        {"", "a", "basic", "", "b", "apiKey", "pair", 403},
+        {"alice", "", "basic", "alice", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "alice", "", "apiKey", "pair", 403},
+        {"alice", "a", "", "alice", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "alice", "b", "", "pair", 403},
+        {"alice", "a", "anonymous", "alice", "b", "apiKey", "pair", 403},
+        {"alice", "a", "basic", "alice", "b", "anonymous", "pair", 403},
+        {"guest", "", "anonymous", "guest", "", "anonymous", "pair", 403},
+        {"alice", "a", "basic", "alice", "b", "apiKey", "", 503},
+        {"alice", "a", "basic", "bob", "b", "apiKey", "", 503},
+        {"guest", "", "anonymous", "guest", "", "anonymous", "", 503},
+    };
+    std::string source = "import \"middleware/identity_auth.rut\"\n";
+    const auto identity = [](const char* consumer, const char* credential, const char* method) {
+        return "identity_auth.Identity(consumerId: \"" + std::string(consumer) +
+               "\", credentialId: \"" + credential + "\", method: \"" + method + "\")";
+    };
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const auto& tc = cases[i];
+        source += "route GET \"/" + std::to_string(i) +
+                  "\" {\nlet bound = identity_auth.requireSameConsumer(" +
+                  identity(tc.first_id, tc.first_credential, tc.first_method) + ", " +
+                  identity(tc.second_id, tc.second_credential, tc.second_method) + ", \"" +
+                  tc.policy + "\")\n";
+        source +=
+            "guard bound.consumerId == \"alice\" && bound.credentialId == \"pair\" && "
+            "bound.method == \"boundCredentials\" else { return 500 }\nreturn 204\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    const char* request = "GET / HTTP/1.1\r\nHost: local\r\nX-Consumer-ID: alice\r\n\r\n";
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", i);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(strlen(request)),
+                                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, cases[i].status);
+        CHECK_EQ(result.next_state, 0u);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, bound_credentials_example_compiles) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/bound-credentials-auth.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    // Keep this compile test independent of the invoking process's secrets.
+    for (const char* name :
+         {"ALICE_BASIC_CREDENTIALS", "BOB_BASIC_CREDENTIALS", "ALICE_API_KEY", "BOB_API_KEY"}) {
+        const std::string expression = "env(\"" + std::string(name) + "\")";
+        const auto offset = source.find(expression);
+        REQUIRE(offset != std::string::npos);
+        source.replace(offset, expression.size(), "\"" + std::string(name) + "-fixture\"");
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "bound-credentials example HIR: code %u, %.*s at %u:%u\n",
+                     static_cast<unsigned>(hir.error().code),
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    engine.shutdown();
+    rir.destroy();
+}

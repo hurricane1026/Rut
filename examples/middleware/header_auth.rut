@@ -1,6 +1,29 @@
 import Crypto
 import "auth.rut"
 
+// Both keys belong to one configured Consumer. policyId names the required pair.
+struct RequiredHeaderKeys {
+    consumerId: str,
+    firstKey: str,
+    secondKey: str,
+    policyId: str
+}
+
+// Read each value with uniqueHeader from its own distinct original header.
+// Empty configuration never disables a factor; both credentials are required.
+func requireBoth(_ firstPresented: str, _ secondPresented: str,
+                 _ config: RequiredHeaderKeys) -> auth.Identity {
+    guard config.consumerId != "" && config.policyId != "" &&
+        config.firstKey != "" && config.secondKey != "" &&
+        !Crypto.equal(config.firstKey, config.secondKey) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "ApiKey")
+    let firstMatches = Crypto.equal(firstPresented, config.firstKey)
+    let secondMatches = Crypto.equal(secondPresented, config.secondKey)
+    guard firstMatches && secondMatches else { respond denied }
+    auth.Identity(consumerId: config.consumerId, credentialId: config.policyId, method: "apiKeyAndApiKey")
+}
+
 // Count and singleton value must come from the SAME original custom header.
 // Only proven absence grants the distinct configured guest identity.
 func multiHeaderKeyOrAnonymous(_ count: i32, _ presented: str,

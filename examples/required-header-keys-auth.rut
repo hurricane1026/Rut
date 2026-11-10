@@ -1,0 +1,24 @@
+import "middleware/header_auth.rut"
+
+listen :8080
+
+// Trusted snapshot: distinct nonempty keys for one Consumer. Use TLS; replace
+// the configuration to rotate/revoke. These shared secrets do not imply MFA.
+func policy() -> header_auth.RequiredHeaderKeys {
+    header_auth.RequiredHeaderKeys(consumerId: "orders-service",
+        firstKey: env("SERVICE_KEY"), secondKey: env("APPLICATION_KEY"),
+        policyId: "service-and-application")
+}
+
+route GET "/private" {
+    // Stripping does not change original singleton authentication reads.
+    req.remove("X-Service-Key")
+    req.remove("X-Application-Key")
+    let identity = header_auth.requireBoth(req.uniqueHeader("X-Service-Key").or(""),
+        req.uniqueHeader("X-Application-Key").or(""), policy())
+    let allowed = header_auth.requireConsumer(identity, "orders-service")
+    let consumerId = allowed.consumerId
+    return response(200, body: consumerId)
+}
+
+route "/" { return 404 }

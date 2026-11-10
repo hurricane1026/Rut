@@ -9080,6 +9080,44 @@ original reads, and no alternate credential source is tried. This is an ordinary
 bounded Rut helper with no new syntax, primitive, dependency or state. See
 `examples/optional-multi-header-key-auth.rut`.
 
+### Binding authenticated Consumer identities
+
+`identity_auth.requireSameConsumer(first, second, policyId)` combines two already-verified
+Identity values in the same trusted Consumer namespace. It is provided by
+`examples/middleware/identity_auth.rut`, which imports the existing auth module.
+Both require nonempty
+Consumer ID, credential ID and method; `anonymous` and mismatched exact,
+case-sensitive Consumer IDs receive 403 without a challenge. Empty trusted policy
+ID receives 503 first. Success publishes only the shared Consumer ID, configured
+pair policy ID as credential ID, and method `boundCredentials`. Individual
+verifiers run before binding and retain their own 401/configuration failures;
+Consumer/group authorization may still reject the resulting identity.
+
+This is an ordinary imported helper with no new syntax, runtime state or
+allocation mechanism. It checks consistency, not Identity provenance, independent
+factor assurance, token claims or credential validity. Callers must run both
+verifiers and establish an appropriate shared identity namespace; repeating an
+Identity or matching unrelated JWT subject and Consumer strings supplies no extra
+authentication assurance. See `examples/bound-credentials-auth.rut` for required
+Basic + custom-header key with two Consumers and explicit cross-Consumer denial.
+
+### Required custom-header key pair
+
+`header_auth.requireBoth(firstPresented, secondPresented, config)` is an ordinary
+imported Rut helper. Its trusted `RequiredHeaderKeys` record contains one Consumer
+ID, two required opaque keys, and a policy ID for the pair. All fields must be
+nonempty and keys must differ; invalid configuration returns 503 before matching.
+Read both inputs with singleton `uniqueHeader(...).or("")` from distinct original
+header names. Missing, empty, wrong or duplicated fields return 401 with ApiKey
+challenge. Both constant-time comparisons must succeed before returning Identity
+with the configured Consumer, policy ID and `apiKeyAndApiKey` method. There is no
+fallback or disabled factor. Apply authorization afterward. Source-header choice
+and trusted configuration are caller obligations, since arguments carry values,
+not provenance. Leading credential removals preserve original singleton reads.
+This bounded static pair adds no language syntax, runtime state or dependencies;
+two shared secrets alone do not establish independent MFA. Use TLS and replace
+configuration to rotate/revoke. See `examples/required-header-keys-auth.rut`.
+
 ### Custom-header API Key rotation and optional access
 
 `auth.rotatingHeaderKey` uses the existing constant-time equality operation for

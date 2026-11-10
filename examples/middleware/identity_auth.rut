@@ -1,0 +1,14 @@
+import "auth.rut"
+
+// Both inputs must come from successful verifiers in the same Consumer namespace.
+// This binds identities; it neither verifies credentials nor proves provenance.
+func requireSameConsumer(_ first: auth.Identity, _ second: auth.Identity, _ policyId: str) -> auth.Identity {
+    guard policyId != "" else { respond 503 }
+    guard first.consumerId != "" && second.consumerId != "" &&
+        first.credentialId != "" && second.credentialId != "" &&
+        first.method != "" && second.method != "" &&
+        first.method != "anonymous" && second.method != "anonymous" &&
+        first.consumerId == second.consumerId else { respond 403 }
+    auth.Identity(consumerId: first.consumerId, credentialId: policyId, method: "boundCredentials")
+}
+

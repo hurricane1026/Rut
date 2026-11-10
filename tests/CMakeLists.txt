@@ -3972,6 +3972,15 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_optional_multi_header_auth_${header_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(binding_backend epoll io_uring)
+                add_test(NAME test_bound_credentials_${binding_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_bound_credentials.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/bound-credentials-auth.rut
+                        --backend ${binding_backend})
+                set_tests_properties(test_bound_credentials_${binding_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(password_backend epoll io_uring)
                 add_test(NAME test_password_login_${password_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_login.py
