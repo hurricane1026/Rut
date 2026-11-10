@@ -3225,11 +3225,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     c.builder, opt, LLVMConstInt(c.i32_ty, 0, 0), 2, "opt.nil.len");
             } else {
                 LLVMTypeRef payload_ty = LLVMStructGetTypeAtIndex(out_ty, 1);
-                const auto* optional_type = c.cur_fn->values[inst.result.id].type;
-                const auto payload = optional_type->inner->kind == rir::TypeKind::Array
-                                         ? LLVMConstNull(payload_ty)
-                                         : LLVMGetUndef(payload_ty);
-                opt = LLVMBuildInsertValue(c.builder, opt, payload, 1, "opt.nil.payload");
+                opt = LLVMBuildInsertValue(
+                    c.builder, opt, LLVMConstNull(payload_ty), 1, "opt.nil.payload");
             }
             c.set_value(inst.result, opt);
             break;
