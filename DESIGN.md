@@ -6783,6 +6783,9 @@ During shutdown:
   Mandatory per-function RIR verification
     │  - reject non-yielding control cycles
     │  - check yield/resume mappings and modeled wait protocols
+    │  - reject potentially infinite yielding control cycles
+    │  - explore bounded completion/cancel/close/next-wait interleavings
+    │  - compose supplied finite peer contracts to check mutual waits
     │  - reject the module before emitting executable code on failure
     ▼
   LLVM IR Generation (from RIR)

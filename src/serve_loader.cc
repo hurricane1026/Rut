@@ -295,8 +295,24 @@ bool load_rut_program(const char* path,
 
     // ── Backend: RIR → LLVM IR → native code ────────────────────────
     err.stage = LoadStage::Codegen;
-    auto cg = jit::codegen(out.rir.module);
-    if (!cg.ok) return false;
+    rir::VerifyResult verification{};
+    auto cg = jit::codegen(out.rir.module, &verification);
+    if (!cg.ok) {
+        if (!verification.ok) {
+            err.stage = LoadStage::Verify;
+            err.has_verification_failure = true;
+            rir::PrintBuf message{};
+            message.init(err.detail_buf, sizeof(err.detail_buf) - 1, -1);
+            rir::format_verify_result(message, verification);
+            if (message.overflow && message.len >= 3) {
+                err.detail_buf[message.len - 3] = '.';
+                err.detail_buf[message.len - 2] = '.';
+                err.detail_buf[message.len - 1] = '.';
+            }
+            err.detail_buf[message.len] = '\0';
+        }
+        return false;
+    }
 
 #if RUT_ENABLE_WEBSOCKET
     // Emit a message handler into the SAME module for each terminate route, before compile() takes
@@ -687,6 +703,8 @@ const char* stage_str(LoadStage stage) {
             return "build MIR";
         case LoadStage::Lower:
             return "lower to RIR";
+        case LoadStage::Verify:
+            return "state-machine verification";
         case LoadStage::Codegen:
             return "codegen (LLVM IR)";
         case LoadStage::JitCompile:
@@ -738,7 +756,10 @@ u32 format_load_error(const LoadError& err, char* buf, u32 buf_size) {
     append(buf, buf_size, &pos, stage_str(err.stage));
     append(buf, buf_size, &pos, " failed");
 
-    if (err.has_diag) {
+    if (err.has_verification_failure) {
+        append(buf, buf_size, &pos, ": ");
+        append(buf, buf_size, &pos, err.detail_buf);
+    } else if (err.has_diag) {
         append(buf, buf_size, &pos, ": ");
         append(buf, buf_size, &pos, frontend_error_str(err.diag.code));
         if (err.diag.span.line > 0) {

@@ -10,7 +10,9 @@ using LLVMContextRef = struct LLVMOpaqueContext*;
 
 namespace rut::rir {
 struct Module;
-}
+struct VerifyResult;
+struct VerifyOptions;
+}  // namespace rut::rir
 
 namespace rut::jit {
 
@@ -37,8 +39,13 @@ u32 format_handler_symbol(Str name, char* out, u32 out_size);
 // Every function must pass RIR structure, control-cycle and wait-protocol
 // verification before code generation. This checks the modeled protocol;
 // external IO progress and runtime implementation correctness remain separate.
+// An optional result preserves verification failure details; options can attach
+// a finite peer contract and search limits. Other codegen errors leave that
+// result ok=true, distinguishing them from verification failures.
 // Returns {module, context, true} on success, {null, null, false} on error.
-CodegenResult codegen(const rir::Module& rir_mod);
+CodegenResult codegen(const rir::Module& rir_mod,
+                      rir::VerifyResult* verification = nullptr,
+                      const rir::VerifyOptions* options = nullptr);
 
 // A synchronous message entry uses ordinary RIR evaluation, with two additional
 // private u8 inputs after HandlerFn's five parameters: opcode and direction.

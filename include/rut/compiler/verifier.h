@@ -2,6 +2,7 @@
 
 #include "rut/common/request_policy.h"
 #include "rut/common/ws_message.h"
+#include "rut/compiler/concurrency_verifier.h"
 #include "rut/compiler/http_call_profile.h"
 #include "rut/compiler/password_profile.h"
 #include "rut/compiler/rir.h"
@@ -40,6 +41,10 @@ enum class VerifyIssueCode : u8 {
     InvalidHandlerAutomaton,
     InvalidRuntimeStateModel,
     NonYieldingControlCycle,
+    HandlerLivelock,
+    HandlerDeadlock,
+    ConcurrentProtocolFailure,
+    ConcurrentVerificationLimit,
     YieldCountMismatch,
     TooManyYieldStates,
     TooManyBlocks,
@@ -66,6 +71,14 @@ struct VerifyIssue {
     u32 inst_index = 0;
     u32 target_index = 0;
     u32 detail_index = 0;
+    static constexpr u32 kMaxTrace = 32;
+    u32 trace[kMaxTrace]{};
+    u8 trace_actors[kMaxTrace]{};
+    u8 trace_count = 0;
+    u8 cycle_start = 255;
+    bool trace_truncated = false;
+    bool trace_is_protocol = false;
+    bool trace_has_actors = false;
 };
 
 struct VerifySummary {
@@ -179,10 +192,29 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
     return true;
 }
 
+// An optional finite contract for known peers. Bindings refer to this
+// function's actual RIR yield blocks; handlers are generated, not hand-copied
+// into the peer model. Unknown network peers have no inferred behavior.
+struct VerifyPeerBinding {
+    u32 block_index = 0;
+    u64 submit_set = 0;
+    u64 completion_set = 0;
+    u64 completion_clear = 0;
+};
+
+struct VerifyPeerEnvironment {
+    u32 function_index = 0;
+    const verify::Model* model = nullptr;
+    const VerifyPeerBinding* bindings = nullptr;
+    u32 binding_count = 0;
+};
+
 struct VerifyOptions {
     // Rut route automata should not carry dead blocks: dead IR makes later
     // verifier traces ambiguous and can hide stale lowering paths.
     bool require_all_blocks_reachable = true;
+    verify::Limits concurrency_limits{};
+    const VerifyPeerEnvironment* environment = nullptr;
 };
 
 struct VerifyResult {
@@ -469,6 +501,13 @@ struct VerifyHandlerAutomaton {
     u32 runtime_completion_count = 0;
     u32 runtime_fail_closed_count = 0;
 };
+
+VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
+                                        u32 root,
+                                        u32 function_index,
+                                        VerifySummary summary,
+                                        verify::Limits limits,
+                                        const VerifyPeerEnvironment* environment);
 
 enum class VerifyHandlerCheckIssueCode : u8 {
     None,
@@ -1339,6 +1378,20 @@ inline VerifyResult verify_function(const Function* fn,
                            runtime_state_check.issue.target_index);
     }
 
+    const auto* environment =
+        options.environment && options.environment->function_index == function_index
+            ? options.environment
+            : nullptr;
+    if (fn->yield_count || environment) {
+        const auto concurrent = verify_handler_concurrency(automaton,
+                                                           reachable_root,
+                                                           function_index,
+                                                           summary,
+                                                           options.concurrency_limits,
+                                                           environment);
+        if (!concurrent.ok) return concurrent;
+    }
+
     VerifyResult result{};
     result.ok = true;
     result.summary = summary;
@@ -1352,6 +1405,10 @@ inline VerifyResult verify_module_impl(const Module& mod,
                                        bool internal_strict_local_response_propagation) {
     VerifySummary summary{};
     summary.function_count = mod.func_count;
+    if (options.environment && options.environment->function_index >= mod.func_count)
+        return verify_fail(summary,
+                           VerifyIssueCode::ConcurrentProtocolFailure,
+                           options.environment->function_index);
 
     static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
     const bool has_exact_strict_local_response_inventory =
@@ -1930,6 +1987,14 @@ inline const char* verify_issue_code_name(VerifyIssueCode code) {
             return "InvalidRuntimeStateModel";
         case VerifyIssueCode::NonYieldingControlCycle:
             return "NonYieldingControlCycle";
+        case VerifyIssueCode::HandlerLivelock:
+            return "HandlerLivelock";
+        case VerifyIssueCode::HandlerDeadlock:
+            return "HandlerDeadlock";
+        case VerifyIssueCode::ConcurrentProtocolFailure:
+            return "ConcurrentProtocolFailure";
+        case VerifyIssueCode::ConcurrentVerificationLimit:
+            return "ConcurrentVerificationLimit";
         case VerifyIssueCode::YieldCountMismatch:
             return "YieldCountMismatch";
         case VerifyIssueCode::TooManyYieldStates:
@@ -1998,6 +2063,26 @@ inline void format_verify_result(PrintBuf& buf, const VerifyResult& result) {
         buf.put_cstr(verify_runtime_callback_slot_name(runtime_check.callback_slot));
         buf.put_cstr(" reason=");
         buf.put_cstr(verify_runtime_protocol_reason_name(runtime_check.reason));
+    }
+    if ((result.issue.code == VerifyIssueCode::ConcurrentProtocolFailure ||
+         result.issue.code == VerifyIssueCode::ConcurrentVerificationLimit) &&
+        result.issue.detail_index) {
+        buf.put_cstr(" concurrent=");
+        buf.put_cstr(verify::issue_name(static_cast<verify::Issue>(result.issue.detail_index)));
+    }
+    if (result.issue.trace_count) {
+        buf.put_cstr(result.issue.trace_is_protocol ? " protocol-path=" : " path=");
+        for (u32 i = 0; i < result.issue.trace_count; ++i) {
+            if (i) buf.put_cstr("->");
+            if (i == result.issue.cycle_start) buf.put_cstr("cycle:");
+            if (result.issue.trace_has_actors) {
+                buf.put('a');
+                buf.put_u32(result.issue.trace_actors[i]);
+                buf.put(':');
+            }
+            buf.put_u32(result.issue.trace[i]);
+        }
+        if (result.issue.trace_truncated) buf.put_cstr("->...");
     }
 }
 

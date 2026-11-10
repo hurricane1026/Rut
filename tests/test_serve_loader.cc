@@ -8256,6 +8256,19 @@ TEST(serve_loader, format_read_stage_without_diag) {
     CHECK(contains(msg, "failed"));
 }
 
+TEST(serve_loader, format_verification_failure_keeps_counterexample_detail) {
+    LoadError err{};
+    err.stage = LoadStage::Verify;
+    err.has_verification_failure = true;
+    const char detail[] = "rir verifier: HandlerLivelock function=1 block=0 path=cycle:0->1->0";
+    __builtin_memcpy(err.detail_buf, detail, sizeof(detail));
+    char message[512]{};
+    format_load_error(err, message, sizeof(message));
+    CHECK(contains(message, "state-machine verification failed"));
+    CHECK(contains(message, "HandlerLivelock"));
+    CHECK(contains(message, "cycle:0->1->0"));
+}
+
 TEST(serve_loader, unmatched_source_loads_into_owned_runtime_table) {
     const std::string path =
         write_file("/tmp/rut_serve_loader_unmatched_guard",

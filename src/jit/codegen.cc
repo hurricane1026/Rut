@@ -3977,7 +3977,18 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
 static CodegenResult codegen_impl(const rir::Module& rir_mod,
                                   LLVMContextRef shared_context,
-                                  bool ws_body_mode) {
+                                  bool ws_body_mode,
+                                  rir::VerifyResult* verification = nullptr,
+                                  const rir::VerifyOptions* options = nullptr) {
+    if (verification) *verification = {};
+    if (options && options->environment &&
+        options->environment->function_index >= rir_mod.func_count) {
+        if (verification)
+            *verification = rir::verify_fail({},
+                                             rir::VerifyIssueCode::ConcurrentProtocolFailure,
+                                             options->environment->function_index);
+        return {nullptr, nullptr, false};
+    }
     if (ws_body_mode && (rir_mod.func_count != 1 || !rir::verify_module(rir_mod).ok))
         return {nullptr, nullptr, false};
     // This variadic RIR operation is emitted by the trusted builder, but keep
@@ -4164,7 +4175,12 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
         // Every handler must pass the state-machine verifier before LLVM can
         // emit executable code. Checking only Phi/HTTP-call functions lets a
         // plain control cycle or an unresumable wait bypass the compiler gate.
-        if (!rir::verify_function(&fn).ok) return {nullptr, nullptr, false};
+        const auto checked =
+            rir::verify_function(&fn, fi, options ? *options : rir::VerifyOptions{});
+        if (!checked.ok) {
+            if (verification) *verification = checked;
+            return {nullptr, nullptr, false};
+        }
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
         if (!rir::password_prefix_valid(rir_mod.functions[i]) ||
@@ -4243,8 +4259,10 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     return {c.llvm_mod, c.llvm_ctx, true};
 }
 
-CodegenResult codegen(const rir::Module& rir_mod) {
-    return codegen_impl(rir_mod, nullptr, false);
+CodegenResult codegen(const rir::Module& rir_mod,
+                      rir::VerifyResult* verification,
+                      const rir::VerifyOptions* options) {
+    return codegen_impl(rir_mod, nullptr, false, verification, options);
 }
 
 CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_context) {

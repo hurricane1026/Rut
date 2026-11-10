@@ -273,8 +273,11 @@ TEST(jit, codegen_rejects_plain_control_cycle_in_any_function) {
     b.set_insert_point(bad.value(), loop.value());
     REQUIRE(b.emit_jmp(loop.value()));
 
-    const auto result = codegen(tc.mod);
+    VerifyResult verification{};
+    const auto result = codegen(tc.mod, &verification);
     CHECK_FALSE(result.ok);
+    CHECK_EQ(verification.issue.code, VerifyIssueCode::NonYieldingControlCycle);
+    CHECK_EQ(verification.issue.function_index, 1u);
     CHECK(result.mod == nullptr);
     CHECK(result.ctx == nullptr);
     tc.destroy();
@@ -305,6 +308,44 @@ route GET "/sleep" { wait(1000) return 200 }
     const auto accepted = codegen(rir.module);
     REQUIRE(accepted.ok);
     dispose_module(accepted.mod, accepted.ctx);
+    rir.destroy();
+}
+
+TEST(jit, codegen_rejects_yielding_cycle_and_returns_counterexample) {
+    auto lexed = lex(lit("route GET \"/sleep\" { wait(1000) return 200 }"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto& fn = rir.module.functions[0];
+    const u32 entry =
+        fn.has_explicit_resume_blocks ? fn.resume_blocks[0] : fn.state_zero_entry_block;
+    const u32 resume_block =
+        fn.has_explicit_resume_blocks ? fn.resume_blocks[1] : fn.resume_terminal_block;
+    auto& resume = fn.blocks[resume_block];
+    auto& terminal = resume.insts[resume.inst_count - 1];
+    const Instruction original = terminal;
+    terminal = {};
+    terminal.op = Opcode::Jmp;
+    terminal.imm.block_targets[0] = BlockId{entry};
+    VerifyResult verification{};
+    CHECK_FALSE(codegen(rir.module, &verification).ok);
+    CHECK_EQ(verification.issue.code, VerifyIssueCode::HandlerLivelock);
+    CHECK(verification.issue.trace_count >= 3);
+    terminal = original;
+    VerifyOptions options{};
+    options.concurrency_limits.states = 1;
+    CHECK_FALSE(codegen(rir.module, &verification, &options).ok);
+    CHECK_EQ(verification.issue.code, VerifyIssueCode::ConcurrentVerificationLimit);
+    const auto good = codegen(rir.module, &verification);
+    REQUIRE(good.ok);
+    CHECK(verification.ok);
+    dispose_module(good.mod, good.ctx);
     rir.destroy();
 }
 
