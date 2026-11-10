@@ -1,0 +1,143 @@
+// Memcached basic text protocol. Requests and complete replies are capped at
+// 8192 bytes, matching the generic transport's existing bounded byte profile.
+variant MemcacheStoreMode { set add replace }
+struct MemcacheOptions { flags: Bytes expirySeconds: i32 }
+struct MemcacheItem { data: Bytes flags: Bytes }
+// kind: 0 NeedMore, -1 Invalid, 1 VALUE, 2 END, 3 STORED,
+// 4 NOT_STORED, 5 DELETED, 6 NOT_FOUND, 7 TOUCHED, 8 server error.
+struct MemcacheReply { kind: i32 data: Bytes flags: Bytes }
+struct MemcacheStream { bytes: Bytes reply: MemcacheReply }
+
+func memcacheKeyOctet(_ key: Bytes, _ offset: i32) -> bool {
+    let octet = key[offset].or(33)
+    octet > 32 && octet != 127
+}
+func memcacheKeyStep(_ key: Bytes, _ offset: i32) -> (i32, i32, bool) {
+    guard memcacheKeyOctet(key, offset) && memcacheKeyOctet(key, offset + 1) &&
+        memcacheKeyOctet(key, offset + 2) && memcacheKeyOctet(key, offset + 3) else { nil }
+    (offset + 4, offset, offset + 4 >= key.count)
+}
+func memcacheKeyValid(_ key: Bytes) -> bool {
+    guard key.count > 0 && !(key.count > 250) else { false }
+    guard let checked = collectBytes(key, 0, 64, memcacheKeyStep) else { false }
+    checked.count > 0
+}
+// Flags are unsigned 32-bit decimal bytes: retain the full range without
+// inventing a source-level u32 or narrowing another client's flags to i32.
+func memcacheFlagsValid(_ flags: Bytes) -> bool {
+    guard let first = flags[0] else { false }
+    guard first > 47 && first < 58 else { false }
+    guard let value = parseInt64(flags) else { false }
+    value > -1 && value < 4294967296
+}
+func memcacheExpiryValid(_ seconds: i32) -> bool {
+    // Above 30 days the wire field means an absolute Unix timestamp. This
+    // relative-TTL API rejects that semantic change rather than guessing.
+    seconds > -1 && !(seconds > 2592000)
+}
+func memcacheField(_ prefix: Bytes, _ field: Bytes) {
+    guard let spaced = concatBytes(prefix, b" ", 8192) else { nil }
+    concatBytes(spaced, field, 8192)
+}
+func memcacheKeyRequest(_ name: Bytes, _ key: Bytes) {
+    guard name == b"get" || name == b"delete" else { nil }
+    guard memcacheKeyValid(key) else { nil }
+    guard let named = memcacheField(name, key) else { nil }
+    concatBytes(named, b"\r\n", 8192)
+}
+func memcacheGetRequest(_ key: Bytes) { memcacheKeyRequest(b"get", key) }
+func memcacheDeleteRequest(_ key: Bytes) { memcacheKeyRequest(b"delete", key) }
+func memcacheTouchRequest(_ key: Bytes, _ seconds: i32) {
+    guard memcacheKeyValid(key) && memcacheExpiryValid(seconds) else { nil }
+    guard let digits = formatInt(seconds) else { nil }
+    guard let keyed = memcacheField(b"touch", key) else { nil }
+    guard let expiring = memcacheField(keyed, Bytes(digits)) else { nil }
+    concatBytes(expiring, b"\r\n", 8192)
+}
+func memcacheStoreName(_ mode: MemcacheStoreMode) -> Bytes {
+    match mode {
+        .set => b"set"
+        .add => b"add"
+        .replace => b"replace"
+    }
+}
+func memcacheStoreHeader(_ mode: MemcacheStoreMode, _ key: Bytes, _ settings: MemcacheOptions) {
+    guard memcacheKeyValid(key) && memcacheFlagsValid(settings.flags) &&
+        memcacheExpiryValid(settings.expirySeconds) else { nil }
+    guard let digits = formatInt(settings.expirySeconds) else { nil }
+    guard let keyed = memcacheField(memcacheStoreName(mode), key) else { nil }
+    guard let flagged = memcacheField(keyed, settings.flags) else { nil }
+    memcacheField(flagged, Bytes(digits))
+}
+func memcacheStoreRequest(_ mode: MemcacheStoreMode, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) {
+    guard let header = memcacheStoreHeader(mode, key, settings) else { nil }
+    guard let digits = formatInt(value.count) else { nil }
+    guard let sized = memcacheField(header, Bytes(digits)) else { nil }
+    guard let line = concatBytes(sized, b"\r\n", 8192) else { nil }
+    guard let content = concatBytes(line, value, 8192) else { nil }
+    concatBytes(content, b"\r\n", 8192)
+}
+
+func memcacheEmptyReply(_ kind: i32) -> MemcacheReply {
+    MemcacheReply(kind: kind, data: b"", flags: b"")
+}
+func memcacheStatusKind(_ line: Bytes) -> i32 {
+    if line == b"END" { 2 } else {
+        if line == b"STORED" { 3 } else {
+            if line == b"NOT_STORED" { 4 } else {
+                if line == b"DELETED" { 5 } else {
+                    if line == b"NOT_FOUND" { 6 } else {
+                        if line == b"TOUCHED" { 7 } else { -1 }
+                    }
+                }
+            }
+        }
+    }
+}
+func memcacheStatusReply(_ line: Bytes) -> MemcacheReply {
+    let kind = memcacheStatusKind(line)
+    if kind > 0 { memcacheEmptyReply(kind) } else {
+        if line == b"ERROR" || (line.count > 13 &&
+            (line.slice(0, 13) == b"CLIENT_ERROR " || line.slice(0, 13) == b"SERVER_ERROR ")) {
+            MemcacheReply(kind: 8, data: line, flags: b"")
+        } else { memcacheEmptyReply(-1) }
+    }
+}
+func memcacheValueBody(_ bytes: Bytes, _ start: i32, _ digits: Bytes, _ flags: Bytes) -> MemcacheReply {
+    guard let first = digits[0] else { memcacheEmptyReply(-1) }
+    guard first > 47 && first < 58 else { memcacheEmptyReply(-1) }
+    guard let length = parseInt(digits) else { memcacheEmptyReply(-1) }
+    guard length > -1 && !(length > 8192 - start - 7) else { memcacheEmptyReply(-1) }
+    let end = start + length
+    if bytes.count < end + 7 { memcacheEmptyReply(0) } else {
+        guard bytes.count == end + 7 && bytes.slice(end, end + 7) == b"\r\nEND\r\n" else { memcacheEmptyReply(-1) }
+        MemcacheReply(kind: 1, data: bytes.slice(start, end).or(b""), flags: flags)
+    }
+}
+func memcacheValueReply(_ bytes: Bytes, _ line: Bytes, _ key: Bytes, _ start: i32) -> MemcacheReply {
+    guard let keyEnd = line.find(b" ", 6) else { memcacheEmptyReply(-1) }
+    guard line.slice(6, keyEnd) == key else { memcacheEmptyReply(-1) }
+    guard let flagEnd = line.find(b" ", keyEnd + 1) else { memcacheEmptyReply(-1) }
+    let flags = line.slice(keyEnd + 1, flagEnd).or(b"")
+    guard memcacheFlagsValid(flags) else { memcacheEmptyReply(-1) }
+    guard let digits = line.slice(flagEnd + 1, line.count) else { memcacheEmptyReply(-1) }
+    memcacheValueBody(bytes, start, digits, flags)
+}
+func memcacheParse(_ bytes: Bytes, _ key: Bytes) -> MemcacheReply {
+    guard let end = bytes.find(b"\r\n") else {
+        if bytes.count < 8192 { memcacheEmptyReply(0) } else { memcacheEmptyReply(-1) }
+    }
+    let line = bytes.slice(0, end).or(b"")
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { memcacheEmptyReply(-1) }
+    if line.slice(0, 6) == b"VALUE " {
+        memcacheValueReply(bytes, line, key, end + 2)
+    } else {
+        guard end + 2 == bytes.count else { memcacheEmptyReply(-1) }
+        memcacheStatusReply(line)
+    }
+}
+func memcacheFeed(_ stream: MemcacheStream, _ chunk: Bytes, _ key: Bytes) {
+    guard stream.reply.kind == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+    MemcacheStream(bytes: bytes, reply: memcacheParse(bytes, key))
+}

@@ -10734,3 +10734,18 @@ selection, business, transport/protocol and cleanup failure and retain owned Byt
 across reset. SET execution can precede a cleanup failure; no replay is added.
 There are no runtime Redis fields/opcodes, new dependencies, keywords, loops or
 budget increases. See [the session contract](docs/redis-sessions.md).
+
+### Memcached basic-text client composition
+
+The ordinary Memcached library composes generic TCP/verified TLS and bounded
+Bytes operations for single-key GET, SET/ADD/REPLACE, DELETE and TOUCH. Requests
+and complete replies are bounded to 8192 bytes; four receives each retain their
+own fixed deadline. Keys are checked before sending, GET validates the echoed
+key and declared payload length, and typed results distinguish a cache miss,
+conditional non-storage, server errors and transport/framing failures. Server,
+transport and framing failures close aliases; successful commands permit pool return without
+introducing automatic retry or release. Flags preserve unsigned 32-bit decimal
+spelling, and relative expiration rejects the wire protocol's greater-than-30-day
+absolute-time interpretation. This is an unauthenticated source-library profile,
+not a native protocol handler or distributed Cache backend. It adds no keywords,
+dependencies or runtime operations. See [the contract](docs/memcache-client.md).

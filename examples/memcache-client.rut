@@ -1,0 +1,57 @@
+import "clients/memcache-client.rut"
+
+func exampleMemcacheValue(_ result: MemcacheGetResult) -> Bytes {
+    match result {
+        .value(item) => item.data
+        _ => nil
+    }
+}
+func exampleMemcacheGetStatus(_ result: MemcacheGetResult) -> i32 {
+    match result {
+        .value(item) => 200
+        .missing => 404
+        .requestFailure => 400
+        .serverError(data) => 503
+        .transportFailure(code) => if code == -2 { 504 } else { 502 }
+        _ => 502
+    }
+}
+func exampleMemcacheSetStatus(_ result: MemcacheStoreResult) -> i32 {
+    match result {
+        .stored => 204
+        .notStored => 409
+        .requestFailure => 400
+        .serverError(data) => 503
+        .transportFailure(code) => if code == -2 { 504 } else { 502 }
+        _ => 502
+    }
+}
+// MEMCACHE_ENDPOINT is a fixed TCP or verified TLS policy. Set poolIdleMs to
+// enable explicit cross-request reuse. Use a dedicated unauthenticated policy.
+route POST "/get" {
+    let pending = tcp(env("MEMCACHE_ENDPOINT"), 1000)
+    guard let connection = pending else { return 503 }
+    let result = memcacheGet(connection, req.bodyBytes)
+    let released = connection.release()
+    let status = exampleMemcacheGetStatus(result)
+    guard status != 404 else { return 404 }
+    guard status != 400 else { return 400 }
+    guard status != 503 else { return 503 }
+    guard status != 504 else { return 504 }
+    guard let value = exampleMemcacheValue(result) else { return 502 }
+    return response(200, body: value)
+}
+route POST "/set" {
+    let pending = tcp(env("MEMCACHE_ENDPOINT"), 1000)
+    guard let connection = pending else { return 503 }
+    let result = memcacheSet(connection, b"example-key", req.bodyBytes,
+        MemcacheOptions(flags: b"0", expirySeconds: 60))
+    let released = connection.release()
+    let status = exampleMemcacheSetStatus(result)
+    guard status != 400 else { return 400 }
+    guard status != 409 else { return 409 }
+    guard status != 503 else { return 503 }
+    guard status != 504 else { return 504 }
+    guard status == 204 else { return 502 }
+    return 204
+}
