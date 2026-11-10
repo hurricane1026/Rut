@@ -180,6 +180,12 @@ timer timeout branch, and an upstream connect/send/recv path.
 
 ## Current MVP
 
+RIR function verification is a mandatory gate for every handler passed to LLVM
+code generation, including direct RIR clients. A handler does not need Phi nodes
+or HTTP calls to trigger verification. A plain non-yielding control cycle or a
+wait whose declared arms disagree with the modeled pending operations prevents
+code generation for the entire module.
+
 The first native verifier entry point is RIR graph validation. It is intentionally
 small: it checks route-local block structure before any larger runtime model is
 introduced.

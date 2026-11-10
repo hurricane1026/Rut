@@ -3985,7 +3985,6 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
-        bool has_phi = false;
         if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn) ||
                              rir::function_uses_http_call(fn)))
             return {nullptr, nullptr, false};
@@ -3995,7 +3994,6 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
-                has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
                     !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst) ||
                     !rir::valid_collected_instruction(fn, inst) ||
@@ -4163,8 +4161,10 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
             }
         }
-        if ((has_phi || rir::function_uses_http_call(fn)) && !rir::verify_function(&fn).ok)
-            return {nullptr, nullptr, false};
+        // Every handler must pass the state-machine verifier before LLVM can
+        // emit executable code. Checking only Phi/HTTP-call functions lets a
+        // plain control cycle or an unresumable wait bypass the compiler gate.
+        if (!rir::verify_function(&fn).ok) return {nullptr, nullptr, false};
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
         if (!rir::password_prefix_valid(rir_mod.functions[i]) ||

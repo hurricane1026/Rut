@@ -255,6 +255,59 @@ static const char kGetRootRequest[] =
 
 // ── Tests ──────────────────────────────────────────────────────────
 
+TEST(jit, codegen_rejects_plain_control_cycle_in_any_function) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto good = b.create_function(lit("good"), lit("/good"), 0);
+    REQUIRE(good);
+    auto entry = b.create_block(good.value(), lit("entry"));
+    REQUIRE(entry);
+    b.set_insert_point(good.value(), entry.value());
+    REQUIRE(b.emit_ret_status(200));
+    auto bad = b.create_function(lit("bad"), lit("/bad"), 0);
+    REQUIRE(bad);
+    auto loop = b.create_block(bad.value(), lit("loop"));
+    REQUIRE(loop);
+    b.set_insert_point(bad.value(), loop.value());
+    REQUIRE(b.emit_jmp(loop.value()));
+
+    const auto result = codegen(tc.mod);
+    CHECK_FALSE(result.ok);
+    CHECK(result.mod == nullptr);
+    CHECK(result.ctx == nullptr);
+    tc.destroy();
+}
+
+TEST(jit, codegen_rejects_wait_without_matching_runtime_arm) {
+    const auto src = R"rut(
+route GET "/sleep" { wait(1000) return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto& fn = rir.module.functions[0];
+    const u8 original = fn.yield_arm_masks[0];
+    fn.yield_arm_masks[0] = kWaitEventArmRecv;
+    const auto rejected = codegen(rir.module);
+    CHECK_FALSE(rejected.ok);
+    CHECK(rejected.mod == nullptr);
+    CHECK(rejected.ctx == nullptr);
+    fn.yield_arm_masks[0] = original;
+    const auto accepted = codegen(rir.module);
+    REQUIRE(accepted.ok);
+    dispose_module(accepted.mod, accepted.ctx);
+    rir.destroy();
+}
+
 // Test: runtime helpers work from C++ (sanity check)
 TEST(jit, helpers_sanity) {
     const char* out_ptr = nullptr;

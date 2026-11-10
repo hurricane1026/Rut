@@ -14,6 +14,12 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 
 ## File anatomy
 
+Before LLVM code generation, every handler passes RIR structure, non-yielding
+control-cycle, and modeled wait-protocol checks. Invalid resume mappings or
+wait-arm mismatches are compile failures. These checks do not yet establish
+general deadlock freedom or liveness; see
+[verification coverage](user-code-formal-verification.md#current-mvp).
+
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
