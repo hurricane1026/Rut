@@ -14,53 +14,57 @@ struct Resp2Token {
 func resp2Select(_ condition: bool, _ yes: i32, _ no: i32) -> i32 {
     if condition { yes } else { no }
 }
-func resp2Emit(_ state: Resp2State, _ token: Resp2Token) -> (Resp2State, Resp2Token, bool) {
-    let pending = state.pending - 1 + token.children
-    guard pending > -1 && !(pending > 64) else { nil }
-    (Resp2State(offset: token.next, pending: pending), token, pending == 0)
-}
-func resp2Bulk(_ bytes: Bytes, _ state: Resp2State, _ length: i32, _ start: i32) -> (Resp2State, Resp2Token, bool) {
+// Parse one complete token without advancing aggregate state. Shared by the
+// ordinary decoder and bounded multi-reply/request scans.
+func resp2TokenBulk(_ bytes: Bytes, _ length: i32, _ start: i32) -> Resp2Token {
     guard length > -1 && !(length > bytes.count - start - 2) else { nil }
     let end = start + length
     guard bytes.slice(end, end + 2) == b"\r\n" else { nil }
     guard let payload = bytes.slice(start, end) else { nil }
-    resp2Emit(state, Resp2Token(kind: 4, data: payload, next: end + 2, children: 0))
+    Resp2Token(kind: 4, data: payload, next: end + 2, children: 0)
 }
-func resp2Length(_ bytes: Bytes, _ state: Resp2State, _ prefix: i32, _ text: Bytes, _ next: i32) -> (Resp2State, Resp2Token, bool) {
+func resp2TokenLength(_ bytes: Bytes, _ prefix: i32, _ text: Bytes, _ next: i32) -> Resp2Token {
     if text == b"-1" {
         let kind = resp2Select(prefix == 36, 6, 7)
-        resp2Emit(state, Resp2Token(kind: kind, data: b"", next: next, children: 0))
+        Resp2Token(kind: kind, data: b"", next: next, children: 0)
     } else {
         guard let first = text[0] else { nil }
         guard first > 47 && first < 58 else { nil }
         guard let length = parseInt(text) else { nil }
         if prefix == 36 {
-            resp2Bulk(bytes, state, length, next)
+            resp2TokenBulk(bytes, length, next)
         } else {
             guard !(length > 64) else { nil }
-            resp2Emit(state, Resp2Token(kind: 5, data: b"", next: next, children: length))
+            Resp2Token(kind: 5, data: b"", next: next, children: length)
+        }
+    }
+}
+func resp2Token(_ bytes: Bytes, _ offset: i32) -> Resp2Token {
+    guard offset > -1 else { nil }
+    guard let prefix = bytes[offset] else { nil }
+    guard let lineEnd = bytes.find(b"\r\n", offset + 1) else { nil }
+    guard let text = bytes.slice(offset + 1, lineEnd) else { nil }
+    let next = lineEnd + 2
+    if prefix == 43 || prefix == 45 {
+        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+        let kind = resp2Select(prefix == 43, 1, 2)
+        Resp2Token(kind: kind, data: text, next: next, children: 0)
+    } else {
+        if prefix == 58 {
+            guard parseInt64(text) != nil else { nil }
+            Resp2Token(kind: 3, data: text, next: next, children: 0)
+        } else {
+            guard prefix == 36 || prefix == 42 else { nil }
+            resp2TokenLength(bytes, prefix, text, next)
         }
     }
 }
 func resp2Step(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
     guard state.pending > 0 else { nil }
-    guard let prefix = bytes[state.offset] else { nil }
-    guard let lineEnd = bytes.find(b"\r\n", state.offset + 1) else { nil }
-    guard let text = bytes.slice(state.offset + 1, lineEnd) else { nil }
-    let next = lineEnd + 2
-    if prefix == 43 || prefix == 45 {
-        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
-        let kind = resp2Select(prefix == 43, 1, 2)
-        resp2Emit(state, Resp2Token(kind: kind, data: text, next: next, children: 0))
-    } else {
-        if prefix == 58 {
-            guard parseInt64(text) != nil else { nil }
-            resp2Emit(state, Resp2Token(kind: 3, data: text, next: next, children: 0))
-        } else {
-            guard prefix == 36 || prefix == 42 else { nil }
-            resp2Length(bytes, state, prefix, text, next)
-        }
-    }
+    guard let token = resp2Token(bytes, state.offset) else { nil }
+    let pending = state.pending - 1 + token.children
+    guard pending > -1 && !(pending > 64) else { nil }
+    (Resp2State(offset: token.next, pending: pending), token, pending == 0)
 }
 // Decode one complete value, rejecting trailing bytes and truncated aggregates.
 // A nesting chain consumes one node per level and is bounded by the same limit.
@@ -229,4 +233,21 @@ func resp2Receive(_ connection: TcpConnection, _ stream: Resp2Stream) {
     } else {
         stream
     }
+}
+
+// Only a flat array of non-null bulk arguments is a request. Validate actual
+// bytes as well as builder metadata before I/O: records are public values.
+func redisRequestStep(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
+    let expected = resp2Select(state.offset == 0, 42, 36)
+    guard bytes[state.offset] == expected else { nil }
+    guard let digit = bytes[state.offset + 1] else { nil }
+    guard digit > 47 && digit < 58 else { nil }
+    resp2Step(bytes, state)
+}
+func redisRequestValid(_ request: Bytes) -> bool {
+    guard request.count > 0 && !(request.count > 8192) else { false }
+    guard let values = collectBytes(request, Resp2State(offset: 0, pending: 1), 64, redisRequestStep) else { false }
+    guard let root = values.get(0) else { false }
+    guard let last = values.get(values.count - 1) else { false }
+    root.kind == 5 && root.children > 0 && root.children == values.count - 1 && last.next == request.count
 }

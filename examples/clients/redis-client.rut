@@ -390,22 +390,6 @@ func redisBulk(_ reply: RedisReply) {
     guard reply.root.kind == 4 else { nil }
     reply.root.data
 }
-// Only a flat array of non-null bulk arguments is a request. Validate actual
-// bytes as well as builder metadata before I/O: records are public values.
-func redisRequestStep(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
-    let expected = resp2Select(state.offset == 0, 42, 36)
-    guard bytes[state.offset] == expected else { nil }
-    guard let digit = bytes[state.offset + 1] else { nil }
-    guard digit > 47 && digit < 58 else { nil }
-    resp2Step(bytes, state)
-}
-func redisRequestValid(_ request: Bytes) -> bool {
-    guard request.count > 0 && !(request.count > 8192) else { false }
-    guard let values = collectBytes(request, Resp2State(offset: 0, pending: 1), 64, redisRequestStep) else { false }
-    guard let root = values.get(0) else { false }
-    guard let last = values.get(values.count - 1) else { false }
-    root.kind == 5 && root.children > 0 && root.children == values.count - 1 && last.next == request.count
-}
 func redisReadValuesTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
     let readingFirst = resp2Receive(connection, stream)
     guard let first = readingFirst else { nil }
@@ -562,4 +546,43 @@ func redisSetWithOptions(_ connection: TcpConnection, _ key: Bytes, _ value: Byt
         let closed = connection.close()
         typed
     } else { typed }
+}
+
+// GET returns the previous value even when NX rejects a write. A null bulk
+// means no previous value, including a successful create or rejected XX.
+struct RedisSetPrevious { found: bool data: Bytes }
+variant RedisSetGetResult {
+    stored(RedisSetPrevious)
+    notStored(RedisSetPrevious)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisSetGetReply(_ connection: TcpConnection, _ reply: RedisReply, _ condition: RedisSetCondition) -> RedisSetGetResult {
+    if reply.root.kind == 4 || reply.root.kind == 6 {
+        let found = reply.root.kind == 4
+        let data = reply.root.data
+        let previous = RedisSetPrevious(found: found, data: data)
+        match condition {
+            .always => RedisSetGetResult.stored(previous)
+            .absent => if found { RedisSetGetResult.notStored(previous) } else { RedisSetGetResult.stored(previous) }
+            .present => if found { RedisSetGetResult.stored(previous) } else { RedisSetGetResult.notStored(previous) }
+        }
+    } else {
+        let closed = connection.close()
+        RedisSetGetResult.replyFailure
+    }
+}
+func redisSetGet(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ condition: RedisSetCondition, _ expiry: RedisSetExpiry) -> RedisSetGetResult {
+    guard let request = resp2SetGetRequest(key, value, condition, expiry) else { RedisSetGetResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    let finished = redisResultFinish(connection, result)
+    match finished {
+        .reply(reply) => redisSetGetReply(connection, reply, condition)
+        .serverError(data) => RedisSetGetResult.serverError(data)
+        .requestFailure => RedisSetGetResult.requestFailure
+        .transportFailure(code) => RedisSetGetResult.transportFailure(code)
+        .replyFailure => RedisSetGetResult.replyFailure
+    }
 }

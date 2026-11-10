@@ -158,7 +158,8 @@ func condition(_ name: str) -> RedisSetCondition {
 }
 func expiry(_ name: str, _ amount: i32) -> RedisSetExpiry {
     match name { "EX" => RedisSetExpiry.seconds(amount)
-        "PX" => RedisSetExpiry.milliseconds(amount) _ => RedisSetExpiry.none }
+        "PX" => RedisSetExpiry.milliseconds(amount)
+        "KEEPTTL" => RedisSetExpiry.keepTtl _ => RedisSetExpiry.none }
 }
 func requestKey(_ duplicate: bool, _ body: Bytes, _ fallback: Bytes) -> Bytes {
     if duplicate { body } else { fallback }
@@ -173,11 +174,6 @@ func setStatus(_ result: RedisSetOptionsResult) -> i32 {
         .replyFailure => 502
     }
 }
-func integerBytes(_ reply: RedisReply) -> Bytes {
-    guard let number = redisInteger(reply) else { nil }
-    guard let digits = formatInt(number) else { nil }
-    Bytes(digits)
-}
 func indexedBytes(_ reply: RedisReply, _ index: i32) -> Bytes {
     guard let values = redisValues(reply) else { nil }
     guard let token = values.get(index) else { nil }
@@ -185,7 +181,11 @@ func indexedBytes(_ reply: RedisReply, _ index: i32) -> Bytes {
 }
 func outputBytes(_ reply: RedisReply, _ mode: str, _ index: i32) -> Bytes {
     match mode {
-        "integer" => integerBytes(reply)
+        "integer" => {
+            guard let number = redisInteger(reply) else { nil }
+            guard let digits = formatInt(number) else { nil }
+            Bytes(digits)
+        }
         "values" => indexedBytes(reply, index)
         _ => reply.frame
     }
@@ -299,13 +299,13 @@ route POST "/{name.lower()}" {{
 
 
 @contextlib.contextmanager
-def gateway(args, endpoint):
+def gateway(args, endpoint, program_factory=program):
     with tempfile.TemporaryDirectory(prefix='rut-redis-commands-') as directory:
         root = Path(directory)
         for name in ('resp2.rut', 'resp2-command.rut', 'redis-client.rut'):
             shutil.copyfile(Path(args.library) / name, root / name)
         source, log = root / 'gateway.rut', root / 'server.log'
-        text = program(args.real_redis)
+        text = program_factory(args.real_redis)
         if args.opt == '2':
             text = text.replace('import "redis-client.rut"', 'import * as client from "redis-client.rut"')
             names = set()
@@ -319,7 +319,8 @@ def gateway(args, endpoint):
                                         '--opt', args.opt, '--no-pin', '--shards', '1', '--drain', '0'],
                                        env=env, stdout=output, stderr=subprocess.STDOUT)
         try:
-            deadline = time.monotonic() + 240
+            startup_timeout = 270
+            deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
                 data = log.read_bytes()
                 found = re.search(rb'Listening on port ([0-9]+) with', data)
@@ -332,7 +333,9 @@ def gateway(args, endpoint):
                     raise AssertionError(data.decode(errors='replace'))
                 time.sleep(.025)
             else:
-                raise AssertionError(log.read_text(errors='replace'))
+                raise AssertionError(
+                    f'gateway did not start listening within {startup_timeout}s; '
+                    f'server log:\n{log.read_text(errors="replace")}')
             for path in root.glob('*.rut'):
                 path.unlink()
             def request(path, body=b'', headers=None):
@@ -408,13 +411,15 @@ def fixture_checks(request, peer):
 
 def builder_checks(request):
     for condition in ('', 'NX', 'XX'):
-        for expiry in ('', 'EX', 'PX'):
+        for expiry in ('', 'EX', 'PX', 'KEEPTTL'):
             headers = {'X-Key': 'options', 'X-Condition': condition, 'X-Expiry': expiry, 'X-Amount': '10000'}
             arguments = [b'SET', b'options', b'a\x00\xff\r\n']
             if condition:
                 arguments.append(condition.encode())
             if expiry:
-                arguments += [expiry.encode(), b'10000']
+                arguments.append(expiry.encode())
+            if expiry in ('EX', 'PX'):
+                arguments.append(b'10000')
             assert request('build-options', arguments[2], headers) == (200, packet(arguments))
     for expiry in ('EX', 'PX'):
         headers = {'X-Expiry': expiry, 'X-Amount': '2147483647'}
@@ -424,12 +429,16 @@ def builder_checks(request):
             headers = {'X-Expiry': expiry, 'X-Amount': amount}
             assert request('build-options', b'value', headers)[0] == 413
             assert request('set-options', b'value', headers)[0] == 413
-    headers = {'X-Condition': 'NX', 'X-Expiry': 'PX', 'X-Amount': '1', 'X-Duplicate': 'yes'}
-    maximum = max(n for n in range(4200) if len(packet([b'SET', b'x' * n, b'x' * n, b'NX', b'PX', b'1'])) <= 8192)
-    assert request('build-options', b'x' * maximum, headers) == (
-        200, packet([b'SET', b'x' * maximum, b'x' * maximum, b'NX', b'PX', b'1']))
-    assert request('build-options', b'x' * (maximum + 1), headers)[0] == 413
-    assert request('set-options', b'x' * (maximum + 1), headers)[0] == 413
+    for expiry, tail in (('PX', [b'PX', b'1']), ('KEEPTTL', [b'KEEPTTL'])):
+        headers = {'X-Condition': 'NX', 'X-Expiry': expiry, 'X-Amount': '1', 'X-Duplicate': 'yes'}
+        maximum = max(n for n in range(4200)
+                      if len(packet([b'SET', b'x' * n, b'x' * n, b'NX'] + tail)) <= 8192)
+        assert request('build-options', b'x' * maximum, headers) == (
+            200, packet([b'SET', b'x' * maximum, b'x' * maximum, b'NX'] + tail))
+        assert request('build-options', b'x' * (maximum + 1), headers)[0] == 413
+        assert request('set-options', b'x' * (maximum + 1), headers)[0] == 413
+
+
 @contextlib.contextmanager
 def real_redis(args):
     name = 'rut-redis-' + uuid.uuid4().hex
@@ -477,6 +486,30 @@ def real_redis(args):
 
 
 def real_checks(request, command):
+    keep_key = b'keep-ttl'
+    for condition in ('', 'NX', 'XX'):
+        assert command(b'SET', keep_key, b'original', b'PX', b'300000') == b'OK'
+        deadline = command(b'PEXPIRETIME', keep_key)
+        headers = {'X-Key': keep_key.decode(), 'X-Condition': condition, 'X-Expiry': 'KEEPTTL'}
+        assert request('set-options', b'updated\x00\xff', headers)[0] == (412 if condition == 'NX' else 204)
+        assert command(b'GET', keep_key) == (b'original' if condition == 'NX' else b'updated\x00\xff')
+        assert command(b'PEXPIRETIME', keep_key) == deadline
+        assert 0 < command(b'PTTL', keep_key) <= 300000
+    assert request('set-options', b'persistent', {'X-Key': keep_key.decode()})[0] == 204
+    assert command(b'PTTL', keep_key) == -1
+    assert request('set-options', b'still-persistent', {
+        'X-Key': keep_key.decode(), 'X-Expiry': 'KEEPTTL'})[0] == 204
+    assert command(b'PTTL', keep_key) == -1
+    assert command(b'DEL', keep_key) == 1
+    assert request('set-options', b'missing', {
+        'X-Key': keep_key.decode(), 'X-Condition': 'XX', 'X-Expiry': 'KEEPTTL'})[0] == 412
+    assert command(b'EXISTS', keep_key) == 0
+    for condition in ('', 'NX'):
+        assert request('set-options', b'created', {
+            'X-Key': keep_key.decode(), 'X-Condition': condition, 'X-Expiry': 'KEEPTTL'})[0] == 204
+        assert command(b'GET', keep_key) == b'created'
+        assert command(b'PTTL', keep_key) == -1
+        assert command(b'DEL', keep_key) == 1
     key, value = b'options', b'a\x00\xff\r\n'
     assert request('set-options', value, {'X-Condition': 'NX', 'X-Expiry': 'EX', 'X-Amount': '100'})[0] == 204
     assert command(b'GET', key) == value
