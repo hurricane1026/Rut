@@ -36,10 +36,20 @@ explicit and bounded; there are no general source loops or recursive values.
 ## SET choices
 
 `RedisSetCondition` has `.always`, `.absent` (NX) and `.present` (XX).
-`RedisSetExpiry` has `.none`, `.seconds(i32)` (EX) and `.milliseconds(i32)` (PX).
-EX/PX must be positive, up to i32 maximum. Contradictory NX/XX or EX/PX choices
-cannot be represented. `resp2SetOptionsRequest(key, value, condition, expiry)`
-builds the request without I/O. Arguments are binary-safe.
+`RedisSetExpiry` has `.none`, `.seconds(i32)` (EX), `.milliseconds(i32)` (PX)
+and `.keepTtl` (KEEPTTL). `.keepTtl` preserves the existing expiration when
+replacing a value; a new key or an already persistent key remains persistent.
+It works with all three conditions and requires Redis 6.0 or later. `.none`
+uses ordinary SET semantics, removing any existing expiration on a successful
+write. EX/PX must be positive, up to i32 maximum. Contradictory conditions or
+expiration modes cannot be represented.
+`resp2SetOptionsRequest(key, value, condition, expiry)` builds the request without
+I/O. Arguments are binary-safe.
+
+```rut
+redisSetWithOptions(connection, key, value,
+    RedisSetCondition.present, RedisSetExpiry.keepTtl)
+```
 
 `RedisSetOptionsResult` has `.ok`, `.notSet`, `.serverError(Bytes)`,
 `.requestFailure`, `.transportFailure(i32)` and `.replyFailure`. A Redis null
@@ -48,7 +58,7 @@ Plain `redisSet` retains its existing result and exact acknowledgement contract.
 The expiration and conditional semantics follow Redis's
 [SET contract](https://redis.io/docs/latest/commands/set/); TTL preserves the
 [-1/-2 sentinels](https://redis.io/docs/latest/commands/ttl/) and counters preserve
-signed 64-bit results and server overflow errors. SET GET, KEEPTTL, EXAT/PXAT and
+signed 64-bit results and server overflow errors. SET GET, EXAT/PXAT and
 newer server-specific conditions have no dedicated wrapper in this profile.
 
 ## Bounds and connection ownership
@@ -86,17 +96,19 @@ bounded standalone Redis client, not a complete Redis driver.
 `test_redis_commands.py` checks strict framing, nested arrays and errors, all
 signed integer boundaries, 64-node limits, fragmentation, EOF/deadlines, no replay,
 failure closure through handle aliases, request rejection before I/O and server
-error recovery against an independent byte-level peer. It checks all nine
-condition/expiry encodings and invalid expiration bounds. Source removal after
-startup and O2 namespace imports check ownership and nominal type relocation.
+error recovery against an independent byte-level peer. It checks all twelve
+condition/expiry encodings, invalid expiration bounds and bounded KEEPTTL framing.
+Source removal after startup and O2 namespace imports check ownership and nominal
+type relocation.
 CTest registers epoll/io_uring at O0/O2 and verified TLS.
 
 The `docker`-labelled live tests use the immutable official Redis 7.2.11 Alpine
 manifest recorded in the test, with an ephemeral container, loopback-only port,
 no persistence and no host Redis installation or Python Redis package. They
-verify SET conditions and expirations, TTL sentinels, key commands, counter
-overflow, binary MGET, nested Lua replies, ACL authentication, database selection
-and RESET before pool return over TCP and TLS. TLS uses the
+verify SET conditions and expirations, exact preservation of expiration timestamps
+with KEEPTTL (including conditional rejection and persistent/missing keys), TTL
+sentinels, key commands, counter overflow, binary MGET, nested Lua replies, ACL
+authentication, database selection and RESET before pool return over TCP and TLS. TLS uses the
 existing fixture certificate files, without an OpenSSL CLI. The normal CI
 selection excludes Docker-labelled tests; run them explicitly with:
 
