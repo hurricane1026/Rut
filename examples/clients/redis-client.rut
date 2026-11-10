@@ -390,22 +390,6 @@ func redisBulk(_ reply: RedisReply) {
     guard reply.root.kind == 4 else { nil }
     reply.root.data
 }
-// Only a flat array of non-null bulk arguments is a request. Validate actual
-// bytes as well as builder metadata before I/O: records are public values.
-func redisRequestStep(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
-    let expected = resp2Select(state.offset == 0, 42, 36)
-    guard bytes[state.offset] == expected else { nil }
-    guard let digit = bytes[state.offset + 1] else { nil }
-    guard digit > 47 && digit < 58 else { nil }
-    resp2Step(bytes, state)
-}
-func redisRequestValid(_ request: Bytes) -> bool {
-    guard request.count > 0 && !(request.count > 8192) else { false }
-    guard let values = collectBytes(request, Resp2State(offset: 0, pending: 1), 64, redisRequestStep) else { false }
-    guard let root = values.get(0) else { false }
-    guard let last = values.get(values.count - 1) else { false }
-    root.kind == 5 && root.children > 0 && root.children == values.count - 1 && last.next == request.count
-}
 func redisReadValuesTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
     let readingFirst = resp2Receive(connection, stream)
     guard let first = readingFirst else { nil }

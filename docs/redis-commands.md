@@ -73,9 +73,11 @@ The generic executor does not infer command side effects. Callers must close
 after arbitrary state-changing commands, or perform command-appropriate cleanup
 before release. In particular, AUTH, SELECT, transactions, WATCH, Pub/Sub and
 protocol mode changes cannot be treated as stateless pool operations. Prefer the
-existing authenticated session helpers for pooled GET/SET. The low-level executor
-does not implement general pipelines, transaction handling, subscription streams,
-Cluster redirects, Sentinel discovery, RESP3, reconnect or retry policy. Some
+existing authenticated session helpers for pooled GET/SET. The single-command
+executor does not batch commands; the separate [pipeline module](redis-pipeline.md)
+supports finite batches. Transaction handling, subscription streams,
+Cluster redirects, Sentinel discovery, RESP3, reconnect and retry policy remain
+outside this profile. Some
 commands cannot fit these finite request/reply/read budgets. This remains a
 bounded standalone Redis client, not a complete Redis driver.
 
