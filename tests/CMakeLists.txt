@@ -4478,6 +4478,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(command_opt 0 2)
+            add_test(NAME test_redis_commands_${backend}_opt${command_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --backend ${backend} --opt ${command_opt})
+            set_tests_properties(test_redis_commands_${backend}_opt${command_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             add_test(NAME test_resp2_commands_${backend}_opt${command_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_resp2_commands.py
                     --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
@@ -4486,6 +4492,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             set_tests_properties(test_resp2_commands_${backend}_opt${command_opt} PROPERTIES
                 LABELS "integration;network" TIMEOUT 240 SKIP_RETURN_CODE 77)
         endforeach()
+        add_test(NAME test_redis_commands_live_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --backend ${backend} --opt 2 --real-redis)
+        set_tests_properties(test_redis_commands_live_${backend} PROPERTIES
+            LABELS "integration;network;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME test_redis_commands_${backend}_tls
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
+        set_tests_properties(test_redis_commands_${backend}_tls PROPERTIES
+            LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME test_redis_commands_live_${backend}_tls
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls --real-redis)
+        set_tests_properties(test_redis_commands_live_${backend}_tls PROPERTIES
+            LABELS "integration;network;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         foreach(stream_opt 0 2)
             add_test(NAME test_incremental_resp2_${backend}_opt${stream_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_incremental_resp2.py

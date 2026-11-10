@@ -372,3 +372,194 @@ func redisSessionSet(_ connection: TcpConnection, _ username: Bytes, _ password:
     let reply = redisSet(connection, key, value)
     redisSessionFinish(connection, redisSessionFromSet(reply))
 }
+
+// General replies retain an invocation-owned frame and a typed root. Arrays
+// use decodeResp2's bounded preorder representation; no collection is hidden
+// in a record, and integer access never narrows the wire's signed 64-bit value.
+struct RedisReply { frame: Bytes root: Resp2Token }
+variant RedisResult {
+    reply(RedisReply)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisValues(_ reply: RedisReply) { decodeResp2(reply.frame) }
+func redisInteger(_ reply: RedisReply) { resp2Integer(reply.root) }
+func redisBulk(_ reply: RedisReply) {
+    guard reply.root.kind == 4 else { nil }
+    reply.root.data
+}
+// Only a flat array of non-null bulk arguments is a request. Validate actual
+// bytes as well as builder metadata before I/O: records are public values.
+func redisRequestStep(_ bytes: Bytes, _ state: Resp2State) -> (Resp2State, Resp2Token, bool) {
+    let expected = resp2Select(state.offset == 0, 42, 36)
+    guard bytes[state.offset] == expected else { nil }
+    guard let digit = bytes[state.offset + 1] else { nil }
+    guard digit > 47 && digit < 58 else { nil }
+    resp2Step(bytes, state)
+}
+func redisRequestValid(_ request: Bytes) -> bool {
+    guard request.count > 0 && !(request.count > 8192) else { false }
+    guard let values = collectBytes(request, Resp2State(offset: 0, pending: 1), 64, redisRequestStep) else { false }
+    guard let root = values.get(0) else { false }
+    guard let last = values.get(values.count - 1) else { false }
+    root.kind == 5 && root.children > 0 && root.children == values.count - 1 && last.next == request.count
+}
+func redisReadValuesTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let readingFirst = resp2Receive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp2Receive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func redisReadValues(_ connection: TcpConnection) {
+    guard let initial = resp2Stream(8192) else { nil }
+    let readingFirst = redisReadValuesTwice(connection, initial)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisReadValuesTwice(connection, first)
+    guard let stream = readingSecond else { nil }
+    guard resp2Finished(stream) else { nil }
+    stream.bytes
+}
+func redisResultReadFailure(_ code: i32) -> RedisResult {
+    if code == 0 { RedisResult.replyFailure } else { RedisResult.transportFailure(code) }
+}
+func redisDecodeReply(_ frame: Bytes) -> RedisResult {
+    guard let values = decodeResp2(frame) else { RedisResult.replyFailure }
+    guard let root = values.get(0) else { RedisResult.replyFailure }
+    if root.kind == 2 { RedisResult.serverError(root.data) } else {
+        RedisResult.reply(RedisReply(frame: frame, root: root))
+    }
+}
+func redisExecuteWire(_ connection: TcpConnection, _ request: Bytes) -> RedisResult {
+    guard redisRequestValid(request) else { RedisResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisResult.transportFailure(netError()) }
+    let reading = redisReadValues(connection)
+    guard let frame = reading else { redisResultReadFailure(netError()) }
+    redisDecodeReply(frame)
+}
+// Commands whose contract is scalar use the one-node incremental path. This
+// keeps ordinary key operations cheap without reducing general reply bounds.
+func redisScalarResult(_ stream: Resp2Stream) -> RedisResult {
+    guard let root = redisScalarReply(stream) else { RedisResult.replyFailure }
+    if root.kind == 2 { RedisResult.serverError(root.data) } else {
+        RedisResult.reply(RedisReply(frame: stream.bytes, root: root))
+    }
+}
+func redisExecuteScalarWire(_ connection: TcpConnection, _ request: Bytes) -> RedisResult {
+    guard redisRequestValid(request) else { RedisResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisResult.transportFailure(netError()) }
+    guard let initial = resp2Stream(8192) else { RedisResult.replyFailure }
+    let reading = redisReadFour(connection, initial)
+    guard let stream = reading else { redisResultReadFailure(netError()) }
+    redisScalarResult(stream)
+}
+func redisResultMustClose(_ result: RedisResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisResultFinish(_ connection: TcpConnection, _ result: RedisResult) -> RedisResult {
+    if redisResultMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+// Exactly one command and one RESP2 value, with four bounded receives and no
+// retry. Stateful commands require caller-managed cleanup before pool return.
+func redisExecute(_ connection: TcpConnection, _ request: Bytes) -> RedisResult {
+    let result = redisExecuteWire(connection, request)
+    redisResultFinish(connection, result)
+}
+// Integer conveniences validate the expected reply before returning it. TTL
+// sentinels and counter values remain signed 64-bit through redisInteger().
+func redisExpectInteger(_ result: RedisResult) -> RedisResult {
+    match result {
+        .reply(value) => if value.root.kind == 3 { result } else { RedisResult.replyFailure }
+        _ => result
+    }
+}
+func redisIntegerCommand(_ connection: TcpConnection, _ request: Bytes) -> RedisResult {
+    let result = redisExecuteScalarWire(connection, request)
+    redisResultFinish(connection, redisExpectInteger(result))
+}
+func redisDel(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"DEL", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisExists(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"EXISTS", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisTtl(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"TTL", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisPttl(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"PTTL", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisIncr(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"INCR", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisDecr(_ connection: TcpConnection, _ key: Bytes) -> RedisResult {
+    guard let request = resp2KeyRequest(b"DECR", key) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisExpire(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32) -> RedisResult {
+    guard let request = resp2KeyNumberRequest(b"EXPIRE", key, seconds) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+func redisPexpire(_ connection: TcpConnection, _ key: Bytes, _ milliseconds: i32) -> RedisResult {
+    guard let request = resp2KeyNumberRequest(b"PEXPIRE", key, milliseconds) else { RedisResult.requestFailure }
+    redisIntegerCommand(connection, request)
+}
+variant RedisSetOptionsResult {
+    ok
+    notSet
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisSetOptionsReply(_ value: RedisReply, _ condition: RedisSetCondition) -> RedisSetOptionsResult {
+    if value.root.kind == 6 {
+        let conditional = resp2SetCondition(condition)
+        guard conditional.count > 0 else { RedisSetOptionsResult.replyFailure }
+        RedisSetOptionsResult.notSet
+    } else {
+        guard value.root.kind == 1 && value.root.data == b"OK" else { RedisSetOptionsResult.replyFailure }
+        RedisSetOptionsResult.ok
+    }
+}
+func redisSetOptionsResult(_ result: RedisResult, _ condition: RedisSetCondition) -> RedisSetOptionsResult {
+    match result {
+        .reply(value) => redisSetOptionsReply(value, condition)
+        .serverError(data) => RedisSetOptionsResult.serverError(data)
+        .requestFailure => RedisSetOptionsResult.requestFailure
+        .transportFailure(code) => RedisSetOptionsResult.transportFailure(code)
+        .replyFailure => RedisSetOptionsResult.replyFailure
+    }
+}
+func redisSetOptionsMustClose(_ result: RedisSetOptionsResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisSetWithOptions(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ condition: RedisSetCondition, _ expiry: RedisSetExpiry) -> RedisSetOptionsResult {
+    guard let request = resp2SetOptionsRequest(key, value, condition, expiry) else { RedisSetOptionsResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    let typed = redisSetOptionsResult(result, condition)
+    if redisSetOptionsMustClose(typed) {
+        let closed = connection.close()
+        typed
+    } else { typed }
+}
