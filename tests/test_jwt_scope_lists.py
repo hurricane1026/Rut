@@ -52,6 +52,7 @@ def main():
     parser.add_argument("--server", required=True)
     parser.add_argument("--source", required=True)
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
+    parser.add_argument("--exclusions", action="store_true")
     args = parser.parse_args()
     now = int(time.time())
     base = dict(sub="alice", iss="https://issuer.example", aud="orders", iat=now, exp=now + 600)
@@ -76,9 +77,24 @@ def main():
         (None, False, 401, 401),
         (read, True, 401, 401),
     ]
-    profiles = [("valid", "admin orders:write orders:read"),
-                ("malformed", "orders:read  admin"),
-                ("oversized", "orders:read " + "a" * 1024)]
+    denied = "debug suspended support:restricted"
+    profiles = [("valid", "admin orders:write orders:read", denied),
+                ("malformed", "orders:read  admin", denied),
+                ("oversized", "orders:read " + "a" * 1024, denied)]
+    if args.exclusions:
+        cases.extend([
+            (token(dict(base, scope="orders:read debug")), False, 403, 403),
+            (token(dict(base, scope="orders:read orders:write admin debug")), False, 403, 403),
+            (token(dict(base, scope="orders:read debug-extra")), False, 204, 403),
+            (token(dict(base, scope="orders:read Debug")), False, 204, 403),
+            (token(dict(base, scope="orders:read orders:write admin debug-extra")), False, 204, 204),
+            (token(dict(base, scope="orders:read suspended support:restricted")), False, 403, 403),
+        ])
+        profiles.extend([
+            ("malformed-deny", "admin orders:write orders:read", "debug  suspended"),
+            ("oversized-deny", "admin orders:write orders:read", "debug " + "a" * 1024),
+            ("empty-deny", "admin orders:write orders:read", ""),
+        ])
     source = Path(args.source).resolve()
     checks = 0
     with tempfile.TemporaryDirectory(prefix="rut-jwt-scope-lists-") as directory:
@@ -86,13 +102,15 @@ def main():
         (root / "middleware").mkdir()
         for name in ("auth.rut", "jwt_scopes.rut"):
             shutil.copyfile(source.parent / "middleware" / name, root / "middleware" / name)
-        for profile, scopes in profiles:
+        for profile, scopes, exclusions in profiles:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
             program = root / "scopes.rut"
             program.write_text(source.read_text().replace("listen :8080", f"listen :{port}"))
             env = dict(os.environ, JWT_SECRET=KEY, JWT_REQUIRED_SCOPES=scopes)
+            if args.exclusions:
+                env["JWT_EXCLUDED_SCOPES"] = exclusions
             with (root / "gateway.log").open("w+") as log:
                 proc = subprocess.Popen([args.server, str(program), "--backend", args.backend,
                                          "--shards", "1", "--drain", "0"],

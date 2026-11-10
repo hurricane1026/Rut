@@ -3962,6 +3962,13 @@ if(RUT_ENABLE_JIT)
                         --backend ${scope_backend})
                 set_tests_properties(test_jwt_scope_lists_${scope_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_jwt_scope_exclusions_${scope_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_scope_lists.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-scope-exclusions-auth.rut
+                        --backend ${scope_backend} --exclusions)
+                set_tests_properties(test_jwt_scope_exclusions_${scope_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
             foreach(header_backend epoll io_uring)
                 add_test(NAME test_optional_multi_header_auth_${header_backend}

@@ -10670,6 +10670,19 @@ shadowing; JIT/native helper dispatch uses the existing scalar Boolean carrier.
 The ordinary Rut upstream OAuth helper composes this with the unchanged response
 metadata contract. See [language card](docs/language-card.md#requiring-a-complete-scope-list).
 
+The ordinary `jwt_scopes.requireAnyExcept` and `requireAllExcept` functions add
+explicit excluded-scope lists to these positive membership policies. Both policy
+lists are mandatory, use the same 1–1024-byte grammar, and are validated before
+authorization. Invalid configuration returns 503. An authenticated token must
+satisfy the positive any/all check and have no exact excluded permission;
+otherwise it receives the existing challenged 403. An excluded permission held
+by the token wins even when also required. Missing or malformed granted scopes
+cannot pass: the positive check validates the whole granted list before negation
+is considered. Successful checks preserve the original document and therefore
+compose with verified JWT or authenticated active introspection metadata.
+This adds no builtin, keyword, dependency, mutable state or I/O. See
+`examples/jwt-scope-exclusions-auth.rut`.
+
 ### Authenticated Redis session composition
 
 Ordinary Rut helpers pipeline only AUTH and SELECT, require both exact simple
