@@ -174,11 +174,6 @@ func setStatus(_ result: RedisSetOptionsResult) -> i32 {
         .replyFailure => 502
     }
 }
-func integerBytes(_ reply: RedisReply) -> Bytes {
-    guard let number = redisInteger(reply) else { nil }
-    guard let digits = formatInt(number) else { nil }
-    Bytes(digits)
-}
 func indexedBytes(_ reply: RedisReply, _ index: i32) -> Bytes {
     guard let values = redisValues(reply) else { nil }
     guard let token = values.get(index) else { nil }
@@ -186,7 +181,11 @@ func indexedBytes(_ reply: RedisReply, _ index: i32) -> Bytes {
 }
 func outputBytes(_ reply: RedisReply, _ mode: str, _ index: i32) -> Bytes {
     match mode {
-        "integer" => integerBytes(reply)
+        "integer" => {
+            guard let number = redisInteger(reply) else { nil }
+            guard let digits = formatInt(number) else { nil }
+            Bytes(digits)
+        }
         "values" => indexedBytes(reply, index)
         _ => reply.frame
     }
@@ -300,13 +299,13 @@ route POST "/{name.lower()}" {{
 
 
 @contextlib.contextmanager
-def gateway(args, endpoint):
+def gateway(args, endpoint, program_factory=program):
     with tempfile.TemporaryDirectory(prefix='rut-redis-commands-') as directory:
         root = Path(directory)
         for name in ('resp2.rut', 'resp2-command.rut', 'redis-client.rut'):
             shutil.copyfile(Path(args.library) / name, root / name)
         source, log = root / 'gateway.rut', root / 'server.log'
-        text = program(args.real_redis)
+        text = program_factory(args.real_redis)
         if args.opt == '2':
             text = text.replace('import "redis-client.rut"', 'import * as client from "redis-client.rut"')
             names = set()

@@ -132,3 +132,13 @@ func resp2SetOptionsRequest(_ key: Bytes, _ value: Bytes, _ condition: RedisSetC
     guard let conditioned = concatBytes(prefix, conditional, 8192) else { nil }
     concatBytes(conditioned, expiration, 8192)
 }
+func resp2SetGetRequest(_ key: Bytes, _ value: Bytes, _ condition: RedisSetCondition, _ expiry: RedisSetExpiry) {
+    guard let arguments = resp2SetArguments(key, value) else { nil }
+    let conditional = resp2SetCondition(condition)
+    guard let expiration = resp2SetExpiry(expiry) else { nil }
+    guard let header = resp2DecimalLine(b"*", resp2SetArgumentCount(conditional, expiry) + 1, 8192) else { nil }
+    guard let prefix = concatBytes(header, arguments, 8192) else { nil }
+    guard let conditioned = concatBytes(prefix, conditional, 8192) else { nil }
+    guard let expiring = concatBytes(conditioned, expiration, 8192) else { nil }
+    concatBytes(expiring, b"$3\r\nGET\r\n", 8192)
+}

@@ -547,3 +547,42 @@ func redisSetWithOptions(_ connection: TcpConnection, _ key: Bytes, _ value: Byt
         typed
     } else { typed }
 }
+
+// GET returns the previous value even when NX rejects a write. A null bulk
+// means no previous value, including a successful create or rejected XX.
+struct RedisSetPrevious { found: bool data: Bytes }
+variant RedisSetGetResult {
+    stored(RedisSetPrevious)
+    notStored(RedisSetPrevious)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisSetGetReply(_ connection: TcpConnection, _ reply: RedisReply, _ condition: RedisSetCondition) -> RedisSetGetResult {
+    if reply.root.kind == 4 || reply.root.kind == 6 {
+        let found = reply.root.kind == 4
+        let data = reply.root.data
+        let previous = RedisSetPrevious(found: found, data: data)
+        match condition {
+            .always => RedisSetGetResult.stored(previous)
+            .absent => if found { RedisSetGetResult.notStored(previous) } else { RedisSetGetResult.stored(previous) }
+            .present => if found { RedisSetGetResult.stored(previous) } else { RedisSetGetResult.notStored(previous) }
+        }
+    } else {
+        let closed = connection.close()
+        RedisSetGetResult.replyFailure
+    }
+}
+func redisSetGet(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ condition: RedisSetCondition, _ expiry: RedisSetExpiry) -> RedisSetGetResult {
+    guard let request = resp2SetGetRequest(key, value, condition, expiry) else { RedisSetGetResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    let finished = redisResultFinish(connection, result)
+    match finished {
+        .reply(reply) => redisSetGetReply(connection, reply, condition)
+        .serverError(data) => RedisSetGetResult.serverError(data)
+        .requestFailure => RedisSetGetResult.requestFailure
+        .transportFailure(code) => RedisSetGetResult.transportFailure(code)
+        .replyFailure => RedisSetGetResult.replyFailure
+    }
+}
