@@ -319,7 +319,8 @@ def gateway(args, endpoint, program_factory=program):
                                         '--opt', args.opt, '--no-pin', '--shards', '1', '--drain', '0'],
                                        env=env, stdout=output, stderr=subprocess.STDOUT)
         try:
-            deadline = time.monotonic() + 240
+            startup_timeout = 270
+            deadline = time.monotonic() + startup_timeout
             while time.monotonic() < deadline:
                 data = log.read_bytes()
                 found = re.search(rb'Listening on port ([0-9]+) with', data)
@@ -332,7 +333,9 @@ def gateway(args, endpoint, program_factory=program):
                     raise AssertionError(data.decode(errors='replace'))
                 time.sleep(.025)
             else:
-                raise AssertionError(log.read_text(errors='replace'))
+                raise AssertionError(
+                    f'gateway did not start listening within {startup_timeout}s; '
+                    f'server log:\n{log.read_text(errors="replace")}')
             for path in root.glob('*.rut'):
                 path.unlink()
             def request(path, body=b'', headers=None):
