@@ -38,15 +38,20 @@ struct HeaderKeyConsumer {
     credentialId: str
 }
 
+// Validate the whole trusted snapshot, including disabled Consumer slots.
+func validHeaderKeyPair(_ first: HeaderKeyConsumer, _ second: HeaderKeyConsumer) -> bool {
+    first.consumerId != "" && second.consumerId != "" &&
+        first.consumerId != second.consumerId && first.credentialId != "" &&
+        second.credentialId != "" && (first.key != "" || second.key != "") &&
+        (first.key == "" || second.key == "" || !Crypto.equal(first.key, second.key))
+}
+
 // Match one raw singleton custom-header value against two configured Consumers.
 func multiHeaderKey(_ presented: str, _ first: HeaderKeyConsumer,
                     _ second: HeaderKeyConsumer) -> Identity {
     let denied = response(401)
     denied.set("WWW-Authenticate", "ApiKey")
-    guard first.consumerId != "" && second.consumerId != "" &&
-        first.consumerId != second.consumerId && first.credentialId != "" &&
-        second.credentialId != "" && (first.key != "" || second.key != "") &&
-        (first.key == "" || second.key == "" || !Crypto.equal(first.key, second.key)) else { respond 503 }
+    guard validHeaderKeyPair(first, second) else { respond 503 }
     let firstMatches = first.key != "" && Crypto.equal(presented, first.key)
     let secondMatches = second.key != "" && Crypto.equal(presented, second.key)
     guard firstMatches || secondMatches else { respond denied }

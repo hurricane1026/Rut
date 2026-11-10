@@ -9064,6 +9064,22 @@ Consumer/group authorization afterward. The helper does not read identity
 headers, query values, body values or Authorization as fallbacks. See
 `examples/multi-header-key-auth.rut`.
 
+`header_auth.multiHeaderKeyOrAnonymous(count, presented, first, second, anonymousId)`
+is provided by `examples/middleware/header_auth.rut` and combines the same
+two-Consumer header policy with explicitly configured guest access.
+`validHeaderKeyPair` shares whole-snapshot validation with
+`multiHeaderKey`; optional access additionally requires a nonempty guest ID
+distinct from both Consumer IDs, including disabled slots. Invalid configuration
+returns 503 before fallback. Count and singleton value must describe the same
+original selected header: only count 0 plus an empty value grants the guest
+Identity (`anonymous`, empty credential ID). Count 1 must match one enabled key;
+other counts, empty/wrong values and inconsistent arguments return an ApiKey
+401. Identity metadata comes from the matched configuration. Separate Consumer
+or group authorization can reject the guest with 403. Removal does not change
+original reads, and no alternate credential source is tried. This is an ordinary
+bounded Rut helper with no new syntax, primitive, dependency or state. See
+`examples/optional-multi-header-key-auth.rut`.
+
 ### Custom-header API Key rotation and optional access
 
 `auth.rotatingHeaderKey` uses the existing constant-time equality operation for
@@ -10622,6 +10638,25 @@ worker and reclaims both active and idle sockets on either I/O backend.
 
 
 ### Complete scope-list authorization
+
+`jwtHasAnyScope(Json, str) -> bool` extends this profile to a configured allow
+union. It uses the same 1–1024-byte policy bound and exact OAuth scope grammar as
+`jwtHasAllScopes`. Both lists are validated in full before deciding membership;
+an early matching token cannot hide an invalid suffix. The native implementation
+shares parsing, scratch-alias preservation and bounded membership matching with
+the all-required operation. It appends an opcode without renumbering existing
+ones and uses the existing Boolean JSON helper dispatch for JIT/native execution.
+It adds no keyword, dependency, I/O, heap allocation or shared state.
+
+The existing two-permission OR helpers cannot express an arbitrarily configured
+bounded list without enumerating it in source; no scope-list tokenizer or
+iterator is currently exposed to Rut. This reusable metadata
+primitive keeps signature and claims authentication separate. The ordinary
+`jwt_scopes.requireAny`/`requireAll` helpers validate trusted policy lists before
+authorization, return 503 for bad policy and challenged 403 for denied membership,
+and preserve the verified document. The same helpers accept authenticated active
+introspection metadata. See `examples/jwt-scope-lists-auth.rut` for signature and
+issuer/audience/time validation before either authorization policy.
 
 `jwtHasAllScopes(Json, str) -> bool` appends a JSON operation without renumbering
 existing opcodes. It reuses the shared OAuth scope grammar and exact membership

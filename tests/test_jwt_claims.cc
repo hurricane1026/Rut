@@ -858,6 +858,83 @@ TEST(jwt_claims, all_scopes_matches_independent_three_permission_set_oracle) {
             }
             CHECK_EQ(jwt_has_all_scopes(scratch, {claims, output.len}, {scopes, policy.len}),
                      (granted & required) == required);
+            CHECK_EQ(jwt_has_any_scope(scratch, {claims, output.len}, {scopes, policy.len}),
+                     (granted & required) != 0);
         }
     }
+}
+
+TEST(jwt_claims, any_scope_validates_both_whole_lists_before_allowing) {
+    json::Document scratch;
+    const Str claims = lit_str(R"({"scope":"read write admin"})");
+    const Str allowed[] = {lit_str("read"),
+                           lit_str("delete write"),
+                           lit_str("admin missing"),
+                           lit_str("missing admin missing"),
+                           lit_str("read read"),
+                           lit_str("write admin read")};
+    for (Str policy : allowed) CHECK(jwt_has_any_scope(scratch, claims, policy));
+    const Str rejected[] = {lit_str(""),
+                            lit_str("Read WRITE Admin"),
+                            lit_str("reader read:all"),
+                            lit_str("read*"),
+                            lit_str("read "),
+                            lit_str(" read"),
+                            lit_str("read  write"),
+                            lit_str("read\twrite"),
+                            lit_str("read\n"),
+                            lit_str("read\\write"),
+                            lit_str("read\"write"),
+                            lit_str("read réad"),
+                            {"read\0write", 10},
+                            {nullptr, 0},
+                            {nullptr, 1}};
+    for (Str policy : rejected) CHECK(!jwt_has_any_scope(scratch, claims, policy));
+    const Str invalid_claims[] = {lit_str(R"({"scope":"read write\t"})"),
+                                  lit_str(R"({"scope":"read write "})"),
+                                  lit_str(R"({"scope":"read  write"})"),
+                                  lit_str(R"({"scope":"read\u0000write"})"),
+                                  lit_str(R"({"scope":"read réad"})"),
+                                  lit_str(R"({"scope":""})"),
+                                  lit_str(R"({"scope":["read"]})"),
+                                  lit_str(R"({"scope":true})"),
+                                  lit_str(R"({"scope":null})"),
+                                  lit_str(R"({"scope":"read","sc\u006fpe":"read"})"),
+                                  lit_str(R"({"nested":{"scope":"read"}})"),
+                                  lit_str("{}"),
+                                  lit_str("[]"),
+                                  lit_str("null"),
+                                  lit_str(R"({"scope":"read"} trailing)"),
+                                  {nullptr, 1}};
+    for (Str input : invalid_claims)
+        CHECK(!jwt_has_any_scope(scratch, input, lit_str("read missing")));
+    CHECK(jwt_has_any_scope(
+        scratch, lit_str(R"({"sc\u006fpe":"r\u0065ad write"})"), lit_str("delete read")));
+    // A rejected document must not retain a previous allow result.
+    CHECK(!jwt_has_any_scope(scratch, lit_str("{}"), lit_str("read")));
+    CHECK(jwt_has_any_scope(scratch, claims, lit_str("missing admin")));
+}
+
+TEST(jwt_claims, any_scope_bounds_and_scratch_aliases) {
+    json::Document scratch;
+    char required[1025];
+    for (char& byte : required) byte = 'a';
+    char claims[1040];
+    json::Writer output{claims};
+    output.text(lit_str("{\"scope\":\""));
+    output.text({required, 1024});
+    output.text(lit_str("\"}"));
+    CHECK(jwt_has_any_scope(scratch, {claims, output.len}, {required, 1024}));
+    CHECK(!jwt_has_any_scope(scratch, {claims, output.len}, {required, 1025}));
+    required[0] = 'r';
+    required[1] = 'e';
+    required[2] = 'a';
+    required[3] = 'd';
+    required[4] = ' ';
+    CHECK(!jwt_has_any_scope(scratch, lit_str(R"({"scope":"read"})"), {required, 1025}));
+    const Str policy = lit_str("missing read");
+    for (u32 i = 0; i < policy.len; ++i) scratch.scratch[i] = policy.ptr[i];
+    CHECK(jwt_has_any_scope(
+        scratch, lit_str(R"({"scope":"read write"})"), {scratch.scratch, policy.len}));
+    CHECK(!jwt_has_any_scope(scratch, lit_str(R"({"scope":"read write"})"), lit_str("reader")));
 }

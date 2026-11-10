@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching; absence-only custom-header guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
+| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
@@ -44,6 +44,23 @@ metadata or two disabled slots are configuration errors. Authentication still
 uses singleton Authorization headers and rejects malformed or duplicate fields.
 
 ## Audit of executable gaps
+
+The shared metadata scope primitives now include `jwtHasAnyScope` alongside
+`jwtHasScope` and `jwtHasAllScopes`. The any-list operation admits at least one
+exact configured permission from a 1–1024-byte policy list, while validating the
+whole policy and whole granted scope string before allowing access. Missing,
+malformed or non-string claims, duplicate JSON names and invalid policy fail
+closed. Case/prefix/wildcard matching is not introduced.
+
+`jwt_scopes.requireAny` and `requireAll` preserve an already authenticated
+document, distinguish invalid policy (503) from missing permission (403 with an
+insufficient-scope challenge), and can consume authenticated active introspection
+metadata. They do not verify signatures or contact an AS. The native/JIT tests
+cover an independent permission-set oracle, malformed suffixes after a match,
+policy bounds, scratch aliases and document preservation. The registered epoll
+and io_uring native HTTP tests use real signed HS256 fixtures, wrong/expired
+tokens, duplicate Authorization, and valid/malformed/oversized route policies.
+See [jwt-scope-lists-auth.rut](../examples/jwt-scope-lists-auth.rut).
 
 The 2026-10-27 audit separates these layers:
 
@@ -275,6 +292,30 @@ handler-level coverage; the existing network backends are unchanged. See
 [optional-multi-auth.rut](../examples/optional-multi-auth.rut).
 
 ## Custom-header API Key rotation and optional access
+
+`header_auth.multiHeaderKeyOrAnonymous` accepts the same two trusted `HeaderKeyConsumer`
+records as `multiHeaderKey`, exposed as `header_auth.HeaderKeyConsumer`, plus
+original selected-header count, singleton value and an explicit guest ID.
+Only count 0 with an empty value publishes the guest;
+count 1 must verify an enabled key. Empty, wrong or duplicate fields, parse errors
+and inconsistent evidence return 401 with an ApiKey challenge. The whole pair is
+validated first: nonempty distinct Consumer IDs, nonempty credential IDs even for
+disabled slots, at least one enabled key and no shared enabled key. An empty
+guest ID or one equal to either configured Consumer also returns 503, including
+when no credential was presented. Disabled Consumers cannot become guests.
+
+Successful identities retain the selected Consumer and credential IDs; guests
+have method `anonymous` and an empty credential ID. Authorization can still deny
+a valid guest with 403. Header removal preserves original reads, and query,
+body, Authorization and client identity headers cannot supply alternate keys or
+metadata. The JIT matrix covers both HTTP/1 versions, disabled slots, ambiguous
+ownership, duplicate/empty fields, configuration failures on absent requests,
+inconsistent count/value pairs and public/private/removal composition. See
+[optional-multi-header-key-auth.rut](../examples/optional-multi-header-key-auth.rut).
+The registered epoll/io_uring integration tests exercise the native-loaded
+example with both HTTP/1 versions under enabled, disabled and ambiguous key
+configurations, checking public/private routes, original reads after removal,
+identity metadata and challenge fields.
 
 `auth.rotatingHeaderKey` adds a current/previous opaque key window for a single
 configured Consumer. Use `req.uniqueHeader("X-API-Key").or("")`; disabled slots

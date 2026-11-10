@@ -150,7 +150,12 @@ bool jwt_has_scope(json::Document& document, Str claims, Str required) {
     return scope_list_matches({document.scratch, decoded.len}, required, found) && found;
 }
 
-bool jwt_has_all_scopes(json::Document& document, Str claims, Str required_scopes) {
+namespace {
+
+bool scope_set_matches(json::Document& document,
+                       Str claims,
+                       Str required_scopes,
+                       bool require_all) {
     constexpr u32 kMaxRequiredBytes = 1024;
     if (required_scopes.len > kMaxRequiredBytes || !jwt_scope_list_valid(required_scopes))
         return false;
@@ -166,15 +171,28 @@ bool jwt_has_all_scopes(json::Document& document, Str claims, Str required_scope
     if (!document.string(kScope, decoded)) return false;
     const Str kGranted{document.scratch, decoded.len};
     if (!jwt_scope_list_valid(kGranted)) return false;
+    bool any = false;
     u32 start = 0;
     for (u32 i = 0; i <= required_scopes.len; ++i) {
         if (i != required_scopes.len && required[i] != ' ') continue;
         bool found = false;
-        if (!scope_list_matches(kGranted, {required + start, i - start}, found) || !found)
+        if (!scope_list_matches(kGranted, {required + start, i - start}, found) ||
+            (require_all && !found))
             return false;
+        any |= found;
         start = i + 1;
     }
-    return true;
+    return require_all || any;
+}
+
+}  // namespace
+
+bool jwt_has_all_scopes(json::Document& document, Str claims, Str required_scopes) {
+    return scope_set_matches(document, claims, required_scopes, true);
+}
+
+bool jwt_has_any_scope(json::Document& document, Str claims, Str required_scopes) {
+    return scope_set_matches(document, claims, required_scopes, false);
 }
 
 bool jwt_certificate_bound(json::Document& document, Str claims, Str certificate_sha256) {

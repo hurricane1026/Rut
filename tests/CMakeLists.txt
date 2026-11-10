@@ -3954,6 +3954,24 @@ if(RUT_ENABLE_JIT)
 
     if(Python3_Interpreter_FOUND)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            foreach(scope_backend epoll io_uring)
+                add_test(NAME test_jwt_scope_lists_${scope_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_scope_lists.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-scope-lists-auth.rut
+                        --backend ${scope_backend})
+                set_tests_properties(test_jwt_scope_lists_${scope_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
+            foreach(header_backend epoll io_uring)
+                add_test(NAME test_optional_multi_header_auth_${header_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_optional_multi_header_auth.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/optional-multi-header-key-auth.rut
+                        --backend ${header_backend})
+                set_tests_properties(test_optional_multi_header_auth_${header_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(password_backend epoll io_uring)
                 add_test(NAME test_password_login_${password_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_login.py

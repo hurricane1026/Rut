@@ -1,0 +1,25 @@
+import "middleware/auth.rut"
+import "middleware/jwt_scopes.rut"
+
+listen :8080
+
+// JWT_SECRET is a trusted HS256 key (at least 32 bytes); JWT_REQUIRED_SCOPES is
+// a nonempty space-separated list, e.g. "orders:read orders:write admin".
+// Configure both before compilation/loading. Use TLS; artifacts contain secrets.
+route GET "/any" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireAny(document, env("JWT_REQUIRED_SCOPES"))
+    guard identity.consumerId != "" else { return 500 }
+    return 204
+}
+
+route GET "/all" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireAll(document, env("JWT_REQUIRED_SCOPES"))
+    guard identity.consumerId != "" else { return 500 }
+    return 204
+}
+
+route "/" { return 404 }

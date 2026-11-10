@@ -1,0 +1,24 @@
+import Crypto
+import "auth.rut"
+
+// Count and singleton value must come from the SAME original custom header.
+// Only proven absence grants the distinct configured guest identity.
+func multiHeaderKeyOrAnonymous(_ count: i32, _ presented: str,
+                               _ first: auth.HeaderKeyConsumer, _ second: auth.HeaderKeyConsumer,
+                               _ anonymousId: str) -> auth.Identity {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "ApiKey")
+    guard auth.validHeaderKeyPair(first, second) && anonymousId != "" &&
+        anonymousId != first.consumerId && anonymousId != second.consumerId else { respond 503 }
+    let firstMatches = first.key != "" && Crypto.equal(presented, first.key)
+    let secondMatches = second.key != "" && Crypto.equal(presented, second.key)
+    guard (count == 0 && presented == "") ||
+        (count == 1 && (firstMatches || secondMatches)) else { respond denied }
+    match count {
+        0 => auth.Identity(consumerId: anonymousId, credentialId: "", method: "anonymous")
+        _ => match firstMatches {
+            true => auth.Identity(consumerId: first.consumerId, credentialId: first.credentialId, method: "apiKey")
+            _ => auth.Identity(consumerId: second.consumerId, credentialId: second.credentialId, method: "apiKey")
+        }
+    }
+}

@@ -1586,6 +1586,22 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   challenged 401; success uses configured identity metadata and method `apiKey`.
   Strip the credential explicitly with `req.remove("X-API-Key")` before
   forwarding when the upstream should not receive it.
+- `header_auth.multiHeaderKeyOrAnonymous(count, presented, first, second, anonymousId)`
+  is provided by `import "middleware/header_auth.rut"`, which also exposes
+  `header_auth.HeaderKeyConsumer` and existing auth policy helpers. It extends
+  the two-Consumer policy with absence-only guest access. Pass
+  `req.headerCount("X-API-Key")` and `req.uniqueHeader("X-API-Key").or("")`
+  from the same original field. Only count 0 plus an empty value creates the
+  configured guest with empty credential ID and method `anonymous`. Count 1
+  must verify one enabled key. Empty, wrong or duplicate credentials, parsing
+  failure and inconsistent count/value arguments receive 401 with an ApiKey
+  challenge, never anonymous fallback. The full pair is validated before guest
+  access; invalid configuration, an empty guest ID or a guest ID matching either
+  Consumer returns 503. Successful key identities retain configured metadata
+  and method `apiKey`. Authorization remains separate and may deny guests with
+  403. Leading removal effects preserve original presence evidence; other
+  headers, query and body are not fallback sources. See
+  [optional-multi-header-key-auth.rut](../examples/optional-multi-header-key-auth.rut).
 - `auth.rotatingHeaderKey(presented, currentKey, previousKey, consumerId, currentId, previousId)`
   reads the same singleton custom field and verifies either configured opaque
   key. Empty keys disable slots, even for an empty/missing presented field.
@@ -3124,6 +3140,15 @@ No command replay or application-state reset is performed. See
 
 ### Requiring a complete scope list
 
+`jwtHasAnyScope(verifiedDocument, candidateScopes) -> bool` permits any exact
+permission from a nonempty configured OAuth scope list, bounded to 1024 bytes.
+It shares the grammar and whole-list validation below with `jwtHasAllScopes`.
+Both the candidate list and granted `scope` must be valid in full, even when an
+early token matches. Missing/non-string/malformed scopes and invalid policy lists
+return false; ordering and duplicates do not change membership. This is metadata
+authorization only, after signature/claims policy or authenticated introspection.
+It requires unwrapped `Json`/`str` operands and allows user-name shadowing.
+
 `jwtHasAllScopes(verifiedDocument, requiredScopes) -> bool` checks every exact
 permission in a nonempty OAuth scope list. The required string is bounded to
 1024 bytes; the granted top-level `scope` string retains existing JSON bounds.
@@ -3148,6 +3173,16 @@ Bearer grammar/type, positive integer expiry and absence of OAuth errors. Any
 failure produces 503 without forwarding; only the returned Bearer header may
 replace downstream Authorization. See
 [upstream-oauth-all-scopes.rut](../examples/upstream-oauth-all-scopes.rut).
+
+The ordinary `jwt_scopes` module provides `requireAny(document, scopes)` and
+`requireAll(document, scopes)`. Import `"middleware/jwt_scopes.rut"` from an
+example. Both validate the complete trusted policy first (invalid/empty/oversized
+lists return 503), return 403 with `Bearer error="insufficient_scope"` for missing
+membership, and preserve the input document on success. Authenticate first:
+invalid signatures, issuer/audience/time or duplicate Authorization remain 401.
+The module also accepts authenticated active introspection metadata; it does not
+perform network calls or authenticate arbitrary JSON. See
+[jwt-scope-lists-auth.rut](../examples/jwt-scope-lists-auth.rut).
 
 ## Authenticated Redis library sessions
 

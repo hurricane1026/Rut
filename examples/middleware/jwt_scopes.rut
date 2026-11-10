@@ -1,0 +1,23 @@
+// Metadata authorization only. Authenticate signature/issuer/audience/time first,
+// or pass metadata from an authenticated, active introspection response.
+// Required scopes are trusted route configuration, not a request header.
+func policyValid(_ required: str) -> bool {
+    guard let policy = json.value({scope: required}) else { false }
+    jwtHasAnyScope(policy, required)
+}
+
+func requireAny(_ document: Json, _ required: str) -> Json {
+    guard policyValid(required) else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAnyScope(document, required) else { respond forbidden }
+    document
+}
+
+func requireAll(_ document: Json, _ required: str) -> Json {
+    guard policyValid(required) else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAllScopes(document, required) else { respond forbidden }
+    document
+}

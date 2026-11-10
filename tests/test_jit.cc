@@ -31349,3 +31349,374 @@ TEST(jit, consumer_group_union_and_deny_policies_fail_closed) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, optional_multi_header_key_requires_absence_and_unambiguous_ownership) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/optional-multi-header-key-auth.rut";
+    struct Config {
+        const char* first_id;
+        const char* first_key;
+        const char* first_credential;
+        const char* second_id;
+        const char* second_key;
+        const char* second_credential;
+        const char* guest;
+        bool valid;
+        bool private_route = false;
+        bool remove = false;
+    };
+    const Config configs[] = {
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "guest", true},
+        {"alice", "", "a-id", "bob", "b/key", "b-id", "guest", true},
+        {"alice", "a:opaque", "a-id", "bob", "", "b-id", "guest", true},
+        {"alice", "", "a-id", "bob", "", "b-id", "guest", false},
+        {"alice", "a:opaque", "a-id", "bob", "a:opaque", "b-id", "guest", false},
+        {"alice", "a:opaque", "a-id", "alice", "b/key", "b-id", "guest", false},
+        {"", "a:opaque", "a-id", "bob", "b/key", "b-id", "guest", false},
+        {"alice", "a:opaque", "a-id", "", "b/key", "b-id", "guest", false},
+        {"alice", "", "", "bob", "b/key", "b-id", "guest", false},
+        {"alice", "a:opaque", "a-id", "bob", "", "", "guest", false},
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "", false},
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "alice", false},
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "bob", false},
+        {"alice", "", "a-id", "bob", "b/key", "b-id", "alice", false},
+        {"alice", "a:opaque", "a-id", "bob", "", "b-id", "bob", false},
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "guest", true, true},
+        {"alice", "a:opaque", "a-id", "bob", "b/key", "b-id", "guest", true, false, true},
+    };
+    std::string source = "import \"middleware/header_auth.rut\"\n";
+    const auto records = [](const Config& config) {
+        return "header_auth.HeaderKeyConsumer(consumerId: \"" + std::string(config.first_id) +
+               "\", key: \"" + config.first_key + "\", credentialId: \"" + config.first_credential +
+               "\"), header_auth.HeaderKeyConsumer(consumerId: \"" + config.second_id +
+               "\", key: \"" + config.second_key + "\", credentialId: \"" +
+               config.second_credential + "\"), \"" + config.guest + "\")\n";
+    };
+    for (u32 i = 0; i < sizeof(configs) / sizeof(configs[0]); ++i) {
+        source += "route GET \"/" + std::to_string(i) + "\" {\n";
+        if (configs[i].remove) source += "req.remove(\"X-API-Key\")\n";
+        source +=
+            "let identity = header_auth.multiHeaderKeyOrAnonymous(req.headerCount(\"X-API-Key\"), "
+            "req.uniqueHeader(\"X-API-Key\").or(\"\"), " +
+            records(configs[i]);
+        if (configs[i].private_route)
+            source +=
+                "let permitted = header_auth.requireAnyConsumer(identity, \"alice\", \"bob\")\n";
+        source += R"rut(
+    guard (identity.consumerId == "alice" && identity.credentialId == "a-id" && identity.method == "apiKey") ||
+          (identity.consumerId == "bob" && identity.credentialId == "b-id" && identity.method == "apiKey") ||
+          (identity.consumerId == "guest" && identity.credentialId == "" && identity.method == "anonymous")
+        else { return 500 }
+    match identity.consumerId {
+        "alice" => return 201
+        "bob" => return 202
+        _ => return 203
+    }
+}
+)rut";
+    }
+    const char* evidence[] = {
+        "0, \"a:opaque\"",
+        "1, \"\"",
+        "2, \"a:opaque\"",
+        "-1, \"\"",
+        "-1, \"a:opaque\"",
+        "-2, \"\"",
+        "3, \"b/key\"",
+        "0, \"b/key\"",
+    };
+    const u32 config_count = sizeof(configs) / sizeof(configs[0]);
+    for (u32 i = 0; i < sizeof(evidence) / sizeof(evidence[0]); ++i) {
+        source += "route GET \"/evidence-" + std::to_string(i) + "\" {\n";
+        source += "let identity = header_auth.multiHeaderKeyOrAnonymous(" +
+                  std::string(evidence[i]) + ", " + records(configs[0]) + "return 500\n}\n";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    if (!hir)
+        std::fprintf(stderr,
+                     "optional header auth: %.*s at %u:%u\n",
+                     hir.error().detail.len,
+                     hir.error().detail.ptr,
+                     hir.error().span.line,
+                     hir.error().span.col);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    Connection conn;
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    struct RequestCase {
+        const char* headers;
+        u16 status;
+    };
+    const RequestCase cases[] = {
+        {"", 203},
+        {"X-API-Key: a:opaque\r\n", 201},
+        {"x-api-key: b/key\r\n", 202},
+        {"X-API-Key: wrong\r\n", 401},
+        {"X-API-Key:\r\n", 401},
+        {"X-API-Key: a:opaque\r\nx-api-key: b/key\r\n", 401},
+        {"X-API-Key: a:opaque\r\nx-api-key: a:opaque\r\n", 401},
+        {"X-API-Key: wrong\r\nx-api-key: b/key\r\n", 401},
+        {"Authorization: Bearer a:opaque\r\n", 203},
+        {"X-API-Key: A:opaque\r\n", 401},
+        {"X-API-Key: a:opaque-extra\r\n", 401},
+        {"X-API-Key: Bearer a:opaque\r\n", 401},
+        {"X-API-Key: a:opaque,b/key\r\n", 401},
+    };
+    for (const char* version : {"HTTP/1.0", "HTTP/1.1"}) {
+        for (u32 i = 0; i < config_count + sizeof(evidence) / sizeof(evidence[0]); ++i) {
+            char name[32];
+            snprintf(name, sizeof(name), "handler_route_%u", i);
+            auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+            REQUIRE(handler);
+            for (const auto& tc : cases) {
+                const std::string body = "X-API-Key: a:opaque";
+                const std::string request =
+                    "GET /?api_key=a:opaque " + std::string(version) + "\r\nHost: local\r\n" +
+                    tc.headers +
+                    "X-Consumer-ID: alice\r\nX-Credential-ID: a-id\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\n\r\n" + body;
+                conn.reset();
+                conn.json_arena.backend.pool = &pool;
+                const auto result =
+                    HandlerResult::unpack(handler(&conn,
+                                                  nullptr,
+                                                  reinterpret_cast<const u8*>(request.data()),
+                                                  static_cast<u32>(request.size()),
+                                                  nullptr));
+                u16 expected = 401;
+                if (i < config_count) {
+                    const auto& config = configs[i];
+                    expected = !config.valid                                      ? 503
+                               : tc.status == 201 && config.first_key[0] == '\0'  ? 401
+                               : tc.status == 202 && config.second_key[0] == '\0' ? 401
+                               : config.private_route && tc.status == 203         ? 403
+                                                                                  : tc.status;
+                }
+                CHECK(result.action == HandlerAction::ReturnStatus);
+                if (result.status_code != expected)
+                    std::fprintf(stderr,
+                                 "%s optional header config %u headers %s: got %u expected %u\n",
+                                 version,
+                                 i,
+                                 tc.headers,
+                                 result.status_code,
+                                 expected);
+                CHECK_EQ(result.status_code, expected);
+                if (i < config_count && configs[i].remove) {
+                    CHECK_EQ(conn.req_header_override_count, 1u);
+                    CHECK_EQ(conn.req_header_remove_mask, 1u);
+                }
+                if (expected == 401) {
+                    REQUIRE(result.next_state != 0);
+                    REQUIRE(result.next_state <= rir.module.header_set_count);
+                    const auto& headers = rir.module.header_sets[result.next_state - 1];
+                    CHECK_EQ(headers.count, 1u);
+                    CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                    CHECK(rir.module.header_values[headers.offset].eq(lit("ApiKey")));
+                } else {
+                    CHECK_EQ(result.next_state, 0u);
+                }
+            }
+        }
+    }
+    conn.json_arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_any_scope_checks_exact_membership_and_rejects_malformed_suffixes) {
+    const char* source = R"rut(route GET "/scopes" {
+    guard let claims = json.parse(req.header("X-Claims").or("")) else { return 400 }
+    guard let policy = json.parse(req.header("X-Required").or("")) else { return 400 }
+    guard let required = json.string(policy) else { return 400 }
+    guard jwtHasAnyScope(claims, required) else { return 401 }
+    return 204
+})rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const auto check = [&](const char* claims, const char* required_scopes, u16 status) {
+        arena.reset();
+        char request[2048];
+        char encoded[2048];
+        json::Writer policy{encoded, sizeof(encoded)};
+        REQUIRE(json::quote(lit(required_scopes), policy));
+        const int length = snprintf(
+            request,
+            sizeof(request),
+            "GET /scopes HTTP/1.1\r\nHost: localhost\r\nX-Claims: %s\r\nX-Required: %.*s\r\n\r\n",
+            claims,
+            static_cast<int>(policy.len),
+            policy.data);
+        REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(request));
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(length),
+                                                          &arena));
+        if (result.status_code != status)
+            std::fprintf(stderr,
+                         "any-scope claims %s policy %s got %u expected %u\n",
+                         claims,
+                         required_scopes,
+                         result.status_code,
+                         status);
+        CHECK_EQ(result.status_code, status);
+    };
+    check(R"({"scope":"read write admin"})", "write read admin", 204);
+    check(R"({"scope":"admin read write"})", "read read write", 204);
+    check(R"({"scope":"read write"})", "read write admin", 204);
+    check(R"({"scope":"Read WRITE ADMIN"})", "read write admin", 401);
+    check(R"({"scope":"read write admin"})", "read  write", 401);
+    check(R"({"scope":"read write admin\t"})", "read write", 401);
+    check(R"({"scope":"read write admin"})", "", 401);
+    check(R"({"scope":["read","write"]})", "read write", 401);
+    check(R"({"sc\u006fpe":"r\u0065ad write"})", "write read", 204);
+    check(R"({"scope":"read"})", "missing admin read", 204);
+    check(R"({"scope":"read"})", "reader admin", 401);
+    check(R"({"scope":"read"})", "read read", 204);
+    check(R"({"scope":"read"})", "read missing ", 401);
+    check(R"({"scope":"read","sc\u006fpe":"read"})", "read", 400);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, jwt_scope_list_helpers_validate_policy_and_preserve_document) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-scope-lists-auth.rut";
+    const char* source = R"rut(
+import "middleware/jwt_scopes.rut"
+route GET "/any" {
+    guard let document = json.parse(req.header("X-Claims").or("")) else { return 400 }
+    guard let policy = json.parse(req.header("X-Required").or("")) else { return 400 }
+    guard let required = json.string(policy) else { return 400 }
+    let checked = jwt_scopes.requireAny(document, required)
+    guard json.string(json.get(checked, "/marker").or(checked)).or("") == "keep" else { return 500 }
+    return 204
+}
+route GET "/all" {
+    guard let document = json.parse(req.header("X-Claims").or("")) else { return 400 }
+    guard let policy = json.parse(req.header("X-Required").or("")) else { return 400 }
+    guard let required = json.string(policy) else { return 400 }
+    let checked = jwt_scopes.requireAll(document, required)
+    guard json.string(json.get(checked, "/marker").or(checked)).or("") == "keep" else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    struct Case {
+        const char* claims;
+        const char* policy;
+        u16 any;
+        u16 all;
+    };
+    const Case cases[] = {
+        {R"({"scope":"read","marker":"keep"})", "admin write read", 204, 403},
+        {R"({"scope":"write","marker":"keep"})", "admin write read", 204, 403},
+        {R"({"scope":"read write","marker":"keep"})", "write read", 204, 204},
+        {R"({"scope":"read","marker":"keep"})", "read read", 204, 204},
+        {R"({"scope":"Read","marker":"keep"})", "read", 403, 403},
+        {R"({"scope":"reader","marker":"keep"})", "read", 403, 403},
+        {R"({"scope":"read bad\t","marker":"keep"})", "read", 403, 403},
+        {R"({"scope":["read"],"marker":"keep"})", "read", 403, 403},
+        {R"({"scope":"read","marker":"keep"})", "read missing ", 503, 503},
+        {R"({"scope":"read","marker":"keep"})", "read  missing", 503, 503},
+        {R"({"scope":"read","marker":"keep"})", "read\\missing", 503, 503},
+        {R"({"scope":"read","marker":"keep"})", "", 503, 503},
+        {R"({"marker":"keep"})", "read", 403, 403},
+        {R"({"sc\u006fpe":"r\u0065ad","marker":"keep"})", "read", 204, 204},
+    };
+    for (u32 route = 0; route < 2; ++route) {
+        auto handler = reinterpret_cast<HandlerFn>(
+            engine.lookup(route == 0 ? "handler_route_0" : "handler_route_1"));
+        REQUIRE(handler);
+        for (const auto& tc : cases) {
+            arena.reset();
+            char request[4096];
+            char encoded[2048];
+            json::Writer policy{encoded, sizeof(encoded)};
+            REQUIRE(json::quote(lit(tc.policy), policy));
+            const int length = snprintf(
+                request,
+                sizeof(request),
+                "GET / HTTP/1.1\r\nHost: local\r\nX-Claims: %s\r\nX-Required: %.*s\r\n\r\n",
+                tc.claims,
+                static_cast<int>(policy.len),
+                policy.data);
+            REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(request));
+            const auto result = HandlerResult::unpack(handler(nullptr,
+                                                              nullptr,
+                                                              reinterpret_cast<const u8*>(request),
+                                                              static_cast<u32>(length),
+                                                              &arena));
+            const u16 expected = route == 0 ? tc.any : tc.all;
+            CHECK_EQ(result.status_code, expected);
+            if (expected == 403) {
+                REQUIRE(result.next_state > 0 && result.next_state <= rir.module.header_set_count);
+                const auto& headers = rir.module.header_sets[result.next_state - 1];
+                CHECK_EQ(headers.count, 1u);
+                CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                CHECK(rir.module.header_values[headers.offset].eq(
+                    lit("Bearer error=\"insufficient_scope\"")));
+            } else {
+                CHECK_EQ(result.next_state, 0u);
+            }
+        }
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

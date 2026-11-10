@@ -88,6 +88,7 @@ enum class Op : u8 {
     NetRelease,
 
     JwtHasAllScopes,
+    JwtHasAnyScope,
 
 };
 
