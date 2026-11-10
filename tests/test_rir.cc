@@ -1406,6 +1406,135 @@ TEST(RirVerifier, HandlerAutomatonRejectsNonYieldingControlCycle) {
     ctx.destroy();
 }
 
+TEST(RirVerifier, RejectsYieldingCycleEvenWithOptionalTerminalExit) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+    auto done = V(b.create_block(fn, lit("done")));
+    u32 payloads[] = {25};
+    u8 kinds[] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resumes[] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resumes, 2));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(kinds[0], 25, 1));
+    b.set_insert_point(fn, resume);
+    auto condition = V(b.emit_const_bool(true));
+    VOK(b.emit_br(condition, entry, done));
+    b.set_insert_point(fn, done);
+    VOK(b.emit_ret_status(204));
+    const auto checked = verify_function(fn);
+    CHECK_FALSE(checked.ok);
+    CHECK_EQ(checked.issue.code, VerifyIssueCode::HandlerLivelock);
+    CHECK(checked.issue.trace_count >= 3);
+    CHECK(checked.issue.cycle_start < checked.issue.trace_count);
+    char buffer[512]{};
+    PrintBuf text{};
+    text.init(buffer, sizeof(buffer), -1);
+    format_verify_result(text, checked);
+    CHECK(std::string(buffer, text.len).find("cycle:") != std::string::npos);
+    ctx.destroy();
+}
+
+TEST(RirVerifier, ConcurrentSearchLimitIsNotVerificationSuccess) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    auto resume = V(b.create_block(fn, lit("resume")));
+    u32 payloads[] = {25};
+    u8 kinds[] = {static_cast<u8>(jit::YieldKind::Timer)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    BlockId resumes[] = {entry, resume};
+    VOK(b.set_explicit_resume_blocks(fn, resumes, 2));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_yield_event(kinds[0], 25, 1));
+    b.set_insert_point(fn, resume);
+    VOK(b.emit_ret_status(204));
+    VerifyOptions options{};
+    options.concurrency_limits.states = 1;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentVerificationLimit);
+    // Enough states for the route, but not for the completion/cancel model.
+    options.concurrency_limits.states = 3;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentVerificationLimit);
+    CHECK(verify_function(fn).ok);
+    ctx.destroy();
+}
+
+TEST(RirVerifier, PeerContractDetectsReceiveBeforeSendInGeneratedHandler) {
+    for (u32 recv_first = 0; recv_first < 2; ++recv_first) {
+        TestContext ctx;
+        REQUIRE(ctx.init());
+        Builder b;
+        b.init(&ctx.mod);
+        auto* fn = V(b.create_function(lit("exchange"), lit("/exchange"), 1));
+        BlockId blocks[] = {V(b.create_block(fn, lit("connect"))),
+                            V(b.create_block(fn, lit("first"))),
+                            V(b.create_block(fn, lit("second"))),
+                            V(b.create_block(fn, lit("done")))};
+        u32 payloads[] = {1, 1, 1};
+        u8 kinds[] = {static_cast<u8>(jit::YieldKind::UpstreamConnect),
+                      static_cast<u8>(recv_first ? jit::YieldKind::UpstreamRecv
+                                                 : jit::YieldKind::UpstreamSend),
+                      static_cast<u8>(recv_first ? jit::YieldKind::UpstreamSend
+                                                 : jit::YieldKind::UpstreamRecv)};
+        VOK(b.set_yield_payload(fn, payloads, 3, kinds));
+        VOK(b.set_explicit_resume_blocks(fn, blocks, 4));
+        for (u32 i = 0; i < 3; ++i) {
+            b.set_insert_point(fn, blocks[i]);
+            VOK(b.emit_yield_event(kinds[i], 1, static_cast<u16>(i + 1)));
+        }
+        b.set_insert_point(fn, blocks[3]);
+        VOK(b.emit_ret_status(204));
+
+        // The server produces a reply only after seeing a submitted send.
+        // Its two actions run independently of handler resume scheduling.
+        verify::Action peer_actions[2]{};
+        peer_actions[0].from = 0;
+        peer_actions[0].to = 1;
+        peer_actions[0].guard_set = 1;
+        peer_actions[0].clear = 1;
+        peer_actions[0].set = 2;
+        peer_actions[1].from = 1;
+        peer_actions[1].to = 2;
+        peer_actions[1].guard_clear = 2;
+        verify::Model peer{};
+        peer.actor_count = 1;
+        peer.actors[0] = {3, 0, 2};
+        peer.actions = peer_actions;
+        peer.action_count = 2;
+        peer.terminal_clear = 3;
+        VerifyPeerBinding bindings[] = {{blocks[recv_first ? 2 : 1].id, 1, 0, 0},
+                                        {blocks[recv_first ? 1 : 2].id, 0, 2, 2}};
+        VerifyPeerEnvironment environment{0, &peer, bindings, 2};
+        VerifyOptions options{};
+        options.environment = &environment;
+        const auto result = verify_function(fn, 0, options);
+        if (recv_first) {
+            CHECK_FALSE(result.ok);
+            CHECK_EQ(result.issue.code, VerifyIssueCode::HandlerDeadlock);
+            CHECK_EQ(result.issue.block_index, blocks[1].id);
+            CHECK(result.issue.trace_is_protocol);
+        } else {
+            CHECK(result.ok);
+        }
+        // No peer behavior is guessed when a contract is absent.
+        CHECK(verify_function(fn).ok);
+        bindings[1].block_index = bindings[0].block_index;
+        CHECK_EQ(verify_function(fn, 0, options).issue.code,
+                 VerifyIssueCode::ConcurrentProtocolFailure);
+        ctx.destroy();
+    }
+}
+
 TEST(RirVerifier, HandlerAutomatonSummarizesUpstreamFailurePath) {
     TestContext ctx;
     REQUIRE(ctx.init());

@@ -178,11 +178,18 @@ The first prototype should model one or two representative handlers, not the
 whole language. A good initial target is a handler with `wait any { ... }`, a
 timer timeout branch, and an upstream connect/send/recv path.
 
-## Current MVP
+## Current Compiler Checks
 
-The first native verifier entry point is RIR graph validation. It is intentionally
-small: it checks route-local block structure before any larger runtime model is
-introduced.
+RIR function verification is a mandatory gate for every handler passed to LLVM
+code generation, including direct RIR clients. A handler does not need Phi nodes
+or HTTP calls to trigger verification. A plain non-yielding control cycle or a
+wait whose declared arms disagree with the modeled pending operations prevents
+code generation for the entire module. Yielding handlers also pass a native
+progress check and bounded wait-lifecycle exploration.
+
+The first entry point is RIR graph validation. The native concurrent checker
+then operates on finite actors and shared protocol facts, without Java, LLVM,
+exceptions, RTTI, or an external solver.
 
 Covered today:
 
@@ -211,18 +218,122 @@ Covered today:
   checker,
 - a first route-local automaton check rejects synchronous CFG cycles made only
   of branch/jump nodes, before Rut attempts larger runtime composition.
-- a minimal explicit-state runtime checker composes yield nodes with declared
+- a local runtime checker compares yield nodes with declared
   wait-arm masks, callback slots, pending operations, completion transitions,
   and fail-closed transitions,
 - the current `wait any { downstream.recv(), timer(ms) }` subset carries an
   exact verifier-visible arm mask even though the runtime ABI still uses
   `YieldKind::Any`.
 
-This is not yet the full safety/deadlock checker described above. It is the
-foundation for that checker: a route automaton must be structurally valid before
-Rut can prove callback hygiene, declared resume targets, or progress properties.
-The next verifier layer should add richer counterexample traces and grow the
-same explicit-state model as Rut admits more wait arms and async capabilities.
+The concurrent layer adds:
+
+- exact-state BFS over all enabled action interleavings, with collision-safe
+  state deduplication rather than approximate bit-state hashing,
+- reachable nonterminal states without enabled actions reported as deadlocks,
+- action assertions and state invariants for ownership and callback safety,
+- terminal-resource checks, so terminating with outstanding modeled IO is an
+  error rather than an accepted end state,
+- iterative SCC analysis for infinite nonterminal executions under explicitly
+  selected weak-fairness groups,
+- handler progress checks that include yield/resume edges; an optional return
+  or failure exit does not excuse a cycle that can keep completing waits,
+- owned counterexample prefixes and fair cycle witnesses, with explicit trace
+  truncation and action/actor identities,
+- compile failures on exhausted state/edge limits or allocation failure.
+
+The state-space model supports up to eight finite actors and 64 shared Boolean
+facts. The default search limits are 32,768 states, 262,144 edges and 4,194,304
+action/invariant checks (including disabled actions). The
+scheduler is assumed to take an enabled action eventually; additional fairness
+groups prevent a particular completion class from being starved by other work.
+Weak fairness does not force an intermittently enabled action, an error outcome,
+or one particular route branch to be chosen.
+
+## Known Peer Contracts
+
+`verify::check(Model)` checks a complete finite protocol composition. For actual
+RIR handlers, `rir::VerifyOptions::environment` accepts a
+`rir::VerifyPeerEnvironment`: a finite peer model and bindings to concrete yield
+blocks in one function. The compiler generates the handler actor from its RIR;
+it does not rely on a manually copied handler specification.
+
+Each `VerifyPeerBinding` identifies the yield block, shared facts published on
+submission, completion prerequisites, and facts consumed on completion. Peer
+actions run independently. Thus a receive before a send can deadlock when the
+peer only replies after observing that send, while the send-before-receive
+version completes. The peer contract can also represent timers, retries,
+failure replies and ownership handoffs.
+
+Bindings currently cover single IO arms. Duplicate bindings, non-yield blocks,
+timer bindings, and multi-arm bindings are rejected. Multi-arm runtime races
+are checked by the lifecycle model below; the peer adapter does not silently
+replace OR waits with AND waits. Peers must describe finite required exchanges,
+including their terminal states and resource invariants.
+
+The contract can be supplied to `rir::verify_function`, `rir::verify_module`,
+or `jit::codegen` through verification options. Source-only compilation has no
+peer contracts: upstream addresses do not reveal server behavior. Its progress
+result assumes submitted external operations eventually complete or fail and
+does **not** establish absence of mutual waits with unknown network services.
+There is currently no `.rut` peer-contract syntax or CLI contract loader.
+
+## Wait Lifecycle and Race Coverage
+
+`verify::build_wait_protocol_model` generates a contract for two consecutive
+waits, each with one or two event arms. Independent completion actors explore
+both winners, close and partial-submit failure, late loser/cancel-target
+completion, resubmission, and final reclamation. Per-operation fairness assumes
+an outstanding operation eventually delivers a completion or cancellation
+target completion.
+
+All ordered pairs of wait shapes used by a function are checked, including
+different event kinds and one-arm/two-arm transitions. Assertions require a
+single owner to resume a wait, generation-correct
+completion, cleared losing callbacks, and no reclamation with outstanding
+operations. Mutation tests remove each protection and require an executable
+counterexample. Successful models are checked for every arm shape used by a
+function, within explicit bounds.
+
+This is a logical wait-ownership contract, not an extraction of the C++ event
+loops. It does not model kernel CQE flags, cancel-acknowledgement counts,
+multishot receive deliveries, concrete buffers, arbitrary thread data races,
+or all pending-operation accounting. A persistent multishot receive can supply
+a new logical wait and is not automatically a stale completion. Connecting
+these runtime details to the contract still requires implementation tests and
+maintained abstraction mappings; passing this model does not prove either
+backend's implementation correct.
+
+The handler CFG abstraction follows both branch outcomes without proving data
+predicates. Reported cycles are possible abstract executions. There is no
+annotation that silently exempts a yielding loop; finite iteration must be
+lowered without a potentially infinite CFG cycle or gain a proved progress
+measure before such loops are admitted.
+
+## Validation and Counterexamples
+
+Run the native checks with:
+
+```bash
+cmake --build build --target test_concurrency_verifier test_rir test_jit
+./build/tests/test_concurrency_verifier
+./build/tests/test_rir
+./build/tests/test_jit
+```
+
+The `runtime-state-model` CI job also checks 16 exported finite cases against an
+independent TLA+ transition semantics. TLC and the native engine must agree on
+success, deadlock, livelock and safety failures, including weak-fairness cases.
+This reference check uses the project's existing pinned TLC artifact:
+
+```bash
+python3 scripts/check_concurrency_model.py \
+  --checker build/tests/test_concurrency_verifier --jar /path/to/tla2tools.jar
+```
+
+`jit::codegen` can return the owned `rir::VerifyResult` to its caller. The
+compiler loader formats verification failures with function, block and path
+details, instead of reducing them to a generic LLVM failure. Peer/protocol
+actor locations are labeled separately from RIR block paths.
 
 ## TLA+ Role
 

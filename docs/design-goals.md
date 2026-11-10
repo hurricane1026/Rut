@@ -60,6 +60,12 @@ The verifier should focus on Rut-specific properties:
 - callback slots and pending operations stay consistent with runtime state,
 - event-driven cycles make progress under explicit fairness assumptions.
 
+The native checker now explores finite actor compositions, rejects abstract
+yielding progress cycles, and checks two consecutive logical wait lifecycles.
+Known peers can be supplied as compiler API contracts bound to actual RIR yield
+blocks. Unknown network behavior, general C++ races and kernel completion
+details remain outside that proof boundary. Search limits must fail explicitly.
+
 TLA+ can remain as a design-level reference for runtime invariants and checker
 validation, but Java/TLC should not be required to verify ordinary user code.
 

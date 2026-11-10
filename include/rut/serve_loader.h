@@ -34,7 +34,8 @@
 namespace rut {
 
 // The pipeline stage a load failed at. Lex..Lower carry a Diagnostic
-// (with source span); Codegen..Register do not (the JIT/bridge report
+// (with source span); Verify owns a formatted counterexample in detail_buf.
+// Codegen..Register do not carry frontend diagnostics (the JIT/bridge report
 // success/failure as a bool), so format_load_error falls back to a
 // static stage description for those.
 enum class LoadStage : u8 {
@@ -44,6 +45,7 @@ enum class LoadStage : u8 {
     Analyze,
     BuildMir,
     Lower,
+    Verify,
     Codegen,
     JitCompile,
     Register,
@@ -52,6 +54,7 @@ enum class LoadStage : u8 {
 struct LoadError {
     LoadStage stage = LoadStage::Read;
     bool has_diag = false;  // true iff `diag` was populated by the frontend
+    bool has_verification_failure = false;
     bool source_limit_exceeded = false;
     Diagnostic diag{};
     // Owns the bytes of `diag.detail`. The frontend's Diagnostic::detail can

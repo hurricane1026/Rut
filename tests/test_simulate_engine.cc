@@ -52,6 +52,10 @@ static u64 json_allocating_handler(void* conn, jit::HandlerCtx*, const u8*, u32,
         .pack();
 }
 
+static u64 repeated_timer_yield_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
+}
+
 static CaptureEntry make_entry(const char* req, u16 status, const char* upstream = nullptr) {
     CaptureEntry entry{};
     u32 len = 0;
@@ -608,7 +612,7 @@ TEST(simulate_engine, multiple_waits_all_drive_then_return) {
     rir.destroy();
 }
 
-TEST(simulate_engine, repeated_yield_at_cap_fails_without_status_zero_mismatch) {
+TEST(simulate_engine, repeated_yield_cycle_is_rejected_before_simulation) {
     ModuleContext ctx{};
     REQUIRE(ctx.init(1));
 
@@ -631,13 +635,73 @@ TEST(simulate_engine, repeated_yield_at_cap_fails_without_status_zero_mismatch) 
     REQUIRE(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 1, 1));
 
     Engine engine;
-    REQUIRE(engine.init(ctx.module, nullptr, 0));
+    CHECK(!engine.init(ctx.module, nullptr, 0));
+    ctx.destroy();
+}
+
+TEST(simulate_engine, repeated_yield_at_cap_fails_without_status_zero_mismatch) {
+    const char* src = "route GET \"/loop\" { return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    engine.routes[0].fn = &repeated_timer_yield_handler;
 
     const auto result =
         simulate_one(engine, make_entry("GET /loop HTTP/1.1\r\nHost: x\r\n\r\n", 200));
     CHECK_EQ(result.verdict, Verdict::Failed);
     CHECK_EQ(result.actual_status, 0u);
     CHECK_EQ(result.yield_count, 32u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, maximum_bounded_yields_complete) {
+    ModuleContext ctx{};
+    REQUIRE(ctx.init(1));
+
+    rir::Builder b;
+    b.init(&ctx.module);
+
+    auto fn_res = b.create_function({"bounded", 7}, {"/bounded", 8}, kRouteMethodGet);
+    REQUIRE(fn_res);
+    auto* fn = fn_res.value();
+
+    constexpr u32 kYieldCount = rir::Function::kMaxResumeBlocks - 1;
+    rir::BlockId resume_blocks[rir::Function::kMaxResumeBlocks]{};
+    for (u32 i = 0; i <= kYieldCount; ++i) {
+        auto block_res = b.create_block(fn, {"step", 4});
+        REQUIRE(block_res);
+        resume_blocks[i] = block_res.value();
+    }
+
+    u32 payloads[kYieldCount]{};
+    u8 kinds[kYieldCount]{};
+    for (u32 i = 0; i < kYieldCount; ++i) {
+        payloads[i] = 1;
+        kinds[i] = static_cast<u8>(jit::YieldKind::Timer);
+    }
+    REQUIRE(b.set_yield_payload(fn, payloads, kYieldCount, kinds));
+    REQUIRE(b.set_explicit_resume_blocks(fn, resume_blocks, kYieldCount + 1));
+
+    for (u32 i = 0; i < kYieldCount; ++i) {
+        b.set_insert_point(fn, resume_blocks[i]);
+        REQUIRE(
+            b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 1, static_cast<u16>(i + 1)));
+    }
+    b.set_insert_point(fn, resume_blocks[kYieldCount]);
+    REQUIRE(b.emit_ret_status(200));
+
+    Engine engine;
+    REQUIRE(engine.init(ctx.module, nullptr, 0));
+
+    const auto result =
+        simulate_one(engine, make_entry("GET /bounded HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 200u);
+    CHECK_EQ(result.yield_count, kYieldCount);
 
     engine.shutdown();
     ctx.destroy();

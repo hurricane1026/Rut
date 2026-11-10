@@ -279,6 +279,15 @@ if(SIMD_FLAGS)
     )
 endif()
 
+# Native protocol checks are shared by the compiler and RIR config tests.
+# Keep their link surface independent of the frontend's Vectorscan/LLVM flags.
+add_library(rut_verifier STATIC
+    compiler/concurrency_verifier.cc
+    compiler/wait_verifier.cc
+    compiler/handler_verifier.cc
+)
+target_include_directories(rut_verifier PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
 # Compiler library
 add_library(rut_compiler STATIC
     compiler/lexer.cc
@@ -288,6 +297,7 @@ add_library(rut_compiler STATIC
     compiler/lower_rir.cc
     compiler/rir_printer.cc
 )
+target_link_libraries(rut_compiler PUBLIC rut_verifier)
 
 target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
@@ -468,7 +478,7 @@ if(RUT_ENABLE_JIT)
         llvm_map_components_to_libnames(LLVM_LIBS
             core bitreader bitwriter linker orcjit orcshared orctargetprocess native support passes target)
     endif()
-    target_link_libraries(rut_jit ${LLVM_LIBS})
+    target_link_libraries(rut_jit ${LLVM_LIBS} rut_verifier)
 
     # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
     # The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add

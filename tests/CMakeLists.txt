@@ -435,7 +435,8 @@ add_executable(test_network
     test_network.cc
     test_password_gateway.cc
 )
-target_link_libraries(test_network rut_test_fault rut_runtime)
+# These tests populate configs from RIR, including the native verifier gate.
+target_link_libraries(test_network rut_test_fault rut_runtime rut_verifier)
 target_include_directories(test_network PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -481,7 +482,7 @@ if(NOT APPLE)
 endif()
 
 add_executable(test_target_transform test_target_transform.cc)
-target_link_libraries(test_target_transform rut_runtime)
+target_link_libraries(test_target_transform rut_runtime rut_verifier)
 target_include_directories(test_target_transform PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
@@ -1079,6 +1080,14 @@ target_include_directories(test_rir PRIVATE
 )
 add_test(NAME test_rir COMMAND test_rir)
 set_tests_properties(test_rir PROPERTIES LABELS "unit")
+
+add_executable(test_concurrency_verifier test_concurrency_verifier.cc
+    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_concurrency_verifier rut_verifier)
+target_include_directories(test_concurrency_verifier PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_concurrency_verifier COMMAND test_concurrency_verifier)
+set_tests_properties(test_concurrency_verifier PROPERTIES LABELS "unit")
 
 add_executable(test_ws_extensions test_ws_extensions.cc)
 target_link_libraries(test_ws_extensions rut_runtime)
@@ -4206,6 +4215,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_auth>
         COMMAND $<TARGET_FILE:test_types>
         COMMAND $<TARGET_FILE:test_rir>
+        COMMAND $<TARGET_FILE:test_concurrency_verifier>
         COMMAND $<TARGET_FILE:test_frontend>
         COMMAND $<TARGET_FILE:test_nginx_parser>
         COMMAND $<TARGET_FILE:test_envoy_parser>
@@ -4238,7 +4248,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running all tests..."
     )
 else()
@@ -4290,6 +4300,7 @@ else()
         COMMAND $<TARGET_FILE:test_auth>
         COMMAND $<TARGET_FILE:test_types>
         COMMAND $<TARGET_FILE:test_rir>
+        COMMAND $<TARGET_FILE:test_concurrency_verifier>
         COMMAND $<TARGET_FILE:test_frontend>
         COMMAND $<TARGET_FILE:test_nginx_parser>
         COMMAND $<TARGET_FILE:test_envoy_parser>
@@ -4317,7 +4328,7 @@ else()
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running non-JIT tests..."
     )
 endif()

@@ -108,6 +108,16 @@ jobs:
       - name: Check runtime state model
         run: TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 scripts/check_runtime_state_model.py
 
+      - name: Cross-check native concurrency verifier with TLC
+        run: |
+          c++ -std=c++23 -O1 -fno-exceptions -fno-rtti -Iinclude -Itesting \
+            tests/test_concurrency_verifier.cc src/compiler/concurrency_verifier.cc \
+            src/compiler/wait_verifier.cc src/placement_new.cc \
+            -o /tmp/rut-concurrency-reference
+          /tmp/rut-concurrency-reference
+          python3 scripts/check_concurrency_model.py \
+            --checker /tmp/rut-concurrency-reference --jar /tmp/tla2tools.jar
+
   test:
     name: Build & Test
     if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'

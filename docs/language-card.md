@@ -14,6 +14,15 @@ they fail to compile today rather than misbehave. Everything unmarked works.
 
 ## File anatomy
 
+Before LLVM code generation, every handler passes RIR structure and modeled
+wait-protocol checks. Yielding handlers also pass progress-cycle checks and
+bounded completion/cancel/close exploration for two consecutive waits. Invalid
+resume mappings, wait-arm mismatches, yielding progress cycles and exhausted
+verification budgets are compile failures. Known finite peer contracts can be
+attached through the compiler API for mutual-wait checks; unknown network peer
+behavior is not inferred. See
+[verification coverage](user-code-formal-verification.md#current-compiler-checks).
+
 A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift

@@ -3974,7 +3974,18 @@ static bool emit_function(Ctx& c, const rir::Function& fn) {
 
 static CodegenResult codegen_impl(const rir::Module& rir_mod,
                                   LLVMContextRef shared_context,
-                                  bool ws_body_mode) {
+                                  bool ws_body_mode,
+                                  rir::VerifyResult* verification = nullptr,
+                                  const rir::VerifyOptions* options = nullptr) {
+    if (verification) *verification = {};
+    if (options && options->environment &&
+        options->environment->function_index >= rir_mod.func_count) {
+        if (verification)
+            *verification = rir::verify_fail({},
+                                             rir::VerifyIssueCode::ConcurrentProtocolFailure,
+                                             options->environment->function_index);
+        return {nullptr, nullptr, false};
+    }
     if (ws_body_mode && (rir_mod.func_count != 1 || !rir::verify_module(rir_mod).ok))
         return {nullptr, nullptr, false};
     // This variadic RIR operation is emitted by the trusted builder, but keep
@@ -3982,7 +3993,6 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     if (rir_mod.func_count > 0 && rir_mod.functions == nullptr) return {nullptr, nullptr, false};
     for (u32 fi = 0; fi < rir_mod.func_count; ++fi) {
         const rir::Function& fn = rir_mod.functions[fi];
-        bool has_phi = false;
         if (ws_body_mode && (fn.yield_count != 0 || fn.is_timer || rir_function_uses_parse(fn) ||
                              rir::function_uses_http_call(fn)))
             return {nullptr, nullptr, false};
@@ -3992,7 +4002,6 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
             if (block.inst_count > 0 && block.insts == nullptr) return {nullptr, nullptr, false};
             for (u32 ii = 0; ii < block.inst_count; ++ii) {
                 const rir::Instruction& inst = block.insts[ii];
-                has_phi |= inst.op == rir::Opcode::Phi;
                 if (!rir::valid_string_instruction(fn, inst) || !rir::valid_bytes_read(fn, inst) ||
                     !rir::valid_integer_parse(fn, inst) || !rir::valid_bytes_field(fn, inst) ||
                     !rir::valid_collected_instruction(fn, inst) ||
@@ -4160,8 +4169,15 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
             }
         }
-        if ((has_phi || rir::function_uses_http_call(fn)) && !rir::verify_function(&fn).ok)
+        // Every handler must pass the state-machine verifier before LLVM can
+        // emit executable code. Checking only Phi/HTTP-call functions lets a
+        // plain control cycle or an unresumable wait bypass the compiler gate.
+        const auto checked =
+            rir::verify_function(&fn, fi, options ? *options : rir::VerifyOptions{});
+        if (!checked.ok) {
+            if (verification) *verification = checked;
             return {nullptr, nullptr, false};
+        }
     }
     for (u32 i = 0; i < rir_mod.func_count; ++i)
         if (!rir::password_prefix_valid(rir_mod.functions[i]) ||
@@ -4240,8 +4256,10 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     return {c.llvm_mod, c.llvm_ctx, true};
 }
 
-CodegenResult codegen(const rir::Module& rir_mod) {
-    return codegen_impl(rir_mod, nullptr, false);
+CodegenResult codegen(const rir::Module& rir_mod,
+                      rir::VerifyResult* verification,
+                      const rir::VerifyOptions* options) {
+    return codegen_impl(rir_mod, nullptr, false, verification, options);
 }
 
 CodegenResult codegen_ws_body(const rir::Module& rir_mod, LLVMContextRef shared_context) {
