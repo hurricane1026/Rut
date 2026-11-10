@@ -1437,3 +1437,27 @@ identity/group headers, unknown Consumers and authentication-before-authorizatio
 behavior, including method-specific challenges and identity preservation.
 These examples reuse the existing static policies; dynamic credential and
 membership lifecycle remain outside their scope.
+
+## Scope-list exclusions
+
+`jwt_scopes.requireAnyExcept` and `requireAllExcept` combine positive scope-list
+membership with an explicit excluded list. Both configured lists are mandatory,
+nonempty and bounded to 1024 bytes. Invalid policy returns 503, including invalid
+suffixes after an otherwise matching permission. An authenticated document must
+satisfy the positive policy and contain no excluded permission; denial is a 403
+with the existing insufficient-scope challenge. An excluded permission held by
+the token wins over positive membership, including overlapping policy names.
+
+The positive check validates the entire granted scope string, so missing, empty,
+non-string or malformed scopes cannot become allows through Boolean negation.
+Names are exact and case-sensitive; prefix matches, wildcards and client-supplied
+scope headers have no authority. Successful checks preserve the document and
+apply equally to verified JWT claims and authenticated active introspection
+metadata; signature, time and AS active checks remain the caller's responsibility.
+
+The JIT matrix includes an independent three-permission set oracle, overlapping
+allow/exclude sets, missing/empty/malformed metadata, duplicate names, policy bounds
+and document preservation. Registered epoll/io_uring tests use signed HS256
+requests over HTTP/1.0 and HTTP/1.1, exercise invalid excluded-list configuration,
+and retain authentication-before-policy failure behavior. See
+[jwt-scope-exclusions-auth.rut](../examples/jwt-scope-exclusions-auth.rut).

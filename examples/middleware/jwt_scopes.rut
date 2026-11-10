@@ -21,3 +21,24 @@ func requireAll(_ document: Json, _ required: str) -> Json {
     guard jwtHasAllScopes(document, required) else { respond forbidden }
     document
 }
+
+// Both policy lists are mandatory and validated before deciding membership.
+// Positive membership validates the entire granted list; negation alone would
+// also accept missing/malformed scopes. Any excluded match wins over allowance.
+func requireAnyExcept(_ document: Json, _ required: str, _ excluded: str) -> Json {
+    guard policyValid(required) && policyValid(excluded) else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAnyScope(document, required) && !jwtHasAnyScope(document, excluded)
+        else { respond forbidden }
+    document
+}
+
+func requireAllExcept(_ document: Json, _ required: str, _ excluded: str) -> Json {
+    guard policyValid(required) && policyValid(excluded) else { respond 503 }
+    let forbidden = response(403)
+    forbidden.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAllScopes(document, required) && !jwtHasAnyScope(document, excluded)
+        else { respond forbidden }
+    document
+}

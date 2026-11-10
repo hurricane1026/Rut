@@ -31720,3 +31720,189 @@ route GET "/all" {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, jwt_scope_exclusions_validate_policies_and_match_independent_set_oracle) {
+    const auto source_path = std::filesystem::path(__FILE__).parent_path().parent_path() /
+                             "examples/jwt-scope-exclusions-auth.rut";
+    std::string source = "import \"middleware/jwt_scopes.rut\"\n";
+    for (const char* mode : {"Any", "All"}) {
+        source += "route GET \"/" + std::string(mode) + "\" {\n";
+        source += R"rut(
+    guard let document = json.parse(req.header("X-Claims").or("")) else { return 400 }
+    guard let policy = json.parse(req.header("X-Policy").or("")) else { return 400 }
+    let required = json.string(json.get(policy, "/allow").or(policy)).or("")
+    let excluded = json.string(json.get(policy, "/deny").or(policy)).or("")
+)rut";
+        source += "let checked = jwt_scopes.require" + std::string(mode) +
+                  "Except(document, required, excluded)\n";
+        source += R"rut(
+    guard json.string(json.get(checked, "/marker").or(checked)).or("") == "keep" else { return 500 }
+    return 204
+}
+)rut";
+    }
+    auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    HandlerFn handlers[] = {
+        reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0")),
+        reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1")),
+    };
+    REQUIRE(handlers[0] && handlers[1]);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const auto check = [&](Str claims, Str required, Str excluded, u16 any, u16 all) {
+        char policy_bytes[4096];
+        json::Writer policy{policy_bytes, sizeof(policy_bytes)};
+        policy.text(lit("{\"allow\":"));
+        REQUIRE(json::quote(required, policy));
+        policy.text(lit(",\"deny\":"));
+        REQUIRE(json::quote(excluded, policy));
+        policy.put('}');
+        REQUIRE(policy.ok);
+        for (u32 mode = 0; mode < 2; ++mode) {
+            arena.reset();
+            char request[8192];
+            const int length = snprintf(
+                request,
+                sizeof(request),
+                "GET / HTTP/1.1\r\nHost: local\r\nX-Claims: %.*s\r\nX-Policy: %.*s\r\n\r\n",
+                static_cast<int>(claims.len),
+                claims.ptr,
+                static_cast<int>(policy.len),
+                policy.data);
+            REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(request));
+            const auto result =
+                HandlerResult::unpack(handlers[mode](nullptr,
+                                                     nullptr,
+                                                     reinterpret_cast<const u8*>(request),
+                                                     static_cast<u32>(length),
+                                                     &arena));
+            const u16 expected = mode == 0 ? any : all;
+            CHECK(result.action == HandlerAction::ReturnStatus);
+            if (result.status_code != expected)
+                std::fprintf(stderr,
+                             "exclusions mode %u allow %.*s deny %.*s got %u expected %u\n",
+                             mode,
+                             static_cast<int>(required.len),
+                             required.ptr,
+                             static_cast<int>(excluded.len),
+                             excluded.ptr,
+                             result.status_code,
+                             expected);
+            CHECK_EQ(result.status_code, expected);
+            if (expected == 403) {
+                REQUIRE(result.next_state > 0 && result.next_state <= rir.module.header_set_count);
+                const auto& headers = rir.module.header_sets[result.next_state - 1];
+                CHECK_EQ(headers.count, 1u);
+                CHECK(rir.module.header_keys[headers.offset].eq(lit("WWW-Authenticate")));
+                CHECK(rir.module.header_values[headers.offset].eq(
+                    lit("Bearer error=\"insufficient_scope\"")));
+            } else {
+                CHECK_EQ(result.next_state, 0u);
+            }
+        }
+    };
+    struct Case {
+        const char* scope;
+        const char* allow;
+        const char* deny;
+        u16 any;
+        u16 all;
+    };
+    const Case cases[] = {
+        {"read", "read write", "blocked", 204, 403},
+        {"read write", "write read", "blocked", 204, 204},
+        {"read blocked", "read write", "blocked", 403, 403},
+        {"read write blocked", "read write", "blocked", 403, 403},
+        {"read", "read", "read", 403, 403},
+        {"read", "read read", "blocked blocked", 204, 204},
+        {"read Blocked", "read", "blocked", 204, 204},
+        {"read blocked-extra", "read", "blocked", 204, 204},
+        {"read", "Read", "blocked", 403, 403},
+        {"read", "reader", "blocked", 403, 403},
+        {"read", "read ", "blocked", 503, 503},
+        {"read", "read", "blocked ", 503, 503},
+        {"read blocked", "read", "blocked  other", 503, 503},
+        {"read", "read", "blocked\t", 503, 503},
+        {"read", "read", "blocked\\other", 503, 503},
+        {"read", "", "blocked", 503, 503},
+        {"read", "read", "", 503, 503},
+        {"", "read", "blocked", 403, 403},
+    };
+    for (const auto& tc : cases) {
+        char claims_bytes[512];
+        json::Writer claims{claims_bytes, sizeof(claims_bytes)};
+        claims.text(lit("{\"marker\":\"keep\",\"scope\":"));
+        REQUIRE(json::quote(lit(tc.scope), claims));
+        claims.put('}');
+        REQUIRE(claims.ok);
+        check({claims.data, claims.len}, lit(tc.allow), lit(tc.deny), tc.any, tc.all);
+    }
+    check(lit(R"({"marker":"keep"})"), lit("read"), lit("blocked"), 403, 403);
+    check(lit(R"({"marker":"keep","scope":null})"), lit("read"), lit("blocked"), 403, 403);
+    check(lit(R"({"marker":"keep","scope":["read"]})"), lit("read"), lit("blocked"), 403, 403);
+    check(lit(R"({"marker":"keep","scope":"read bad\t"})"), lit("read"), lit("blocked"), 403, 403);
+    check(lit(R"({"marker":"keep","sc\u006fpe":"r\u0065ad"})"),
+          lit("read"),
+          lit("blocked"),
+          204,
+          204);
+    char oversized[1025];
+    __builtin_memset(oversized, 'a', sizeof(oversized));
+    const Str document = lit(R"({"marker":"keep","scope":"read"})");
+    check(document, {oversized, sizeof(oversized)}, lit("blocked"), 503, 503);
+    check(document, lit("read"), {oversized, sizeof(oversized)}, 503, 503);
+
+    constexpr Str permissions[] = {lit_str("read"), lit_str("write"), lit_str("admin")};
+    const auto list = [&](u32 mask, json::Writer& out) {
+        bool first = true;
+        for (u32 bit = 0; bit < 3; ++bit) {
+            if (!(mask & (1u << bit))) continue;
+            if (!first) out.put(' ');
+            first = false;
+            out.text(permissions[bit]);
+        }
+    };
+    for (u32 grant = 0; grant < 8; ++grant) {
+        char claims_bytes[128];
+        json::Writer claims{claims_bytes, sizeof(claims_bytes)};
+        claims.text(lit("{\"marker\":\"keep\",\"scope\":\""));
+        list(grant, claims);
+        claims.text(lit("\"}"));
+        for (u32 allow = 1; allow < 8; ++allow) {
+            char allow_bytes[64];
+            json::Writer required{allow_bytes, sizeof(allow_bytes)};
+            list(allow, required);
+            for (u32 deny = 1; deny < 8; ++deny) {
+                char deny_bytes[64];
+                json::Writer excluded{deny_bytes, sizeof(deny_bytes)};
+                list(deny, excluded);
+                const bool permitted = (grant & deny) == 0;
+                check({claims.data, claims.len},
+                      {required.data, required.len},
+                      {excluded.data, excluded.len},
+                      permitted && (grant & allow) != 0 ? 204 : 403,
+                      permitted && (grant & allow) == allow ? 204 : 403);
+            }
+        }
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

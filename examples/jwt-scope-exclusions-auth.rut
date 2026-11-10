@@ -1,0 +1,27 @@
+import "middleware/auth.rut"
+import "middleware/jwt_scopes.rut"
+
+listen :8080
+
+// All policy comes from trusted compile-time configuration. For example:
+// JWT_REQUIRED_SCOPES="orders:read orders:write admin"
+// JWT_EXCLUDED_SCOPES="debug suspended support:restricted"
+// Both lists are nonempty; JWT_SECRET is an HS256 key of at least 32 bytes.
+// Use TLS. Compiled artifacts contain the configured secret.
+route GET "/any" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let checked = jwt_scopes.requireAnyExcept(document, env("JWT_REQUIRED_SCOPES"),
+        env("JWT_EXCLUDED_SCOPES"))
+    return 204
+}
+
+route GET "/all" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let checked = jwt_scopes.requireAllExcept(document, env("JWT_REQUIRED_SCOPES"),
+        env("JWT_EXCLUDED_SCOPES"))
+    return 204
+}
+
+route "/" { return 404 }

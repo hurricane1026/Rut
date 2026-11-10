@@ -3184,6 +3184,19 @@ The module also accepts authenticated active introspection metadata; it does not
 perform network calls or authenticate arbitrary JSON. See
 [jwt-scope-lists-auth.rut](../examples/jwt-scope-lists-auth.rut).
 
+`jwt_scopes.requireAnyExcept(document, requiredScopes, excludedScopes)` requires
+at least one permission from the allowed list and no permission from the excluded
+list. `requireAllExcept` requires every allowed permission and no excluded one.
+Both trusted lists must be valid, nonempty and at most 1024 bytes; invalid policy
+returns 503 before membership is considered. Names may overlap between lists:
+a token holding any excluded permission receives 403 even when its positive
+requirement succeeds. Matching remains exact and case-sensitive; duplicates and
+order do not change membership. Empty/missing/non-string/malformed granted scopes
+return 403 rather than passing a negated check. These helpers preserve the input
+document on success and use the same insufficient-scope challenge on rejection.
+Authenticate first; they do not verify a JWT or make introspection calls. See
+[jwt-scope-exclusions-auth.rut](../examples/jwt-scope-exclusions-auth.rut).
+
 ## Authenticated Redis library sessions
 
 The ordinary Rut Redis library provides binary AUTH/SELECT builders and typed

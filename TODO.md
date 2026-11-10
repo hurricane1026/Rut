@@ -643,6 +643,9 @@ canonical spelling for common gateway tasks.
 
 ### M4：身份、安全与企业访问（清单 3、4）
 
+- [x] JWT/已认证内省 scope 列表支持允许任一/全部权限并排除指定权限：
+  双侧配置先校验，正向检查防止畸形 scope 经取反放行，显式排除优先。
+
 - [x] JWT/已认证内省元数据支持有界 scope 列表任一权限授权：`jwtHasAnyScope`；
   完整校验两侧列表、精确匹配、配置错误与权限拒绝分离，Rut 策略保留原文档。
 
