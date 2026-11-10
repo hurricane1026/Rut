@@ -1602,6 +1602,19 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   403. Leading removal effects preserve original presence evidence; other
   headers, query and body are not fallback sources. See
   [optional-multi-header-key-auth.rut](../examples/optional-multi-header-key-auth.rut).
+- `header_auth.requireBoth(firstPresented, secondPresented, config)` requires two
+  distinct nonempty opaque keys for one Consumer. Import `middleware/header_auth.rut`;
+  config is `header_auth.RequiredHeaderKeys(consumerId: ..., firstKey: ...,
+  secondKey: ..., policyId: ...)`. Read each input with `uniqueHeader(...).or("")`
+  from its own distinct original custom header. Missing/empty/duplicate/wrong
+  credentials return 401 plus `WWW-Authenticate: ApiKey`. Empty config fields or
+  identical configured keys return 503; no slot can be disabled. Success preserves
+  the configured Consumer, names the pair with credential ID `policyId`, and uses
+  method `apiKeyAndApiKey`. Authorize afterward; client headers cannot supply
+  metadata. The helper receives values and cannot enforce distinct source names.
+  Use TLS, strip both secrets before forwarding, and replace config to rotate or
+  revoke. Two shared keys do not imply MFA. See
+  [required-header-keys-auth.rut](../examples/required-header-keys-auth.rut).
 - `auth.rotatingHeaderKey(presented, currentKey, previousKey, consumerId, currentId, previousId)`
   reads the same singleton custom field and verifies either configured opaque
   key. Empty keys disable slots, even for an empty/missing presented field.
@@ -1655,6 +1668,18 @@ Rut functions returning `Identity { consumerId, credentialId, method }`:
   `req.authorization.or("")`; neither factor is optional. Either failure returns
   401; empty configuration returns 503. The returned method is `apiKeyAndBasic`,
   and credentialId is the configured ID of the required pair.
+- `identity_auth.requireSameConsumer(firstIdentity, secondIdentity, policyId)` binds two
+  successful verifier results in the same trusted Consumer ID namespace. Import
+  `middleware/identity_auth.rut`, which also exposes the existing auth helpers. Both
+  identities need nonempty Consumer/credential/method fields; `anonymous` and
+  unequal Consumer IDs return 403 without a challenge. Matching is exact and
+  case-sensitive. Empty trusted `policyId` returns 503. Success returns the shared
+  Consumer, credential ID `policyId`, and method `boundCredentials`. Authenticate
+  both sources first, preserving their 401 failures, then apply Consumer/group
+  authorization. This helper does not verify credentials, prove provenance or
+  guarantee independent MFA. Never construct inputs from client identity headers
+  or equate unrelated issuer/local identity namespaces. See
+  [bound-credentials-auth.rut](../examples/bound-credentials-auth.rut).
 - `auth.requireAnyConsumer(identity, first, second)` permits either exact,
   case-sensitive configured Consumer ID after authentication. It preserves the
   Identity, returns 403 outside the set and 503 for an empty policy ID.

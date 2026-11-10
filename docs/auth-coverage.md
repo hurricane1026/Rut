@@ -17,7 +17,7 @@ whether a competing open-source edition includes them.
 | API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
-| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
+| Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
@@ -195,6 +195,68 @@ both Consumers, disabled/conflicting configurations, exact value matching,
 spoofed identity headers, duplicate fields, authorization order and removal
 from forwarded requests. See
 [the runnable example](../examples/multi-header-key-auth.rut).
+
+## Binding multiple verified credentials to one Consumer
+
+Import `middleware/identity_auth.rut`.
+`identity_auth.requireSameConsumer(first, second, policyId)` binds two successful
+`auth.Identity` results in the same trusted Consumer ID namespace. Both
+identities must have nonempty Consumer IDs, credential IDs and methods, neither
+may have method `anonymous`, and Consumer IDs must match exactly, including
+case. Mismatching Consumers, guests or incomplete metadata return 403 without an
+authentication challenge. An empty trusted policy ID returns 503 before the
+binding checks. Success returns the matched Consumer, the configured policy ID
+as credential ID, and method `boundCredentials`. Subsequent Consumer/group
+checks remain separate authorization steps.
+
+Run both actual verifiers first. A missing, invalid or duplicate credential
+retains that verifier's 401 response and challenges; never catch failure and
+substitute a guest. This helper does not verify credentials or prove Identity
+provenance. A constructed Identity, repeated verifier result, matching credential
+ID or method name does not establish two independent factors. Callers must choose
+the credential sources, enforce their individual trust policies, and map both
+results into the same Consumer namespace. Do not bind an arbitrary external JWT
+subject to a local Consumer merely because the strings happen to match.
+
+[bound-credentials-auth.rut](../examples/bound-credentials-auth.rut) requires
+Basic and a custom-header key through separate two-Consumer registries. Alice's
+password plus Bob's valid key returns 403; either invalid credential returns 401;
+matching Alice or Bob credentials succeed, while `/alice-only` still rejects Bob.
+The JIT matrix checks both HTTP/1 versions, source duplication, spoofed metadata,
+query/body non-fallback, original reads after stripping, exact ID matching,
+malformed/guest identities, policy failures and authentication-before-binding
+precedence. Registered native-loaded HTTP tests exercise the real example on
+epoll and io_uring: both HTTP/1 versions, both Consumer pairs, swapped ownership,
+each invalid or duplicate source, challenge ordering, stripping and policy errors.
+No registry, session, replay state or language primitive is added.
+
+## Required custom-header key pair
+
+`header_auth.requireBoth(firstPresented, secondPresented, config)` requires two
+opaque header keys for one Consumer. Import `middleware/header_auth.rut` and use
+`RequiredHeaderKeys(consumerId: ..., firstKey: ..., secondKey: ..., policyId: ...)`
+from trusted configuration. Both keys must be nonempty and distinct; empty keys
+never disable a factor. Empty Consumer/policy IDs and reused keys return 503
+before evaluating credentials. The policy ID names the required pair.
+
+Read each credential with `req.uniqueHeader("...").or("")` from two distinct
+original header names. Missing, empty, duplicate, wrong, swapped or combined
+values return 401 with `WWW-Authenticate: ApiKey`; there is no Authorization,
+query, body or guest fallback. Exact constant-time comparisons authenticate both
+keys. Success returns the configured Consumer, policy ID as credential ID, and
+method `apiKeyAndApiKey`. Apply Consumer/group authorization afterward; it can
+still return 403. Do not construct either configuration or identity from client
+metadata. Callers are responsible for choosing distinct header names; the value
+helper cannot verify where its inputs originated.
+
+Use TLS and remove both credential headers before forwarding. Original singleton
+reads still work after removal. Replace the static configuration to rotate or
+revoke; this helper adds no registry, session or replay state. Requiring two shared
+secrets does not establish independent multi-factor authentication. See
+[required-header-keys-auth.rut](../examples/required-header-keys-auth.rut).
+The JIT matrix covers both HTTP/1 versions, each missing/invalid factor, duplicates
+in either header, swapped credentials, spoofed metadata, configuration failures,
+original reads after stripping, and authentication before authorization.
 
 ## Required credentials and bounded authorization union
 
