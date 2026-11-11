@@ -10825,6 +10825,25 @@ across reset. SET execution can precede a cleanup failure; no replay is added.
 There are no runtime Redis fields/opcodes, new dependencies, keywords, loops or
 budget increases. See [the session contract](docs/redis-sessions.md).
 
+### Advanced Redis library composition
+
+Ordinary source modules implement bounded MULTI/EXEC transactions and WATCH,
+RESP3 framing/HELLO negotiation with explicit Push events, finite dedicated
+subscriptions, configured Cluster redirects and Sentinel discovery plus ROLE
+verification. MULTI and ASKING acknowledgements gate business writes. Remainders
+and command errors remain explicit; unknown write outcomes never trigger replay.
+Discovered addresses select only admitted fixed TCP/verified TLS policies.
+The existing sixteen-I/O, byte/node, parser and arena limits remain in force;
+there is no native Redis opcode or background topology/subscription task. See
+[the advanced client contracts](docs/redis-advanced.md).
+
+Pure Boolean, Bytes, collection and variant helper bodies retain lexical
+initializer sharing like records and tuples. Normalization caches an initializer
+across binding scopes only after proving it has no free outer lexical value;
+dependent cache entries are cleared
+when entering/leaving `let` and collector scopes. This bounds repeated helper
+expansion without changing lexical capture or source evaluation semantics.
+
 ### Memcached basic-text client composition
 
 The ordinary Memcached library composes generic TCP/verified TLS and bounded

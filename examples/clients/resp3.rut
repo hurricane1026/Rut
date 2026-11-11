@@ -1,0 +1,194 @@
+// Bounded RESP3 values. Numeric spellings remain exact Bytes; no floating
+// conversion or narrowing is invented by this source library.
+// Kinds 1..7 match RESP2; 8 null, 9 bool, 10 double, 11 big number,
+// 12 blob error, 13 verbatim, 14 map, 15 attribute, 16 set, 17 push.
+struct Resp3Token { kind: i32 data: Bytes next: i32 children: i32 }
+struct Resp3State { offset: i32 pending: i32 root: i32 }
+struct Resp3Value { kind: i32 data: Bytes next: i32 children: i32 root: i32 }
+struct Resp3Stream { bytes: Bytes }
+struct Resp3Frame { frame: Bytes rest: Bytes root: Resp3Token }
+
+func resp3Choose(_ test: bool, _ yes: i32, _ no: i32) -> i32 {
+    if test { yes } else { no }
+}
+// Prefix dispatch is an immutable table, avoiding a branch tree in every
+// unrolled token step. Zero denotes an unsupported prefix.
+func resp3Kind(_ prefix: i32) -> i32 {
+    let kinds = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x00\x09\x04\x0e\x00\x00\x0b\x00\x05\x01\x0a\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x0d\x11\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0f\x00\x10\x00"
+    kinds[prefix].or(0)
+}
+func resp3DigitsPart(_ bytes: Bytes, _ start: i32) -> bool {
+    if start < bytes.count {
+        guard let part = bytes.slice(start, min(start + 16, bytes.count)) else { false }
+        guard let first = part[0] else { false }
+        guard first > 47 && first < 58 else { false }
+        parseInt64(part) != nil
+    } else { true }
+}
+func resp3Digits(_ bytes: Bytes) -> bool {
+    bytes.count > 0 && !(bytes.count > 64) && resp3DigitsPart(bytes, 0) &&
+        resp3DigitsPart(bytes, 16) && resp3DigitsPart(bytes, 32) && resp3DigitsPart(bytes, 48)
+}
+func resp3Unsigned(_ text: Bytes) -> Bytes {
+    if text[0] == 45 || text[0] == 43 { text.slice(1, text.count) } else { text }
+}
+func resp3Decimal(_ text: Bytes) -> bool {
+    if let dot = text.find(b".") {
+        guard let whole = text.slice(0, dot) else { false }
+        guard let fraction = text.slice(dot + 1, text.count) else { false }
+        resp3Digits(whole) && resp3Digits(fraction)
+    } else { resp3Digits(text) }
+}
+func resp3Double(_ text: Bytes) -> bool {
+    if text == b"inf" || text == b"-inf" || text == b"nan" { true } else {
+        guard let unsigned = resp3Unsigned(text) else { false }
+        let exponent = unsigned.find(b"e").or(unsigned.find(b"E").or(unsigned.count))
+        guard let mantissa = unsigned.slice(0, exponent) else { false }
+        if exponent < unsigned.count {
+            guard let tail = unsigned.slice(exponent + 1, unsigned.count) else { false }
+            guard let digits = resp3Unsigned(tail) else { false }
+            resp3Decimal(mantissa) && resp3Digits(digits)
+        } else { resp3Decimal(mantissa) }
+    }
+}
+func resp3Blob(_ bytes: Bytes, _ prefix: i32, _ text: Bytes, _ next: i32) -> Resp3Token {
+    if prefix == 36 && text == b"-1" {
+        Resp3Token(kind: 6, data: b"", next: next, children: 0)
+    } else {
+        guard text[0].or(0) > 47 && text[0].or(0) < 58 else { nil }
+        guard let length = parseInt(text) else { nil }
+        guard length > -1 && !(length > bytes.count - next - 2) else { nil }
+        let end = next + length
+        guard bytes.slice(end, end + 2) == b"\r\n" else { nil }
+        guard let data = bytes.slice(next, end) else { nil }
+        guard prefix != 61 || (length > 3 && data[3] == 58) else { nil }
+        Resp3Token(kind: resp3Kind(prefix),
+            data: data, next: end + 2, children: 0)
+    }
+}
+func resp3Aggregate(_ prefix: i32, _ text: Bytes, _ next: i32) -> Resp3Token {
+    if prefix == 42 && text == b"-1" {
+        Resp3Token(kind: 7, data: b"", next: next, children: 0)
+    } else {
+        guard text[0].or(0) > 47 && text[0].or(0) < 58 else { nil }
+        guard let length = parseInt(text) else { nil }
+        let pair = prefix == 37 || prefix == 124
+        guard length > -1 && !(length > resp3Choose(pair, 31, 63)) else { nil }
+        let kind = resp3Kind(prefix)
+        Resp3Token(kind: kind, data: b"", next: next, children: length * resp3Choose(pair, 2, 1))
+    }
+}
+func resp3Scalar(_ prefix: i32, _ text: Bytes, _ next: i32) -> Resp3Token {
+    guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+    if prefix == 43 || prefix == 45 || prefix == 58 {
+        guard prefix != 58 || parseInt64(text) != nil else { nil }
+        Resp3Token(kind: resp3Kind(prefix),
+            data: text, next: next, children: 0)
+    } else {
+        guard (prefix == 95 && text.count == 0) || (prefix == 35 && (text == b"t" || text == b"f")) ||
+            (prefix == 44 && resp3Double(text)) || (prefix == 40 && resp3Digits(resp3Unsigned(text).or(b""))) else { nil }
+        Resp3Token(kind: resp3Kind(prefix),
+            data: text, next: next, children: 0)
+    }
+}
+func resp3Token(_ bytes: Bytes, _ offset: i32) -> Resp3Token {
+    guard offset > -1 else { nil }
+    guard let prefix = bytes[offset] else { nil }
+    guard let end = bytes.find(b"\r\n", offset + 1) else { nil }
+    guard let text = bytes.slice(offset + 1, end) else { nil }
+    if prefix == 36 || prefix == 33 || prefix == 61 { resp3Blob(bytes, prefix, text, end + 2) } else {
+        if prefix == 42 || prefix == 37 || prefix == 124 || prefix == 126 || prefix == 62 {
+            resp3Aggregate(prefix, text, end + 2)
+        } else { resp3Scalar(prefix, text, end + 2) }
+    }
+}
+func resp3Advance(_ state: Resp3State, _ token: Resp3Token) -> (Resp3State, Resp3Value, bool) {
+    // Attributes annotate the following value; they do not consume its slot.
+    let pending = state.pending - resp3Choose(token.kind == 15, 0, 1) + token.children
+    let root = resp3Choose(state.root < 0 && state.pending == 1 && token.kind != 15, state.offset, state.root)
+    guard pending > -1 && !(pending > 64) else { nil }
+    (Resp3State(offset: token.next, pending: pending, root: root),
+        Resp3Value(kind: token.kind, data: token.data, next: token.next, children: token.children, root: root), pending == 0)
+}
+func resp3Step(_ bytes: Bytes, _ state: Resp3State) -> (Resp3State, Resp3Value, bool) {
+    guard state.pending > 0 else { nil }
+    guard let token = resp3Token(bytes, state.offset) else { nil }
+    resp3Advance(state, token)
+}
+// Accumulation only needs numeric line boundaries. Validate their spelling
+// once when publishing the completed frame, rather than on every read attempt.
+func resp3FramingScalar(_ prefix: i32, _ text: Bytes, _ next: i32) -> Resp3Token {
+    if prefix == 58 || prefix == 44 || prefix == 40 {
+        Resp3Token(kind: resp3Kind(prefix),
+            data: text, next: next, children: 0)
+    } else {
+        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+        guard prefix == 43 || prefix == 45 || (prefix == 95 && text.count == 0) ||
+            (prefix == 35 && (text == b"t" || text == b"f")) else { nil }
+        Resp3Token(kind: resp3Kind(prefix),
+            data: text, next: next, children: 0)
+    }
+}
+func resp3FramingToken(_ bytes: Bytes, _ offset: i32) -> Resp3Token {
+    guard let prefix = bytes[offset] else { nil }
+    guard let end = bytes.find(b"\r\n", offset + 1) else { nil }
+    guard let text = bytes.slice(offset + 1, end) else { nil }
+    if prefix == 36 || prefix == 33 || prefix == 61 { resp3Blob(bytes, prefix, text, end + 2) } else {
+        if prefix == 42 || prefix == 37 || prefix == 124 || prefix == 126 || prefix == 62 {
+            resp3Aggregate(prefix, text, end + 2)
+        } else { resp3FramingScalar(prefix, text, end + 2) }
+    }
+}
+func resp3FramingStep(_ bytes: Bytes, _ state: Resp3State) -> (Resp3State, Resp3Value, bool) {
+    guard state.pending > 0 else { nil }
+    guard let token = resp3FramingToken(bytes, state.offset) else { nil }
+    resp3Advance(state, token)
+}
+func resp3Framed(_ bytes: Bytes) -> bool {
+    guard bytes.count > 0 && !(bytes.count > 8192) else { false }
+    collectBytes(bytes, Resp3State(offset: 0, pending: 1, root: -1), 64, resp3FramingStep) != nil
+}
+func resp3Prefix(_ bytes: Bytes) {
+    guard bytes.count > 0 && !(bytes.count > 8192) else { nil }
+    collectBytes(bytes, Resp3State(offset: 0, pending: 1, root: -1), 64, resp3Step)
+}
+func decodeResp3(_ bytes: Bytes) {
+    guard let values = resp3Prefix(bytes) else { nil }
+    guard let last = values.get(values.count - 1) else { nil }
+    guard last.next == bytes.count else { nil }
+    values
+}
+func resp3Frame(_ bytes: Bytes) -> Resp3Frame {
+    guard let values = resp3Prefix(bytes) else { nil }
+    guard let last = values.get(values.count - 1) else { nil }
+    guard let frame = bytes.slice(0, last.next) else { nil }
+    guard let rest = bytes.slice(last.next, bytes.count) else { nil }
+    // Prefix validation already checked every numeric spelling. Recover only
+    // the root metadata here instead of duplicating its full validation graph.
+    guard let root = resp3FramingToken(bytes, last.root) else { nil }
+    Resp3Frame(frame: frame, rest: rest, root: root)
+}
+// A buffered remainder belongs to the caller: a coalesced push/message must
+// never be dropped or mistaken for the next command's response.
+func resp3Receive(_ connection: TcpConnection, _ stream: Resp3Stream) {
+    if !resp3Framed(stream.bytes) {
+        guard stream.bytes.count < 8192 else { nil }
+        let reading = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+        Resp3Stream(bytes: bytes)
+    } else { stream }
+}
+func resp3ReadPair(_ connection: TcpConnection, _ stream: Resp3Stream) {
+    let readingFirst = resp3Receive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp3Receive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func resp3Read(_ connection: TcpConnection, _ buffered: Bytes) -> Resp3Frame {
+    let reading = resp3ReadPair(connection, Resp3Stream(bytes: buffered))
+    guard let stream = reading else { nil }
+    resp3Frame(stream.bytes)
+}

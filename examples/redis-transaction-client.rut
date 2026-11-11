@@ -1,0 +1,22 @@
+import "clients/redis-transaction.rut"
+
+func transactionExample(_ value: Bytes) -> RedisTransaction {
+    guard let write = resp2SetRequest(b"transaction-example", value) else { nil }
+    guard let read = resp2GetRequest(b"transaction-example") else { nil }
+    guard let first = redisTransactionAdd(redisTransaction(), write) else { nil }
+    redisTransactionAdd(first, read)
+}
+func transactionBytes(_ result: RedisTransactionResult) -> Bytes {
+    match result { .executed(bytes) => bytes _ => nil }
+}
+// The response is the exact EXEC array, including any per-command error.
+// Authenticate this physical connection first when required; never replay it.
+route POST "/transaction" {
+    guard let batch = transactionExample(req.bodyBytes) else { return 413 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisTransactionExecute(connection, batch)
+    let closed = connection.close()
+    guard let body = transactionBytes(result) else { return 502 }
+    return response(200, body: body)
+}

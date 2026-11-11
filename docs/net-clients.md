@@ -9,6 +9,11 @@ The executable [TCP/UDP example](../examples/tcp-udp-clients.rut) imports a smal
 [Redis RESP2 PING client](../examples/clients/redis.rut) written in Rut. It is a
 protocol-library example, not a complete Redis driver.
 
+The [Redis command](redis-commands.md), [pipeline](redis-pipeline.md),
+[authenticated session](redis-sessions.md) and [advanced](redis-advanced.md)
+libraries compose these primitives for bounded Redis operations, including
+transactions, RESP3 events, subscriptions and configured topology routing.
+
 The [Memcached client](memcache-client.md) uses the same primitives for bounded
 single-key GET, SET/ADD/REPLACE, DELETE and TOUCH over TCP or verified TLS.
 

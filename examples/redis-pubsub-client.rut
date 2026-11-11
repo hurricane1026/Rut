@@ -1,0 +1,17 @@
+import "clients/redis-pubsub.rut"
+
+func subscriptionBytes(_ result: RedisPubSubResult) -> Bytes {
+    match result { .message(frame) => redisPubSubData(frame) _ => nil }
+}
+// Request-scoped: acknowledge one channel subscription, await one message,
+// then close the dedicated transport. This never returns a subscribed lease
+// to the generic pool. Publish from a separate client while this request waits.
+route POST "/subscribe-once" {
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSubscribeOnce(connection,
+        RedisSubscription(channel: req.bodyBytes, mode: 1, closing: false))
+    let closed = connection.close()
+    guard let body = subscriptionBytes(result) else { return 502 }
+    return response(200, body: body)
+}

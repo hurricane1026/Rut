@@ -1,0 +1,22 @@
+import "clients/redis-resp3.rut"
+import "clients/resp2-command.rut"
+
+func resp3ExampleReady(_ result: RedisResp3Result) -> bool {
+    match result { .reply(event) => true _ => false }
+}
+func resp3ExampleBytes(_ result: RedisResp3Result) -> Bytes {
+    match result { .reply(event) => event.frame _ => nil }
+}
+// HELLO 3 must advertise proto: 3 before the GET is sent. This simple example
+// uses no tracking/subscriptions and closes rather than sharing protocol state.
+route POST "/get-resp3" {
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let hello = redisHello3(connection)
+    guard resp3ExampleReady(hello) else { return 502 }
+    guard let request = resp2GetRequest(req.bodyBytes) else { return 413 }
+    let result = redisResp3Execute(connection, request)
+    let closed = connection.close()
+    guard let body = resp3ExampleBytes(result) else { return 502 }
+    return response(200, body: body)
+}

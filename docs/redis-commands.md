@@ -130,7 +130,9 @@ existing authenticated session helpers for pooled GET/SET. The single-command
 executor does not batch commands; the separate [pipeline module](redis-pipeline.md)
 supports finite batches. Transaction handling, subscription streams,
 Cluster redirects, Sentinel discovery, RESP3, reconnect and retry policy remain
-outside this profile. Some
+outside this profile; the separate [advanced modules](redis-advanced.md) provide
+bounded transactions, subscriptions, RESP3 events, configured Cluster/Sentinel
+routing and explicit recovery decisions. Some
 commands cannot fit these finite request/reply/read budgets. This remains a
 bounded standalone Redis client, not a complete Redis driver.
 

@@ -81,6 +81,10 @@ the existing `redisInitialize` helpers first and acknowledge `redisReset` before
 pool return. The executor retains caller ownership and does not release the
 connection implicitly.
 
+For MULTI/EXEC with WATCH conflicts, RESP3 events, dedicated subscriptions and
+configured topology routing, see the separate [advanced modules](redis-advanced.md).
+An ordinary pipeline is not an atomic transaction.
+
 The existing [authenticated helpers](redis-sessions.md) compose through selective
 imports, alongside unqualified pipeline/encoder imports:
 

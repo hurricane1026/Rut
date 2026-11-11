@@ -6039,10 +6039,15 @@ static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
     const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body) ||
                           (fn.lexical_body_index < fn.exprs.len &&
                            hir_has_resumable_call(fn.exprs[fn.lexical_body_index]));
-    const bool kStringBody = hir_has_string_construction(fn.body) ||
-                             fn.body.type == HirTypeKind::Struct ||
-                             fn.body.type == HirTypeKind::Tuple;
-    if (!kLexical && (!kStringBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
+    // Predicates, byte views and variant projections need the same shared
+    // lexical initializers as records/tuples. Expanding their normalized guard
+    // and slice graphs at every use makes bounded source codecs grow sharply.
+    const bool kValueBody =
+        hir_has_string_construction(fn.body) || fn.body.type == HirTypeKind::Struct ||
+        fn.body.type == HirTypeKind::Tuple || fn.body.type == HirTypeKind::Variant ||
+        fn.body.type == HirTypeKind::Bool || fn.body.type == HirTypeKind::Bytes ||
+        fn.body.type == HirTypeKind::Collected;
+    if (!kLexical && (!kValueBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
     if (fn.lexical_body_index >= fn.exprs.len)
         return frontend_error(FrontendError::UnsupportedSyntax,
                               span,
@@ -6125,9 +6130,16 @@ struct LexicalCallArguments {
         // too, so helper substitution cannot discard or duplicate their effects.
         // netError is a state observation rather than a resumable operation,
         // but its value must still be captured before later arguments run.
-        if (route == nullptr ||
-            (!uses_lexical_values(route) && !hir_has_string_construction(value) &&
-             !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
+        // Ordinary value helpers also project records, byte views and bounded
+        // collections repeatedly. Keep their nontrivial arguments in one
+        // initializer just as lexical/message helpers do.
+        const bool kValueArgument =
+            value.type == HirTypeKind::Struct || value.type == HirTypeKind::Tuple ||
+            value.type == HirTypeKind::Variant || value.type == HirTypeKind::Bool ||
+            value.type == HirTypeKind::Bytes || value.type == HirTypeKind::Collected;
+        if (route == nullptr || (!uses_lexical_values(route) && !kValueArgument &&
+                                 !hir_has_string_construction(value) &&
+                                 !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
         if (is_ws_borrowed_type(value.type) && kEvaluated)
@@ -6690,8 +6702,124 @@ struct NormalizeLocalCache {
     static constexpr u32 kCapacity = AstFunctionDecl::kMaxParams + HirRoute::kMaxLocals;
     HirExpr values[kCapacity]{};
     bool ready[kCapacity]{};
+    bool independent[kCapacity]{};
+    bool checked[kCapacity]{};
+    bool checking[kCapacity]{};
     u32 local_count = 0;
 };
+
+static void reset_normalize_local_cache(NormalizeLocalCache* cache) {
+    if (cache == nullptr) return;
+    for (u32 i = 0; i < cache->local_count; ++i)
+        if (!cache->independent[i]) cache->ready[i] = false;
+}
+
+// A helper-local initializer with no free lexical BoundValue can be reused
+// across binding scopes. References owned by its own LetIn/CollectBytes do
+// not make it depend on the surrounding environment.
+static bool normalize_local_independent(NormalizeLocalCache& cache,
+                                        u32 index,
+                                        const HirLocal* locals,
+                                        u32 local_count,
+                                        u32 param_count,
+                                        u32 depth);
+
+static bool normalization_uses_outer_binding(const HirExpr& expr,
+                                             const ExprValueBinding* owned,
+                                             NormalizeLocalCache& cache,
+                                             const HirLocal* locals,
+                                             u32 local_count,
+                                             u32 param_count,
+                                             u32& visits,
+                                             u32 depth) {
+    if (++visits > 262144 || depth > 512) return true;
+    if (expr.kind == HirExprKind::BoundValue) {
+        if (expr.lhs == nullptr) return true;
+        for (auto* entry = owned; entry != nullptr; entry = entry->parent)
+            if (entry->source == expr.lhs) return false;
+        return true;
+    }
+    if (expr.kind == HirExprKind::LocalRef) {
+        if (expr.local_index >= local_count) return true;
+        if (expr.local_index < param_count) return false;
+        if (normalize_local_independent(
+                cache, expr.local_index, locals, local_count, param_count, depth + 1))
+            return false;
+        return normalization_uses_outer_binding(locals[expr.local_index].init,
+                                                owned,
+                                                cache,
+                                                locals,
+                                                local_count,
+                                                param_count,
+                                                visits,
+                                                depth + 1);
+    }
+    if (expr.kind == HirExprKind::LetIn) {
+        if (!expr.lhs || !expr.rhs) return true;
+        if (normalization_uses_outer_binding(
+                *expr.lhs, owned, cache, locals, local_count, param_count, visits, depth + 1))
+            return true;
+        const ExprValueBinding kInner{expr.lhs, nullptr, owned};
+        return normalization_uses_outer_binding(
+            *expr.rhs, &kInner, cache, locals, local_count, param_count, visits, depth + 1);
+    }
+    if (expr.kind == HirExprKind::CollectBytes) {
+        if (!expr.lhs || !expr.rhs || expr.args.len != 1 || !expr.args[0]) return true;
+        if (normalization_uses_outer_binding(
+                *expr.lhs, owned, cache, locals, local_count, param_count, visits, depth + 1) ||
+            normalization_uses_outer_binding(
+                *expr.rhs, owned, cache, locals, local_count, param_count, visits, depth + 1))
+            return true;
+        const ExprValueBinding kInput{expr.lhs, nullptr, owned};
+        const ExprValueBinding kState{expr.rhs, nullptr, &kInput};
+        return normalization_uses_outer_binding(
+            *expr.args[0], &kState, cache, locals, local_count, param_count, visits, depth + 1);
+    }
+    if (expr.lhs &&
+        normalization_uses_outer_binding(
+            *expr.lhs, owned, cache, locals, local_count, param_count, visits, depth + 1))
+        return true;
+    if (expr.rhs &&
+        normalization_uses_outer_binding(
+            *expr.rhs, owned, cache, locals, local_count, param_count, visits, depth + 1))
+        return true;
+    for (u32 i = 0; i < expr.args.len; ++i)
+        if (expr.args[i] &&
+            normalization_uses_outer_binding(
+                *expr.args[i], owned, cache, locals, local_count, param_count, visits, depth + 1))
+            return true;
+    for (u32 i = 0; i < expr.field_inits.len; ++i)
+        if (expr.field_inits[i].value &&
+            normalization_uses_outer_binding(*expr.field_inits[i].value,
+                                             owned,
+                                             cache,
+                                             locals,
+                                             local_count,
+                                             param_count,
+                                             visits,
+                                             depth + 1))
+            return true;
+    return false;
+}
+
+static bool normalize_local_independent(NormalizeLocalCache& cache,
+                                        u32 index,
+                                        const HirLocal* locals,
+                                        u32 local_count,
+                                        u32 param_count,
+                                        u32 depth) {
+    if (index >= cache.local_count || depth > 512) return false;
+    if (cache.checked[index]) return cache.independent[index];
+    if (cache.checking[index]) return false;
+    cache.checking[index] = true;
+    u32 visits = 0;
+    const bool kIndependent = !normalization_uses_outer_binding(
+        locals[index].init, nullptr, cache, locals, local_count, param_count, visits, depth + 1);
+    cache.checking[index] = false;
+    cache.checked[index] = true;
+    cache.independent[index] = kIndependent;
+    return kIndependent;
+}
 
 static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
                                               NodePool<HirExpr>& exprs,
@@ -6732,8 +6860,10 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
         out.rhs = &exprs[exprs.len - 1];
         const ExprValueBinding input_binding{expr.lhs, out.lhs, bindings};
         const ExprValueBinding state_binding{expr.rhs, out.rhs, &input_binding};
+        reset_normalize_local_cache(local_cache);
         auto step = normalize_expr(
             *expr.args[0], exprs, locals, local_count, param_count, &state_binding, local_cache);
+        reset_normalize_local_cache(local_cache);
         if (!step) return core::make_unexpected(step.error());
         if (!exprs.push(step.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         if (!out.args.push(&exprs[exprs.len - 1]))
@@ -6750,8 +6880,10 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         HirExpr* key = &exprs[exprs.len - 1];
         const ExprValueBinding kScoped{expr.lhs, key, bindings};
+        reset_normalize_local_cache(local_cache);
         auto body = normalize_expr(
             *expr.rhs, exprs, locals, local_count, param_count, &kScoped, local_cache);
+        reset_normalize_local_cache(local_cache);
         if (!body) return core::make_unexpected(body.error());
         if (!exprs.push(body.value())) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = key;
@@ -6762,11 +6894,14 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
         if (expr.local_index >= local_count)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         if (expr.local_index < param_count) return expr;
+        if (local_cache != nullptr && expr.local_index < local_cache->local_count)
+            normalize_local_independent(
+                *local_cache, expr.local_index, locals, local_count, param_count, 0);
         // This cache belongs to one function normalization and its local environment.
-        // Binding scopes can rebind the same source expression (notably LetIn and
-        // CollectBytes), so only reuse initializer expansions outside those scopes.
-        const bool kMemoize = bindings == nullptr && local_cache != nullptr &&
-                              expr.local_index < local_cache->local_count;
+        // Binding scopes can rebind the same source expression. Entering and
+        // leaving LetIn/CollectBytes clears dependent entries, so repeated references
+        // may share expansions within any one active binding environment.
+        const bool kMemoize = local_cache != nullptr && expr.local_index < local_cache->local_count;
         if (kMemoize && local_cache->ready[expr.local_index])
             return local_cache->values[expr.local_index];
         auto value = normalize_expr(locals[expr.local_index].init,

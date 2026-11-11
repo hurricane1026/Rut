@@ -1,0 +1,289 @@
+import "resp2.rut"
+import "resp2-command.rut"
+
+struct RedisRedirect { slot: i32 endpoint: Bytes asking: bool }
+struct RedisCrcState { offset: i32 crc: i32 }
+variant RedisTopologyResult {
+    reply(Bytes)
+    redirect(RedisRedirect)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+// CRC16/XMODEM polynomial 0x1021, initial zero. This immutable 512-byte
+// table uses the existing bounded integer reader; there is no new hash builtin.
+func redisCrcByte(_ crc: i32, _ octet: i32) -> i32 {
+    let table = b"\x00\x00\x10\x21\x20\x42\x30\x63\x40\x84\x50\xa5\x60\xc6\x70\xe7\x81\x08\x91\x29\xa1\x4a\xb1\x6b\xc1\x8c\xd1\xad\xe1\xce\xf1\xef\x12\x31\x02\x10\x32\x73\x22\x52\x52\xb5\x42\x94\x72\xf7\x62\xd6\x93\x39\x83\x18\xb3\x7b\xa3\x5a\xd3\xbd\xc3\x9c\xf3\xff\xe3\xde\x24\x62\x34\x43\x04\x20\x14\x01\x64\xe6\x74\xc7\x44\xa4\x54\x85\xa5\x6a\xb5\x4b\x85\x28\x95\x09\xe5\xee\xf5\xcf\xc5\xac\xd5\x8d\x36\x53\x26\x72\x16\x11\x06\x30\x76\xd7\x66\xf6\x56\x95\x46\xb4\xb7\x5b\xa7\x7a\x97\x19\x87\x38\xf7\xdf\xe7\xfe\xd7\x9d\xc7\xbc\x48\xc4\x58\xe5\x68\x86\x78\xa7\x08\x40\x18\x61\x28\x02\x38\x23\xc9\xcc\xd9\xed\xe9\x8e\xf9\xaf\x89\x48\x99\x69\xa9\x0a\xb9\x2b\x5a\xf5\x4a\xd4\x7a\xb7\x6a\x96\x1a\x71\x0a\x50\x3a\x33\x2a\x12\xdb\xfd\xcb\xdc\xfb\xbf\xeb\x9e\x9b\x79\x8b\x58\xbb\x3b\xab\x1a\x6c\xa6\x7c\x87\x4c\xe4\x5c\xc5\x2c\x22\x3c\x03\x0c\x60\x1c\x41\xed\xae\xfd\x8f\xcd\xec\xdd\xcd\xad\x2a\xbd\x0b\x8d\x68\x9d\x49\x7e\x97\x6e\xb6\x5e\xd5\x4e\xf4\x3e\x13\x2e\x32\x1e\x51\x0e\x70\xff\x9f\xef\xbe\xdf\xdd\xcf\xfc\xbf\x1b\xaf\x3a\x9f\x59\x8f\x78\x91\x88\x81\xa9\xb1\xca\xa1\xeb\xd1\x0c\xc1\x2d\xf1\x4e\xe1\x6f\x10\x80\x00\xa1\x30\xc2\x20\xe3\x50\x04\x40\x25\x70\x46\x60\x67\x83\xb9\x93\x98\xa3\xfb\xb3\xda\xc3\x3d\xd3\x1c\xe3\x7f\xf3\x5e\x02\xb1\x12\x90\x22\xf3\x32\xd2\x42\x35\x52\x14\x62\x77\x72\x56\xb5\xea\xa5\xcb\x95\xa8\x85\x89\xf5\x6e\xe5\x4f\xd5\x2c\xc5\x0d\x34\xe2\x24\xc3\x14\xa0\x04\x81\x74\x66\x64\x47\x54\x24\x44\x05\xa7\xdb\xb7\xfa\x87\x99\x97\xb8\xe7\x5f\xf7\x7e\xc7\x1d\xd7\x3c\x26\xd3\x36\xf2\x06\x91\x16\xb0\x66\x57\x76\x76\x46\x15\x56\x34\xd9\x4c\xc9\x6d\xf9\x0e\xe9\x2f\x99\xc8\x89\xe9\xb9\x8a\xa9\xab\x58\x44\x48\x65\x78\x06\x68\x27\x18\xc0\x08\xe1\x38\x82\x28\xa3\xcb\x7d\xdb\x5c\xeb\x3f\xfb\x1e\x8b\xf9\x9b\xd8\xab\xbb\xbb\x9a\x4a\x75\x5a\x54\x6a\x37\x7a\x16\x0a\xf1\x1a\xd0\x2a\xb3\x3a\x92\xfd\x2e\xed\x0f\xdd\x6c\xcd\x4d\xbd\xaa\xad\x8b\x9d\xe8\x8d\xc9\x7c\x26\x6c\x07\x5c\x64\x4c\x45\x3c\xa2\x2c\x83\x1c\xe0\x0c\xc1\xef\x1f\xff\x3e\xcf\x5d\xdf\x7c\xaf\x9b\xbf\xba\x8f\xd9\x9f\xf8\x6e\x17\x7e\x36\x4e\x55\x5e\x74\x2e\x93\x3e\xb2\x0e\xd1\x1e\xf0"
+    let index = bitwise.xor(bitwise.shiftRight(crc, 8), octet) * 2
+    let entry = table.readU16BE(index).or(0)
+    bitwise.and(bitwise.xor(bitwise.shiftLeft(crc, 8), entry), 65535)
+}
+func redisCrcAt(_ key: Bytes, _ offset: i32, _ crc: i32) -> i32 {
+    if let octet = key[offset] { redisCrcByte(crc, octet) } else { crc }
+}
+func redisCrcStep(_ key: Bytes, _ state: RedisCrcState) -> (RedisCrcState, i32, bool) {
+    let one = redisCrcAt(key, state.offset, state.crc)
+    let two = redisCrcAt(key, state.offset + 1, one)
+    let three = redisCrcAt(key, state.offset + 2, two)
+    let four = redisCrcAt(key, state.offset + 3, three)
+    guard state.offset > -1 && state.offset < key.count && state.crc > -1 && state.crc < 65536 else { nil }
+    (RedisCrcState(offset: state.offset + 4, crc: four), four, state.offset + 4 >= key.count)
+}
+func redisClusterTag(_ key: Bytes) -> Bytes {
+    if let open = key.find(b"{") {
+        if let end = key.find(b"}", open + 1) {
+            if end > open + 1 { key.slice(open + 1, end) } else { key }
+        } else { key }
+    } else { key }
+}
+func redisClusterSlot(_ key: Bytes) -> i32 {
+    guard let tag = redisClusterTag(key) else { nil }
+    guard !(tag.count > 256) else { nil }
+    if tag.count == 0 { 0 } else {
+        guard let values = collectBytes(tag, RedisCrcState(offset: 0, crc: 0), 64, redisCrcStep) else { nil }
+        guard let crc = values.get(values.count - 1) else { nil }
+        bitwise.and(crc, 16383)
+    }
+}
+func redisTopologyPort(_ digits: Bytes) -> i32 {
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let port = parseInt(digits) else { nil }
+    guard port > 0 && port < 65536 else { nil }
+    port
+}
+
+func redisRedirectEndpoint(_ detail: Bytes, _ start: i32, _ slot: i32, _ asking: bool) -> RedisRedirect {
+    guard slot > -1 && slot < 16384 else { nil }
+    guard let endpoint = detail.slice(start, detail.count) else { nil }
+    guard endpoint.count > 0 && !(endpoint.count > 128) && endpoint.find(b" ") == nil &&
+        endpoint.find(b"\r") == nil && endpoint.find(b"\n") == nil && endpoint.find(b"\x00") == nil else { nil }
+    guard let colon = endpoint.find(b":") else { nil }
+    guard let digits = endpoint.slice(colon + 1, endpoint.count) else { nil }
+    guard let port = redisTopologyPort(digits) else { nil }
+    RedisRedirect(slot: slot, endpoint: endpoint, asking: asking)
+}
+func redisRedirect(_ detail: Bytes) -> RedisRedirect {
+    let asking = detail.slice(0, 4) == b"ASK "
+    guard asking || detail.slice(0, 6) == b"MOVED " else { nil }
+    let start = resp2Select(asking, 4, 6)
+    guard let end = detail.find(b" ", start) else { nil }
+    guard let digits = detail.slice(start, end) else { nil }
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let slot = parseInt(digits) else { nil }
+    redisRedirectEndpoint(detail, end + 1, slot, asking)
+}
+
+func redisRedirectResolve(_ redirect: RedisRedirect, _ currentAddress: Bytes) -> RedisRedirect {
+    if redirect.endpoint[0] == 58 {
+        guard let endpoint = concatBytes(currentAddress, redirect.endpoint, 128) else { nil }
+        RedisRedirect(slot: redirect.slot, endpoint: endpoint, asking: redirect.asking)
+    } else { redirect }
+}
+// Return a configured node index, never a runtime network address. Unknown
+// redirects must fail rather than expanding the compiler's outbound policy.
+func redisRedirectNode(_ redirect: RedisRedirect, _ first: Bytes, _ second: Bytes, _ third: Bytes) -> i32 {
+    if redirect.endpoint == first { 0 } else {
+        if redirect.endpoint == second { 1 } else {
+            if redirect.endpoint == third { 2 } else { -1 }
+        }
+    }
+}
+func redisClusterCommand(_ name: Bytes, _ names: Bytes) -> bool {
+    guard name.count > 0 && name.count < 17 && name.find(b"|") == nil else { false }
+    guard let prefix = concatBytes(b"|", name, 18) else { false }
+    guard let selected = concatBytes(prefix, b"|", 18) else { false }
+    names.find(selected) != nil
+}
+func redisClusterRequest(_ request: Bytes, _ key: Bytes) -> bool {
+    guard redisRequestValid(request) else { false }
+    guard let root = resp2Token(request, 0) else { false }
+    guard let command = resp2Token(request, root.next) else { false }
+    guard let argument = resp2Token(request, command.next) else { false }
+    guard argument.kind == 4 && argument.data == key else { false }
+    let names = b"|GET|SET|TTL|PTTL|EXPIRE|PEXPIRE|PERSIST|INCR|DECR|INCRBY|DECRBY|HGET|HSET|HDEL|HGETALL|LPUSH|RPUSH|LPOP|RPOP|LRANGE|SADD|SREM|SMEMBERS|ZADD|ZREM|ZRANGE|"
+    if command.data == b"DEL" || command.data == b"UNLINK" || command.data == b"EXISTS" {
+        root.children == 2
+    } else { redisClusterCommand(command.data, names) }
+}
+
+func redisTopologyFailure(_ code: i32) -> RedisTopologyResult {
+    if code == 0 { RedisTopologyResult.replyFailure } else { RedisTopologyResult.transportFailure(code) }
+}
+func redisTopologyReply(_ bytes: Bytes) -> RedisTopologyResult {
+    guard let root = resp2Token(bytes, 0) else { RedisTopologyResult.replyFailure }
+    if root.kind == 2 { RedisTopologyResult.serverError(root.data) } else { RedisTopologyResult.reply(bytes) }
+}
+func redisTopologyRead(_ connection: TcpConnection) -> RedisTopologyResult {
+    guard let initial = resp2Stream(8192) else { RedisTopologyResult.replyFailure }
+    let readingFirst = resp2Receive(connection, initial)
+    guard let first = readingFirst else { redisTopologyFailure(netError()) }
+    let readingSecond = resp2Receive(connection, first)
+    guard let second = readingSecond else { redisTopologyFailure(netError()) }
+    guard resp2Finished(second) else { RedisTopologyResult.replyFailure }
+    redisTopologyReply(second.bytes)
+}
+
+func redisTopologyWire(_ connection: TcpConnection, _ request: Bytes) -> RedisTopologyResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisTopologyResult.transportFailure(netError()) }
+    redisTopologyRead(connection)
+}
+func redisTopologyMustClose(_ result: RedisTopologyResult) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisTopologyFinish(_ connection: TcpConnection, _ result: RedisTopologyResult) -> RedisTopologyResult {
+    if redisTopologyMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func redisClusterError(_ detail: Bytes, _ slot: i32) -> RedisTopologyResult {
+    if detail.slice(0, 6) == b"MOVED " || detail.slice(0, 4) == b"ASK " {
+        guard let redirect = redisRedirect(detail) else { RedisTopologyResult.replyFailure }
+        guard redirect.slot == slot else { RedisTopologyResult.replyFailure }
+        RedisTopologyResult.redirect(redirect)
+    } else { RedisTopologyResult.serverError(detail) }
+}
+func redisClusterResult(_ result: RedisTopologyResult, _ slot: i32) -> RedisTopologyResult {
+    match result {
+        .serverError(detail) => redisClusterError(detail, slot)
+        _ => result
+    }
+}
+func redisClusterExecute(_ connection: TcpConnection, _ request: Bytes, _ key: Bytes) -> RedisTopologyResult {
+    guard redisClusterRequest(request, key) else { RedisTopologyResult.requestFailure }
+    guard let slot = redisClusterSlot(key) else { RedisTopologyResult.requestFailure }
+    let result = redisTopologyWire(connection, request)
+    redisTopologyFinish(connection, redisClusterResult(result, slot))
+}
+func redisAsking(_ connection: TcpConnection) -> RedisTopologyResult {
+    let sending = connection.send(b"*1\r\n$6\r\nASKING\r\n", 1000)
+    guard let sent = sending else { RedisTopologyResult.transportFailure(netError()) }
+    let reading = connection.readLine(8192, 1000)
+    guard let line = reading else { RedisTopologyResult.transportFailure(netError()) }
+    guard line == b"+OK\r\n" else { RedisTopologyResult.replyFailure }
+    RedisTopologyResult.reply(b"")
+}
+func redisClusterFollowReady(_ connection: TcpConnection, _ request: Bytes, _ slot: i32, _ result: RedisTopologyResult) -> RedisTopologyResult {
+    match result {
+        .reply(empty) => redisClusterResult(redisTopologyWire(connection, request), slot)
+        _ => result
+    }
+}
+func redisClusterPrepare(_ connection: TcpConnection, _ asking: bool) -> RedisTopologyResult {
+    if asking { redisAsking(connection) } else { RedisTopologyResult.reply(b"") }
+}
+func redisClusterFollowWire(_ connection: TcpConnection, _ request: Bytes, _ redirect: RedisRedirect) -> RedisTopologyResult {
+    let ready = redisClusterPrepare(connection, redirect.asking)
+    redisClusterFollowReady(connection, request, redirect.slot, ready)
+}
+func redisClusterFollow(_ connection: TcpConnection, _ request: Bytes, _ key: Bytes, _ redirect: RedisRedirect) -> RedisTopologyResult {
+    guard redisClusterRequest(request, key) else { RedisTopologyResult.requestFailure }
+    guard let slot = redisClusterSlot(key) else { RedisTopologyResult.requestFailure }
+    guard slot == redirect.slot else { RedisTopologyResult.requestFailure }
+    let result = redisClusterFollowWire(connection, request, redirect)
+    redisTopologyFinish(connection, result)
+}
+
+struct RedisMaster { address: Bytes port: i32 }
+variant RedisSentinelResult {
+    master(RedisMaster)
+    unknown
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisSentinelRequest(_ name: Bytes) {
+    guard let initial = resp2Command(3, 8192) else { nil }
+    guard let command = resp2Argument(initial, b"SENTINEL") else { nil }
+    guard let operation = resp2Argument(command, b"get-master-addr-by-name") else { nil }
+    guard let selected = resp2Argument(operation, name) else { nil }
+    resp2Request(selected)
+}
+func redisSentinelMaster(_ bytes: Bytes) -> RedisSentinelResult {
+    guard let root = resp2Token(bytes, 0) else { RedisSentinelResult.replyFailure }
+    if root.kind == 7 { RedisSentinelResult.unknown } else {
+        guard root.kind == 5 && root.children == 2 else { RedisSentinelResult.replyFailure }
+        guard let address = resp2Token(bytes, root.next) else { RedisSentinelResult.replyFailure }
+        guard let port = resp2Token(bytes, address.next) else { RedisSentinelResult.replyFailure }
+        guard address.kind == 4 && address.data.count > 0 && port.kind == 4 && port.next == bytes.count else { RedisSentinelResult.replyFailure }
+        guard let number = parseInt(port.data) else { RedisSentinelResult.replyFailure }
+        guard number > 0 && number < 65536 && port.data[0].or(0) > 47 && port.data[0].or(0) < 58 else { RedisSentinelResult.replyFailure }
+        RedisSentinelResult.master(RedisMaster(address: address.data, port: number))
+    }
+}
+func redisSentinelResult(_ result: RedisTopologyResult) -> RedisSentinelResult {
+    match result {
+        .reply(bytes) => redisSentinelMaster(bytes)
+        .serverError(detail) => RedisSentinelResult.serverError(detail)
+        .requestFailure => RedisSentinelResult.requestFailure
+        .transportFailure(code) => RedisSentinelResult.transportFailure(code)
+        _ => RedisSentinelResult.replyFailure
+    }
+}
+func redisSentinelFinish(_ connection: TcpConnection, _ result: RedisSentinelResult) -> RedisSentinelResult {
+    match result {
+        .master(node) => result
+        .unknown => result
+        .serverError(detail) => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func redisSentinelDiscover(_ connection: TcpConnection, _ name: Bytes) -> RedisSentinelResult {
+    guard let request = redisSentinelRequest(name) else { RedisSentinelResult.requestFailure }
+    let result = redisTopologyWire(connection, request)
+    let checked = redisSentinelResult(result)
+    redisSentinelFinish(connection, checked)
+}
+
+func redisMasterMatches(_ master: RedisMaster, _ address: Bytes, _ port: i32) -> bool {
+    master.address == address && master.port == port
+}
+func redisRoleMaster(_ bytes: Bytes) -> bool {
+    guard let root = resp2Token(bytes, 0) else { false }
+    guard root.kind == 5 && root.children == 3 else { false }
+    guard let role = resp2Token(bytes, root.next) else { false }
+    guard let offset = resp2Token(bytes, role.next) else { false }
+    guard let replicas = resp2Token(bytes, offset.next) else { false }
+    role.kind == 4 && role.data == b"master" && offset.kind == 3 &&
+        offset.data[0].or(45) != 45 && replicas.kind == 5
+}
+func redisSentinelVerifyReply(_ result: RedisTopologyResult) -> RedisTopologyResult {
+    match result {
+        .reply(bytes) => if redisRoleMaster(bytes) { result } else { RedisTopologyResult.replyFailure }
+        _ => result
+    }
+}
+func redisSentinelVerifyMaster(_ connection: TcpConnection) -> RedisTopologyResult {
+    let result = redisTopologyWire(connection, b"*1\r\n$4\r\nROLE\r\n")
+    let verified = redisSentinelVerifyReply(result)
+    match verified {
+        .reply(bytes) => verified
+        _ => {
+            let closed = connection.close()
+            verified
+        }
+    }
+}
+
+// Recovery is explicit. A redirect confirms a command was not executed there;
+// a failed transport cannot prove that a mutation was not already committed.
+variant RedisRecovery { complete redirect reconnectRead unknownWrite stop }
+func redisRecovery(_ result: RedisTopologyResult, _ readOnly: bool) -> RedisRecovery {
+    match result {
+        .reply(bytes) => RedisRecovery.complete
+        .redirect(node) => RedisRecovery.redirect
+        .transportFailure(code) => if readOnly { RedisRecovery.reconnectRead } else { RedisRecovery.unknownWrite }
+        .replyFailure => if readOnly { RedisRecovery.reconnectRead } else { RedisRecovery.unknownWrite }
+        _ => RedisRecovery.stop
+    }
+}
