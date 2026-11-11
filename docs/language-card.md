@@ -3228,3 +3228,13 @@ with no new keyword, builtin or change to the sixteen-I/O profile. Status/setup
 replies have a two-receive bound; GET/SET keep four. RESET requires Redis 6.2+;
 failures close instead of sharing authentication/database state. See
 [session results, budgets and ownership](redis-sessions.md).
+
+## Memcached library client
+
+Import `"clients/memcache-client.rut"` from an example for bounded single-key
+GET, SET/ADD/REPLACE, DELETE and TOUCH. These are ordinary Rut functions over
+the existing TCP/TLS and Bytes surface. Typed results preserve misses, empty
+binary values, conditional non-storage and distinct failure classes. Successful
+commands allow explicit pool return; server/transport/framing errors close the
+handle. Four receives and 8192-byte request/reply bounds remain within the
+existing I/O profile. See [options, TTL limits and example](memcache-client.md).

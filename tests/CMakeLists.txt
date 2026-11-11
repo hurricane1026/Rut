@@ -4484,6 +4484,40 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
         set_tests_properties(test_net_clients_${backend} PROPERTIES
             LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        foreach(memcache_opt 0 2)
+            add_test(NAME test_memcache_client_${backend}_opt${memcache_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt ${memcache_opt})
+            set_tests_properties(test_memcache_client_${backend}_opt${memcache_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+        add_test(NAME test_memcache_client_${backend}_tls
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
+        set_tests_properties(test_memcache_client_${backend}_tls PROPERTIES
+            LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        foreach(memcache_tls tcp tls)
+            set(memcache_tls_args)
+            if(memcache_tls STREQUAL "tls")
+                list(APPEND memcache_tls_args --tls)
+            endif()
+            add_test(NAME test_memcache_client_live_${backend}_${memcache_tls}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2
+                    --real-memcached ${memcache_tls_args})
+            set_tests_properties(test_memcache_client_live_${backend}_${memcache_tls} PROPERTIES
+                LABELS "integration;network;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+        add_test(NAME test_memcache_example_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --example ${PROJECT_SOURCE_DIR}/examples/memcache-client.rut
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2)
+        set_tests_properties(test_memcache_example_${backend} PROPERTIES
+            LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         foreach(parse_opt 0 2)
             add_test(NAME test_parse_integers_${backend}_opt${parse_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_parse_integers.py
