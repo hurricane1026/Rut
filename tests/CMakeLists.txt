@@ -446,6 +446,16 @@ target_compile_definitions(test_network PRIVATE RUT_TESTING=1)
 add_test(NAME test_network COMMAND test_network)
 set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
+add_executable(test_wait_scheduler test_wait_scheduler.cc)
+target_link_libraries(test_wait_scheduler rut_test_fault rut_runtime)
+target_include_directories(test_wait_scheduler PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(test_wait_scheduler PRIVATE RUT_TESTING=1)
+add_test(NAME test_wait_scheduler COMMAND test_wait_scheduler)
+set_tests_properties(test_wait_scheduler PROPERTIES LABELS "unit;network;model")
+
 add_executable(test_ws_shutdown_deadline test_ws_shutdown_deadline.cc)
 target_link_libraries(test_ws_shutdown_deadline rut_test_fault rut_runtime)
 target_include_directories(test_ws_shutdown_deadline PRIVATE
@@ -4136,6 +4146,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
 )
 set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
+add_test(NAME test_wait_scheduler_manifest
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only)
+set_tests_properties(test_wait_scheduler_manifest PROPERTIES LABELS "unit;model")
+
 
 # Strict decimal parser has no LLVM or external-library dependencies.
 add_executable(test_parse_integer test_parse_integer.cc)
@@ -4175,8 +4189,10 @@ if(APPLE)
 elseif(RUT_ENABLE_JIT)
     add_custom_target(check
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
+        COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
         COMMAND $<TARGET_FILE:test_ws_lifecycle>
         COMMAND $<TARGET_FILE:test_ws_bulk>
@@ -4248,7 +4264,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running all tests..."
     )
 else()
@@ -4260,8 +4276,10 @@ else()
     endif()
     add_custom_target(check
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
+        COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
         COMMAND $<TARGET_FILE:test_ws_lifecycle>
         COMMAND $<TARGET_FILE:test_ws_bulk>
@@ -4328,7 +4346,7 @@ else()
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions
         COMMENT "Running non-JIT tests..."
     )
 endif()

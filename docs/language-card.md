@@ -1170,6 +1170,7 @@ guard let resp = any(wait(h1, 5s)) else { return 504 }   // timeout race
 wait(2s) // timer sleep
 wait(downstream.recv())
 wait(downstream.send()) // even an empty send resumes on a later loop turn
+// Scheduler safety/progress has bounded TLC coverage plus concrete runtime tests.
 
 // TCP/UDP clients — fixed endpoints, request-owned handles (implemented).
 // See net-clients.md for bounds, UDP and TLS policies.

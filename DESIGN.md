@@ -4298,6 +4298,11 @@ ready work prevents a blocking backend wait. Close/free unlinks queued work,
 and drained batches validate the connection generation and continuation state.
 This scheduling contract applies to epoll, io_uring and kqueue and requires no
 coroutines, threads per wait, or hot-path heap allocation.
+The bounded scheduler TLA+ model checks FIFO turns, generation-qualified
+completion/cancellation and progress under explicit scheduler/IO fairness.
+Concrete boundary and C++ mutation tests bridge the contract to the runtime;
+see [scheduler verification](docs/user-code-formal-verification.md#runtime-continuation-scheduling)
+for bounds and the remaining implementation-refinement gap.
 
 For dynamic-length fan-out, use `for` + `submit`:
 ```swift

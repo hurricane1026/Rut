@@ -61,6 +61,8 @@ class EventLoopCRTP {
     Connection* jit_ready_tail_ = nullptr;
 
 public:
+    static constexpr u32 kJitReadyBatchLimit = 64;
+
     // Per-loop shard limiter for @rateLimit(scope: shard). HTTP/1 and HTTP/2
     // dispatch through the same loop instance, so they intentionally share this
     // table. Keeping it on the loop (rather than in rate_limit_exceeded's
@@ -119,9 +121,9 @@ public:
             u32 generation;
             u16 state;
         };
-        Ready batch[64]{};
+        Ready batch[kJitReadyBatchLimit]{};
         u32 count = 0;
-        while (jit_ready_head_ && count < 64) {
+        while (jit_ready_head_ && count < kJitReadyBatchLimit) {
             Connection& c = *jit_ready_head_;
             batch[count++] = {&c, c.jit_ready_generation, c.jit_ready_state};
             cancel_ready_jit_handler(c);
