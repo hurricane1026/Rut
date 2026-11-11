@@ -1,0 +1,50 @@
+// Signature-only bounded pair. documentHs256 validates configuration and claims.
+func rotatingClaimsHs256(_ token: str, _ currentSecret: str, _ previousSecret: str) -> Json {
+    let current = jwtDecode(token, currentSecret, "HS256")
+    let previous = jwtDecode(token, previousSecret, "HS256")
+    match current != nil { true => current _ => previous }
+}
+
+// Authentication precedes every online lookup. These are trusted issuer keys
+// and namespace policy, never request-selected service credentials or endpoints.
+func documentHs256(_ token: str, _ secret: str, _ previousSecret: str, _ issuer: str, _ audience: str) -> Json {
+    guard Bytes(secret).count >= 32 && Bytes(secret).count <= 4096 &&
+        (previousSecret == "" || (Bytes(previousSecret).count >= 32 && Bytes(previousSecret).count <= 4096)) &&
+        issuer != "" && audience != "" else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard let document = rotatingClaimsHs256(token, secret, previousSecret) else { respond denied }
+    guard jwtClaimsValid(document, issuer, audience) else { respond denied }
+    document
+}
+
+// Hash the exact already-verified compact token, not an unverified jti/subject.
+// Each issuer/application must own a distinct trusted namespace.
+func key(_ token: str, _ namespace: str) -> Bytes {
+    guard namespace != "" && Bytes(namespace).count <= 128 else { nil }
+    guard let digest = sha256(token) else { nil }
+    Bytes(namespace + ":" + digest)
+}
+
+// Consume only redisSessionGet's terminal result from the trusted service.
+// Even a successful GET cannot allow if AUTH/SELECT/RESET/release failed.
+func requireActiveStatus(_ status: i32) -> bool {
+    guard status == 0 || status == 1 else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard status == 1 else { respond denied }
+    true
+}
+
+// A single issuance snapshot: the permit expiry is the token's exact signed exp.
+struct IssuedSession { token: str key: Bytes expiry: Bytes }
+func issueHs256(_ subject: str, _ issuer: str, _ audience: str, _ tokenId: str,
+                _ secret: str, _ namespace: str, _ scopes: str) -> IssuedSession {
+    guard Bytes(scopes).count > 0 && Bytes(scopes).count <= 1024 else { nil }
+    guard let token = jwtIssueHs256WithIdAndScope(subject, issuer, audience, tokenId, scopes, secret, 300) else { nil }
+    guard let document = jwtDecode(token, secret, "HS256") else { nil }
+    guard let expiryValue = json.get(document, "/exp") else { nil }
+    guard let expiry = json.encode(expiryValue) else { nil }
+    guard let sessionKey = key(token, namespace) else { nil }
+    IssuedSession(token: token, key: sessionKey, expiry: Bytes(expiry))
+}

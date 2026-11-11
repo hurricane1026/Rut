@@ -3928,7 +3928,9 @@ if(RUT_ENABLE_JIT)
     )
     target_compile_definitions(test_jit PRIVATE ${RUT_LLVM_DEFINITIONS})
     add_test(NAME test_jit COMMAND test_jit)
-    set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
+    # GCC Debug CI reached the test's timeout after reporting only PASS cases;
+    # the expanded JIT suite needs more than the workflow's 120s default.
+    set_tests_properties(test_jit PROPERTIES LABELS "unit;jit" TIMEOUT 300)
 
     add_executable(test_jwt_group_policies test_jwt_group_policies.cc
         ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
@@ -3989,6 +3991,28 @@ if(RUT_ENABLE_JIT)
                         --backend ${binding_backend})
                 set_tests_properties(test_bound_credentials_${binding_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
+            foreach(jwt_session_backend epoll io_uring)
+                foreach(jwt_session_opt 0 2)
+                    add_test(NAME test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_sessions.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR}
+                            --backend ${jwt_session_backend} --opt ${jwt_session_opt})
+                    # GCC Debug CI completes opt0 in ~174s and hits the old
+                    # 180s limit for opt2 and TLS under the same workload.
+                    set_tests_properties(test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
+                endforeach()
+                add_test(NAME test_jwt_sessions_${jwt_session_backend}_tls
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_sessions.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR}
+                        --backend ${jwt_session_backend} --opt 2 --tls)
+                set_tests_properties(test_jwt_sessions_${jwt_session_backend}_tls PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
             endforeach()
             foreach(password_backend epoll io_uring)
                 add_test(NAME test_password_login_${password_backend}

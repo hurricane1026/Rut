@@ -682,7 +682,9 @@ struct AstItem {
 };
 
 struct AstFile {
-    static constexpr u32 kMaxItems = 128;
+    // Imported client modules are merged into one AST; Redis pipeline helpers
+    // plus online-session helpers now exceed the old 128-item ceiling.
+    static constexpr u32 kMaxItems = 256;
     // Match-arm patterns moved into this pool alongside sub-expressions; sized
     // so pooled patterns cannot regress capacity for files that previously
     // stored them inline (512 fully-loaded match statements at kMaxMatchArms).
