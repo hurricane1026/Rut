@@ -868,6 +868,12 @@ struct ConnectionBase {
     i32 resume_event_result;
     void* handler_ctx;
     jit::HandlerFn pending_handler_fn;
+    // Intrusive shard-ready continuation. The loop unlinks it before close/free.
+    ConnectionBase* jit_ready_prev = nullptr;
+    ConnectionBase* jit_ready_next = nullptr;
+    u32 jit_ready_generation = 0;
+    u16 jit_ready_state = 0;
+    bool jit_ready_queued = false;
     alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 
@@ -2284,6 +2290,11 @@ struct ConnectionBase {
         request_config = nullptr;
         listener_context = {};
         pending_handler_fn = nullptr;
+        jit_ready_prev = nullptr;
+        jit_ready_next = nullptr;
+        jit_ready_queued = false;
+        jit_ready_generation = 0;
+        jit_ready_state = 0;
         yield_timespec.tv_sec = 0;
         yield_timespec.tv_nsec = 0;
         yield_timer_gen = 0;

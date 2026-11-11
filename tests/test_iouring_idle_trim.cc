@@ -1164,9 +1164,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // Required subprotocol negotiation pins one additional route-owned Str (+16 bytes).
     // Verified inbound mTLS identity accounts for 64 bytes; struct padding absorbs its
     // valid flag. The optional HTTP/1 TLS-upstream owner and transport links account for
-    // two pointers and alignment padding. The measured current 64-bit Connection layout is 5680
-    // bytes.
-    CHECK_EQ(sizeof(Connection), 5680u);
+    // two pointers plus 8 bytes of generation/state/queued metadata after
+    // reordering. The measured current 64-bit Connection layout is 5704 bytes.
+    CHECK_EQ(sizeof(Connection), 5704u);
 }
 
 TEST(iouring_idle_trim,

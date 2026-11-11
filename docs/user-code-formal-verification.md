@@ -208,8 +208,7 @@ Covered today:
 - a small runtime-protocol model classifies each lowered yield by pending
   operation, callback slot, and submit/completion/fail-closed transition shape,
   and rejects yield shapes that the event loop cannot safely schedule, such as
-  downstream-send event yields and upstream connect/recv/send yields without a
-  target payload,
+  upstream connect/recv/send yields without a target payload,
 - runtime-protocol verifier failures include a compact Rut-facing trace with
   the yield kind, payload, modeled pending operation, callback slot, and failure
   reason,
@@ -334,6 +333,68 @@ python3 scripts/check_concurrency_model.py \
 compiler loader formats verification failures with function, block and path
 details, instead of reducing them to a generic LLVM failure. Peer/protocol
 actor locations are labeled separately from RIR block paths.
+
+## Runtime Continuation Scheduling
+
+Event waits return control to the shard loop. An empty downstream send also
+suspends: the loop queues its already-ready continuation instead of recursively
+invoking the handler. The intrusive queue is bounded by live connections and
+needs no allocations. Epoll and kqueue keep the 64-owner FIFO drain; when the
+synthetic completion ring is full, nonempty sends are retained in the existing per-owner
+send state and completed from writable readiness. io_uring keeps the same
+64-owner drain and does not use this synthetic ring. New waits defer to a later
+turn, and pending ready work makes kernel polling nonblocking. Close/free
+removes queued owners. Generation and continuation-state checks protect
+detached batches against close/reuse.
+
+`spec/wait_scheduler.tla` additionally models publication, FIFO batch extraction,
+callback execution, kernel polling, IO completion, peer close, slot reuse and
+shutdown as distinct actions. TLC checks safety and eventual completion or
+cancellation of each generation-qualified wait obligation. The checked bounds
+are one/two owners, two waits per generation, two generations, and batch limits
+one/two. Separate C++ tests exercise the actual 64/65/129-owner boundary and
+continuous re-waits, as well as closing/reusing another owner in a detached
+batch and ignoring an old Send event while a ready continuation owns the wakeup.
+The TLA model does not represent backend completion-ring capacity or syscall
+submission; those properties are covered by C++ scheduler/backend tests, not
+claimed as TLC-proven.
+
+Progress assumes a weakly fair scheduler and handler publication. IO delivery
+is strongly fair across poll opportunities: a pending completion eligible at
+repeated polls eventually arrives. Weak fairness of that poll-only delivery is
+insufficient, since eligibility is intermittent. Explicit negative cases remove
+each fairness assumption and must produce a liveness counterexample. No claim
+is made that an unresponsive external service must produce a successful reply.
+
+CI checks three healthy TLC configurations and ten defective variants. The
+variants cover inline resume, LIFO ordering, same-turn re-draining, missing
+generation fencing, missing close/shutdown cancellation, stale event takeover,
+blocking polling with ready work, and absent scheduler/IO fairness. A syntax,
+tool or timeout failure is not accepted as a counterexample. Concrete C++
+mutation checks separately remove the generation fence, reverse FIFO order and
+change the batch limit; the actual regression tests must reject every compiled
+variant through test assertions. Temporary header overlays leave production
+sources, build objects and the baseline executable unchanged.
+
+Run the focused checks with:
+
+```bash
+cmake --build build --target test_wait_scheduler
+./build/tests/test_wait_scheduler
+python3 scripts/check_wait_scheduler_model.py --jar /path/to/tla2tools.jar
+python3 scripts/check_wait_scheduler_mutations.py --build-dir build
+```
+
+The model uses the existing pinned TLC artifact. Ordinary CTest runs the C++
+tests and a source-manifest drift check without requiring Java. The required
+`Runtime state model` CI job runs TLC explicitly, and Clang Debug CI checks the
+C++ mutations. Both retain counterexample logs as CI artifacts.
+
+The manifest links model actions to runtime/test symbols and checks the batch
+constant; it is a structural drift check. This bounded model plus implementation
+and mutation tests is **not a proof of refinement of C++ to TLA+**, nor a proof
+of arbitrary kernel CQE/buffer/accounting behavior. The lifecycle and peer-model
+bounds described above still apply. kqueue execution still requires macOS.
 
 ## TLA+ Role
 

@@ -406,7 +406,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                         if (!conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
-                    } else if (conn.pending_handler_fn &&
+                    } else if (conn.pending_handler_fn && !conn.jit_ready_queued &&
                                yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
                         if (conn.yield_armed) {
                             conn.yield_armed = false;
@@ -902,7 +902,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                         if (!conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn, keepalive_timeout);
                         this->dispatch_event(conn, ev);
-                    } else if (conn.pending_handler_fn &&
+                    } else if (conn.pending_handler_fn && !conn.jit_ready_queued &&
                                yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
                         if (conn.yield_armed) {
                             conn.yield_armed = false;
@@ -1392,7 +1392,12 @@ struct LoopThread {
         i32 iters = 0;
         const i64 deadline = lt->max_run_ms > 0 ? mono_ms() + lt->max_run_ms : 0;
         while (lp->is_running()) {
-            u32 n = lp->backend.wait(events, 256, lp->conns, RealLoop::kMaxConns);
+            lp->drain_ready_jit_handlers();
+            u32 n = lp->backend.wait(events,
+                                     256,
+                                     lp->conns,
+                                     RealLoop::kMaxConns,
+                                     lp->has_ready_jit_handlers() ? 0u : ~u32{0});
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (deadline != 0) {
                 if (mono_ms() >= deadline) break;

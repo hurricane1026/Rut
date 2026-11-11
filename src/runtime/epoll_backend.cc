@@ -650,11 +650,30 @@ bool EpollBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
 
+    auto& state = upstream_send_state[conn_id];
+    if (state.remaining || state.src || state.fd >= 0) return false;
+    if (pending_count >= kPendingCap) {
+        if (len == 0 || buf == nullptr) return false;
+        const i32 previous_fd = upstream_fd_map[conn_id];
+        upstream_fd_map[conn_id] = fd;
+        state = {buf, fd, 0, len, IoEventType::UpstreamSend, false, 0, upstream_episode, 0, 0};
+        struct epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
+        invalidate_fd_interest(conn_id, fd);
+        i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+        if (rc < 0 && errno == ENOENT) rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+        if (rc >= 0) return true;
+        const i32 error = errno;
+        state = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
+        upstream_fd_map[conn_id] = previous_fd;
+        errno = error;
+        return false;
+    }
+
     // This operation can produce at most one synchronous completion.  The
     // producer is single-threaded/non-reentrant, so this entry check reserves
     // its completion slot without needing a separate reservation counter.
-    if (pending_count >= kPendingCap) return false;
-
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
     if (nw == static_cast<ssize_t>(len)) {
@@ -759,11 +778,31 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
 bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool more_follows) {
     if (conn_id >= connection_capacity) return false;
 
+    const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
+    auto& state = send_state[conn_id];
+    if (state.remaining || state.src || state.fd >= 0) return false;
+
+    if (pending_count >= kPendingCap) {
+        if (len == 0 || buf == nullptr) return false;
+        const i32 previous_fd = downstream_fd_map[conn_id];
+        downstream_fd_map[conn_id] = fd;
+        state = {buf, fd, 0, len, IoEventType::Send, false, 0, 0, extra_flags};
+        invalidate_fd_interest(conn_id, fd);
+        struct epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.u64 = encode_data(conn_id, IoEventType::Send, 0);
+        i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+        if (rc < 0 && errno == ENOENT) rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+        if (rc >= 0) return true;
+        const i32 error = errno;
+        state = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
+        downstream_fd_map[conn_id] = previous_fd;
+        errno = error;
+        return false;
+    }
+
     // One immediate/error completion is the only synchronous result this
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
-    if (pending_count >= kPendingCap) return false;
-
-    const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
 
     if (nw == static_cast<ssize_t>(len)) {
@@ -807,10 +846,34 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
 
     if (!c.tls_active || !c.tls) return add_send(c.fd, c.id, buf, len);
 
+    auto& state = send_state[c.id];
+    if (state.remaining || state.src || state.fd >= 0) return false;
+    if (pending_count >= kPendingCap) {
+        if (len == 0 || buf == nullptr) return false;
+        const i32 previous_fd = downstream_fd_map[c.id];
+        downstream_fd_map[c.id] = c.fd;
+        state = {buf, c.fd, 0, len, IoEventType::Send, true, EPOLLOUT, 0, 0, false};
+        const i32 rc = set_fd_interest(fd_interest.data(),
+                                       connection_capacity,
+                                       epoll_fd,
+                                       c.fd,
+                                       c.id,
+                                       IoEventType::Send,
+                                       EPOLLIN | EPOLLOUT,
+                                       0);
+        if (rc >= 0) return true;
+        const i32 error = errno;
+        state = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
+        downstream_fd_map[c.id] = previous_fd;
+        errno = error;
+        return false;
+    }
+    if (len == 0)
+        return queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::Send, 0);
+
     // TLS may complete, fail, or hit an invalid connection id synchronously;
     // reserve the one possible completion before the first SSL_write.
-    if (pending_count >= kPendingCap) return false;
-
     SSL* ssl = c.tls;
     const EpollTlsHooks* tls_hooks = get_tls_hooks();
     u32 sent = 0;

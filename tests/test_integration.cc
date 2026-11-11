@@ -5022,12 +5022,14 @@ TEST(epoll_wait_boundary, ordinary_send_waits_for_epollout_when_read_is_only_rea
     backend.shutdown();
 }
 
-TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effects) {
+TEST(epoll_pending_capacity, full_ring_defers_nonempty_sends_but_rejects_other_producers) {
     EpollBackend backend;
     REQUIRE(backend.init(0, -1).has_value());
 
-    i32 fds[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) {
+    i32 fds[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds[0]) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds[1]) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds[2]) != 0) {
         backend.shutdown();
         CHECK(false);
         return;
@@ -5038,31 +5040,29 @@ TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effec
             200u + i, static_cast<i32>(i), 9, 1, IoEventType::Recv, 1, kPauseCancelAux, 0};
     }
     backend.pending_count = EpollBackend::kPendingCap;
-    backend.upstream_fd_map[7] = 1234;
-    const auto saved_send = backend.send_state[7];
-    const auto saved_upstream_send = backend.upstream_send_state[7];
+    REQUIRE(backend.begin_upstream_episode(8, 1));
 
     static const u8 payload[] = {'n', 'o'};
-    CHECK_FALSE(backend.add_send(fds[0], 7, payload, sizeof(payload)));
-    CHECK_FALSE(backend.add_send_upstream(fds[0], 7, payload, sizeof(payload), 1));
-    CHECK_FALSE(backend.add_connect(fds[0], 7, nullptr, 0, 1));
-    CHECK_FALSE(backend.add_recv_upstream(fds[0], 7, 1));
+    CHECK(backend.add_send(fds[0][0], 7, payload, sizeof(payload)));
+    CHECK_EQ(backend.send_state[7].src, payload);
+    CHECK_EQ(backend.send_state[7].fd, fds[0][0]);
+    CHECK_EQ(backend.send_state[7].offset, 0u);
+    CHECK_EQ(backend.send_state[7].remaining, sizeof(payload));
+    CHECK(backend.add_send_upstream(fds[1][0], 8, payload, sizeof(payload), 1));
+    CHECK_EQ(backend.upstream_send_state[8].src, payload);
+    CHECK_EQ(backend.upstream_send_state[8].upstream_episode, 1u);
+    CHECK_FALSE(backend.add_connect(fds[0][0], 7, nullptr, 0, 1));
+    CHECK_FALSE(backend.add_recv_upstream(fds[0][0], 7, 1));
     CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
     CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
     CHECK_EQ(backend.pending_completions[63].result, 63);
-    CHECK_EQ(backend.upstream_fd_map[7], 1234);
-    CHECK_EQ(backend.send_state[7].src, saved_send.src);
-    CHECK_EQ(backend.send_state[7].fd, saved_send.fd);
-    CHECK_EQ(backend.send_state[7].remaining, saved_send.remaining);
-    CHECK_EQ(backend.upstream_send_state[7].src, saved_upstream_send.src);
-    CHECK_EQ(backend.upstream_send_state[7].fd, saved_upstream_send.fd);
-    CHECK_EQ(backend.upstream_send_state[7].remaining, saved_upstream_send.remaining);
+    CHECK(backend.add_send(fds[0][0], 10, nullptr, 0) == false);
     u8 received[sizeof(payload)] = {};
-    CHECK_EQ(recv(fds[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK_EQ(recv(fds[0][1], received, sizeof(received), MSG_DONTWAIT), -1);
     CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
 
     TestConn tc;
-    tc.init(0, fds[0]);
+    tc.init(9, fds[2][0]);
     Connection& conn = tc.conn;
     conn.tls_active = true;
     conn.tls_handshake_complete = true;
@@ -5071,13 +5071,180 @@ TEST(epoll_pending_capacity, scoped_producers_reject_full_ring_before_side_effec
     tls_state.write_first_rc = -1;
     tls_state.write_first_error = SSL_ERROR_WANT_WRITE;
     ScopedTlsHooks hooks(tls_state);
-    CHECK_FALSE(backend.add_send_tls(conn, payload, sizeof(payload)));
+    CHECK(backend.add_send_tls(conn, payload, sizeof(payload)));
     CHECK_EQ(tls_state.write_calls, 0);
+    CHECK_EQ(backend.send_state[9].src, payload);
+    CHECK_EQ(backend.send_state[9].tls, true);
     CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
     CHECK_EQ(backend.pending_completions[63].conn_id, 263u);
 
-    close(fds[0]);
-    close(fds[1]);
+    for (auto& pair : fds) {
+        close(pair[0]);
+        close(pair[1]);
+    }
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, full_ring_deferred_plain_and_upstream_sends_complete_once) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, downstream), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, upstream), 0);
+    REQUIRE(backend.begin_upstream_episode(8, 1));
+    for (u32 i = 0; i < EpollBackend::kPendingCap; ++i)
+        backend.pending_completions[i] = {
+            200u + i, static_cast<i32>(i), 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = EpollBackend::kPendingCap;
+
+    static const u8 payload[] = {'o', 'k'};
+    REQUIRE(backend.add_send(downstream[0], 7, payload, sizeof(payload)));
+    REQUIRE(backend.add_send_upstream(upstream[0], 8, payload, sizeof(payload), 1));
+    u8 received[sizeof(payload)]{};
+    CHECK_EQ(recv(downstream[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK_EQ(recv(upstream[1], received, sizeof(received), MSG_DONTWAIT), -1);
+
+    Connection conns[16]{};
+    conns[8].id = 8;
+    conns[8].upstream_episode = 1;
+    IoEvent event{};
+    u32 downstream_completions = 0;
+    u32 upstream_completions = 0;
+    auto record_completion = [&]() {
+        if (event.type == IoEventType::Send && event.conn_id == 7) {
+            ++downstream_completions;
+            CHECK_EQ(event.result, static_cast<i32>(sizeof(payload)));
+        }
+        if (event.type == IoEventType::UpstreamSend && event.conn_id == 8) {
+            ++upstream_completions;
+            CHECK_EQ(event.result, static_cast<i32>(sizeof(payload)));
+        }
+    };
+    for (u32 i = 0; i < 256 && backend.pending_count; ++i) {
+        if (backend.wait(&event, 1, conns, 16, 0) == 1) record_completion();
+    }
+    REQUIRE_EQ(backend.pending_count, 0u);
+    for (u32 i = 0; i < 8 && (!downstream_completions || !upstream_completions); ++i) {
+        if (backend.wait(&event, 1, conns, 16, 0) == 1) record_completion();
+    }
+    CHECK_EQ(downstream_completions, 1u);
+    CHECK_EQ(upstream_completions, 1u);
+    CHECK_EQ(recv(downstream[1], received, sizeof(received), MSG_DONTWAIT),
+             static_cast<ssize_t>(sizeof(payload)));
+    CHECK_EQ(memcmp(received, payload, sizeof(payload)), 0);
+    CHECK_EQ(recv(upstream[1], received, sizeof(received), MSG_DONTWAIT),
+             static_cast<ssize_t>(sizeof(payload)));
+    CHECK_EQ(memcmp(received, payload, sizeof(payload)), 0);
+    CHECK_EQ(backend.wait(&event, 1, conns, 16, 0), 0u);
+
+    backend.shutdown();
+    close(downstream[0]);
+    close(downstream[1]);
+    close(upstream[0]);
+    close(upstream[1]);
+}
+
+TEST(epoll_pending_capacity, full_ring_deferred_tls_send_retries_after_want_read_once) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 sockets[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    Connection conns[16]{};
+    Connection& conn = conns[9];
+    conn.id = 9;
+    conn.fd = sockets[0];
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls = reinterpret_cast<SSL*>(0x1);
+    for (u32 i = 0; i < EpollBackend::kPendingCap; ++i)
+        backend.pending_completions[i] = {
+            200u + i, static_cast<i32>(i), 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = EpollBackend::kPendingCap;
+    static const u8 payload[] = {'t', 'l'};
+    ScriptedTlsState tls_state;
+    tls_state.write_first_rc = -1;
+    tls_state.write_first_error = SSL_ERROR_WANT_READ;
+    tls_state.write_second_rc = sizeof(payload);
+    tls_state.write_second_error = SSL_ERROR_NONE;
+    ScopedTlsHooks hooks(tls_state);
+    REQUIRE(backend.add_send_tls(conn, payload, sizeof(payload)));
+    CHECK_EQ(tls_state.write_calls, 0);
+    IoEvent event{};
+    u32 send_completions = 0;
+    auto record_completion = [&]() {
+        if (event.type == IoEventType::Send && event.conn_id == 9) ++send_completions;
+    };
+    for (u32 i = 0; i < 256 && backend.pending_count; ++i) {
+        if (backend.wait(&event, 1, conns, 16, 0) == 1) record_completion();
+    }
+    REQUIRE_EQ(backend.pending_count, 0u);
+    for (u32 i = 0; i < 8 && tls_state.write_calls == 0; ++i) {
+        if (backend.wait(&event, 1, conns, 16, 0) == 1) record_completion();
+    }
+    CHECK_EQ(tls_state.write_calls, 1);
+
+    const u8 byte = 'r';
+    REQUIRE_EQ(send(sockets[1], &byte, 1, MSG_NOSIGNAL), 1);
+    for (u32 i = 0; i < 8 && send_completions == 0; ++i) {
+        if (backend.wait(&event, 1, conns, 16, 0) == 1) record_completion();
+    }
+    CHECK_EQ(tls_state.write_calls, 2);
+    CHECK_EQ(send_completions, 1u);
+    CHECK_EQ(backend.send_state[9].remaining, 0u);
+
+    backend.shutdown();
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+TEST(epoll_pending_capacity, full_ring_send_registration_failure_rolls_back_state_and_map) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    REQUIRE(backend.begin_upstream_episode(8, 1));
+    for (u32 i = 0; i < EpollBackend::kPendingCap; ++i)
+        backend.pending_completions[i] = {
+            200u + i, static_cast<i32>(i), 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = EpollBackend::kPendingCap;
+    backend.downstream_fd_map[7] = 123;
+    backend.upstream_fd_map[8] = 456;
+    static const u8 payload[] = {'x'};
+    CHECK_FALSE(backend.add_send(-1, 7, payload, sizeof(payload)));
+    CHECK_FALSE(backend.add_send_upstream(-1, 8, payload, sizeof(payload), 1));
+    CHECK_EQ(backend.pending_count, EpollBackend::kPendingCap);
+    CHECK_EQ(backend.downstream_fd_map[7], 123);
+    CHECK_EQ(backend.upstream_fd_map[8], 456);
+    CHECK_EQ(backend.send_state[7].src, nullptr);
+    CHECK_EQ(backend.send_state[7].fd, -1);
+    CHECK_EQ(backend.upstream_send_state[8].src, nullptr);
+    CHECK_EQ(backend.upstream_send_state[8].fd, -1);
+    backend.shutdown();
+}
+
+TEST(epoll_pending_capacity, full_ring_deferred_send_cancellation_clears_owned_buffer) {
+    EpollBackend backend;
+    REQUIRE(backend.init(0, -1).has_value());
+    i32 sockets[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    for (u32 i = 0; i < EpollBackend::kPendingCap; ++i)
+        backend.pending_completions[i] = {
+            200u + i, static_cast<i32>(i), 0, 0, IoEventType::Recv, 0, 0, 0};
+    backend.pending_count = EpollBackend::kPendingCap;
+    static const u8 payload[] = {'c', 'a', 'n', 'c', 'e', 'l'};
+    REQUIRE(backend.add_send(sockets[0], 7, payload, sizeof(payload)));
+    CHECK_EQ(backend.send_state[7].src, payload);
+    backend.cancel(sockets[0], 7, false, true, false, false, false);
+    backend.clear_send_state(7);
+    CHECK_EQ(backend.send_state[7].src, nullptr);
+    CHECK_EQ(backend.send_state[7].fd, -1);
+    backend.pending_count = 0;
+    u8 received[sizeof(payload)]{};
+    CHECK_EQ(recv(sockets[1], received, sizeof(received), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    close(sockets[0]);
+    IoEvent event{};
+    CHECK_EQ(backend.wait(&event, 1, nullptr, 0, 0), 0u);
+    close(sockets[1]);
     backend.shutdown();
 }
 
@@ -54035,4 +54202,54 @@ TEST(route, public_paired_head_source_connect_failure) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+static u64 event_loop_ready_wait_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state != 0 && (ctx->resume_event_kind != static_cast<u32>(jit::YieldKind::Send) ||
+                            ctx->resume_event_result != 0))
+        return jit::HandlerResult::make_status(500).pack();
+    if (ctx->state == 256) return jit::HandlerResult::make_status(204).pack();
+    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+}
+
+template <typename Loop>
+static void ready_wait_real_loop_roundtrip(rut::test::TestCase* _tc) {
+    Shard<Loop> shard;
+    RouteConfig config;
+    struct Resources {
+        Shard<Loop>& shard;
+        i32 listen_fd = -1;
+        i32 client_fd = -1;
+        ~Resources() {
+            if (client_fd >= 0) close(client_fd);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } resources{shard};
+    resources.listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(resources.listen_fd >= 0);
+    const u16 port = get_port(resources.listen_fd);
+    REQUIRE(config.add_jit_handler("/ready", 'G', &event_loop_ready_wait_handler));
+    REQUIRE(shard.init(0, resources.listen_fd, 8, 64));
+    shard.route_config = &config;
+    REQUIRE(shard.spawn(-1));
+    resources.client_fd = connect_to(port);
+    REQUIRE(resources.client_fd >= 0);
+    static constexpr char request[] = "GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(resources.client_fd, request, sizeof(request) - 1));
+    char response[1024];
+    const i32 n = recv_timeout(resources.client_fd, response, sizeof(response), 2000);
+    REQUIRE(n > 0);
+    CHECK(n >= 12 && memcmp(response, "HTTP/1.1 204", 12) == 0);
+}
+
+TEST(wait_event_loop, ready_chain_completes_on_epoll) {
+    ready_wait_real_loop_roundtrip<EpollEventLoop>(_tc);
+}
+
+TEST(wait_event_loop, ready_chain_completes_on_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    ready_wait_real_loop_roundtrip<IoUringEventLoop>(_tc);
 }

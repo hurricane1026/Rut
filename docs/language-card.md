@@ -1158,13 +1158,19 @@ guard res.status == 200 else { return 502 }
 
 fire post http://audit/log { Body: json(evt) } // fire-and-forget, non-terminal
 
-// Concurrency — submit/wait, single yield point
+// ⏳ Planned submit/wait handle composition; implemented event waits below.
 let h1 = submit get http://svc-a/x
 let h2 = submit get http://svc-b/y
 let (r1, r2) = wait(h1, h2)
 guard let r1 else { return 502 }
 guard let resp = any(wait(h1, 5s)) else { return 504 }   // timeout race
-wait(2s)                                                  // sleep
+
+// Implemented event waits suspend the handler and return to the shard loop.
+// A matching event resumes the continuation; other connections can progress.
+wait(2s) // timer sleep
+wait(downstream.recv())
+wait(downstream.send()) // even an empty send resumes on a later loop turn
+// Scheduler safety/progress has bounded TLC coverage plus concrete runtime tests.
 
 // TCP/UDP clients — fixed endpoints, request-owned handles (implemented).
 // See net-clients.md for bounds, UDP and TLS policies.

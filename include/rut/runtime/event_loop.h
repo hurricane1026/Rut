@@ -57,7 +57,12 @@ class EventLoopCRTP {
 
     Derived& self() { return static_cast<Derived&>(*this); }
 
+    Connection* jit_ready_head_ = nullptr;
+    Connection* jit_ready_tail_ = nullptr;
+
 public:
+    static constexpr u32 kJitReadyBatchLimit = 64;
+
     // Per-loop shard limiter for @rateLimit(scope: shard). HTTP/1 and HTTP/2
     // dispatch through the same loop instance, so they intentionally share this
     // table. Keeping it on the loop (rather than in rate_limit_exceeded's
@@ -70,6 +75,76 @@ public:
     // threads accept connections. It is copied into each allocated connection.
     ListenerContext listener_context{};
     Connection* grpc_upstreams = nullptr;
+
+    // An already-completed wait still suspends: never call its continuation
+    // recursively from handler dispatch. One node per connection, no allocation.
+    void defer_jit_handler(Connection& c) {
+        if (c.jit_ready_queued) return;
+        c.jit_ready_queued = true;
+        c.jit_ready_generation = c.handler_gen;
+        c.jit_ready_state = c.handler_state;
+        c.jit_ready_prev = jit_ready_tail_;
+        c.jit_ready_next = nullptr;
+        if (jit_ready_tail_)
+            jit_ready_tail_->jit_ready_next = &c;
+        else
+            jit_ready_head_ = &c;
+        jit_ready_tail_ = &c;
+    }
+
+    void cancel_ready_jit_handler(Connection& c) {
+        if (!c.jit_ready_queued) return;
+        if (c.jit_ready_prev)
+            c.jit_ready_prev->jit_ready_next = c.jit_ready_next;
+        else
+            jit_ready_head_ = c.jit_ready_next;
+        if (c.jit_ready_next)
+            c.jit_ready_next->jit_ready_prev = c.jit_ready_prev;
+        else
+            jit_ready_tail_ = c.jit_ready_prev;
+        c.jit_ready_prev = c.jit_ready_next = nullptr;
+        c.jit_ready_queued = false;
+    }
+
+    bool has_ready_jit_handlers() const { return jit_ready_head_ != nullptr; }
+
+    static constexpr bool fetch_idle_pause_allowed(bool fetch_busy,
+                                                   u32 event_count,
+                                                   bool ready_handlers) {
+        return fetch_busy && event_count == 0 && !ready_handlers;
+    }
+
+    void discard_ready_jit_handlers() {
+        while (jit_ready_head_) cancel_ready_jit_handler(*jit_ready_head_);
+    }
+
+    void drain_ready_jit_handlers() {
+        // Detach the batch before invoking callbacks. Closing another owner
+        // cannot splice newly enqueued work into this turn. Connection storage
+        // is shard-owned; generation/fd checks reject closed or reused slots.
+        struct Ready {
+            Connection* conn;
+            u32 generation;
+            u16 state;
+        };
+        Ready batch[kJitReadyBatchLimit]{};
+        u32 count = 0;
+        while (jit_ready_head_ && count < kJitReadyBatchLimit) {
+            Connection& c = *jit_ready_head_;
+            batch[count++] = {&c, c.jit_ready_generation, c.jit_ready_state};
+            cancel_ready_jit_handler(c);
+        }
+        for (u32 i = 0; i < count; ++i) {
+            Connection& c = *batch[i].conn;
+            if (c.fd < 0 || c.handler_gen != batch[i].generation ||
+                c.handler_state != batch[i].state || c.state != ConnState::ExecHandler ||
+                !c.pending_handler_fn || c.pending_yield_kind != jit::YieldKind::Send)
+                continue;
+            c.resume_event_kind = jit::YieldKind::Send;
+            c.resume_event_result = 0;
+            resume_jit_handler<Derived>(&self(), c);
+        }
+    }
 
     bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
     bool submit_send(Connection& c, const u8* buf, u32 len) {
@@ -95,6 +170,7 @@ public:
         return self().submit_connect_impl(c, addr, addr_len);
     }
     void close_conn(Connection& c) {
+        cancel_ready_jit_handler(c);
         if (password_gateway) password_gateway->cancel(c.id);
         if (c.h1_tls_upstream) h1_tls_detach(&self(), c);
         c.release_backend_active();
@@ -127,6 +203,7 @@ public:
     }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) {
+        cancel_ready_jit_handler(c);
         if (password_gateway) password_gateway->cancel(c.id);
         self().free_conn_impl(c);
     }

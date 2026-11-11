@@ -323,10 +323,15 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running() && backend.failure_code() == 0) {
+            this->drain_ready_jit_handlers();
             const bool fetch_busy =
                 config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
-            u32 n = backend.wait(
-                events, kMaxEventsPerWait, conns, kMaxConns, fetch_busy ? 10u : ~u32{0});
+            u32 n =
+                backend.wait(events,
+                             kMaxEventsPerWait,
+                             conns,
+                             kMaxConns,
+                             this->has_ready_jit_handlers() ? 0u : (fetch_busy ? 10u : ~u32{0}));
             dispatch_batch(events, n);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
@@ -413,6 +418,7 @@ public:
     }
 
     void shutdown() {
+        this->discard_ready_jit_handlers();
         backend.shutdown();
         h2_pool.destroy();
         pool.destroy();
@@ -1024,7 +1030,8 @@ public:
                         }
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
-                        if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                        if (!conn.jit_ready_queued &&
+                            yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
                             conn.resume_event_result = ev.result;

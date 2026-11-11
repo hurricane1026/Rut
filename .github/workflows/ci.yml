@@ -108,6 +108,19 @@ jobs:
       - name: Check runtime state model
         run: TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 scripts/check_runtime_state_model.py
 
+      - name: Check wait scheduler safety, liveness and counterexamples
+        run: |
+          python3 scripts/check_wait_scheduler_model.py --jar /tmp/tla2tools.jar \
+            --output-dir /tmp/wait-scheduler-tlc
+
+      - name: Preserve wait scheduler model traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wait-scheduler-tlc
+          path: /tmp/wait-scheduler-tlc
+          if-no-files-found: ignore
+
       - name: Cross-check native concurrency verifier with TLC
         run: |
           c++ -std=c++23 -O1 -fno-exceptions -fno-rtti -Iinclude -Itesting \
@@ -154,6 +167,20 @@ jobs:
 
       - name: Build
         run: ninja -C build
+
+      - name: Reject wait scheduler implementation mutations
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          python3 scripts/check_wait_scheduler_mutations.py --build-dir build \
+            --output-dir /tmp/wait-scheduler-mutations
+
+      - name: Preserve wait scheduler implementation counterexamples
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wait-scheduler-cpp-mutations
+          path: /tmp/wait-scheduler-mutations
+          if-no-files-found: ignore
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -LE docker

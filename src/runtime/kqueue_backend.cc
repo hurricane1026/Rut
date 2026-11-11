@@ -347,13 +347,24 @@ bool KqueueBackend::finish_send(u32 id, SendState& state, SSL* ssl, IoEvent& eve
 }
 
 bool KqueueBackend::start_send(i32 fd, u32 id, const u8* buf, u32 len, bool upstream, u32 episode) {
-    if (id >= kMaxFdMap || pending_count == kPendingCap || (upstream && !valid_owner(id, episode)))
+    if (id >= kMaxFdMap || (upstream && !valid_owner(id, episode)) || (len != 0 && !buf))
         return false;
     auto& state = upstream ? upstream_send_state[id] : send_state[id];
-    if (state.remaining) return false;
+    if (state.remaining || state.src || state.fd >= 0) return false;
+    if (pending_count == kPendingCap && len == 0) return false;
+    const int previous_fd = (upstream ? upstream_fd_map[id] : downstream_fd_map[id]);
     (upstream ? upstream_fd_map[id] : downstream_fd_map[id]) = fd;
     const IoEventType type = upstream ? IoEventType::UpstreamSend : IoEventType::Send;
     state = {buf, fd, 0, len, type, false, EVFILT_WRITE, episode};
+    if (pending_count == kPendingCap) {
+        if (arm_send(id, state)) return true;
+        const int error = errno;
+        state = {};
+        if (upstream) state.type = IoEventType::UpstreamSend;
+        (upstream ? upstream_fd_map[id] : downstream_fd_map[id]) = previous_fd;
+        errno = error;
+        return false;
+    }
     IoEvent event{};
     if (finish_send(id, state, nullptr, event)) pending_[pending_count++] = event;
     return true;
@@ -376,10 +387,23 @@ bool KqueueBackend::add_recv_tls(Connection& conn) {
 
 bool KqueueBackend::add_send_tls(Connection& conn, const u8* buf, u32 len) {
     const u32 id = conn.id;
-    if (id >= kMaxFdMap || pending_count == kPendingCap || send_state[id].remaining) return false;
+    if (id >= kMaxFdMap || send_state[id].remaining || send_state[id].src || send_state[id].fd >= 0)
+        return false;
+    if (pending_count == kPendingCap && len == 0) return false;
+    const int previous_fd = downstream_fd_map[id];
+    SSL* const previous_tls = downstream_tls_[id];
     downstream_fd_map[id] = conn.fd;
     downstream_tls_[id] = conn.tls;
     send_state[id] = {buf, conn.fd, 0, len, IoEventType::Send, true, EVFILT_WRITE, 0};
+    if (pending_count == kPendingCap) {
+        if (arm_send(id, send_state[id])) return true;
+        const int error = errno;
+        send_state[id] = {};
+        downstream_fd_map[id] = previous_fd;
+        downstream_tls_[id] = previous_tls;
+        errno = error;
+        return false;
+    }
     IoEvent event{};
     if (finish_send(id, send_state[id], conn.tls, event)) pending_[pending_count++] = event;
     return true;
