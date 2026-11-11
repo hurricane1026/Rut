@@ -737,15 +737,17 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
+            this->drain_ready_jit_handlers();
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
             const bool fetch_busy =
                 config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
-            const u32 kEventCount = backend.wait(events,
-                                                 kMaxEventsPerWait,
-                                                 conns,
-                                                 slots_initialized,
-                                                 deferred_relay_read_count == 0 && !fetch_busy);
+            const u32 kEventCount = backend.wait(
+                events,
+                kMaxEventsPerWait,
+                conns,
+                slots_initialized,
+                deferred_relay_read_count == 0 && !fetch_busy && !this->has_ready_jit_handlers());
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -881,6 +883,7 @@ public:
     }
 
     void shutdown() {
+        this->discard_ready_jit_handlers();
         close_deferred_idle_return_fds();
         reclaim_pending();
         if (idle_trim_pidfd >= 0) {
@@ -8899,7 +8902,8 @@ public:
                         if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
-                        if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
+                        if (!conn.jit_ready_queued &&
+                            yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
                             if (conn.uses_iouring_tls() && ev.type == IoEventType::Recv) {
                                 conn.tls_pending_on_recv =
                                     &tls_resume_pending_handler_recv<IoUringEventLoop>;

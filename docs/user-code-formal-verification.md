@@ -208,8 +208,7 @@ Covered today:
 - a small runtime-protocol model classifies each lowered yield by pending
   operation, callback slot, and submit/completion/fail-closed transition shape,
   and rejects yield shapes that the event loop cannot safely schedule, such as
-  downstream-send event yields and upstream connect/recv/send yields without a
-  target payload,
+  upstream connect/recv/send yields without a target payload,
 - runtime-protocol verifier failures include a compact Rut-facing trace with
   the yield kind, payload, modeled pending operation, callback slot, and failure
   reason,
@@ -334,6 +333,18 @@ python3 scripts/check_concurrency_model.py \
 compiler loader formats verification failures with function, block and path
 details, instead of reducing them to a generic LLVM failure. Peer/protocol
 actor locations are labeled separately from RIR block paths.
+
+## Runtime Continuation Scheduling
+
+Event waits return control to the shard loop. An empty downstream send also
+suspends: the loop queues its already-ready continuation instead of recursively
+invoking the handler. The intrusive queue is bounded by live connections and
+needs no allocations. A turn processes at most 64 previously queued owners;
+new waits defer to a later turn, and pending ready work makes kernel polling
+nonblocking. Close/free removes queued owners. Generation and continuation-state
+checks protect a detached drain batch against close/reuse by another callback.
+The same contract is used by epoll, io_uring and kqueue. These are implementation
+checks and tests, not additional proof coverage for the abstract wait model.
 
 ## TLA+ Role
 

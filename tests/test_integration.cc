@@ -54036,3 +54036,53 @@ TEST(route, public_paired_head_source_connect_failure) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+static u64 event_loop_ready_wait_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state != 0 && (ctx->resume_event_kind != static_cast<u32>(jit::YieldKind::Send) ||
+                            ctx->resume_event_result != 0))
+        return jit::HandlerResult::make_status(500).pack();
+    if (ctx->state == 256) return jit::HandlerResult::make_status(204).pack();
+    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+}
+
+template <typename Loop>
+static void ready_wait_real_loop_roundtrip(rut::test::TestCase* _tc) {
+    Shard<Loop> shard;
+    RouteConfig config;
+    struct Resources {
+        Shard<Loop>& shard;
+        i32 listen_fd = -1;
+        i32 client_fd = -1;
+        ~Resources() {
+            if (client_fd >= 0) close(client_fd);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } resources{shard};
+    resources.listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE(resources.listen_fd >= 0);
+    const u16 port = get_port(resources.listen_fd);
+    REQUIRE(config.add_jit_handler("/ready", 'G', &event_loop_ready_wait_handler));
+    REQUIRE(shard.init(0, resources.listen_fd, 8, 64));
+    shard.route_config = &config;
+    REQUIRE(shard.spawn(-1));
+    resources.client_fd = connect_to(port);
+    REQUIRE(resources.client_fd >= 0);
+    static constexpr char request[] = "GET /ready HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(resources.client_fd, request, sizeof(request) - 1));
+    char response[1024];
+    const i32 n = recv_timeout(resources.client_fd, response, sizeof(response), 2000);
+    REQUIRE(n > 0);
+    CHECK(n >= 12 && memcmp(response, "HTTP/1.1 204", 12) == 0);
+}
+
+TEST(wait_event_loop, ready_chain_completes_on_epoll) {
+    ready_wait_real_loop_roundtrip<EpollEventLoop>(_tc);
+}
+
+TEST(wait_event_loop, ready_chain_completes_on_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+    ready_wait_real_loop_roundtrip<IoUringEventLoop>(_tc);
+}

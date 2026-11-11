@@ -40755,7 +40755,7 @@ TEST(state_invariant, jit_recv_yield_sets_recv_rearm_pending_if_recv_pause_cance
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
 }
 
-TEST(state_invariant, jit_downstream_send_yield_without_buffer_resumes_immediately) {
+TEST(state_invariant, jit_downstream_send_yield_without_buffer_defers_to_loop) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -40772,6 +40772,12 @@ TEST(state_invariant, jit_downstream_send_yield_without_buffer_resumes_immediate
     loop.backend.clear_ops();
     handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
 
+    CHECK_EQ(c->state, ConnState::ExecHandler);
+    CHECK_EQ(c->pending_handler_fn, &state_invariant_configured_jit_result);
+    CHECK(loop.has_ready_jit_handlers());
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    loop.drain_ready_jit_handlers();
+    CHECK(!loop.has_ready_jit_handlers());
     CHECK_EQ(c->pending_handler_fn, nullptr);
     CHECK_EQ(c->resp_status, 204u);
     CHECK_EQ(c->state, ConnState::Sending);
@@ -40852,6 +40858,10 @@ TEST(state_invariant, response_sent_clears_send_buf_before_downstream_send_wait)
     loop.backend.clear_ops();
     on_header_received<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
 
+    CHECK(loop.has_ready_jit_handlers());
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    loop.drain_ready_jit_handlers();
+    CHECK(!loop.has_ready_jit_handlers());
     CHECK_EQ(c->pending_handler_fn, nullptr);
     CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
@@ -90096,4 +90106,108 @@ TEST(http2, buffered_upload_promotion_failure_closes_once) {
     CHECK_EQ(loop->free_top, free_before + 1);
     CHECK_EQ(loop->pending_free_count, 0u);
     loop->shutdown();
+}
+
+// Already-ready waits still suspend, including native handlers that bypass RIR.
+static u32 ready_wait_calls = 0;
+static u64 ready_wait_chain(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    ++ready_wait_calls;
+    if (ctx->resume_event_kind != static_cast<u32>(jit::YieldKind::Send) ||
+        ctx->resume_event_result != 0)
+        return jit::HandlerResult::make_status(500).pack();
+    if (ctx->state == 256) return jit::HandlerResult::make_status(204).pack();
+    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+}
+
+TEST(state_invariant, ready_wait_chain_yields_each_turn_without_recursion) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    ready_wait_calls = 0;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 1;
+    outcome.yield_kind = jit::YieldKind::Send;
+    handle_jit_outcome(&loop, *c, outcome, &ready_wait_chain, true);
+    CHECK_EQ(ready_wait_calls, 0u);
+    for (u32 turn = 1; turn <= 256; ++turn) {
+        REQUIRE(loop.has_ready_jit_handlers());
+        loop.drain_ready_jit_handlers();
+        CHECK_EQ(ready_wait_calls, turn);
+    }
+    CHECK(!loop.has_ready_jit_handlers());
+    CHECK_EQ(c->resp_status, 204u);
+}
+
+TEST(state_invariant, ready_wait_close_and_slot_reuse_do_not_resume_old_owner) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    const u32 id = c->id;
+    ready_wait_calls = 0;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 1;
+    outcome.yield_kind = jit::YieldKind::Send;
+    handle_jit_outcome(&loop, *c, outcome, &ready_wait_chain, true);
+    REQUIRE(loop.has_ready_jit_handlers());
+    loop.close_conn(*c);
+    CHECK(!loop.has_ready_jit_handlers());
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    auto* reused = loop.find_fd(43);
+    REQUIRE(reused != nullptr);
+    REQUIRE_EQ(reused->id, id);
+    loop.drain_ready_jit_handlers();
+    CHECK_EQ(ready_wait_calls, 0u);
+    CHECK_EQ(reused->state, ConnState::ReadingHeader);
+}
+
+TEST(state_invariant, ready_wait_queue_handles_cancelled_middle_owner) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* owners[3]{};
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 256;
+    outcome.yield_kind = jit::YieldKind::Send;
+    ready_wait_calls = 0;
+    for (u32 i = 0; i < 3; ++i) {
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42 + i));
+        owners[i] = loop.find_fd(42 + i);
+        REQUIRE(owners[i] != nullptr);
+        handle_jit_outcome(&loop, *owners[i], outcome, &ready_wait_chain, true);
+        loop.defer_jit_handler(*owners[i]);  // duplicate publication is harmless
+    }
+    loop.close_conn(*owners[1]);
+    loop.drain_ready_jit_handlers();
+    CHECK_EQ(ready_wait_calls, 2u);
+    CHECK_EQ(owners[0]->resp_status, 204u);
+    CHECK_EQ(owners[2]->resp_status, 204u);
+    CHECK(!loop.has_ready_jit_handlers());
+}
+
+TEST(state_invariant, ready_wait_shutdown_discard_never_invokes_handler) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    ready_wait_calls = 0;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 256;
+    outcome.yield_kind = jit::YieldKind::Send;
+    handle_jit_outcome(&loop, *c, outcome, &ready_wait_chain, true);
+    loop.discard_ready_jit_handlers();
+    CHECK(!loop.has_ready_jit_handlers());
+    CHECK(!c->jit_ready_queued);
+    CHECK_EQ(c->jit_ready_prev, nullptr);
+    CHECK_EQ(c->jit_ready_next, nullptr);
+    loop.drain_ready_jit_handlers();
+    CHECK_EQ(ready_wait_calls, 0u);
+    loop.close_conn(*c);
 }

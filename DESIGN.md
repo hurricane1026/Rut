@@ -4287,6 +4287,18 @@ Compiler optimizations:
 - `any(...)` → cancel pending SQEs/timers on first CQE
 - `all(...)` → cancel remaining on first failure
 
+Implemented event waits are continuation boundaries: publish the next handler
+state, register the event, then return to the shard loop. Positive-duration
+waits use backend timers; IO waits resume from matching completions. An empty
+downstream send has no kernel operation, so its completion is published to a
+shard-local intrusive ready queue rather than recursively invoking the handler.
+Each turn drains at most 64 previously published continuations, then services
+kernel events. Newly published continuations wait for the next turn; pending
+ready work prevents a blocking backend wait. Close/free unlinks queued work,
+and drained batches validate the connection generation and continuation state.
+This scheduling contract applies to epoll, io_uring and kqueue and requires no
+coroutines, threads per wait, or hot-path heap allocation.
+
 For dynamic-length fan-out, use `for` + `submit`:
 ```swift
 for host in healthCheckHosts {

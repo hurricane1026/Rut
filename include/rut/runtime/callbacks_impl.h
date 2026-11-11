@@ -4419,10 +4419,13 @@ void handle_jit_outcome(Loop* loop,
             }
             if (outcome.yield_kind == jit::YieldKind::Send) {
                 if (conn.send_buf.len() == 0) {
-                    conn.transition_to_exec_handler_wait();
-                    conn.resume_event_kind = jit::YieldKind::Send;
-                    conn.resume_event_result = 0;
-                    resume_jit_handler<Loop>(loop, conn);
+                    // Zero bytes complete without a syscall, but wait remains
+                    // an event-loop boundary rather than recursive execution.
+                    if constexpr (requires { loop->defer_jit_handler(conn); }) {
+                        loop->defer_jit_handler(conn);
+                    } else {
+                        send_internal_error();
+                    }
                     return;
                 }
                 conn.transition_to_sending(&on_jit_wait_send_sent<Loop>);
