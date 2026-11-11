@@ -32292,9 +32292,12 @@ TEST(jit, jwt_session_permits_require_exact_success_and_bounded_token_keys) {
     REQUIRE(input.good());
     const std::string original((std::istreambuf_iterator<char>(input)),
                                std::istreambuf_iterator<char>());
-    const auto end = original.find("// The AS/session owner");
+    // Keep this fixture portable across frontends: the production prefix after
+    // this helper contains unused TcpConnection async helpers whose bodies are
+    // platform-gated (kqueue rejects them during HIR even when unreachable).
+    const auto end = original.find("func sessionExecuteWrite");
     REQUIRE(end != std::string::npos);
-    // Exercise the example's actual typed result mapper and imported policies.
+    // Exercise the actual typed result mapper and imported policies.
     std::string source = original.substr(0, end);
     struct Case {
         const char* expression;
@@ -32423,9 +32426,17 @@ TEST(jit, jwt_session_writes_require_command_specific_acknowledgements) {
     REQUIRE(input.good());
     const std::string original((std::istreambuf_iterator<char>(input)),
                                std::istreambuf_iterator<char>());
-    const auto end = original.find("// The AS/session owner");
+    // Exclude unused platform-gated TcpConnection async helpers; this fixture
+    // only needs the pure typed write-result mapper and imported policies.
+    const auto end = original.find("func sessionExecuteWrite");
     REQUIRE(end != std::string::npos);
     std::string source = original.substr(0, end);
+    const auto mapper_begin = original.find("func sessionWriteSucceeded");
+    const auto mapper_end = original.find("// Fresh registration", mapper_begin);
+    REQUIRE(mapper_begin != std::string::npos);
+    REQUIRE(mapper_end != std::string::npos);
+    REQUIRE(mapper_begin < mapper_end);
+    source.append(original, mapper_begin, mapper_end - mapper_begin);
     struct ReplyCase {
         i32 kind;
         const char* data;
