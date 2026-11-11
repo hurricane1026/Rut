@@ -828,3 +828,22 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Bounded remote ES256 JWKS refresh with authenticated fixed endpoints,
   approved-kid rotation, maximum-age expiry, idle maintenance and cancellation.
 - [ ] DNS/discovery, other remote JWKS profiles, other EC profiles and ES signing.
+
+
+### Free authentication foundation profiles
+
+- [x] Bounded Consumer/credential/group registry snapshots and identity-only
+  projection, strict compile-time validation and old/new native-program isolation.
+- [x] Atomic authenticated Redis replay claims for Standard Webhooks and the fixed
+  signed-request profile; no allow on uncertain write or cleanup failure.
+- [x] Bounded A-only DNS and issuer/JWKS-URI metadata validation for RS256/ES256
+  refresh, with configured IP allowlists and existing monotonic cache expiry.
+- [ ] Remaining #1072 profiles: optional query/form credential extraction/removal
+  and administrative management surface; snapshot compilation/publication is the
+  current lifecycle interface, not a new CLI watcher or IAM platform.
+- [ ] Deployment-level persistence/failover verification for the replay authority;
+  broad DNS profiles/automatic kid onboarding remain separately scoped.
+
+Contracts and executable coverage: `docs/consumer-registry.md`,
+`docs/auth-replay.md`, `docs/jwks-discovery.md`. These checkboxes describe the named
+bounded slices, not completion of every auth issue or the whole M4 milestone.

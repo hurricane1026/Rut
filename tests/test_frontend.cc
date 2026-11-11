@@ -48055,3 +48055,38 @@ TEST(frontend, jwt_any_scope_user_function_can_shadow_the_builtin) {
     REQUIRE(ast);
     REQUIRE(analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, consumer_registry_rejects_request_selected_or_invalid_configuration) {
+    const char* invalid[] = {
+        R"rut(route GET "/" { let identity = consumerAuthenticate("key", "{\"version\":1,\"consumers\":[],\"credentials\":[]}", req.header("Method").or("header")) return 204 })rut",
+        R"rut(route GET "/" { let identity = consumerAuthenticate("key", "{\"version\":1,\"consumers\":[],\"credentials\":[]}", "query") return 204 })rut",
+        R"rut(route GET "/" { let identity = consumerAuthenticate(req.authorization.or(""), req.header("Registry").or(""), "bearer") return 204 })rut",
+        R"rut(route GET "/" { let identity = consumerAuthenticate(req.authorization.or(""), "{}", "bearer") return 204 })rut",
+        R"rut(route GET "/" { let identity = consumerAuthenticate(req.authorization, "{}", "bearer") return 204 })rut",
+        R"rut(func authenticate(_ registry: str) { consumerAuthenticate("Bearer key", registry, "bearer") }
+route GET "/" { let identity = authenticate(req.header("Registry").or("")) return 204 })rut",
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+TEST(frontend, consumer_registry_allows_configuration_through_helper_local) {
+    const char* source = R"rut(func authenticate(_ registry: str) {
+    let snapshot = registry
+    consumerAuthenticate(req.authorization.or(""), snapshot, "bearer")
+}
+route GET "/" {
+    let registry = "{\"version\":1,\"consumers\":[],\"credentials\":[]}"
+    let identity = authenticate(registry)
+    return 204
+})rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}

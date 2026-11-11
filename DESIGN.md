@@ -10103,7 +10103,7 @@ the executable contract and the auth ledger for remaining work.
 
 ### Configuration-owned remote JWKS refresh
 
-An optional eight-field `remoteJwks` object extends the existing static RS256
+An optional `remoteJwks` object with eight required fields extends the existing static RS256
 and ES256 policies without a new language keyword, dependency or handler ABI.
 See the language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
 certificate hostname and origin-form path define a trusted TLS GET. No Token
@@ -10913,3 +10913,34 @@ echoed keys, payload boundaries, CAS fields and the final END before publishing
 values. Append/prepend preserve flags/expiration, CAS distinguishes conflicts
 from absent items, and no failed mutation is automatically replayed.
 See [the contract](docs/memcache-client.md).
+
+
+### Free auth foundations: bounded registries, replay claims and trusted discovery
+
+`consumerAuthenticate` appends a JSON opcode without renumbering existing ones.
+The compiler proves the registry's literal/configuration origin after helper
+inlining and validates its complete bounded schema before publishing a program.
+The runtime reuses strict Bearer/Basic and constant-time comparisons, evaluates
+bounded credentials, and projects only identity/groups into the request arena.
+No mutable registry state is shared across shards. Registry creation, disable,
+rotation and membership changes are replacement configuration snapshots; existing
+native-program/RouteConfig ownership and RCU retirement retain old readers.
+See [the schema and host publication boundary](docs/consumer-registry.md).
+
+Replay policy is composed in Rut over the existing RESP2/TCP/TLS client. One
+atomic NX claim on an authoritative external store precedes side effects; a
+successful write cannot allow before acknowledged session cleanup. Ambiguous
+writes stay fail closed without retries or compensating deletion. Namespaces
+bind logical signers/profiles, and the 601-second retention covers the existing
+300-second past/future freshness tolerance under the declared clock assumptions.
+This preserves shard ownership while letting one configured authority arbitrate
+across shards and gateway restarts; persistence/failover is a store contract, not
+a property of the lossy local Cache. See [replay semantics](docs/auth-replay.md).
+
+`JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
+nonblocking UDP A-only query and optional authenticated metadata fetch before the
+JWKS GET. Resolved IPs must match an explicit finite allowlist. TLS name/CA,
+issuer, endpoint URI and kid/algorithm inventory remain configuration-owned.
+DNS/discovery/key stages share one deadline and retry cadence; failures do not
+renew key age. No libc DNS wait, redirects, request-selected endpoints, new
+library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).

@@ -11,6 +11,7 @@
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/node_pool.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
 #include "rut/runtime/hash.h"
@@ -4078,6 +4079,80 @@ static FrontendResult<HirExpr> make_json_op(json::Op op,
 
 // Helper parameters are only values after inlining. Defer the static policy
 // obligation in helper scratch, then discharge it on every concrete route use.
+static FrontendResult<void> normalize_consumer_registry(HirExpr& expression,
+                                                        HirRoute* route,
+                                                        const HirLocal* locals,
+                                                        u32 local_count) {
+    if (expression.kind != HirExprKind::JsonOp ||
+        expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticate))
+        return {};
+    if (expression.args.len != 3 || !expression.args[1])
+        return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
+    const HirExpr* value = expression.args[1];
+    // LocalRef holds a stable ref_index, which may differ from the array slot
+    // after guards, shadowing, or synthesized helper locals. Never prove trust
+    // using an unrelated local that happens to occupy that numeric slot.
+    for (u32 depth = 0; depth <= local_count && value->kind == HirExprKind::LocalRef; ++depth) {
+        const HirExpr* next = nullptr;
+        for (u32 i = 0; i < local_count; ++i) {
+            if (locals[i].ref_index == value->local_index) {
+                next = &locals[i].init;
+                break;
+            }
+        }
+        if (!next) break;
+        value = next;
+    }
+    if (value->kind != HirExprKind::StrLit || value->type != HirTypeKind::Str || value->may_nil ||
+        value->may_error) {
+        if (route && route->is_helper_scratch) return {};
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("Consumer registry must be compile-time configuration"));
+    }
+    const HirExpr* method = expression.args[2];
+    if (!method) return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
+    for (u32 depth = 0; depth <= local_count && method->kind == HirExprKind::LocalRef; ++depth) {
+        const HirExpr* next = nullptr;
+        for (u32 i = 0; i < local_count; ++i)
+            if (locals[i].ref_index == method->local_index) {
+                next = &locals[i].init;
+                break;
+            }
+        if (!next) break;
+        method = next;
+    }
+    if (method->kind != HirExprKind::StrLit) {
+        if (route && route->is_helper_scratch) return {};
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("Consumer method must be compile-time configuration"));
+    }
+    if (!method->str_value.eq(lit_str("bearer")) && !method->str_value.eq(lit_str("basic")) &&
+        !method->str_value.eq(lit_str("header")))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("Consumer method must be bearer, basic or header"));
+    json::Document scratch;
+    if (!consumer_registry_valid(scratch, value->str_value))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("invalid Consumer registry snapshot"));
+    HirExpr literal{};
+    literal.kind = HirExprKind::StrLit;
+    literal.type = HirTypeKind::Str;
+    literal.str_value = value->str_value;
+    literal.span = expression.span;
+    if (!route->exprs.push(literal))
+        return frontend_error(FrontendError::OutOfMemory, expression.span);
+    expression.args[1] = &route->exprs[route->exprs.len - 1];
+    literal.str_value = method->str_value;
+    if (!route->exprs.push(literal))
+        return frontend_error(FrontendError::OutOfMemory, expression.span);
+    expression.args[2] = &route->exprs[route->exprs.len - 1];
+    return {};
+}
+
 static FrontendResult<void> normalize_rs256_policy(HirExpr& expression,
                                                    HirRoute* route,
                                                    const HirLocal* locals,
@@ -6647,6 +6722,8 @@ static FrontendResult<HirExpr> instantiate_function_expr(const HirExpr& expr,
             out.rhs = nullptr;
         }
     }
+    auto registry = normalize_consumer_registry(out, route, route->locals.data, route->locals.len);
+    if (!registry) return core::make_unexpected(registry.error());
     auto policy = normalize_rs256_policy(out, route, route->locals.data, route->locals.len);
     if (!policy) return core::make_unexpected(policy.error());
     auto ec_policy = normalize_es256_policy(out, route, route->locals.data, route->locals.len);
@@ -14303,6 +14380,35 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                             kResource || kExchange ? &values[2] : nullptr,
                             expr.span,
                             route);
+    }
+
+    if (expr.name.eq(lit_str("consumerAuthenticate")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 3)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr values[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            values[i] = value.value();
+        }
+        auto operation = make_json_op(json::Op::ConsumerAuthenticate,
+                                      HirTypeKind::Json,
+                                      true,
+                                      &values[0],
+                                      &values[1],
+                                      &values[2],
+                                      expr.span,
+                                      route);
+        if (!operation) return operation;
+        auto normalized =
+            normalize_consumer_registry(operation.value(), route, locals, local_count);
+        if (!normalized) return core::make_unexpected(normalized.error());
+        return operation;
     }
 
     if ((expr.name.eq(lit_str("jwtHasScope")) || expr.name.eq(lit_str("jwtHasAllScopes")) ||

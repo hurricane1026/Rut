@@ -247,12 +247,39 @@ TEST(https_fetch, cancellation_timeout_clock_failure_and_endpoint_validation) {
 }
 
 template <typename Fixture>
-static int print_remote_fixture() {
+static int print_remote_fixture(bool discovery = false) {
     Fixture first, second;
     if (!first.init() || !second.init()) return 2;
+    const Str claims =
+        discovery
+            ? lit_str(
+                  R"({"sub":"alice","iss":"https://localhost","aud":"gateway","exp":4102444800})")
+            : Fixture::claims;
+    if (discovery) {
+        Fixture* fixtures[] = {&first, &second};
+        for (Fixture* fixture : fixtures) {
+            json::Document document;
+            if (!document.parse(fixture->policy)) return 2;
+            const u32 node = document.pointer(lit_str("/jwks"));
+            if (node == json::kNone) return 2;
+            char keys[4096];
+            const Str raw = document.raw(node);
+            if (raw.len >= sizeof(keys)) return 2;
+            memcpy(keys, raw.ptr, raw.len);
+            const int size = snprintf(
+                fixture->policy_bytes,
+                sizeof(fixture->policy_bytes),
+                "{\"issuer\":\"https://"
+                "localhost\",\"audience\":\"gateway\",\"kids\":[\"current\"],\"jwks\":%.*s}",
+                raw.len,
+                keys);
+            if (size <= 0 || static_cast<u32>(size) >= sizeof(fixture->policy_bytes)) return 2;
+            fixture->policy = {fixture->policy_bytes, static_cast<u32>(size)};
+        }
+    }
     char a_bytes[4096], b_bytes[4096];
-    const Str a = first.sign(Fixture::header, Fixture::claims, a_bytes);
-    const Str b = second.sign(Fixture::header, Fixture::claims, b_bytes);
+    const Str a = first.sign(Fixture::header, claims, a_bytes);
+    const Str b = second.sign(Fixture::header, claims, b_bytes);
     if (!a.len || !b.len) return 2;
     printf("{\"first\":%.*s,\"second\":%.*s,\"a\":\"%.*s\",\"b\":\"%.*s\"}\n",
            first.policy.len,
@@ -272,6 +299,10 @@ int main(int argc, char** argv) {
         return print_remote_fixture<test::Rs256Fixture>();
     if (argc == 2 && strcmp(argv[1], "--fixture-es256") == 0)
         return print_remote_fixture<test::Es256Fixture>();
+    if (argc == 2 && strcmp(argv[1], "--fixture-discovery") == 0)
+        return print_remote_fixture<test::Rs256Fixture>(true);
+    if (argc == 2 && strcmp(argv[1], "--fixture-es256-discovery") == 0)
+        return print_remote_fixture<test::Es256Fixture>(true);
     return rut::test::run_all(argc, argv);
 }
 

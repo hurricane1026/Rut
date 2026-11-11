@@ -164,6 +164,7 @@ add_library(rut_runtime STATIC
     runtime/password_worker.cc
     runtime/password_gateway.cc
     runtime/auth.cc
+    runtime/consumer_registry.cc
     runtime/webhook.cc
     runtime/signed_request.cc
     runtime/memory_http_cache_store.cc

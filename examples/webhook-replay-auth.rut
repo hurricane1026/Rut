@@ -1,0 +1,24 @@
+import "clients/redis-client.rut"
+import "middleware/auth.rut"
+import "middleware/replay.rut"
+
+listen :8080
+
+route POST "/webhook" {
+    let id = req.uniqueHeader("webhook-id").or("")
+    let identity = auth.standardWebhook(id,
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""), req.body,
+        env("STANDARD_WEBHOOK_RAW_KEY"), "billing-provider", "billing-webhook-v1")
+    guard let key = replay.key(env("REPLAY_NAMESPACE"), id) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisReplayClaim(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let admitted = replay.requireClaimed(status)
+    // Only this branch may perform side effects. An uncertain claim is never
+    // retried automatically; a crash after claiming can suppress delivery.
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+route "/" { return 404 }
+

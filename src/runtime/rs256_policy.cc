@@ -106,6 +106,10 @@ bool Rs256Policy::load(Str configuration) {
         }
     }
     if (required != 15 || jwks == json::kNone || kids == json::kNone) return false;
+    if (remote_.discovery_path[0] &&
+        !issuer().eq({remote_.discovery_issuer,
+                      static_cast<u32>(__builtin_strlen(remote_.discovery_issuer))}))
+        return false;
     char ids[Rs256KeySet::kMaxKeys][Rs256KeySet::kMaxKidBytes];
     Str approved[Rs256KeySet::kMaxKeys];
     u32 count = 0;
@@ -246,7 +250,7 @@ bool Rs256Policies::activate(u32 shard) {
         }
     }
     for (u32 i = 0; i < count_; ++i) {
-        if (row.remote[i] && !row.remote[i]->fetch.init(policies_[i].remote().endpoint)) {
+        if (row.remote[i] && !row.remote[i]->fetch.init(policies_[i].remote())) {
             for (u32 j = 0; j < count_; ++j) row.verifiers[j].reset();
             cancel(shard);
             return false;

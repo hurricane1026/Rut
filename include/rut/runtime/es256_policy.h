@@ -71,7 +71,7 @@ public:
 
 private:
     struct RemoteRow {
-        HttpsFetch fetch;
+        JwksFetch fetch;
         Es256VerifierSet alternate;
         u64 last_success = 0;
         u64 next_attempt = 0;

@@ -586,3 +586,45 @@ func redisSetGet(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ co
         .replyFailure => RedisSetGetResult.replyFailure
     }
 }
+
+// The fixed verifier accepts signed timestamps up to 300 seconds in the future
+// and up to 300 seconds old. Retain every claim for 601 seconds after admission.
+// Redis must preserve claims across gateway restart and not evict live entries.
+func redisReplayClaimRequest(_ key: Bytes) -> Bytes {
+    guard let argument = resp2BulkArgument(key, 8192) else { nil }
+    guard let prefix = concatBytes(b"*6\r\n$3\r\nSET\r\n", argument, 8192) else { nil }
+    concatBytes(prefix, b"$7\r\nclaimed\r\n$2\r\nNX\r\n$2\r\nEX\r\n$3\r\n601\r\n", 8192)
+}
+
+// Status is terminal: 1 = claimed and cleanup acknowledged, 0 = duplicate,
+// -1 = any uncertain write, authentication, framing or cleanup failure.
+func redisReplayResultStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .ok => 1
+        .missing => 0
+        _ => -1
+    }
+}
+func redisReplayClaimReply(_ reply: Resp2Token) -> RedisSessionResult {
+    if reply.kind == 1 && reply.data == b"OK" { RedisSessionResult.ok } else {
+        if reply.kind == 6 { RedisSessionResult.missing } else { RedisSessionResult.replyFailure }
+    }
+}
+func redisReplayExecuteClaim(_ connection: TcpConnection, _ request: Bytes) -> RedisSessionResult {
+    guard request.count > 0 else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    let reading = redisReply(connection)
+    guard let reply = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    redisReplayClaimReply(reply)
+}
+func redisReplayClaim(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+           _ database: i32, _ key: Bytes) -> i32 {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { -1 }
+    let result = redisReplayExecuteClaim(connection, redisReplayClaimRequest(key).or(b""))
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        redisReplayResultStatus(result)
+    } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
+}

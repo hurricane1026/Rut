@@ -4069,10 +4069,12 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         kJsonOp == json::Op::OauthIntrospectionValid ||
                         kJsonOp == json::Op::OauthClientCredentialsRequest ||
                         kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                        kJsonOp == json::Op::OauthTokenExchangeRequest) {
+                        kJsonOp == json::Op::OauthTokenExchangeRequest ||
+                        kJsonOp == json::Op::ConsumerAuthenticate) {
                         const u32 kCount =
                             (kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                             kJsonOp == json::Op::OauthTokenExchangeRequest)
+                             kJsonOp == json::Op::OauthTokenExchangeRequest ||
+                             kJsonOp == json::Op::ConsumerAuthenticate)
                                 ? 3u
                                 : 2u;
                         if (inst.operand_count != kCount || inst.extra_operands ||
@@ -4091,7 +4093,8 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                            kJsonOp == json::Op::OauthTokenExchangeRequest) {
+                            kJsonOp == json::Op::OauthTokenExchangeRequest ||
+                            kJsonOp == json::Op::ConsumerAuthenticate) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||
                                 result->struct_def || result->inner->kind != rir::TypeKind::Str ||
                                 result->inner->inner || result->inner->struct_def)
