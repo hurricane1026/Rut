@@ -6039,11 +6039,14 @@ static FrontendResult<HirExpr> function_call_body(const HirFunction& fn,
     const bool kLexical = uses_lexical_values(route) || hir_has_resumable_call(fn.body) ||
                           (fn.lexical_body_index < fn.exprs.len &&
                            hir_has_resumable_call(fn.exprs[fn.lexical_body_index]));
-    // Variant tags and payload projections need the same shared lexical
-    // initializers as records/tuples, including pure protocol-result helpers.
+    // Predicates, byte views and variant projections need the same shared
+    // lexical initializers as records/tuples. Expanding their normalized guard
+    // and slice graphs at every use makes bounded source codecs grow sharply.
     const bool kValueBody =
         hir_has_string_construction(fn.body) || fn.body.type == HirTypeKind::Struct ||
-        fn.body.type == HirTypeKind::Tuple || fn.body.type == HirTypeKind::Variant;
+        fn.body.type == HirTypeKind::Tuple || fn.body.type == HirTypeKind::Variant ||
+        fn.body.type == HirTypeKind::Bool || fn.body.type == HirTypeKind::Bytes ||
+        fn.body.type == HirTypeKind::Collected;
     if (!kLexical && (!kValueBody || fn.lexical_body_index >= fn.exprs.len)) return fn.body;
     if (fn.lexical_body_index >= fn.exprs.len)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -6127,9 +6130,16 @@ struct LexicalCallArguments {
         // too, so helper substitution cannot discard or duplicate their effects.
         // netError is a state observation rather than a resumable operation,
         // but its value must still be captured before later arguments run.
-        if (route == nullptr ||
-            (!uses_lexical_values(route) && !hir_has_string_construction(value) &&
-             !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
+        // Ordinary value helpers also project records, byte views and bounded
+        // collections repeatedly. Keep their nontrivial arguments in one
+        // initializer just as lexical/message helpers do.
+        const bool kValueArgument =
+            value.type == HirTypeKind::Struct || value.type == HirTypeKind::Tuple ||
+            value.type == HirTypeKind::Variant || value.type == HirTypeKind::Bool ||
+            value.type == HirTypeKind::Bytes || value.type == HirTypeKind::Collected;
+        if (route == nullptr || (!uses_lexical_values(route) && !kValueArgument &&
+                                 !hir_has_string_construction(value) &&
+                                 !hir_has_resumable_call(value) && !hir_has_net_error_query(value)))
             return {};
         const bool kEvaluated = call_argument_needs_evaluation(value);
         if (is_ws_borrowed_type(value.type) && kEvaluated)
@@ -6889,7 +6899,7 @@ static FrontendResult<HirExpr> normalize_expr(const HirExpr& expr,
                 *local_cache, expr.local_index, locals, local_count, param_count, 0);
         // This cache belongs to one function normalization and its local environment.
         // Binding scopes can rebind the same source expression. Entering and
-        // leaving LetIn/CollectBytes clears the cache, so repeated references
+        // leaving LetIn/CollectBytes clears dependent entries, so repeated references
         // may share expansions within any one active binding environment.
         const bool kMemoize = local_cache != nullptr && expr.local_index < local_cache->local_count;
         if (kMemoize && local_cache->ready[expr.local_index])

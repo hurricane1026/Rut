@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import socket
@@ -25,6 +26,22 @@ REDIS_IMAGE = 'redis@sha256:1a34bdba051ecd8a58ec8a3cc460acef697a1605e918149cc53d
 def packet(arguments):
     return b'*%d\r\n' % len(arguments) + b''.join(
         b'$%d\r\n' % len(arg) + arg + b'\r\n' for arg in arguments)
+
+
+def assert_ack_boundary(connection, stream, message):
+    # BufferedReader may have prefetched a business command, so socket
+    # readiness alone cannot prove that the client waited for the ACK.
+    select.select([connection], [], [], .01)
+    previous = connection.gettimeout()
+    connection.setblocking(False)
+    try:
+        try:
+            pending = stream.peek(1)
+        except (BlockingIOError, ssl.SSLWantReadError):
+            pending = b''
+        assert not pending, message
+    finally:
+        connection.settimeout(previous)
 
 
 def read_value(stream):
@@ -300,7 +317,20 @@ route POST "/{name.lower()}" {{
 
 
 @contextlib.contextmanager
-def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypoint='redis-client.rut'):
+def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypoint='redis-client.rut',
+            startup_timeout=270):
+    def birth(pid):
+        try:
+            return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def signal_children(children, action):
+        for pid, start in children.items():
+            if start is not None and birth(pid) == start:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(pid), action)
+
     with tempfile.TemporaryDirectory(prefix='rut-redis-commands-') as directory:
         root = Path(directory)
         for name in ('resp2.rut', 'resp2-command.rut', 'redis-client.rut', *extra_libraries):
@@ -320,8 +350,8 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
                                         '--opt', args.opt, '--no-pin', '--shards', '1', '--drain', '0'],
                                        env=env, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
+        owned_children = {}
         try:
-            startup_timeout = 270
             deadline = time.monotonic() + startup_timeout
             peak_compiler_kib = 0
             while time.monotonic() < deadline:
@@ -332,6 +362,7 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
                     child_ids = []
                 if child_ids:
                     for child in child_ids:
+                        owned_children.setdefault(child, birth(child))
                         try:
                             status = Path(f'/proc/{child}/status').read_text()
                         except FileNotFoundError:
@@ -371,6 +402,9 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
                     client.close()
             yield request
         finally:
+            # rut-compile owns a separate process group. Track its birth time
+            # so interruption cleans it up without signalling a reused PID.
+            signal_children(owned_children, signal.SIGTERM)
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -382,6 +416,7 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
             # A compiler subprocess may outlive the server after failed startup.
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
+            signal_children(owned_children, signal.SIGKILL)
 
 
 def fixture_checks(request, peer):

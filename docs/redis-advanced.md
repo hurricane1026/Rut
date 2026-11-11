@@ -117,8 +117,11 @@ Channel, pattern, message kind, arity, payload types and counts must match.
 
 `RedisPubSubResult` distinguishes `subscribed(RedisPubSubFrame)`,
 `message(RedisPubSubFrame)`, `unsubscribed`, `serverError(Bytes)` and ordinary
-failure classes. Frames contain exact `frame` and buffered `rest` Bytes.
-`redisPubSubData(frame)` and `redisPubSubOrigin(frame)` expose payload and actual
+failure classes. Frames contain exact `frame` and buffered `rest` Bytes. Messages
+also retain validated payload/origin ranges within their frame, avoiding
+reparsing after later I/O. The subscribed and message branches share one frame
+record type.
+`redisPubSubData(message)` and `redisPubSubOrigin(message)` expose payload and actual
 origin channel; a pattern subscription retains the matching pattern separately
 in its configuration. Never drop `rest` between operations.
 

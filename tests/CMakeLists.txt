@@ -4574,20 +4574,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(redis_advanced transactions resp3 pubsub topology)
+            set(advanced_timeout 300)
+            if(redis_advanced STREQUAL "pubsub" OR redis_advanced STREQUAL "resp3")
+                # Two bounded native compilations, with independent startup
+                # deadlines; protocol I/O deadlines remain unchanged.
+                set(advanced_timeout 1500)
+            endif()
             foreach(advanced_opt 0 2)
                 add_test(NAME test_redis_${redis_advanced}_${backend}_opt${advanced_opt}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_${redis_advanced}.py
                         --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt ${advanced_opt})
                 set_tests_properties(test_redis_${redis_advanced}_${backend}_opt${advanced_opt} PROPERTIES
-                    LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                    LABELS "integration;network" TIMEOUT ${advanced_timeout} SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
             add_test(NAME test_redis_${redis_advanced}_${backend}_tls
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_${redis_advanced}.py
                     --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
                     --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
             set_tests_properties(test_redis_${redis_advanced}_${backend}_tls PROPERTIES
-                LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                LABELS "integration;network" TIMEOUT ${advanced_timeout} SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             foreach(advanced_transport tcp tls)
                 set(advanced_tls_args)
                 if(advanced_transport STREQUAL "tls")
@@ -4599,7 +4605,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2
                         --real-redis ${advanced_tls_args})
                 set_tests_properties(test_redis_${redis_advanced}_live_${backend}_${advanced_transport} PROPERTIES
-                    LABELS "integration;network;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                    LABELS "integration;network;docker" TIMEOUT ${advanced_timeout} SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
                 if(redis_advanced STREQUAL "topology")
                     add_test(NAME test_redis_cluster_live_${backend}_${advanced_transport}
                         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_topology.py
@@ -4607,7 +4613,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                             --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2
                             --real-cluster ${advanced_tls_args})
                     set_tests_properties(test_redis_cluster_live_${backend}_${advanced_transport} PROPERTIES
-                        LABELS "integration;network;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                        LABELS "integration;network;docker" TIMEOUT ${advanced_timeout} SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
                 endif()
             endforeach()
         endforeach()

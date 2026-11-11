@@ -2,6 +2,7 @@
 """Dedicated finite subscriptions, coalesced messages and unsubscribe races."""
 import argparse
 from pathlib import Path
+import re
 import ssl
 import threading
 import time
@@ -42,15 +43,16 @@ func subFinish(_ connection: TcpConnection, _ state: RedisSubscription, _ result
         _ => result
     }
 }
+func subFixtureMessage(_ mode: i32) -> Bytes {
+    if mode == 2 { b"\x2a\x34\x0d\x0a\x24\x38\x0d\x0a\x70\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x31\x34\x0d\x0a\x61\x63\x74\x75\x61\x6c\x2d\x63\x68\x61\x6e\x6e\x65\x6c\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" } else {
+        if mode == 3 { b"\x2a\x33\x0d\x0a\x24\x38\x0d\x0a\x73\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" } else { b"\x2a\x33\x0d\x0a\x24\x37\x0d\x0a\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" }
+    }
+}
 func subSetupReply(_ state: RedisSubscription) -> Bytes {
-    if state.channel == b"quiet" {
-        if state.mode == 2 { b"\x2a\x33\x0d\x0a\x24\x31\x30\x0d\x0a\x70\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x35\x0d\x0a\x71\x75\x69\x65\x74\x0d\x0a\x3a\x31\x0d\x0a" } else {
-            if state.mode == 3 { b"\x2a\x33\x0d\x0a\x24\x31\x30\x0d\x0a\x73\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x35\x0d\x0a\x71\x75\x69\x65\x74\x0d\x0a\x3a\x31\x0d\x0a" } else { b"\x2a\x33\x0d\x0a\x24\x39\x0d\x0a\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x35\x0d\x0a\x71\x75\x69\x65\x74\x0d\x0a\x3a\x31\x0d\x0a" }
-        }
-    } else {
-        if state.mode == 2 { b"\x2a\x33\x0d\x0a\x24\x31\x30\x0d\x0a\x70\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x3a\x31\x0d\x0a\x2a\x34\x0d\x0a\x24\x38\x0d\x0a\x70\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x31\x34\x0d\x0a\x61\x63\x74\x75\x61\x6c\x2d\x63\x68\x61\x6e\x6e\x65\x6c\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" } else {
-            if state.mode == 3 { b"\x2a\x33\x0d\x0a\x24\x31\x30\x0d\x0a\x73\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x3a\x31\x0d\x0a\x2a\x33\x0d\x0a\x24\x38\x0d\x0a\x73\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" } else { b"\x2a\x33\x0d\x0a\x24\x39\x0d\x0a\x73\x75\x62\x73\x63\x72\x69\x62\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x3a\x31\x0d\x0a\x2a\x33\x0d\x0a\x24\x37\x0d\x0a\x6d\x65\x73\x73\x61\x67\x65\x0d\x0a\x24\x31\x0d\x0a\x78\x0d\x0a\x24\x36\x0d\x0a\x61\x00\xff\x0d\x0a\x62\x0d\x0a" }
-        }
+    guard let body = redisSubscribeAck(state) else { nil }
+    guard let ack = concatBytes(b"*3\r\n", body, 8192) else { nil }
+    if state.channel == b"quiet" { ack } else {
+        concatBytes(ack, subFixtureMessage(state.mode), 8192)
     }
 }
 route POST "/one" {
@@ -63,8 +65,46 @@ route POST "/one" {
     guard let body = subPayload(result) else { return 500 }
     return response(200, body: body)
 }
-route POST "/cancel" {
-    let state = RedisSubscription(channel: req.bodyBytes, mode: parseInt(req.header("X-Mode").or("1")).or(0), closing: false)
+route POST "/cancel1" {
+    let state = RedisSubscription(channel: req.bodyBytes, mode: 1, closing: false)
+    guard let expected = subSetupReply(state) else { return 400 }
+    guard let request = resp2KeyRequest(redisPubSubName(state.mode, false), state.channel) else { return 400 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { return 502 }
+    let reading = connection.readExactly(expected.count, 1000)
+    guard let setup = reading else { return 502 }
+    guard setup == expected else { return 500 }
+    let result = redisUnsubscribe(connection, state, b"")
+    let closing = RedisSubscription(channel: req.bodyBytes, mode: state.mode, closing: true)
+    let ended = subFinish(connection, closing, result)
+    guard subEnded(ended) else { return 500 }
+    let stale = connection.send(b"ILLEGAL", 1000)
+    guard stale == nil && netError() == -4 else { return 500 }
+    return 204
+}
+route POST "/cancel2" {
+    let state = RedisSubscription(channel: req.bodyBytes, mode: 2, closing: false)
+    guard let expected = subSetupReply(state) else { return 400 }
+    guard let request = resp2KeyRequest(redisPubSubName(state.mode, false), state.channel) else { return 400 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { return 502 }
+    let reading = connection.readExactly(expected.count, 1000)
+    guard let setup = reading else { return 502 }
+    guard setup == expected else { return 500 }
+    let result = redisUnsubscribe(connection, state, b"")
+    let closing = RedisSubscription(channel: req.bodyBytes, mode: state.mode, closing: true)
+    let ended = subFinish(connection, closing, result)
+    guard subEnded(ended) else { return 500 }
+    let stale = connection.send(b"ILLEGAL", 1000)
+    guard stale == nil && netError() == -4 else { return 500 }
+    return 204
+}
+route POST "/cancel3" {
+    let state = RedisSubscription(channel: req.bodyBytes, mode: 3, closing: false)
     guard let expected = subSetupReply(state) else { return 400 }
     guard let request = resp2KeyRequest(redisPubSubName(state.mode, false), state.channel) else { return 400 }
     let opening = tcp(env("REDIS_ENDPOINT"), 1000)
@@ -100,6 +140,21 @@ route POST "/decode" {
     return response(200, body: body)
 }
 '''
+
+
+def program(cancellation):
+    # Keep independent handlers in separate native modules: LLVM's register
+    # coalescer otherwise holds the large subscription and cancellation graphs
+    # together. Each module retains the same startup/8-GiB compiler bound.
+    start = PROGRAM.index('route POST ')
+    routes = re.split(r'(?=^route POST )', PROGRAM[start:], flags=re.M)
+    helpers = re.split(r'(?=^func )', PROGRAM[:start], flags=re.M)
+    required = {'subEnded', 'subFinish', 'subFixtureMessage', 'subSetupReply'} if cancellation else {
+        'subPayload', 'subOutput', 'subFailed'}
+    prefix = ''.join(helper for helper in helpers if not helper.startswith('func ') or
+                     helper.split('(', 1)[0].split()[1] in required)
+    return prefix + ''.join(route for route in routes
+        if route.startswith('route POST "/cancel') == cancellation)
 
 
 def acknowledgement(name, channel, count, push=False):
@@ -175,19 +230,21 @@ def fixture_checks(request, peer):
     for mode in (1, 2, 3):
         assert request('one', b'x', {'X-Mode': str(mode)}) == (200, b'a\x00\xff\r\nb')
     assert request('one', b'push') == (200, b'a\x00\xff\r\nb')
-    for mode in (1, 2, 3):
-        assert request('cancel', b'x', {'X-Mode': str(mode)})[0] == 204
-        assert request('cancel', b'quiet', {'X-Mode': str(mode)})[0] == 204
     for channel in (b'wrong-channel', b'wrong-count', b'wrong-type', b'server-error', b'eof', b'timeout'):
         assert request('poison', channel)[0] == 204, channel
         assert sum(command == [b'subscribe', channel] for command in peer.observed) == 1
     assert not any(command[0] == b'ILLEGAL' for command in peer.observed)
 
 
+def cancellation_checks(request, real):
+    for mode in (1, 2, 3):
+        assert request(f'cancel{mode}', b'quiet')[0] == 204
+        if not real:
+            assert request(f'cancel{mode}', b'x')[0] == 204
+
+
 def real_checks(request, command):
     pure_checks(request)
-    for mode in (1, 2, 3):
-        assert request('cancel', b'quiet', {'X-Mode': str(mode)})[0] == 204
     # Repeated publications avoid a scheduling assumption about subscription
     # startup. Data is observed once by this finite subscriber, never replayed.
     for mode, channel, publication in ((1, b'pubsub-channel', b'PUBLISH'),
@@ -221,8 +278,13 @@ def main():
             value.update(tls=True, caFile=str(Path(args.testdata) / 'localhost_cert.pem'), serverName='localhost')
         return value
     def run(port, check):
-        with gateway(args, policy(port), lambda real: PROGRAM, ('redis-pubsub.rut',), 'redis-pubsub.rut') as request:
-            check(request)
+        for cancellation in (False, True):
+            with gateway(args, policy(port), lambda real: program(cancellation),
+                         ('redis-pubsub.rut',), 'redis-pubsub.rut', startup_timeout=600) as request:
+                if cancellation:
+                    cancellation_checks(request, args.real_redis)
+                else:
+                    check(request)
     if args.real_redis:
         with real_redis(args) as (port, command):
             run(port, lambda request: real_checks(request, command))

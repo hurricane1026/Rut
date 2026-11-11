@@ -6,6 +6,18 @@ from test_redis_commands import gateway
 
 
 PROGRAM = r'''variant ScopeValue { bytes(Bytes) missing }
+struct ScopeWindow { bytes: Bytes start: i32 }
+func scopePair(_ bytes: Bytes, _ position: i32) -> Bytes {
+    guard let pair = bytes.slice(position, position + 2) else { nil }
+    guard pair.count == 2 else { nil }
+    pair
+}
+func scopePositions(_ bytes: Bytes, _ position: i32) -> bool {
+    guard let pair = scopePair(bytes, position) else { false }
+    guard let first = pair[0] else { false }
+    guard let second = pair[1] else { false }
+    first == bytes[position] && second == bytes[position + 1]
+}
 func triple(_ bytes: Bytes, _ position: i32) -> Bytes {
     guard let one = bytes.slice(position, position + 1) else { nil }
     guard let two = concatBytes(one, one, 64) else { nil }
@@ -26,18 +38,27 @@ func scopeBytes(_ value: ScopeValue) -> Bytes {
     match value { .bytes(bytes) => bytes _ => nil }
 }
 func scopeStep(_ bytes: Bytes, _ position: i32) -> (i32, Bytes, bool) {
+    guard scopePositions(bytes, position) else { nil }
     guard let value = scopeBytes(scopeValue(bytes, position)) else { nil }
     (position + 1, value, position + 2 == bytes.count)
 }
-func scoped(_ bytes: Bytes, _ start: i32) -> Bytes {
+func scopeList(_ bytes: Bytes, _ start: i32) {
     guard let values = collectBytes(bytes, start, 8, scopeStep) else { nil }
+    guard values.count > 0 else { nil }
+    values
+}
+func scoped(_ bytes: Bytes, _ start: i32) -> Bytes {
+    guard let values = scopeList(bytes, start) else { nil }
     guard let first = values.get(0) else { nil }
     guard let last = values.get(values.count - 1) else { nil }
     concatBytes(first, last, 64)
 }
+func scopeWindow(_ window: ScopeWindow) -> Bytes {
+    scoped(window.bytes, window.start)
+}
 route POST "/scopes" {
-    guard let first = scoped(req.bodyBytes, 0) else { return 400 }
-    guard let second = scoped(req.bodyBytes, 1) else { return 400 }
+    guard let first = scopeWindow(ScopeWindow(bytes: req.bodyBytes, start: 0)) else { return 400 }
+    guard let second = scopeWindow(ScopeWindow(bytes: req.bodyBytes, start: 1)) else { return 400 }
     guard let body = concatBytes(first, second, 64) else { return 500 }
     return response(200, body: body)
 }

@@ -2,6 +2,7 @@
 """RESP3 types, attribute roots, coalesced pushes and real HELLO 3."""
 import argparse
 from pathlib import Path
+import re
 import ssl
 
 from test_redis_commands import Fixture, gateway, packet, read_value, real_redis
@@ -83,6 +84,15 @@ route POST "/hello" {
 '''
 
 
+def program(codec):
+    start = PROGRAM.index('route POST ')
+    routes = re.split(r'(?=^route POST )', PROGRAM[start:], flags=re.M)
+    prefix = 'import "redis-resp3.rut"\n' if codec else PROGRAM[:start]
+    return prefix + ''.join(route for route in routes
+        if (route.startswith('route POST "/decode"') or
+            route.startswith('route POST "/frame"')) == codec)
+
+
 def pure_checks(request):
     cases = [(b'+OK\r\n', 1, b'OK'), (b'-ERR no\r\n', 2, b'ERR no'),
              (b':-9223372036854775808\r\n', 3, b'-9223372036854775808'),
@@ -148,7 +158,6 @@ class Resp3Fixture(Fixture):
 
 
 def fixture_checks(request, peer):
-    pure_checks(request)
     for frame in (b'%1\r\n+k\r\n#t\r\n', b'~1\r\n:1\r\n', b'!7\r\nERR bad\r\n'):
         prefix = b'E:' if frame.startswith(b'!') else b'R:'
         assert request('execute', packet([b'FIXTURE', frame])) == (200, prefix + frame)
@@ -177,7 +186,6 @@ def fixture_checks(request, peer):
 
 
 def real_checks(request, command):
-    pure_checks(request)
     status, body = request('hello')
     assert status == 200 and body.startswith(b'R:%') and b'$5\r\nproto\r\n:3\r\n' in body
     assert command(b'HSET', b'resp3-hash', b'field', b'value') in (0, 1)
@@ -204,9 +212,16 @@ def main():
             value.update(tls=True, caFile=str(Path(args.testdata) / 'localhost_cert.pem'), serverName='localhost')
         return value
     def run(port, check):
-        with gateway(args, policy(port), lambda real: PROGRAM,
-                     ('resp3.rut', 'redis-resp3.rut'), 'redis-resp3.rut') as request:
-            check(request)
+        # Pure decoding has no Redis/backend/TLS dependency. Cover it once at
+        # each optimization level; the remaining profiles exercise network I/O.
+        groups = (True, False) if args.backend == 'epoll' and not args.tls and not args.real_redis else (False,)
+        for codec in groups:
+            with gateway(args, policy(port), lambda real: program(codec),
+                         ('resp3.rut', 'redis-resp3.rut'), 'redis-resp3.rut', startup_timeout=600) as request:
+                if codec:
+                    pure_checks(request)
+                else:
+                    check(request)
     if args.real_redis:
         with real_redis(args) as (port, command):
             run(port, lambda request: real_checks(request, command))

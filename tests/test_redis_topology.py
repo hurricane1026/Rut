@@ -14,7 +14,7 @@ import tempfile
 import time
 import uuid
 
-from test_redis_commands import Fixture, REDIS_IMAGE, gateway, packet, read_value, real_redis
+from test_redis_commands import Fixture, REDIS_IMAGE, assert_ack_boundary, gateway, packet, read_value, real_redis
 
 
 PROGRAM = r'''import "redis-topology.rut"
@@ -133,11 +133,7 @@ class TopologyFixture(Fixture):
                     self.observed.append(command)
                     name = command[0]
                     if name == b'ASKING':
-                        import select
-                        if isinstance(connection, ssl.SSLSocket):
-                            assert not connection.pending(), 'business preceded ASKING acknowledgement'
-                        else:
-                            assert not select.select([connection], [], [], .01)[0], 'business preceded ASKING acknowledgement'
+                        assert_ack_boundary(connection, stream, 'business preceded ASKING acknowledgement')
                         asking = True
                         connection.sendall(self.asking_ack)
                     elif name == b'SENTINEL':
@@ -375,7 +371,9 @@ def main():
                     assert command(b'SET', b'topology-key', b'a\x00\xffb') == b'OK'
                     assert request('sentinel', packet([b'GET', b'topology-key'])) == (200, b'R:$4\r\na\x00\xffb\r\n')
                     assert request('execute', packet([b'GET', b'topology-key']), {'X-Key': 'topology-key'}) == (200, b'R:$4\r\na\x00\xffb\r\n')
-                    assert request('execute', packet([b'GET', b'ask']), {'X-Key': 'ask'}) == (200, b'R:$-1\r\n')
+                    # Standalone Redis rejects ASKING. The real Cluster profile
+                    # below exercises a successful importing/migrating ASK path.
+                    assert request('execute', packet([b'GET', b'ask']), {'X-Key': 'ask'})[0] == 502
             finally:
                 seed.close()
     else:

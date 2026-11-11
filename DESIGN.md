@@ -10837,9 +10837,10 @@ The existing sixteen-I/O, byte/node, parser and arena limits remain in force;
 there is no native Redis opcode or background topology/subscription task. See
 [the advanced client contracts](docs/redis-advanced.md).
 
-Pure variant helper bodies retain lexical initializer sharing like records and
-tuples. Normalization caches an initializer across binding scopes only after
-proving it has no free outer lexical value; dependent cache entries are cleared
+Pure Boolean, Bytes, collection and variant helper bodies retain lexical
+initializer sharing like records and tuples. Normalization caches an initializer
+across binding scopes only after proving it has no free outer lexical value;
+dependent cache entries are cleared
 when entering/leaving `let` and collector scopes. This bounds repeated helper
 expansion without changing lexical capture or source evaluation semantics.
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import ssl
 import time
 
-from test_redis_commands import Fixture, gateway, packet, read_value, real_redis
+from test_redis_commands import Fixture, assert_ack_boundary, gateway, packet, read_value, real_redis
 
 
 PROGRAM = r'''import "redis-transaction.rut"
@@ -145,11 +145,7 @@ class TransactionFixture(Fixture):
                     elif command[0] == b'MULTI':
                         # If a client pipelines business writes before this
                         # acknowledgement, they are visible here on the socket.
-                        if isinstance(connection, ssl.SSLSocket):
-                            assert not connection.pending(), 'business bytes preceded MULTI acknowledgement'
-                        else:
-                            import select
-                            assert not select.select([connection], [], [], .01)[0], 'business bytes preceded MULTI acknowledgement'
+                        assert_ack_boundary(connection, stream, 'business bytes preceded MULTI acknowledgement')
                         if watch == b'begin-error':
                             connection.sendall(b'-NOPERM no multi\r\n')
                         elif watch == b'begin-wrong':

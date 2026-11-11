@@ -4,7 +4,10 @@ import "resp2-command.rut"
 // mode: 1 channel, 2 pattern, 3 sharded channel. Every subscription belongs to
 // one request and one caller-owned connection. No background worker or replay.
 struct RedisSubscription { channel: Bytes mode: i32 closing: bool }
-struct RedisPubSubFrame { frame: Bytes rest: Bytes }
+struct RedisPubSubFrame {
+    frame: Bytes rest: Bytes
+    dataStart: i32 dataCount: i32 originStart: i32 originCount: i32
+}
 variant RedisPubSubResult {
     subscribed(RedisPubSubFrame)
     message(RedisPubSubFrame)
@@ -16,15 +19,10 @@ variant RedisPubSubResult {
 }
 func redisPubSubMode(_ mode: i32) -> bool { mode > 0 && mode < 4 }
 func redisPubSubName(_ mode: i32, _ closing: bool) -> Bytes {
-    if closing {
-        if mode == 2 { b"punsubscribe" } else {
-            if mode == 3 { b"sunsubscribe" } else { b"unsubscribe" }
-        }
-    } else {
-        if mode == 2 { b"psubscribe" } else {
-            if mode == 3 { b"ssubscribe" } else { b"subscribe" }
-        }
-    }
+    let names = b"subscribepsubscribessubscribeunsubscribepunsubscribesunsubscribe"
+    let starts = b"\x00\x09\x13\x1d\x28\x34\x40"
+    let index = resp2Select(mode == 2, 1, resp2Select(mode == 3, 2, 0)) + resp2Select(closing, 3, 0)
+    names.slice(starts[index].or(0), starts[index + 1].or(64)).or(b"")
 }
 func redisPubSubAtom(_ bytes: Bytes, _ offset: i32, _ prefix: i32, _ text: Bytes, _ next: i32) -> Resp2Token {
     if prefix == 36 {
@@ -70,7 +68,7 @@ func redisPubSubFrame(_ bytes: Bytes) -> RedisPubSubFrame {
     guard let end = redisPubSubEnd(bytes, root) else { nil }
     guard let frame = bytes.slice(0, end) else { nil }
     guard let rest = bytes.slice(end, bytes.count) else { nil }
-    RedisPubSubFrame(frame: frame, rest: rest)
+    RedisPubSubFrame(frame: frame, rest: rest, dataStart: -1, dataCount: 0, originStart: -1, originCount: 0)
 }
 func redisPubSubReceive(_ connection: TcpConnection, _ buffered: Bytes) -> Bytes {
     if redisPubSubFrame(buffered) == nil {
@@ -114,12 +112,16 @@ func redisPubSubMessage(_ frame: RedisPubSubFrame, _ state: RedisSubscription, _
         guard let origin = redisPubSubToken(frame.frame, channel.next) else { RedisPubSubResult.replyFailure }
         guard let payload = redisPubSubToken(frame.frame, origin.next) else { RedisPubSubResult.replyFailure }
         guard origin.kind == 4 && payload.kind == 4 && payload.next == frame.frame.count else { RedisPubSubResult.replyFailure }
-        RedisPubSubResult.message(frame)
+        RedisPubSubResult.message(RedisPubSubFrame(frame: frame.frame, rest: frame.rest,
+            dataStart: payload.next - 2 - payload.data.count, dataCount: payload.data.count,
+            originStart: origin.next - 2 - origin.data.count, originCount: origin.data.count))
     } else {
         guard name.data == redisPubSubMessageName(state.mode) && channel.data == state.channel else { RedisPubSubResult.replyFailure }
         guard let payload = redisPubSubToken(frame.frame, channel.next) else { RedisPubSubResult.replyFailure }
         guard payload.kind == 4 && payload.next == frame.frame.count else { RedisPubSubResult.replyFailure }
-        RedisPubSubResult.message(frame)
+        RedisPubSubResult.message(RedisPubSubFrame(frame: frame.frame, rest: frame.rest,
+            dataStart: payload.next - 2 - payload.data.count, dataCount: payload.data.count,
+            originStart: channel.next - 2 - channel.data.count, originCount: channel.data.count))
     }
 }
 func redisPubSubParse(_ frame: RedisPubSubFrame, _ state: RedisSubscription, _ starting: bool) -> RedisPubSubResult {
@@ -166,7 +168,7 @@ func redisSubscribeAckTail(_ connection: TcpConnection, _ header: Bytes, _ expec
     guard let tail = reading else { RedisPubSubResult.transportFailure(netError()) }
     guard tail == expected else { RedisPubSubResult.replyFailure }
     guard let bytes = concatBytes(header, tail, 8192) else { RedisPubSubResult.replyFailure }
-    RedisPubSubResult.subscribed(RedisPubSubFrame(frame: bytes, rest: b""))
+    RedisPubSubResult.subscribed(RedisPubSubFrame(frame: bytes, rest: b"", dataStart: -1, dataCount: 0, originStart: -1, originCount: 0))
 }
 func redisSubscribeAckHeader(_ connection: TcpConnection, _ header: Bytes, _ expected: Bytes) -> RedisPubSubResult {
     if header == b"*3\r\n" || header == b">3\r\n" {
@@ -204,35 +206,13 @@ func redisUnsubscribe(_ connection: TcpConnection, _ state: RedisSubscription, _
     redisPubSubFinish(connection, result)
 }
 
-func redisPubSubData(_ frame: RedisPubSubFrame) -> Bytes {
-    guard let root = redisPubSubToken(frame.frame, 0) else { nil }
-    guard root.kind == 5 || root.kind == 17 else { nil }
-    guard let name = redisPubSubToken(frame.frame, root.next) else { nil }
-    guard let channel = redisPubSubToken(frame.frame, name.next) else { nil }
-    guard let third = redisPubSubToken(frame.frame, channel.next) else { nil }
-    if root.children == 4 {
-        guard name.data == b"pmessage" else { nil }
-        guard let fourth = redisPubSubToken(frame.frame, third.next) else { nil }
-        guard fourth.kind == 4 && fourth.next == frame.frame.count else { nil }
-        fourth.data
-    } else {
-        guard (name.data == b"message" || name.data == b"smessage") && third.kind == 4 && third.next == frame.frame.count else { nil }
-        third.data
-    }
+func redisPubSubData(_ message: RedisPubSubFrame) -> Bytes {
+    guard message.dataStart > -1 else { nil }
+    message.frame.slice(message.dataStart, message.dataStart + message.dataCount)
 }
-func redisPubSubOrigin(_ frame: RedisPubSubFrame) -> Bytes {
-    guard let root = redisPubSubToken(frame.frame, 0) else { nil }
-    guard let name = redisPubSubToken(frame.frame, root.next) else { nil }
-    guard let channel = redisPubSubToken(frame.frame, name.next) else { nil }
-    if root.children == 4 {
-        guard name.data == b"pmessage" else { nil }
-        guard let origin = redisPubSubToken(frame.frame, channel.next) else { nil }
-        guard origin.kind == 4 else { nil }
-        origin.data
-    } else {
-        guard name.data == b"message" || name.data == b"smessage" else { nil }
-        channel.data
-    }
+func redisPubSubOrigin(_ message: RedisPubSubFrame) -> Bytes {
+    guard message.originStart > -1 else { nil }
+    message.frame.slice(message.originStart, message.originStart + message.originCount)
 }
 
 // Continue an acknowledged subscription without replaying its command.
