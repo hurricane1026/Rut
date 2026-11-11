@@ -3229,6 +3229,20 @@ replies have a two-receive bound; GET/SET keep four. RESET requires Redis 6.2+;
 failures close instead of sharing authentication/database state. See
 [session results, budgets and ownership](redis-sessions.md).
 
+## Advanced Redis library profiles
+
+Ordinary source modules add bounded MULTI/EXEC and WATCH controls, RESP3 values
+and HELLO 3, dedicated finite Pub/Sub consumption, Cluster MOVED/ASK and Sentinel
+master discovery/ROLE verification. They retain the existing sixteen-I/O,
+8192-byte and 64-token limits. Topology destinations must match preconfigured
+TCP/verified TLS policies; ambiguous writes are never replayed. These add no
+source keyword, runtime protocol operation or persistent background task. See
+[APIs, ownership and finite limits](redis-advanced.md).
+
+Helper normalization may share local initializers proven independent of outer
+lexical bindings. Initializers capturing a `let` or collector binding are
+reinstantiated in the active scope; source evaluation semantics are unchanged.
+
 ## Memcached library client
 
 Import `"clients/memcache-client.rut"` from an example for bounded single-key

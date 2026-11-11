@@ -1,0 +1,255 @@
+import "resp2.rut"
+import "resp2-command.rut"
+
+// mode: 1 channel, 2 pattern, 3 sharded channel. Every subscription belongs to
+// one request and one caller-owned connection. No background worker or replay.
+struct RedisSubscription { channel: Bytes mode: i32 closing: bool }
+struct RedisPubSubFrame { frame: Bytes rest: Bytes }
+variant RedisPubSubResult {
+    subscribed(RedisPubSubFrame)
+    message(RedisPubSubFrame)
+    unsubscribed
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisPubSubMode(_ mode: i32) -> bool { mode > 0 && mode < 4 }
+func redisPubSubName(_ mode: i32, _ closing: bool) -> Bytes {
+    if closing {
+        if mode == 2 { b"punsubscribe" } else {
+            if mode == 3 { b"sunsubscribe" } else { b"unsubscribe" }
+        }
+    } else {
+        if mode == 2 { b"psubscribe" } else {
+            if mode == 3 { b"ssubscribe" } else { b"subscribe" }
+        }
+    }
+}
+func redisPubSubAtom(_ bytes: Bytes, _ offset: i32, _ prefix: i32, _ text: Bytes, _ next: i32) -> Resp2Token {
+    if prefix == 36 {
+        guard text[0].or(0) > 47 && text[0].or(0) < 58 else { nil }
+        guard let count = parseInt(text) else { nil }
+        resp2TokenBulk(bytes, count, next)
+    } else {
+        guard prefix == 58 && parseInt64(text) != nil else { nil }
+        Resp2Token(kind: 3, data: text, next: next, children: 0)
+    }
+}
+func redisPubSubHeader(_ prefix: i32, _ text: Bytes, _ next: i32) -> Resp2Token {
+    if prefix == 45 {
+        guard text.find(b"\r") == nil && text.find(b"\n") == nil else { nil }
+        Resp2Token(kind: 2, data: text, next: next, children: 0)
+    } else {
+        guard (prefix == 42 || prefix == 62) && (text == b"3" || text == b"4") else { nil }
+        guard let count = parseInt(text) else { nil }
+        Resp2Token(kind: resp2Select(prefix == 62, 17, 5), data: b"", next: next, children: count)
+    }
+}
+func redisPubSubToken(_ bytes: Bytes, _ offset: i32) -> Resp2Token {
+    guard let prefix = bytes[offset] else { nil }
+    guard let end = bytes.find(b"\r\n", offset + 1) else { nil }
+    guard let text = bytes.slice(offset + 1, end) else { nil }
+    if offset == 0 { redisPubSubHeader(prefix, text, end + 2) }
+    else { redisPubSubAtom(bytes, offset, prefix, text, end + 2) }
+}
+func redisPubSubEnd(_ bytes: Bytes, _ root: Resp2Token) -> i32 {
+    if root.kind == 2 { root.next } else {
+        guard let first = redisPubSubToken(bytes, root.next) else { nil }
+        guard let second = redisPubSubToken(bytes, first.next) else { nil }
+        guard let third = redisPubSubToken(bytes, second.next) else { nil }
+        if root.children == 3 { third.next } else {
+            guard let fourth = redisPubSubToken(bytes, third.next) else { nil }
+            fourth.next
+        }
+    }
+}
+func redisPubSubFrame(_ bytes: Bytes) -> RedisPubSubFrame {
+    guard bytes.count > 0 && !(bytes.count > 8192) else { nil }
+    guard let root = redisPubSubToken(bytes, 0) else { nil }
+    guard let end = redisPubSubEnd(bytes, root) else { nil }
+    guard let frame = bytes.slice(0, end) else { nil }
+    guard let rest = bytes.slice(end, bytes.count) else { nil }
+    RedisPubSubFrame(frame: frame, rest: rest)
+}
+func redisPubSubReceive(_ connection: TcpConnection, _ buffered: Bytes) -> Bytes {
+    if redisPubSubFrame(buffered) == nil {
+        guard buffered.count < 8192 else { nil }
+        let reading = connection.receive(8192 - buffered.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        concatBytes(buffered, chunk, 8192)
+    } else { buffered }
+}
+func redisPubSubRead(_ connection: TcpConnection, _ buffered: Bytes) -> RedisPubSubFrame {
+    let readingFirst = redisPubSubReceive(connection, buffered)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisPubSubReceive(connection, first)
+    guard let second = readingSecond else { nil }
+    redisPubSubFrame(second)
+}
+func redisPubSubFailure(_ code: i32) -> RedisPubSubResult {
+    if code == 0 { RedisPubSubResult.replyFailure } else { RedisPubSubResult.transportFailure(code) }
+}
+func redisPubSubExpectedCount(_ closing: bool) -> Bytes {
+    if closing { b"0" } else { b"1" }
+}
+func redisPubSubMessageName(_ mode: i32) -> Bytes {
+    if mode == 3 { b"smessage" } else { b"message" }
+}
+func redisPubSubStatus(_ frame: RedisPubSubFrame, _ state: RedisSubscription, _ name: Resp2Token, _ channel: Resp2Token) -> RedisPubSubResult {
+    guard name.kind == 4 && channel.kind == 4 && channel.data == state.channel else { RedisPubSubResult.replyFailure }
+    guard name.data == redisPubSubName(state.mode, state.closing) else { RedisPubSubResult.replyFailure }
+    guard let count = redisPubSubToken(frame.frame, channel.next) else { RedisPubSubResult.replyFailure }
+    guard count.kind == 3 && count.next == frame.frame.count &&
+        count.data == redisPubSubExpectedCount(state.closing) else { RedisPubSubResult.replyFailure }
+    if state.closing { RedisPubSubResult.unsubscribed } else {
+        RedisPubSubResult.subscribed(frame)
+    }
+}
+func redisPubSubMessage(_ frame: RedisPubSubFrame, _ state: RedisSubscription, _ name: Resp2Token, _ channel: Resp2Token) -> RedisPubSubResult {
+    guard name.kind == 4 && channel.kind == 4 else { RedisPubSubResult.replyFailure }
+    if state.mode == 2 {
+        guard name.data == b"pmessage" && channel.data == state.channel else { RedisPubSubResult.replyFailure }
+        guard let origin = redisPubSubToken(frame.frame, channel.next) else { RedisPubSubResult.replyFailure }
+        guard let payload = redisPubSubToken(frame.frame, origin.next) else { RedisPubSubResult.replyFailure }
+        guard origin.kind == 4 && payload.kind == 4 && payload.next == frame.frame.count else { RedisPubSubResult.replyFailure }
+        RedisPubSubResult.message(frame)
+    } else {
+        guard name.data == redisPubSubMessageName(state.mode) && channel.data == state.channel else { RedisPubSubResult.replyFailure }
+        guard let payload = redisPubSubToken(frame.frame, channel.next) else { RedisPubSubResult.replyFailure }
+        guard payload.kind == 4 && payload.next == frame.frame.count else { RedisPubSubResult.replyFailure }
+        RedisPubSubResult.message(frame)
+    }
+}
+func redisPubSubParse(_ frame: RedisPubSubFrame, _ state: RedisSubscription, _ starting: bool) -> RedisPubSubResult {
+    guard let root = redisPubSubToken(frame.frame, 0) else { RedisPubSubResult.replyFailure }
+    if root.kind == 2 { RedisPubSubResult.serverError(root.data) } else {
+        guard let name = redisPubSubToken(frame.frame, root.next) else { RedisPubSubResult.replyFailure }
+        guard let channel = redisPubSubToken(frame.frame, name.next) else { RedisPubSubResult.replyFailure }
+        if starting || name.data == redisPubSubName(state.mode, true) {
+            redisPubSubStatus(frame, state, name, channel)
+        } else { redisPubSubMessage(frame, state, name, channel) }
+    }
+}
+func redisPubSubFinish(_ connection: TcpConnection, _ result: RedisPubSubResult) -> RedisPubSubResult {
+    match result {
+        .subscribed(state) => result
+        .message(event) => result
+        .requestFailure => result
+        _ => {
+            // Even an acknowledged unsubscribe retires this dedicated lease;
+            // interleaved or late messages can never leak into a generic pool.
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func redisPubSubNextWire(_ connection: TcpConnection, _ state: RedisSubscription, _ buffered: Bytes, _ starting: bool) -> RedisPubSubResult {
+    let reading = redisPubSubRead(connection, buffered)
+    guard let frame = reading else { redisPubSubFailure(netError()) }
+    redisPubSubParse(frame, state, starting)
+}
+func redisSubscriptionNext(_ connection: TcpConnection, _ state: RedisSubscription, _ buffered: Bytes) -> RedisPubSubResult {
+    guard redisPubSubMode(state.mode) && !(buffered.count > 8192) else { RedisPubSubResult.requestFailure }
+    let result = redisPubSubNextWire(connection, state, buffered, false)
+    redisPubSubFinish(connection, result)
+}
+func redisSubscribeAck(_ state: RedisSubscription) -> Bytes {
+    guard let name = resp2BulkArgument(redisPubSubName(state.mode, false), 8192) else { nil }
+    guard let channel = resp2BulkArgument(state.channel, 8192) else { nil }
+    guard let fields = concatBytes(name, channel, 8184) else { nil }
+    concatBytes(fields, b":1\r\n", 8188)
+}
+func redisSubscribeAckTail(_ connection: TcpConnection, _ header: Bytes, _ expected: Bytes) -> RedisPubSubResult {
+    let reading = connection.readExactly(expected.count, 1000)
+    guard let tail = reading else { RedisPubSubResult.transportFailure(netError()) }
+    guard tail == expected else { RedisPubSubResult.replyFailure }
+    guard let bytes = concatBytes(header, tail, 8192) else { RedisPubSubResult.replyFailure }
+    RedisPubSubResult.subscribed(RedisPubSubFrame(frame: bytes, rest: b""))
+}
+func redisSubscribeAckHeader(_ connection: TcpConnection, _ header: Bytes, _ expected: Bytes) -> RedisPubSubResult {
+    if header == b"*3\r\n" || header == b">3\r\n" {
+        redisSubscribeAckTail(connection, header, expected)
+    } else {
+        guard let token = redisPubSubToken(header, 0) else { RedisPubSubResult.replyFailure }
+        guard token.kind == 2 && token.next == header.count else { RedisPubSubResult.replyFailure }
+        RedisPubSubResult.serverError(token.data)
+    }
+}
+func redisSubscribeWire(_ connection: TcpConnection, _ request: Bytes, _ state: RedisSubscription) -> RedisPubSubResult {
+    guard let expected = redisSubscribeAck(state) else { RedisPubSubResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisPubSubResult.transportFailure(netError()) }
+    let reading = connection.readLine(8192, 1000)
+    guard let header = reading else { RedisPubSubResult.transportFailure(netError()) }
+    redisSubscribeAckHeader(connection, header, expected)
+}
+func redisSubscribe(_ connection: TcpConnection, _ state: RedisSubscription) -> RedisPubSubResult {
+    guard redisPubSubMode(state.mode) && !state.closing else { RedisPubSubResult.requestFailure }
+    guard let request = resp2KeyRequest(redisPubSubName(state.mode, false), state.channel) else { RedisPubSubResult.requestFailure }
+    let result = redisSubscribeWire(connection, request, state)
+    redisPubSubFinish(connection, result)
+}
+func redisUnsubscribeWire(_ connection: TcpConnection, _ request: Bytes, _ state: RedisSubscription, _ buffered: Bytes) -> RedisPubSubResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisPubSubResult.transportFailure(netError()) }
+    redisPubSubNextWire(connection, state, buffered, false)
+}
+func redisUnsubscribe(_ connection: TcpConnection, _ state: RedisSubscription, _ buffered: Bytes) -> RedisPubSubResult {
+    guard redisPubSubMode(state.mode) && !state.closing && !(buffered.count > 8192) else { RedisPubSubResult.requestFailure }
+    guard let request = resp2KeyRequest(redisPubSubName(state.mode, true), state.channel) else { RedisPubSubResult.requestFailure }
+    let closing = RedisSubscription(channel: state.channel, mode: state.mode, closing: true)
+    let result = redisUnsubscribeWire(connection, request, closing, buffered)
+    redisPubSubFinish(connection, result)
+}
+
+func redisPubSubData(_ frame: RedisPubSubFrame) -> Bytes {
+    guard let root = redisPubSubToken(frame.frame, 0) else { nil }
+    guard root.kind == 5 || root.kind == 17 else { nil }
+    guard let name = redisPubSubToken(frame.frame, root.next) else { nil }
+    guard let channel = redisPubSubToken(frame.frame, name.next) else { nil }
+    guard let third = redisPubSubToken(frame.frame, channel.next) else { nil }
+    if root.children == 4 {
+        guard name.data == b"pmessage" else { nil }
+        guard let fourth = redisPubSubToken(frame.frame, third.next) else { nil }
+        guard fourth.kind == 4 && fourth.next == frame.frame.count else { nil }
+        fourth.data
+    } else {
+        guard (name.data == b"message" || name.data == b"smessage") && third.kind == 4 && third.next == frame.frame.count else { nil }
+        third.data
+    }
+}
+func redisPubSubOrigin(_ frame: RedisPubSubFrame) -> Bytes {
+    guard let root = redisPubSubToken(frame.frame, 0) else { nil }
+    guard let name = redisPubSubToken(frame.frame, root.next) else { nil }
+    guard let channel = redisPubSubToken(frame.frame, name.next) else { nil }
+    if root.children == 4 {
+        guard name.data == b"pmessage" else { nil }
+        guard let origin = redisPubSubToken(frame.frame, channel.next) else { nil }
+        guard origin.kind == 4 else { nil }
+        origin.data
+    } else {
+        guard name.data == b"message" || name.data == b"smessage" else { nil }
+        channel.data
+    }
+}
+
+// Continue an acknowledged subscription without replaying its command.
+func redisSubscribeFirst(_ connection: TcpConnection, _ state: RedisSubscription, _ result: RedisPubSubResult) -> RedisPubSubResult {
+    match result {
+        .subscribed(frame) => redisSubscriptionNext(connection, state, frame.rest)
+        _ => result
+    }
+}
+// Retire after one message. Closing the dedicated transport also cancels the
+// subscription, leaving room for caller-owned authentication in the I/O budget.
+func redisSubscribeOnce(_ connection: TcpConnection, _ state: RedisSubscription) -> RedisPubSubResult {
+    guard redisPubSubMode(state.mode) && !state.closing else { RedisPubSubResult.requestFailure }
+    guard let packet = resp2KeyRequest(redisPubSubName(state.mode, false), state.channel) else { RedisPubSubResult.requestFailure }
+    let initial = redisSubscribeWire(connection, packet, state)
+    let starting = redisPubSubFinish(connection, initial)
+    let first = redisSubscribeFirst(connection, state, starting)
+    let closed = connection.close()
+    first
+}

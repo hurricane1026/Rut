@@ -44,7 +44,9 @@ trailing replies fail closed. A failure invalidates aliases and closes the lease
 The command behavior follows the Redis [AUTH](https://redis.io/docs/latest/commands/auth/)
 and [SELECT](https://redis.io/docs/latest/commands/select/) contracts. This profile
 is for standalone Redis logical databases. It does not implement Redis Cluster,
-RESP3, Sentinel discovery, transactions or subscriptions.
+RESP3, Sentinel discovery, transactions or subscriptions; use the separate
+[advanced modules](redis-advanced.md) for those finite profiles. Cluster nodes
+must be authenticated individually and do not support logical database SELECT.
 
 ## A single command with safe pool return
 

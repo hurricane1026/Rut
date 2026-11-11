@@ -1,0 +1,197 @@
+import "resp2.rut"
+import "resp2-command.rut"
+
+// A transaction batch contains only canonical, explicitly supported business
+// commands. Connection/mode/transaction commands cannot escape MULTI state.
+struct RedisTransaction { request: Bytes count: i32 }
+variant RedisTransactionResult {
+    executed(Bytes)
+    watchAborted
+    queueError(Bytes)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+struct RedisTransactionRequestState { offset: i32 pending: i32 count: i32 name: bool }
+struct RedisTransactionRequestItem { next: i32 count: i32 pending: i32 }
+struct RedisTransactionAckState { offset: i32 count: i32 expected: i32 detail: Bytes failed: i32 }
+struct RedisTransactionAck { next: i32 detail: Bytes failed: i32 }
+
+func redisTransaction() -> RedisTransaction { RedisTransaction(request: b"", count: 0) }
+func redisTransactionCommand(_ name: Bytes) -> bool {
+    guard name.count > 0 && name.count < 17 && name.find(b"|") == nil else { false }
+    guard let prefix = concatBytes(b"|", name, 18) else { false }
+    guard let selected = concatBytes(prefix, b"|", 18) else { false }
+    let names = b"|GET|SET|DEL|UNLINK|EXISTS|TTL|PTTL|EXPIRE|PEXPIRE|PERSIST|INCR|DECR|INCRBY|DECRBY|MGET|MSET|HGET|HSET|HDEL|HGETALL|LPUSH|RPUSH|LPOP|RPOP|LRANGE|SADD|SREM|SMEMBERS|ZADD|ZREM|ZRANGE|PING|"
+    names.find(selected) != nil
+}
+func redisTransactionRequestStep(_ bytes: Bytes, _ state: RedisTransactionRequestState) -> (RedisTransactionRequestState, RedisTransactionRequestItem, bool) {
+    guard let token = resp2Token(bytes, state.offset) else { nil }
+    let root = state.pending == 0
+    guard (root && token.kind == 5 && token.children > 0) || (!root && token.kind == 4) else { nil }
+    guard !state.name || redisTransactionCommand(token.data) else { nil }
+    let count = state.count + resp2Select(root, 1, 0)
+    let pending = resp2Select(root, 1, state.pending) - 1 + token.children
+    guard count < 9 else { nil }
+    (RedisTransactionRequestState(offset: token.next, pending: pending, count: count, name: root),
+        RedisTransactionRequestItem(next: token.next, count: count, pending: pending), pending == 0 && token.next == bytes.count)
+}
+func redisTransactionValid(_ batch: RedisTransaction) -> bool {
+    guard batch.count > 0 && batch.count < 9 && batch.request.count > 0 && batch.request.count < 8179 else { false }
+    let initial = RedisTransactionRequestState(offset: 0, pending: 0, count: 0, name: false)
+    guard let tokens = collectBytes(batch.request, initial, 64, redisTransactionRequestStep) else { false }
+    guard let last = tokens.get(tokens.count - 1) else { false }
+    last.next == batch.request.count && last.count == batch.count && last.pending == 0
+}
+func redisTransactionAdd(_ batch: RedisTransaction, _ request: Bytes) {
+    guard batch.count > -1 && batch.count < 8 &&
+        (batch.count != 0 || batch.request.count == 0) else { nil }
+    guard redisRequestValid(request) else { nil }
+    guard let root = resp2Token(request, 0) else { nil }
+    guard let command = resp2Token(request, root.next) else { nil }
+    guard redisTransactionCommand(command.data) else { nil }
+    guard let bytes = concatBytes(batch.request, request, 8178) else { nil }
+    let result = RedisTransaction(request: bytes, count: batch.count + 1)
+    result
+}
+func redisTransactionFailure(_ code: i32) -> RedisTransactionResult {
+    if code == 0 { RedisTransactionResult.replyFailure } else { RedisTransactionResult.transportFailure(code) }
+}
+func redisTransactionQueueError(_ token: Resp2Token, _ previous: Bytes) -> Bytes {
+    if token.kind == 2 { token.data } else { previous }
+}
+func redisTransactionAckStep(_ bytes: Bytes, _ state: RedisTransactionAckState) -> (RedisTransactionAckState, RedisTransactionAck, bool) {
+    guard let token = resp2Token(bytes, state.offset) else { nil }
+    guard (token.kind == 1 && token.data == b"QUEUED") || token.kind == 2 else { nil }
+    let detail = redisTransactionQueueError(token, state.detail)
+    guard state.count > -1 && state.count < state.expected else { nil }
+    (RedisTransactionAckState(offset: token.next, count: state.count + 1, expected: state.expected, detail: detail, failed: max(state.failed, resp2Select(token.kind == 2, 1, 0))),
+        RedisTransactionAck(next: token.next, detail: detail, failed: max(state.failed, resp2Select(token.kind == 2, 1, 0))), state.count + 1 == state.expected)
+}
+func redisTransactionExecResult(_ bytes: Bytes, _ count: i32, _ detail: Bytes, _ failed: i32) -> RedisTransactionResult {
+    guard let values = decodeResp2(bytes) else { RedisTransactionResult.replyFailure }
+    guard let root = values.get(0) else { RedisTransactionResult.replyFailure }
+    if failed > 0 {
+        guard root.kind == 2 && (root.data == b"EXECABORT" || root.data.slice(0, 10) == b"EXECABORT ") else { RedisTransactionResult.replyFailure }
+        RedisTransactionResult.queueError(detail)
+    } else {
+        if root.kind == 7 { RedisTransactionResult.watchAborted } else {
+            guard root.kind == 5 && root.children == count else { RedisTransactionResult.replyFailure }
+            RedisTransactionResult.executed(bytes)
+        }
+    }
+}
+func redisTransactionParse(_ bytes: Bytes, _ count: i32) -> RedisTransactionResult {
+    guard count > 0 && count < 9 else { RedisTransactionResult.replyFailure }
+    let initial = RedisTransactionAckState(offset: 0, count: 0, expected: count, detail: b"", failed: 0)
+    guard let values = collectBytes(bytes, initial, 8, redisTransactionAckStep) else { RedisTransactionResult.replyFailure }
+    guard let last = values.get(values.count - 1) else { RedisTransactionResult.replyFailure }
+    guard let frame = bytes.slice(last.next, bytes.count) else { RedisTransactionResult.replyFailure }
+    redisTransactionExecResult(frame, count, last.detail, last.failed)
+}
+func redisTransactionReceivePair(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let readingFirst = resp2Receive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp2Receive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func redisTransactionRead(_ connection: TcpConnection, _ count: i32) {
+    let initial = Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: count + 1, nodes: 0,
+        status: 0, search: 1, bulkEnd: -1, limit: 8192))
+    let readingFirst = redisTransactionReceivePair(connection, initial)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisTransactionReceivePair(connection, first)
+    guard let second = readingSecond else { nil }
+    guard resp2Finished(second) else { nil }
+    second.bytes
+}
+func redisTransactionBeginReply(_ line: Bytes) -> RedisTransactionResult {
+    guard let token = resp2Token(line, 0) else { RedisTransactionResult.replyFailure }
+    guard token.next == line.count else { RedisTransactionResult.replyFailure }
+    if token.kind == 2 { RedisTransactionResult.serverError(token.data) } else {
+        guard token.kind == 1 && token.data == b"OK" else { RedisTransactionResult.replyFailure }
+        RedisTransactionResult.executed(b"")
+    }
+}
+func redisTransactionBegin(_ connection: TcpConnection) -> RedisTransactionResult {
+    let sending = connection.send(b"*1\r\n$5\r\nMULTI\r\n", 1000)
+    guard let sent = sending else { RedisTransactionResult.transportFailure(netError()) }
+    let reading = connection.readLine(8192, 1000)
+    guard let line = reading else { RedisTransactionResult.transportFailure(netError()) }
+    redisTransactionBeginReply(line)
+}
+func redisTransactionSend(_ connection: TcpConnection, _ packet: Bytes, _ count: i32) -> RedisTransactionResult {
+    let sending = connection.send(packet, 1000)
+    guard let sent = sending else { RedisTransactionResult.transportFailure(netError()) }
+    let reading = redisTransactionRead(connection, count)
+    guard let bytes = reading else { redisTransactionFailure(netError()) }
+    redisTransactionParse(bytes, count)
+}
+func redisTransactionWire(_ connection: TcpConnection, _ packet: Bytes, _ count: i32) -> RedisTransactionResult {
+    let beginning = redisTransactionBegin(connection)
+    match beginning {
+        .executed(empty) => redisTransactionSend(connection, packet, count)
+        _ => beginning
+    }
+}
+func redisTransactionExecute(_ connection: TcpConnection, _ batch: RedisTransaction) -> RedisTransactionResult {
+    guard redisTransactionValid(batch) else { RedisTransactionResult.requestFailure }
+    guard let packet = concatBytes(batch.request, b"*1\r\n$4\r\nEXEC\r\n", 8192) else { RedisTransactionResult.requestFailure }
+    let result = redisTransactionWire(connection, packet, batch.count)
+    match result {
+        .executed(bytes) => result
+        .watchAborted => result
+        .queueError(detail) => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+
+// WATCH is opt-in and belongs to this same physical connection. No helper
+// retries a watch conflict. Discard an unfinished watch with UNWATCH or close.
+variant RedisWatchResult {
+    ok
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisWatchReply(_ line: Bytes) -> RedisWatchResult {
+    guard let token = resp2Token(line, 0) else { RedisWatchResult.replyFailure }
+    guard token.next == line.count else { RedisWatchResult.replyFailure }
+    if token.kind == 2 { RedisWatchResult.serverError(token.data) } else {
+        guard token.kind == 1 && token.data == b"OK" else { RedisWatchResult.replyFailure }
+        RedisWatchResult.ok
+    }
+}
+func redisWatchWire(_ connection: TcpConnection, _ request: Bytes) -> RedisWatchResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisWatchResult.transportFailure(netError()) }
+    let reading = connection.readLine(8192, 1000)
+    guard let line = reading else { RedisWatchResult.transportFailure(netError()) }
+    redisWatchReply(line)
+}
+func redisWatchCommand(_ connection: TcpConnection, _ request: Bytes) -> RedisWatchResult {
+    let result = redisWatchWire(connection, request)
+    match result {
+        .ok => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func redisWatch(_ connection: TcpConnection, _ key: Bytes) -> RedisWatchResult {
+    guard let request = resp2KeyRequest(b"WATCH", key) else { RedisWatchResult.requestFailure }
+    redisWatchCommand(connection, request)
+}
+func redisUnwatch(_ connection: TcpConnection) -> RedisWatchResult {
+    redisWatchCommand(connection, b"*1\r\n$7\r\nUNWATCH\r\n")
+}
+func redisDiscard(_ connection: TcpConnection) -> RedisWatchResult {
+    redisWatchCommand(connection, b"*1\r\n$7\r\nDISCARD\r\n")
+}

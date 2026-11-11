@@ -1,0 +1,111 @@
+import "resp3.rut"
+import "resp2.rut"
+
+struct RedisResp3Event { frame: Bytes rest: Bytes kind: i32 content: i32 }
+variant RedisResp3Result {
+    reply(RedisResp3Event)
+    push(RedisResp3Event)
+    serverError(RedisResp3Event)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func redisResp3Failure(_ code: i32) -> RedisResp3Result {
+    if code == 0 { RedisResp3Result.replyFailure } else { RedisResp3Result.transportFailure(code) }
+}
+func redisResp3FrameResult(_ frame: Resp3Frame) -> RedisResp3Result {
+    let root = frame.root
+    let event = RedisResp3Event(frame: frame.frame, rest: frame.rest, kind: root.kind, content: root.next)
+    if root.kind == 17 { RedisResp3Result.push(event) } else {
+        if root.kind == 2 || root.kind == 12 {
+            RedisResp3Result.serverError(event)
+        } else { RedisResp3Result.reply(event) }
+    }
+}
+func redisResp3Read(_ connection: TcpConnection, _ buffered: Bytes) -> RedisResp3Result {
+    let reading = resp3Read(connection, buffered)
+    guard let frame = reading else { redisResp3Failure(netError()) }
+    redisResp3FrameResult(frame)
+}
+func redisResp3MustClose(_ result: RedisResp3Result) -> bool {
+    match result {
+        .transportFailure(code) => true
+        .replyFailure => true
+        _ => false
+    }
+}
+func redisResp3Finish(_ connection: TcpConnection, _ result: RedisResp3Result) -> RedisResp3Result {
+    if redisResp3MustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func redisResp3Next(_ connection: TcpConnection, _ buffered: Bytes) -> RedisResp3Result {
+    let result = redisResp3Read(connection, buffered)
+    redisResp3Finish(connection, result)
+}
+func redisResp3Wire(_ connection: TcpConnection, _ request: Bytes) -> RedisResp3Result {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisResp3Result.transportFailure(netError()) }
+    redisResp3Read(connection, b"")
+}
+// This is an event API: a push is explicit, and its rest must be carried into
+// Next until the pending command's ordinary reply has been observed.
+func redisResp3Execute(_ connection: TcpConnection, _ request: Bytes) -> RedisResp3Result {
+    guard redisRequestValid(request) else { RedisResp3Result.requestFailure }
+    let result = redisResp3Wire(connection, request)
+    redisResp3Finish(connection, result)
+}
+struct RedisHelloState { offset: i32 pending: i32 value: bool proto: bool found: bool }
+func redisHello3Yield(_ state: RedisHelloState, _ done: bool) -> (RedisHelloState, bool, bool) {
+    guard state.pending > -1 else { nil }
+    (state, state.found, done)
+}
+// The frame has already been fully validated. Walk top-level map entries,
+// ignoring nested values and attributes; a nested/string "proto" is no proof.
+func redisHello3Step(_ bytes: Bytes, _ state: RedisHelloState) -> (RedisHelloState, bool, bool) {
+    guard let token = resp3FramingToken(bytes, state.offset) else { nil }
+    let top = state.pending == 0 && token.kind != 15
+    let proto = (top && !state.value && (token.kind == 1 || token.kind == 4) && token.data == b"proto") || ((!top || state.value) && state.proto)
+    let checking = top && state.value && state.proto
+    guard !checking || (!state.found && token.kind == 3 && token.data == b"3") else { nil }
+    let pending = resp3Choose(state.pending == 0, resp3Choose(token.kind == 15, 0, 1), state.pending) - resp3Choose(token.kind == 15, 0, 1) + token.children
+    redisHello3Yield(RedisHelloState(offset: token.next, pending: pending, value: (top && !state.value) || (!top && state.value), proto: proto, found: state.found || checking), token.next == bytes.count)
+}
+func redisHello3Valid(_ event: RedisResp3Event) -> bool {
+    guard event.kind == 14 && event.rest.count == 0 else { false }
+    guard let entries = collectBytes(event.frame, RedisHelloState(offset: event.content, pending: 0, value: false, proto: false, found: false), 64, redisHello3Step) else { false }
+    entries.get(entries.count - 1).or(false)
+}
+func redisHello3Reply(_ event: RedisResp3Event) -> RedisResp3Result {
+    guard redisHello3Valid(event) else { RedisResp3Result.replyFailure }
+    RedisResp3Result.reply(event)
+}
+func redisHello3Check(_ result: RedisResp3Result) -> RedisResp3Result {
+    match result {
+        .reply(event) => redisHello3Reply(event)
+        .push(event) => RedisResp3Result.replyFailure
+        _ => result
+    }
+}
+func redisHello3Wire(_ connection: TcpConnection) -> RedisResp3Result {
+    let sending = connection.send(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n", 1000)
+    guard let sent = sending else { RedisResp3Result.transportFailure(netError()) }
+    let reading = resp3ReadPair(connection, Resp3Stream(bytes: b""))
+    guard let stream = reading else { redisResp3Failure(netError()) }
+    guard let frame = resp3Frame(stream.bytes) else { RedisResp3Result.replyFailure }
+    redisHello3Check(redisResp3FrameResult(frame))
+}
+func redisHello3Succeeded(_ result: RedisResp3Result) -> bool {
+    match result {
+        .reply(event) => true
+        _ => false
+    }
+}
+func redisHello3(_ connection: TcpConnection) -> RedisResp3Result {
+    let result = redisHello3Wire(connection)
+    if !redisHello3Succeeded(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
