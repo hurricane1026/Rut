@@ -280,7 +280,7 @@ def main():
     def run(port, check):
         for cancellation in (False, True):
             with gateway(args, policy(port), lambda real: program(cancellation),
-                         ('redis-pubsub.rut',), 'redis-pubsub.rut', startup_timeout=600) as request:
+                         ('redis-pubsub.rut',), 'redis-pubsub.rut') as request:
                 if cancellation:
                     cancellation_checks(request, args.real_redis)
                 else:

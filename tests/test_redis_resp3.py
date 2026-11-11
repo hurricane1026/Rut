@@ -216,8 +216,11 @@ def main():
         # each optimization level; the remaining profiles exercise network I/O.
         groups = (True, False) if args.backend == 'epoll' and not args.tls and not args.real_redis else (False,)
         for codec in groups:
+            # Cold O2 code generation for the forward-unrolled 64-token codec
+            # can approach ten minutes with Debug LLVM. This only extends
+            # compiler startup; protocol I/O retains its 1000 ms deadlines.
             with gateway(args, policy(port), lambda real: program(codec),
-                         ('resp3.rut', 'redis-resp3.rut'), 'redis-resp3.rut', startup_timeout=600) as request:
+                         ('resp3.rut', 'redis-resp3.rut'), 'redis-resp3.rut', startup_timeout=900) as request:
                 if codec:
                     pure_checks(request)
                 else:

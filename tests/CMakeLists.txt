@@ -4575,10 +4575,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         endforeach()
         foreach(redis_advanced transactions resp3 pubsub topology)
             set(advanced_timeout 300)
-            if(redis_advanced STREQUAL "pubsub" OR redis_advanced STREQUAL "resp3")
+            if(redis_advanced STREQUAL "resp3")
                 # Two bounded native compilations, with independent startup
                 # deadlines; protocol I/O deadlines remain unchanged.
-                set(advanced_timeout 1500)
+                set(advanced_timeout 2100)
             endif()
             foreach(advanced_opt 0 2)
                 add_test(NAME test_redis_${redis_advanced}_${backend}_opt${advanced_opt}
