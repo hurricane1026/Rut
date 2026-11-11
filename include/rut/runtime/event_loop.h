@@ -108,6 +108,12 @@ public:
 
     bool has_ready_jit_handlers() const { return jit_ready_head_ != nullptr; }
 
+    static constexpr bool fetch_idle_pause_allowed(bool fetch_busy,
+                                                   u32 event_count,
+                                                   bool ready_handlers) {
+        return fetch_busy && event_count == 0 && !ready_handlers;
+    }
+
     void discard_ready_jit_handlers() {
         while (jit_ready_head_) cancel_ready_jit_handler(*jit_ready_head_);
     }

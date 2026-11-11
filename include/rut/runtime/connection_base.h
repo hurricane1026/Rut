@@ -871,9 +871,9 @@ struct ConnectionBase {
     // Intrusive shard-ready continuation. The loop unlinks it before close/free.
     ConnectionBase* jit_ready_prev = nullptr;
     ConnectionBase* jit_ready_next = nullptr;
-    bool jit_ready_queued = false;
     u32 jit_ready_generation = 0;
     u16 jit_ready_state = 0;
+    bool jit_ready_queued = false;
     alignas(alignof(u64)) u8 handler_ctx_storage[sizeof(jit::HandlerCtx) +
                                                  static_cast<size_t>(kMaxJitHandlerSlots) * 8]{};
 

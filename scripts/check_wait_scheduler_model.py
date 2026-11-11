@@ -43,17 +43,30 @@ def check_manifest() -> None:
         "tests/test_network.cc": ("ready_wait_shutdown_discard_never_invokes_handler",),
         "tests/test_wait_scheduler.cc": (
             "batch_limit_and_fifo_at_64_65_and_129_owners",
+            "busy_fetch_does_not_pause_ready_handlers",
+            "epoll_ready_responses_survive_prefilled_completion_ring",
             "peer_close_inside_detached_batch_cancels_resume",
             "peer_close_and_reuse_inside_batch_cannot_resume_new_generation",
             "generation_or_continuation_change_invalidates_queued_resume",
             "kernel_send_cannot_steal_ready_queue_completion",
         ),
+        "tests/test_integration.cc": (
+            "full_ring_defers_nonempty_sends_but_rejects_other_producers",
+            "full_ring_deferred_plain_and_upstream_sends_complete_once",
+            "full_ring_deferred_tls_send_retries_after_want_read_once",
+        ),
     }
-    for backend in ("epoll", "iouring", "kqueue"):
+    for backend in ("epoll", "kqueue"):
         requirements[f"include/rut/runtime/{backend}_event_loop.h"] = (
-            "this->drain_ready_jit_handlers()", "this->has_ready_jit_handlers()",
+            "this->drain_ready_jit_handlers()",
+            "this->has_ready_jit_handlers()",
             "this->discard_ready_jit_handlers()", "!conn.jit_ready_queued",
         )
+    requirements["include/rut/runtime/iouring_event_loop.h"] = (
+        "this->drain_ready_jit_handlers()", "this->has_ready_jit_handlers()",
+        "this->fetch_idle_pause_allowed(", "this->discard_ready_jit_handlers()",
+        "!conn.jit_ready_queued",
+    )
     for filename, tokens in requirements.items():
         source = (ROOT / filename).read_text()
         for token in tokens:

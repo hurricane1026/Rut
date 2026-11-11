@@ -757,7 +757,8 @@ public:
             }
             relay_budget_calls = kRelayTurnMaxCalls;
             relay_budget_bytes = kRelayTurnMaxBytes;
-            if (fetch_busy && kEventCount == 0) {
+            if (this->fetch_idle_pause_allowed(
+                    fetch_busy, kEventCount, this->has_ready_jit_handlers())) {
                 // Advance nonblocking TLS state regularly on an idle shard
                 // without spinning while the fetch socket has no gateway slot.
                 struct timespec pause = {0, 10'000'000};

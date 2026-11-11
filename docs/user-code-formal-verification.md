@@ -339,11 +339,13 @@ actor locations are labeled separately from RIR block paths.
 Event waits return control to the shard loop. An empty downstream send also
 suspends: the loop queues its already-ready continuation instead of recursively
 invoking the handler. The intrusive queue is bounded by live connections and
-needs no allocations. A turn processes at most 64 previously queued owners;
-new waits defer to a later turn, and pending ready work makes kernel polling
-nonblocking. Close/free removes queued owners. Generation and continuation-state
-checks protect a detached drain batch against close/reuse by another callback.
-The same contract is used by epoll, io_uring and kqueue.
+needs no allocations. Epoll and kqueue keep the 64-owner FIFO drain; when the
+synthetic completion ring is full, nonempty sends are retained in the existing per-owner
+send state and completed from writable readiness. io_uring keeps the same
+64-owner drain and does not use this synthetic ring. New waits defer to a later
+turn, and pending ready work makes kernel polling nonblocking. Close/free
+removes queued owners. Generation and continuation-state checks protect
+detached batches against close/reuse.
 
 `spec/wait_scheduler.tla` additionally models publication, FIFO batch extraction,
 callback execution, kernel polling, IO completion, peer close, slot reuse and
@@ -353,6 +355,9 @@ are one/two owners, two waits per generation, two generations, and batch limits
 one/two. Separate C++ tests exercise the actual 64/65/129-owner boundary and
 continuous re-waits, as well as closing/reusing another owner in a detached
 batch and ignoring an old Send event while a ready continuation owns the wakeup.
+The TLA model does not represent backend completion-ring capacity or syscall
+submission; those properties are covered by C++ scheduler/backend tests, not
+claimed as TLC-proven.
 
 Progress assumes a weakly fair scheduler and handler publication. IO delivery
 is strongly fair across poll opportunities: a pending completion eligible at

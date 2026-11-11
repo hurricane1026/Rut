@@ -4086,6 +4086,10 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive,
                         const RouteEntry* selected_route) {
+    auto send_terminal_response = [&]() {
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+            loop->close_conn(conn);
+    };
     if (outcome.kind != JitDispatchOutcome::Kind::TimerYield) {
         if (auto* passwords = request_password_gateway(loop)) passwords->cancel(conn.id);
     }
@@ -4190,7 +4194,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
@@ -4233,7 +4237,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 500, false, is_head, ordinary_local_response_version(conn));
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
             // Distinguish "user didn't supply a body" (body_idx == 0)
@@ -4310,7 +4314,7 @@ void handle_jit_outcome(Loop* loop,
             }
             release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            send_terminal_response();
             return;
         }
         case JitDispatchOutcome::Kind::Redirect: {
@@ -4334,7 +4338,7 @@ void handle_jit_outcome(Loop* loop,
             conn.keep_alive = false;
             release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            send_terminal_response();
             return;
         }
         case JitDispatchOutcome::Kind::TimerYield: {
@@ -4369,7 +4373,7 @@ void handle_jit_outcome(Loop* loop,
             // on_response_sent's normal dispatch refresh would eventually
             // cover it, but only if the Send CQE arrives.
             loop->timer.add(&conn, loop->keepalive_timeout);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            send_terminal_response();
             return;
         }
         case JitDispatchOutcome::Kind::EventYield: {
@@ -4388,7 +4392,7 @@ void handle_jit_outcome(Loop* loop,
                                                             : HttpVersion::Http11);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
             };
             auto send_internal_error = [&]() {
                 // A failed io_uring TLS send may already have closed and reset
@@ -4404,7 +4408,7 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
             };
             auto upstream_target_matches = [&]() {
                 if (conn.upstream_fd < 0) return false;
@@ -4473,7 +4477,7 @@ void handle_jit_outcome(Loop* loop,
                                            ordinary_local_response_version(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                     return;
                 }
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
@@ -4532,8 +4536,8 @@ void handle_jit_outcome(Loop* loop,
             }
             if (outcome.yield_kind == jit::YieldKind::Any && outcome.timer_ms != 0 &&
                 !loop->schedule_yield_timer(conn, outcome.timer_ms)) {
-                send_internal_error();
                 loop->timer.refresh(&conn, loop->keepalive_timeout);
+                send_internal_error();
                 return;
             }
             auto disarm_yield_timer = [&]() {
@@ -5000,7 +5004,7 @@ void handle_jit_outcome(Loop* loop,
                                            ordinary_local_response_version(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                     return;
                 }
                 bool response_policy_request_connection = false;
@@ -5042,7 +5046,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
             if (outcome.request_policy_id == 0 && outcome.policy_bundle_id == 0 &&
@@ -5143,7 +5147,7 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
             if (strict_pipeline_successor) {
@@ -5413,7 +5417,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                     return;
                 }
                 conn.response_policy_id = forward_response_policy_id;
@@ -5432,7 +5436,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 500, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
             conn.state = ConnState::Proxying;
@@ -5456,7 +5460,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 503, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                     return;
                 }
                 conn.upstream_slot_held = true;
@@ -5497,7 +5501,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 500, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response();
                 return;
             }
 
@@ -5576,7 +5580,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                 }
                 return;
             }
@@ -5597,7 +5601,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_terminal_response();
                 }
                 return;
             }
@@ -5616,7 +5620,7 @@ void handle_jit_outcome(Loop* loop,
                                    ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            send_terminal_response();
             return;
     }
 }

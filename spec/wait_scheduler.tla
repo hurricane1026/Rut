@@ -2,6 +2,8 @@
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 \* Bounded logical scheduling contract; not extraction/proof of kernel/C++.
 \* Small BatchLimit explores the boundary; C++ tests cover 64/65/129 owners.
+\* Backend completion-ring deferral is outside this model; C++ backend tests
+\* cover its bounded send-state behavior.
 CONSTANTS OwnerCount, BatchLimit, Fault
 ASSUME /\ OwnerCount \in Nat /\ OwnerCount > 0
        /\ BatchLimit \in Nat /\ BatchLimit > 0
