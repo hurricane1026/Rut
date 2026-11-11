@@ -40687,19 +40687,31 @@ TEST(state_invariant, jit_downstream_send_yield_fails_closed_when_send_cannot_qu
     outcome.yield_kind = jit::YieldKind::Send;
     loop.backend.clear_ops();
     // The wait(downstream.send()) write cannot be queued (SQ-full analogue:
-    // add_send returns false). The handler must fail closed with a 500 instead
-    // of parking on pending_handler_fn for a Send completion that will never
-    // arrive, and recv must not be paused.
+    // add_send returns false). Its 500 fallback also fails in this fixture, so
+    // the terminal response path must close and free the owner rather than
+    // leaving it Sending without a completion. recv must not be paused.
     loop.backend.fail_send = true;
+    const u32 owner_id = c->id;
     handle_jit_outcome<SmallLoop>(&loop, *c, outcome, &state_invariant_configured_jit_result, true);
 
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->state, ConnState::Idle);
     CHECK_EQ(c->pending_handler_fn, nullptr);
-    CHECK_EQ(c->resp_status, 500u);
-    CHECK_EQ(c->state, ConnState::Sending);
-    CHECK_EQ(c->on_send, &on_response_sent<SmallLoop>);
+    CHECK_EQ(c->resp_status, 0u);
+    CHECK_EQ(c->on_send, nullptr);
     CHECK(!c->keep_alive);
     CHECK(!c->recv_paused_for_send);
+    CHECK(c->timer_node.empty());
     CHECK_EQ(loop.backend.count_ops(MockOp::PauseRecv), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.send_submit_attempts, 2u);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_FALSE(loop.has_ready_jit_handlers());
+    auto* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, owner_id);
+    loop.free_conn(*reused);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
 TEST(state_invariant, jit_send_failure_after_terminal_close_does_not_format_second_response) {
