@@ -48058,6 +48058,9 @@ TEST(frontend, jwt_any_scope_user_function_can_shadow_the_builtin) {
 
 TEST(frontend, consumer_registry_rejects_request_selected_or_invalid_configuration) {
     const char* invalid[] = {
+        R"rut(route GET "/" { let identity = consumerAuthenticateQuery(req.path, "{\"version\":1,\"consumers\":[],\"credentials\":[]}", req.header("Field").or("key")) return 204 })rut",
+        R"rut(route POST "/" { let identity = consumerAuthenticateForm(req.body, "{\"version\":1,\"consumers\":[],\"credentials\":[]}", "api%5fkey") return 204 })rut",
+        R"rut(route POST "/" { let identity = consumerAuthenticateForm(req.body, req.body, "key") return 204 })rut",
         R"rut(route GET "/" { let identity = consumerAuthenticate("key", "{\"version\":1,\"consumers\":[],\"credentials\":[]}", req.header("Method").or("header")) return 204 })rut",
         R"rut(route GET "/" { let identity = consumerAuthenticate("key", "{\"version\":1,\"consumers\":[],\"credentials\":[]}", "query") return 204 })rut",
         R"rut(route GET "/" { let identity = consumerAuthenticate(req.authorization.or(""), req.header("Registry").or(""), "bearer") return 204 })rut",
@@ -48082,6 +48085,23 @@ TEST(frontend, consumer_registry_allows_configuration_through_helper_local) {
 route GET "/" {
     let registry = "{\"version\":1,\"consumers\":[],\"credentials\":[]}"
     let identity = authenticate(registry)
+    return 204
+})rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, consumer_query_configuration_and_name_resolve_through_helpers) {
+    const char* source = R"rut(func check(_ registry: str, _ field: str) {
+    let snapshot = registry
+    consumerAuthenticateQuery(req.path, snapshot, field)
+}
+route GET "/" {
+    let registry = "{\"version\":1,\"consumers\":[],\"credentials\":[]}"
+    let identity = check(registry, "api_key")
     return 204
 })rut";
     auto tokens = lex(lit(source));

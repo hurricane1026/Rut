@@ -110,3 +110,51 @@ TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     CHECK(valid("https://issuer.example/tenant%2Fblue"));
     CHECK(valid("https://issuer.example:443"));
 }
+
+TEST(remote_jwks_metadata, dns_configuration_pairs_bounds_and_failure_reset) {
+    const char* base =
+        "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\",\"ca\":\"ca."
+        "pem\",\"path\":\"/keys\",\"refreshSeconds\":1,\"maxAgeSeconds\":3,\"timeoutSeconds\":1";
+    const char* invalid[] = {
+        ",\"dnsAddress\":\"192.0.2.53\"",
+        ",\"allowedAddresses\":[\"192.0.2.1\"]",
+        ",\"dnsPort\":53",
+        ",\"dnsAddress\":\"invalid\",\"allowedAddresses\":[\"192.0.2.1\"]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":{}}",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[7]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"invalid\"]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\\u0000\"]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\",\"192.0.2.2\",\"192.0."
+        "2.3\",\"192.0.2.4\",\"192.0.2.5\",\"192.0.2.6\",\"192.0.2.7\",\"192.0.2.8\",\"192.0.2."
+        "9\"]",
+        ",\"discoveryPath\":\"/discovery\"",
+        ",\"discoveryIssuer\":\"https://issuer.example\"",
+        ",\"discoveryPath\":\"unsafe\",\"discoveryIssuer\":\"https://issuer.example\"",
+        ",\"unknown\":1",
+        ",\"unknown\":true",
+        ",\"dnsPort\":65536",
+        ",\"timeoutSeconds\":61",
+        ",\"refreshSeconds\":3601",
+        ",\"maxAgeSeconds\":86401"};
+    json::Document document;
+    RemoteJwks configuration = policy();
+    char bytes[4096];
+    for (const char* extra : invalid) {
+        const int length = snprintf(bytes, sizeof(bytes), "{%s%s}", base, extra);
+        const bool parsed = document.parse({bytes, static_cast<u32>(length)});
+        CHECK(!parsed || !configuration.load(document, 0));
+        if (parsed) CHECK_EQ(configuration.allowed_count, 0u);
+    }
+    const int length = snprintf(
+        bytes,
+        sizeof(bytes),
+        "{%s,\"dnsAddress\":\"192.0.2.53\",\"dnsPort\":5353,\"allowedAddresses\":[\"192.0.2.1\"]}",
+        base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(length)}));
+    REQUIRE(configuration.load(document, 0));
+    CHECK_EQ(configuration.dns_port, 5353u);
+    CHECK_EQ(configuration.allowed_count, 1u);
+    CHECK(!configuration.load(document, document.count));
+    CHECK_EQ(configuration.allowed_count, 0u);
+}

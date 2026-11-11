@@ -4084,7 +4084,9 @@ static FrontendResult<void> normalize_consumer_registry(HirExpr& expression,
                                                         const HirLocal* locals,
                                                         u32 local_count) {
     if (expression.kind != HirExprKind::JsonOp ||
-        expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticate))
+        (expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticate) &&
+         expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateQuery) &&
+         expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateForm)))
         return {};
     if (expression.args.len != 3 || !expression.args[1])
         return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
@@ -4128,8 +4130,14 @@ static FrontendResult<void> normalize_consumer_registry(HirExpr& expression,
                               expression.span,
                               lit_str("Consumer method must be compile-time configuration"));
     }
-    if (!method->str_value.eq(lit_str("bearer")) && !method->str_value.eq(lit_str("basic")) &&
-        !method->str_value.eq(lit_str("header")))
+    const bool kFields = expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticate);
+    if (kFields && !consumer_credential_name_valid(method->str_value))
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              expression.span,
+                              lit_str("invalid Consumer credential field name"));
+    if (!kFields &&
+        (!method->str_value.eq(lit_str("bearer")) && !method->str_value.eq(lit_str("basic")) &&
+         !method->str_value.eq(lit_str("header"))))
         return frontend_error(FrontendError::UnsupportedSyntax,
                               expression.span,
                               lit_str("Consumer method must be bearer, basic or header"));
@@ -14382,7 +14390,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                             route);
     }
 
-    if (expr.name.eq(lit_str("consumerAuthenticate")) &&
+    if ((expr.name.eq(lit_str("consumerAuthenticate")) ||
+         expr.name.eq(lit_str("consumerAuthenticateQuery")) ||
+         expr.name.eq(lit_str("consumerAuthenticateForm"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 3)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -14396,7 +14406,11 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             values[i] = value.value();
         }
-        auto operation = make_json_op(json::Op::ConsumerAuthenticate,
+        const auto kOperation =
+            expr.name.eq(lit_str("consumerAuthenticateQuery")) ? json::Op::ConsumerAuthenticateQuery
+            : expr.name.eq(lit_str("consumerAuthenticateForm")) ? json::Op::ConsumerAuthenticateForm
+                                                                : json::Op::ConsumerAuthenticate;
+        auto operation = make_json_op(kOperation,
                                       HirTypeKind::Json,
                                       true,
                                       &values[0],

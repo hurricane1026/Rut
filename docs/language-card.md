@@ -3381,7 +3381,7 @@ invalid JSON/schema or request-derived configuration rejects compilation/loading
 It returns only request-owned `consumerId`, `credentialId`, `method` and `groups`.
 Authentication failure is nil; group authorization stays explicit. Pass singleton
 request header accessors; duplicates do not become guest access. No query/body
-credential source is enabled by this profile. See [Consumer registry](consumer-registry.md)
+credential source is implicitly enabled by this profile. See [Consumer registry](consumer-registry.md)
 for the exact schema, 32-Consumer/64-credential bounds, rotation, disabled state,
 RCU/native-program ownership, redaction and current publication interfaces.
 
@@ -3395,3 +3395,17 @@ no gateway Cache or GET-before-SET fallback is used. See [replay claims](auth-re
 for the freshness/retention assumption, failure uncertainty, persistence ownership
 and distinction from exactly-once business delivery. These are Rut functions,
 not new language keywords or runtime protocol opcodes.
+
+
+### Explicit Consumer query/form sources
+
+`consumerAuthenticateQuery(req.path, configuration, name)` and
+`consumerAuthenticateForm(req.body, configuration, name)` return optional Json.
+Registry/name must be compile-time strings. They authenticate one explicitly
+selected URL-encoded raw-key field against registry method `header`, reject all
+decoded duplicate names/malformed fields, and return identity plus sanitized
+`remaining` fields. The ASCII profile is bounded to 4096 input bytes, 64 fields,
+64-byte field names and 512 decoded credential bytes. Form callers require a
+singleton expected Content-Type. They do not mutate the original request or add
+implicit fallback; use an explicitly rebuilt upstream request, as in
+[the source/redaction contract](consumer-registry.md#explicit-query-and-form-credentials).

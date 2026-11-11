@@ -2838,7 +2838,9 @@ extern "C" void rut_helper_json(void* conn,
         op != static_cast<u32>(json::Op::JwtCertificateBound) &&
         op != static_cast<u32>(json::Op::JwtHasAllScopes) &&
         op != static_cast<u32>(json::Op::JwtHasAnyScope) &&
-        op != static_cast<u32>(json::Op::ConsumerAuthenticate))
+        op != static_cast<u32>(json::Op::ConsumerAuthenticate) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateQuery) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateForm))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2846,7 +2848,16 @@ extern "C" void rut_helper_json(void* conn,
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::ConsumerAuthenticate) {
+    if (operation == json::Op::ConsumerAuthenticateQuery ||
+        operation == json::Op::ConsumerAuthenticateForm) {
+        if (!consumer_registry_authenticate_fields(document,
+                                                   {b, b_len},
+                                                   {c, c_len},
+                                                   {a, a_len},
+                                                   operation == json::Op::ConsumerAuthenticateQuery,
+                                                   writer))
+            return;
+    } else if (operation == json::Op::ConsumerAuthenticate) {
         if (!consumer_registry_authenticate(document, {b, b_len}, {c, c_len}, {a, a_len}, writer))
             return;
     } else if (operation == json::Op::OauthIntrospectionRequest) {

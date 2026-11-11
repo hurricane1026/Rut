@@ -10944,3 +10944,21 @@ issuer, endpoint URI and kid/algorithm inventory remain configuration-owned.
 DNS/discovery/key stages share one deadline and retry cadence; failures do not
 renew key age. No libc DNS wait, redirects, request-selected endpoints, new
 library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).
+
+
+### Explicit encoded Consumer credential sources
+
+The query/form Consumer functions append JSON opcodes and reuse the existing
+compile-time registry proof, request-arena identity carrier and raw-key matcher.
+A bounded parser validates the whole ASCII URL-encoded field list, decodes names
+once for duplicate detection, authenticates exactly one selected source, then
+projects identity plus the untouched non-credential encoded fields. It never
+returns the key. Empty/ambiguous/over-capacity input fails closed. Original
+request bytes remain unchanged; the example rebuilds a fixed-endpoint HTTPS form
+POST and selects only sanitized fields and authenticated identity. No transparent
+forward/body rewrite is implied. See [the contract](docs/consumer-registry.md).
+
+`JwksFetch` publishes initialized state only after both HTTPS contexts initialize.
+Failed partial initialization cannot start a keys-only refresh, and a second init
+cannot overwrite an active fetch's trusted configuration. Lifecycle tests exercise
+DNS/discovery/keys, deadlines, cancellation, rebinding refusal and partial failure.

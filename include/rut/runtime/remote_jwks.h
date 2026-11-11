@@ -45,6 +45,7 @@ private:
     u64 started_ = 0;
     u32 timeout_ = 0;
     bool discovering_ = false;
+    bool initialized_ = false;
     bool begin_http(u64 now);
     bool fail();
 };

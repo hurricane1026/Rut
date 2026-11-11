@@ -838,9 +838,11 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   signed-request profile; no allow on uncertain write or cleanup failure.
 - [x] Bounded A-only DNS and issuer/JWKS-URI metadata validation for RS256/ES256
   refresh, with configured IP allowlists and existing monotonic cache expiry.
-- [ ] Remaining #1072 profiles: optional query/form credential extraction/removal
-  and administrative management surface; snapshot compilation/publication is the
-  current lifecycle interface, not a new CLI watcher or IAM platform.
+- [x] Explicit bounded query/form Consumer raw-key authentication with decoded
+  duplicate rejection and sanitized fields for rebuilt HTTPS requests.
+- [ ] Remaining #1072 interfaces: administrative management surface and transparent
+  request-target/body mutation; snapshot compilation/publication and explicit
+  rebuilt messages are the current interfaces, not a new CLI watcher/IAM platform.
 - [ ] Deployment-level persistence/failover verification for the replay authority;
   broad DNS profiles/automatic kid onboarding remain separately scoped.
 

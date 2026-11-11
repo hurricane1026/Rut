@@ -4065,16 +4065,17 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 }
                 if (inst.op == rir::Opcode::JsonOp) {
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
+                    const bool kConsumer = kJsonOp == json::Op::ConsumerAuthenticate ||
+                                           kJsonOp == json::Op::ConsumerAuthenticateQuery ||
+                                           kJsonOp == json::Op::ConsumerAuthenticateForm;
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                         kJsonOp == json::Op::OauthIntrospectionValid ||
                         kJsonOp == json::Op::OauthClientCredentialsRequest ||
                         kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                        kJsonOp == json::Op::OauthTokenExchangeRequest ||
-                        kJsonOp == json::Op::ConsumerAuthenticate) {
+                        kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer) {
                         const u32 kCount =
                             (kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                             kJsonOp == json::Op::OauthTokenExchangeRequest ||
-                             kJsonOp == json::Op::ConsumerAuthenticate)
+                             kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer)
                                 ? 3u
                                 : 2u;
                         if (inst.operand_count != kCount || inst.extra_operands ||
@@ -4093,8 +4094,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                            kJsonOp == json::Op::OauthTokenExchangeRequest ||
-                            kJsonOp == json::Op::ConsumerAuthenticate) {
+                            kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||
                                 result->struct_def || result->inner->kind != rir::TypeKind::Str ||
                                 result->inner->inner || result->inner->struct_def)

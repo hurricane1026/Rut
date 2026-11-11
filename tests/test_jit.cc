@@ -32839,3 +32839,54 @@ TEST(jit, consumer_registry_retains_projected_identity_without_secret_fields) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, consumer_query_authentication_returns_sanitized_fields) {
+    const char* source = R"rut(route GET "/" {
+    guard let identity = consumerAuthenticateQuery(req.path,
+        "{\"version\":1,\"consumers\":[{\"id\":\"alice\",\"enabled\":true,\"groups\":[\"staff\"]}],\"credentials\":[{\"id\":\"key-v1\",\"consumerId\":\"alice\",\"enabled\":true,\"method\":\"header\",\"secret\":\"current-key\"}]}",
+        "api_key") else { return 401 }
+    guard jwtHasGroup(identity, "staff") else { return 403 }
+    guard json.get(identity, "/secret") == nil else { return 500 }
+    guard json.string(json.get(identity, "/remaining").or(identity)).or("bad") == "item=1" else { return 500 }
+    return 204
+})rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const char* requests[] = {
+        "GET /?api%5fkey=current-key&item=1 HTTP/1.1\r\n\r\n",
+        "GET /?api_key=wrong&item=1 HTTP/1.1\r\n\r\n",
+        "GET /?api_key=current-key&api%5Fkey=current-key HTTP/1.1\r\n\r\n",
+    };
+    for (u32 i = 0; i < 3; ++i) {
+        arena.reset();
+        auto result = HandlerResult::unpack(handler(nullptr,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(requests[i]),
+                                                    static_cast<u32>(strlen(requests[i])),
+                                                    &arena));
+        CHECK_EQ(result.status_code, i == 0 ? 204u : 401u);
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}

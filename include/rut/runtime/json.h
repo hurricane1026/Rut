@@ -90,6 +90,8 @@ enum class Op : u8 {
     JwtHasAllScopes,
     JwtHasAnyScope,
     ConsumerAuthenticate,
+    ConsumerAuthenticateQuery,
+    ConsumerAuthenticateForm,
 
 };
 

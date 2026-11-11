@@ -4043,6 +4043,12 @@ if(RUT_ENABLE_JIT)
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
             foreach(auth_free_backend epoll io_uring)
+                add_test(NAME test_consumer_fields_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_fields.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-fields-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend})
+                set_tests_properties(test_consumer_fields_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 add_test(NAME test_consumer_registry_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_registry.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-registry-auth.rut

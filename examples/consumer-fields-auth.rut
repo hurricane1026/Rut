@@ -1,0 +1,36 @@
+// Explicit query/form API keys. AUTH_REGISTRY uses method "header" for raw keys.
+// Sanitized fields are sent as a new form POST to one trusted HTTPS endpoint;
+// the incoming target, body, Authorization and identity headers are never copied.
+listen :8080
+
+func submit(_ identity: Json) -> Json {
+    guard let subject = json.string(json.get(identity, "/consumerId").or(identity)) else { nil }
+    guard let fields = json.string(json.get(identity, "/remaining").or(identity)) else { nil }
+    guard let base = json.parse("{\"Content-Type\":\"application/x-www-form-urlencoded\"}") else { nil }
+    guard let value = json.value(subject) else { nil }
+    guard let headers = json.member(base, "X-Consumer-ID", value) else { nil }
+    guard let request = json.value({method: "POST", headers: headers, body: fields}) else { nil }
+    httpCall(env("CONSUMER_SUBMIT_ENDPOINT"), request, 1000)
+}
+func requireSubmitted(_ pending: Json) -> i32 {
+    guard json.bool(json.get(pending, "/ok").or(pending)).or(false) else { respond 503 }
+    guard json.int(json.get(pending, "/status").or(pending)).or(0) == 200 else { respond 503 }
+    204
+}
+route GET "/query" {
+    guard let identity = consumerAuthenticateQuery(req.path, env("AUTH_REGISTRY"), "api_key") else { return 401 }
+    let pending = submit(identity)
+    guard let reply = pending else { return 503 }
+    let accepted = requireSubmitted(reply)
+    return 204
+}
+route POST "/form" {
+    guard req.uniqueHeader("Content-Type").or("") == "application/x-www-form-urlencoded" else { return 415 }
+    guard let identity = consumerAuthenticateForm(req.body, env("AUTH_REGISTRY"), "api_key") else { return 401 }
+    let pending = submit(identity)
+    guard let reply = pending else { return 503 }
+    let accepted = requireSubmitted(reply)
+    return 204
+}
+route GET "/ready" { return 204 }
+route "/" { return 404 }

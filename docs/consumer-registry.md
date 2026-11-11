@@ -32,15 +32,57 @@ syntax/canonical encoding and constant-time equal-length secret comparison.
 `header` admits the bounded Bearer-key byte grammar as an exact custom-header key.
 Use `req.authorization.or("")` for Authorization or `req.uniqueHeader(name).or("")`
 for a custom header: duplicates become absent, never an anonymous grant. These
-are explicitly header-only methods. Query, cookie and body credentials are not
-implicitly extracted; no version-1 configuration can enable them. Query/form
-credential extraction and removal remain a separate, unimplemented profile.
+methods never implicitly extract query, cookie or body credentials. Explicit
+query/form admission is available through the separate functions below.
 
 A successful result owns only `consumerId`, `credentialId`, `method`, and `groups`
 in the request arena. It contains no secret or full registry. Missing, malformed,
 wrong, disabled or revoked credentials return nil; authorization remains separate
 (e.g. `jwtHasGroup(identity, "staff")`). There is no guest fallback. Match results
 never accept client identity/group headers as proof.
+
+## Explicit query and form credentials
+
+`consumerAuthenticateQuery(target, configuration, name) -> Json?` accepts the raw
+origin-form `req.path` (including its query); `consumerAuthenticateForm(body,
+configuration, name) -> Json?` accepts an application/x-www-form-urlencoded body.
+Both use raw-key registry records with method `header`. Registry and field name
+must resolve to compile-time configuration; name is 1–64 ASCII letters, digits,
+`_`, `-` or `.`. Routes explicitly select one source. Authorization, cookies and
+other headers are never fallback credentials. Form routes must additionally
+require exactly one expected Content-Type before calling the function; the example
+admits the exact `application/x-www-form-urlencoded` spelling without parameters.
+
+The finite ASCII profile accepts at most 4096 input bytes and 64 fields. Every
+field requires a nonempty valid name followed by `=`. Percent triplets decode
+once and `+` becomes space. All decoded names must be unique, including encoded
+aliases such as `api_key` / `api%5Fkey`; duplicates of business fields reject too.
+Malformed escapes, controls/NUL, non-ASCII decoded bytes, raw semicolons/fragments,
+empty segments and trailing `&` reject the entire input. The decoded credential
+must be nonempty, at most 512 bytes, and pass the existing raw-key grammar.
+Unknown, disabled, wrong or ambiguous keys return nil without a partial identity.
+
+On success the identity additionally contains `remaining`: URL-encoded fields
+with the credential field removed, preserving every other field's exact encoded
+bytes and order. Empty remaining content is an empty string. Neither the decoded
+credential nor the full registry appears in this result. The remaining fields
+are still untrusted application input; this is not general secret classification.
+The original request bytes are unchanged. Do **not** pass the original request to
+transparent `forward` and claim it was sanitized. Build a new outbound message
+from `remaining` and the verified identity instead.
+
+[consumer-fields-auth.rut](../examples/consumer-fields-auth.rut) demonstrates this
+contract: both source-specific routes submit sanitized fields as a new form POST
+to one configuration-owned verified HTTPS `httpCall` endpoint. The downstream
+query target and original body/headers are not copied, and client identity headers
+cannot select the forwarded Consumer. This is a bounded callout adapter, not a
+transparent body/target rewriting proxy. Its remote success is required before
+returning 204. Native H1/H2 tests inspect the actual upstream wire contents on both
+backends after deleting the source, and verify invalid requests make no callout.
+
+Keep credentials out of custom logs/traces. The supported downstreamRequestBytes
+and downstreamHost access-log formats do not include query/form content; this API
+does not retroactively redact external capture systems or arbitrary user logging.
 
 ## Lifecycle and publication
 

@@ -267,12 +267,15 @@ JwksFetch::~JwksFetch() {
     cancel();
 }
 bool JwksFetch::init(const RemoteJwks& configuration) {
+    if (initialized_ || state_ == State::Busy || !keys_.init(configuration.endpoint)) return false;
+    if (configuration.discovery_path[0]) {
+        HttpsEndpoint endpoint = configuration.endpoint;
+        __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
+        if (!discovery_.init(endpoint)) return false;
+    }
     configuration_ = configuration;
-    if (!keys_.init(configuration.endpoint)) return false;
-    if (!configuration.discovery_path[0]) return true;
-    HttpsEndpoint endpoint = configuration.endpoint;
-    __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
-    return discovery_.init(endpoint);
+    initialized_ = true;
+    return true;
 }
 void JwksFetch::cancel() {
     if (dns_fd_ >= 0) ::close(dns_fd_);
@@ -292,7 +295,7 @@ bool JwksFetch::begin_http(u64 now) {
     return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) || fail();
 }
 bool JwksFetch::start(u64 now, u32 timeout_ms) {
-    if (state_ == State::Busy || !now || !timeout_ms) return false;
+    if (!initialized_ || state_ == State::Busy || !now || !timeout_ms) return false;
     cancel();
     started_ = now;
     timeout_ = timeout_ms;

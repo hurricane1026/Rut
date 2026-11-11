@@ -173,4 +173,113 @@ bool consumer_registry_authenticate(
     output.put('}');
     return output.ok;
 }
+namespace {
+i32 field_hex(char byte) {
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    return -1;
+}
+bool decode_field(Str raw, char* bytes, u32 capacity, u32& length) {
+    length = 0;
+    for (u32 i = 0; i < raw.len; ++i) {
+        u32 byte = static_cast<u8>(raw.ptr[i]);
+        if (byte == '%') {
+            if (raw.len - i < 3) return false;
+            const i32 high = field_hex(raw.ptr[i + 1]), low = field_hex(raw.ptr[i + 2]);
+            if (high < 0 || low < 0) return false;
+            byte = static_cast<u32>(high * 16 + low);
+            i += 2;
+        } else if (byte == '+')
+            byte = ' ';
+        // ASCII profile rejects controls, NUL and alternate raw delimiters.
+        else if (byte == ';' || byte == '#')
+            return false;
+        if (byte < 32 || byte > 126 || length == capacity) return false;
+        bytes[length++] = static_cast<char>(byte);
+    }
+    return true;
+}
+}  // namespace
+bool consumer_credential_name_valid(Str name) {
+    if (!name.ptr || !name.len || name.len > 64) return false;
+    for (u32 i = 0; i < name.len; ++i) {
+        const char byte = name.ptr[i];
+        if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9') || byte == '_' || byte == '-' || byte == '.'))
+            return false;
+    }
+    return true;
+}
+bool consumer_registry_authenticate_fields(json::Document& document,
+                                           Str configuration,
+                                           Str name,
+                                           Str input,
+                                           bool query,
+                                           json::Writer& output) {
+    if (!consumer_credential_name_valid(name) || !input.ptr || !input.len || input.len > 4096)
+        return false;
+    if (query) {
+        if (input.ptr[0] != '/') return false;
+        u32 separator = input.len;
+        for (u32 i = 0; i < input.len; ++i) {
+            const auto byte = static_cast<u8>(input.ptr[i]);
+            if (byte <= 32 || byte >= 127 || byte == '#') return false;
+            if (byte == '?' && separator == input.len) separator = i;
+        }
+        if (separator == input.len) return false;
+        input = {input.ptr + separator + 1, input.len - separator - 1};
+    }
+    char names[64][64]{};
+    u32 lengths[64]{};
+    u32 count = 0;
+    char credential[512]{};
+    u32 credential_length = 0;
+    char remaining[4096]{};
+    u32 remaining_length = 0;
+    for (u32 begin = 0; begin < input.len;) {
+        if (count == 64) return false;
+        u32 end = begin, equals = input.len;
+        while (end < input.len && input.ptr[end] != '&') {
+            if (input.ptr[end] == '=' && equals == input.len) equals = end;
+            ++end;
+        }
+        if (equals >= end || equals == begin || end == begin ||
+            !decode_field({input.ptr + begin, equals - begin}, names[count], 64, lengths[count]) ||
+            !consumer_credential_name_valid({names[count], lengths[count]}))
+            return false;
+        const Str current{names[count], lengths[count]};
+        for (u32 n = 0; n < count; ++n)
+            if (current.eq({names[n], lengths[n]})) return false;
+        char decoded[4096];
+        u32 decoded_length = 0;
+        if (!decode_field({input.ptr + equals + 1, end - equals - 1},
+                          decoded,
+                          sizeof(decoded),
+                          decoded_length))
+            return false;
+        if (current.eq(name)) {
+            if (!decoded_length || decoded_length > sizeof(credential)) return false;
+            __builtin_memcpy(credential, decoded, decoded_length);
+            credential_length = decoded_length;
+        } else {
+            if (remaining_length) remaining[remaining_length++] = '&';
+            __builtin_memcpy(remaining + remaining_length, input.ptr + begin, end - begin);
+            remaining_length += end - begin;
+        }
+        ++count;
+        if (end + 1 == input.len) return false;
+        begin = end + 1;
+    }
+    if (!credential_length ||
+        !consumer_registry_authenticate(
+            document, configuration, lit_str("header"), {credential, credential_length}, output))
+        return false;
+    // Authentication wrote one complete identity object. Extend only on success.
+    --output.len;
+    output.text(lit_str(",\"remaining\":"));
+    if (!json::quote({remaining, remaining_length}, output)) return false;
+    output.put('}');
+    return output.ok;
+}
 }  // namespace rut

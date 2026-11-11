@@ -1140,3 +1140,144 @@ TEST(net_client, idle_pool_capacity_does_not_consume_live_lease_slots) {
         CHECK_EQ(pool_call(worker, NetOp::Release, i + 1, 2, handles[i]).scalar, 0u);
     worker.stop();
 }
+
+namespace {
+struct DnsOrigin {
+    int fd = -1;
+    u16 port = 0;
+    bool init() {
+        fd = test::cloexec_socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0 || fcntl(fd, F_SETFL, O_NONBLOCK) < 0) return false;
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (fd < 0 || bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+            return false;
+        socklen_t size = sizeof(address);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) return false;
+        port = ntohs(address.sin_port);
+        return true;
+    }
+    bool reply(bool allowed) {
+        u8 packet[512]{};
+        sockaddr_in peer{};
+        socklen_t size = sizeof(peer);
+        const auto length =
+            recvfrom(fd, packet, sizeof(packet) - 16, 0, reinterpret_cast<sockaddr*>(&peer), &size);
+        if (length < 0) return false;
+        packet[2] = 0x81;
+        packet[3] = 0x80;
+        packet[7] = 1;
+        const u8 answer[] = {
+            0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, static_cast<u8>(allowed ? 1 : 2)};
+        __builtin_memcpy(packet + length, answer, sizeof(answer));
+        return sendto(fd,
+                      packet,
+                      static_cast<u32>(length) + sizeof(answer),
+                      0,
+                      reinterpret_cast<sockaddr*>(&peer),
+                      size) == length + static_cast<ssize_t>(sizeof(answer));
+    }
+    ~DnsOrigin() {
+        if (fd >= 0) close(fd);
+    }
+};
+void complete_jwks(JwksFetch& fetch, DnsOrigin* resolver = nullptr, bool allowed = true) {
+    for (u32 i = 0; i < 3000 && fetch.state() == JwksFetch::State::Busy; ++i) {
+        if (resolver) (void)resolver->reply(allowed);
+        fetch.advance(jwt_monotonic_ms());
+        usleep(1000);
+    }
+}
+}  // namespace
+TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
+    signal(SIGPIPE, SIG_IGN);
+    DnsOrigin dns;
+    REQUIRE(dns.init());
+    TlsOrigin origin;
+    REQUIRE(origin.init());
+    char discovery[2048];
+    char body[1024];
+    const int body_length =
+        snprintf(body,
+                 sizeof(body),
+                 "{\"issuer\":\"https://localhost/tenant\",\"jwks_uri\":\"https://localhost:%u/"
+                 "keys?profile=rs256\"}",
+                 origin.port);
+    const int size = snprintf(
+        discovery,
+        sizeof(discovery),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+        body_length,
+        body);
+    REQUIRE(size > 0);
+    const Str keys = lit_str(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        "11\r\n\r\n{\"keys\":[]}");
+    origin.responses[0] = {discovery, static_cast<u32>(size)};
+    origin.responses[1] = keys;
+    origin.count = 2;
+    RemoteJwks configuration;
+    configuration.endpoint = origin.endpoint();
+    strcpy(configuration.discovery_path, "/.well-known/openid-configuration");
+    strcpy(configuration.discovery_issuer, "https://localhost/tenant");
+    strcpy(configuration.dns_address, "127.0.0.1");
+    strcpy(configuration.allowed_addresses[0], "127.0.0.1");
+    configuration.allowed_count = 1;
+    configuration.dns_port = dns.port;
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    CHECK(!fetch.start(0, 1000));
+    CHECK(!fetch.start(jwt_monotonic_ms(), 0));
+    REQUIRE(fetch.start(jwt_monotonic_ms(), 3000));
+    CHECK(!fetch.init(RemoteJwks{}));
+    CHECK(!fetch.start(jwt_monotonic_ms(), 3000));
+    CHECK(fetch.body().len == 0);
+    complete_jwks(fetch, &dns);
+    REQUIRE_EQ(fetch.state(), JwksFetch::State::Done);
+    CHECK(fetch.body().eq(lit_str("{\"keys\":[]}")));
+    fetch.advance(0);  // A completed result is stable until explicit restart/cancel.
+    CHECK_EQ(fetch.state(), JwksFetch::State::Done);
+    REQUIRE(fetch.start(jwt_monotonic_ms(), 3000));
+    complete_jwks(fetch, &dns, false);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    CHECK_EQ(fetch.body().len, 0u);
+    const u64 now = jwt_monotonic_ms();
+    REQUIRE(fetch.start(now, 100));
+    fetch.advance(now + 100);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    REQUIRE(fetch.start(now, 100));
+    fetch.advance(now - 1);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    REQUIRE(fetch.start(now, 100));
+    fetch.cancel();
+    CHECK_EQ(fetch.state(), JwksFetch::State::Cancelled);
+    fetch.advance(now + 1);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Cancelled);
+}
+TEST(https_fetch, jwks_discovery_rejects_mismatched_origin_and_uninitialized_fetch) {
+    signal(SIGPIPE, SIG_IGN);
+    TlsOrigin origin;
+    origin.responses[0] =
+        lit_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    origin.count = 1;
+    REQUIRE(origin.init());
+    RemoteJwks configuration;
+    configuration.endpoint = origin.endpoint();
+    strcpy(configuration.discovery_path, "/discovery");
+    strcpy(configuration.discovery_issuer, "https://localhost");
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    REQUIRE(fetch.start(jwt_monotonic_ms(), 2000));
+    complete_jwks(fetch);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    CHECK_EQ(fetch.body().len, 0u);
+    JwksFetch uninitialized;
+    CHECK(!uninitialized.start(jwt_monotonic_ms(), 1000));
+    CHECK_EQ(uninitialized.state(), JwksFetch::State::Idle);
+    configuration.discovery_path[0] = 'x';  // keys init succeeds, discovery init rejects.
+    JwksFetch partial;
+    CHECK(!partial.init(configuration));
+    CHECK(!partial.start(jwt_monotonic_ms(), 1000));
+    CHECK_EQ(partial.state(), JwksFetch::State::Idle);
+}
