@@ -17,6 +17,13 @@ There are no new keywords, runtime protocol handlers or linked dependencies.
 | `memcacheReplace(connection, key, value, options)` | Store only if present; the same typed store result. |
 | `memcacheDelete(connection, key)` | `MemcacheCommandResult`: `ok`, `missing`, or failure. |
 | `memcacheTouch(connection, key, seconds)` | Change relative expiration; the same typed command result. |
+| `memcacheAppend(connection, key, data)` / `memcachePrepend(...)` | Add binary data to an existing item; `MemcacheStoreResult`. |
+| `memcacheGets(connection, key)` | Fetch data, flags and an opaque CAS identifier; `MemcacheGetsResult`. |
+| `memcacheCas(connection, key, data, options, cas)` | Conditional write; `MemcacheCasResult`. |
+| `memcacheIncrement(connection, key, amount)` / `memcacheDecrement(...)` | Modify an existing unsigned counter; `MemcacheCounterResult`. |
+| `memcacheGat(connection, key, seconds)` / `memcacheGats(...)` | Fetch and replace relative expiration, without/with CAS. |
+| `memcacheMultiGet(connection, keys)` / `memcacheMultiGets(...)` | Fetch up to eight unique keys; `MemcacheManyResult`. |
+| `memcacheMultiGat(connection, keys, seconds)` / `memcacheMultiGats(...)` | Fetch and replace expiration for the found keys. |
 
 `memcacheStore(connection, mode, key, value, options)` accepts the closed
 `MemcacheStoreMode` choices `set`, `add`, `replace`. A conditional miss is
@@ -81,9 +88,68 @@ The [executable example](../examples/memcache-client.rut) uses
 
 Verified TLS uses the unchanged `tls`, `caFile` and `serverName` policy fields.
 Use a dedicated policy for this unauthenticated basic-text profile. Text-token
-authentication (`-Y`), binary/SASL, meta commands, CAS/gets, counters, multi-get,
-pipelining, UDP, failover and background sessions are not provided by this
-initial client. It is not an implementation of a distributed Cache backend.
+authentication (`-Y`), binary/SASL, meta commands, pipelining, UDP, failover and
+background sessions are not provided. It is not an implementation of a
+distributed Cache backend.
+
+## CAS, counters and concatenation
+
+`MemcacheGetsResult` distinguishes `value(MemcacheCasItem)`, `missing` and the
+ordinary failure classes. An item retains `data`, unsigned-32-bit `flags` and
+unsigned-64-bit `cas` as Bytes. Keep the token opaque and pass it to
+`memcacheCas`; do not narrow it through a signed integer. CAS requires server
+CAS support. `MemcacheCasResult` distinguishes `stored`, `exists` (version
+conflict), `missing` (deleted/expired), `notStored` and ordinary failures. A
+conflict is not retried. The caller decides whether to re-read and recompute.
+
+The [CAS example](../examples/memcache-cas-client.rut) exposes POST `/gets`
+(a decimal CAS line, CRLF, then binary data) and POST `/cas` (`X-Key`, `X-CAS`
+and binary body). It returns 409 for a conflict and 404 for a missing item.
+Successful CAS applies the supplied flags and relative TTL; the example uses
+zero for both. The example uses the same `MEMCACHE_ENDPOINT` policy.
+
+Counter amounts and results are decimal Bytes in `0...18446744073709551615`.
+`MemcacheCounterResult.value(Bytes)` preserves this full unsigned range;
+`missing` does not create a counter. Increment wraps at 64 bits; decrement
+saturates at zero. Non-numeric stored data is a server error. Decimal fields
+must contain 1–20 digits, without signs or padding; overflow is rejected before
+I/O or as an invalid reply. No source-level unsigned numeric type is invented.
+An ordinary GET still returns exact stored data, including any space padding a
+server retains after shortening a counter.
+
+Append/prepend return `stored` or `notStored` for an absent item. They preserve
+the item's flags and expiration, including when adding empty or binary data.
+They take no replacement flags/TTL arguments. The existing three-case
+`MemcacheStoreMode` remains unchanged.
+
+## Multiple keys and get-and-touch
+
+Build `MemcacheKeys` with `memcacheKeys()` and `memcacheKeysAdd(keys, key)`.
+The immutable builder admits at most eight distinct 1–250-byte keys, totaling
+at most 2007 bytes including spaces. `memcacheManyRequest(keys, mode, seconds)`
+revalidates public bytes/count fields, delimiters, lengths and duplicates before
+I/O. `MemcacheRetrievalMode` is `plain`, `cas`, `touching` or `touchingCas`, for
+get, gets, gat or gats respectively. Ordinary callers can use the named wrappers.
+
+`MemcacheManyResult.values(MemcacheManyReply)` is published only after a complete
+END-terminated response. `reply.count` counts found values; zero is a successful
+all-missing lookup. `memcacheManyItem(reply, index)` returns an optional item
+with `key`, `data`, `flags` and `cas`. Items retain server response order rather
+than the input key order. The CAS field is empty for plain get/gat. Negative or
+out-of-range indices return nil. Views survive later I/O and release/close
+within the request. Keep the echoed key when associating results with inputs.
+
+GAT returns the ordinary `MemcacheGetResult`; GATS returns
+`MemcacheGetsResult`. Their multi-key equivalents return `MemcacheManyResult`.
+They update expiration for found items and keep missing items distinct. Only
+the existing relative TTL range is accepted; zero removes expiration. A failed
+get-and-touch is a possibly-applied mutation, not a reason to replay it.
+
+The scanner follows declared payload lengths and validates the whole response
+before publication: no unrequested/duplicate key, unexpected/missing CAS,
+invalid flags/length, partial-error suffix or data after END is accepted. A
+multi-key read uses the same four-receive, 8192-byte, fixed-deadline profile as
+single-key reads. There is no implicit pipeline, quiet command or retry.
 
 ## Validation
 
@@ -98,3 +164,9 @@ Live profiles use the official Memcached 1.6.45 Alpine image pinned to
 with TCP and TLS on both backends. Docker is an existing test mechanism and the
 server image is test-only. These profiles check interoperability, conditional
 writes, flags, delete/touch and actual expiration; no host OpenSSL CLI is used.
+
+`test_memcache_advanced.py` adds independent wire fixtures and the same live
+TCP/TLS/backend matrix for CAS conflicts, full-width unsigned counters,
+append/prepend metadata preservation, multi-key membership/order/bounds,
+GAT/GATS expiration, fragmentation and poisoned aliases. The CAS example runs
+at O2 on both backends. All native tests remove source/import files after startup.

@@ -3251,13 +3251,16 @@ reinstantiated in the active scope; source evaluation semantics are unchanged.
 
 ## Memcached library client
 
-Import `"clients/memcache-client.rut"` from an example for bounded single-key
-GET, SET/ADD/REPLACE, DELETE and TOUCH. These are ordinary Rut functions over
+Import `"clients/memcache-client.rut"` from an example for bounded GET/GETS,
+CAS, multi-key retrieval, unsigned counters, append/prepend, GAT/GATS,
+SET/ADD/REPLACE, DELETE and TOUCH. These are ordinary Rut functions over
 the existing TCP/TLS and Bytes surface. Typed results preserve misses, empty
 binary values, conditional non-storage and distinct failure classes. Successful
 commands allow explicit pool return; server/transport/framing errors close the
 handle. Four receives and 8192-byte request/reply bounds remain within the
-existing I/O profile. See [options, TTL limits and example](memcache-client.md).
+existing I/O profile. CAS/counter fields retain the full unsigned 64-bit range
+as validated decimal Bytes; multi-key replies publish only after END and retain
+each echoed key. See [options, TTL limits and examples](memcache-client.md).
 
 ## Online HS256 JWT session permits
 

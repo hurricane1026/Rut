@@ -191,3 +191,252 @@ func memcacheTouch(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32) ->
     let result = memcacheTouchExecute(connection, key, seconds)
     memcacheCommandFinish(connection, result)
 }
+
+// append/prepend preserve the existing item's flags and expiration.
+func memcacheConcatExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ front: bool) -> MemcacheStoreResult {
+    guard let request = memcacheConcatRequest(key, value, front) else { MemcacheStoreResult.requestFailure }
+    let result = memcacheWire(connection, request, key)
+    match result {
+        .reply(reply) => memcacheStoreReply(reply)
+        .transportFailure(code) => MemcacheStoreResult.transportFailure(code)
+        .replyFailure => MemcacheStoreResult.replyFailure
+    }
+}
+func memcacheConcat(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ front: bool) -> MemcacheStoreResult {
+    let result = memcacheConcatExecute(connection, key, value, front)
+    if memcacheStoreMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func memcacheAppend(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) -> MemcacheStoreResult {
+    memcacheConcat(connection, key, value, false)
+}
+func memcachePrepend(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) -> MemcacheStoreResult {
+    memcacheConcat(connection, key, value, true)
+}
+variant MemcacheCounterResult {
+    value(Bytes)
+    missing
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheCounterReply(_ reply: MemcacheReply) -> MemcacheCounterResult {
+    match reply.kind {
+        10 => MemcacheCounterResult.value(reply.data)
+        6 => MemcacheCounterResult.missing
+        8 => MemcacheCounterResult.serverError(reply.data)
+        _ => MemcacheCounterResult.replyFailure
+    }
+}
+func memcacheCounterExecute(_ connection: TcpConnection, _ key: Bytes, _ amount: Bytes, _ decrement: bool) -> MemcacheCounterResult {
+    guard let request = memcacheCounterRequest(key, amount, decrement) else { MemcacheCounterResult.requestFailure }
+    let result = memcacheWire(connection, request, key)
+    match result {
+        .reply(reply) => memcacheCounterReply(reply)
+        .transportFailure(code) => MemcacheCounterResult.transportFailure(code)
+        .replyFailure => MemcacheCounterResult.replyFailure
+    }
+}
+func memcacheCounter(_ connection: TcpConnection, _ key: Bytes, _ amount: Bytes, _ decrement: bool) -> MemcacheCounterResult {
+    let result = memcacheCounterExecute(connection, key, amount, decrement)
+    match result {
+        .value(number) => result
+        .missing => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func memcacheIncrement(_ connection: TcpConnection, _ key: Bytes, _ amount: Bytes) -> MemcacheCounterResult {
+    memcacheCounter(connection, key, amount, false)
+}
+func memcacheDecrement(_ connection: TcpConnection, _ key: Bytes, _ amount: Bytes) -> MemcacheCounterResult {
+    memcacheCounter(connection, key, amount, true)
+}
+variant MemcacheCasResult {
+    stored
+    exists
+    missing
+    notStored
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheCasReply(_ reply: MemcacheReply) -> MemcacheCasResult {
+    match reply.kind {
+        3 => MemcacheCasResult.stored
+        9 => MemcacheCasResult.exists
+        6 => MemcacheCasResult.missing
+        4 => MemcacheCasResult.notStored
+        8 => MemcacheCasResult.serverError(reply.data)
+        _ => MemcacheCasResult.replyFailure
+    }
+}
+func memcacheCasExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) -> MemcacheCasResult {
+    guard let request = memcacheCasRequest(key, value, settings, cas) else { MemcacheCasResult.requestFailure }
+    let result = memcacheWire(connection, request, key)
+    match result {
+        .reply(reply) => memcacheCasReply(reply)
+        .transportFailure(code) => MemcacheCasResult.transportFailure(code)
+        .replyFailure => MemcacheCasResult.replyFailure
+    }
+}
+func memcacheCas(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) -> MemcacheCasResult {
+    let result = memcacheCasExecute(connection, key, value, settings, cas)
+    match result {
+        .stored => result
+        .exists => result
+        .missing => result
+        .notStored => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+variant MemcacheManyResult {
+    values(MemcacheManyReply)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheManyReceive(_ connection: TcpConnection, _ stream: MemcacheManyStream, _ keys: Bytes, _ withCas: bool) -> MemcacheManyStream {
+    if stream.kind == 0 {
+        guard stream.bytes.count < 8192 else { nil }
+        let reading = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+        memcacheManyFeed(bytes, keys, withCas)
+    } else { stream }
+}
+func memcacheManyReadPair(_ connection: TcpConnection, _ stream: MemcacheManyStream, _ keys: Bytes, _ withCas: bool) -> MemcacheManyStream {
+    let readingFirst = memcacheManyReceive(connection, stream, keys, withCas)
+    guard let first = readingFirst else { nil }
+    let readingSecond = memcacheManyReceive(connection, first, keys, withCas)
+    guard let second = readingSecond else { nil }
+    second
+}
+func memcacheManyRead(_ connection: TcpConnection, _ keys: Bytes, _ withCas: bool) -> MemcacheManyStream {
+    let initial = MemcacheManyStream(bytes: b"", kind: 0, count: 0)
+    let readingFirst = memcacheManyReadPair(connection, initial, keys, withCas)
+    guard let first = readingFirst else { nil }
+    let readingSecond = memcacheManyReadPair(connection, first, keys, withCas)
+    guard let second = readingSecond else { nil }
+    second
+}
+func memcacheManyReadFailure(_ code: i32) -> MemcacheManyResult {
+    if code == 0 { MemcacheManyResult.replyFailure } else { MemcacheManyResult.transportFailure(code) }
+}
+func memcacheManyWire(_ connection: TcpConnection, _ request: Bytes, _ keys: Bytes, _ withCas: bool) -> MemcacheManyResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheManyResult.transportFailure(netError()) }
+    let reading = memcacheManyRead(connection, keys, withCas)
+    guard let stream = reading else { memcacheManyReadFailure(netError()) }
+    if stream.kind == 8 {
+        let token = memcacheValueToken(stream.bytes, 0, withCas)
+        MemcacheManyResult.serverError(token.data)
+    } else {
+        guard stream.kind == 2 else { MemcacheManyResult.replyFailure }
+        MemcacheManyResult.values(MemcacheManyReply(frame: stream.bytes, keys: keys, withCas: withCas, count: stream.count))
+    }
+}
+func memcacheManyExecute(_ connection: TcpConnection, _ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) -> MemcacheManyResult {
+    guard let request = memcacheManyRequest(keys, mode, seconds) else { MemcacheManyResult.requestFailure }
+    let result = memcacheManyWire(connection, request, keys.bytes, memcacheRetrievalCas(mode))
+    match result {
+        .values(reply) => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func memcacheMultiGet(_ connection: TcpConnection, _ keys: MemcacheKeys) -> MemcacheManyResult {
+    memcacheManyExecute(connection, keys, MemcacheRetrievalMode.plain, 0)
+}
+func memcacheMultiGets(_ connection: TcpConnection, _ keys: MemcacheKeys) -> MemcacheManyResult {
+    memcacheManyExecute(connection, keys, MemcacheRetrievalMode.cas, 0)
+}
+func memcacheMultiGat(_ connection: TcpConnection, _ keys: MemcacheKeys, _ seconds: i32) -> MemcacheManyResult {
+    memcacheManyExecute(connection, keys, MemcacheRetrievalMode.touching, seconds)
+}
+func memcacheMultiGats(_ connection: TcpConnection, _ keys: MemcacheKeys, _ seconds: i32) -> MemcacheManyResult {
+    memcacheManyExecute(connection, keys, MemcacheRetrievalMode.touchingCas, seconds)
+}
+struct MemcacheCasItem { data: Bytes flags: Bytes cas: Bytes }
+variant MemcacheGetsResult {
+    value(MemcacheCasItem)
+    missing
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheGetsItem(_ reply: MemcacheManyReply) -> MemcacheGetsResult {
+    if reply.count == 0 { MemcacheGetsResult.missing } else {
+        guard reply.count == 1 else { MemcacheGetsResult.replyFailure }
+        guard let item = memcacheManyItem(reply, 0) else { MemcacheGetsResult.replyFailure }
+        MemcacheGetsResult.value(MemcacheCasItem(data: item.data, flags: item.flags, cas: item.cas))
+    }
+}
+func memcacheGetsResult(_ result: MemcacheManyResult) -> MemcacheGetsResult {
+    match result {
+        .values(reply) => memcacheGetsItem(reply)
+        .serverError(data) => MemcacheGetsResult.serverError(data)
+        .requestFailure => MemcacheGetsResult.requestFailure
+        .transportFailure(code) => MemcacheGetsResult.transportFailure(code)
+        _ => MemcacheGetsResult.replyFailure
+    }
+}
+func memcacheGetsFinish(_ connection: TcpConnection, _ result: MemcacheGetsResult) -> MemcacheGetsResult {
+    match result {
+        .value(item) => result
+        .missing => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func memcacheGets(_ connection: TcpConnection, _ key: Bytes) -> MemcacheGetsResult {
+    let result = memcacheManyExecute(connection, MemcacheKeys(bytes: key, count: 1), MemcacheRetrievalMode.cas, 0)
+    memcacheGetsFinish(connection, memcacheGetsResult(result))
+}
+func memcacheGats(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32) -> MemcacheGetsResult {
+    let result = memcacheManyExecute(connection, MemcacheKeys(bytes: key, count: 1), MemcacheRetrievalMode.touchingCas, seconds)
+    memcacheGetsFinish(connection, memcacheGetsResult(result))
+}
+func memcacheGatItem(_ reply: MemcacheManyReply) -> MemcacheGetResult {
+    if reply.count == 0 { MemcacheGetResult.missing } else {
+        guard reply.count == 1 else { MemcacheGetResult.replyFailure }
+        guard let item = memcacheManyItem(reply, 0) else { MemcacheGetResult.replyFailure }
+        MemcacheGetResult.value(MemcacheItem(data: item.data, flags: item.flags))
+    }
+}
+func memcacheGatResult(_ result: MemcacheManyResult) -> MemcacheGetResult {
+    match result {
+        .values(reply) => memcacheGatItem(reply)
+        .serverError(data) => MemcacheGetResult.serverError(data)
+        .requestFailure => MemcacheGetResult.requestFailure
+        .transportFailure(code) => MemcacheGetResult.transportFailure(code)
+        _ => MemcacheGetResult.replyFailure
+    }
+}
+func memcacheGat(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32) -> MemcacheGetResult {
+    let result = memcacheManyExecute(connection, MemcacheKeys(bytes: key, count: 1), MemcacheRetrievalMode.touching, seconds)
+    let converted = memcacheGatResult(result)
+    if memcacheGetMustClose(converted) {
+        let closed = connection.close()
+        converted
+    } else { converted }
+}

@@ -15,7 +15,8 @@ libraries compose these primitives for bounded Redis operations, including
 transactions, RESP3 events, subscriptions and configured topology routing.
 
 The [Memcached client](memcache-client.md) uses the same primitives for bounded
-single-key GET, SET/ADD/REPLACE, DELETE and TOUCH over TCP or verified TLS.
+GET/GETS, conditional CAS, multi-key retrieval, counters, append/prepend and
+get-and-touch as well as SET/ADD/REPLACE, DELETE and TOUCH over TCP or verified TLS.
 
 ## Endpoint configuration
 
