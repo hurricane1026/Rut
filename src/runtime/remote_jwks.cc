@@ -228,7 +228,7 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
         packet.len < query.len)
         return false;
     const auto* bytes = reinterpret_cast<const u8*>(packet.ptr);
-    if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa0f) != 0x8000 ||
+    if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa4f) != 0x8000 ||
         read16(bytes + 4) != 1 || read16(bytes + 8) || read16(bytes + 10) ||
         memcmp(packet.ptr + 12, query.ptr + 12, query.len - 12) != 0)
         return false;

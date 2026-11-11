@@ -66,6 +66,9 @@ TEST(remote_jwks_metadata, dns_wire_allowlist_and_rebinding) {
     reply[2] |= 2;
     CHECK(!jwks_dns_answer(answer(), request, configuration, address));
     reply[2] &= 0xfd;
+    reply[3] |= 64;
+    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    reply[3] &= 191;
     reply[21] = 0;
     reply[22] = 5;
     CHECK(!jwks_dns_answer(answer(), request, configuration, address));

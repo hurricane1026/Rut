@@ -299,7 +299,10 @@ add_library(rut_compiler STATIC
     compiler/lower_rir.cc
     compiler/rir_printer.cc
 )
-target_link_libraries(rut_compiler PUBLIC rut_verifier)
+# Frontend configuration proofs call bounded runtime validators (including
+# Consumer snapshots). Model that dependency so runtime-first consumers also
+# link correctly when JIT helpers do not otherwise pull validator objects in.
+target_link_libraries(rut_compiler PUBLIC rut_verifier rut_runtime)
 
 target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
