@@ -1182,8 +1182,9 @@ wait any {
 // an eventual completion/failure assumption. TLA+ is a CI design/reference
 // check, not proof of arbitrary source programs or kernel/backend behavior.
 
-// TCP/UDP clients — fixed endpoints, request-owned handles (implemented).
-// See net-clients.md for bounds, UDP and TLS policies.
+// TCP/UDP clients — configured IPv4/DNS endpoints, request-owned handles (implemented).
+// DNS: bounded A/CNAME, TTL cache, UDP/TCP fallback; no AAAA/SRV or dynamic targets.
+// See net-clients.md for resolver bounds, UDP and TLS policies.
 let pending = tcp(env("SERVICE_ENDPOINT"), 1000)
 guard let conn = pending else { return 502 }
 let pendingSend = conn.send(b"PING\r\n", 1000)

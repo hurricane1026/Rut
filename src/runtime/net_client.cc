@@ -32,6 +32,17 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
             bit = 1;
             value = endpoint.address;
             cap = sizeof(endpoint.address);
+        } else if (name.eq(lit_str("dnsServer"))) {
+            bit = 64;
+            value = endpoint.dns_server;
+            cap = sizeof(endpoint.dns_server);
+        } else if (name.eq(lit_str("dnsPort"))) {
+            bit = 128;
+            i64 number = 0;
+            if (doc.nodes[n].kind != json::Kind::Number || !json::integer(doc.raw(n), number) ||
+                number < 1 || number > 65535)
+                return false;
+            endpoint.dns_port = static_cast<u16>(number);
         } else if (name.eq(lit_str("port"))) {
             bit = 2;
             i64 number = 0;
@@ -75,7 +86,13 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
         }
     }
     in_addr address{};
-    if ((seen & 3) != 3 || inet_pton(AF_INET, endpoint.address, &address) != 1) return false;
+    if ((seen & 3) != 3) return false;
+    const bool literal = inet_pton(AF_INET, endpoint.address, &address) == 1;
+    if (!literal && !dns_hostname(endpoint.address)) return false;
+    if ((seen & 128) && !(seen & 64)) return false;
+    if ((seen & 64) &&
+        (literal || inet_pton(AF_INET, endpoint.dns_server, &address) != 1 || !address.s_addr))
+        return false;
     if (datagram && (seen & 28)) return false;
     if (endpoint.tls.enabled) return (seen & 24) == 24 && valid_upstream_tls(endpoint.tls);
     return !(seen & 24);
@@ -231,6 +248,11 @@ NetReply NetClientWorker::call(u32 owner,
     return reply;
 }
 void NetClientWorker::close(Slot& s) {
+    s.dns.close();
+    s.dns = {};
+    s.resolved = s.address_index = 0;
+    s.dns_expires = 0;
+    s.dns_ready = false;
     if (s.ssl) SSL_free(s.ssl);
     s.ssl = nullptr;
     destroy_tls_client_context(s.tls);
@@ -260,8 +282,9 @@ bool NetClientWorker::clean(int fd, SSL* ssl) {
 void NetClientWorker::sweep(u64 now) {
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE);
     for (auto& p : parked)
-        if (p.fd >= 0 && (!now || !epoch || p.epoch != epoch || now < p.since ||
-                          now - p.since >= p.endpoint.pool_idle_ms))
+        if (p.fd >= 0 &&
+            (!now || !epoch || p.epoch != epoch || now < p.since ||
+             now - p.since >= p.endpoint.pool_idle_ms || (p.dns_expires && now >= p.dns_expires)))
             close(p);
 }
 bool NetClientWorker::borrow(Slot& s) {
@@ -269,11 +292,14 @@ bool NetClientWorker::borrow(Slot& s) {
         s.pool_epoch != __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE))
         return false;
     for (auto& p : parked) {
-        if (p.fd < 0 || p.epoch != s.pool_epoch ||
+        if (p.fd < 0 || p.epoch != s.pool_epoch || p.resolved != s.resolved ||
+            (p.dns_expires && jwt_monotonic_ms() >= p.dns_expires) ||
             (p.endpoint.port != s.endpoint.port ||
              p.endpoint.pool_idle_ms != s.endpoint.pool_idle_ms ||
              p.endpoint.tls.enabled != s.endpoint.tls.enabled ||
              __builtin_strcmp(p.endpoint.address, s.endpoint.address) != 0 ||
+             __builtin_strcmp(p.endpoint.dns_server, s.endpoint.dns_server) != 0 ||
+             p.endpoint.dns_port != s.endpoint.dns_port ||
              __builtin_strcmp(p.endpoint.tls.ca, s.endpoint.tls.ca) != 0 ||
              __builtin_strcmp(p.endpoint.tls.server_name, s.endpoint.tls.server_name) != 0 ||
              __builtin_strcmp(p.endpoint.tls.cert, s.endpoint.tls.cert) != 0 ||
@@ -298,10 +324,12 @@ bool NetClientWorker::release(Slot& s) {
     // have consumed exactly one complete reply and restored its protocol state.
     if (!s.datagram && s.endpoint.pool_idle_ms && s.pool_epoch &&
         s.pool_epoch == __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE) && !s.buffered && !s.eof &&
-        clean(s.fd, s.ssl)) {
+        (!s.dns_expires || jwt_monotonic_ms() < s.dns_expires) && clean(s.fd, s.ssl)) {
         for (auto& p : parked) {
             if (p.fd >= 0) continue;
             p.endpoint = s.endpoint;
+            p.resolved = s.resolved;
+            p.dns_expires = s.dns_expires;
             p.epoch = s.pool_epoch;
             p.since = jwt_monotonic_ms();
             p.fd = s.fd;
@@ -321,6 +349,7 @@ void* NetClientWorker::entry(void* pointer) {
     return nullptr;
 }
 void NetClientWorker::run() {
+    resolver.init();
     const timespec idle{0, 1000000};
     while (!__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) {
         sweep(jwt_monotonic_ms());
@@ -342,17 +371,6 @@ void NetClientWorker::run() {
                                                  __ATOMIC_ACQ_REL,
                                                  __ATOMIC_ACQUIRE))
                     continue;
-                if (s.operation == NetOp::Tcp && borrow(s)) {
-                    success(s, s.token);
-                    u32 running = Running;
-                    __atomic_compare_exchange_n(&s.phase,
-                                                &running,
-                                                static_cast<u32>(Done),
-                                                false,
-                                                __ATOMIC_RELEASE,
-                                                __ATOMIC_RELAXED);
-                    continue;
-                }
                 s.offset = 0;
                 s.step = s.operation == NetOp::Tcp || s.operation == NetOp::Udp ? begin_connect
                          : s.operation == NetOp::Send                           ? write
@@ -365,7 +383,9 @@ void NetClientWorker::run() {
                 complete = true;
             } else {
                 // One bounded nonblocking step per worker turn.
-                complete = s.operation == NetOp::Release ? release(s) : s.step(s);
+                complete = s.operation == NetOp::Release             ? release(s)
+                           : s.step == begin_connect && !s.dns_ready ? resolve(s)
+                                                                     : s.step(s);
             }
             if (!complete) continue;
             OPENSSL_cleanse(s.pending, sizeof(s.pending));
@@ -391,16 +411,48 @@ bool NetClientWorker::failed(Slot& s) {
     s.reply.status = -1;
     return true;
 }
+bool NetClientWorker::resolve(Slot& s) {
+    in_addr literal{};
+    if (inet_pton(AF_INET, s.endpoint.address, &literal) == 1) {
+        s.resolved = literal.s_addr;
+        // Zero is a valid literal; it must not re-enter resolution.
+        s.step = connected;
+    } else {
+        in_addr server{};
+        if (s.endpoint.dns_server[0]) inet_pton(AF_INET, s.endpoint.dns_server, &server);
+        const int result = resolver.resolve(s.dns,
+                                            s.endpoint.address,
+                                            server.s_addr,
+                                            s.endpoint.dns_port,
+                                            s.pool_epoch,
+                                            jwt_monotonic_ms(),
+                                            s.dns_expires);
+        if (result < 0) return failed(s);
+        if (!result) return false;
+        s.resolved = s.dns.result.addresses[0];
+    }
+    s.dns_ready = true;
+    if (s.operation == NetOp::Tcp && borrow(s)) return success(s, s.token);
+    return begin_connect(s);
+}
+bool NetClientWorker::retry_connect(Slot& s) {
+    if (s.fd >= 0) ::close(s.fd);
+    s.fd = -1;
+    if (++s.address_index >= s.dns.result.count) return failed(s);
+    s.resolved = s.dns.result.addresses[s.address_index];
+    s.step = begin_connect;
+    return false;
+}
 bool NetClientWorker::begin_connect(Slot& s) {
     s.fd = s.datagram ? platform::datagram_socket() : platform::stream_socket();
     if (s.fd < 0) return failed(s);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(s.endpoint.port);
-    if (inet_pton(AF_INET, s.endpoint.address, &address.sin_addr) != 1) return failed(s);
+    address.sin_addr.s_addr = s.resolved;
     if (connect(s.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 &&
         errno != EINPROGRESS)
-        return failed(s);
+        return retry_connect(s);
     s.step = connected;
     return false;
 }
@@ -411,7 +463,8 @@ bool NetClientWorker::connected(Slot& s) {
     if (!count) return false;
     int error = 0;
     socklen_t length = sizeof(error);
-    if (getsockopt(s.fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error) return failed(s);
+    if (getsockopt(s.fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error)
+        return retry_connect(s);
     if (!s.endpoint.tls.enabled) return success(s, s.token);
     if (!init_tls_client_context(s.tls, s.endpoint.tls, false)) return failed(s);
     auto ssl = create_tls_client_ssl(s.tls, s.fd, s.endpoint.tls.server_name);

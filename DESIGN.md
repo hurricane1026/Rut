@@ -10607,12 +10607,18 @@ HTTP continuation. The earlier TCP/UDP sketches involving unrestricted runtime
 addresses, defer, UDP bind/sendTo, submit/wait and arbitrary parsing loops remain
 target designs. The current [net client contract](docs/net-clients.md) is narrower.
 
-Generic runtime transport performs nonblocking connect, optional verified TLS,
+Generic runtime transport resolves configured ASCII hostnames through a bounded
+worker-owned IPv4 A/CNAME stub (UDP and truncated-response TCP fallback), then
+performs nonblocking connect, optional verified TLS,
 full send, bounded receive/exact/line reads and connected UDP datagram I/O.
 Application framing, commands, authentication and policy belong in ordinary Rut
 libraries; no Redis-specific native operation is added. A source Redis RESP2 PING
 helper demonstrates this split. Endpoint identity/trust is compile/load-time
 configuration, while send payloads and bounded read counts may be dynamic.
+DNS shares the open deadline, validates response ID/question/owners, bounds
+packets/records/aliases, caches positive answers by TTL and configuration epoch,
+and retires expired idle transports. It does not replace TLS server identity.
+Resolver policy and remaining limits are specified in the net client contract.
 
 Opaque source handle types lower to owner/generation-validated scalar tokens.
 A bounded worker owns descriptors, TLS contexts and surplus input independently

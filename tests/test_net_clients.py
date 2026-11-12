@@ -21,7 +21,24 @@ def main():
     parser.add_argument('--server', required=True)
     parser.add_argument('--testdata', required=True)
     parser.add_argument('--backend', required=True, choices=('epoll', 'io_uring'))
+    parser.add_argument('--dns', action='store_true')
+    parser.add_argument('--opt', choices=('0', '2'), default='2')
     args = parser.parse_args()
+    class DnsHandler(socketserver.BaseRequestHandler):
+        def handle(self):
+            data, sock = self.request
+            if len(data) < 12:
+                return
+            # Local deterministic DNS: alias + A in one answer, no Internet access.
+            question = data[12:]
+            alias = b'\x05alias\x07example\x00'
+            cname = b'\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x02' + len(alias).to_bytes(2, 'big') + alias
+            address = alias + b'\x00\x01\x00\x01\x00\x00\x00\x02\x00\x04\x7f\x00\x00\x01'
+            sock.sendto(data[:2] + b'\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00' + question + cname + address, self.client_address)
+
+    dns = socketserver.UDPServer(('127.0.0.1', 0), DnsHandler) if args.dns else None
+    if dns:
+        threading.Thread(target=dns.serve_forever, daemon=True).start()
     requests = []
     tls_alpn = []
     active = set()
@@ -375,11 +392,16 @@ route GET "/limit" {
                        UDP=json.dumps(dict(address='127.0.0.1', port=udp_socket.getsockname()[1])),
                        HTTP=json.dumps(dict(address='127.0.0.1', port=secure.server_address[1],
                                             serverName='localhost', caFile=str(cert), path='/http')))
+            if dns:
+                for key in ('TCP', 'TLS', 'TLS_PROBE', 'WRONG_TLS', 'UDP'):
+                    policy = json.loads(env[key])
+                    policy.update(address='cache.example', dnsServer='127.0.0.1', dnsPort=dns.server_address[1])
+                    env[key] = json.dumps(policy)
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             with log.open('wb') as output:
                 process = subprocess.Popen([args.server, '0', str(program), '--backend', args.backend,
-                                            '--shards', '2', '--no-pin', '--drain', '0'],
+                                            '--shards', '2', '--no-pin', '--drain', '0', '--opt', args.opt],
                                            env=env, stdout=output, stderr=subprocess.STDOUT)
             try:
                 deadline = time.monotonic() + 30
@@ -492,6 +514,9 @@ route GET "/limit" {
                     process.wait()
                     raise AssertionError('network worker shutdown timed out')
     finally:
+        if dns:
+            dns.shutdown()
+            dns.server_close()
         stopped.set()
         udp_socket.close()
         for server in (plain, secure):

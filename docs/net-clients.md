@@ -37,16 +37,59 @@ Verified TCP TLS:
 {"address":"127.0.0.1","port":6380,"tls":true,"caFile":"/certs/ca.pem","serverName":"redis.internal"}
 ```
 
-Address is a fixed IPv4 literal and port 1–65535. TLS uses the existing pinned
+Address is a configured IPv4 literal or ASCII DNS hostname and port 1–65535.
+Hostnames are normalized to lowercase without a trailing dot; labels must be
+1–63 LDH characters (no leading/trailing hyphen), total at most 253 characters,
+with at least one ASCII letter.
+Ambiguous numeric addresses, URLs, Unicode names and request-derived targets reject compilation. TLS uses the existing pinned
 static OpenSSL, requires both CA and server identity, and never falls back to
 plaintext. Unknown/duplicate fields, controls/NUL, missing fields, invalid ranges
 and inconsistent TLS fields reject compilation. UDP rejects all TLS fields.
 TCP policy may additionally set `poolIdleMs` to an integer 1–60000; absence disables
 cross-request reuse. UDP rejects this field. Policy is at most 2048 bytes.
-There is no DNS, listener/server API, Unix socket,
+There is no listener/server API, Unix socket,
 DTLS, client certificate or application ALPN selection in this profile. Remote
 addresses cannot be selected from request data. A UDP socket sends only to and
 receives only from its configured peer; there is no arbitrary `sendTo`/`bind` API.
+
+## DNS for configured client endpoints
+
+```json
+{"address":"redis.internal.example","port":6380,"tls":true,"caFile":"/certs/ca.pem","serverName":"redis.internal.example","poolIdleMs":10000}
+```
+
+The network worker resolves A records without blocking the shard or using libc
+NSS/getaddrinfo. It reads up to three IPv4 nameservers from the first 4095 bytes
+of `/etc/resolv.conf` when the worker starts. A policy may instead specify an
+IPv4 `dnsServer` and optional `dnsPort` (1–65535, default 53). `dnsPort` requires
+`dnsServer`; resolver fields are rejected for literal service addresses.
+System resolver changes require worker restart; configuration epochs fence cached
+answers. DNS uses exact names: no search suffixes, `/etc/hosts`, mDNS or NSS rules.
+
+The bounded stub implements [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035)
+A/CNAME responses and UDP with truncated-response TCP fallback, as required by
+[RFC 7766](https://www.rfc-editor.org/rfc/rfc7766). Connected resolver sockets,
+unpredictable transaction IDs and matching questions bind each response to its
+query. Invalid/compression-loop packets and unrelated additional records cannot
+supply addresses. Limits: 4096-byte DNS messages, 64 records, eight addresses,
+eight CNAME hops within a response and eight follow-up alias queries. Each
+nameserver gets at most one second (including TCP fallback); the original open
+deadline bounds the entire resolution, connect and TLS handshake. Resolver
+failure reports `netError() == -1`, overall deadline expiry `-2`.
+
+Each worker caches 16 positive answers until the minimum A/CNAME TTL, capped at
+60 seconds; zero TTL and negative answers are not cached. Fresh opens rotate
+cached addresses and may try remaining addresses after TCP connect failure,
+before application writes. Business operations and TLS authentication failures
+are never replayed. Expired DNS answers retire idle pooled transports regardless
+of `poolIdleMs`; active leases can finish but cannot park after expiry. TLS still
+requires explicit CA and `serverName`; DNS results never replace the verified
+identity or disable certificate checks. Plain DNS relies on a trusted recursive
+resolver and does not authenticate an answer.
+
+This adds hostname endpoints for `tcp`/`udp` and the Rut libraries built on them.
+It does not add IPv6/AAAA, SRV, DNSSEC/DoT/DoH, dynamic Redis topology, or DNS to
+the separate HTTP/JWKS/upstream endpoint policies.
 
 ## Operations
 
@@ -198,7 +241,8 @@ implicitly release a lease. A pooled descriptor is never retried after a send.
 Each shard's existing I/O worker owns up to sixteen idle transports, separately
 from its sixteen live lease slots. Idle entries own descriptor, TLS session and
 trust context; they retain no request arena, source/JIT pointer or byte result.
-The key is exact IPv4 endpoint, port, TLS enablement, CA path, server identity,
+The key includes configured address, resolver address/port, resolved IPv4 address,
+service port, TLS enablement, CA path, server identity,
 idle policy and configuration epoch. Equal parsed keys share a pool even when
 the JSON spelling or environment binding differs. A borrow issues a fresh token fenced to
 its new HTTP request/stream; an older token cannot operate on the new lease.
