@@ -4,7 +4,8 @@ variant MemcacheStoreMode { set add replace }
 struct MemcacheOptions { flags: Bytes expirySeconds: i32 }
 struct MemcacheItem { data: Bytes flags: Bytes }
 // kind: 0 NeedMore, -1 Invalid, 1 VALUE, 2 END, 3 STORED,
-// 4 NOT_STORED, 5 DELETED, 6 NOT_FOUND, 7 TOUCHED, 8 server error.
+// 4 NOT_STORED, 5 DELETED, 6 NOT_FOUND, 7 TOUCHED, 8 server error,
+// 9 EXISTS, 10 unsigned counter value.
 struct MemcacheReply { kind: i32 data: Bytes flags: Bytes }
 struct MemcacheStream { bytes: Bytes reply: MemcacheReply }
 
@@ -94,13 +95,40 @@ func memcacheStatusKind(_ line: Bytes) -> i32 {
         }
     }
 }
+// Decimal u64 is kept as Bytes, including CAS identifiers and counters above
+// INT64_MAX. Two at-most-ten-digit parts fit the existing signed parser.
+func memcacheUnsignedPart(_ part: Bytes) -> bool {
+    guard part.count > 0 && !(part.count > 10) && part[0].or(0) > 47 && part[0].or(0) < 58 else { false }
+    parseInt64(part) != nil
+}
+
+func memcacheUnsignedValid(_ digits: Bytes) -> bool {
+    guard digits.count > 0 && !(digits.count > 20) else { false }
+    guard let first = digits.slice(0, min(digits.count, 10)) else { false }
+    guard memcacheUnsignedPart(first) else { false }
+    if digits.count > 10 {
+        guard let last = digits.slice(10, digits.count) else { false }
+        guard memcacheUnsignedPart(last) else { false }
+        digits.count < 20 || parseInt64(first).or(0) < 1844674407 ||
+            (parseInt64(first).or(0) == 1844674407 && parseInt64(last).or(0) < 3709551616)
+    } else { true }
+}
+
+func memcacheExtendedStatus(_ line: Bytes) -> MemcacheReply {
+    if line == b"EXISTS" { memcacheEmptyReply(9) } else {
+        if memcacheUnsignedValid(line) { MemcacheReply(kind: 10, data: line, flags: b"") } else {
+            if line == b"ERROR" || (line.count > 13 &&
+                (line.slice(0, 13) == b"CLIENT_ERROR " || line.slice(0, 13) == b"SERVER_ERROR ")) {
+                MemcacheReply(kind: 8, data: line, flags: b"")
+            } else { memcacheEmptyReply(-1) }
+        }
+    }
+}
+
 func memcacheStatusReply(_ line: Bytes) -> MemcacheReply {
     let kind = memcacheStatusKind(line)
     if kind > 0 { memcacheEmptyReply(kind) } else {
-        if line == b"ERROR" || (line.count > 13 &&
-            (line.slice(0, 13) == b"CLIENT_ERROR " || line.slice(0, 13) == b"SERVER_ERROR ")) {
-            MemcacheReply(kind: 8, data: line, flags: b"")
-        } else { memcacheEmptyReply(-1) }
+        memcacheExtendedStatus(line)
     }
 }
 func memcacheValueBody(_ bytes: Bytes, _ start: i32, _ digits: Bytes, _ flags: Bytes) -> MemcacheReply {
@@ -140,4 +168,273 @@ func memcacheFeed(_ stream: MemcacheStream, _ chunk: Bytes, _ key: Bytes) {
     guard stream.reply.kind == 0 else { nil }
     guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
     MemcacheStream(bytes: bytes, reply: memcacheParse(bytes, key))
+}
+
+func memcacheSizeField(_ header: Bytes, _ size: i32) -> Bytes {
+    guard let digits = formatInt(size) else { nil }
+    memcacheField(header, Bytes(digits))
+}
+
+func memcacheCasHeader(_ key: Bytes, _ settings: MemcacheOptions) -> Bytes {
+    guard let header = memcacheStoreHeader(MemcacheStoreMode.set, key, settings) else { nil }
+    guard let tail = header.slice(3, header.count) else { nil }
+    concatBytes(b"cas", tail, 8192)
+}
+func memcacheCasRequest(_ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) {
+    guard memcacheUnsignedValid(cas) else { nil }
+    guard let named = memcacheCasHeader(key, settings) else { nil }
+    guard let sized = memcacheSizeField(named, value.count) else { nil }
+    guard let versioned = memcacheField(sized, cas) else { nil }
+    guard let line = concatBytes(versioned, b"\r\n", 8192) else { nil }
+    guard let content = concatBytes(line, value, 8192) else { nil }
+    concatBytes(content, b"\r\n", 8192)
+}
+func memcacheCounterName(_ decrement: bool) -> Bytes {
+    if decrement { b"decr" } else { b"incr" }
+}
+func memcacheConcatName(_ front: bool) -> Bytes {
+    if front { b"prepend" } else { b"append" }
+}
+func memcacheConcatRequest(_ key: Bytes, _ value: Bytes, _ front: bool) -> Bytes {
+    guard let initial = memcacheStoreRequest(MemcacheStoreMode.set, key, value,
+        MemcacheOptions(flags: b"0", expirySeconds: 0)) else { nil }
+    guard let tail = initial.slice(3, initial.count) else { nil }
+    concatBytes(memcacheConcatName(front), tail, 8192)
+}
+func memcacheCounterRequest(_ key: Bytes, _ amount: Bytes, _ decrement: bool) {
+    guard memcacheKeyValid(key) && memcacheUnsignedValid(amount) else { nil }
+    let name = memcacheCounterName(decrement)
+    guard let keyed = memcacheField(name, key) else { nil }
+    guard let changed = memcacheField(keyed, amount) else { nil }
+    concatBytes(changed, b"\r\n", 8192)
+}
+
+variant MemcacheRetrievalMode { plain cas touching touchingCas }
+struct MemcacheKeys { bytes: Bytes count: i32 }
+struct MemcacheKeyScan { offset: i32 count: i32 }
+struct MemcacheValueHeader { key: Bytes flags: Bytes size: i32 cas: Bytes }
+struct MemcacheValueToken { kind: i32 key: Bytes data: Bytes flags: Bytes cas: Bytes next: i32 }
+struct MemcacheManyState { offset: i32 count: i32 seen: i32 keys: Bytes withCas: bool }
+struct MemcacheManyStream { bytes: Bytes kind: i32 count: i32 }
+struct MemcacheManyReply { frame: Bytes keys: Bytes withCas: bool count: i32 }
+
+func memcacheKeys() -> MemcacheKeys { MemcacheKeys(bytes: b"", count: 0) }
+func memcacheKeyWord(_ key: Bytes) -> Bytes {
+    guard let first = concatBytes(b" ", key, 2009) else { nil }
+    concatBytes(first, b" ", 2009)
+}
+func memcacheKeyContains(_ keys: Bytes, _ key: Bytes) -> bool {
+    guard let haystack = memcacheKeyWord(keys) else { nil }
+    guard let needle = memcacheKeyWord(key) else { nil }
+    haystack.find(needle) != nil
+}
+func memcacheKeysJoin(_ keys: MemcacheKeys, _ key: Bytes) -> Bytes {
+    if keys.count == 0 { key } else {
+        guard let prefix = concatBytes(keys.bytes, b" ", 2007) else { nil }
+        concatBytes(prefix, key, 2007)
+    }
+}
+
+func memcacheKeysAdd(_ keys: MemcacheKeys, _ key: Bytes) {
+    guard keys.count > -1 && keys.count < 8 && (keys.count != 0 || keys.bytes.count == 0) else { nil }
+    guard memcacheKeyValid(key) && !memcacheKeyContains(keys.bytes, key).or(true) else { nil }
+    guard let bytes = memcacheKeysJoin(keys, key) else { nil }
+    MemcacheKeys(bytes: bytes, count: keys.count + 1)
+}
+// A flat control-character check avoids a nested collector in the key-list
+// scanner. Space is its sole delimiter; all other key restrictions are kept.
+func memcacheKeysClean0(_ bytes: Bytes) -> bool {
+    bytes.find(b"\x00") == nil && bytes.find(b"\x01") == nil && bytes.find(b"\x02") == nil && bytes.find(b"\x03") == nil &&
+    bytes.find(b"\x04") == nil && bytes.find(b"\x05") == nil && bytes.find(b"\x06") == nil && bytes.find(b"\x07") == nil
+}
+func memcacheKeysClean1(_ bytes: Bytes) -> bool {
+    bytes.find(b"\x08") == nil && bytes.find(b"\x09") == nil && bytes.find(b"\x0a") == nil && bytes.find(b"\x0b") == nil &&
+    bytes.find(b"\x0c") == nil && bytes.find(b"\x0d") == nil && bytes.find(b"\x0e") == nil && bytes.find(b"\x0f") == nil
+}
+func memcacheKeysClean2(_ bytes: Bytes) -> bool {
+    bytes.find(b"\x10") == nil && bytes.find(b"\x11") == nil && bytes.find(b"\x12") == nil && bytes.find(b"\x13") == nil &&
+    bytes.find(b"\x14") == nil && bytes.find(b"\x15") == nil && bytes.find(b"\x16") == nil && bytes.find(b"\x17") == nil
+}
+func memcacheKeysClean3(_ bytes: Bytes) -> bool {
+    bytes.find(b"\x18") == nil && bytes.find(b"\x19") == nil && bytes.find(b"\x1a") == nil && bytes.find(b"\x1b") == nil &&
+    bytes.find(b"\x1c") == nil && bytes.find(b"\x1d") == nil && bytes.find(b"\x1e") == nil && bytes.find(b"\x1f") == nil && bytes.find(b"\x7f") == nil
+}
+func memcacheKeysStep(_ bytes: Bytes, _ state: MemcacheKeyScan) -> (MemcacheKeyScan, i32, bool) {
+    let end = bytes.find(b" ", state.offset).or(bytes.count)
+    guard let key = bytes.slice(state.offset, end) else { nil }
+    guard key.count > 0 && !(key.count > 250) && state.count < 8 else { nil }
+    guard let previous = bytes.slice(0, state.offset) else { nil }
+    guard !memcacheKeyContains(previous, key).or(true) else { nil }
+    (MemcacheKeyScan(offset: end + 1, count: state.count + 1), state.count + 1, end == bytes.count)
+}
+func memcacheKeysValid(_ keys: MemcacheKeys) -> bool {
+    guard keys.count > 0 && keys.count < 9 && keys.bytes.count > 0 && !(keys.bytes.count > 2007) else { false }
+    guard memcacheKeysClean0(keys.bytes) && memcacheKeysClean1(keys.bytes) &&
+        memcacheKeysClean2(keys.bytes) && memcacheKeysClean3(keys.bytes) else { false }
+    guard let values = collectBytes(keys.bytes, MemcacheKeyScan(offset: 0, count: 0), 8, memcacheKeysStep) else { false }
+    values.get(values.count - 1) == keys.count
+}
+func memcacheKeyAt(_ keys: Bytes, _ index: i32) -> Bytes {
+    let first = keys.find(b" ").or(keys.count)
+    if index == 0 { keys.slice(0, first) } else {
+        guard let tail1 = keys.slice(first + 1, keys.count) else { nil }
+        let second = tail1.find(b" ").or(tail1.count)
+        if index == 1 { tail1.slice(0, second) } else {
+            guard let tail2 = tail1.slice(second + 1, tail1.count) else { nil }
+            let third = tail2.find(b" ").or(tail2.count)
+            if index == 2 { tail2.slice(0, third) } else {
+                guard let tail3 = tail2.slice(third + 1, tail2.count) else { nil }
+                let fourth = tail3.find(b" ").or(tail3.count)
+                if index == 3 { tail3.slice(0, fourth) } else {
+                    guard let tail4 = tail3.slice(fourth + 1, tail3.count) else { nil }
+                    let fifth = tail4.find(b" ").or(tail4.count)
+                    if index == 4 { tail4.slice(0, fifth) } else {
+                        guard let tail5 = tail4.slice(fifth + 1, tail4.count) else { nil }
+                        let sixth = tail5.find(b" ").or(tail5.count)
+                        if index == 5 { tail5.slice(0, sixth) } else {
+                            guard let tail6 = tail5.slice(sixth + 1, tail5.count) else { nil }
+                            let seventh = tail6.find(b" ").or(tail6.count)
+                            if index == 6 { tail6.slice(0, seventh) } else {
+                                guard let tail7 = tail6.slice(seventh + 1, tail6.count) else { nil }
+                                tail7.slice(0, tail7.find(b" ").or(tail7.count))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+func memcacheKeyIndex(_ keys: Bytes, _ key: Bytes) -> i32 {
+    guard let first = memcacheKeyAt(keys, 0) else { -1 }
+    if first == key { 0 } else {
+        guard let second = memcacheKeyAt(keys, 1) else { -1 }
+        if second == key { 1 } else {
+            guard let third = memcacheKeyAt(keys, 2) else { -1 }
+            if third == key { 2 } else {
+                guard let fourth = memcacheKeyAt(keys, 3) else { -1 }
+                if fourth == key { 3 } else {
+                    guard let fifth = memcacheKeyAt(keys, 4) else { -1 }
+                    if fifth == key { 4 } else {
+                        guard let sixth = memcacheKeyAt(keys, 5) else { -1 }
+                        if sixth == key { 5 } else {
+                            guard let seventh = memcacheKeyAt(keys, 6) else { -1 }
+                            if seventh == key { 6 } else {
+                                guard let eighth = memcacheKeyAt(keys, 7) else { -1 }
+                                if eighth == key { 7 } else { -1 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+func memcacheRetrievalName(_ mode: MemcacheRetrievalMode) -> Bytes {
+    match mode {
+        .plain => b"get"
+        .cas => b"gets"
+        .touching => b"gat"
+        .touchingCas => b"gats"
+    }
+}
+func memcacheRetrievalCas(_ mode: MemcacheRetrievalMode) -> bool {
+    match mode {
+        .cas => true
+        .touchingCas => true
+        _ => false
+    }
+}
+func memcacheRetrievalPrefix(_ mode: MemcacheRetrievalMode, _ seconds: i32) -> Bytes {
+    let name = memcacheRetrievalName(mode)
+    if name == b"gat" || name == b"gats" {
+        guard memcacheExpiryValid(seconds) else { nil }
+        guard let digits = formatInt(seconds) else { nil }
+        memcacheField(name, Bytes(digits))
+    } else { name }
+}
+func memcacheManyRequest(_ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) {
+    guard memcacheKeysValid(keys) else { nil }
+    guard let prefix = memcacheRetrievalPrefix(mode, seconds) else { nil }
+    guard let keyed = memcacheField(prefix, keys.bytes) else { nil }
+    concatBytes(keyed, b"\r\n", 8192)
+}
+func memcacheValueEmpty(_ kind: i32, _ next: i32, _ data: Bytes) -> MemcacheValueToken {
+    MemcacheValueToken(kind: kind, key: b"", data: data, flags: b"", cas: b"", next: next)
+}
+func memcacheValueLength(_ line: Bytes, _ key: Bytes, _ flags: Bytes, _ start: i32, _ withCas: bool) -> MemcacheValueHeader {
+    let end = line.find(b" ", start).or(line.count)
+    guard let digits = line.slice(start, end) else { nil }
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let size = parseInt(digits) else { nil }
+    let cas = line.slice(end + 1, line.count).or(b"")
+    guard (withCas && memcacheUnsignedValid(cas)) || (!withCas && end == line.count) else { nil }
+    MemcacheValueHeader(key: key, flags: flags, size: size, cas: cas)
+}
+func memcacheValueHeader(_ line: Bytes, _ withCas: bool) -> MemcacheValueHeader {
+    guard let keyEnd = line.find(b" ", 6) else { nil }
+    guard let key = line.slice(6, keyEnd) else { nil }
+    guard key.count > 0 && !(key.count > 250) else { nil }
+    guard let flagEnd = line.find(b" ", keyEnd + 1) else { nil }
+    guard let flags = line.slice(keyEnd + 1, flagEnd) else { nil }
+    guard memcacheFlagsValid(flags) else { nil }
+    memcacheValueLength(line, key, flags, flagEnd + 1, withCas)
+}
+func memcacheValueContent(_ bytes: Bytes, _ header: MemcacheValueHeader, _ start: i32) -> MemcacheValueToken {
+    guard header.size > -1 && !(header.size > 8192 - start - 2) else { memcacheValueEmpty(-1, start, b"") }
+    let end = start + header.size
+    if bytes.count < end + 2 { memcacheValueEmpty(0, start, b"") } else {
+        guard bytes.slice(end, end + 2) == b"\r\n" else { memcacheValueEmpty(-1, end, b"") }
+        guard let data = bytes.slice(start, end) else { memcacheValueEmpty(-1, end, b"") }
+        MemcacheValueToken(kind: 1, key: header.key, data: data, flags: header.flags, cas: header.cas, next: end + 2)
+    }
+}
+func memcacheValueStatus(_ kind: i32) -> i32 {
+    if kind == 2 || kind == 8 { kind } else { -1 }
+}
+
+func memcacheValueToken(_ bytes: Bytes, _ offset: i32, _ withCas: bool) -> MemcacheValueToken {
+    guard offset > -1 && !(offset > bytes.count) else { memcacheValueEmpty(-1, offset, b"") }
+    guard let end = bytes.find(b"\r\n", offset) else { memcacheValueEmpty(0, offset, b"") }
+    guard let line = bytes.slice(offset, end) else { memcacheValueEmpty(-1, offset, b"") }
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { memcacheValueEmpty(-1, end, b"") }
+    if line.slice(0, 6) == b"VALUE " {
+        guard let header = memcacheValueHeader(line, withCas) else { memcacheValueEmpty(-1, end, b"") }
+        memcacheValueContent(bytes, header, end + 2)
+    } else {
+        let status = memcacheStatusReply(line)
+        memcacheValueEmpty(memcacheValueStatus(status.kind), end + 2, status.data)
+    }
+}
+func memcacheManyValue(_ bytes: Bytes, _ state: MemcacheManyState, _ token: MemcacheValueToken) -> (MemcacheManyState, MemcacheValueToken, bool) {
+    guard state.count < 8 else { nil }
+    let index = memcacheKeyIndex(state.keys, token.key)
+    guard index > -1 else { nil }
+    let bit = bitwise.shiftLeft(1, index)
+    guard bitwise.and(state.seen, bit) == 0 else { nil }
+    (MemcacheManyState(offset: token.next, count: state.count + 1,
+        seen: bitwise.or(state.seen, bit), keys: state.keys, withCas: state.withCas), token, false)
+}
+func memcacheManyStep(_ bytes: Bytes, _ state: MemcacheManyState) -> (MemcacheManyState, MemcacheValueToken, bool) {
+    let token = memcacheValueToken(bytes, state.offset, state.withCas)
+    if token.kind == 1 { memcacheManyValue(bytes, state, token) } else {
+        guard (token.kind != 2 && token.kind != 8) || (token.next == bytes.count && (token.kind != 8 || state.count == 0)) else { nil }
+        (state, token, true)
+    }
+}
+func memcacheManyScan(_ bytes: Bytes, _ keys: Bytes, _ withCas: bool) {
+    guard !(bytes.count > 8192) else { nil }
+    collectBytes(bytes, MemcacheManyState(offset: 0, count: 0, seen: 0, keys: keys, withCas: withCas), 9, memcacheManyStep)
+}
+func memcacheManyFeed(_ bytes: Bytes, _ keys: Bytes, _ withCas: bool) -> MemcacheManyStream {
+    guard let tokens = memcacheManyScan(bytes, keys, withCas) else { MemcacheManyStream(bytes: bytes, kind: -1, count: 0) }
+    guard let last = tokens.get(tokens.count - 1) else { MemcacheManyStream(bytes: bytes, kind: -1, count: 0) }
+    MemcacheManyStream(bytes: bytes, kind: last.kind, count: tokens.count - 1)
+}
+func memcacheManyItem(_ reply: MemcacheManyReply, _ index: i32) -> MemcacheValueToken {
+    guard index > -1 && index < reply.count else { nil }
+    guard let tokens = memcacheManyScan(reply.frame, reply.keys, reply.withCas) else { nil }
+    guard let last = tokens.get(tokens.count - 1) else { nil }
+    guard last.kind == 2 && tokens.count - 1 == reply.count else { nil }
+    tokens.get(index)
 }

@@ -10864,7 +10864,8 @@ expansion without changing lexical capture or source evaluation semantics.
 ### Memcached basic-text client composition
 
 The ordinary Memcached library composes generic TCP/verified TLS and bounded
-Bytes operations for single-key GET, SET/ADD/REPLACE, DELETE and TOUCH. Requests
+Bytes operations for GET/GETS, CAS, unsigned counters, append/prepend,
+GAT/GATS, multi-key retrieval, SET/ADD/REPLACE, DELETE and TOUCH. Requests
 and complete replies are bounded to 8192 bytes; four receives each retain their
 own fixed deadline. Keys are checked before sending, GET validates the echoed
 key and declared payload length, and typed results distinguish a cache miss,
@@ -10874,4 +10875,10 @@ introducing automatic retry or release. Flags preserve unsigned 32-bit decimal
 spelling, and relative expiration rejects the wire protocol's greater-than-30-day
 absolute-time interpretation. This is an unauthenticated source-library profile,
 not a native protocol handler or distributed Cache backend. It adds no keywords,
-dependencies or runtime operations. See [the contract](docs/memcache-client.md).
+dependencies or runtime operations. CAS and counter fields preserve decimal
+unsigned-64-bit Bytes without signed narrowing. Multi-key requests admit at
+most eight unique keys and revalidate public builders; replies validate all
+echoed keys, payload boundaries, CAS fields and the final END before publishing
+values. Append/prepend preserve flags/expiration, CAS distinguishes conflicts
+from absent items, and no failed mutation is automatically replayed.
+See [the contract](docs/memcache-client.md).

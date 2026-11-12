@@ -1,0 +1,66 @@
+import "clients/memcache-client.rut"
+
+func exampleGetsStatus(_ result: MemcacheGetsResult) -> i32 {
+    match result {
+        .value(item) => 200
+        .missing => 404
+        .requestFailure => 400
+        .serverError(data) => 503
+        .transportFailure(code) => if code == -2 { 504 } else { 502 }
+        _ => 502
+    }
+}
+func exampleVersionedBytes(_ item: MemcacheCasItem) -> Bytes {
+    guard let prefix = concatBytes(item.cas, b"\r\n", 8192) else { nil }
+    concatBytes(prefix, item.data, 8192)
+}
+func exampleGetsBytes(_ result: MemcacheGetsResult) -> Bytes {
+    match result {
+        .value(item) => exampleVersionedBytes(item)
+        _ => nil
+    }
+}
+func exampleCasStatus(_ result: MemcacheCasResult) -> i32 {
+    match result {
+        .stored => 204
+        .exists => 409
+        .missing => 404
+        .notStored => 409
+        .requestFailure => 400
+        .serverError(data) => 503
+        .transportFailure(code) => if code == -2 { 504 } else { 502 }
+        .replyFailure => 502
+    }
+}
+// GETS returns one decimal CAS line, then the exact binary value. Keep the CAS
+// opaque. Another request may update this item before the conditional write.
+route POST "/gets" {
+    let opening = tcp(env("MEMCACHE_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = memcacheGets(connection, req.bodyBytes)
+    let released = connection.release()
+    let status = exampleGetsStatus(result)
+    guard status != 400 else { return 400 }
+    guard status != 404 else { return 404 }
+    guard status != 503 else { return 503 }
+    guard status != 504 else { return 504 }
+    guard let body = exampleGetsBytes(result) else { return 502 }
+    return response(200, body: body)
+}
+// X-CAS is the token from GETS; X-Key identifies that same item. A conflict is
+// explicit, with no retry. This example replaces flags/TTL with zero on success.
+route POST "/cas" {
+    let opening = tcp(env("MEMCACHE_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = memcacheCas(connection, Bytes(req.header("X-Key").or("example-key")), req.bodyBytes,
+        MemcacheOptions(flags: b"0", expirySeconds: 0), Bytes(req.header("X-CAS").or("")))
+    let released = connection.release()
+    let status = exampleCasStatus(result)
+    guard status != 400 else { return 400 }
+    guard status != 404 else { return 404 }
+    guard status != 409 else { return 409 }
+    guard status != 503 else { return 503 }
+    guard status != 504 else { return 504 }
+    guard status == 204 else { return 502 }
+    return 204
+}

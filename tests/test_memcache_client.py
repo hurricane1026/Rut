@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import socketserver
 import ssl
@@ -355,14 +356,18 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 @contextlib.contextmanager
-def gateway(args, endpoint):
+def gateway(args, endpoint, program_factory=None):
     with tempfile.TemporaryDirectory(prefix='rut-memcache-') as directory:
         root = Path(directory)
         for name in ('memcache-codec.rut', 'memcache-client.rut'):
             shutil.copyfile(Path(args.library) / name, root / name)
-        program = (Path(args.example).read_text().replace('"clients/memcache-client.rut"',
-                                                        '"memcache-client.rut"')
-                   if args.example else PROGRAM)
+        if program_factory is not None:
+            program = program_factory()
+        elif args.example:
+            program = Path(args.example).read_text().replace('"clients/memcache-client.rut"',
+                                                            '"memcache-client.rut"')
+        else:
+            program = PROGRAM
         if args.opt == '2':
             program = program.replace('import "memcache-client.rut"',
                                       'import * as client from "memcache-client.rut"')
@@ -376,14 +381,39 @@ def gateway(args, endpoint):
         with log.open('wb') as output:
             process = subprocess.Popen([args.server, '0', str(source), '--backend', args.backend,
                                         '--opt', args.opt, '--no-pin', '--shards', '1', '--drain', '0'],
-                                       env=env, stdout=output, stderr=subprocess.STDOUT)
+                                       env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        children = {}
+        peak_compiler_kib = 0
+
+        def birth(pid):
+            try:
+                return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+            except FileNotFoundError:
+                return None
+
         try:
             deadline = time.monotonic() + 270
             while time.monotonic() < deadline:
+                child_file = Path(f'/proc/{process.pid}/task/{process.pid}/children')
+                try:
+                    child_ids = child_file.read_text().split()
+                except FileNotFoundError:
+                    child_ids = []
+                for pid in child_ids:
+                    children.setdefault(pid, birth(pid))
+                    try:
+                        status = Path(f'/proc/{pid}/status').read_text()
+                    except FileNotFoundError:
+                        continue
+                    rss = re.search(r'^VmRSS:\s+(\d+) kB$', status, re.M)
+                    if rss:
+                        peak_compiler_kib = max(peak_compiler_kib, int(rss[1]))
+                assert peak_compiler_kib <= 8 * 1024 * 1024, 'compiler startup exceeded 8 GiB RSS'
                 text = log.read_bytes()
                 found = re.search(rb'Listening on port ([0-9]+) with', text)
                 if found:
                     port = int(found[1])
+                    print(f'Gateway startup peak compiler RSS: {peak_compiler_kib} KiB', flush=True)
                     break
                 if process.poll() is not None:
                     if args.backend == 'io_uring' and b'io_uring is unavailable' in text:
@@ -406,12 +436,22 @@ def gateway(args, endpoint):
 
             yield request
         finally:
-            process.terminate()
+            for pid, started in children.items():
+                if started is not None and birth(pid) == started:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(pid), signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
+            for pid, started in children.items():
+                if started is not None and birth(pid) == started:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(pid), signal.SIGKILL)
 
 
 def builder_checks(request):
