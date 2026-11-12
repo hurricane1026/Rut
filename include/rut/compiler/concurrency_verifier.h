@@ -112,6 +112,8 @@ const char* issue_name(Issue issue);
 // Two consecutive waits plus independent completion actors. A losing or
 // cancelled operation can drain after the next wait is published. Separate
 // generations deliberately prevent old completions from resuming a new wait.
+// Each submitted cancel owns an acknowledgement independent of its target;
+// reclaim waits for both, in either completion order.
 struct WaitProtocolModel {
     static constexpr u32 kMaxActions = 64;
     Model model{};
@@ -119,6 +121,7 @@ struct WaitProtocolModel {
     Invariant invariants[8]{};
     u32 win_actions[4]{};
     u32 drain_actions[4]{};
+    u32 cancel_ack_actions[4]{};
     u32 reclaim_action = kNoIndex;
     u8 operation_count = 0;
 

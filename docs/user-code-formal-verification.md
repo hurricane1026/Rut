@@ -263,11 +263,21 @@ peer only replies after observing that send, while the send-before-receive
 version completes. The peer contract can also represent timers, retries,
 failure replies and ownership handoffs.
 
-Bindings currently cover single IO arms. Duplicate bindings, non-yield blocks,
-timer bindings, and multi-arm bindings are rejected. Multi-arm runtime races
-are checked by the lifecycle model below; the peer adapter does not silently
-replace OR waits with AND waits. Peers must describe finite required exchanges,
-including their terminal states and resource invariants.
+Bindings cover single event/timer arms and explicit two-arm OR waits.
+`VerifyPeerBinding::arms` must name each actual wait-arm bit exactly once;
+missing, duplicate, extra, and combined bits reject the contract. Completion
+prerequisites and consumed facts belong to each arm separately, so a timeout
+can release a receive that never completes. The resumed CFG remains a
+conservative abstraction of both data-dependent branch outcomes.
+Submission assertions check required ownership or acknowledgement facts before
+publication. Peers must describe finite required exchanges, including their
+terminal states and resource invariants.
+
+A supplied environment requires every yield in its selected function to be
+bound by default. Partial contracts require explicitly setting
+`require_all_yields_bound = false`; omitted yields then retain the eventual
+external-completion assumption. A partial contract is not a whole-handler
+protocol proof. Other functions keep their own source-only verification scope.
 
 The contract can be supplied to `rir::verify_function`, `rir::verify_module`,
 or `jit::codegen` through verification options. Source-only compilation has no
@@ -281,9 +291,12 @@ There is currently no `.rut` peer-contract syntax or CLI contract loader.
 `verify::build_wait_protocol_model` generates a contract for two consecutive
 waits, each with one or two event arms. Independent completion actors explore
 both winners, close and partial-submit failure, late loser/cancel-target
-completion, resubmission, and final reclamation. Per-operation fairness assumes
+completion, resubmission, and final reclamation. Cancellation acknowledgements
+and target completions are independent resource owners: either may arrive
+first, and reclamation requires both to drain. Targets that finish before a
+cancel is submitted need no acknowledgement. Per-operation fairness assumes
 an outstanding operation eventually delivers a completion or cancellation
-target completion.
+target completion, and every submitted cancellation eventually acknowledges.
 
 All ordered pairs of wait shapes used by a function are checked, including
 different event kinds and one-arm/two-arm transitions. Assertions require a
@@ -294,8 +307,9 @@ counterexample. Successful models are checked for every arm shape used by a
 function, within explicit bounds.
 
 This is a logical wait-ownership contract, not an extraction of the C++ event
-loops. It does not model kernel CQE flags, cancel-acknowledgement counts,
-multishot receive deliveries, concrete buffers, arbitrary thread data races,
+loops. It models one acknowledgement per abstract submitted cancel, but not
+kernel CQE flags, concrete backend cancellation counts, multishot receive
+deliveries, concrete buffers, arbitrary thread data races,
 or all pending-operation accounting. A persistent multishot receive can supply
 a new logical wait and is not automatically a stale completion. Connecting
 these runtime details to the contract still requires implementation tests and
@@ -319,7 +333,7 @@ cmake --build build --target test_concurrency_verifier test_rir test_jit
 ./build/tests/test_jit
 ```
 
-The `runtime-state-model` CI job also checks 16 exported finite cases against an
+The `runtime-state-model` CI job also checks 29 exported finite cases against an
 independent TLA+ transition semantics. TLC and the native engine must agree on
 success, deadlock, livelock and safety failures, including weak-fairness cases.
 This reference check uses the project's existing pinned TLC artifact:
@@ -395,6 +409,69 @@ constant; it is a structural drift check. This bounded model plus implementation
 and mutation tests is **not a proof of refinement of C++ to TLA+**, nor a proof
 of arbitrary kernel CQE/buffer/accounting behavior. The lifecycle and peer-model
 bounds described above still apply. kqueue execution still requires macOS.
+
+## Synchronization Design Scenarios
+
+`spec/synchronization.tla` separately describes two nonblocking submissions,
+AND/OR result collection, owner application before acknowledgement, explicit
+queue-full failure, and timeout exits. Its ten configurations include required
+counterexamples for collection before readiness, acknowledgement before apply,
+a parked owner waiting on itself, and waiting before submission. The CI job
+requires each negative configuration to fail with its expected property class.
+The native/TLC reference cases additionally cover cyclic owner waits, duplicate
+submission, early all-resume, and cancellation-acknowledgement retirement.
+
+```bash
+python3 scripts/check_synchronization_model.py --jar /path/to/tla2tools.jar
+```
+
+`submit`, handle-based `wait`/`all`/`any`, `notify`, and `consistent: true` remain
+unimplemented source-language design forms. Their models check bounded design
+contracts, not shipped implementations. Supported `wait` and recv/timer
+`wait any` handlers use the native compiler gate; RIR and codegen tests verify
+that a supplied blocking contract prevents LLVM emission and a timer escape
+allows it. Unknown services and the concrete runtime backends still need
+separate contracts and implementation tests. None of these checks establishes
+general freedom from distributed deadlock.
+
+## Executable Receive-Before-Send Example
+
+[`receive-before-send.rut`](../tests/fixtures/deadlock/receive-before-send.rut)
+connects, waits for an upstream reply, and only then sends the request body.
+The explicit peer contract replies only after receiving that request. With no
+timeout or close escape in the contract, both sides wait forever.
+[`send-before-receive.rut`](../tests/fixtures/deadlock/send-before-receive.rut)
+reverses the send/receive order and completes under the same contract.
+
+The JIT test loads both actual source files, lowers them through HIR/MIR/RIR,
+binds the peer contract to their actual yield blocks, and checks LLVM admission:
+
+```bash
+./build/tests/test_jit --filter=source_receive_before_send_deadlocks_under_reply_after_request_contract
+```
+
+The bad source returns `HandlerDeadlock` before LLVM emission; the corrected
+source is accepted. Without a peer contract both source files pass the local
+verifier: this example does not imply that ordinary source-only compilation
+can infer a remote server's behavior.
+
+[`receive_before_send.tla`](../spec/receive_before_send.tla) is an independently
+written reference abstraction, not an automatic translation of these files.
+The synchronization CI script checks both configurations: the bad order must
+produce `Deadlock reached`, and the corrected order must satisfy safety and
+termination. To view TLC's counterexample directly (the first command is
+expected to return a nonzero exit status):
+
+```bash
+cd spec
+java -cp /path/to/tla2tools.jar tlc2.TLC -config receive_before_send.cfg receive_before_send
+java -cp /path/to/tla2tools.jar tlc2.TLC -config send_before_receive.cfg receive_before_send
+```
+
+The bad model reaches two states: `Connect / WaitRequest`, then
+`Recv / WaitRequest`, with neither request nor reply published. The corrected
+model explores eight reachable states with no error. Concrete runtime timeout,
+transport failure and disconnect behavior are outside this deadlock contract.
 
 ## TLA+ Role
 

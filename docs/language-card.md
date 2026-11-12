@@ -423,10 +423,10 @@ let blacklist = Set<IP>(capacity: 100000)          // ⏳ pending (Set<CIDR> = L
 let seen      = Bloom<str>(capacity: 1000000, errorRate: 0.01)           // ⏳ pending
 let flags     = Bitmap(size: 256)                                        // ⏳ pending
 
-notify all blacklist.add(ip)      // fan-out to all shards (eventual)
-notify(ip) blacklist.add(ip)      // to owner shard by key hash (expr form;
+notify all blacklist.add(ip)      // ⏳ target: fan-out to all shards (eventual)
+notify(ip) blacklist.add(ip)      // ⏳ target: to owner shard by key hash (expr form;
                                   // bare-statement cache.set does not nest)
-// single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
+// ⏳ single-owner routing: consistent: true (+ // rut:allow(consistent)); Cache
 // remains lossy and separate get/set operations are not an atomic update.
 // ⏳ cross-node backend is unspecified until Cache has a freshness contract.
 ```
@@ -1158,7 +1158,7 @@ guard res.status == 200 else { return 502 }
 
 fire post http://audit/log { Body: json(evt) } // fire-and-forget, non-terminal
 
-// ⏳ Planned submit/wait handle composition; implemented event waits below.
+// ⏳ Target concurrency syntax: handles, submit, all/any are not implemented.
 let h1 = submit get http://svc-a/x
 let h2 = submit get http://svc-b/y
 let (r1, r2) = wait(h1, h2)
@@ -1171,6 +1171,16 @@ wait(2s) // timer sleep
 wait(downstream.recv())
 wait(downstream.send()) // even an empty send resumes on a later loop turn
 // Scheduler safety/progress has bounded TLC coverage plus concrete runtime tests.
+
+// Implemented bounded OR wait: downstream recv versus timer (integer ms).
+wait any {
+    downstream.recv() => { return 204 }
+    timer(250) => { return 408 }
+}
+// Every handler passes native CFG/protocol checks before LLVM emission.
+// Known peer contracts can reject mutual waits; unknown network peers retain
+// an eventual completion/failure assumption. TLA+ is a CI design/reference
+// check, not proof of arbitrary source programs or kernel/backend behavior.
 
 // TCP/UDP clients — fixed endpoints, request-owned handles (implemented).
 // See net-clients.md for bounds, UDP and TLS policies.

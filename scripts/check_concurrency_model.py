@@ -16,7 +16,10 @@ CASES = (
     "mutual", "timeout", "or_wait", "livelock", "starvation_fair",
     "starvation_unfair", "intermittent", "ownership", "wait_single",
     "wait_any", "wait_mixed", "wait_mixed_reverse", "stale_completion", "reclaim",
-    "missing_cancel", "missing_disarm",
+    "missing_cancel", "missing_disarm", "missing_cancel_ack", "reclaim_before_cancel_ack",
+    "submit_all", "submit_after_wait", "submit_reuse", "all_early_resume",
+    "consistent_ack", "consistent_early_ack", "consistent_self_wait", "consistent_self_inline",
+    "consistent_cycle", "consistent_timeout", "consistent_full",
 )
 
 
@@ -50,10 +53,10 @@ def main() -> int:
                 + "".join(f"{name} <- {name}Value\n" for name in constants)
             )
             completed = subprocess.run(
-                ["java", "-cp", str(jar), "tlc2.TLC", "-workers", "1", "-cleanup",
+                ["java", "-Xmx1g", "-XX:+UseParallelGC", "-cp", str(jar), "tlc2.TLC", "-workers", "1", "-lncheck", "final", "-cleanup",
                  "-metadir", str(work / f"states-{case}"), "-config", config.name,
                  "concurrency_instance"],
-                cwd=work, capture_output=True, text=True, timeout=60,
+                cwd=work, capture_output=True, text=True, timeout=180,
             )
             output = completed.stdout + completed.stderr
             if "Deadlock reached" in output:

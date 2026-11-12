@@ -1512,9 +1512,10 @@ TEST(RirVerifier, PeerContractDetectsReceiveBeforeSendInGeneratedHandler) {
         peer.actions = peer_actions;
         peer.action_count = 2;
         peer.terminal_clear = 3;
-        VerifyPeerBinding bindings[] = {{blocks[recv_first ? 2 : 1].id, 1, 0, 0},
+        VerifyPeerBinding bindings[] = {{blocks[0].id, 0, 0, 0},
+                                        {blocks[recv_first ? 2 : 1].id, 1, 0, 0},
                                         {blocks[recv_first ? 1 : 2].id, 0, 2, 2}};
-        VerifyPeerEnvironment environment{0, &peer, bindings, 2};
+        VerifyPeerEnvironment environment{0, &peer, bindings, 3};
         VerifyOptions options{};
         options.environment = &environment;
         const auto result = verify_function(fn, 0, options);
@@ -1533,6 +1534,71 @@ TEST(RirVerifier, PeerContractDetectsReceiveBeforeSendInGeneratedHandler) {
                  VerifyIssueCode::ConcurrentProtocolFailure);
         ctx.destroy();
     }
+}
+
+TEST(RirVerifier, PeerContractTimedAnyUsesAlternativeCompletionsAndExactArms) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("race"), lit("/race"), 1));
+    BlockId blocks[] = {V(b.create_block(fn, lit("wait"))), V(b.create_block(fn, lit("done")))};
+    u32 payloads[] = {25};
+    u8 kinds[] = {static_cast<u8>(jit::YieldKind::Any)};
+    VOK(b.set_yield_payload(fn, payloads, 1, kinds));
+    VOK(b.set_explicit_resume_blocks(fn, blocks, 2));
+    b.set_insert_point(fn, blocks[0]);
+    VOK(b.emit_yield_event(kinds[0], 25, 1));
+    b.set_insert_point(fn, blocks[1]);
+    VOK(b.emit_ret_status(204));
+
+    verify::Action timer{};
+    timer.to = 1;
+    timer.set = 2;
+    verify::Model peer{};
+    peer.actor_count = 1;
+    peer.actors[0] = {2, 0, 1};
+    peer.actions = &timer;
+    peer.action_count = 1;
+    peer.terminal_clear = 2;
+    VerifyPeerBinding binding{};
+    binding.block_index = blocks[0].id;
+    binding.arm_count = 2;
+    binding.arms[0] = {kWaitEventArmRecv, 1, 1};
+    binding.arms[1] = {kWaitEventArmTimer, 2, 2};
+    VerifyPeerEnvironment environment{0, &peer, &binding, 1};
+    VerifyOptions options{};
+    options.environment = &environment;
+    // Receive can never complete. Timer alone must release the OR wait.
+    CHECK(verify_function(fn, 0, options).ok);
+    binding.arms[1].completion_set = 4;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code, VerifyIssueCode::HandlerDeadlock);
+    binding.arms[1].completion_set = 2;
+    binding.submit_require_set = 8;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentProtocolFailure);
+    binding.submit_require_set = 0;
+    const u8 malformed_masks[] = {0, kWaitEventArmRecv, kWaitEventArmUpstreamRecv};
+    for (u8 malformed : malformed_masks) {
+        binding.arms[1].arm_mask = malformed;
+        CHECK_EQ(verify_function(fn, 0, options).issue.code,
+                 VerifyIssueCode::ConcurrentProtocolFailure);
+    }
+    binding.arms[1].arm_mask = kWaitEventArmTimer;
+    binding.completion_set = 1;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentProtocolFailure);
+    binding.completion_set = 0;
+    binding.arm_count = 0;  // no legacy AND interpretation of a multi-arm wait
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentProtocolFailure);
+    environment.binding_count = 0;
+    CHECK_EQ(verify_function(fn, 0, options).issue.code,
+             VerifyIssueCode::ConcurrentProtocolFailure);
+    environment.require_all_yields_bound = false;
+    peer.terminal_clear = 0;
+    CHECK(verify_function(fn, 0, options).ok);
+    ctx.destroy();
 }
 
 TEST(RirVerifier, HandlerAutomatonSummarizesUpstreamFailurePath) {

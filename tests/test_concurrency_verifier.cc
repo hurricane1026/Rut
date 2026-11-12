@@ -242,13 +242,13 @@ TEST(ConcurrencyVerifier, AllSupportedWaitMasksHandleCloseCancelAndNextGeneratio
         const u32 count = static_cast<u32>(__builtin_popcount(mask));
         CHECK_EQ(built, count <= 2);
         if (!built) continue;
-        const auto result = check(protocol.model, {2048, 16384});
+        const auto result = check(protocol.model, {32768, 262144});
         CHECK(result.ok);
         CHECK(result.state_count > 10);
         for (u8 next = 1; next < 64; ++next) {
             if (__builtin_popcount(next) > 2) continue;
             REQUIRE(build_wait_protocol_model(mask, next, protocol));
-            CHECK(check(protocol.model, {2048, 16384}).ok);
+            CHECK(check(protocol.model, {32768, 262144}).ok);
         }
     }
     WaitProtocolModel protocol{};
@@ -261,7 +261,7 @@ TEST(ConcurrencyVerifier, MissingLoserDisarmIsRejected) {
     REQUIRE(build_wait_protocol_model(3, protocol));
     auto& winner = protocol.actions[protocol.win_actions[0]];
     winner.clear &= ~(u64{1} << 5);  // leave the other arm's callback installed
-    const auto result = check(protocol.model, {2048, 16384});
+    const auto result = check(protocol.model, {32768, 262144});
     CHECK_EQ(result.issue, Issue::UnsafeAction);
     replay(_tc, protocol.model, result);
 }
@@ -271,7 +271,7 @@ TEST(ConcurrencyVerifier, MissingGenerationFenceAllowsDuplicateResume) {
     REQUIRE(build_wait_protocol_model(3, protocol));
     auto& old_completion = protocol.actions[protocol.win_actions[0]];
     old_completion.guard_set = 1 | (u64{1} << 9);  // old IO delivered during the second wait
-    const auto result = check(protocol.model, {2048, 16384});
+    const auto result = check(protocol.model, {32768, 262144});
     CHECK_EQ(result.issue, Issue::UnsafeAction);
     CHECK_EQ(result.witness.locations[0], 7u);
     replay(_tc, protocol.model, result);
@@ -282,7 +282,7 @@ TEST(ConcurrencyVerifier, MissingCancelDrainLeavesAnOperationStuck) {
     REQUIRE(build_wait_protocol_model(3, protocol));
     auto& drain = protocol.actions[protocol.drain_actions[0]];
     drain.guard_set |= u64{1} << 63;  // no cancellation target can ever drain
-    const auto result = check(protocol.model, {2048, 16384});
+    const auto result = check(protocol.model, {32768, 262144});
     CHECK_EQ(result.issue, Issue::Deadlock);
     replay(_tc, protocol.model, result);
 }
@@ -291,7 +291,39 @@ TEST(ConcurrencyVerifier, PrematureReclaimIsRejectedBeforeSlotReuse) {
     WaitProtocolModel protocol{};
     REQUIRE(build_wait_protocol_model(3, protocol));
     protocol.actions[protocol.reclaim_action].guard_clear = 0;
-    const auto result = check(protocol.model, {2048, 16384});
+    const auto result = check(protocol.model, {32768, 262144});
+    CHECK_EQ(result.issue, Issue::UnsafeAction);
+    replay(_tc, protocol.model, result);
+}
+
+TEST(ConcurrencyVerifier, CancelTargetAndAcknowledgementCanArriveInEitherOrder) {
+    for (u32 target_first = 0; target_first < 2; ++target_first) {
+        WaitProtocolModel protocol{};
+        REQUIRE(build_wait_protocol_model(3, protocol));
+        for (u32 op = 0; op < protocol.operation_count; ++op) {
+            if (target_first)
+                protocol.actions[protocol.cancel_ack_actions[op]].guard_clear |= u64{1} << op;
+            else
+                protocol.actions[protocol.drain_actions[op]].guard_clear |= u64{1} << (20 + op);
+        }
+        CHECK(check(protocol.model).ok);
+    }
+}
+
+TEST(ConcurrencyVerifier, CancelAcknowledgementMustDrainIndependentlyOfTarget) {
+    WaitProtocolModel protocol{};
+    REQUIRE(build_wait_protocol_model(3, protocol));
+    protocol.actions[protocol.cancel_ack_actions[0]].guard_set |= u64{1} << 63;
+    const auto result = check(protocol.model);
+    CHECK_EQ(result.issue, Issue::Deadlock);
+    replay(_tc, protocol.model, result);
+}
+
+TEST(ConcurrencyVerifier, TargetCompletionDoesNotPermitReclaimBeforeCancelAcknowledgement) {
+    WaitProtocolModel protocol{};
+    REQUIRE(build_wait_protocol_model(3, protocol));
+    protocol.actions[protocol.reclaim_action].guard_clear = 15;
+    const auto result = check(protocol.model);
     CHECK_EQ(result.issue, Issue::UnsafeAction);
     replay(_tc, protocol.model, result);
 }
@@ -300,7 +332,7 @@ namespace {
 
 struct ReferenceCase {
     Model model{};
-    Action actions[8]{};
+    Action actions[16]{};
     Invariant invariant{};
     WaitProtocolModel protocol{};
 };
@@ -311,7 +343,80 @@ bool reference_case(const char* name, ReferenceCase& out) {
     model.actor_count = 1;
     model.actors[0] = {3, 0, 2};
     model.actions = actions;
-    if (!strcmp(name, "mutual")) {
+    if (!strcmp(name, "submit_all") || !strcmp(name, "submit_after_wait") ||
+        !strcmp(name, "submit_reuse") || !strcmp(name, "all_early_resume")) {
+        model.actor_count = 3;
+        model.actors[0] = {4, 0, 3};
+        model.actors[1] = model.actors[2] = {2, 0, 1};
+        actions[0] = step(0, 0, 1, 0, 1);
+        actions[1] = step(0, 1, 2, 0, 2);
+        actions[2] = step(0, 2, 3, 12);
+        actions[2].clear = 12;
+        actions[3] = step(1, 0, 1, 1, 4);
+        actions[3].clear = 1;
+        actions[4] = step(2, 0, 1, 2, 8);
+        actions[4].clear = 2;
+        model.action_count = 5;
+        model.terminal_clear = 15;
+        if (!strcmp(name, "submit_after_wait")) actions[0].guard_set = 4;
+        if (!strcmp(name, "submit_reuse")) {
+            actions[1].set = 1;
+            actions[1].assert_clear = 1;
+        }
+        if (!strcmp(name, "all_early_resume")) {
+            actions[2].guard_set = 4;
+            actions[2].assert_set = 12;
+        }
+    } else if (!strcmp(name, "consistent_ack") || !strcmp(name, "consistent_early_ack") ||
+               !strcmp(name, "consistent_self_wait") || !strcmp(name, "consistent_self_inline") ||
+               !strcmp(name, "consistent_cycle") || !strcmp(name, "consistent_timeout") ||
+               !strcmp(name, "consistent_full")) {
+        // Bounded owner delivery contract: publication, application, then ack.
+        // These are design cases, not implemented consistent:true source syntax.
+        model.actor_count = 2;
+        model.actors[0] = model.actors[1] = {3, 0, 2};
+        actions[0] = step(0, 0, 1, 0, 1);
+        actions[1] = step(0, 1, 2, 4);
+        actions[1].assert_set = 2;
+        actions[1].clear = 4;
+        actions[2] = step(1, 0, 1, 1, 2);
+        actions[2].clear = 1;
+        actions[3] = step(1, 1, 2, 2, 4);
+        model.action_count = 4;
+        model.terminal_clear = 5;
+        if (!strcmp(name, "consistent_early_ack")) {
+            actions[2].set = 4;
+            actions[3].guard_set = 0;
+            actions[3].set = 2;
+        }
+        if (!strcmp(name, "consistent_self_wait")) {
+            model.actor_count = 1;
+            model.action_count = 2;  // queued owner work cannot run on a parked actor
+        }
+        if (!strcmp(name, "consistent_self_inline")) {
+            model.actor_count = 1;
+            model.action_count = 1;
+            actions[0] = step(0, 0, 2, 0, 2);
+        }
+        if (!strcmp(name, "consistent_cycle") || !strcmp(name, "consistent_timeout")) {
+            actions[0] = step(0, 0, 1, 0, 1);
+            actions[1] = step(0, 1, 2, 2);
+            actions[2] = step(1, 0, 1, 0, 4);
+            actions[3] = step(1, 1, 2, 8);
+            model.terminal_clear = 0;
+            if (!strcmp(name, "consistent_timeout")) {
+                actions[4] = step(0, 1, 2);
+                actions[5] = step(1, 1, 2);
+                model.action_count = 6;
+            }
+        }
+        if (!strcmp(name, "consistent_full")) {
+            model.actor_count = 1;
+            model.action_count = 1;
+            model.initial_bits = 8;  // queue full: explicit failure, no publication
+            actions[0] = step(0, 0, 2, 8);
+        }
+    } else if (!strcmp(name, "mutual")) {
         model.actor_count = 2;
         model.actors[1] = {3, 0, 2};
         actions[0] = step(0, 0, 1);
@@ -372,7 +477,8 @@ bool reference_case(const char* name, ReferenceCase& out) {
         if (strcmp(name, "wait_single") && strcmp(name, "wait_any") && strcmp(name, "wait_mixed") &&
             strcmp(name, "wait_mixed_reverse") && strcmp(name, "stale_completion") &&
             strcmp(name, "reclaim") && strcmp(name, "missing_cancel") &&
-            strcmp(name, "missing_disarm"))
+            strcmp(name, "missing_disarm") && strcmp(name, "missing_cancel_ack") &&
+            strcmp(name, "reclaim_before_cancel_ack"))
             return false;
         if (!build_wait_protocol_model(!strcmp(name, "wait_single") ? 1 : 3, out.protocol))
             return false;
@@ -386,11 +492,51 @@ bool reference_case(const char* name, ReferenceCase& out) {
             out.protocol.actions[out.protocol.reclaim_action].guard_clear = 0;
         if (!strcmp(name, "missing_cancel"))
             out.protocol.actions[out.protocol.drain_actions[0]].guard_set |= u64{1} << 63;
+        if (!strcmp(name, "missing_cancel_ack"))
+            out.protocol.actions[out.protocol.cancel_ack_actions[0]].guard_set |= u64{1} << 63;
+        if (!strcmp(name, "reclaim_before_cancel_ack"))
+            out.protocol.actions[out.protocol.reclaim_action].guard_clear = 15;
         if (!strcmp(name, "missing_disarm"))
             out.protocol.actions[out.protocol.win_actions[0]].clear &= ~(u64{1} << 5);
         model = out.protocol.model;
     }
     return true;
+}
+
+TEST(ConcurrencyVerifier, SynchronizationReferenceCasesHaveExpectedVerdicts) {
+    const char* names[] = {"submit_all",
+                           "submit_after_wait",
+                           "submit_reuse",
+                           "all_early_resume",
+                           "consistent_ack",
+                           "consistent_early_ack",
+                           "consistent_self_wait",
+                           "consistent_self_inline",
+                           "consistent_cycle",
+                           "consistent_timeout",
+                           "consistent_full",
+                           "missing_cancel_ack",
+                           "reclaim_before_cancel_ack"};
+    const Issue expected[] = {Issue::None,
+                              Issue::Deadlock,
+                              Issue::UnsafeAction,
+                              Issue::UnsafeAction,
+                              Issue::None,
+                              Issue::UnsafeAction,
+                              Issue::Deadlock,
+                              Issue::None,
+                              Issue::Deadlock,
+                              Issue::None,
+                              Issue::None,
+                              Issue::Deadlock,
+                              Issue::UnsafeAction};
+    for (u32 i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        ReferenceCase fixture{};
+        REQUIRE(reference_case(names[i], fixture));
+        const auto result = check(fixture.model);
+        CHECK_EQ(result.issue, expected[i]);
+        if (!result.ok) replay(_tc, fixture.model, result);
+    }
 }
 
 void emit_set(u64 bits) {
@@ -408,7 +554,7 @@ int export_reference(const char* name) {
     ReferenceCase fixture{};
     if (!reference_case(name, fixture)) return 2;
     const auto& model = fixture.model;
-    const auto result = check(model, {2048, 16384});
+    const auto result = check(model, {32768, 262144});
     if (result.issue == Issue::StateLimit || result.issue == Issue::EdgeLimit ||
         result.issue == Issue::WorkLimit || result.issue == Issue::InvalidModel ||
         result.issue == Issue::OutOfMemory)
