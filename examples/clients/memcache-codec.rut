@@ -214,7 +214,7 @@ struct MemcacheKeys { bytes: Bytes count: i32 }
 struct MemcacheKeyScan { offset: i32 count: i32 }
 struct MemcacheValueHeader { key: Bytes flags: Bytes size: i32 cas: Bytes }
 struct MemcacheValueToken { kind: i32 key: Bytes data: Bytes flags: Bytes cas: Bytes next: i32 }
-struct MemcacheManyState { offset: i32 count: i32 seen: Bytes keys: Bytes withCas: bool }
+struct MemcacheManyState { offset: i32 count: i32 seen: i32 keys: Bytes withCas: bool }
 struct MemcacheManyStream { bytes: Bytes kind: i32 count: i32 }
 struct MemcacheManyReply { frame: Bytes keys: Bytes withCas: bool count: i32 }
 
@@ -273,6 +273,62 @@ func memcacheKeysValid(_ keys: MemcacheKeys) -> bool {
         memcacheKeysClean2(keys.bytes) && memcacheKeysClean3(keys.bytes) else { false }
     guard let values = collectBytes(keys.bytes, MemcacheKeyScan(offset: 0, count: 0), 8, memcacheKeysStep) else { false }
     values.get(values.count - 1) == keys.count
+}
+func memcacheKeyAt(_ keys: Bytes, _ index: i32) -> Bytes {
+    let first = keys.find(b" ").or(keys.count)
+    if index == 0 { keys.slice(0, first) } else {
+        guard let tail1 = keys.slice(first + 1, keys.count) else { nil }
+        let second = tail1.find(b" ").or(tail1.count)
+        if index == 1 { tail1.slice(0, second) } else {
+            guard let tail2 = tail1.slice(second + 1, tail1.count) else { nil }
+            let third = tail2.find(b" ").or(tail2.count)
+            if index == 2 { tail2.slice(0, third) } else {
+                guard let tail3 = tail2.slice(third + 1, tail2.count) else { nil }
+                let fourth = tail3.find(b" ").or(tail3.count)
+                if index == 3 { tail3.slice(0, fourth) } else {
+                    guard let tail4 = tail3.slice(fourth + 1, tail3.count) else { nil }
+                    let fifth = tail4.find(b" ").or(tail4.count)
+                    if index == 4 { tail4.slice(0, fifth) } else {
+                        guard let tail5 = tail4.slice(fifth + 1, tail4.count) else { nil }
+                        let sixth = tail5.find(b" ").or(tail5.count)
+                        if index == 5 { tail5.slice(0, sixth) } else {
+                            guard let tail6 = tail5.slice(sixth + 1, tail5.count) else { nil }
+                            let seventh = tail6.find(b" ").or(tail6.count)
+                            if index == 6 { tail6.slice(0, seventh) } else {
+                                guard let tail7 = tail6.slice(seventh + 1, tail6.count) else { nil }
+                                tail7.slice(0, tail7.find(b" ").or(tail7.count))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+func memcacheKeyIndex(_ keys: Bytes, _ key: Bytes) -> i32 {
+    guard let first = memcacheKeyAt(keys, 0) else { -1 }
+    if first == key { 0 } else {
+        guard let second = memcacheKeyAt(keys, 1) else { -1 }
+        if second == key { 1 } else {
+            guard let third = memcacheKeyAt(keys, 2) else { -1 }
+            if third == key { 2 } else {
+                guard let fourth = memcacheKeyAt(keys, 3) else { -1 }
+                if fourth == key { 3 } else {
+                    guard let fifth = memcacheKeyAt(keys, 4) else { -1 }
+                    if fifth == key { 4 } else {
+                        guard let sixth = memcacheKeyAt(keys, 5) else { -1 }
+                        if sixth == key { 5 } else {
+                            guard let seventh = memcacheKeyAt(keys, 6) else { -1 }
+                            if seventh == key { 6 } else {
+                                guard let eighth = memcacheKeyAt(keys, 7) else { -1 }
+                                if eighth == key { 7 } else { -1 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 func memcacheRetrievalName(_ mode: MemcacheRetrievalMode) -> Bytes {
     match mode {
@@ -351,10 +407,13 @@ func memcacheValueToken(_ bytes: Bytes, _ offset: i32, _ withCas: bool) -> Memca
     }
 }
 func memcacheManyValue(_ bytes: Bytes, _ state: MemcacheManyState, _ token: MemcacheValueToken) -> (MemcacheManyState, MemcacheValueToken, bool) {
-    guard state.count < 8 && memcacheKeyContains(state.keys, token.key).or(false) &&
-        !memcacheKeyContains(state.seen, token.key).or(true) else { nil }
-    guard let seen = memcacheField(state.seen, token.key) else { nil }
-    (MemcacheManyState(offset: token.next, count: state.count + 1, seen: seen, keys: state.keys, withCas: state.withCas), token, false)
+    guard state.count < 8 else { nil }
+    let index = memcacheKeyIndex(state.keys, token.key)
+    guard index > -1 else { nil }
+    let bit = bitwise.shiftLeft(1, index)
+    guard bitwise.and(state.seen, bit) == 0 else { nil }
+    (MemcacheManyState(offset: token.next, count: state.count + 1,
+        seen: bitwise.or(state.seen, bit), keys: state.keys, withCas: state.withCas), token, false)
 }
 func memcacheManyStep(_ bytes: Bytes, _ state: MemcacheManyState) -> (MemcacheManyState, MemcacheValueToken, bool) {
     let token = memcacheValueToken(bytes, state.offset, state.withCas)
@@ -365,7 +424,7 @@ func memcacheManyStep(_ bytes: Bytes, _ state: MemcacheManyState) -> (MemcacheMa
 }
 func memcacheManyScan(_ bytes: Bytes, _ keys: Bytes, _ withCas: bool) {
     guard !(bytes.count > 8192) else { nil }
-    collectBytes(bytes, MemcacheManyState(offset: 0, count: 0, seen: b"", keys: keys, withCas: withCas), 9, memcacheManyStep)
+    collectBytes(bytes, MemcacheManyState(offset: 0, count: 0, seen: 0, keys: keys, withCas: withCas), 9, memcacheManyStep)
 }
 func memcacheManyFeed(_ bytes: Bytes, _ keys: Bytes, _ withCas: bool) -> MemcacheManyStream {
     guard let tokens = memcacheManyScan(bytes, keys, withCas) else { MemcacheManyStream(bytes: bytes, kind: -1, count: 0) }

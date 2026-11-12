@@ -117,6 +117,19 @@ func extManyOutput(_ result: MemcacheManyResult, _ index: i32, _ countOnly: bool
     if countOnly { Bytes(formatInt(extManyCount(result)).or("invalid")) }
     else { extManyBody(result, index) }
 }
+func extManyTriple(_ reply: MemcacheManyReply, _ index: i32) -> Bytes {
+    guard let first = extManyReplyBody(reply, index) else { nil }
+    guard let second = extManyReplyBody(reply, index) else { nil }
+    guard let third = extManyReplyBody(reply, index) else { nil }
+    guard let a = concatBytes(first, second, 8192) else { nil }
+    concatBytes(a, third, 8192)
+}
+func extManyTripleResult(_ result: MemcacheManyResult, _ index: i32) -> Bytes {
+    match result {
+        .values(reply) => extManyTriple(reply, index)
+        _ => nil
+    }
+}
 func extGetsStatus(_ result: MemcacheGetsResult) -> i32 {
     match result {
         .value(item) => 200
@@ -206,6 +219,17 @@ route POST "/append" {
     let body = storeBody(result)
     return response(200, body: body)
 }
+route POST "/many-triple" {
+    let opening = tcp(env("MEMCACHE_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = memcacheManyExecute(connection,
+        MemcacheKeys(bytes: req.bodyBytes, count: parseInt(req.header("X-Count").or("0")).or(0)),
+        extMode(req.header("X-Mode").or("get")), 0)
+    let finished = extManyFinish(connection, result)
+    guard finished else { return 500 }
+    guard let body = extManyTripleResult(result, parseInt(req.header("X-Index").or("-1")).or(-1)) else { return 404 }
+    return response(200, body: body)
+}
 route POST "/many" {
     let opening = tcp(env("MEMCACHE_ENDPOINT"), 1000)
     guard let connection = opening else { return 503 }
@@ -290,7 +314,7 @@ def program(reads):
     base = BASIC_PROGRAM[:start] + ''.join(r for r in base_routes if r.startswith(('route POST "/store"', 'route POST "/get"')))
     start = ADVANCED.index('route POST ')
     routes = re.split(r'(?=^route POST )', ADVANCED[start:], flags=re.M)
-    read_routes = ('many', 'gets', 'gats', 'gat', 'retain', 'keys', 'addkey')
+    read_routes = ('many', 'many-triple', 'gets', 'gats', 'gat', 'retain', 'keys', 'addkey')
     return base + ADVANCED[:start] + ''.join(r for r in routes if r.startswith('route POST "/cas"') or any(r.startswith('route POST "/' + name + '"') for name in read_routes) == reads)
 
 
@@ -390,7 +414,7 @@ class AdvancedHandler(socketserver.StreamRequestHandler):
         name = parts[0]
         keys = parts[2:] if name in (b'gat', b'gats') else parts[1:]
         key = keys[0]
-        mode = key.removeprefix(b'fixture-')
+        mode = b'reorder' if key.startswith(b'fixture-eight') else key.removeprefix(b'fixture-')
         if mode == b'timeout':
             self.server.stopping.wait(1.3)
             return True
@@ -528,6 +552,11 @@ def reads(request, peer):
     for key in keys:
         assert request('store', b'v', {'X-Key':key.decode()})[0] == 200
     assert request('many', packed, {'X-Count':'8','X-Count-Only':'yes'}) == (200,b'8')
+    long_fixture = b'fixture-eight' + b'X' * (250 - len(b'fixture-eight'))
+    long_reply_keys = b' '.join([long_fixture] + keys[:7])
+    for index, key in enumerate(list(reversed([long_fixture] + keys[:7]))):
+        status, body = request('many-triple', long_reply_keys, {'X-Count':'8', 'X-Index':str(index)})
+        assert status == 200 and body.count(b'|0|') == 3 and key in body, (index, status, body[:100])
     for key, data, flags in ((b'one',b'a\x00\xff\r\nEND\r\nz','4294967295'),(b'two',b'','0'),(b'key',b'present','0')):
         assert request('store', data, {'X-Key': key.decode(), 'X-Flags':flags})[0] == 200
     assert request('gets', b'absent')[0] == 404
