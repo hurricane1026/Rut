@@ -3384,6 +3384,9 @@ request header accessors; duplicates do not become guest access. No query/body
 credential source is implicitly enabled by this profile. See [Consumer registry](consumer-registry.md)
 for the exact schema, 32-Consumer/64-credential bounds, rotation, disabled state,
 RCU/native-program ownership, redaction and current publication interfaces.
+The offline `rut-consumers` executable validates, previews redacted replacements,
+inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic
+running-gateway publication. See [offline administration](consumer-registry.md#offline-administration).
 
 ## Persistent replay claim composition (implemented bounded profile)
 

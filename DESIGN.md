@@ -10925,7 +10925,12 @@ bounded credentials, and projects only identity/groups into the request arena.
 No mutable registry state is shared across shards. Registry creation, disable,
 rotation and membership changes are replacement configuration snapshots; existing
 native-program/RouteConfig ownership and RCU retirement retain old readers.
-See [the schema and host publication boundary](docs/consumer-registry.md).
+The offline `rut-consumers` tool reuses the runtime validator for transactional
+full-record upserts/removals, validated redacted previews and inspection. Bounded
+owned buffers hold all input and output; no mutable state or allocator enters the request path.
+Validated snapshots publish as new private files using synced no-replace links;
+activation and RCU retirement remain the configuration host's responsibility.
+See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
 Replay policy is composed in Rut over the existing RESP2/TCP/TLS client. One
 atomic NX claim on an authoritative external store precedes side effects; a

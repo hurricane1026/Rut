@@ -76,11 +76,28 @@ def request(port,path,header):
     return int(head.split(b' ',2)[1]),body
 
 
+def administer(args, root, name, config, previous=None):
+    if not args.admin:
+        return config
+    base = previous or root / 'empty.json'
+    if previous is None:
+        subprocess.run([args.admin, 'init', str(base)], check=True, capture_output=True)
+    patch = root / (name + '-changes.json')
+    patch.write_text(json.dumps(dict(consumers=config['consumers'], credentials=config['credentials'],
+                                    removeConsumers=[], removeCredentials=[])))
+    patch.chmod(0o600)
+    target = root / (name + '.json')
+    subprocess.run([args.admin, 'apply', str(base), str(patch), str(target)],
+                   check=True, capture_output=True)
+    return json.loads(target.read_text())
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--server',required=True)
     parser.add_argument('--source',required=True)
     parser.add_argument('--backend',required=True)
+    parser.add_argument('--admin')
     args=parser.parse_args()
     initial=dict(version=1,consumers=[consumer('alice',groups=['staff'])],credentials=[
         credential('old','alice','bearer','alice-old'),
@@ -89,6 +106,7 @@ def main():
         credential('key','alice','header','custom-key')])
     with tempfile.TemporaryDirectory(prefix='rut-consumers-') as tmp:
         root=Path(tmp)
+        initial=administer(args,root,'initial-snapshot',initial)
         with gateway(args,initial,root/'initial') as first:
             for value,expected in [('',401),('Bearer alice-current',200),('Bearer alice-old',200),
                                    ('Bearer wrong',401),('Bearer alice-current ',200)]:
@@ -108,6 +126,7 @@ def main():
             updated['consumers'][0]['groups']=[]
             updated['consumers'].append(consumer('bob'))
             updated['credentials'].append(credential('bob','bob','bearer','bob-key'))
+            updated=administer(args,root,'updated-snapshot',updated,root/'initial-snapshot.json')
             with gateway(args,updated,root/'updated') as second:
                 assert request(second,'/private','Authorization: Bearer alice-old\r\n')[0]==401
                 assert request(second,'/staff','Authorization: Bearer alice-current\r\n')[0]==403
@@ -119,6 +138,7 @@ def main():
             with gateway(args,invalid,root/'invalid',invalid=True):pass
             assert request(first,'/private','Authorization: Bearer alice-current\r\n')[0]==200
         disabled=json.loads(json.dumps(initial));disabled['consumers'][0]['enabled']=False
+        disabled=administer(args,root,'disabled-snapshot',disabled,root/'initial-snapshot.json')
         with gateway(args,disabled,root/'disabled') as port:
             assert request(port,'/private','Authorization: Bearer alice-current\r\n')[0]==401
     print('PASS: Consumer creation, disable, credential retirement, groups, snapshot isolation and invalid update')

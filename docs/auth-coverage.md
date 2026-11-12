@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Bounded 32-Consumer/64-credential configuration snapshots with stable IDs, enable/disable, rotation, groups and identity-only projection; static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement; opt-in bounded query/form authentication returns sanitized fields for rebuilt requests | Administrative registry APIs and transparent target/body mutation |
+| API Key / Basic | Bounded 32-Consumer/64-credential configuration snapshots with stable IDs, enable/disable, rotation, groups and identity-only projection; static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement; opt-in bounded query/form authentication returns sanitized fields for rebuilt requests | Online administrative registry APIs and transparent target/body mutation; offline `rut-consumers` snapshot administration is implemented |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
@@ -1571,8 +1571,10 @@ JIT tests also cover the 1024/1025-byte bound. See
   exact stable IDs, disabled/retired credentials and group updates, compiler
   validation, identity-only results and native-program lifetime isolation. This
   adds a bounded registry plus opt-in query/form authentication and sanitized
-  fields for explicitly rebuilt requests. Administrative management APIs and
-  transparent target/body mutation remain separate interfaces for #1072.
+  fields for explicitly rebuilt requests. Offline `rut-consumers` administration
+  supports full-record updates/removals, credential rotation, group replacement,
+  redacted inspection/preflight and validated atomic private files. Online management APIs
+  and transparent target/body mutation remain separate interfaces for #1072.
 - [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
   Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
   and gateway-restart retention. Store persistence/eviction/failover guarantees

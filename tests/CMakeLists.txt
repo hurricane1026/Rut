@@ -514,6 +514,27 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME test_consumers_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumers_cli.py
+        $<TARGET_FILE:rut-consumers>)
+set_tests_properties(test_consumers_cli PROPERTIES LABELS "unit;auth;cli" TIMEOUT 60)
+add_custom_target(check_consumers_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumers_cli.py
+        $<TARGET_FILE:rut-consumers>
+    DEPENDS rut-consumers VERBATIM)
+if(NOT RUT_SANITIZE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_consumers_cli_cxx_deps
+        COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-consumers>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
+    set_tests_properties(test_consumers_cli_cxx_deps PROPERTIES LABELS "unit;auth")
+    if(RUT_STATIC_RUNTIME)
+        add_test(NAME test_consumers_cli_static_deps
+            COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-consumers>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_static.cmake)
+        set_tests_properties(test_consumers_cli_static_deps PROPERTIES LABELS "unit;auth")
+    endif()
+endif()
+
 add_test(NAME test_password_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_cli.py
         $<TARGET_FILE:rut-password>)
@@ -4052,7 +4073,7 @@ if(RUT_ENABLE_JIT)
                 add_test(NAME test_consumer_registry_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_registry.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-registry-auth.rut
-                        --backend ${auth_free_backend})
+                        --admin $<TARGET_FILE:rut-consumers> --backend ${auth_free_backend})
                 set_tests_properties(test_consumer_registry_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 add_test(NAME test_signed_replay_${auth_free_backend}
@@ -4569,7 +4590,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
 endif()
 
 if(TARGET check)
-    add_dependencies(check check_password_cli)
+    add_dependencies(check check_password_cli check_consumers_cli)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
