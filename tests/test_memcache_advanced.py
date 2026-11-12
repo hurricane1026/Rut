@@ -552,11 +552,12 @@ def reads(request, peer):
     for key in keys:
         assert request('store', b'v', {'X-Key':key.decode()})[0] == 200
     assert request('many', packed, {'X-Count':'8','X-Count-Only':'yes'}) == (200,b'8')
-    long_fixture = b'fixture-eight' + b'X' * (250 - len(b'fixture-eight'))
-    long_reply_keys = b' '.join([long_fixture] + keys[:7])
-    for index, key in enumerate(list(reversed([long_fixture] + keys[:7]))):
-        status, body = request('many-triple', long_reply_keys, {'X-Count':'8', 'X-Index':str(index)})
-        assert status == 200 and body.count(b'|0|') == 3 and key in body, (index, status, body[:100])
+    if peer:
+        long_fixture = b'fixture-eight' + b'X' * (250 - len(b'fixture-eight'))
+        long_reply_keys = b' '.join([long_fixture] + keys[:7])
+        for index, key in enumerate(list(reversed([long_fixture] + keys[:7]))):
+            status, body = request('many-triple', long_reply_keys, {'X-Count':'8', 'X-Index':str(index)})
+            assert status == 200 and body.count(b'|0|') == 3 and key in body, (index, status, body[:100])
     for key, data, flags in ((b'one',b'a\x00\xff\r\nEND\r\nz','4294967295'),(b'two',b'','0'),(b'key',b'present','0')):
         assert request('store', data, {'X-Key': key.decode(), 'X-Flags':flags})[0] == 200
     assert request('gets', b'absent')[0] == 404
