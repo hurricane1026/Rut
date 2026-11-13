@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_concurrency_model import check_reference_case
+from check_upstream_retirement_model import classify as retirement_verdict
 
 
 def exported(verdict="None", returncode=0, stderr=""):
@@ -97,6 +98,25 @@ class ReferenceChecks(unittest.TestCase):
                 with patch("check_concurrency_model.subprocess.run", side_effect=[export_result, result]):
                     with self.assertRaises(RuntimeError):
                         self.check_case("Deadlock")
+
+
+class RetirementVerdicts(unittest.TestCase):
+    def test_exact_verdicts_require_complete_tool_evidence(self):
+        cases = (
+            (0, "Model checking completed. No error has been found.", "success"),
+            (12, "Invariant Safety is violated. State 1:", "safety"),
+            (13, "Temporal properties were violated. State 1:", "liveness"),
+            (12, "Invariant Safety is violated by the initial state:\n/\\ episode = 1\n/\\ pending = 3", "safety"),
+            (0, "No error has been found.", "error"),
+            (12, "Invariant Safety is violated.", "error"),
+            (13, "Temporal properties were violated.", "error"),
+            (0, "Invariant Safety is violated. State 1:", "error"),
+            (-9, "Invariant Safety is violated. State 1:", "error"),
+            (150, "Parsing or semantic analysis failed", "error"),
+        )
+        for code, output, expected in cases:
+            with self.subTest(code=code, output=output):
+                self.assertEqual(retirement_verdict(code, output), expected)
 
 
 if __name__ == "__main__":

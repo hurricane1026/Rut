@@ -410,6 +410,60 @@ and mutation tests is **not a proof of refinement of C++ to TLA+**, nor a proof
 of arbitrary kernel CQE/buffer/accounting behavior. The lifecycle and peer-model
 bounds described above still apply. kqueue execution still requires macOS.
 
+## io_uring Upstream Retirement
+
+`spec/upstream_retirement.tla` expands coverage below the logical wait layer.
+It starts after transfer into the exact-episode retirement ledger, with each
+cancel either submitted or deferred because the SQ is full. One operation
+represents Recv; two represent concurrently owned Send and Recv. Bounds are
+one/two operations and one/two episodes, with one independently completing
+non-retirement operation sharing `pending_ops`.
+
+Separate actions represent target final CQEs, cancel final CQEs, multishot
+`MORE` (including cancel records), failed/retried cancel submission, duplicate,
+wrong-auxiliary and stale-episode records, downstream close, slot reclamation
+and reuse. Safety requires exact aggregate accounting, retry bits owned only
+by outstanding targets, disjoint cancel/retry ownership, no callbacks for old
+records, no release on `MORE`, and exactly one reclamation per episode after
+all owners drain. Progress assumes that each outstanding target and submitted
+cancel eventually delivers a final CQE, together with fair close, unrelated
+completion, reclamation and reuse. It does not assume SQ retries always succeed:
+a target can finish before the next cancellation attempt.
+
+The required runtime-state CI job checks four healthy configurations, ten
+safety mutations and two missing-fairness liveness counterexamples. Initial
+safety violations must include an actual initial-state dump; transition
+violations and liveness failures must include a trace. Parse errors, missing
+trace evidence, wrong exit status, process failure and timeouts fail the gate.
+Model, config and TLC log artifacts are retained when requested.
+
+```bash
+python3 scripts/check_upstream_retirement_model.py --jar /path/to/tla2tools.jar \
+  --output-dir /tmp/upstream-retirement-tlc
+./build/tests/test_network --filter=iouring_retirement,iouring_episode
+python3 scripts/check_upstream_retirement_mutations.py --build-dir build \
+  --output-dir /tmp/upstream-retirement-mutations
+```
+
+The concrete regression dispatches all 24 permutations of Send/Recv target and
+cancel finals through the production loop, injecting `MORE`, duplicate, wrong
+auxiliary and stale records between finals and reusing the allocator slot.
+Existing tests cover SQ-full retry, final-before-retry, provided-buffer return,
+second-episode close and exactly-once reclamation. Two temporary C++ header
+mutations remove the `MORE` and exact-ownership checks; the permutation test
+must reject each with assertions. Skipped io_uring initialization is not a
+passing mutation baseline. Clang Debug CI runs these checks and preserves
+implementation counterexamples.
+
+The manifest is a structural drift map to implementation/test symbols, not a
+refinement proof. This is an independently maintained finite model, not code
+extraction. It does not model concrete provided-buffer IDs or their return
+accounting, socket/syscall behavior, memory ordering, maximum episode overflow
+quarantine, TLS buffers, or the full downstream close ledger. Provided-buffer
+handling and maximum-episode behavior remain implementation-test coverage.
+Epoll's synchronous retirement is outside this io_uring-specific model. These
+checks add no language feature and make no claim about all runtime protocols.
+
 ## Synchronization Design Scenarios
 
 `spec/synchronization.tla` separately describes two nonblocking submissions,

@@ -1179,6 +1179,7 @@ wait any {
 }
 // Every handler passes native CFG/protocol checks before LLVM emission.
 // CI also cross-checks protocol models exported from actual compiled fixtures.
+// io_uring retirement has separate bounded TLC and concrete completion-order checks.
 // Known peer contracts can reject mutual waits; unknown network peers retain
 // an eventual completion/failure assumption. TLA+ is a CI design/reference
 // check, not proof of arbitrary source programs or kernel/backend behavior.

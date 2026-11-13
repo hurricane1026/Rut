@@ -76230,6 +76230,98 @@ TEST(iouring_retirement, generic_connect_send_recv_targets_retire_in_both_orders
     }
 }
 
+// The retirement TLC model explores arbitrary target/cancel delivery order.
+// Exercise all 24 concrete Send/Recv orderings through production dispatch,
+// including MORE, duplicates and foreign records between every final CQE.
+TEST(iouring_retirement, all_send_recv_completion_permutations_preserve_exact_owners) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    constexpr u8 kTargets = kUpstreamOpSend | kUpstreamOpRecv;
+    static constexpr u8 kPayload[] = {'r', 'u', 't'};
+    u32 checked_orders = 0;
+    for (u32 a = 0; a < 4; ++a)
+        for (u32 b = 0; b < 4; ++b)
+            for (u32 c = 0; c < 4; ++c) {
+                if (a == b || a == c || b == c) continue;
+                const u32 order[] = {a, b, c, 6u - a - b - c};
+                // The same completion orders must work after a previous
+                // retirement drained and the allocator slot was reused.
+                Connection* conn = loop->alloc_conn();
+                REQUIRE(conn != nullptr);
+                const u32 kEpisode = conn->upstream_episode + 1u;
+                conn->upstream_episode = kEpisode;
+                conn->upstream_fd = 42;
+                conn->upstream_send_armed = true;
+                conn->upstream_recv_armed = true;
+                conn->on_upstream_send = &boundary_current_callback<IoUringEventLoop>;
+                conn->on_upstream_recv = &boundary_current_callback<IoUringEventLoop>;
+                conn->pending_ops = 2;
+                loop->backend.upstream_send_state[conn->id] = {
+                    kPayload, 42, 0, sizeof(kPayload), IoEventType::UpstreamSend, kEpisode};
+                REQUIRE(loop->begin_upstream_retirement(*conn, kTargets));
+                REQUIRE_EQ(conn->pending_ops, 4u);
+                u8 targets = kTargets;
+                u8 cancels = kTargets;
+                g_boundary_current_callback_count = 0;
+                const IoEvent finals[] = {
+                    {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamSend, 0, 0, kEpisode},
+                    {conn->id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kEpisode},
+                    {conn->id,
+                     -ENOENT,
+                     0,
+                     0,
+                     IoEventType::UpstreamSend,
+                     0,
+                     kUpstreamRetirementCancelAux,
+                     kEpisode},
+                    {conn->id,
+                     -ENOENT,
+                     0,
+                     0,
+                     IoEventType::UpstreamRecv,
+                     0,
+                     kUpstreamRetirementCancelAux,
+                     kEpisode},
+                };
+                for (u32 step = 0; step < 4; ++step) {
+                    const IoEvent& event = finals[order[step]];
+                    IoEvent more = event;
+                    more.more = 1;
+                    loop->dispatch(more);
+                    IoEvent stale = event;
+                    stale.upstream_episode = kEpisode - 1u;
+                    loop->dispatch(stale);
+                    IoEvent wrong_aux = event;
+                    wrong_aux.aux = kLocalSubmitFailureAux;
+                    loop->dispatch(wrong_aux);
+                    CHECK_EQ(conn->pending_ops, 4u - step);
+                    CHECK_EQ(conn->upstream_retirement_target_owned, targets);
+                    CHECK_EQ(conn->upstream_retirement_cancel_owned, cancels);
+                    loop->dispatch(event);
+                    const u8 op =
+                        event.type == IoEventType::UpstreamSend ? kUpstreamOpSend : kUpstreamOpRecv;
+                    if (event.aux == 0)
+                        targets &= static_cast<u8>(~op);
+                    else
+                        cancels &= static_cast<u8>(~op);
+                    CHECK_EQ(conn->pending_ops, 3u - step);
+                    CHECK_EQ(conn->upstream_retirement_target_owned, targets);
+                    CHECK_EQ(conn->upstream_retirement_cancel_owned, cancels);
+                    CHECK_EQ(conn->upstream_retirement_active, step != 3);
+                    loop->dispatch(event);
+                    CHECK_EQ(conn->pending_ops, 3u - step);
+                    CHECK_EQ(g_boundary_current_callback_count, 0u);
+                }
+                CHECK_EQ(conn->upstream_retirement_cancel_retry, 0u);
+                CHECK_EQ(loop->upstream_retirement_retry_count, 0u);
+                conn->upstream_fd = -1;
+                loop->free_conn(*conn);
+                ++checked_orders;
+            }
+    CHECK_EQ(checked_orders, 24u);
+}
+
 TEST(iouring_retirement, generic_begin_rejects_unmatched_owner_callback_and_send_state) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
