@@ -628,3 +628,74 @@ func redisReplayClaim(_ connection: TcpConnection, _ username: Bytes, _ password
         redisReplayResultStatus(result)
     } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
 }
+
+// Optional local-AOF replay profile for Redis 7.2+. The SET and same-connection
+// fsync barrier form a finite pipeline, not a MULTI transaction. Four receives
+// preserve the existing sixteen-operation initialization/cleanup budget.
+func redisReplayDurableReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let reading = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+        // One SET result, one array and two integer children are the entire
+        // supported response. Do not instantiate a generic 64-node pipeline.
+        guard let steps = collectBytes(bytes, stream.cursor, 4, resp2StreamStep) else { nil }
+        guard let cursor = steps.get(steps.count - 1) else { nil }
+        resp2StreamFinish(bytes, cursor)
+    } else { stream }
+}
+func redisReplayDurableReadTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let readingFirst = redisReplayDurableReceive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisReplayDurableReceive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func redisReplayDurableRead(_ connection: TcpConnection) -> Bytes {
+    let initial = Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 2, nodes: 0,
+        status: 0, search: 1, bulkEnd: -1, limit: 128))
+    let readingFirst = redisReplayDurableReadTwice(connection, initial)
+    guard let first = readingFirst else { nil }
+    let readingSecond = redisReplayDurableReadTwice(connection, first)
+    guard let stream = readingSecond else { nil }
+    guard resp2Finished(stream) else { nil }
+    stream.bytes
+}
+func redisReplayDurableBarrier(_ barrier: Bytes) -> bool {
+    guard let root = resp2Token(barrier, 0) else { false }
+    guard root.kind == 5 && root.children == 2 else { false }
+    guard let local = resp2Token(barrier, root.next) else { false }
+    guard let replicas = resp2Token(barrier, local.next) else { false }
+    local.kind == 3 && local.data == b"1" && replicas.kind == 3 &&
+        parseInt64(replicas.data).or(-1) > -1 && replicas.next == barrier.count
+}
+func redisReplayDurableReply(_ frame: Bytes) -> RedisSessionResult {
+    guard let token = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
+    guard let barrier = frame.slice(token.next, frame.count) else { RedisSessionResult.replyFailure }
+    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    redisReplayClaimReply(token)
+}
+func redisReplayDurableExecute(_ connection: TcpConnection, _ key: Bytes) -> RedisSessionResult {
+    guard let claim = redisReplayClaimRequest(key) else { RedisSessionResult.requestFailure }
+    guard let request = concatBytes(claim,
+        b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192) else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    let reading = redisReplayDurableRead(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    redisReplayDurableReply(frame)
+}
+// 1 = newly claimed, local AOF confirmed and cleanup acknowledged; 0 = an
+// existing claim with the same barrier/cleanup; -1 = any uncertainty. Never
+// retry or delete an uncertain claim. Replica/failover guarantees are separate.
+func redisReplayDurableClaim(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+           _ database: i32, _ key: Bytes) -> i32 {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { -1 }
+    let result = redisReplayDurableExecute(connection, key)
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        redisReplayResultStatus(result)
+    } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
+}

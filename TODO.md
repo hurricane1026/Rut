@@ -836,6 +836,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   projection, strict compile-time validation and old/new native-program isolation.
 - [x] Atomic authenticated Redis replay claims for Standard Webhooks and the fixed
   signed-request profile; no allow on uncertain write or cleanup failure.
+- [x] Opt-in local AOF-confirmed replay claims with a bounded same-connection
+  WAITAOF barrier and pinned Redis SIGKILL/restart/TTL recovery tests.
 - [x] Bounded A-only DNS and issuer/JWKS-URI metadata validation for RS256/ES256
   refresh, with configured IP allowlists and existing monotonic cache expiry.
 - [x] Explicit bounded query/form Consumer raw-key authentication with decoded
@@ -846,7 +848,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [ ] Remaining #1072 interfaces: online administrative management and transparent
   request-target/body mutation; offline snapshot administration/publication and
   explicit rebuilt messages are the current interfaces, not a CLI watcher/IAM platform.
-- [ ] Deployment-level persistence/failover verification for the replay authority;
+- [ ] Replicated persistence/failover verification for the replay authority beyond
+  the tested single-instance intact-AOF recovery profile;
   broad DNS profiles/automatic kid onboarding remain separately scoped.
 
 Contracts and executable coverage: `docs/consumer-registry.md`,

@@ -10942,6 +10942,16 @@ This preserves shard ownership while letting one configured authority arbitrate
 across shards and gateway restarts; persistence/failover is a store contract, not
 a property of the lossy local Cache. See [replay semantics](docs/auth-replay.md).
 
+An opt-in `redisReplayDurableClaim` composes the same SET with a same-connection
+`WAITAOF 1 0 500` barrier before acknowledged cleanup. Both replies are bounded
+to 128 bytes/four nodes and four receives, retaining the sixteen-I/O profile.
+Only a confirmed local AOF count of 1 and nonnegative replica count can finish;
+errors keep uncertain claims and never downgrade to the ordinary profile. Pinned
+Redis SIGKILL/restart tests validate single-instance intact-volume recovery and
+original TTL retention on both backends, including service TLS. This adds no
+runtime operation or syntax, and provides no replica promotion or stale-restore
+fencing. See [the recovery boundary](docs/auth-replay.md#confirmed-local-aof-profile).
+
 `JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
 nonblocking UDP A-only query and optional authenticated metadata fetch before the
 JWKS GET. Resolved IPs must match an explicit finite allowlist. TLS name/CA,

@@ -3399,6 +3399,16 @@ for the freshness/retention assumption, failure uncertainty, persistence ownersh
 and distinction from exactly-once business delivery. These are Rut functions,
 not new language keywords or runtime protocol opcodes.
 
+`redisReplayDurableClaim(connection, username, password, database, key) -> i32`
+is the optional local AOF-confirmed variant from the same Redis module. Redis
+7.2+ must confirm `WAITAOF 1 0 500` after the SET on the same connection, then
+RESET/release must succeed before status 1/0. A missing acknowledgement,
+unsupported command, disabled AOF, malformed reply or cleanup failure returns -1;
+it never falls back to the ordinary claim. The bounded pipeline fits sixteen I/O
+operations and leaves uncertain claims in place. See the
+[local persistence/recovery contract](auth-replay.md#confirmed-local-aof-profile);
+replica failover and exactly-once work are separate.
+
 
 ### Explicit Consumer query/form sources
 
