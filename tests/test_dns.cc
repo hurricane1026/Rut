@@ -83,9 +83,16 @@ struct Peer {
                         length = static_cast<u32>(n) + sizeof(cname);
                     }
                     if (p.multiple) {
-                        // First destination refuses connections; second succeeds.
-                        packet[length - 1] = 2;
+                        // A TCP connection to the limited broadcast address is
+                        // rejected immediately on every supported platform.
+                        packet[length - 4] = 255;
+                        packet[length - 3] = 255;
+                        packet[length - 2] = 255;
+                        packet[length - 1] = 255;
                         memcpy(packet + length, packet + n, 16);
+                        packet[length + 12] = 127;
+                        packet[length + 13] = 0;
+                        packet[length + 14] = 0;
                         packet[length + 15] = 1;
                         length += 16;
                         put(packet + 6, 2);
@@ -105,6 +112,11 @@ struct Peer {
             }
             const int client = accept(p.tcp, nullptr, nullptr);
             if (client >= 0) {
+                // Darwin accept() preserves O_NONBLOCK from the listener,
+                // unlike Linux. Make the fixture's bounded MSG_WAITALL reads
+                // blocking on both systems.
+                const int flags = fcntl(client, F_GETFL);
+                if (flags >= 0) fcntl(client, F_SETFL, flags & ~O_NONBLOCK);
                 // Fixtures use bounded reads even if the client is cancelled.
                 timeval timeout{0, 200000};
                 setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
