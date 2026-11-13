@@ -10103,7 +10103,7 @@ the executable contract and the auth ledger for remaining work.
 
 ### Configuration-owned remote JWKS refresh
 
-An optional eight-field `remoteJwks` object extends the existing static RS256
+An optional `remoteJwks` object with eight required fields extends the existing static RS256
 and ES256 policies without a new language keyword, dependency or handler ABI.
 See the language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
 certificate hostname and origin-form path define a trusted TLS GET. No Token
@@ -10913,3 +10913,57 @@ echoed keys, payload boundaries, CAS fields and the final END before publishing
 values. Append/prepend preserve flags/expiration, CAS distinguishes conflicts
 from absent items, and no failed mutation is automatically replayed.
 See [the contract](docs/memcache-client.md).
+
+
+### Free auth foundations: bounded registries, replay claims and trusted discovery
+
+`consumerAuthenticate` appends a JSON opcode without renumbering existing ones.
+The compiler proves the registry's literal/configuration origin after helper
+inlining and validates its complete bounded schema before publishing a program.
+The runtime reuses strict Bearer/Basic and constant-time comparisons, evaluates
+bounded credentials, and projects only identity/groups into the request arena.
+No mutable registry state is shared across shards. Registry creation, disable,
+rotation and membership changes are replacement configuration snapshots; existing
+native-program/RouteConfig ownership and RCU retirement retain old readers.
+The offline `rut-consumers` tool reuses the runtime validator for transactional
+full-record upserts/removals, validated redacted previews and inspection. Bounded
+owned buffers hold all input and output; no mutable state or allocator enters the request path.
+Validated snapshots publish as new private files using synced no-replace links;
+activation and RCU retirement remain the configuration host's responsibility.
+See [the schema, administration and host publication boundary](docs/consumer-registry.md).
+
+Replay policy is composed in Rut over the existing RESP2/TCP/TLS client. One
+atomic NX claim on an authoritative external store precedes side effects; a
+successful write cannot allow before acknowledged session cleanup. Ambiguous
+writes stay fail closed without retries or compensating deletion. Namespaces
+bind logical signers/profiles, and the 601-second retention covers the existing
+300-second past/future freshness tolerance under the declared clock assumptions.
+This preserves shard ownership while letting one configured authority arbitrate
+across shards and gateway restarts; persistence/failover is a store contract, not
+a property of the lossy local Cache. See [replay semantics](docs/auth-replay.md).
+
+`JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
+nonblocking UDP A-only query and optional authenticated metadata fetch before the
+JWKS GET. Resolved IPs must match an explicit finite allowlist. TLS name/CA,
+issuer, endpoint URI and kid/algorithm inventory remain configuration-owned.
+DNS/discovery/key stages share one deadline and retry cadence; failures do not
+renew key age. No libc DNS wait, redirects, request-selected endpoints, new
+library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).
+
+
+### Explicit encoded Consumer credential sources
+
+The query/form Consumer functions append JSON opcodes and reuse the existing
+compile-time registry proof, request-arena identity carrier and raw-key matcher.
+A bounded parser validates the whole ASCII URL-encoded field list, decodes names
+once for duplicate detection, authenticates exactly one selected source, then
+projects identity plus the untouched non-credential encoded fields. It never
+returns the key. Empty/ambiguous/over-capacity input fails closed. Original
+request bytes remain unchanged; the example rebuilds a fixed-endpoint HTTPS form
+POST and selects only sanitized fields and authenticated identity. No transparent
+forward/body rewrite is implied. See [the contract](docs/consumer-registry.md).
+
+`JwksFetch` publishes initialized state only after both HTTPS contexts initialize.
+Failed partial initialization cannot start a keys-only refresh, and a second init
+cannot overwrite an active fetch's trusted configuration. Lifecycle tests exercise
+DNS/discovery/keys, deadlines, cancellation, rebinding refusal and partial failure.

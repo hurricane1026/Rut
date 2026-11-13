@@ -164,6 +164,7 @@ add_library(rut_runtime STATIC
     runtime/password_worker.cc
     runtime/password_gateway.cc
     runtime/auth.cc
+    runtime/consumer_registry.cc
     runtime/webhook.cc
     runtime/signed_request.cc
     runtime/memory_http_cache_store.cc
@@ -298,7 +299,10 @@ add_library(rut_compiler STATIC
     compiler/lower_rir.cc
     compiler/rir_printer.cc
 )
-target_link_libraries(rut_compiler PUBLIC rut_verifier)
+# Frontend configuration proofs call bounded runtime validators (including
+# Consumer snapshots). Model that dependency so runtime-first consumers also
+# link correctly when JIT helpers do not otherwise pull validator objects in.
+target_link_libraries(rut_compiler PUBLIC rut_verifier rut_runtime)
 
 target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
@@ -577,9 +581,12 @@ target_link_libraries(rut
 )
 add_executable(rut-password password_main.cc)
 target_link_libraries(rut-password PRIVATE rut_runtime)
+add_executable(rut-consumers consumers_main.cc)
+target_link_libraries(rut-consumers PRIVATE rut_runtime)
 if(RUT_STATIC_RUNTIME)
     target_link_options(rut PRIVATE -static)
     target_link_options(rut-password PRIVATE -static)
+    target_link_options(rut-consumers PRIVATE -static)
 endif()
 
 # Keep the shipped server independent of the C++ standard/ABI runtime.
@@ -589,12 +596,14 @@ if(NOT RUT_SANITIZE)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_link_options(rut PRIVATE -nostdlib++)
         target_link_options(rut-password PRIVATE -nostdlib++)
+        target_link_options(rut-consumers PRIVATE -nostdlib++)
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         # GCC has no -nostdlib++ option. Its C driver supplies the C/compiler
         # runtime at the end of the link without injecting libstdc++. Prevent
         # CMake from reintroducing it for the C++ archives linked by rut.
         set_target_properties(rut PROPERTIES LINKER_LANGUAGE C)
         set_target_properties(rut-password PROPERTIES LINKER_LANGUAGE C)
+        set_target_properties(rut-consumers PROPERTIES LINKER_LANGUAGE C)
         list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_LINK_LIBRARIES stdc++ supc++)
     else()
         message(FATAL_ERROR "The runtime's no-C++-library link requires Clang or GCC")
@@ -602,6 +611,7 @@ if(NOT RUT_SANITIZE)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_options(rut PRIVATE -Wl,--as-needed)
         target_link_options(rut-password PRIVATE -Wl,--as-needed)
+        target_link_options(rut-consumers PRIVATE -Wl,--as-needed)
     endif()
 endif()
 

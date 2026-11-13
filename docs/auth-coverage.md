@@ -14,13 +14,13 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic | Static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement | Dynamic Consumer registry/credential lifecycle and query/body credential hiding |
+| API Key / Basic | Bounded 32-Consumer/64-credential configuration snapshots with stable IDs, enable/disable, rotation, groups and identity-only projection; static identity helpers, singleton credential fields, exact matching, rotating Bearer/Basic/custom-header key windows, two-Consumer custom-header key matching with absence-only guests; explicit header credential stripping and verified identity header replacement; opt-in bounded query/form authentication returns sanitized fields for rebuilt requests | Online administrative registry APIs and transparent target/body mutation; offline `rut-consumers` snapshot administration is implemented |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS/discovery and broader JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies | Full Kong/APISIX plugin compatibility, dynamic key registry/refresh, nonce/replay persistence |
-| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Dynamic registry and membership lifecycle, larger policy sets |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, broader DNS/discovery/JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and deployment-level persistence/failover |
+| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Administrative membership management and larger policy sets; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
 | Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
@@ -829,7 +829,9 @@ fixed IPv4, TLS hostname, CA, path, refresh interval, maximum cache age and tota
 fetch timeout. The initial JWKS defines approved IDs but does not authenticate
 remote-mode requests before the first successful fetch. Only configured approved
 kids can be imported. A valid empty intersection immediately removes cached keys.
-There is no token-triggered fetch, DNS, discovery or redirect following.
+There is no token-triggered fetch or redirect following. Optional bounded A-only
+DNS and exact issuer/JWKS URI discovery validation now share the same cold refresh
+lifecycle; see [the trust contract](jwks-discovery.md).
 
 The reusable bounded HTTPS state machine and existing HTTP/chunk parsers accept
 200 JSON bodies with strict framing, byte limits and authenticated transport.
@@ -1561,3 +1563,37 @@ logout and service/cleanup failures. Grace-period old-key tokens obey the same
 permissions. A malformed configured grant fails issuance before touching Redis;
 JIT tests also cover the 1024/1025-byte bound. See
 [scoped session policy](jwt-sessions.md#scope-authorization-for-online-sessions).
+
+
+## Free auth foundation profiles
+
+- [Consumer registry snapshots](consumer-registry.md): 32 Consumers, 64 credentials,
+  exact stable IDs, disabled/retired credentials and group updates, compiler
+  validation, identity-only results and native-program lifetime isolation. This
+  adds a bounded registry plus opt-in query/form authentication and sanitized
+  fields for explicitly rebuilt requests. Offline `rut-consumers` administration
+  supports full-record updates/removals, credential rotation, group replacement,
+  redacted inspection/preflight and validated atomic private files. Online management APIs
+  and transparent target/body mutation remain separate interfaces for #1072.
+- [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
+  Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
+  and gateway-restart retention. Store persistence/eviction/failover guarantees
+  must be supplied and tested by the deployed authority (#1076).
+- [JWKS DNS/discovery](jwks-discovery.md): bounded nonblocking A-only resolution,
+  finite address allowlist, exact issuer and pre-authorized URI, both asymmetric
+  algorithms and both Linux backends. This is not unrestricted DNS/OIDC or
+  automatic admission of new kid inventory (#1077).
+
+These profiles are proposed free foundations. Their security fixes and necessary
+failure protection do not depend on a commercial tier. Enterprise governance,
+full browser SSO/identity platform and managed distributed services remain separate.
+
+
+Explicit Consumer query/form raw-key admission now uses separate opt-in APIs,
+compile-time registry/name proof and whole-list duplicate/encoding validation.
+The returned `remaining` content removes the selected credential; an executable
+fixed-HTTPS form adapter verifies upstream redaction on native H1/H2 and both
+backends. Original request bytes and transparent forward are not rewritten.
+See [the precise input/redaction bounds](consumer-registry.md#explicit-query-and-form-credentials).
+JWKS initialization is all-or-nothing before refresh admission; native cold-path
+tests cover successful DNS/discovery, denied answers, timeout, cancel and recovery.

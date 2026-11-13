@@ -1,0 +1,26 @@
+import "clients/redis-client.rut"
+import "middleware/auth.rut"
+import "middleware/replay.rut"
+
+listen :8080
+
+// No separate nonce exists in this fixed signed-request profile. The canonical
+// method/target/date/body-digest identity is one-use within its freshness window.
+route POST "/signed" {
+    guard env("SIGNED_REQUEST_KEY") != "" else { return 503 }
+    guard !req.chunked && signedRequestHmacSha256Matches(req.method, req.path,
+        req.authorization.or(""), req.uniqueHeader("Date").or(""),
+        req.uniqueHeader("Digest").or(""), req.body, "billing-key", env("SIGNED_REQUEST_KEY")) else { return 401 }
+    // The validated target, Date and Digest contain no LF, so this tuple is
+    // unambiguous and independent of Authorization parameter order/signature.
+    guard let key = replay.key(env("REPLAY_NAMESPACE") + ":signed-post",
+        req.path + "\n" + req.uniqueHeader("Date").or("") + "\n" + req.uniqueHeader("Digest").or("")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisReplayClaim(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let admitted = replay.requireClaimed(status)
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+
+route "/" { return 404 }

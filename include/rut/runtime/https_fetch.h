@@ -70,6 +70,7 @@ public:
     u16 status() const { return state_ == State::Done ? response_.status() : 0; }
     Str unique_header(Str name) const { return response_.unique_header(name); }
     bool start(u64 monotonic_ms, u32 timeout_ms);
+    bool set_address(Str address);
     void advance(u64 monotonic_ms);
     void cancel();
     State state() const { return state_; }

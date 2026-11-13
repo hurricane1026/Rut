@@ -514,6 +514,27 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME test_consumers_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumers_cli.py
+        $<TARGET_FILE:rut-consumers>)
+set_tests_properties(test_consumers_cli PROPERTIES LABELS "unit;auth;cli" TIMEOUT 60)
+add_custom_target(check_consumers_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumers_cli.py
+        $<TARGET_FILE:rut-consumers>
+    DEPENDS rut-consumers VERBATIM)
+if(NOT RUT_SANITIZE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_consumers_cli_cxx_deps
+        COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-consumers>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
+    set_tests_properties(test_consumers_cli_cxx_deps PROPERTIES LABELS "unit;auth")
+    if(RUT_STATIC_RUNTIME)
+        add_test(NAME test_consumers_cli_static_deps
+            COMMAND ${CMAKE_COMMAND} -DREADELF=${CMAKE_READELF} -DRUT_BINARY=$<TARGET_FILE:rut-consumers>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_static.cmake)
+        set_tests_properties(test_consumers_cli_static_deps PROPERTIES LABELS "unit;auth")
+    endif()
+endif()
+
 add_test(NAME test_password_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_password_cli.py
         $<TARGET_FILE:rut-password>)
@@ -870,6 +891,18 @@ target_include_directories(test_cache_table PRIVATE
 add_test(NAME test_cache_table COMMAND test_cache_table)
 set_tests_properties(test_cache_table PROPERTIES LABELS "unit")
 
+add_executable(test_remote_jwks_metadata test_remote_jwks_metadata.cc)
+target_link_libraries(test_remote_jwks_metadata rut_runtime)
+target_include_directories(test_remote_jwks_metadata PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_remote_jwks_metadata COMMAND test_remote_jwks_metadata)
+set_tests_properties(test_remote_jwks_metadata PROPERTIES LABELS "unit;auth")
+
+add_executable(test_consumer_registry test_consumer_registry.cc)
+target_link_libraries(test_consumer_registry rut_runtime)
+target_include_directories(test_consumer_registry PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_consumer_registry COMMAND test_consumer_registry)
+set_tests_properties(test_consumer_registry PROPERTIES LABELS "unit;auth")
+
 add_executable(test_jwt_claims test_jwt_claims.cc)
 target_link_libraries(test_jwt_claims rut_runtime)
 target_include_directories(test_jwt_claims PRIVATE ${PROJECT_SOURCE_DIR}/testing)
@@ -1005,6 +1038,15 @@ if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
                 --algorithm ES256)
         set_tests_properties(test_remote_es256_jwks_${jwks_backend} PROPERTIES
             LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        foreach(discovery_algorithm RS256 ES256)
+            add_test(NAME test_jwks_discovery_${discovery_algorithm}_${jwks_backend}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
+                    --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend}
+                    --algorithm ${discovery_algorithm} --discovery-dns)
+            set_tests_properties(test_jwks_discovery_${discovery_algorithm}_${jwks_backend} PROPERTIES
+                LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endforeach()
     endforeach()
 endif()
 
@@ -4021,6 +4063,38 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_bound_credentials_${binding_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(auth_free_backend epoll io_uring)
+                add_test(NAME test_consumer_fields_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_fields.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-fields-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend})
+                set_tests_properties(test_consumer_fields_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_consumer_registry_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_registry.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-registry-auth.rut
+                        --admin $<TARGET_FILE:rut-consumers> --backend ${auth_free_backend})
+                set_tests_properties(test_consumer_registry_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_signed_replay_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signed-request-replay-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --signed)
+                set_tests_properties(test_signed_replay_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                foreach(replay_tls plain tls)
+                    set(replay_tls_flag)
+                    if(replay_tls STREQUAL "tls")
+                        set(replay_tls_flag --tls)
+                    endif()
+                    add_test(NAME test_auth_replay_${auth_free_backend}_${replay_tls}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-replay-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} ${replay_tls_flag})
+                    set_tests_properties(test_auth_replay_${auth_free_backend}_${replay_tls} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(jwt_session_backend epoll io_uring)
                 foreach(jwt_session_opt 0 2)
                     add_test(NAME test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt}
@@ -4254,6 +4328,8 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_cache_table>
         COMMAND $<TARGET_FILE:test_jwt_claims>
+        COMMAND $<TARGET_FILE:test_consumer_registry>
+        COMMAND $<TARGET_FILE:test_remote_jwks_metadata>
         COMMAND $<TARGET_FILE:test_jwt_hs256_issue>
         COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth_forwarding>
@@ -4308,7 +4384,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata
         COMMENT "Running all tests..."
     )
 else()
@@ -4342,6 +4418,8 @@ else()
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_cache_table>
         COMMAND $<TARGET_FILE:test_jwt_claims>
+        COMMAND $<TARGET_FILE:test_consumer_registry>
+        COMMAND $<TARGET_FILE:test_remote_jwks_metadata>
         COMMAND $<TARGET_FILE:test_jwt_hs256_issue>
         COMMAND $<TARGET_FILE:test_compiler_node_pool>
         COMMAND $<TARGET_FILE:test_auth_forwarding>
@@ -4391,7 +4469,7 @@ else()
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions
+        DEPENDS test_network test_wait_scheduler test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata
         COMMENT "Running non-JIT tests..."
     )
 endif()
@@ -4512,7 +4590,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
 endif()
 
 if(TARGET check)
-    add_dependencies(check check_password_cli)
+    add_dependencies(check check_password_cli check_consumers_cli)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

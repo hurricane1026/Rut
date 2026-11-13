@@ -247,6 +247,20 @@ bool HttpsFetch::init_callout(const HttpsEndpoint& endpoint, Str request) {
     callout_ = true;
     return true;
 }
+bool HttpsFetch::set_address(Str address) {
+    if (!context_.ssl_ctx || state_ == State::Busy || !address.ptr || !address.len ||
+        address.len >= sizeof(endpoint_.address))
+        return false;
+    for (u32 i = 0; i < address.len; ++i)
+        if (!address.ptr[i]) return false;
+    HttpsEndpoint candidate = endpoint_;
+    __builtin_memcpy(candidate.address, address.ptr, address.len);
+    candidate.address[address.len] = 0;
+    if (!candidate.valid()) return false;
+    endpoint_ = candidate;
+    return true;
+}
+
 bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     if (!context_.ssl_ctx || state_ == State::Busy || !monotonic_ms || !timeout_ms) return false;
     close();

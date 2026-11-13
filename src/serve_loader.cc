@@ -438,9 +438,15 @@ bool load_rut_program(const char* path,
     err.stage = LoadStage::JitCompile;
     if (!out.engine.init()) return false;
     out.jit_inited = true;
-    out.engine.opt_level = opt;
+    // rut-compile retains the original LLVM module and optimizes it again
+    // when emitting the native artifact. Keep this validation JIT compile
+    // at O0 in that path; the requested optimization level is still applied
+    // to the retained module below. This avoids running the same O2 pipeline
+    // twice during compiler startup.
+    out.engine.opt_level = retain_native_module ? jit::OptLevel::O0 : opt;
     // compile() takes ownership of cg.mod and cg.ctx unconditionally.
     if (!out.engine.compile(cg.mod, cg.ctx)) return false;
+    out.engine.opt_level = opt;
 
     // ── Bridge: declarative content + route handler registration ────
     // Order matters: populate_route_config fills upstreams / response

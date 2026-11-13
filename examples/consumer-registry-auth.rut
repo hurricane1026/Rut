@@ -1,0 +1,28 @@
+// AUTH_REGISTRY is trusted version-1 JSON, validated while compiling/loading.
+// New snapshots create/update/disable credentials and group membership; keep
+// the old native program alive until its in-flight RCU readers have retired.
+listen :8080
+
+route GET "/private" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else {
+        return response(401, headers: {"WWW-Authenticate": "Bearer"})
+    }
+    guard let subject = json.string(json.get(identity, "/consumerId").or(identity)) else { return 503 }
+    return response(200, body: subject)
+}
+route GET "/staff" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    guard jwtHasGroup(identity, "staff") else { return 403 }
+    return 204
+}
+route GET "/basic" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "basic") else {
+        return response(401, headers: {"WWW-Authenticate": "Basic realm=\"gateway\""})
+    }
+    return 204
+}
+route GET "/key" {
+    guard let identity = consumerAuthenticate(req.uniqueHeader("X-API-Key").or(""), env("AUTH_REGISTRY"), "header") else { return 401 }
+    return 204
+}
+route "/" { return 404 }

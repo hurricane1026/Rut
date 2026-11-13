@@ -3627,3 +3627,62 @@ TEST(native_program, websocket_cache_effects_keep_identity_and_clock_across_mess
         _tc, owner.p->config, changed.p->config, [&]() { activate_native_program(*changed.p); });
 }
 #endif
+
+TEST(native_program, consumer_registry_retirement_preserves_pinned_dispatch) {
+    constexpr Str kOld = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["staff"]}],"credentials":[{"id":"old","consumerId":"alice","method":"bearer","secret":"old-key","enabled":true},{"id":"current","consumerId":"alice","method":"bearer","secret":"current-key","enabled":true}]})");
+    constexpr Str kNew = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":[]}],"credentials":[{"id":"old","consumerId":"alice","method":"bearer","secret":"old-key","enabled":false},{"id":"current","consumerId":"alice","method":"bearer","secret":"current-key","enabled":true}]})");
+    const auto append = [](Source& source, Str snapshot) {
+        char quoted[8192];
+        json::Writer output{quoted};
+        if (!json::quote(snapshot, output)) return false;
+        return source.append(
+                   "route GET \"/\" { guard let identity = "
+                   "consumerAuthenticate(req.authorization.or(\"\"), ") &&
+               source.append(quoted, output.len) &&
+               source.append(
+                   ", \"bearer\") else { return 401 } guard jwtHasGroup(identity, "
+                   "\"staff\") else { return 403 } return 204 }\n");
+    };
+    Source old_source, new_source;
+    REQUIRE(old_source.fd >= 0 && new_source.fd >= 0);
+    REQUIRE(append(old_source, kOld));
+    REQUIRE(append(new_source, kNew));
+    Program old_program, new_program;
+    REQUIRE(old_program.p && new_program.p);
+    REQUIRE(load(old_source, *old_program.p));
+    REQUIRE(load(new_source, *new_program.p));
+    REQUIRE_EQ(unlink(old_source.path), 0);
+    REQUIRE_EQ(unlink(new_source.path), 0);
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena old_arena, new_arena;
+    REQUIRE(old_arena.init(&pool));
+    REQUIRE(new_arena.init(&pool));
+    struct Frame {
+        jit::HandlerCtx context{};
+        u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
+        Frame() { context.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    } old_frame, new_frame;
+    const char* old_request = "GET / HTTP/1.1\r\nAuthorization: Bearer old-key\r\n\r\n";
+    const char* current_request = "GET / HTTP/1.1\r\nAuthorization: Bearer current-key\r\n\r\n";
+    const auto call = [](jit::HandlerFn fn, Frame& frame, const char* request, SliceArena& arena) {
+        return jit::HandlerResult::unpack(fn(nullptr,
+                                             &frame.context,
+                                             reinterpret_cast<const u8*>(request),
+                                             static_cast<u32>(strlen(request)),
+                                             &arena));
+    };
+    const RouteConfig* active = &old_program.p->config;
+    const auto pinned = active->routes[0].fn;
+    // A request pins its handler/config before dispatch. Publication affects
+    // subsequent dispatches, while the previous program remains a live reader.
+    active = &new_program.p->config;
+    CHECK_EQ(call(active->routes[0].fn, new_frame, old_request, new_arena).status_code, 401u);
+    CHECK_EQ(call(active->routes[0].fn, new_frame, current_request, new_arena).status_code, 403u);
+    CHECK_EQ(call(pinned, old_frame, old_request, old_arena).status_code, 204u);
+    old_arena.destroy();
+    new_arena.destroy();
+    pool.destroy();
+}

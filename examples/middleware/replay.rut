@@ -1,0 +1,16 @@
+// Import clients/redis-client.rut at the application root before this module.
+
+// Invoke only after authenticating the complete message. Namespace belongs to
+// one logical signer/profile and stays stable across signing-key rotation.
+func key(_ namespace: str, _ messageId: str) -> Bytes {
+    guard namespace != "" && Bytes(namespace).count <= 128 &&
+        Bytes(messageId).count > 0 && Bytes(messageId).count <= 16384 else { nil }
+    guard let digest = sha256(messageId) else { nil }
+    Bytes(namespace + ":" + digest)
+}
+
+func requireClaimed(_ status: i32) -> bool {
+    guard status == 0 || status == 1 else { respond 503 }
+    guard status == 1 else { respond 409 }
+    true
+}

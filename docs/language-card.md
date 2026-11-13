@@ -2479,7 +2479,8 @@ succeed before any claims are returned; revocation failure is the usual nil/401.
 
 The compile-time `Crypto.jwtRs256(token, policy)` and
 `Crypto.jwtEs256(token, policy)` policies can include an optional `remoteJwks`
-object with exactly these eight required members:
+object with these eight required members (and the optional trusted DNS/discovery
+fields described below):
 
 ```json
 {"address":"192.0.2.10","port":443,"serverName":"issuer.example",
@@ -2492,7 +2493,11 @@ The initial public JWKS validates the explicitly approved kid inventory; remote
 mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a literal IPv4;
-there is no blocking DNS, discovery, redirect following or token-driven fetch.
+there is no blocking DNS, redirect following or token-driven fetch. Optional
+`dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A-only DNS; optional
+`discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
+validation. Neither profile accepts request-selected destinations. See
+[JWKS DNS/discovery](jwks-discovery.md) for schema, ownership and failure limits.
 The CA file and TLS server name are mandatory and certificate verification cannot
 be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
 implicit and cleartext endpoints are unavailable.
@@ -3365,3 +3370,45 @@ Whole-list validity, case and exact tokens matter; no prefix/case folding or
 client metadata fallback occurs. A valid read-only session cannot write.
 Existing scope-less tokens remain identity-only on `/private`; issuer changes do
 not rewrite their claims or permits. See [the full policy](jwt-sessions.md#scope-authorization-for-online-sessions).
+
+
+## Consumer registry authentication (implemented bounded profile)
+
+`consumerAuthenticate(presented, configuration, method) -> Json?` supports
+`bearer`, `basic` and exact custom `header` credentials in a version-1 bounded
+registry. Registry and method must resolve to trusted compile-time `str` configuration;
+invalid JSON/schema or request-derived configuration rejects compilation/loading.
+It returns only request-owned `consumerId`, `credentialId`, `method` and `groups`.
+Authentication failure is nil; group authorization stays explicit. Pass singleton
+request header accessors; duplicates do not become guest access. No query/body
+credential source is implicitly enabled by this profile. See [Consumer registry](consumer-registry.md)
+for the exact schema, 32-Consumer/64-credential bounds, rotation, disabled state,
+RCU/native-program ownership, redaction and current publication interfaces.
+The offline `rut-consumers` executable validates, previews redacted replacements,
+inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic
+running-gateway publication. See [offline administration](consumer-registry.md#offline-administration).
+
+## Persistent replay claim composition (implemented bounded profile)
+
+The ordinary Rut Redis module exposes `redisReplayClaim` for atomic authenticated
+`SET NX EX 601` claims, with terminal status after RESET/release. `replay.key` and
+`replay.requireClaimed` compose it after Standard Webhooks or fixed signed-request
+verification. Claims use stable signer/profile namespaces and SHA-256 identities;
+no gateway Cache or GET-before-SET fallback is used. See [replay claims](auth-replay.md)
+for the freshness/retention assumption, failure uncertainty, persistence ownership
+and distinction from exactly-once business delivery. These are Rut functions,
+not new language keywords or runtime protocol opcodes.
+
+
+### Explicit Consumer query/form sources
+
+`consumerAuthenticateQuery(req.path, configuration, name)` and
+`consumerAuthenticateForm(req.body, configuration, name)` return optional Json.
+Registry/name must be compile-time strings. They authenticate one explicitly
+selected URL-encoded raw-key field against registry method `header`, reject all
+decoded duplicate names/malformed fields, and return identity plus sanitized
+`remaining` fields. The ASCII profile is bounded to 4096 input bytes, 64 fields,
+64-byte field names and 512 decoded credential bytes. Form callers require a
+singleton expected Content-Type. They do not mutate the original request or add
+implicit fallback; use an explicitly rebuilt upstream request, as in
+[the source/redaction contract](consumer-registry.md#explicit-query-and-form-credentials).

@@ -15,6 +15,7 @@
 #include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/format_integer.h"
 #include "rut/runtime/hash.h"
@@ -2836,7 +2837,10 @@ extern "C" void rut_helper_json(void* conn,
         op != static_cast<u32>(json::Op::OauthTokenExchangeRequest) &&
         op != static_cast<u32>(json::Op::JwtCertificateBound) &&
         op != static_cast<u32>(json::Op::JwtHasAllScopes) &&
-        op != static_cast<u32>(json::Op::JwtHasAnyScope))
+        op != static_cast<u32>(json::Op::JwtHasAnyScope) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticate) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateQuery) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateForm))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2844,7 +2848,19 @@ extern "C" void rut_helper_json(void* conn,
     Str view{};
     i64 scalar = 0;
     const auto operation = static_cast<json::Op>(op);
-    if (operation == json::Op::OauthIntrospectionRequest) {
+    if (operation == json::Op::ConsumerAuthenticateQuery ||
+        operation == json::Op::ConsumerAuthenticateForm) {
+        if (!consumer_registry_authenticate_fields(document,
+                                                   {b, b_len},
+                                                   {c, c_len},
+                                                   {a, a_len},
+                                                   operation == json::Op::ConsumerAuthenticateQuery,
+                                                   writer))
+            return;
+    } else if (operation == json::Op::ConsumerAuthenticate) {
+        if (!consumer_registry_authenticate(document, {b, b_len}, {c, c_len}, {a, a_len}, writer))
+            return;
+    } else if (operation == json::Op::OauthIntrospectionRequest) {
         if (!oauth_introspection_request({a, a_len}, {b, b_len}, writer)) return;
     } else if (operation == json::Op::OauthClientCredentialsRequest) {
         if (!oauth_client_credentials_request({a, a_len}, {b, b_len}, writer)) return;

@@ -22,17 +22,34 @@ def main():
     parser.add_argument("--testdata", required=True)
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
     parser.add_argument("--algorithm", choices=("RS256", "ES256"), default="RS256")
+    parser.add_argument("--discovery-dns", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
+    if args.discovery_dns: fixture_option += "-discovery"
     fixture = json.loads(subprocess.check_output([args.helper, fixture_option], timeout=10))
     lock = threading.Lock()
     release_response = threading.Event()
-    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200, "requests": 0, "hold": False}
+    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200, "requests": 0, "hold": False, "discovery": "valid", "dns": "valid"}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
+            if self.path == "/.well-known/openid-configuration" and args.discovery_dns:
+                with lock: mode = state["discovery"]
+                metadata = dict(issuer=fixture["first"]["issuer"],
+                                jwks_uri=f"https://localhost:{origin.server_port}/keys")
+                if mode == "issuer": metadata["issuer"] = "https://evil.example"
+                if mode == "uri": metadata["jwks_uri"] = "https://127.0.0.2/keys"
+                body = json.dumps(metadata).encode()
+                self.send_response(302 if mode == "redirect" else 200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try: self.wfile.write(body)
+                except (BrokenPipeError, ConnectionError, ssl.SSLError): pass
+                return
             if self.path != "/keys":
                 self.send_error(404)
                 return
@@ -61,6 +78,24 @@ def main():
     origin.socket = context.wrap_socket(origin.socket, server_side=True)
     worker = threading.Thread(target=origin.serve_forever, daemon=True)
     worker.start()
+    dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dns.bind(("127.0.0.1", 0))
+    dns.settimeout(.1)
+    dns_stop = threading.Event()
+    def resolve():
+        while not dns_stop.is_set():
+            try: query, peer = dns.recvfrom(512)
+            except socket.timeout: continue
+            except OSError: return
+            with lock: mode = state["dns"]
+            if mode == "timeout": continue
+            address = socket.inet_aton("127.0.0.2" if mode == "rebind" else "127.0.0.1")
+            response = query[:2]+b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"+query[12:]
+            response += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x1e\x00\x04"+address
+            try: dns.sendto(response,peer)
+            except OSError: return
+    dns_worker=threading.Thread(target=resolve,daemon=True)
+    dns_worker.start()
     process = None
     try:
         policy = fixture["first"]
@@ -68,6 +103,11 @@ def main():
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
+        if args.discovery_dns:
+            policy["remoteJwks"].update(dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
+                                       allowedAddresses=["127.0.0.1"],
+                                       discoveryPath="/.well-known/openid-configuration",
+                                       discoveryIssuer=policy["issuer"])
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
         verifier = "jwtEs256" if args.algorithm == "ES256" else "jwtRs256"
         source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.' + verifier + '('
@@ -167,6 +207,17 @@ def main():
             wait_status(fixture["b"], 200)
             publish(b"{bad")
             wait_status(fixture["b"], 401)
+            if args.discovery_dns:
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                for kind, modes in [("discovery", ["issuer", "uri", "redirect"]),
+                                    ("dns", ["rebind", "timeout"])]:
+                    with lock: state[kind] = "valid"
+                    wait_status(fixture["b"], 200)
+                    for mode in modes:
+                        with lock: state[kind] = mode
+                        wait_status(fixture["b"], 401)
+                        with lock: state[kind] = "valid"
+                        wait_status(fixture["b"], 200)
             # Leave an authenticated fetch waiting on an origin response while
             # retiring the gateway, exercising in-flight refresh cancellation.
             with lock:
@@ -179,6 +230,9 @@ def main():
             release_response.set()
             print(f"PASS: {args.algorithm} {args.backend} remote JWKS rotation, empty set, outage, malformed refresh and shutdown")
     finally:
+        dns_stop.set()
+        dns.close()
+        dns_worker.join(timeout=2)
         release_response.set()
         if process is not None and process.poll() is None:
             process.kill()

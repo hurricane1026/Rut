@@ -97,6 +97,10 @@ bool Es256Policy::load(Str configuration) {
         }
     }
     if (required != 15 || jwks == json::kNone || kids == json::kNone) return false;
+    if (remote_configuration.discovery_path[0] &&
+        !issuer().eq({remote_configuration.discovery_issuer,
+                      static_cast<u32>(__builtin_strlen(remote_configuration.discovery_issuer))}))
+        return false;
     char ids[Es256KeySet::kMaxKeys][Es256KeySet::kMaxKidBytes];
     Str approved[Es256KeySet::kMaxKeys];
     u32 count = 0;
@@ -239,7 +243,7 @@ bool Es256Policies::activate(u32 shard) {
         }
     }
     for (u32 i = 0; i < count; ++i) {
-        if (row.remote[i] && !row.remote[i]->fetch.init(policies[i].remote().endpoint)) {
+        if (row.remote[i] && !row.remote[i]->fetch.init(policies[i].remote())) {
             for (u32 j = 0; j < count; ++j) row.verifiers[j].reset();
             cancel(shard);
             return false;
