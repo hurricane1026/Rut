@@ -850,7 +850,7 @@ TEST(net_client, fixed_endpoint_policy_rejects_unknown_duplicate_and_unsafe_tls_
     CHECK(endpoint.tls.enabled);
     const char* invalid[] = {
         "{}",
-        R"({"address":"localhost","port":1})",
+        R"({"address":"bad..host","port":1})",
         R"({"address":"127.0.0.1","port":0})",
         R"({"address":"127.0.0.1","port":65536})",
         R"({"address":"127.0.0.1","port":1,"p\u006frt":2})",

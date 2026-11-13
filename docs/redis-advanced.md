@@ -175,8 +175,10 @@ arbitrary response addresses. This is the Redis
 [Sentinel discovery procedure](https://redis.io/docs/latest/develop/reference/sentinel-clients/).
 
 Topology commands use at most two receives and 8192-byte/64-node response bounds.
-Policies keep their existing verified TLS identities, fixed IPv4 addresses and
-compile-time admission. DNS, arbitrary newly announced nodes, a shared mutable
+Policies retain verified TLS identities and compile-time endpoint admission.
+Configured TCP endpoints now accept bounded IPv4 DNS names (see
+[network clients](net-clients.md)); topology-discovered hostname admission,
+arbitrary newly announced nodes, a shared mutable
 slot map, background topology refresh and unlimited failover attempts are not
 added. Authentication is caller-owned on every new physical connection; account
 for it and cleanup within the same existing operation budget.

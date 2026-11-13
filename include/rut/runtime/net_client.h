@@ -2,6 +2,7 @@
 #include "core/expected.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/runtime/arena.h"
+#include "rut/runtime/dns.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/tls.h"
 
@@ -9,7 +10,9 @@
 
 namespace rut {
 struct NetEndpoint {
-    char address[16]{};
+    char address[255]{};
+    char dns_server[16]{};
+    u16 dns_port = 53;
     u16 port = 0;
     u32 pool_idle_ms = 0;
     UpstreamTlsSpec tls{};
@@ -58,8 +61,11 @@ private:
         u64 generation = 0, started = 0, pool_epoch = 0;
         u32 timeout = 0, amount = 0, offset = 0, buffered = 0;
         NetOp operation = NetOp::Tcp;
-        bool datagram = false, eof = false;
+        bool datagram = false, eof = false, dns_ready = false;
         NetEndpoint endpoint{};
+        DnsQuery dns{};
+        u32 resolved = 0, address_index = 0;
+        u64 dns_expires = 0;
         NetReply reply{};
         char pending[kMaxBytes]{};
         u32 pending_length = 0;
@@ -71,11 +77,13 @@ private:
     };
     struct Parked {
         NetEndpoint endpoint{};
-        u64 epoch = 0, since = 0;
+        u64 epoch = 0, since = 0, dns_expires = 0;
+        u32 resolved = 0;
         int fd = -1;
         TlsClientContext tls{};
         SSL* ssl = nullptr;
     };
+    DnsResolver resolver{};
     Parked parked[kCapacity]{};  // touched only by the worker
     u64 pool_epoch = 1;
     const void* pool_config = nullptr;  // producer shard only
@@ -94,6 +102,8 @@ private:
     void sweep(u64 now);
     static bool success(Slot&, u32 scalar);
     static bool failed(Slot&);
+    bool resolve(Slot&);
+    static bool retry_connect(Slot&);
     static bool begin_connect(Slot&);
     static bool connected(Slot&);
     static bool handshake(Slot&);

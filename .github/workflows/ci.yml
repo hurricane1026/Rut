@@ -840,6 +840,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_ws_upgrade_admission.profraw ./build/tests/test_ws_upgrade_admission
           LLVM_PROFILE_FILE=build/test_http_tokens.profraw ./build/tests/test_http_tokens
           LLVM_PROFILE_FILE=build/test_http_cache.profraw ./build/tests/test_http_cache
+          LLVM_PROFILE_FILE=build/test_dns.profraw ./build/tests/test_dns
           LLVM_PROFILE_FILE=build/test_https_fetch.profraw ./build/tests/test_https_fetch
           LLVM_PROFILE_FILE=build/test_jwt_rs256.profraw ./build/tests/test_jwt_rs256
           LLVM_PROFILE_FILE=build/test_public_key.profraw ./build/tests/test_public_key
@@ -886,6 +887,7 @@ jobs:
             build/tests/test_ws_terminate \
             build/tests/test_http_tokens \
             build/tests/test_http_cache \
+            build/tests/test_dns \
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \
