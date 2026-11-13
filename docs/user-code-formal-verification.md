@@ -434,6 +434,49 @@ allows it. Unknown services and the concrete runtime backends still need
 separate contracts and implementation tests. None of these checks establishes
 general freedom from distributed deadlock.
 
+## Compiler-Generated Protocol Cross-Checks
+
+`build_handler_protocol_model` now owns the shared composition path used by the
+compiler gate and offline exporters. It builds handler actions from the actual
+RIR automaton, adds the supplied peer actions and per-arm completion guards,
+and retains the peer invariants and terminal-resource checks. It does not run
+a search by itself. Its owned action arena is reset on rebuilding; failure
+leaves no exportable partial model. Peer invariant storage remains borrowed.
+
+`test_handler_reference` loads actual `.rut` fixtures through HIR/MIR/RIR,
+checks the compiler verdict, and exports that same generated composition in the
+existing `concurrency_reference.tla` instance format. TLC independently executes
+its transition semantics. Eight cases have fixed expected verdicts: receive
+before send, the corrected order, timer escape from an OR wait, blocked OR arms,
+missing ownership, leaked terminal resources, a finite sleep, and a yielding
+cycle. The last case deliberately mutates the lowered RIR continuation; it is
+not source syntax admitting unbounded loops. The OR fixtures supply finite
+explicit peer/timer contracts; no network behavior is inferred.
+
+```bash
+cmake --build build --target test_handler_reference
+./build/tests/test_handler_reference
+python3 scripts/check_handler_models.py --checker build/tests/test_handler_reference \
+  --jar /path/to/tla2tools.jar --output-dir /tmp/handler-reference-tlc
+```
+
+Each output subdirectory retains the exported `.tla` instance, reference
+semantics, TLC configuration, export diagnostics and TLC counterexample log.
+The shared primitive-case runner supports the same `--output-dir` option.
+Clang Debug CI checks the generated models and uploads their artifacts; the
+runtime-state job also retains the primitive-case artifacts. Ordinary CTest
+runs the source/composition regression and fail-closed orchestration tests
+without Java. A golden verdict must agree with both the native result and TLC:
+checker agreement alone is insufficient. Export failure, missing verdicts,
+search exhaustion, parser errors, contradictory exit status and timeout fail
+the check; a TLC timeout preserves any partial output for diagnosis.
+
+This closes the hand-copied-handler gap for these finite fixtures, not the
+concrete runtime/backend refinement gap. Branch predicates remain abstract,
+peer contracts remain explicit, and the exported model's bounds and scheduler
+assumptions still apply. The standalone design examples below remain useful
+independent models; they are not the compiler-generated exports.
+
 ## Executable Receive-Before-Send Example
 
 [`receive-before-send.rut`](../tests/fixtures/deadlock/receive-before-send.rut)

@@ -54,19 +54,16 @@ VerifyResult failure(const verify::Result& checked,
     return result;
 }
 
-struct Scratch {
-    MmapArena arena{};
-    ~Scratch() { arena.destroy(); }
-};
-
 }  // namespace
 
-VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
-                                        u32 root,
-                                        u32 function_index,
-                                        VerifySummary summary,
-                                        verify::Limits limits,
-                                        const VerifyPeerEnvironment* environment) {
+VerifyResult build_handler_protocol_model(const VerifyHandlerAutomaton& automaton,
+                                          u32 root,
+                                          const VerifyPeerEnvironment* environment,
+                                          VerifyHandlerProtocolModel& out,
+                                          u32 function_index,
+                                          VerifySummary summary) {
+    out.model = {};
+    out.arena.destroy();
     if (!automaton.node_count || automaton.node_count > VerifyHandlerAutomaton::kMaxNodes ||
         root >= automaton.node_count)
         return verify_fail(summary, VerifyIssueCode::InvalidHandlerAutomaton, function_index);
@@ -95,8 +92,7 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
                                    node.inst_index,
                                    node.targets[j]);
     }
-    Scratch scratch;
-    if (!scratch.arena.init(4096))
+    if (!out.arena.init(4096))
         return verify_fail(summary, VerifyIssueCode::ConcurrentVerificationLimit, function_index);
     const verify::Model* peers = environment ? environment->model : nullptr;
     const u32 kBindingCount = environment ? environment->binding_count : 0;
@@ -157,8 +153,8 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
     const u32 kPeerActions = peers ? peers->action_count : 0;
     if (kPeerActions > (1u << 20))
         return verify_fail(summary, VerifyIssueCode::ConcurrentVerificationLimit, function_index);
-    auto* actions = scratch.arena.alloc_array<verify::Action>(automaton.node_count * 2 +
-                                                              kBindingCount * 2 + kPeerActions);
+    auto* actions = out.arena.alloc_array<verify::Action>(automaton.node_count * 2 +
+                                                          kBindingCount * 2 + kPeerActions);
     if (!actions)
         return verify_fail(summary, VerifyIssueCode::ConcurrentVerificationLimit, function_index);
     verify::Model model{};
@@ -224,6 +220,25 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
                 node.kind == VerifyHandlerNodeKind::Terminal ? kDone : node.targets[target]);
         }
     }
+    out.model = model;
+    VerifyResult result{};
+    result.summary = summary;
+    return result;
+}
+
+VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
+                                        u32 root,
+                                        u32 function_index,
+                                        VerifySummary summary,
+                                        verify::Limits limits,
+                                        const VerifyPeerEnvironment* environment) {
+    VerifyHandlerProtocolModel protocol_model;
+    const auto kBuilt = build_handler_protocol_model(
+        automaton, root, environment, protocol_model, function_index, summary);
+    if (!kBuilt.ok) return kBuilt;
+    const auto& model = protocol_model.model;
+    const auto* peers = environment ? environment->model : nullptr;
+    const u32 kDone = model.actors[0].terminal;
     // A yield edge abstracts eventual completion (or failure) of the submitted
     // operation. It does not assume that errors, a close, or a particular
     // branch will eventually be chosen. A successful-yield cycle is livelock

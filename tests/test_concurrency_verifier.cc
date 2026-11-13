@@ -1,3 +1,4 @@
+#include "concurrency_reference.h"
 #include "rut/compiler/concurrency_verifier.h"
 #include "test.h"
 
@@ -539,79 +540,10 @@ TEST(ConcurrencyVerifier, SynchronizationReferenceCasesHaveExpectedVerdicts) {
     }
 }
 
-void emit_set(u64 bits) {
-    printf("{");
-    bool first = true;
-    for (u32 bit = 0; bit < 64; ++bit) {
-        if (!(bits & (u64{1} << bit))) continue;
-        printf("%s%u", first ? "" : ", ", bit);
-        first = false;
-    }
-    printf("}");
-}
-
 int export_reference(const char* name) {
     ReferenceCase fixture{};
     if (!reference_case(name, fixture)) return 2;
-    const auto& model = fixture.model;
-    const auto result = check(model, {32768, 262144});
-    if (result.issue == Issue::StateLimit || result.issue == Issue::EdgeLimit ||
-        result.issue == Issue::WorkLimit || result.issue == Issue::InvalidModel ||
-        result.issue == Issue::OutOfMemory)
-        return 1;
-    printf(
-        "\\* native-result: %s\n---- MODULE concurrency_instance ----\n"
-        "EXTENDS concurrency_reference\n",
-        issue_name(result.issue));
-    printf("ActorCountValue == %u\nInitialValue == <<", model.actor_count);
-    for (u32 a = 0; a < model.actor_count; ++a)
-        printf("%s%u", a ? ", " : "", model.actors[a].initial);
-    printf(">>\nTerminalValue == <<");
-    for (u32 a = 0; a < model.actor_count; ++a)
-        printf("%s%u", a ? ", " : "", model.actors[a].terminal);
-    printf(">>\nInitialBitsValue == ");
-    emit_set(model.initial_bits);
-    printf("\nTerminalClearValue == ");
-    emit_set(model.terminal_clear);
-    printf("\nFairGroupsValue == ");
-    emit_set(model.weak_fairness);
-    printf("\nActionsValue == <<\n");
-    for (u32 i = 0; i < model.action_count; ++i) {
-        const auto& action = model.actions[i];
-        printf("%s[actor |-> %u, source |-> %u, target |-> %u, fair |-> %u, needs |-> ",
-               i ? ",\n" : "",
-               action.actor + 1,
-               action.from,
-               action.to,
-               action.fairness);
-        emit_set(action.guard_set);
-        printf(", absent |-> ");
-        emit_set(action.guard_clear);
-        printf(", add |-> ");
-        emit_set(action.set);
-        printf(", remove |-> ");
-        emit_set(action.clear);
-        printf(", assertSet |-> ");
-        emit_set(action.assert_set);
-        printf(", assertClear |-> ");
-        emit_set(action.assert_clear);
-        printf("]");
-    }
-    printf("\n>>\nInvariantsValue == <<\n");
-    for (u32 i = 0; i < model.invariant_count; ++i) {
-        const auto& invariant = model.invariants[i];
-        printf("%s[whenSet |-> ", i ? ",\n" : "");
-        emit_set(invariant.when_set);
-        printf(", whenClear |-> ");
-        emit_set(invariant.when_clear);
-        printf(", requireSet |-> ");
-        emit_set(invariant.require_set);
-        printf(", requireClear |-> ");
-        emit_set(invariant.require_clear);
-        printf("]");
-    }
-    printf("\n>>\n====\n");
-    return 0;
+    return rut::test::export_concurrency_reference(fixture.model);
 }
 
 }  // namespace

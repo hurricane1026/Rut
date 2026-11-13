@@ -4240,6 +4240,14 @@ segfault, or access shared memory.
 
 #### 3.4.22 Concurrent I/O
 
+Compiler verification and offline TLC exports share
+`build_handler_protocol_model`, so source/peer reference cases no longer need
+a separately hand-copied handler. The exporter follows actual RIR control and
+wait metadata and is checked against independent TLC transition semantics and
+fixed expected verdicts. Export/search/tool failure is never proof. These
+finite, explicitly contracted compositions do not prove concrete backend
+refinement or arbitrary external service progress.
+
 Implementation boundary: the handle-based `submit`, `wait`/`all`/`any` forms
 below remain target design syntax. Shipped waits support timers/events and the
 bounded downstream-recv/timer `wait any` statement. `notify` and
