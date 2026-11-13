@@ -10913,7 +10913,12 @@ conditional non-storage, server errors and transport/framing failures. Server,
 transport and framing failures close aliases; successful commands permit pool return without
 introducing automatic retry or release. Flags preserve unsigned 32-bit decimal
 spelling, and relative expiration rejects the wire protocol's greater-than-30-day
-absolute-time interpretation. This is an unauthenticated source-library profile,
+absolute-time interpretation. Additive typed expiry helpers accept explicit
+signed-32-bit Unix seconds for storage, CAS, TOUCH and GAT/GATS, including
+multi-key retrieval. Relative expiry APIs keep their existing bounds. Redis
+SET options and SET GET similarly support explicit EXAT/PXAT decimal Bytes,
+validated before I/O and without timestamp narrowing or clock conversion.
+This is an unauthenticated source-library profile,
 not a native protocol handler or distributed Cache backend. It adds no keywords,
 dependencies or runtime operations. CAS and counter fields preserve decimal
 unsigned-64-bit Bytes without signed narrowing. Multi-key requests admit at

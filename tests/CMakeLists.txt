@@ -5014,3 +5014,42 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "network;cli" TIMEOUT 60)
     endforeach()
 endif()
+
+# Explicit absolute expiry stays within the existing client transport profile.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(expiry_protocol redis memcache)
+        foreach(expiry_backend epoll io_uring)
+            foreach(expiry_opt 0 2)
+                add_test(NAME test_client_expiry_${expiry_protocol}_${expiry_backend}_opt${expiry_opt}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_expiry.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${expiry_protocol} --backend ${expiry_backend} --opt ${expiry_opt})
+                set_tests_properties(test_client_expiry_${expiry_protocol}_${expiry_backend}_opt${expiry_opt}
+                    PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+            if(expiry_protocol STREQUAL "memcache")
+                foreach(expiry_helpers mutations retrievals)
+                    add_test(NAME test_client_expiry_memcache_${expiry_backend}_${expiry_helpers}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_expiry.py
+                            --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                            --protocol memcache --backend ${expiry_backend} --opt 2 --real
+                            --helpers ${expiry_helpers})
+                    set_tests_properties(test_client_expiry_memcache_${expiry_backend}_${expiry_helpers}
+                        PROPERTIES LABELS "integration;network;docker" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                endforeach()
+            endif()
+            foreach(expiry_transport plain tls)
+                set(expiry_tls_args)
+                if(expiry_transport STREQUAL "tls")
+                    list(APPEND expiry_tls_args --tls --testdata ${RUT_TLS_TESTDATA_DIR})
+                endif()
+                add_test(NAME test_client_expiry_${expiry_protocol}_${expiry_backend}_real_${expiry_transport}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_expiry.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${expiry_protocol} --backend ${expiry_backend} --opt 2 --real ${expiry_tls_args})
+                set_tests_properties(test_client_expiry_${expiry_protocol}_${expiry_backend}_real_${expiry_transport}
+                    PROPERTIES LABELS "integration;network;docker" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+        endforeach()
+    endforeach()
+endif()

@@ -108,9 +108,10 @@ func memcacheStoreReply(_ reply: MemcacheReply) -> MemcacheStoreResult {
         _ => MemcacheStoreResult.replyFailure
     }
 }
-func memcacheStoreExecute(_ connection: TcpConnection, _ mode: MemcacheStoreMode,
-    _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) -> MemcacheStoreResult {
-    guard let request = memcacheStoreRequest(mode, key, value, settings) else { MemcacheStoreResult.requestFailure }
+
+func memcacheStoreExpiryExecute(_ connection: TcpConnection, _ mode: MemcacheStoreMode,
+    _ key: Bytes, _ value: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry) -> MemcacheStoreResult {
+    guard let request = memcacheStoreExpiryRequest(mode, key, value, flags, expiry) else { MemcacheStoreResult.requestFailure }
     let result = memcacheWire(connection, request, key)
     match result {
         .reply(reply) => memcacheStoreReply(reply)
@@ -118,6 +119,11 @@ func memcacheStoreExecute(_ connection: TcpConnection, _ mode: MemcacheStoreMode
         .replyFailure => MemcacheStoreResult.replyFailure
     }
 }
+func memcacheStoreExecute(_ connection: TcpConnection, _ mode: MemcacheStoreMode,
+    _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) -> MemcacheStoreResult {
+    memcacheStoreExpiryExecute(connection, mode, key, value, settings.flags, MemcacheExpiry.seconds(settings.expirySeconds))
+}
+
 func memcacheStoreMustClose(_ result: MemcacheStoreResult) -> bool {
     match result {
         .serverError(data) => true
@@ -278,8 +284,10 @@ func memcacheCasReply(_ reply: MemcacheReply) -> MemcacheCasResult {
         _ => MemcacheCasResult.replyFailure
     }
 }
-func memcacheCasExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) -> MemcacheCasResult {
-    guard let request = memcacheCasRequest(key, value, settings, cas) else { MemcacheCasResult.requestFailure }
+
+func memcacheCasExpiryExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ flags: Bytes,
+    _ expiry: MemcacheExpiry, _ cas: Bytes) -> MemcacheCasResult {
+    guard let request = memcacheCasExpiryRequest(key, value, flags, expiry, cas) else { MemcacheCasResult.requestFailure }
     let result = memcacheWire(connection, request, key)
     match result {
         .reply(reply) => memcacheCasReply(reply)
@@ -287,6 +295,10 @@ func memcacheCasExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Byte
         .replyFailure => MemcacheCasResult.replyFailure
     }
 }
+func memcacheCasExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) -> MemcacheCasResult {
+    memcacheCasExpiryExecute(connection, key, value, settings.flags, MemcacheExpiry.seconds(settings.expirySeconds), cas)
+}
+
 func memcacheCas(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) -> MemcacheCasResult {
     let result = memcacheCasExecute(connection, key, value, settings, cas)
     match result {
@@ -349,8 +361,10 @@ func memcacheManyWire(_ connection: TcpConnection, _ request: Bytes, _ keys: Byt
         MemcacheManyResult.values(MemcacheManyReply(frame: stream.bytes, keys: keys, withCas: withCas, count: stream.count))
     }
 }
-func memcacheManyExecute(_ connection: TcpConnection, _ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) -> MemcacheManyResult {
-    guard let request = memcacheManyRequest(keys, mode, seconds) else { MemcacheManyResult.requestFailure }
+
+func memcacheManyExpiryExecute(_ connection: TcpConnection, _ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode,
+    _ expiry: MemcacheExpiry) -> MemcacheManyResult {
+    guard let request = memcacheManyExpiryRequest(keys, mode, expiry) else { MemcacheManyResult.requestFailure }
     let result = memcacheManyWire(connection, request, keys.bytes, memcacheRetrievalCas(mode))
     match result {
         .values(reply) => result
@@ -360,6 +374,10 @@ func memcacheManyExecute(_ connection: TcpConnection, _ keys: MemcacheKeys, _ mo
         }
     }
 }
+func memcacheManyExecute(_ connection: TcpConnection, _ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) -> MemcacheManyResult {
+    memcacheManyExpiryExecute(connection, keys, mode, MemcacheExpiry.seconds(seconds))
+}
+
 func memcacheMultiGet(_ connection: TcpConnection, _ keys: MemcacheKeys) -> MemcacheManyResult {
     memcacheManyExecute(connection, keys, MemcacheRetrievalMode.plain, 0)
 }
@@ -434,6 +452,52 @@ func memcacheGatResult(_ result: MemcacheManyResult) -> MemcacheGetResult {
 }
 func memcacheGat(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32) -> MemcacheGetResult {
     let result = memcacheManyExecute(connection, MemcacheKeys(bytes: key, count: 1), MemcacheRetrievalMode.touching, seconds)
+    let converted = memcacheGatResult(result)
+    if memcacheGetMustClose(converted) {
+        let closed = connection.close()
+        converted
+    } else { converted }
+}
+
+// Explicit expiry choices; legacy relative-TTL entry points retain their contracts.
+func memcacheStoreWithExpiry(_ connection: TcpConnection, _ mode: MemcacheStoreMode,
+    _ key: Bytes, _ value: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry) -> MemcacheStoreResult {
+    let result = memcacheStoreExpiryExecute(connection, mode, key, value, flags, expiry)
+    if memcacheStoreMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func memcacheCasWithExpiry(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry, _ cas: Bytes) -> MemcacheCasResult {
+    let result = memcacheCasExpiryExecute(connection, key, value, flags, expiry, cas)
+    match result {
+        .stored => result
+        .exists => result
+        .missing => result
+        .notStored => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func memcacheTouchWithExpiry(_ connection: TcpConnection, _ key: Bytes, _ expiry: MemcacheExpiry) -> MemcacheCommandResult {
+    guard let request = memcacheTouchExpiryRequest(key, expiry) else { MemcacheCommandResult.requestFailure }
+    memcacheCommandFinish(connection, memcacheCommandWire(connection, request, key, 7))
+}
+func memcacheMultiGatWithExpiry(_ connection: TcpConnection, _ keys: MemcacheKeys, _ expiry: MemcacheExpiry) -> MemcacheManyResult {
+    memcacheManyExpiryExecute(connection, keys, MemcacheRetrievalMode.touching, expiry)
+}
+func memcacheMultiGatsWithExpiry(_ connection: TcpConnection, _ keys: MemcacheKeys, _ expiry: MemcacheExpiry) -> MemcacheManyResult {
+    memcacheManyExpiryExecute(connection, keys, MemcacheRetrievalMode.touchingCas, expiry)
+}
+func memcacheGatsWithExpiry(_ connection: TcpConnection, _ key: Bytes, _ expiry: MemcacheExpiry) -> MemcacheGetsResult {
+    let result = memcacheMultiGatsWithExpiry(connection, MemcacheKeys(bytes: key, count: 1), expiry)
+    memcacheGetsFinish(connection, memcacheGetsResult(result))
+}
+func memcacheGatWithExpiry(_ connection: TcpConnection, _ key: Bytes, _ expiry: MemcacheExpiry) -> MemcacheGetResult {
+    let result = memcacheMultiGatWithExpiry(connection, MemcacheKeys(bytes: key, count: 1), expiry)
     let converted = memcacheGatResult(result)
     if memcacheGetMustClose(converted) {
         let closed = connection.close()

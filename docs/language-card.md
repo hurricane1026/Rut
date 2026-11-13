@@ -3278,7 +3278,12 @@ commands allow explicit pool return; server/transport/framing errors close the
 handle. Four receives and 8192-byte request/reply bounds remain within the
 existing I/O profile. CAS/counter fields retain the full unsigned 64-bit range
 as validated decimal Bytes; multi-key replies publish only after END and retain
-each echoed key. See [options, TTL limits and examples](memcache-client.md).
+each echoed key. Explicit `MemcacheExpiry` choices distinguish relative seconds
+from signed 32-bit Unix timestamps; `WithExpiry` storage/CAS/TOUCH/GAT/GATS
+helpers preserve the existing relative-TTL entry points. Redis SET expiry also
+supports EXAT/PXAT via validated decimal Bytes, including timestamps beyond i32.
+See [Redis SET options](redis-commands.md) and
+[Memcache options, TTL limits and examples](memcache-client.md).
 
 ## Online HS256 JWT session permits
 

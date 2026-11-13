@@ -47,6 +47,38 @@ TTL zero means no expiration. Positive TTL is limited to 2592000 seconds
 Memcached interprets larger fields as absolute Unix timestamps, which are
 outside this relative-TTL API. Eviction remains possible even with TTL zero.
 
+For explicit expiration, use `MemcacheExpiry.seconds(i32)` (the same relative
+`0...2592000` range) or `.unixSeconds(Bytes)` (decimal Unix seconds in
+`2592001...2147483647`). The absolute form rejects the relative discriminator
+range instead of silently changing its meaning. Leading zeros are canonicalized;
+signs, malformed decimals and overflow fail before I/O. A timestamp in the past
+expires immediately; no local clock conversion is performed. The pinned
+[Memcached 1.6.45 text parser](https://github.com/memcached/memcached/blob/1.6.45/proto_parser.c)
+parses expiry as signed 32-bit seconds; later timestamps are rejected locally to prevent premature
+expiration after an apparently successful store.
+
+| API | Arguments after `connection` |
+| --- | --- |
+| `memcacheStoreWithExpiry` | `mode: MemcacheStoreMode, key, value, flags: Bytes, expiry: MemcacheExpiry` |
+| `memcacheCasWithExpiry` | `key, value, flags: Bytes, expiry: MemcacheExpiry, cas: Bytes` |
+| `memcacheTouchWithExpiry`, `memcacheGatWithExpiry`, `memcacheGatsWithExpiry` | `key, expiry: MemcacheExpiry` |
+| `memcacheMultiGatWithExpiry`, `memcacheMultiGatsWithExpiry` | `keys: MemcacheKeys, expiry: MemcacheExpiry` |
+
+These return the same typed results and use the same framing, budgets and
+connection-close rules as their relative-TTL counterparts. Invalid expiry sends
+nothing and preserves the connection. An ambiguous write failure closes the
+connection and never replays the command. The corresponding pure builders are
+`memcacheStoreExpiryRequest`, `memcacheCasExpiryRequest`,
+`memcacheTouchExpiryRequest` and `memcacheManyExpiryRequest`.
+
+```rut
+memcacheStoreWithExpiry(connection, MemcacheStoreMode.set, b"key", b"value",
+    b"0", MemcacheExpiry.unixSeconds(b"2147483647"))
+```
+
+The expiry field interpretation follows the
+[Memcached text protocol](https://docs.memcached.org/protocols/basic/).
+
 ## Framing and ownership
 
 Keys must contain 1–250 bytes and no octet 0–32 or DEL. Invalid keys, flags,
@@ -170,3 +202,10 @@ TCP/TLS/backend matrix for CAS conflicts, full-width unsigned counters,
 append/prepend metadata preservation, multi-key membership/order/bounds,
 GAT/GATS expiration, fragmentation and poisoned aliases. The CAS example runs
 at O2 on both backends. All native tests remove source/import files after startup.
+
+The focused `test_client_expiry.py` matrix covers explicit expiry encoding,
+relative/absolute discriminator and overflow rejection, exact 8192-byte request
+bounds, invalid requests before I/O, and EOF/timeout without mutation replay.
+Pinned real Redis and Memcached tests verify actual expiration over TCP/TLS on
+both backends. Memcached helper cases also cover CAS conflicts, TOUCH, GAT/GATS
+and multi-key expiry updates, including the largest supported timestamp.
