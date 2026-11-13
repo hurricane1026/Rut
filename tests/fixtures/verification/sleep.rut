@@ -1,0 +1,4 @@
+route GET "/sleep" {
+    wait(1)
+    return 204
+}

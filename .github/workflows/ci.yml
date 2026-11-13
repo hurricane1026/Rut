@@ -132,7 +132,16 @@ jobs:
             -o /tmp/rut-concurrency-reference
           /tmp/rut-concurrency-reference
           python3 scripts/check_concurrency_model.py \
-            --checker /tmp/rut-concurrency-reference --jar /tmp/tla2tools.jar
+            --checker /tmp/rut-concurrency-reference --jar /tmp/tla2tools.jar \
+            --output-dir /tmp/concurrency-reference-tlc
+
+      - name: Preserve native concurrency reference models and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concurrency-reference-tlc
+          path: /tmp/concurrency-reference-tlc
+          if-no-files-found: ignore
 
   test:
     name: Build & Test
@@ -170,6 +179,28 @@ jobs:
 
       - name: Build
         run: ninja -C build
+
+      - name: Set up Java for compiler-generated protocol models
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cross-check compiler-generated handler models with TLC
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          python3 scripts/acquire_tla2tools.py /tmp/handler-tla2tools.jar
+          python3 scripts/check_handler_models.py --checker build/tests/test_handler_reference \
+            --jar /tmp/handler-tla2tools.jar --output-dir /tmp/handler-reference-tlc
+
+      - name: Preserve compiler-generated models and counterexamples
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: handler-reference-tlc
+          path: /tmp/handler-reference-tlc
+          if-no-files-found: ignore
 
       - name: Reject wait scheduler implementation mutations
         if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'

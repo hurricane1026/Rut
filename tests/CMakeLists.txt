@@ -1091,6 +1091,19 @@ target_include_directories(test_rir PRIVATE
 add_test(NAME test_rir COMMAND test_rir)
 set_tests_properties(test_rir PROPERTIES LABELS "unit")
 
+add_executable(test_handler_reference test_handler_reference.cc
+    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_link_libraries(test_handler_reference PRIVATE rut_compiler rut_runtime)
+target_include_directories(test_handler_reference PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+target_compile_definitions(test_handler_reference PRIVATE RUT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+add_test(NAME test_handler_reference COMMAND test_handler_reference)
+set_tests_properties(test_handler_reference PROPERTIES LABELS "unit;model")
+
+add_test(NAME test_model_crosscheck
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_model_crosscheck.py)
+set_tests_properties(test_model_crosscheck PROPERTIES LABELS "unit;model")
+
 add_executable(test_concurrency_verifier test_concurrency_verifier.cc
     ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_link_libraries(test_concurrency_verifier rut_verifier)

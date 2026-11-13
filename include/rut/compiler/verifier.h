@@ -520,6 +520,26 @@ struct VerifyHandlerAutomaton {
     u32 runtime_fail_closed_count = 0;
 };
 
+// Owns generated handler/peer actions. Peer invariants remain borrowed and
+// must outlive this composition, just as the input peer contract must.
+struct VerifyHandlerProtocolModel {
+    MmapArena arena{};
+    verify::Model model{};
+    VerifyHandlerProtocolModel() = default;
+    ~VerifyHandlerProtocolModel() { arena.destroy(); }
+    VerifyHandlerProtocolModel(const VerifyHandlerProtocolModel&) = delete;
+    VerifyHandlerProtocolModel& operator=(const VerifyHandlerProtocolModel&) = delete;
+};
+
+// The compiler and offline model exporters use the same composition builder.
+// Building is not verification: callers must check the result, then check(model).
+VerifyResult build_handler_protocol_model(const VerifyHandlerAutomaton& automaton,
+                                          u32 root,
+                                          const VerifyPeerEnvironment* environment,
+                                          VerifyHandlerProtocolModel& out,
+                                          u32 function_index = 0,
+                                          VerifySummary summary = {});
+
 VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
                                         u32 root,
                                         u32 function_index,

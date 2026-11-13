@@ -1178,6 +1178,7 @@ wait any {
     timer(250) => { return 408 }
 }
 // Every handler passes native CFG/protocol checks before LLVM emission.
+// CI also cross-checks protocol models exported from actual compiled fixtures.
 // Known peer contracts can reject mutual waits; unknown network peers retain
 // an eventual completion/failure assumption. TLA+ is a CI design/reference
 // check, not proof of arbitrary source programs or kernel/backend behavior.

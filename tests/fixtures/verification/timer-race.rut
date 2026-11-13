@@ -1,0 +1,6 @@
+route GET "/race" {
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(25) => { return 408 }
+    }
+}
