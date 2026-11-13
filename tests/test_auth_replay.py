@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import traceback
+from test_redis_commands import assert_ack_boundary
 
 KEY = 'standard-webhook-fixture-0123456789'
 SIGNED = False
@@ -25,7 +26,7 @@ SIGNED_TIME = int(time.time())
 
 
 class Store:
-    def __init__(self, certificates, tls):
+    def __init__(self, certificates, tls, durable=False):
         self.lock = threading.Lock()
         self.claims = {}
         self.mode = 'normal'
@@ -33,6 +34,9 @@ class Store:
         self.errors = []
         self.workers = []
         self.stopping = threading.Event()
+        self.durable = durable
+        self.barrier_entered = threading.Event()
+        self.release_barrier = threading.Event()
         self.listener = socket.socket()
         self.listener.bind(('127.0.0.1', 0))
         self.listener.listen(64)
@@ -108,6 +112,36 @@ class Store:
                         if mode == 'set-timeout':
                             self.stopping.wait(1.4)
                             return
+                    elif args[0] == b'WAITAOF':
+                        assert self.durable and authenticated and selected
+                        assert args == [b'WAITAOF', b'1', b'0', b'500']
+                        assert_ack_boundary(connection, stream, 'cleanup preceded AOF confirmation')
+                        reply = b'*2\r\n:1\r\n:0\r\n'
+                        if mode == 'aof-error': reply = b'-ERR AOF disabled\r\n'
+                        if mode == 'aof-timeout': reply = b'*2\r\n:0\r\n:0\r\n'
+                        if mode == 'aof-negative': reply = b'*2\r\n:1\r\n:-1\r\n'
+                        if mode == 'aof-local': reply = b'*2\r\n:2\r\n:0\r\n'
+                        if mode == 'aof-type': reply = b'*2\r\n$1\r\n1\r\n:0\r\n'
+                        if mode == 'aof-arity': reply = b'*1\r\n:1\r\n'
+                        if mode == 'aof-nested': reply = b'*2\r\n*1\r\n:1\r\n:0\r\n'
+                        if mode == 'aof-overflow': reply = b'*2\r\n:1\r\n:9223372036854775808\r\n'
+                        if mode == 'aof-oversized': reply = b'-ERR ' + b'x' * 128 + b'\r\n'
+                        if mode == 'aof-trailing': reply += b'+OK\r\n'
+                        if mode == 'aof-short':
+                            connection.sendall(b'*2\r\n:1\r\n')
+                            return
+                        if mode == 'aof-eof': return
+                        if mode == 'aof-hang':
+                            self.stopping.wait(1.4)
+                            return
+                        if mode == 'aof-held':
+                            self.barrier_entered.set()
+                            assert self.release_barrier.wait(3), 'barrier test did not release'
+                        if mode == 'aof-replicas': reply = b'*2\r\n:1\r\n:2\r\n'
+                        if mode == 'aof-fragmented':
+                            connection.sendall(reply[:4])
+                            time.sleep(.01)
+                            reply = reply[4:]
                     elif args[0] == b'RESET':
                         authenticated, selected = False, False
                         reply = b'-ERR\r\n' if mode == 'reset-error' else b'+RESET\r\n'
@@ -125,13 +159,14 @@ class Store:
 
     def close(self):
         self.stopping.set()
+        self.release_barrier.set()
         self.listener.close()
         self.thread.join(2)
         for worker in self.workers: worker.join(4)
         assert not self.errors, self.errors
 
 
-def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'event', h2=False):
+def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'event', h2=False, abort_when=None):
     signed_timestamp = SIGNED_TIME if timestamp is None else timestamp
     timestamp = str(int(time.time()) if timestamp is None else timestamp)
     digest = hmac.new(key.encode(), message.encode()+b'.'+timestamp.encode()+b'.'+body,
@@ -155,6 +190,9 @@ def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'eve
             f'Content-Length: {len(body)}\r\n\r\n').encode()+body
     with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
         connection.sendall(wire)
+        if abort_when is not None:
+            assert abort_when.wait(2), 'service did not enter held barrier'
+            return None  # Close the downstream while its claim awaits confirmation.
         data=b''
         while True:
             chunk=connection.recv(65536)
@@ -182,7 +220,7 @@ def gateway(args, source, store, directory):
              REDIS_PASSWORD='service-password',REDIS_DATABASE='1')
     log=root/'gateway.log'
     with log.open('w') as output:
-        process=subprocess.Popen([args.server,str(path),'--backend',args.backend,'--opt','2',
+        process=subprocess.Popen([args.server,str(path),'--backend',args.backend,'--opt',str(getattr(args,'opt',2)),
                                   '--no-pin','--shards','2','--drain','0',
                                   '--max-connections-per-shard','128'],env=env,
                                  stdout=output,stderr=subprocess.STDOUT)
@@ -215,10 +253,12 @@ def main():
     parser.add_argument('--backend',required=True)
     parser.add_argument('--tls',action='store_true')
     parser.add_argument("--signed",action="store_true")
+    parser.add_argument('--durable',action='store_true')
+    parser.add_argument('--opt',type=int,choices=(0,2),default=2)
     args=parser.parse_args()
     global SIGNED
     SIGNED=args.signed
-    store=Store(Path(args.testdata),args.tls)
+    store=Store(Path(args.testdata),args.tls,args.durable)
     try:
         with tempfile.TemporaryDirectory(prefix='rut-auth-replay-') as tmp:
             with gateway(args,Path(args.source).resolve(),store,Path(tmp)) as port:
@@ -248,6 +288,31 @@ def main():
                 # Applied-but-unacknowledged SET/RESET cannot become a new allow.
                 for name in ['set-eof','set-timeout','reset-error']:
                     assert exchange(port,name)==409,name
+                if args.durable:
+                    uncertain = ['aof-error', 'aof-timeout', 'aof-negative', 'aof-local',
+                                 'aof-type', 'aof-arity', 'aof-nested', 'aof-overflow',
+                                 'aof-oversized', 'aof-trailing', 'aof-short',
+                                 'aof-eof', 'aof-hang']
+                    for mode in uncertain + ['aof-replicas', 'aof-fragmented']:
+                        with store.lock: store.mode=mode
+                        assert exchange(port,mode)==(204 if mode in ('aof-replicas','aof-fragmented') else 503),mode
+                    with store.lock: store.mode='normal'
+                    for name in uncertain:
+                        assert exchange(port,name)==409,name
+                    with store.lock: store.mode='aof-held'
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pending=pool.submit(exchange,port,'barrier-held')
+                        assert store.barrier_entered.wait(2)
+                        time.sleep(.05)
+                        assert not pending.done(), 'admission preceded local fsync acknowledgement'
+                        store.release_barrier.set()
+                        assert pending.result(timeout=4)==204
+                    store.barrier_entered.clear()
+                    store.release_barrier.clear()
+                    assert exchange(port,'cancelled-at-barrier',abort_when=store.barrier_entered) is None
+                    store.release_barrier.set()
+                    with store.lock: store.mode='normal'
+                    assert exchange(port,'cancelled-at-barrier')==409
             # Same authoritative store survives gateway restart.
             with gateway(args,Path(args.source).resolve(),store,Path(tmp)) as port:
                 assert exchange(port,'one')==409

@@ -4064,6 +4064,39 @@ if(RUT_ENABLE_JIT)
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
             foreach(auth_free_backend epoll io_uring)
+                foreach(durable_replay_opt 0 2)
+                    add_test(NAME test_auth_durable_replay_${auth_free_backend}_opt${durable_replay_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-durable-replay-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend}
+                            --opt ${durable_replay_opt} --durable)
+                    set_tests_properties(test_auth_durable_replay_${auth_free_backend}_opt${durable_replay_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                endforeach()
+                add_test(NAME test_auth_durable_replay_${auth_free_backend}_tls
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-durable-replay-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --durable)
+                set_tests_properties(test_auth_durable_replay_${auth_free_backend}_tls PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                add_test(NAME test_signed_durable_replay_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signed-request-durable-replay-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --signed --durable)
+                set_tests_properties(test_signed_durable_replay_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                foreach(durable_replay_tls plain tls)
+                    set(durable_replay_tls_args)
+                    if(durable_replay_tls STREQUAL "tls")
+                        set(durable_replay_tls_args --tls)
+                    endif()
+                    add_test(NAME test_auth_durable_replay_live_${auth_free_backend}_${durable_replay_tls}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay_durable.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-durable-replay-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} ${durable_replay_tls_args})
+                    set_tests_properties(test_auth_durable_replay_live_${auth_free_backend}_${durable_replay_tls} PROPERTIES
+                        LABELS "integration;auth;docker" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                endforeach()
                 add_test(NAME test_consumer_fields_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_fields.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-fields-auth.rut
