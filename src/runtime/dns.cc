@@ -11,6 +11,8 @@
 #include <sys/poll.h>
 #if defined(__linux__)
 #include <sys/random.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
 #endif
 #include <sys/socket.h>
 #include <unistd.h>
