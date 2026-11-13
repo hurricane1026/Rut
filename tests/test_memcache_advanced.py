@@ -314,8 +314,29 @@ def program(reads):
     base = BASIC_PROGRAM[:start] + ''.join(r for r in base_routes if r.startswith(('route POST "/store"', 'route POST "/get"')))
     start = ADVANCED.index('route POST ')
     routes = re.split(r'(?=^route POST )', ADVANCED[start:], flags=re.M)
-    read_routes = ('many', 'many-triple', 'gets', 'gats', 'gat', 'retain', 'keys', 'addkey')
-    return base + ADVANCED[:start] + ''.join(r for r in routes if r.startswith('route POST "/cas"') or any(r.startswith('route POST "/' + name + '"') for name in read_routes) == reads)
+    read_routes = ('many', 'gets', 'gats', 'gat', 'retain', 'keys', 'addkey')
+    helpers = re.split(r'(?=^func )', ADVANCED[:start], flags=re.M)
+    helpers = ''.join(helper for helper in helpers
+                      if not helper.startswith(('func extManyTriple(', 'func extManyTripleResult(')))
+    selected_routes = (r for r in routes if not r.startswith('route POST "/many-triple"') and
+                       (r.startswith('route POST "/cas"') or
+                        any(r.startswith('route POST "/' + name + '"') for name in read_routes) == reads))
+    return base + helpers + ''.join(selected_routes)
+
+
+def many_triple_program():
+    base_start = BASIC_PROGRAM.index('route POST ')
+    base_routes = re.split(r'(?=^route POST )', BASIC_PROGRAM[base_start:], flags=re.M)
+    base = BASIC_PROGRAM[:base_start] + ''.join(
+        route for route in base_routes if route.startswith('route POST "/store"'))
+    advanced_start = ADVANCED.index('route POST ')
+    helpers = re.split(r'(?=^func )', ADVANCED[:advanced_start], flags=re.M)
+    helper_names = ('func extMode(', 'func extManyFinish(', 'func extPack(',
+                    'func extManyReplyBody(', 'func extManyTriple(',
+                    'func extManyTripleResult(')
+    route = next(route for route in re.split(r'(?=^route POST )', ADVANCED[advanced_start:], flags=re.M)
+                 if route.startswith('route POST "/many-triple"'))
+    return base + ''.join(helper for helper in helpers if helper.startswith(helper_names)) + route
 
 
 def value(key, data, flags=b'0', cas=None):
@@ -552,12 +573,6 @@ def reads(request, peer):
     for key in keys:
         assert request('store', b'v', {'X-Key':key.decode()})[0] == 200
     assert request('many', packed, {'X-Count':'8','X-Count-Only':'yes'}) == (200,b'8')
-    if peer:
-        long_fixture = b'fixture-eight' + b'X' * (250 - len(b'fixture-eight'))
-        long_reply_keys = b' '.join([long_fixture] + keys[:7])
-        for index, key in enumerate(list(reversed([long_fixture] + keys[:7]))):
-            status, body = request('many-triple', long_reply_keys, {'X-Count':'8', 'X-Index':str(index)})
-            assert status == 200 and body.count(b'|0|') == 3 and key in body, (index, status, body[:100])
     for key, data, flags in ((b'one',b'a\x00\xff\r\nEND\r\nz','4294967295'),(b'two',b'','0'),(b'key',b'present','0')):
         assert request('store', data, {'X-Key': key.decode(), 'X-Flags':flags})[0] == 200
     assert request('gets', b'absent')[0] == 404
@@ -600,6 +615,18 @@ def reads(request, peer):
         assert request('many',b'fixture-reorder second') == (200,b'second|0||second\x00\xff')
         assert not any(parts[0]==b'ILLEGAL' for _,parts,_ in peer.observed)
     return cas
+
+
+def many_triple(request, peer):
+    keys = [bytes([65+i])*250 for i in range(8)]
+    for key in keys:
+        assert request('store', b'v', {'X-Key': key.decode()})[0] == 200
+    long_fixture = b'fixture-eight' + b'X' * (250 - len(b'fixture-eight'))
+    long_reply_keys = b' '.join([long_fixture] + keys[:7])
+    for index, key in enumerate(list(reversed([long_fixture] + keys[:7]))):
+        status, body = request('many-triple', long_reply_keys,
+                               {'X-Count':'8', 'X-Index':str(index)})
+        assert status == 200 and body.count(b'|0|') == 3 and key in body, (index, status, body[:100])
 
 
 def example_checks(request):
@@ -648,6 +675,9 @@ def main():
             with gateway(args,policy(port),lambda:program(reading)) as request:
                 if reading: reads(request,peer)
                 else: writes(request,peer)
+        if peer:
+            with gateway(args, policy(port), many_triple_program) as request:
+                many_triple(request, peer)
     if args.real_memcached:
         with real_memcached(args) as port: run(port,None)
     else:
