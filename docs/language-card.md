@@ -3317,6 +3317,19 @@ Other tokens for the same subject/jti are untouched. Query/body target selection
 enrollment, automatic retries and cookie/OIDC logout are absent. See
 [ownership and ambiguous failure behavior](jwt-sessions.md#self-service-logout).
 
+### Local-AOF durable JWT logout
+
+The online session example additionally provides `POST /logout-durable` for
+Redis 7.2+. It verifies the same Bearer JWT before service I/O, writes `revoked`
+under the exact-token key with the original signed `EXAT`, and requires
+same-connection `WAITAOF 1 0 500` plus acknowledged RESET/release before 204.
+Every repeated or absent-key logout writes a tombstone; it never extends the
+signed expiry. Only `active` permits authorize resource requests. Every write,
+barrier, protocol or cleanup uncertainty returns 503. This composes existing
+Rut functions and bounded Redis parsing; it introduces no new builtin or syntax.
+The local-instance AOF contract excludes stale replicas, failover, snapshot
+rollback and in-flight cancellation. See [durable logout](jwt-sessions.md#local-aof-durable-logout).
+
 ### Trusted JWT issuance with online enrollment
 
 The [online session example](../examples/jwt-session-auth.rut) also exposes

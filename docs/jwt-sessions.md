@@ -240,6 +240,62 @@ explicit logout may complete with the absent-key acknowledgement. A successful
 stale replicas, snapshot restoration and already-admitted requests retain the
 limitations described above.
 
+## Local-AOF durable logout
+
+`POST /logout-durable` is an opt-in Redis 7.2+ profile for single-instance
+persistent exact-token revocation. It applies the same singleton Bearer,
+current/previous HS256, issuer/audience and time policy before opening Redis.
+The target key and expiry come exclusively from that verified token. The
+existing `/logout` endpoint retains its acknowledged-DEL contract.
+
+After AUTH/SELECT, the profile sends a bounded pipeline on the same connection:
+
+```text
+SET <exact-token-key> revoked EXAT <signed-exp>
+WAITAOF 1 0 500
+```
+
+Every invocation writes, including absent permits and repeated logout. A
+no-op DEL would not establish a new write offset on this connection. The
+`revoked` tombstone prevents an existing `SET NX` enrollment from reactivating
+that exact token while it remains valid; fresh online GETs accept only `active`.
+The absolute expiration is always the original signed exp, so repeated calls
+never extend the retention window. A valid token that expires during I/O can
+leave no record; it remains rejected by local claims verification. Redis rejects
+non-integral or unsupported expiration values and the endpoint returns 503.
+
+Only an exact simple-string `OK`, followed by a complete two-integer WAITAOF
+array with local count 1 and a nonnegative replica count, then acknowledged
+RESET/release can return an empty 204 with `Cache-Control: no-store`.
+[WAITAOF](https://redis.io/docs/latest/commands/waitaof/) confirms preceding writes
+on that connection. This profile requests local AOF only and never treats a
+replica acknowledgement as an additional durability guarantee. It reuses the
+replay profile's 128-byte/four-receive bounded reader and existing session
+cleanup; there is no retry or rollback. Missing AOF, denied commands, capacity,
+read-only service roles, malformed/truncated/trailing replies, timeout and
+cleanup failures return 503, even when the tombstone was already applied.
+Subsequent explicit logout may write and confirm it again.
+
+Use a fixed authoritative instance with AOF enabled, `noeviction`, storage that
+honors fsync, and ACL access limited to the configured namespace and required
+AUTH/SELECT/GET/SET/WAITAOF/RESET operations (DEL only for legacy logout).
+A successful 204 promises local AOF recovery on that instance and retained
+storage, subject to its persistence/storage contract. It does not cover stale
+replica reads, failover to unconfirmed replicas, restoring an older snapshot,
+operator re-enrollment, disk loss or cancellation of already-admitted work.
+All gateway resource routes must consult the same authority. The free profile
+adds no distributed consensus, replica routing or positive permit cache.
+Issuance still acknowledges enrollment and cleanup without a durability barrier;
+a lost enrollment fails closed as a missing permit.
+
+The native fault fixture checks both HTTP/1 versions, exact-token isolation,
+present/absent/repeated logout, signed-exp retention, authentication-before-I/O,
+write/barrier/cleanup error handling and delayed confirmation. The pinned Redis
+fixture checks SIGKILL/AOF recovery, gateway reload, other-token continuity,
+tombstone expiry, ACL denial, capacity, read-only role and disabled AOF. Both
+backends, O0/O2 wire tests and verified TLS service tests are registered. These
+single-instance tests do not establish replication/failover consistency.
+
 ## Validation scope
 
 The JIT test uses the example's real typed mapper to cover every

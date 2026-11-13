@@ -10977,3 +10977,20 @@ forward/body rewrite is implied. See [the contract](docs/consumer-registry.md).
 Failed partial initialization cannot start a keys-only refresh, and a second init
 cannot overwrite an active fetch's trusted configuration. Lifecycle tests exercise
 DNS/discovery/keys, deadlines, cancellation, rebinding refusal and partial failure.
+
+### Single-instance durable JWT session revocation
+
+The free `jwt-session-auth.rut` profile adds opt-in `POST /logout-durable`.
+Verified singleton Bearer identity determines the exact SHA-256 permit key and
+original signed expiry. AUTH/SELECT precedes a bounded `SET key revoked EXAT exp`
+and same-connection `WAITAOF 1 0 500` pipeline. Only exact OK, confirmed local AOF
+and acknowledged RESET/release publish 204; every uncertainty returns 503.
+An unconditional tombstone supplies a fresh connection write offset even for
+repeated/absent-key logout, blocks NX re-enrollment while valid, and expires at
+the signed exp without renewal. Resource GETs still accept only `active`.
+The existing DEL endpoint and non-durable issuance contracts are unchanged.
+The 128-byte/four-receive replay reader and existing session cleanup preserve
+bounded I/O and lease ownership. Native fault and pinned Redis crash/recovery
+fixtures cover both backends and verified TLS. Local AOF recovery does not claim
+replica/failover linearizability, snapshot rollback prevention or cancellation
+of already-admitted work. See `docs/jwt-sessions.md` for deployment assumptions.

@@ -4128,6 +4128,37 @@ if(RUT_ENABLE_JIT)
                         LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            foreach(session_durable_backend epoll io_uring)
+                foreach(session_durable_opt 0 2)
+                    add_test(NAME test_jwt_session_durable_${session_durable_backend}_opt${session_durable_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_session_durable.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${session_durable_backend}
+                            --opt ${session_durable_opt})
+                    set_tests_properties(test_jwt_session_durable_${session_durable_backend}_opt${session_durable_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                endforeach()
+                foreach(session_durable_mode wire_tls live_plain live_tls)
+                    set(session_durable_flags)
+                    if(session_durable_mode MATCHES "tls$")
+                        list(APPEND session_durable_flags --tls)
+                    endif()
+                    if(session_durable_mode MATCHES "^live")
+                        list(APPEND session_durable_flags --live)
+                    endif()
+                    add_test(NAME test_jwt_session_durable_${session_durable_backend}_${session_durable_mode}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_session_durable.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${session_durable_backend}
+                            ${session_durable_flags})
+                    set_tests_properties(test_jwt_session_durable_${session_durable_backend}_${session_durable_mode} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                    if(session_durable_mode MATCHES "^live")
+                        set_tests_properties(test_jwt_session_durable_${session_durable_backend}_${session_durable_mode} PROPERTIES
+                            LABELS "integration;auth;docker" RUN_SERIAL TRUE)
+                    endif()
+                endforeach()
+            endforeach()
             foreach(jwt_session_backend epoll io_uring)
                 foreach(jwt_session_opt 0 2)
                     add_test(NAME test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt}
