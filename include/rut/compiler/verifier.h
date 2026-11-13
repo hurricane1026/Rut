@@ -195,11 +195,26 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
 // An optional finite contract for known peers. Bindings refer to this
 // function's actual RIR yield blocks; handlers are generated, not hand-copied
 // into the peer model. Unknown network peers have no inferred behavior.
+struct VerifyPeerArm {
+    // Exactly one bit from the actual yield's wait_arm_mask.
+    u8 arm_mask = 0;
+    u64 completion_set = 0;
+    u64 completion_clear = 0;
+};
+
 struct VerifyPeerBinding {
     u32 block_index = 0;
     u64 submit_set = 0;
     u64 completion_set = 0;
     u64 completion_clear = 0;
+    // Explicit alternatives for an OR wait. Legacy fields above describe a
+    // single arm only; explicit arms must cover the exact encoded mask.
+    u8 arm_count = 0;
+    VerifyPeerArm arms[2]{};
+    // Assertions expose invalid ownership/acknowledgement dependencies as
+    // safety errors rather than hiding them behind a disabled submission.
+    u64 submit_require_set = 0;
+    u64 submit_require_clear = 0;
 };
 
 struct VerifyPeerEnvironment {
@@ -207,6 +222,9 @@ struct VerifyPeerEnvironment {
     const verify::Model* model = nullptr;
     const VerifyPeerBinding* bindings = nullptr;
     u32 binding_count = 0;
+    // A supplied contract is complete by default. Partial contracts must opt
+    // into external-completion assumptions explicitly.
+    bool require_all_yields_bound = true;
 };
 
 struct VerifyOptions {

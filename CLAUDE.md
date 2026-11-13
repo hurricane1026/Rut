@@ -131,8 +131,8 @@ LLM-facing surface contract).
 - **No `async`/`await`** — compiler auto-generates state machines at I/O points
 - **`forward`** replaces proxy — zero-copy (`return forward`) or buffered (`let resp = forward(..., buffered: true)`)
 - **`read`** — unified file/pipe I/O, zero-copy or buffered based on usage
-- **`submit`/`wait`/`any`/`all`** — explicit concurrent I/O with io_uring batch submission
-- **`notify`** — cross-shard primitive: `notify all expr` (all shards) or `notify(key) expr` (targeted by key hash). `consistent: true` for strong consistency
+- **`wait`** — timer/event waits and bounded recv/timer `wait any` are implemented; handle-based `submit`/`wait`/`any`/`all` remain target design syntax
+- **`notify`** — pending cross-shard design primitive: `notify all expr` (all shards) or `notify(key) expr` (targeted by key hash). `consistent: true` is also pending
 - **`timer`** — background periodic tasks (health checks, cache warmup, metrics push)
 - **`@decorator`** for middleware — `@func pattern` bindings in route block, `@if(expr)` conditional
 - **Pre/post middleware** inferred from signature: first param `Request` → pre, `Response` → post

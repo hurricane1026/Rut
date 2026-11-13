@@ -4240,6 +4240,23 @@ segfault, or access shared memory.
 
 #### 3.4.22 Concurrent I/O
 
+Implementation boundary: the handle-based `submit`, `wait`/`all`/`any` forms
+below remain target design syntax. Shipped waits support timers/events and the
+bounded downstream-recv/timer `wait any` statement. `notify` and
+`consistent: true` owner routing are also pending, not implementation claims.
+
+`spec/synchronization.tla` checks bounded submit/collect and owner apply/ack
+contracts, with required negative examples for self-wait, wait-before-submit,
+early resume and early acknowledgement. Native protocol models and TLC agree
+on the exported reference cases. The compiler checks actual RIR handlers before
+LLVM emission: explicit peer contracts now support exact per-arm OR completion
+conditions and submission ownership assertions, and require all yields in the
+selected function to be bound unless partial assumptions are explicitly chosen.
+Wait lifecycle exploration separately owns cancel acknowledgements and target
+completions and rejects reclaim before both retire. These bounded contracts do
+not prove concrete backend code or unknown service behavior. See
+[formal verification](docs/user-code-formal-verification.md) for scope and commands.
+
 `submit` starts an async I/O operation without waiting. `wait` collects results.
 Maps directly to io_uring batched submission.
 

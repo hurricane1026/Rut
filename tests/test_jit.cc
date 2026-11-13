@@ -349,6 +349,140 @@ TEST(jit, codegen_rejects_yielding_cycle_and_returns_counterexample) {
     rir.destroy();
 }
 
+TEST(jit, codegen_checks_complete_peer_contract_for_source_any_wait) {
+    auto lexed = lex(lit(R"rut(
+route GET "/race" {
+    wait any {
+        downstream.recv() => { return 204 }
+        timer(25) => { return 408 }
+    }
+}
+)rut"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    VerifyHandlerAutomaton automaton{};
+    REQUIRE(build_verify_handler_automaton(&rir.module.functions[0], automaton));
+    VerifyPeerBinding binding{};
+    binding.block_index = ~u32{0};
+    for (u32 i = 0; i < automaton.node_count; ++i)
+        if (automaton.nodes[i].kind == VerifyHandlerNodeKind::Yield) binding.block_index = i;
+    REQUIRE(binding.block_index < automaton.node_count);
+    binding.arm_count = 2;
+    binding.arms[0] = {kWaitEventArmRecv, 1, 1};
+    binding.arms[1] = {kWaitEventArmTimer, 2, 2};
+    verify::Action timer{};
+    timer.to = 1;
+    timer.set = 2;
+    verify::Model peer{};
+    peer.actor_count = 1;
+    peer.actors[0] = {2, 0, 1};
+    peer.actions = &timer;
+    peer.action_count = 1;
+    peer.terminal_clear = 2;
+    VerifyPeerEnvironment environment{0, &peer, &binding, 1};
+    VerifyOptions options{};
+    options.environment = &environment;
+    VerifyResult verification{};
+    binding.arms[1].completion_set = 4;
+    const auto bad = codegen(rir.module, &verification, &options);
+    CHECK_FALSE(bad.ok);
+    CHECK(bad.mod == nullptr);
+    CHECK(bad.ctx == nullptr);
+    CHECK_EQ(verification.issue.code, VerifyIssueCode::HandlerDeadlock);
+    CHECK(verification.issue.trace_is_protocol);
+    binding.arms[1].completion_set = 2;
+    const auto good = codegen(rir.module, &verification, &options);
+    REQUIRE(good.ok);
+    dispose_module(good.mod, good.ctx);
+    environment.binding_count = 0;
+    CHECK_FALSE(codegen(rir.module, &verification, &options).ok);
+    CHECK_EQ(verification.issue.code, VerifyIssueCode::ConcurrentProtocolFailure);
+    rir.destroy();
+}
+
+TEST(jit, source_receive_before_send_deadlocks_under_reply_after_request_contract) {
+    for (u32 receive_first = 0; receive_first < 2; ++receive_first) {
+        const auto path = std::filesystem::path(__FILE__).parent_path() / "fixtures" / "deadlock" /
+                          (receive_first ? "receive-before-send.rut" : "send-before-receive.rut");
+        std::ifstream input(path);
+        REQUIRE(input.good());
+        const std::string source((std::istreambuf_iterator<char>(input)),
+                                 std::istreambuf_iterator<char>());
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE_EQ(rir.module.func_count, 1u);
+        VerifyHandlerAutomaton automaton{};
+        REQUIRE(build_verify_handler_automaton(&rir.module.functions[0], automaton));
+        VerifyPeerBinding bindings[3]{};
+        u32 binding_count = 0;
+        for (u32 i = 0; i < automaton.node_count; ++i) {
+            const auto& node = automaton.nodes[i];
+            if (node.kind != VerifyHandlerNodeKind::Yield) continue;
+            REQUIRE(binding_count < 3);
+            auto& binding = bindings[binding_count++];
+            binding.block_index = i;
+            if (node.wait_arm_mask == kWaitEventArmUpstreamSend)
+                binding.submit_set = 1;
+            else if (node.wait_arm_mask == kWaitEventArmUpstreamRecv) {
+                binding.completion_set = 2;
+                binding.completion_clear = 2;
+            } else
+                REQUIRE_EQ(node.wait_arm_mask, kWaitEventArmUpstreamConnect);
+        }
+        REQUIRE_EQ(binding_count, 3u);
+        verify::Action actions[2]{};
+        actions[0].to = 1;
+        actions[0].guard_set = 1;
+        actions[0].clear = 1;
+        actions[0].set = 2;
+        actions[1].from = 1;
+        actions[1].to = 2;
+        actions[1].guard_clear = 2;
+        verify::Model peer{};
+        peer.actor_count = 1;
+        peer.actors[0] = {3, 0, 2};
+        peer.actions = actions;
+        peer.action_count = 2;
+        peer.terminal_clear = 3;
+        VerifyPeerEnvironment environment{0, &peer, bindings, binding_count};
+        VerifyOptions options{};
+        options.environment = &environment;
+        VerifyResult verification{};
+        const auto generated = codegen(rir.module, &verification, &options);
+        if (receive_first) {
+            CHECK_FALSE(generated.ok);
+            CHECK(generated.mod == nullptr);
+            CHECK(generated.ctx == nullptr);
+            CHECK_EQ(verification.issue.code, VerifyIssueCode::HandlerDeadlock);
+            CHECK(verification.issue.trace_is_protocol);
+            CHECK(verification.issue.trace_count > 0);
+            printf("  source receive-before-send.rut: HandlerDeadlock before LLVM emission\n");
+        } else {
+            REQUIRE(generated.ok);
+            dispose_module(generated.mod, generated.ctx);
+            printf("  source send-before-receive.rut: accepted under the same peer contract\n");
+        }
+        // Source alone does not supply a peer contract to the compiler.
+        CHECK(verify_function(&rir.module.functions[0]).ok);
+        rir.destroy();
+    }
+}
+
 // Test: runtime helpers work from C++ (sanity check)
 TEST(jit, helpers_sanity) {
     const char* out_ptr = nullptr;

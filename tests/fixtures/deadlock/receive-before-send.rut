@@ -1,0 +1,10 @@
+// Peer contract: the upstream sends its reply only after receiving req.body.
+// Rut waits for that reply before sending req.body: a circular protocol wait.
+// This fixture models no timeout/close escape; it is not a production route.
+upstream peer at "127.0.0.1:9000"
+route POST "/exchange" {
+    wait(upstream(peer).connect())
+    wait(upstream(peer).recv())
+    wait(upstream(peer).send(req.body))
+    return 204
+}

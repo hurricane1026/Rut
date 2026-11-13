@@ -105,16 +105,44 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
          (peers->action_count && !peers->actions) || (kBindingCount && !environment->bindings) ||
          kBindingCount > automaton.node_count))
         return verify_fail(summary, VerifyIssueCode::ConcurrentProtocolFailure, function_index);
-    // Validate bindings before allocation, including duplicates and multi-arm
-    // waits whose OR-completion semantics cannot be expressed by this adapter.
+    // Validate contracts before allocation. OR arms are separate transitions,
+    // never a conjunction of completion prerequisites.
     for (u32 i = 0; i < kBindingCount; ++i) {
         const auto& binding = environment->bindings[i];
         if (binding.block_index >= automaton.node_count)
             return verify_fail(summary, VerifyIssueCode::ConcurrentProtocolFailure, function_index);
         const auto& node = automaton.nodes[binding.block_index];
         if (node.kind != VerifyHandlerNodeKind::Yield || !node.wait_arm_mask ||
-            (node.wait_arm_mask & (node.wait_arm_mask - 1)) ||
-            node.wait_arm_mask == verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp::Timer))
+            binding.arm_count > 2 || (binding.submit_require_set & binding.submit_require_clear))
+            return verify_fail(summary,
+                               VerifyIssueCode::ConcurrentProtocolFailure,
+                               function_index,
+                               binding.block_index);
+        u8 covered = 0;
+        if (binding.arm_count) {
+            if (binding.completion_set || binding.completion_clear)
+                return verify_fail(summary,
+                                   VerifyIssueCode::ConcurrentProtocolFailure,
+                                   function_index,
+                                   binding.block_index);
+            for (u32 arm = 0; arm < binding.arm_count; ++arm) {
+                const u8 kMask = binding.arms[arm].arm_mask;
+                if (!kMask || (kMask & (kMask - 1)) || (covered & kMask))
+                    return verify_fail(summary,
+                                       VerifyIssueCode::ConcurrentProtocolFailure,
+                                       function_index,
+                                       binding.block_index);
+                covered |= kMask;
+            }
+        } else {
+            if (node.wait_arm_mask & (node.wait_arm_mask - 1))
+                return verify_fail(summary,
+                                   VerifyIssueCode::ConcurrentProtocolFailure,
+                                   function_index,
+                                   binding.block_index);
+            covered = node.wait_arm_mask;
+        }
+        if (covered != node.wait_arm_mask)
             return verify_fail(summary,
                                VerifyIssueCode::ConcurrentProtocolFailure,
                                function_index,
@@ -130,7 +158,7 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
     if (kPeerActions > (1u << 20))
         return verify_fail(summary, VerifyIssueCode::ConcurrentVerificationLimit, function_index);
     auto* actions = scratch.arena.alloc_array<verify::Action>(automaton.node_count * 2 +
-                                                              kBindingCount + kPeerActions);
+                                                              kBindingCount * 2 + kPeerActions);
     if (!actions)
         return verify_fail(summary, VerifyIssueCode::ConcurrentVerificationLimit, function_index);
     verify::Model model{};
@@ -170,13 +198,24 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
             submit.from = static_cast<u16>(i);
             submit.to = static_cast<u16>(automaton.node_count + binding_index);
             submit.set = binding->submit_set;
-            auto& complete = actions[model.action_count++];
-            complete.from = submit.to;
-            complete.to = static_cast<u16>(node.targets[0]);
-            complete.guard_set = binding->completion_set;
-            complete.clear = binding->completion_clear;
+            submit.assert_set = binding->submit_require_set;
+            submit.assert_clear = binding->submit_require_clear;
+            const u32 kArms = binding->arm_count ? binding->arm_count : 1;
+            for (u32 arm = 0; arm < kArms; ++arm) {
+                auto& complete = actions[model.action_count++];
+                complete.from = submit.to;
+                complete.to = static_cast<u16>(node.targets[0]);
+                complete.guard_set = binding->arm_count ? binding->arms[arm].completion_set
+                                                        : binding->completion_set;
+                complete.clear = binding->arm_count ? binding->arms[arm].completion_clear
+                                                    : binding->completion_clear;
+            }
             continue;
         }
+        if (environment && environment->require_all_yields_bound &&
+            node.kind == VerifyHandlerNodeKind::Yield)
+            return verify_fail(
+                summary, VerifyIssueCode::ConcurrentProtocolFailure, function_index, i);
         const u32 kCount = node.kind == VerifyHandlerNodeKind::Terminal ? 1 : node.target_count;
         for (u32 target = 0; target < kCount; ++target) {
             auto& action = actions[model.action_count++];
@@ -250,8 +289,8 @@ VerifyResult verify_handler_concurrency(const VerifyHandlerAutomaton& automaton,
                                    node.inst_index,
                                    kMask);
             verify::Limits protocol_limits = limits;
-            protocol_limits.states = limits.states < 2048 ? limits.states : 2048;
-            protocol_limits.edges = limits.edges < 16384 ? limits.edges : 16384;
+            protocol_limits.states = limits.states < 32768 ? limits.states : 32768;
+            protocol_limits.edges = limits.edges < 262144 ? limits.edges : 262144;
             const auto kRaces = verify::check(protocol.model, protocol_limits);
             if (!kRaces.ok) {
                 auto result = failure(kRaces, protocol.model, function_index, summary);

@@ -1,0 +1,8 @@
+// Same peer contract as receive-before-send.rut; publish the request first.
+upstream peer at "127.0.0.1:9000"
+route POST "/exchange" {
+    wait(upstream(peer).connect())
+    wait(upstream(peer).send(req.body))
+    wait(upstream(peer).recv())
+    return 204
+}

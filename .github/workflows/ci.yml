@@ -121,6 +121,9 @@ jobs:
           path: /tmp/wait-scheduler-tlc
           if-no-files-found: ignore
 
+      - name: Check synchronization design and required counterexamples
+        run: python3 scripts/check_synchronization_model.py --jar /tmp/tla2tools.jar
+
       - name: Cross-check native concurrency verifier with TLC
         run: |
           c++ -std=c++23 -O1 -fno-exceptions -fno-rtti -Iinclude -Itesting \

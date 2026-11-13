@@ -24,7 +24,9 @@ Step(i) ==
     /\ bits' = (bits \ a.remove) \union a.add
     /\ safe' = (safe /\ a.assertSet \subseteq bits /\ a.assertClear \intersect bits = {})
     \* An executed no-op still counts as scheduling its fairness group.
-    /\ tick' = ~tick
+    \* Only a no-op needs an observable scheduling tick. Toggling on real
+    \* transitions needlessly doubles acyclic ownership state spaces.
+    /\ tick' = IF pc' = pc /\ bits' = bits THEN ~tick ELSE tick
 
 Group(g) == \E i \in 1..Len(Actions): Actions[i].fair = g /\ Step(i)
 Work == \E i \in 1..Len(Actions): Step(i)

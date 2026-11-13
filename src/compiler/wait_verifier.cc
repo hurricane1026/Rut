@@ -10,6 +10,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
     for (u32 i = 0; i < 4; ++i) {
         out.win_actions[i] = kNoIndex;
         out.drain_actions[i] = kNoIndex;
+        out.cancel_ack_actions[i] = kNoIndex;
     }
     if (!first_arms || !second_arms || ((first_arms | second_arms) & ~u8{63})) return false;
     u32 counts[2]{};
@@ -24,6 +25,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
     const u32 kOperationCount = counts[0] + counts[1];
     const u64 kPending = (u64{1} << kOperationCount) - 1;
     const u64 kSlots = kPending << 4;
+    const u64 kCancels = kPending << 20;
     const u64 kWaiting = (u64{1} << 8) | (u64{1} << 9);
     const u64 kResumed = (u64{1} << 10) | (u64{1} << 11);
     const u16 kDraining = static_cast<u16>(kOperationCount + 4);
@@ -32,7 +34,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
     model.actors[0] = {static_cast<u16>(kDraining + 2), 0, static_cast<u16>(kDraining + 1)};
     model.actions = out.actions;
     model.invariants = out.invariants;
-    model.terminal_clear = kPending | kSlots | kWaiting;
+    model.terminal_clear = kPending | kSlots | kWaiting | kCancels;
     model.weak_fairness = kPending;
     out.operation_count = static_cast<u8>(kOperationCount);
 
@@ -53,6 +55,9 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             const u32 kOperation = kOperationBase + arm;
             const u64 kPendingBit = u64{1} << kOperation;
             const u64 kSlotBit = kPendingBit << 4;
+            const u64 kStartedBit = kPendingBit << 16;
+            const u64 kCancelBit = kPendingBit << 20;
+            const u64 kCancelIssuedBit = kPendingBit << 24;
             const u8 kActor = static_cast<u8>(kOperation + 1);
             model.actors[kActor] = {2, 0, 1};
             out.invariants[model.invariant_count++] = {kSlotBit, 0, kPendingBit, 0};
@@ -60,14 +65,14 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             Action submit{};
             submit.from = static_cast<u16>(kBase + arm);
             submit.to = static_cast<u16>(submit.from + 1);
-            submit.set = kPendingBit | kSlotBit;
+            submit.set = kPendingBit | kSlotBit | kStartedBit;
             submit.assert_clear = kPendingBit | kSlotBit | kWaiting | kClosed;
             (void)kAdd(submit);
 
             Action win{};
             win.actor = kActor;
             win.fairness = static_cast<u8>(kOperation);
-            win.to = 1;
+            win.to = 0;
             win.guard_set = kPendingBit | kSlotBit | kWaitingBit;
             win.assert_set = kWaitingBit | kSlotBit;
             win.assert_clear = kSeenBit | kClosed;
@@ -80,12 +85,37 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
             Action drain{};
             drain.actor = kActor;
             drain.fairness = static_cast<u8>(kOperation);
-            drain.to = 1;
+            drain.to = 0;
             drain.guard_set = kPendingBit;
             drain.guard_clear = kSlotBit;
             drain.clear = kPendingBit;
             drain.assert_clear = kSlotBit;
             out.drain_actions[kOperation] = kAdd(drain);
+
+            // A cancel owns a separate completion. Its acknowledgement can
+            // arrive before or after the target final completion; neither one
+            // permits reclaim while the other is outstanding. If the target
+            // already finished, no cancellation needs to be submitted.
+            Action cancel{};
+            cancel.actor = kActor;
+            cancel.guard_set = kPendingBit;
+            cancel.guard_clear = kSlotBit | kCancelIssuedBit;
+            cancel.set = kCancelBit | kCancelIssuedBit;
+            (void)kAdd(cancel);
+
+            Action acknowledge{};
+            acknowledge.actor = kActor;
+            acknowledge.fairness = static_cast<u8>(kOperation);
+            acknowledge.guard_set = kCancelBit;
+            acknowledge.clear = kCancelBit;
+            out.cancel_ack_actions[kOperation] = kAdd(acknowledge);
+
+            Action retire{};
+            retire.actor = kActor;
+            retire.to = 1;
+            retire.guard_set = kStartedBit;
+            retire.guard_clear = kPendingBit | kCancelBit;
+            (void)kAdd(retire);
 
             // Close/submit failure may occur before this operation is armed.
             for (u32 choice = 0; choice < 2; ++choice) {
@@ -93,7 +123,7 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
                 unused.actor = kActor;
                 unused.to = 1;
                 unused.guard_set = choice == 0 ? kClosed : kFinished;
-                unused.guard_clear = kPendingBit;
+                unused.guard_clear = kStartedBit;
                 (void)kAdd(unused);
             }
         }
@@ -126,8 +156,8 @@ bool build_wait_protocol_model(u8 first_arms, u8 second_arms, WaitProtocolModel&
     Action reclaim{};
     reclaim.from = kDraining;
     reclaim.to = static_cast<u16>(kDraining + 1);
-    reclaim.guard_clear = kPending;
-    reclaim.assert_clear = kPending | kSlots | kWaiting;
+    reclaim.guard_clear = kPending | kCancels;
+    reclaim.assert_clear = kPending | kSlots | kWaiting | kCancels;
     out.reclaim_action = kAdd(reclaim);
     out.invariants[model.invariant_count++] = {kClosed, 0, 0, kSlots | kWaiting};
     return true;
