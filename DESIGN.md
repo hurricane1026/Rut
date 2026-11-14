@@ -10994,3 +10994,26 @@ bounded I/O and lease ownership. Native fault and pinned Redis crash/recovery
 fixtures cover both backends and verified TLS. Local AOF recovery does not claim
 replica/failover linearizability, snapshot rollback prevention or cancellation
 of already-admitted work. See `docs/jwt-sessions.md` for deployment assumptions.
+
+### Keycloak access-token role authorization
+
+The free `keycloak` Rut module composes existing verified RS256 claims with
+Keycloak's documented default realm/client role layout. Realm and selected
+client roles are distinct exact namespaces; an explicit intersection requires
+both in the same verified document. Required policy is a compile/load snapshot,
+not request metadata. Client IDs are bounded to unambiguous ASCII JSON-pointer
+components; realm/resource/client containers must be objects and the complete
+selected nonempty string array is validated through the existing group helper.
+Invalid policy responds 503; missing/malformed/nonmatching role membership
+responds 403 after authentication. Role, azp and scope never substitute for issuer
+or audience. No new builtin, keyword, dependency, network call, mutable state or
+positive decision cache is introduced. Native two-shard tests cover both backends,
+O0/O2, HTTP/1+HTTP/2 and successive policy snapshots; live Keycloak/Casdoor and
+browser-session conformance are separate. See `docs/keycloak-roles.md`.
+
+The example additionally calls `keycloak.requireBearerAccessToken(document)`
+after RS256 validation: the signed payload `typ` must equal `Bearer` exactly.
+Missing, non-string, ID-token and refresh-token types receive a challenged 401,
+regardless of matching roles. This provider gate is separate from the JWS header
+`typ` policy, and neither gate replaces signature/issuer/audience/time checks.
+The role metadata helpers alone do not enforce token use.

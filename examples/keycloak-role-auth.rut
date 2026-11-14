@@ -1,0 +1,32 @@
+// RS256 resource-server profile, not an OIDC/browser login or token endpoint.
+// JWT_RS256_POLICY pins the realm issuer, resource audience and approved JWKS.
+// KEYCLOAK_CLIENT, KEYCLOAK_REALM_ROLE and KEYCLOAK_CLIENT_ROLE are trusted
+// compile/load-time configuration. Never derive them from request metadata.
+import "middleware/auth.rut"
+import "middleware/keycloak.rut"
+
+listen :8080
+
+route GET "/realm" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireRealmRole(access, env("KEYCLOAK_REALM_ROLE"))
+    return 204
+}
+
+route GET "/client" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireClientRole(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"))
+    return 204
+}
+
+route GET "/both" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireRealmAndClientRole(access, env("KEYCLOAK_REALM_ROLE"),
+        env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"))
+    return 204
+}
+
+route "/" { return 404 }

@@ -33,7 +33,7 @@ whether a competing open-source edition includes them.
 | Certificate-bound JWT | **Bounded RFC 8705 resource policy implemented** | Exact signed `cnf.x5t#S256` binding to the verified TLS client certificate, strict canonical encoding, native/JIT and two-backend HTTP/1 + HTTP/2 tests. See [the contract](mtls-bound-jwt.md). AS issuance, OAuth mTLS client authentication, refresh binding, DPoP and proxy certificate assertions remain outside this profile. |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
-| Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
+| Keycloak / Casdoor | Keycloak default access-token realm/client role adapter implemented | Verified RS256 resource policy with exact independent realm/client roles and explicit intersection; two-backend native HTTP/1 + HTTP/2 matrix. See [Keycloak roles](keycloak-roles.md). Live provider conformance, Casdoor, browser login and provider management remain separate. |
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
 | Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout, opt-in local-AOF durable revocation tombstones and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, distributed durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
 
@@ -1609,3 +1609,14 @@ Native protocol fault tests and pinned Redis SIGKILL/AOF recovery tests cover
 failure-closed behavior and TLS. The existing acknowledged-DEL logout remains
 available. See [the durability boundary](jwt-sessions.md#local-aof-durable-logout);
 replica/failover consensus and cancellation of admitted work remain outside it.
+
+### Keycloak role claim adapter
+
+The free `keycloak` Rut module maps the documented `realm_access.roles` and
+`resource_access[configured client].roles` layouts after existing RS256
+signature/issuer/audience/time verification. Realm/client roles remain separate;
+explicit intersection, whole-array validation, trusted bounded client lookup,
+default denial and policy replacement have native two-backend HTTP/1+HTTP/2
+fixtures. No external dependency or language surface is added. See
+[the supported contract](keycloak-roles.md); this is not live-provider or full
+OIDC/Casdoor conformance.
