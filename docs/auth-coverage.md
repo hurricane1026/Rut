@@ -29,7 +29,7 @@ whether a competing open-source edition includes them.
 | OIDC login / session | Pending | Discovery validation, authorization-code + PKCE, state/nonce, redirect validation, ID-token verification, secure cookies, logout and refresh |
 | Gateway OAuth2 endpoints | Pending | Authorization/token grants, client authentication, consent/redirect binding, code single use, token expiry/revocation and persistent state |
 | Upstream OAuth token | **Per-request client credentials and access-token exchange profiles implemented** | Fixed verified HTTPS token endpoint, configured Basic service credentials, default AS scope or explicit bounded configured scopes, a single configured HTTPS resource indicator, strict Bearer/expiry/scope response policy and explicit upstream Authorization replacement; two-backend native HTTP/1 + HTTP/2 evidence. See [the contract](upstream-oauth.md). Other URI schemes/multiple resources, provider-specific audience parameters, actor tokens/other token types, caching and refresh coordination remain outside these profiles. See [token exchange](oauth-token-exchange.md) for fixed access-token types and strict issued-token validation. |
-| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity, two-pin credential rotation and two-Consumer certificate mapping helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, CRL/OCSP and durable revocation |
+| mTLS identity | Inbound mandatory client certificate verification with startup CA bundle and optional bounded direct-issuer leaf CRL; verified SHA-256 fingerprint exposed to Rut/JIT/native requests; static pinned identity, two-pin credential rotation and two-Consumer certificate mapping helpers; epoll and io_uring HTTP/1 and HTTP/2 loopback tests; TLS 1.2/1.3 valid, absent, wrong-CA and expired certificate cases; ordinary TLS and cleartext spoof-header rejection; keepalive/reset, pin RCU update, bounded HTTP/2 refusal/retry, and source-unlinked native artifact evidence | Dynamic identity mapping, online CRL refresh/OCSP and distributed revocation |
 | Certificate-bound JWT | **Bounded RFC 8705 resource policy implemented** | Exact signed `cnf.x5t#S256` binding to the verified TLS client certificate, strict canonical encoding, native/JIT and two-backend HTTP/1 + HTTP/2 tests. See [the contract](mtls-bound-jwt.md). AS issuance, OAuth mTLS client authentication, refresh binding, DPoP and proxy certificate assertions remain outside this profile. |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
@@ -1295,7 +1295,8 @@ private key or system OpenSSL CLI dependency is introduced.
 
 Mapping is static until replacement config adoption, with existing RCU reader
 semantics. It adds no persistent Consumer registry, SAN mapping, automatic CA
-reload, CRL/OCSP or distributed revocation. See
+reload, online CRL refresh/OCSP or distributed revocation. Optional startup-static
+leaf CRLs are covered [separately](mtls-client-crl.md). See
 [mtls-consumers-auth.rut](../examples/mtls-consumers-auth.rut).
 
 ## Static mTLS pin rotation
@@ -1320,7 +1321,8 @@ are explicitly skipped.
 Rotation is an immutable route policy update. Existing RCU readers finish with
 the old snapshot, and all nodes must adopt the replacement policy for retirement
 to take effect. This neither changes the startup CA bundle nor implements CA
-reload, CRL/OCSP, automatic certificate renewal or durable distributed revocation.
+reload, online CRL refresh/OCSP, automatic certificate renewal or durable distributed revocation.
+The separate listener CRL profile is documented [here](mtls-client-crl.md).
 
 ## HS256 issuance with multiple permissions
 
@@ -1620,3 +1622,14 @@ default denial and policy replacement have native two-backend HTTP/1+HTTP/2
 fixtures. No external dependency or language surface is added. See
 [the supported contract](keycloak-roles.md); this is not live-provider or full
 OIDC/Casdoor conformance.
+
+### Inbound mTLS leaf CRL checking
+
+The free inbound mTLS profile supports `--tls-client-crl` with the existing
+client CA and server certificate/key flags. One bounded complete direct-issuer
+PEM CRL is loaded at startup; current lastUpdate/nextUpdate are mandatory and
+new handshakes enforce issuer/signature/serial/time checks before publishing
+client identity. Session resumption remains disabled. Local fixtures cover both
+backends, TLS1.2/1.3, HTTP1/2, malformed input, revocation and snapshot/keep-alive
+boundaries. See [the exact contract](mtls-client-crl.md). Online refresh, OCSP,
+intermediate revocation and cancellation of established connections remain open.

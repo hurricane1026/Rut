@@ -968,6 +968,7 @@ int main(int argc, char** argv) {
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* tls_client_ca_path = nullptr;
+    const char* tls_client_crl_path = nullptr;
     const char* config_path = nullptr;
     ListenerSpec source_listener{};
     bool source_listener_present = false;
@@ -997,6 +998,7 @@ int main(int argc, char** argv) {
     //                      [--shards N] [--no-pin] [--drain N]
     //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
+    //                      [--tls-client-crl PATH]
     //                      [--access-log PATH] [--access-log-compress]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
@@ -1165,6 +1167,13 @@ int main(int argc, char** argv) {
                 }
                 i++;
                 tls_client_ca_path = argv[i];
+            } else if (str_eq(argv[i], "--tls-client-crl")) {
+                if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--tls-client-crl requires a path argument\n");
+                    return 1;
+                }
+                i++;
+                tls_client_crl_path = argv[i];
             } else if (str_eq(argv[i], "--access-log-level")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--access-log-level requires a numeric argument\n");
@@ -1202,9 +1211,9 @@ int main(int argc, char** argv) {
             if (str_eq(argv[i], "--compile") || str_eq(argv[i], "--shards") ||
                 str_eq(argv[i], "--drain") || str_eq(argv[i], "--pool-prealloc") ||
                 str_eq(argv[i], "--tls-cert") || str_eq(argv[i], "--tls-key") ||
-                str_eq(argv[i], "--tls-client-ca") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt") ||
-                str_eq(argv[i], "--max-connections-per-shard")) {
+                str_eq(argv[i], "--tls-client-ca") || str_eq(argv[i], "--tls-client-crl") ||
+                str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level") ||
+                str_eq(argv[i], "--opt") || str_eq(argv[i], "--max-connections-per-shard")) {
                 if (str_eq(argv[i], "--max-connections-per-shard"))
                     write_str("--max-connections-per-shard capacity requires an argument\n");
                 else {
@@ -1225,7 +1234,8 @@ int main(int argc, char** argv) {
             write_str("eBPF plans require a .rut source program\n");
             return 1;
         }
-        if (tls_cert_path || tls_key_path || tls_client_ca_path || offer_h2) {
+        if (tls_cert_path || tls_key_path || tls_client_ca_path || tls_client_crl_path ||
+            offer_h2) {
             write_str(
                 "eBPF plan diagnostics use source listener metadata; TLS/h2 CLI options are "
                 "unsupported\n");
@@ -1278,10 +1288,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (tls_client_crl_path && !tls_client_ca_path) {
+        write_str("--tls-client-crl requires --tls-client-ca\n");
+        return 1;
+    }
+
     TlsServerContext* tls_server = nullptr;
     if (tls_cert_path && tls_key_path) {
-        auto tls_result =
-            create_tls_server_context(tls_cert_path, tls_key_path, offer_h2, tls_client_ca_path);
+        auto tls_result = create_tls_server_context(
+            tls_cert_path, tls_key_path, offer_h2, tls_client_ca_path, tls_client_crl_path);
         if (!tls_result) {
             write_error("Failed to initialize TLS", tls_result.error());
             return 1;
@@ -1289,6 +1304,7 @@ int main(int argc, char** argv) {
         tls_server = tls_result.value();
         write_str("TLS: enabled\n");
         if (tls_client_ca_path) write_str("TLS client certificate verification: required\n");
+        if (tls_client_crl_path) write_str("TLS client leaf CRL verification: required\n");
     }
 
     // Compile in a separate process and load native code/configuration.
