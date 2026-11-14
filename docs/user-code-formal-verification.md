@@ -638,6 +638,71 @@ successful detections. CI runs the TLC gate, native tests and mutations and
 preserves their diagnostic artifacts. These checks establish concrete evidence
 for the listed operations, not a full backend refinement proof.
 
+## Precise response-read timer ownership
+
+`spec/response_timer_owner.tla` expands the timer coverage to the precise
+response-read transport owner in `ConnectionBase` and `IoUringBackend`.
+Unlike the yield lifecycle abstraction, this model distinguishes the target
+completion from the cancel SQE's own completion. A separate ghost kernel ledger
+records which obligations were actually submitted; the implementation-side
+owner bits must equal that ledger after every transition.
+
+The model checks:
+
+- no owner is published when an arm or cancel cannot obtain an SQE;
+- target/cancel finals drain independently in either order, with no early clear;
+- stale generations and duplicate completions change neither owner nor storage;
+- `reset()` and attempted clear preserve the borrowed timespec and identity
+  until all obligations have drained;
+- reuse of the owner requires neutral storage, and generation exhaustion
+  refuses another arm instead of wrapping;
+- submitted owners eventually drain under explicit weak fairness for target
+  and cancel final completions independently. Cancellation submission failure
+  creates no cancel obligation; the natural target completion must still drain.
+
+Generation limits of 1, 2 and 3 exercise the exhaustion boundary and repeated
+arming. Each identity represents a fixed nonzero timespec/deadline/upstream
+key tuple; its storage must remain unchanged while borrowed. This finite model
+abstracts connection-wide pending-operation accounting, the complete wait-batch
+arbitration of response progress versus expiry, transport status/flag validation,
+request-policy admission, TLS output custody and the final slot reclaim gate.
+It is not an extraction of C++ or a proof about kernel delivery. In particular,
+`reset` is checked as an attempted state reset while storage remains borrowed;
+it does not authorize reclaiming that connection slot.
+
+The required suite has 13 TLC verdicts: three healthy models, eight safety
+mutants (generation wrap, premature publication, phantom cancel ownership,
+first-final clear, missing generation check, duplicate acceptance, borrowed
+storage reset and unguarded clear), and two liveness counterexamples obtained
+by removing target/cancel delivery fairness separately.
+
+```bash
+python3 scripts/check_response_timer_model.py --jar /path/to/tla2tools.jar \
+  --output-dir /tmp/response-timer-tlc
+cmake --build build --target test_response_timer_owner
+ctest --test-dir build -R '^test_response_timer_owner' --output-on-failure
+python3 scripts/check_response_timer_mutations.py --build-dir build \
+  --output-dir /tmp/response-timer-mutations
+```
+
+`test_response_timer_owner.cc` checks production arm/cancel SQE construction
+and `ConnectionBase` completion/reset/clear operations against an independent
+two-obligation oracle. It exhausts all 14,641 length-four operation sequences
+from each of three generation origins (zero, limit-minus-one, limit), then
+resets and drains the remaining owners. Tests use a four-entry in-memory SQ
+with full-SQ flushing disabled, so submission success/failure is deterministic
+and requires no kernel ring. SQE opcode, borrowed address, target/cancel token
+and submission counts are also checked. The native test uses the real 31-bit
+generation limit; TLC uses small limits to exercise exhaustion in a finite graph.
+
+Four isolated production-header mutations must fail native assertions: removing
+the generation fence, accepting a duplicate during CancelPending, clearing
+borrowed storage and allowing allocation at generation exhaustion. The runner
+is shared with the previous timer mutation gate and does not modify the source
+tree or build objects. TLC also reuses the existing fail-closed timer runner.
+Both gates are registered in CI with retained logs; normal CTest and `dev.sh test` run the native tests and manifest. A manifest checks source anchors only
+and is never reported as a TLC proof.
+
 ## TLA+ Role
 
 TLA+ should stay in the project for design-level runtime invariants and for

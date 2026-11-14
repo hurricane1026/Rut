@@ -147,6 +147,19 @@ jobs:
           path: /tmp/timer-tlc
           if-no-files-found: ignore
 
+      - name: Check response timer ownership and required counterexamples
+        run: |
+          python3 scripts/check_response_timer_model.py --jar /tmp/tla2tools.jar \
+            --output-dir /tmp/response-timer-tlc
+
+      - name: Preserve response timer ownership traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: response-timer-tlc
+          path: /tmp/response-timer-tlc
+          if-no-files-found: ignore
+
       - name: Check synchronization design and required counterexamples
         run: python3 scripts/check_synchronization_model.py --jar /tmp/tla2tools.jar
 
@@ -254,6 +267,20 @@ jobs:
         with:
           name: upstream-retirement-cpp-mutations
           path: /tmp/upstream-retirement-mutations
+          if-no-files-found: ignore
+
+      - name: Reject response timer ownership mutations
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          python3 scripts/check_response_timer_mutations.py --build-dir build \
+            --output-dir /tmp/response-timer-mutations
+
+      - name: Preserve response timer implementation counterexamples
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: response-timer-cpp-mutations
+          path: /tmp/response-timer-mutations
           if-no-files-found: ignore
 
       - name: Reject timer implementation mutations
