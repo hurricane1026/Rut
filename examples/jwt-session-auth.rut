@@ -49,6 +49,45 @@ func sessionWriteSucceeded(_ result: RedisSessionResult) -> bool {
     match result { .ok => true _ => false }
 }
 
+// Always write, including repeated logout and absent permits. A DEL returning
+// zero would not establish this connection's write offset for the AOF barrier.
+func sessionRevokeRequest(_ key: Bytes, _ expiry: Bytes) {
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let expiration = resp2BulkArgument(expiry, 8192) else { nil }
+    guard let prefix = concatBytes(b"*5\r\n$3\r\nSET\r\n", keyed, 8192) else { nil }
+    guard let arguments = concatBytes(prefix, b"$7\r\nrevoked\r\n$4\r\nEXAT\r\n", 8192) else { nil }
+    guard let write = concatBytes(arguments, expiration, 8192) else { nil }
+    concatBytes(write, b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192)
+}
+
+func sessionRevokeReply(_ frame: Bytes) -> RedisSessionResult {
+    guard let reply = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
+    guard let barrier = frame.slice(reply.next, frame.count) else { RedisSessionResult.replyFailure }
+    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    sessionWriteReply(reply, false)
+}
+
+func sessionRevokeExecute(_ connection: TcpConnection, _ request: Bytes) -> RedisSessionResult {
+    guard request.count > 0 else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    // Reuse the bounded scalar-plus-barrier reader: 128 bytes, four receives.
+    let reading = redisReplayDurableRead(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    sessionRevokeReply(frame)
+}
+
+func sessionRevokeDurable(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                         _ database: i32, _ key: Bytes, _ expiry: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let result = sessionRevokeExecute(connection, sessionRevokeRequest(key, expiry).or(b""))
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        result
+    } else { redisSessionFinish(connection, result) }
+}
+
 // Fresh registration is one atomic SET NX EXAT. Never publish a token on NX
 // refusal or before the shared authenticated session cleanup has succeeded.
 func sessionEnrollRequest(_ key: Bytes, _ expiry: Bytes) {
@@ -135,6 +174,23 @@ route POST "/logout" {
     let acknowledged = response(204)
     acknowledged.set("Cache-Control", "no-store")
     return acknowledged
+}
+
+// Opt-in Redis 7.2+ local-AOF revocation. Keep the tombstone only until the
+// verified token's original expiry; never trust a query/body-selected expiry.
+route POST "/logout-durable" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    guard let expiryValue = json.get(document, "/exp") else { return 503 }
+    guard let expiryText = json.encode(expiryValue) else { return 503 }
+    let database = parseInt(env("REDIS_DATABASE")).or(-1)
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = sessionRevokeDurable(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), database, key, Bytes(expiryText))
+    guard sessionWriteSucceeded(result) else { return 503 }
+    return response(204, headers: {"Cache-Control": "no-store"})
 }
 
 // Trusted issuer control-plane credential, distinct from the JWT signing key.

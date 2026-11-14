@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 
+from test_redis_commands import assert_ack_boundary
+
 KEY = "jwt-session-fixture-key-0123456789abcdefghijklmnopqrstuvwxyz"
 NAMESPACE = "rut:issuer:orders"
 ISSUE_KEY = "session-control-fixture-0123456789abcdefghijklmnopqrstuvwxyz"
@@ -139,11 +141,12 @@ class Peer:
                             reply = reply[4:]
                     elif command == b"SET":
                         assert user == "gateway" and database == 1
-                        assert len(arguments) == 6 and arguments[2:5] == [b"active", b"NX", b"EXAT"]
+                        revoking = len(arguments) == 5 and arguments[2:4] == [b"revoked", b"EXAT"]
+                        assert revoking or (len(arguments) == 6 and arguments[2:5] == [b"active", b"NX", b"EXAT"])
                         assert arguments[1].startswith(NAMESPACE.encode() + b":")
                         assert re.fullmatch(rb"[0-9a-f]{64}", arguments[1][-64:])
-                        assert re.fullmatch(rb"[1-9][0-9]*", arguments[5])
-                        expires = int(arguments[5])
+                        assert re.fullmatch(rb"[1-9][0-9]*", arguments[-1])
+                        expires = int(arguments[-1])
                         assert time.time() < expires <= time.time() + 301
                         if mode == "set-error":
                             reply = b"-ERR set fixture\r\n"
@@ -153,8 +156,8 @@ class Peer:
                             reply = b"$-1\r\n"
                         else:
                             with self.lock:
-                                assert arguments[1] not in self.store, "NX must not overwrite an existing permit"
-                                self.store[arguments[1]] = b"active"
+                                assert revoking or arguments[1] not in self.store, "NX must not overwrite an existing permit"
+                                self.store[arguments[1]] = b"revoked" if revoking else b"active"
                                 self.expiries[arguments[1]] = expires
                             reply = b"+OK\r\n"
                             if mode == "set-bulk":
@@ -174,6 +177,35 @@ class Peer:
                                 connection.sendall(reply[:1])
                                 time.sleep(.02)
                                 reply = reply[1:]
+                    elif command == b"WAITAOF":
+                        assert user == "gateway" and database == 1
+                        assert arguments == [b"WAITAOF", b"1", b"0", b"500"]
+                        assert_ack_boundary(connection, stream, "cleanup preceded AOF confirmation")
+                        reply = {
+                            "aof-error": b"-ERR AOF disabled\r\n",
+                            "aof-timeout": b"*2\r\n:0\r\n:0\r\n",
+                            "aof-type": b"*2\r\n$1\r\n1\r\n:0\r\n",
+                            "aof-local": b"*2\r\n:2\r\n:0\r\n",
+                            "aof-negative": b"*2\r\n:1\r\n:-1\r\n",
+                            "aof-overflow": b"*2\r\n:1\r\n:9223372036854775808\r\n",
+                            "aof-arity": b"*1\r\n:1\r\n",
+                            "aof-trailing": b"*2\r\n:1\r\n:0\r\n+OK\r\n",
+                            "aof-short": b"*2\r\n:1\r\n",
+                        }.get(mode, b"*2\r\n:1\r\n:0\r\n")
+                        if mode == "aof-eof":
+                            return
+                        if mode == "aof-hang":
+                            self.stop.wait(1.3)
+                            return
+                        if mode == "aof-fragmented":
+                            connection.sendall(reply[:4])
+                            time.sleep(.02)
+                            reply = reply[4:]
+                        if mode == "aof-delayed":
+                            self.stop.wait(.3)
+                        if mode == "aof-short":
+                            connection.sendall(reply)
+                            return
                     elif command == b"DEL":
                         assert user == "gateway" and database == 1
                         assert len(arguments) == 2 and arguments[1].startswith(NAMESPACE.encode() + b":")

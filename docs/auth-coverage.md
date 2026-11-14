@@ -35,7 +35,7 @@ whether a competing open-source edition includes them.
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Pending | Explicit supported OIDC/OAuth2 or provider protocols and conformance fixtures, role mapping and outage behavior |
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
-| Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
+| Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout, opt-in local-AOF durable revocation tombstones and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, distributed durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
 
 `auth.rotatingBasic` provides a static current/previous Basic credential window
 for one configured Consumer. Both slots are evaluated, current wins a tie, and
@@ -1599,3 +1599,13 @@ backends. Original request bytes and transparent forward are not rewritten.
 See [the precise input/redaction bounds](consumer-registry.md#explicit-query-and-form-credentials).
 JWKS initialization is all-or-nothing before refresh admission; native cold-path
 tests cover successful DNS/discovery, denied answers, timeout, cancel and recovery.
+
+### Single-instance durable session revocation
+
+The free online session profile exposes `POST /logout-durable`: verified exact-token
+`SET revoked EXAT <signed-exp>` plus same-connection `WAITAOF 1 0 500` and acknowledged
+cleanup. Repeated logout performs a new write without extending signed expiry.
+Native protocol fault tests and pinned Redis SIGKILL/AOF recovery tests cover
+failure-closed behavior and TLS. The existing acknowledged-DEL logout remains
+available. See [the durability boundary](jwt-sessions.md#local-aof-durable-logout);
+replica/failover consensus and cancellation of admitted work remain outside it.
