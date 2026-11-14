@@ -204,3 +204,5 @@ checks actual expiry times and the largest timestamps over TCP and verified TLS
 on both transport backends.
 
 See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
+
+See [bounded cache invalidation](client-invalidation.md) for multi-key deletion APIs and partial-write semantics.

@@ -735,3 +735,19 @@ func redisInfo(_ connection: TcpConnection, _ section: Bytes) -> RedisResult {
     let result = redisExecuteScalarWire(connection, request)
     redisResultFinish(connection, redisExpectDiagnosticBulk(result))
 }
+
+func redisDeletedCountValid(_ reply: RedisReply, _ expected: i32) -> bool {
+    guard let count = redisInteger(reply) else { false }
+    count > -1 && !(count > i64(expected))
+}
+func redisExpectDeletedCount(_ result: RedisResult, _ expected: i32) -> RedisResult {
+    match result {
+        .reply(reply) => if redisDeletedCountValid(reply, expected) { result } else { RedisResult.replyFailure }
+        _ => result
+    }
+}
+func redisDeleteKeys(_ connection: TcpConnection, _ keys: RedisKeys, _ mode: RedisDeleteMode) -> RedisResult {
+    guard let request = resp2DeleteKeysRequest(keys, mode) else { RedisResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    redisResultFinish(connection, redisExpectDeletedCount(result, keys.count))
+}

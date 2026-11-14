@@ -155,3 +155,25 @@ func resp2SetGetRequest(_ key: Bytes, _ value: Bytes, _ condition: RedisSetCondi
     guard let expiring = concatBytes(conditioned, expiration, 8192) else { nil }
     concatBytes(expiring, b"$3\r\nGET\r\n", 8192)
 }
+
+// Explicitly bounded keys for one DEL/UNLINK command. Redis keys are binary-safe
+// and may repeat; final execution revalidates the complete encoded request.
+struct RedisKeys { arguments: Bytes count: i32 }
+variant RedisDeleteMode { blocking lazy }
+func redisKeys() -> RedisKeys { RedisKeys(arguments: b"", count: 0) }
+func redisKeysAdd(_ keys: RedisKeys, _ key: Bytes) {
+    guard keys.count > -1 && keys.count < 8 else { nil }
+    guard let argument = resp2BulkArgument(key, 8192) else { nil }
+    guard let arguments = concatBytes(keys.arguments, argument, 8192) else { nil }
+    RedisKeys(arguments: arguments, count: keys.count + 1)
+}
+func resp2DeleteName(_ mode: RedisDeleteMode) -> Bytes {
+    match mode { .blocking => b"$3\r\nDEL\r\n"
+        .lazy => b"$6\r\nUNLINK\r\n" }
+}
+func resp2DeleteKeysRequest(_ keys: RedisKeys, _ mode: RedisDeleteMode) {
+    guard keys.count > 0 && keys.count < 9 else { nil }
+    guard let header = resp2DecimalLine(b"*", keys.count + 1, 8192) else { nil }
+    guard let named = concatBytes(header, resp2DeleteName(mode), 8192) else { nil }
+    concatBytes(named, keys.arguments, 8192)
+}

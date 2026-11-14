@@ -211,3 +211,5 @@ both backends. Memcached helper cases also cover CAS conflicts, TOUCH, GAT/GATS
 and multi-key expiry updates, including the largest supported timestamp.
 
 See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
+
+See [bounded cache invalidation](client-invalidation.md) for multi-key deletion APIs and partial-write semantics.

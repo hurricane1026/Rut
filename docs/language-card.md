@@ -3293,6 +3293,15 @@ STATS (general/settings/items/slabs), publishing at most 128 records only after
 END. Both retain 8192-byte frames and four fixed-deadline receives. They add no
 language or runtime operations. See [contracts and examples](client-diagnostics.md).
 
+## Bounded multi-key deletion
+
+Redis `redisKeys`/`redisKeysAdd` and `redisDeleteKeys` encode one DEL or UNLINK
+command for up to eight binary keys and validate the returned deletion count.
+The separate `clients/memcache-delete-batch.rut` library sends up to eight basic
+text delete commands and publishes ordered per-key outcomes only after all
+acknowledgements. Failures never trigger replay; Memcached batches are not atomic.
+Existing frame/I/O limits remain unchanged. See [cache invalidation](client-invalidation.md).
+
 ## Online HS256 JWT session permits
 
 Import `middleware/jwt_session.rut` alongside `clients/redis-client.rut`.

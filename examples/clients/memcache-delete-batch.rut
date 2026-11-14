@@ -1,0 +1,127 @@
+// A finite sequence of basic-text delete commands, not an atomic transaction.
+import "memcache-codec.rut"
+struct MemcacheDeleteBuild { offset: i32 count: i32 request: Bytes }
+struct MemcacheDeleteToken { kind: i32 next: i32 message: Bytes }
+struct MemcacheDeleteState { offset: i32 count: i32 expected: i32 kind: i32 message: Bytes }
+struct MemcacheDeleteStream { bytes: Bytes kind: i32 count: i32 message: Bytes }
+struct MemcacheDeleteBatchReply { frame: Bytes keys: MemcacheKeys }
+struct MemcacheDeleteItem { key: Bytes deleted: bool }
+variant MemcacheDeleteBatchResult {
+    reply(MemcacheDeleteBatchReply)
+    serverError(Bytes)
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheDeleteBuildStep(_ bytes: Bytes, _ state: MemcacheDeleteBuild) -> (MemcacheDeleteBuild, Bytes, bool) {
+    let end = bytes.find(b" ", state.offset).or(bytes.count)
+    guard let key = bytes.slice(state.offset, end) else { nil }
+    guard let named = concatBytes(b"delete ", key, 8192) else { nil }
+    guard let command = concatBytes(named, b"\r\n", 8192) else { nil }
+    guard let request = concatBytes(state.request, command, 8192) else { nil }
+    (MemcacheDeleteBuild(offset: end + 1, count: state.count + 1, request: request), request, end == bytes.count)
+}
+func memcacheDeleteBatchRequest(_ keys: MemcacheKeys) {
+    guard memcacheKeysValid(keys) else { nil }
+    let initial = MemcacheDeleteBuild(offset: 0, count: 0, request: b"")
+    guard let steps = collectBytes(keys.bytes, initial, 8, memcacheDeleteBuildStep) else { nil }
+    steps.get(steps.count - 1)
+}
+func memcacheDeleteToken(_ bytes: Bytes, _ offset: i32) -> MemcacheDeleteToken {
+    guard let end = bytes.find(b"\r\n", offset) else { MemcacheDeleteToken(kind: 0, next: offset, message: b"") }
+    guard let line = bytes.slice(offset, end) else { nil }
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { nil }
+    if line == b"DELETED" { MemcacheDeleteToken(kind: 1, next: end + 2, message: b"") } else {
+        if line == b"NOT_FOUND" { MemcacheDeleteToken(kind: 2, next: end + 2, message: b"") } else {
+            let status = memcacheExtendedStatus(line)
+            guard status.kind == 8 else { nil }
+            MemcacheDeleteToken(kind: 8, next: end + 2, message: status.data)
+        }
+    }
+}
+func memcacheDeleteStep(_ bytes: Bytes, _ state: MemcacheDeleteState) -> (MemcacheDeleteState, MemcacheDeleteState, bool) {
+    guard let token = memcacheDeleteToken(bytes, state.offset) else { nil }
+    if token.kind == 0 { (state, state, true) } else {
+        guard state.count < state.expected else { nil }
+        (MemcacheDeleteState(offset: token.next, count: state.count + 1,
+            expected: state.expected, kind: token.kind, message: token.message),
+         MemcacheDeleteState(offset: token.next, count: state.count + 1,
+            expected: state.expected, kind: token.kind, message: token.message),
+         token.kind == 8 || state.count + 1 == state.expected)
+    }
+}
+func memcacheDeleteScan(_ bytes: Bytes, _ count: i32) {
+    guard count > 0 && count < 9 && !(bytes.count > 8192) else { nil }
+    let initial = MemcacheDeleteState(offset: 0, count: 0, expected: count, kind: 0, message: b"")
+    collectBytes(bytes, initial, 9, memcacheDeleteStep)
+}
+func memcacheDeleteKind(_ state: MemcacheDeleteState, _ count: i32) -> i32 {
+    if state.kind == 8 { 8 } else { if state.count == count { 1 } else { 0 } }
+}
+func memcacheDeleteFeed(_ stream: MemcacheDeleteStream, _ chunk: Bytes, _ count: i32) {
+    guard stream.kind == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+    guard let steps = memcacheDeleteScan(bytes, count) else { nil }
+    guard let last = steps.get(steps.count - 1) else { nil }
+    guard last.kind == 8 || last.count != count || last.offset == bytes.count else { nil }
+    MemcacheDeleteStream(bytes: bytes, kind: memcacheDeleteKind(last, count), count: last.count, message: last.message)
+}
+func memcacheDeleteReceive(_ connection: TcpConnection, _ stream: MemcacheDeleteStream, _ count: i32) {
+    if stream.kind == 0 {
+        guard stream.bytes.count < 8192 else { nil }
+        let reading = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        memcacheDeleteFeed(stream, chunk, count)
+    } else { stream }
+}
+func memcacheDeleteReadPair(_ connection: TcpConnection, _ stream: MemcacheDeleteStream, _ count: i32) {
+    let firstReading = memcacheDeleteReceive(connection, stream, count)
+    guard let first = firstReading else { nil }
+    let secondReading = memcacheDeleteReceive(connection, first, count)
+    guard let second = secondReading else { nil }
+    second
+}
+func memcacheDeleteRead(_ connection: TcpConnection, _ count: i32) {
+    let initial = MemcacheDeleteStream(bytes: b"", kind: 0, count: 0, message: b"")
+    let firstReading = memcacheDeleteReadPair(connection, initial, count)
+    guard let first = firstReading else { nil }
+    let secondReading = memcacheDeleteReadPair(connection, first, count)
+    guard let stream = secondReading else { nil }
+    guard stream.kind > 0 else { nil }
+    stream
+}
+func memcacheDeleteReadFailure(_ code: i32) -> MemcacheDeleteBatchResult {
+    if code == 0 { MemcacheDeleteBatchResult.replyFailure } else { MemcacheDeleteBatchResult.transportFailure(code) }
+}
+func memcacheDeleteBatchWire(_ connection: TcpConnection, _ keys: MemcacheKeys) -> MemcacheDeleteBatchResult {
+    guard let request = memcacheDeleteBatchRequest(keys) else { MemcacheDeleteBatchResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheDeleteBatchResult.transportFailure(netError()) }
+    let reading = memcacheDeleteRead(connection, keys.count)
+    guard let stream = reading else { memcacheDeleteReadFailure(netError()) }
+    if stream.kind == 8 { MemcacheDeleteBatchResult.serverError(stream.message) } else {
+        MemcacheDeleteBatchResult.reply(MemcacheDeleteBatchReply(frame: stream.bytes, keys: keys))
+    }
+}
+func memcacheDeleteBatch(_ connection: TcpConnection, _ keys: MemcacheKeys) -> MemcacheDeleteBatchResult {
+    let result = memcacheDeleteBatchWire(connection, keys)
+    match result {
+        .reply(reply) => result
+        .requestFailure => result
+        _ => {
+            let closed = connection.close()
+            result
+        }
+    }
+}
+func memcacheDeleteItem(_ reply: MemcacheDeleteBatchReply, _ index: i32) {
+    guard memcacheKeysValid(reply.keys) && index > -1 && index < reply.keys.count else { nil }
+    guard let steps = memcacheDeleteScan(reply.frame, reply.keys.count) else { nil }
+    guard let last = steps.get(steps.count - 1) else { nil }
+    guard last.kind != 8 && last.count == reply.keys.count && last.offset == reply.frame.count else { nil }
+    guard let item = steps.get(index) else { nil }
+    guard item.kind == 1 || item.kind == 2 else { nil }
+    guard let key = memcacheKeyAt(reply.keys.bytes, index) else { nil }
+    MemcacheDeleteItem(key: key, deleted: item.kind == 1)
+}

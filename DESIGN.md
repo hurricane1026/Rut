@@ -11042,3 +11042,14 @@ collections; transport remains four fixed-deadline receives. Returned frames
 survive later I/O within an invocation. No diagnostics command reconnects or
 replays, and existing protocol-specific error/alias-close rules apply.
 See [client diagnostics](docs/client-diagnostics.md).
+
+### Finite multi-key cache invalidation
+
+Ordinary source helpers encode one Redis DEL/UNLINK for up to eight binary keys,
+revalidate the complete command before I/O and require an integer in the request's
+key-count range. Memcached composes up to eight ordered basic-text delete commands,
+publishing per-key outcomes only after complete acknowledgement of the batch.
+Public builders and accessors are revalidated. A partial write or reply is not
+proof that no deletion occurred, and no failure automatically replays a batch.
+The source library keeps the existing 8192-byte and four-receive transport profile.
+See [cache invalidation](docs/client-invalidation.md).
