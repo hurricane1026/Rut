@@ -49,28 +49,35 @@ def main() -> int:
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
-    build = args.build_dir.resolve()
+    run_implementation_mutations(args.build_dir, args.output_dir, "test_timer_model", MUTATIONS,
+                                 {"wheel_off_by_one": ["--filter=wheel_deadline_boundary_smoke"]})
+    return 0
+
+
+def run_implementation_mutations(build: Path, output_dir: Path | None, target: str,
+                                 mutations: dict, filters: dict | None = None) -> None:
+    build = build.resolve()
     ninja = shutil.which("ninja") or shutil.which("ninja-build")
     if not ninja:
-        parser.error("the configured Ninja build is required")
-    baseline = subprocess.run([str(build / "tests/test_timer_model")], capture_output=True, text=True, timeout=60)
+        raise RuntimeError("the configured Ninja build is required")
+    baseline = subprocess.run([str(build / f"tests/{target}")], capture_output=True, text=True, timeout=60)
     if baseline.returncode or not re.search(r"\b[1-9][0-9]* passed, 0 failed", baseline.stdout):
         raise RuntimeError(f"baseline timer tests failed\n{baseline.stdout}{baseline.stderr}")
     entries = json.loads((build / "compile_commands.json").read_text())
-    entry = next(e for e in entries if Path(e["file"]).resolve() == ROOT / "tests/test_timer_model.cc")
+    entry = next(e for e in entries if Path(e["file"]).resolve() == ROOT / f"tests/{target}.cc")
     compile_base = entry.get("arguments") or shlex.split(entry["command"])
-    commands = subprocess.check_output([ninja, "-C", str(build), "-t", "commands", "test_timer_model"], text=True)
-    link_line = next(line for line in commands.splitlines() if " -o tests/test_timer_model " in line)
+    commands = subprocess.check_output([ninja, "-C", str(build), "-t", "commands", target], text=True)
+    link_line = next(line for line in commands.splitlines() if f" -o tests/{target} " in line)
     link_base = shlex.split(link_line)
     # CMake's Ninja link rule wraps one compiler invocation with ': && ... && :'.
     if link_base[:2] != [":", "&&"] or link_base[-2:] != ["&&", ":"]:
         raise RuntimeError("unrecognized CMake/Ninja link wrapper")
     link_base = link_base[2:-2]
-    if args.output_dir:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="rut-timer-mutations-") as directory:
         work = Path(directory)
-        for name, (relative, old, new) in MUTATIONS.items():
+        for name, (relative, old, new) in mutations.items():
             original = (ROOT / "include" / relative).read_text()
             if original.count(old) != 1:
                 raise RuntimeError(f"mutation drift: {name}: expected exactly one source match")
@@ -90,22 +97,21 @@ def main() -> int:
             if compiled.returncode:
                 raise RuntimeError(f"{name}: mutant did not compile\n{compiled.stdout}{compiled.stderr}")
             link = list(link_base)
-            object_index = next(i for i, x in enumerate(link) if x.endswith("test_timer_model.cc.o"))
+            object_index = next(i for i, x in enumerate(link) if x.endswith(f"{target}.cc.o"))
             link[object_index] = str(obj)
             link[link.index("-o") + 1] = str(executable)
             link = [f"--dependency-file={overlay / 'link.d'}" if x.startswith("--dependency-file=") else x for x in link]
             linked = subprocess.run(link, cwd=build, capture_output=True, text=True, timeout=60)
             if linked.returncode:
                 raise RuntimeError(f"{name}: mutant did not link\n{linked.stdout}{linked.stderr}")
-            filters = ["--filter=wheel_deadline_boundary_smoke"] if name == "wheel_off_by_one" else []
-            result = subprocess.run([str(executable), *filters], capture_output=True, text=True, timeout=60)
+            arguments = (filters or {}).get(name, [])
+            result = subprocess.run([str(executable), *arguments], capture_output=True, text=True, timeout=60)
             output = result.stdout + result.stderr
-            if args.output_dir:
-                (args.output_dir / f"{name}.log").write_text(output)
+            if output_dir:
+                (output_dir / f"{name}.log").write_text(output)
             if result.returncode <= 0 or not re.search(r"\b[1-9][0-9]* failed", output):
                 raise RuntimeError(f"{name}: expected test assertions, not success/crash\n{output}")
             print(f"PASS {name}: concrete C++ tests rejected the mutant", flush=True)
-    return 0
 
 
 if __name__ == "__main__":

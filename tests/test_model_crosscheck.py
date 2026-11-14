@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_concurrency_model import check_reference_case
 from check_upstream_retirement_model import classify as retirement_verdict
+from check_response_timer_model import CASES as RESPONSE_TIMER_CASES
 from check_timer_model import classify as timer_verdict, run_case as timer_case, CASES as TIMER_CASES
 
 
@@ -134,6 +135,17 @@ class TimerVerdicts(unittest.TestCase):
                 (150, "Parsing or semantic analysis failed", "error")):
             with self.subTest(code=code, output=output):
                 self.assertEqual(timer_verdict(code, output), expected)
+
+    def test_response_owner_uses_shared_fail_closed_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with patch("check_timer_model.subprocess.run", return_value=
+                       tlc("Invariant Safety is violated. State 1:", 12)):
+                with self.assertRaisesRegex(RuntimeError, "expected=success, actual=safety"):
+                    timer_case(Path("/jar"), work, RESPONSE_TIMER_CASES[0])
+            self.assertIn("Limit = 1", (work / "instance.cfg").read_text())
+            self.assertTrue((work / "response_timer_owner.tla").exists())
+            self.assertIn("State 1:", (work / "tlc.log").read_text())
 
     def test_timeout_preserves_diagnostic_and_fails(self):
         with tempfile.TemporaryDirectory() as directory:
