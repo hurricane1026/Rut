@@ -50,12 +50,19 @@ def status(block):
     return int(digits)
 
 
-def request(port, path, fields, body=b'', method='GET'):
+def request(port, path, fields, body=b'', method='GET', tls_context=None):
     headers = bytes((0x82 if method == 'GET' else 0x83, 0x86, 0x04)) + string(path)
     headers += b'\x01' + string('localhost')
     for name, value in [*fields, ('content-length', str(len(body)))]:
         headers += b'\x00' + string(name.lower()) + string(value)
-    with socket.create_connection(('127.0.0.1', port), timeout=8) as connection:
+    transport = socket.create_connection(('127.0.0.1', port), timeout=8)
+    if tls_context is not None:
+        try:
+            transport = tls_context.wrap_socket(transport, server_hostname='localhost')
+        except BaseException:
+            transport.close()
+            raise
+    with transport as connection:
         connection.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) +
                            frame(1, 4 if body else 5, 1, headers) +
                            (frame(0, 1, 1, body) if body else b''))

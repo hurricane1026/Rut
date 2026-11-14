@@ -600,8 +600,11 @@ missing/mismatched certificate and 503 for invalid pin configuration. The CA
 file is read at listener startup; replacing
 it requires listener restart. Route pin changes take effect for the next
 request while the connection fingerprint remains fixed. Session resumption,
-tickets and renegotiation are disabled for this profile. CRL/OCSP, SAN mapping
-and durable revocation are not provided. See
+tickets and renegotiation are disabled for this profile. Optional
+`--tls-client-crl PATH` adds a startup-static complete direct-issuer leaf CRL,
+with mandatory current lastUpdate/nextUpdate, bounded input and fail-closed new
+handshakes. See [the CRL contract](mtls-client-crl.md). Online refresh, OCSP,
+SAN mapping and immediate established-connection revocation remain separate. See
 [`mtls-pinned-auth.rut`](../examples/mtls-pinned-auth.rut).
 
 `auth.rotatingPinnedMtlsIdentity(currentPin, previousPin, consumerId, currentId,

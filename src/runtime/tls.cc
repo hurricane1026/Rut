@@ -1,15 +1,23 @@
 #include "rut/runtime/tls.h"
 
 #include "core/expected.h"
+#include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/platform/socket.h"
+#include "rut/runtime/error.h"
 #include "tls_internal.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
+#include <openssl/pem.h>
+#include <openssl/prov_ssl.h>
+#include <openssl/safestack.h>
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
 #include <openssl/types.h>
@@ -18,11 +26,81 @@
 #include <openssl/x509v3.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace rut {
 
 namespace {
+
+// Cold startup only: one complete direct-issuer PEM CRL, at most 64 KiB.
+// Import CRLs explicitly so this file can never add a trusted CA certificate.
+// The store owns its reference; no BIO/file/input views outlive this function.
+bool load_client_crl(SSL_CTX* ctx, const char* path) {
+    if (!path || path[0] == '\0') return false;
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    if (!store) return false;
+    // A certificate-only CA bundle keeps this explicit CRL authoritative.
+    // Do not let another CRL imported by the CA loader compete with it.
+    const STACK_OF(X509_OBJECT)* objects = X509_STORE_get0_objects(store);
+    for (int i = 0; i < sk_X509_OBJECT_num(objects); ++i)
+        if (X509_OBJECT_get_type(sk_X509_OBJECT_value(objects, i)) == X509_LU_CRL) return false;
+    const int kFd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (kFd < 0) return false;
+    struct stat info{};
+    if (fstat(kFd, &info) != 0 || !S_ISREG(info.st_mode)) {
+        close(kFd);
+        return false;
+    }
+    char pem[65536];
+    u32 length = 0;
+    bool ok = true;
+    while (length < sizeof(pem)) {
+        const ssize_t kRead = read(kFd, pem + length, sizeof(pem) - length);
+        if (kRead < 0 && errno == EINTR) continue;
+        if (kRead < 0) ok = false;
+        if (kRead <= 0) break;
+        length += static_cast<u32>(kRead);
+    }
+    char extra;
+    ssize_t remaining;
+    do {
+        remaining = read(kFd, &extra, 1);
+    } while (remaining < 0 && errno == EINTR);
+    close(kFd);
+    constexpr char kBegin[] = "-----BEGIN X509 CRL-----";
+    if (!ok || remaining != 0 || length < sizeof(kBegin) - 1 ||
+        memcmp(pem, kBegin, sizeof(kBegin) - 1) != 0)
+        return false;
+    BIO* input = BIO_new_mem_buf(pem, static_cast<int>(length));
+    if (!input) return false;
+    BIO_set_mem_eof_return(input, 0);
+    X509_CRL* crl = PEM_read_bio_X509_CRL(input, nullptr, nullptr, nullptr);
+    ok = crl != nullptr;
+    char tail[256];
+    int count;
+    while ((count = BIO_read(input, tail, sizeof(tail))) > 0) {
+        for (int i = 0; i < count; ++i)
+            if (tail[i] != ' ' && tail[i] != '\t' && tail[i] != '\r' && tail[i] != '\n') ok = false;
+    }
+    BIO_free(input);
+    ok = ok && count == 0;
+    if (ok) {
+        const ASN1_TIME* last = X509_CRL_get0_lastUpdate(crl);
+        const ASN1_TIME* next = X509_CRL_get0_nextUpdate(crl);
+        ok = last && next && X509_cmp_current_time(last) < 0 && X509_cmp_current_time(next) > 0 &&
+             X509_CRL_get_ext_by_NID(crl, NID_delta_crl, -1) < 0 &&
+             X509_CRL_get_ext_by_NID(crl, NID_issuing_distribution_point, -1) < 0;
+    }
+    if (ok) {
+        ok = X509_STORE_add_crl(store, crl) == 1 &&
+             X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK) == 1;
+    }
+    X509_CRL_free(crl);
+    return ok;
+}
 
 // The standard socket BIO writes with write(2), which raises SIGPIPE when the
 // peer has already closed. This BIO sends with platform::kSendFlags
@@ -175,7 +253,10 @@ bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& o
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
                                                                    const char* key_path,
                                                                    bool offer_h2,
-                                                                   const char* client_ca_path) {
+                                                                   const char* client_ca_path,
+                                                                   const char* client_crl_path) {
+    if (client_crl_path && !client_ca_path)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 
@@ -220,7 +301,8 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
     const bool kRequireClientCertificate = client_ca_path != nullptr;
     if (kRequireClientCertificate) {
         if (client_ca_path[0] == '\0' ||
-            SSL_CTX_load_verify_locations(ssl_ctx, client_ca_path, nullptr) != 1) {
+            SSL_CTX_load_verify_locations(ssl_ctx, client_ca_path, nullptr) != 1 ||
+            (client_crl_path && !load_client_crl(ssl_ctx, client_crl_path))) {
             SSL_CTX_free(ssl_ctx);
             BIO_meth_free(bridge_bio_method);
             BIO_meth_free(socket_bio_method);

@@ -695,6 +695,26 @@ configure_file(
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/fixtures/mtls_second_cert.pem
     ${RUT_TLS_TESTDATA_DIR}/mtls_second_cert.pem COPYONLY)
 
+add_executable(mtls_crl_fixture mtls_crl_fixture.cc)
+target_link_libraries(mtls_crl_fixture rut_runtime)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME test_mtls_client_crl_context
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_client_crl_context.py
+            --helper $<TARGET_FILE:mtls_crl_fixture> --testdata ${RUT_TLS_TESTDATA_DIR})
+    set_tests_properties(test_mtls_client_crl_context PROPERTIES LABELS "unit;auth;tls" TIMEOUT 30)
+endif()
+if(Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(crl_backend epoll io_uring)
+        add_test(NAME test_mtls_client_crl_${crl_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_client_crl.py
+                --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:mtls_crl_fixture>
+                --source ${PROJECT_SOURCE_DIR}/examples/mtls-consumers-auth.rut
+                --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${crl_backend})
+        set_tests_properties(test_mtls_client_crl_${crl_backend} PROPERTIES
+            LABELS "integration;auth;tls" TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
+
 add_custom_target(test_tls_fixtures DEPENDS ${RUT_TLS_TEST_CERT} ${RUT_TLS_TEST_KEY})
 target_compile_definitions(test_network PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
 add_dependencies(test_network test_tls_fixtures)

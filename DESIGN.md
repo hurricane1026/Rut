@@ -9379,8 +9379,13 @@ This follows [RFC 9110 §15.5.4](https://www.rfc-editor.org/rfc/rfc9110.html#sec
 Pin rotation follows route configuration RCU and
 applies to the next request; an established connection retains the certificate
 fingerprint captured at its handshake. Replacing the listener CA requires
-restarting the listener. This profile does not provide CRL/OCSP, dynamic
-certificate-to-identity mapping, or durable revocation. See
+restarting the listener. Optional `--tls-client-crl PATH` adds one bounded,
+startup-static direct-issuer full leaf CRL with mandatory current time bounds.
+Only CRLs are imported, CA-bundle CRLs cannot compete with the explicit CRL,
+and new handshakes fail closed on revocation, unsuitable issuer/signature or
+expiry. Existing connections retain their handshake identity. Online refresh,
+OCSP, intermediate revocation, dynamic mapping and immediate established-session
+revocation remain separate; see `docs/mtls-client-crl.md`. See
 [`mtls-pinned-auth.rut`](examples/mtls-pinned-auth.rut). OpenSSL verification
 and session options follow the [verify API](https://docs.openssl.org/3.5/man3/SSL_CTX_set_verify/)
 and [context options](https://docs.openssl.org/3.5/man3/SSL_CTX_set_options/).

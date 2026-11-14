@@ -54,13 +54,17 @@ bool configure_tls_client_ssl(SSL* ssl, const char* server_name, bool http2 = tr
 bool tls_client_peer_valid(SSL* ssl, bool http2 = true);
 bool tls_handshake_finished(SSL* ssl);
 
+// Optional client_crl_path requires client_ca_path. Loads one current direct-issuer
+// full PEM leaf CRL (<=64 KiB) at startup; failure prevents context publication.
+// CRL signature/issuer/serial/time validation occurs in each new full handshake.
 // offer_h2: advertise HTTP/2 over ALPN. Leave false until the HTTP/2 data
 // path is wired, otherwise an h2 client would be handed to the HTTP/1 parser.
 core::Expected<TlsServerContext*, Error> create_tls_server_context(
     const char* cert_path,
     const char* key_path,
     bool offer_h2 = false,
-    const char* client_ca_path = nullptr);
+    const char* client_ca_path = nullptr,
+    const char* client_crl_path = nullptr);
 void destroy_tls_server_context(TlsServerContext* ctx);
 core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd);
 void destroy_tls_server_ssl(SSL* ssl);
