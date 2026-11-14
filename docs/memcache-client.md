@@ -209,3 +209,5 @@ bounds, invalid requests before I/O, and EOF/timeout without mutation replay.
 Pinned real Redis and Memcached tests verify actual expiration over TCP/TLS on
 both backends. Memcached helper cases also cover CAS conflicts, TOUCH, GAT/GATS
 and multi-key expiry updates, including the largest supported timestamp.
+
+See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.

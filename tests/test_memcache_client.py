@@ -356,10 +356,10 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 @contextlib.contextmanager
-def gateway(args, endpoint, program_factory=None):
+def gateway(args, endpoint, program_factory=None, extra_libraries=(), entrypoint="memcache-client.rut"):
     with tempfile.TemporaryDirectory(prefix='rut-memcache-') as directory:
         root = Path(directory)
-        for name in ('memcache-codec.rut', 'memcache-client.rut'):
+        for name in ('memcache-codec.rut', 'memcache-client.rut', *extra_libraries):
             shutil.copyfile(Path(args.library) / name, root / name)
         if program_factory is not None:
             program = program_factory()
@@ -369,8 +369,8 @@ def gateway(args, endpoint, program_factory=None):
         else:
             program = PROGRAM
         if args.opt == '2':
-            program = program.replace('import "memcache-client.rut"',
-                                      'import * as client from "memcache-client.rut"')
+            program = program.replace('import "' + entrypoint + '"',
+                                      'import * as client from "' + entrypoint + '"')
             names = set()
             for path in root.glob('*.rut'):
                 names.update(re.findall(r'^(?:func|struct|variant) (\w+)', path.read_text(), re.M))

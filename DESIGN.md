@@ -11031,3 +11031,14 @@ Missing, non-string, ID-token and refresh-token types receive a challenged 401,
 regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
+
+### Bounded client diagnostics
+
+Redis PING/ECHO/INFO compose the existing scalar RESP2 executor with expected
+reply validation. Memcached VERSION/STATS use a separate ordinary source codec,
+retain unknown fields as Bytes and publish only complete END-terminated reports.
+STATS bounds are 128 records and 8192 bytes, scanned in two sequential 64-step
+collections; transport remains four fixed-deadline receives. Returned frames
+survive later I/O within an invocation. No diagnostics command reconnects or
+replays, and existing protocol-specific error/alias-close rules apply.
+See [client diagnostics](docs/client-diagnostics.md).

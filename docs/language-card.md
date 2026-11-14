@@ -3285,6 +3285,14 @@ supports EXAT/PXAT via validated decimal Bytes, including timestamps beyond i32.
 See [Redis SET options](redis-commands.md) and
 [Memcache options, TTL limits and examples](memcache-client.md).
 
+## Client diagnostics
+
+Redis `redisPing`, `redisEcho` and `redisInfo` reuse the scalar RESP2 executor.
+The separate `clients/memcache-info.rut` library provides VERSION and bounded
+STATS (general/settings/items/slabs), publishing at most 128 records only after
+END. Both retain 8192-byte frames and four fixed-deadline receives. They add no
+language or runtime operations. See [contracts and examples](client-diagnostics.md).
+
 ## Online HS256 JWT session permits
 
 Import `middleware/jwt_session.rut` alongside `clients/redis-client.rut`.

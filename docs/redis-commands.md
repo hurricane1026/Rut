@@ -202,3 +202,5 @@ boundaries, all NX/XX/GET combinations, exact request-size bounds, invalid
 requests before I/O and EOF/timeout without write replay. Pinned Redis 7.2.11
 checks actual expiry times and the largest timestamps over TCP and verified TLS
 on both transport backends.
+
+See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
