@@ -4249,6 +4249,16 @@ tests connect these scenarios to dispatch; this is not a refinement proof.
 The model scope and commands are documented in
 [formal verification](docs/user-code-formal-verification.md#io_uring-upstream-retirement).
 
+Timer verification has separate bounded models in `spec/timer_wheel.tla`
+and `spec/yield_timer.tla`: tick-index deadlines, refresh/remove, wraparound,
+I/O/timer winners, stale completion isolation, close and slot reuse, with
+explicit clock/completion fairness. Deterministic C++ deadline oracles and
+implementation mutations check the production wheel, heap, epoll disarm and
+uring stale-completion flags. Heap removal compacts entries before rebuilding
+in O(n), so sifting cannot move another matching entry behind the scan.
+This is bounded evidence rather than kernel or wall-clock verification; see
+`docs/user-code-formal-verification.md` for assumptions and excluded policies.
+
 Compiler verification and offline TLC exports share
 `build_handler_protocol_model`, so source/peer reference cases no longer need
 a separately hand-copied handler. The exporter follows actual RIR control and

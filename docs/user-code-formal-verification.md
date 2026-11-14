@@ -570,6 +570,74 @@ The bad model reaches two states: `Connect / WaitRequest`, then
 model explores eight reachable states with no error. Concrete runtime timeout,
 transport failure and disconnect behavior are outside this deadlock contract.
 
+## Timer verification
+
+`spec/timer_wheel.tla` checks two timer owners with bounded add/refresh/remove
+activity, zero/one/last-slot offsets, and wraparound at 4 and 64 slots. The
+reference deadline is an absolute **tick index**: production `tick()` drains
+`cursor` before incrementing it, so `add(5)` expires on the sixth call to
+`tick()`, and `add(0)` on the next call. This is not a wall-clock precision
+claim. The API precondition is that `add` receives an unlinked node; `refresh`
+may replace an existing arming. Delays are restricted to `[0, Slots - 1]`:
+longer delays are not supported by the wheel and must be rejected by fallback
+callers. Under fair ticking, finite API activity eventually leaves no timers.
+
+`spec/yield_timer.tla` separately checks two wait identities, I/O versus timer
+wins, disarm, close, successor waits, and slot reuse. The heap abstraction
+removes entries synchronously; the uring abstraction retains a target token
+until its final completion and prevents closed-slot reuse while it remains.
+Old completions must neither resume nor disarm the successor. Clock advancement
+and final-completion delivery are explicit weak-fairness assumptions. One
+wait has at most one winner, and outstanding waits eventually settle.
+
+These are bounded reference models, not models generated from the backend
+code. In particular, the uring model abstracts cancel-submission failure and
+cancel-ack bookkeeping, assumes one final completion per submitted target,
+and uses non-wrapping logical identities. It does not prove the kernel,
+32-bit generation exhaustion, physical timer accuracy, callback latency,
+arbitrary callback mutations of timer lists, or every application-specific
+timeout policy (HTTP/2, gRPC, response-read deadlines, WebSocket shutdown and
+throttle). Source manifests detect drift only; they do not prove refinement.
+
+Run all 16 required TLC verdicts (four healthy configurations and twelve
+required safety/liveness counterexamples):
+
+```bash
+python3 scripts/check_timer_model.py --jar /path/to/tla2tools.jar --output-dir /tmp/timer-tlc
+```
+
+The mutations include off-by-one expiry, a refresh retaining its old bucket,
+failed removal, early completion, I/O failing to disarm, missing generation
+checks, stale completions disarming a successor, and premature slot reuse.
+Removing ticking/clock fairness must also produce a liveness counterexample.
+Parser errors, missing traces, wrong exit status, crashes and timeouts fail
+closed; generated configs, models and TLC output are retained for diagnosis.
+`--check-only` validates the manifest without claiming to run TLC.
+
+Concrete evidence is supplied by `tests/test_timer_model.cc`: all 6,561
+length-four wheel operation sequences at each of three origins (including
+slot wrap and `u32` cursor wrap) are checked against an independent absolute
+deadline oracle, followed by a complete drain. A heap oracle checks 256
+equal-deadline/removal patterns; production epoll disarm and uring stale/current
+completion dispatch are exercised without requiring a kernel ring. The heap
+oracle found a real multiple-entry removal bug: sifting while scanning could
+move a matching tail entry into an already-scanned prefix. Both epoll and
+kqueue now compact first, then rebuild the heap in O(n). Linux tests execute
+the epoll implementation; the corresponding kqueue change needs macOS testing.
+
+```bash
+cmake --build build --target test_timer_model
+ctest --test-dir build -R '^test_timer_model' --output-on-failure
+python3 scripts/check_timer_mutations.py --build-dir build --output-dir /tmp/timer-mutations
+```
+
+The implementation mutation gate must reject a wheel tick offset, restoration
+of the original heap removal algorithm, and stale uring completions clearing
+the successor's armed flags. Compile failures or crashes are not accepted as
+successful detections. CI runs the TLC gate, native tests and mutations and
+preserves their diagnostic artifacts. These checks establish concrete evidence
+for the listed operations, not a full backend refinement proof.
+
 ## TLA+ Role
 
 TLA+ should stay in the project for design-level runtime invariants and for
