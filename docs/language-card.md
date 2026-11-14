@@ -3302,6 +3302,14 @@ text delete commands and publishes ordered per-key outcomes only after all
 acknowledgements. Failures never trigger replay; Memcached batches are not atomic.
 Existing frame/I/O limits remain unchanged. See [cache invalidation](client-invalidation.md).
 
+## Authenticated client handshakes
+
+`redisHello3Auth` adds AUTH and optional SETNAME to strict RESP3 negotiation.
+`clients/memcache-auth.rut` validates a fresh `-Y` challenge before sending its
+credential payload. Its GET/SET session helpers always close after use and never
+pool authenticated state. Existing framing/I/O bounds and no-replay behavior
+remain unchanged. See [authenticated clients](client-authentication.md).
+
 ## Online HS256 JWT session permits
 
 Import `middleware/jwt_session.rut` alongside `clients/redis-client.rut`.

@@ -11053,3 +11053,15 @@ Public builders and accessors are revalidated. A partial write or reply is not
 proof that no deletion occurred, and no failure automatically replays a batch.
 The source library keeps the existing 8192-byte and four-receive transport profile.
 See [cache invalidation](docs/client-invalidation.md).
+
+### Authenticated RESP3 and Memcached text sessions
+
+RESP3 HELLO authentication composes binary-safe AUTH/SETNAME arguments with the
+existing strict map/proto validation, closing on any failed negotiation without
+fallback. Memcached text-token authentication requires the exact fresh `-Y`
+challenge before sending a fake SET credential payload, so ordinary cache
+endpoints are not sent that payload. Close-after-use GET/SET helpers keep
+identity out of generic pools, retain typed failure stages, validate business
+requests before credentials and never replay an uncertain write. All helpers
+use existing source/TCP/TLS facilities and remain within existing frame,
+receive and sixteen-operation budgets. See [client authentication](docs/client-authentication.md).

@@ -119,8 +119,9 @@ The [executable example](../examples/memcache-client.rut) uses
 ```
 
 Verified TLS uses the unchanged `tls`, `caFile` and `serverName` policy fields.
-Use a dedicated policy for this unauthenticated basic-text profile. Text-token
-authentication (`-Y`), binary/SASL, meta commands, pipelining, UDP, failover and
+Use a dedicated policy for this unauthenticated basic-text profile. The separate
+[authentication library](client-authentication.md) adds challenge-gated `-Y` text
+sessions. Binary/SASL, meta commands, arbitrary pipelining, UDP, failover and
 background sessions are not provided. It is not an implementation of a
 distributed Cache backend.
 
