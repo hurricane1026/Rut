@@ -1,0 +1,172 @@
+// Text-token authentication for fresh Memcached -Y connections. The challenge
+// prevents sending the fake SET credential payload to an ordinary cache server.
+import "memcache-codec.rut"
+variant MemcacheAuthResult {
+    authenticated
+    requestFailure
+    challengeFailure
+    rejected(Bytes)
+    transportFailure(i32)
+    replyFailure
+}
+variant MemcacheAuthWireResult { reply(MemcacheReply) transportFailure(i32) replyFailure }
+variant MemcacheAuthSessionResult {
+    value(MemcacheItem)
+    missing
+    stored
+    notStored
+    authError(Bytes)
+    serverError(Bytes)
+    challengeFailure
+    requestFailure
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheAuthPasswordValid(_ password: Bytes) -> bool {
+    password.count > 0 && !(password.count > 4096) && password.find(b"\x00") == nil &&
+        password.find(b"\r") == nil && password.find(b"\n") == nil
+}
+func memcacheAuthRequest(_ username: Bytes, _ password: Bytes) {
+    guard memcacheKeyValid(username) && memcacheAuthPasswordValid(password) else { nil }
+    guard let prefix = concatBytes(username, b" ", 8192) else { nil }
+    guard let token = concatBytes(prefix, password, 8192) else { nil }
+    memcacheStoreRequest(MemcacheStoreMode.set, b"__rut_auth", token, MemcacheOptions(flags: b"0", expirySeconds: 0))
+}
+func memcacheAuthReceive(_ connection: TcpConnection, _ stream: MemcacheStream, _ key: Bytes) {
+    if stream.reply.kind == 0 {
+        guard stream.bytes.count < 8192 else { nil }
+        let reading = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = reading else { nil }
+        guard chunk.count > 0 else { nil }
+        memcacheFeed(stream, chunk, key)
+    } else { stream }
+}
+func memcacheAuthReadPair(_ connection: TcpConnection, _ stream: MemcacheStream, _ key: Bytes) {
+    let firstReading = memcacheAuthReceive(connection, stream, key)
+    guard let first = firstReading else { nil }
+    let secondReading = memcacheAuthReceive(connection, first, key)
+    guard let second = secondReading else { nil }
+    second
+}
+func memcacheAuthReadFailure(_ code: i32) -> MemcacheAuthWireResult {
+    if code == 0 { MemcacheAuthWireResult.replyFailure } else { MemcacheAuthWireResult.transportFailure(code) }
+}
+func memcacheAuthWire2(_ connection: TcpConnection, _ request: Bytes) -> MemcacheAuthWireResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheAuthWireResult.transportFailure(netError()) }
+    let initial = MemcacheStream(bytes: b"", reply: memcacheEmptyReply(0))
+    let reading = memcacheAuthReadPair(connection, initial, b"")
+    guard let stream = reading else { memcacheAuthReadFailure(netError()) }
+    guard stream.reply.kind > 0 else { MemcacheAuthWireResult.replyFailure }
+    MemcacheAuthWireResult.reply(stream.reply)
+}
+func memcacheAuthChallenge(_ result: MemcacheAuthWireResult) -> bool {
+    match result {
+        .reply(reply) => reply.kind == 8 && reply.data == b"CLIENT_ERROR unauthenticated"
+        _ => false
+    }
+}
+func memcacheAuthProbeFailure(_ result: MemcacheAuthWireResult) -> MemcacheAuthResult {
+    match result {
+        .transportFailure(code) => MemcacheAuthResult.transportFailure(code)
+        _ => MemcacheAuthResult.challengeFailure
+    }
+}
+func memcacheAuthReply(_ result: MemcacheAuthWireResult) -> MemcacheAuthResult {
+    match result {
+        .reply(reply) => if reply.kind == 3 { MemcacheAuthResult.authenticated } else {
+            if reply.kind == 8 { MemcacheAuthResult.rejected(reply.data) } else { MemcacheAuthResult.replyFailure }
+        }
+        .transportFailure(code) => MemcacheAuthResult.transportFailure(code)
+        .replyFailure => MemcacheAuthResult.replyFailure
+    }
+}
+func memcacheAuthSucceeded(_ result: MemcacheAuthResult) -> bool {
+    match result { .authenticated => true
+        _ => false }
+}
+func memcacheAuthExecute(_ connection: TcpConnection, _ request: Bytes) -> MemcacheAuthResult {
+    let probe = memcacheAuthWire2(connection, b"version\r\n")
+    guard memcacheAuthChallenge(probe) else { memcacheAuthProbeFailure(probe) }
+    let result = memcacheAuthWire2(connection, request)
+    memcacheAuthReply(result)
+}
+func memcacheAuthenticate(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes) -> MemcacheAuthResult {
+    guard let request = memcacheAuthRequest(username, password) else { MemcacheAuthResult.requestFailure }
+    let result = memcacheAuthExecute(connection, request)
+    if memcacheAuthSucceeded(result) { result } else {
+        let closed = connection.close()
+        result
+    }
+}
+func memcacheAuthSessionFailure(_ result: MemcacheAuthResult) -> MemcacheAuthSessionResult {
+    match result {
+        .rejected(message) => MemcacheAuthSessionResult.authError(message)
+        .challengeFailure => MemcacheAuthSessionResult.challengeFailure
+        .requestFailure => MemcacheAuthSessionResult.requestFailure
+        .transportFailure(code) => MemcacheAuthSessionResult.transportFailure(code)
+        _ => MemcacheAuthSessionResult.replyFailure
+    }
+}
+func memcacheAuthSessionRead(_ connection: TcpConnection, _ key: Bytes) {
+    let initial = MemcacheStream(bytes: b"", reply: memcacheEmptyReply(0))
+    let firstReading = memcacheAuthReadPair(connection, initial, key)
+    guard let first = firstReading else { nil }
+    let secondReading = memcacheAuthReadPair(connection, first, key)
+    guard let stream = secondReading else { nil }
+    guard stream.reply.kind > 0 else { nil }
+    stream.reply
+}
+func memcacheAuthSessionWire(_ connection: TcpConnection, _ request: Bytes, _ key: Bytes) -> MemcacheAuthWireResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheAuthWireResult.transportFailure(netError()) }
+    let reading = memcacheAuthSessionRead(connection, key)
+    guard let reply = reading else { memcacheAuthReadFailure(netError()) }
+    MemcacheAuthWireResult.reply(reply)
+}
+func memcacheAuthSessionValue(_ reply: MemcacheReply, _ storing: bool) -> MemcacheAuthSessionResult {
+    if storing {
+        match reply.kind {
+            3 => MemcacheAuthSessionResult.stored
+            4 => MemcacheAuthSessionResult.notStored
+            8 => MemcacheAuthSessionResult.serverError(reply.data)
+            _ => MemcacheAuthSessionResult.replyFailure
+        }
+    } else {
+        match reply.kind {
+            1 => MemcacheAuthSessionResult.value(MemcacheItem(data: reply.data, flags: reply.flags))
+            2 => MemcacheAuthSessionResult.missing
+            8 => MemcacheAuthSessionResult.serverError(reply.data)
+            _ => MemcacheAuthSessionResult.replyFailure
+        }
+    }
+}
+func memcacheAuthSessionReply(_ result: MemcacheAuthWireResult, _ storing: bool) -> MemcacheAuthSessionResult {
+    match result {
+        .reply(reply) => memcacheAuthSessionValue(reply, storing)
+        .transportFailure(code) => MemcacheAuthSessionResult.transportFailure(code)
+        .replyFailure => MemcacheAuthSessionResult.replyFailure
+    }
+}
+func memcacheAuthSessionExecute(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+    _ request: Bytes, _ key: Bytes, _ storing: bool) -> MemcacheAuthSessionResult {
+    let auth = memcacheAuthenticate(connection, username, password)
+    guard memcacheAuthSucceeded(auth) else { memcacheAuthSessionFailure(auth) }
+    let result = memcacheAuthSessionWire(connection, request, key)
+    memcacheAuthSessionReply(result, storing)
+}
+func memcacheAuthSessionClose(_ connection: TcpConnection, _ result: MemcacheAuthSessionResult) -> MemcacheAuthSessionResult {
+    let closed = connection.close()
+    result
+}
+func memcacheSessionGet(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ key: Bytes) -> MemcacheAuthSessionResult {
+    guard let request = memcacheGetRequest(key) else { memcacheAuthSessionClose(connection, MemcacheAuthSessionResult.requestFailure) }
+    let result = memcacheAuthSessionExecute(connection, username, password, request, key, false)
+    memcacheAuthSessionClose(connection, result)
+}
+func memcacheSessionSet(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+    _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) -> MemcacheAuthSessionResult {
+    guard let request = memcacheStoreRequest(MemcacheStoreMode.set, key, value, settings) else { memcacheAuthSessionClose(connection, MemcacheAuthSessionResult.requestFailure) }
+    let result = memcacheAuthSessionExecute(connection, username, password, request, key, true)
+    memcacheAuthSessionClose(connection, result)
+}

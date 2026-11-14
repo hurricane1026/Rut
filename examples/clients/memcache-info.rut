@@ -1,0 +1,69 @@
+import "memcache-info-codec.rut"
+
+variant MemcacheInfoResult {
+    version(Bytes)
+    stats(MemcacheStats)
+    serverError(Bytes)
+    transportFailure(i32)
+    replyFailure
+}
+func memcacheInfoReceive(_ connection: TcpConnection, _ stream: MemcacheInfoStream) {
+    if stream.kind == 0 {
+        guard stream.bytes.count < 8192 else { nil }
+        let pending = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        memcacheInfoFeed(stream, chunk)
+    } else { stream }
+}
+func memcacheInfoReadPair(_ connection: TcpConnection, _ stream: MemcacheInfoStream) {
+    let firstPending = memcacheInfoReceive(connection, stream)
+    guard let first = firstPending else { nil }
+    let secondPending = memcacheInfoReceive(connection, first)
+    guard let second = secondPending else { nil }
+    second
+}
+func memcacheInfoRead(_ connection: TcpConnection, _ version: bool) {
+    let initial = MemcacheInfoStream(bytes: b"", kind: 0, count: 0, version: version)
+    let firstPending = memcacheInfoReadPair(connection, initial)
+    guard let first = firstPending else { nil }
+    let secondPending = memcacheInfoReadPair(connection, first)
+    guard let second = secondPending else { nil }
+    guard second.kind > 0 else { nil }
+    second
+}
+func memcacheInfoReadFailure(_ code: i32) -> MemcacheInfoResult {
+    if code == 0 { MemcacheInfoResult.replyFailure } else { MemcacheInfoResult.transportFailure(code) }
+}
+func memcacheInfoExecute(_ connection: TcpConnection, _ request: Bytes, _ version: bool) -> MemcacheInfoResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheInfoResult.transportFailure(netError()) }
+    let reading = memcacheInfoRead(connection, version)
+    guard let stream = reading else { memcacheInfoReadFailure(netError()) }
+    if stream.kind == 8 { MemcacheInfoResult.serverError(stream.bytes.slice(0, stream.bytes.count - 2).or(b"")) } else {
+        if version { MemcacheInfoResult.version(stream.bytes.slice(8, stream.bytes.count - 2).or(b"")) } else {
+            MemcacheInfoResult.stats(MemcacheStats(frame: stream.bytes, count: stream.count))
+        }
+    }
+}
+func memcacheInfoMustClose(_ result: MemcacheInfoResult) -> bool {
+    match result {
+        .version(value) => false
+        .stats(value) => false
+        _ => true
+    }
+}
+func memcacheInfoFinish(_ connection: TcpConnection, _ result: MemcacheInfoResult) -> MemcacheInfoResult {
+    if memcacheInfoMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func memcacheVersion(_ connection: TcpConnection) -> MemcacheInfoResult {
+    let result = memcacheInfoExecute(connection, memcacheVersionRequest(), true)
+    memcacheInfoFinish(connection, result)
+}
+func memcacheStats(_ connection: TcpConnection, _ section: MemcacheStatsSection) -> MemcacheInfoResult {
+    let result = memcacheInfoExecute(connection, memcacheStatsRequest(section), false)
+    memcacheInfoFinish(connection, result)
+}

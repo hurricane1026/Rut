@@ -1,0 +1,111 @@
+import "resp2-command.rut"
+import "resp2.rut"
+
+struct RedisMgetReply { frame: Bytes count: i32 }
+struct RedisMgetItem { found: bool data: Bytes }
+struct RedisMgetScan { offset: i32 count: i32 keys: bool }
+variant RedisMgetResult { reply(RedisMgetReply) serverError(Bytes) requestFailure transportFailure(i32) replyFailure }
+// A flat array of bulk/null elements. This also validates public key builders
+// and reply objects before execution/access, without permitting nested values.
+func redisMgetStep(_ bytes: Bytes, _ state: RedisMgetScan) -> (RedisMgetScan, Resp2Token, bool) {
+    guard state.count > 0 else { nil }
+    guard let token = resp2Token(bytes, state.offset) else { nil }
+    guard token.kind == 4 || (!state.keys && token.kind == 6) else { nil }
+    guard !state.keys || (bytes[state.offset + 1].or(0) > 47 && bytes[state.offset + 1].or(0) < 58) else { nil }
+    (RedisMgetScan(offset: token.next, count: state.count - 1, keys: state.keys), token, state.count == 1)
+}
+func redisMgetScanValues(_ frame: Bytes, _ count: i32, _ keys: bool) {
+    guard count > 0 && count < 9 && !(frame.count > 8192) else { nil }
+    guard let root = resp2Token(frame, 0) else { nil }
+    guard root.kind == 5 && root.children == count else { nil }
+    guard let values = collectBytes(frame, RedisMgetScan(offset: root.next, count: count, keys: keys), 8, redisMgetStep) else { nil }
+    guard let last = values.get(count - 1) else { nil }
+    guard values.count == count && last.next == frame.count else { nil }
+    values
+}
+func redisMgetValues(_ frame: Bytes, _ count: i32) {
+    redisMgetScanValues(frame, count, false)
+}
+func redisMgetKeysValid(_ keys: RedisKeys) -> bool {
+    guard let header = resp2DecimalLine(b"*", keys.count, 8192) else { false }
+    guard let framed = concatBytes(header, keys.arguments, 8192) else { false }
+    guard let values = redisMgetScanValues(framed, keys.count, true) else { false }
+    values.count == keys.count
+}
+func redisMgetRequest(_ keys: RedisKeys) {
+    guard redisMgetKeysValid(keys) else { nil }
+    guard let count = resp2DecimalLine(b"*", keys.count + 1, 8192) else { nil }
+    guard let named = concatBytes(count, b"$4\r\nMGET\r\n", 8192) else { nil }
+    concatBytes(named, keys.arguments, 8192)
+}
+func redisMgetItem(_ reply: RedisMgetReply, _ index: i32) {
+    guard let values = redisMgetValues(reply.frame, reply.count) else { nil }
+    guard let token = values.get(index) else { nil }
+    RedisMgetItem(found: token.kind == 4, data: token.data)
+}
+// At most nine scalar/array nodes are needed, instead of the generic 64-node
+// profile. There are still at most four receives, no automatic retry.
+func redisMgetFeed(_ stream: Resp2Stream, _ chunk: Bytes) {
+    guard stream.cursor.status == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+    guard let steps = collectBytes(bytes, stream.cursor, 9, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(steps.count - 1) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
+func redisMgetReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let pending = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        redisMgetFeed(stream, chunk)
+    } else { stream }
+}
+func redisMgetReadPair(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let firstPending = redisMgetReceive(connection, stream)
+    guard let first = firstPending else { nil }
+    let secondPending = redisMgetReceive(connection, first)
+    guard let second = secondPending else { nil }
+    second
+}
+func redisMgetRead(_ connection: TcpConnection) {
+    guard let initial = resp2Stream(8192) else { nil }
+    let firstPending = redisMgetReadPair(connection, initial)
+    guard let first = firstPending else { nil }
+    let secondPending = redisMgetReadPair(connection, first)
+    guard let second = secondPending else { nil }
+    guard resp2Finished(second) else { nil }
+    second.bytes
+}
+func redisMgetDecode(_ frame: Bytes, _ count: i32) -> RedisMgetResult {
+    guard let root = resp2Token(frame, 0) else { RedisMgetResult.replyFailure }
+    if root.kind == 2 {
+        guard root.next == frame.count else { RedisMgetResult.replyFailure }
+        RedisMgetResult.serverError(root.data)
+    } else {
+        guard let values = redisMgetValues(frame, count) else { RedisMgetResult.replyFailure }
+        RedisMgetResult.reply(RedisMgetReply(frame: frame, count: count))
+    }
+}
+func redisMgetFailure(_ code: i32) -> RedisMgetResult {
+    if code == 0 { RedisMgetResult.replyFailure } else { RedisMgetResult.transportFailure(code) }
+}
+func redisMgetWire(_ connection: TcpConnection, _ request: Bytes, _ count: i32) -> RedisMgetResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisMgetResult.transportFailure(netError()) }
+    let reading = redisMgetRead(connection)
+    guard let frame = reading else { redisMgetFailure(netError()) }
+    redisMgetDecode(frame, count)
+}
+func redisMgetMustClose(_ result: RedisMgetResult) -> bool {
+    match result { .transportFailure(code) => true
+        .replyFailure => true
+        _ => false }
+}
+func redisMget(_ connection: TcpConnection, _ keys: RedisKeys) -> RedisMgetResult {
+    guard let request = redisMgetRequest(keys) else { RedisMgetResult.requestFailure }
+    let result = redisMgetWire(connection, request, keys.count)
+    if redisMgetMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}

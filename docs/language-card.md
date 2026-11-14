@@ -3278,7 +3278,37 @@ commands allow explicit pool return; server/transport/framing errors close the
 handle. Four receives and 8192-byte request/reply bounds remain within the
 existing I/O profile. CAS/counter fields retain the full unsigned 64-bit range
 as validated decimal Bytes; multi-key replies publish only after END and retain
-each echoed key. See [options, TTL limits and examples](memcache-client.md).
+each echoed key. Explicit `MemcacheExpiry` choices distinguish relative seconds
+from signed 32-bit Unix timestamps; `WithExpiry` storage/CAS/TOUCH/GAT/GATS
+helpers preserve the existing relative-TTL entry points. Redis SET expiry also
+supports EXAT/PXAT via validated decimal Bytes, including timestamps beyond i32.
+See [Redis SET options](redis-commands.md) and
+[Memcache options, TTL limits and examples](memcache-client.md).
+
+## Client diagnostics
+
+Redis `redisPing`, `redisEcho` and `redisInfo` reuse the scalar RESP2 executor.
+The separate `clients/memcache-info.rut` library provides VERSION and bounded
+STATS (general/settings/items/slabs), publishing at most 128 records only after
+END. Both retain 8192-byte frames and four fixed-deadline receives. They add no
+language or runtime operations. See [contracts and examples](client-diagnostics.md).
+
+## Bounded multi-key deletion
+
+Redis `redisKeys`/`redisKeysAdd` and `redisDeleteKeys` encode one DEL or UNLINK
+command for up to eight binary keys and validate the returned deletion count.
+The separate `clients/memcache-delete-batch.rut` library sends up to eight basic
+text delete commands and publishes ordered per-key outcomes only after all
+acknowledgements. Failures never trigger replay; Memcached batches are not atomic.
+Existing frame/I/O limits remain unchanged. See [cache invalidation](client-invalidation.md).
+
+## Authenticated client handshakes
+
+`redisHello3Auth` adds AUTH and optional SETNAME to strict RESP3 negotiation.
+`clients/memcache-auth.rut` validates a fresh `-Y` challenge before sending its
+credential payload. Its GET/SET session helpers always close after use and never
+pool authenticated state. Existing framing/I/O bounds and no-replay behavior
+remain unchanged. See [authenticated clients](client-authentication.md).
 
 ## Online HS256 JWT session permits
 
@@ -3457,3 +3487,35 @@ Missing, non-string, ID-token and refresh-token types receive a challenged 401,
 regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
+
+### Atomic read mutations and metadata retrieval
+
+Ordinary Redis source helpers expose GETEX with an exclusive typed expiry option
+(including PERSIST) and GETDEL, preserving binary/empty/missing values through
+`RedisGetResult`. The Memcached meta GET profile returns value, full-width flags
+and CAS, and remaining TTL; it validates length framing and exactly one f/c/t
+metadata token each in any order. Stale/unknown flags fail closed. These helpers
+keep existing frame/read/deadline bounds, close uncertain connections, and never
+replay mutations. See [read control and metadata](client-read-control.md).
+
+### Conditional expiry and version-protected deletion
+
+The standalone `redis-expiry.rut` module adds EXPIRE/PEXPIRE with typed conditions
+on the current expiry (including supported XX+GT/XX+LT combinations), exact 0/1
+acknowledgements, and signed immediate-deletion durations. `memcache-meta.rut`
+adds one-command deletion protected by an unsigned CAS token, distinguishing
+success, version conflict and missing keys. GET and DELETE reply parsers remain
+separate. Helpers preserve existing byte, receive, deadline and I/O budgets,
+close uncertain handles and never replay mutations. See
+[conditional cache mutations](client-conditional-mutations.md).
+
+### Ordered MGET and CAS-conditional retrieval
+
+The standalone Redis MGET source module validates one to eight binary keys and
+publishes a complete flat array of string/missing items in request order. Public
+builders and indexed accessors revalidate their whole frames. Memcached's meta
+module distinguishes changed values, unchanged metadata and missing items,
+checking returned CAS consistency without narrowing unsigned version tokens.
+All profiles keep the existing byte, read and deadline bounds, preserve explicit
+session ownership, and close uncertain handles without retry. See
+[cache reads](client-cache-reads.md).

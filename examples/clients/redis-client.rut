@@ -96,8 +96,7 @@ func redisSetFinish(_ connection: TcpConnection, _ result: RedisSetResult) -> Re
         result
     } else { result }
 }
-func redisGetExecute(_ connection: TcpConnection, _ key: Bytes) {
-    guard let request = resp2GetRequest(key) else { RedisGetResult.requestFailure }
+func redisGetWire(_ connection: TcpConnection, _ request: Bytes) {
     let pendingSend = connection.send(request, 1000)
     guard let sent = pendingSend else { RedisGetResult.transportFailure(netError()) }
     let pendingRead = redisReply(connection)
@@ -127,6 +126,20 @@ func redisSetExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) 
     }
 }
 
+func redisGetExecute(_ connection: TcpConnection, _ key: Bytes) {
+    guard let request = resp2GetRequest(key) else { RedisGetResult.requestFailure }
+    redisGetWire(connection, request)
+}
+func redisGetDel(_ connection: TcpConnection, _ key: Bytes) -> RedisGetResult {
+    guard let request = resp2KeyRequest(b"GETDEL", key) else { RedisGetResult.requestFailure }
+    let result = redisGetWire(connection, request)
+    redisGetFinish(connection, result)
+}
+func redisGetEx(_ connection: TcpConnection, _ key: Bytes, _ expiry: RedisGetExpiry) -> RedisGetResult {
+    guard let request = resp2GetExRequest(key, expiry) else { RedisGetResult.requestFailure }
+    let result = redisGetWire(connection, request)
+    redisGetFinish(connection, result)
+}
 func redisGet(_ connection: TcpConnection, _ key: Bytes) -> RedisGetResult {
     let result = redisGetExecute(connection, key)
     redisGetFinish(connection, result)
@@ -698,4 +711,56 @@ func redisReplayDurableClaim(_ connection: TcpConnection, _ username: Bytes, _ p
         let closed = connection.close()
         redisReplayResultStatus(result)
     } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
+}
+
+// Bounded RESP2 diagnostics on an ordinary authenticated, non-subscribed handle.
+func resp2PingRequest() -> Bytes { b"*1\r\n$4\r\nPING\r\n" }
+func resp2EchoRequest(_ message: Bytes) { resp2KeyRequest(b"ECHO", message) }
+func resp2InfoRequest(_ section: Bytes) {
+    if section.count == 0 { b"*1\r\n$4\r\nINFO\r\n" }
+    else { resp2KeyRequest(b"INFO", section) }
+}
+func redisExpectPong(_ result: RedisResult) -> RedisResult {
+    match result {
+        .reply(reply) => if reply.root.kind == 1 && reply.root.data == b"PONG" { result }
+            else { RedisResult.replyFailure }
+        _ => result
+    }
+}
+func redisExpectDiagnosticBulk(_ result: RedisResult) -> RedisResult {
+    match result {
+        .reply(reply) => if reply.root.kind == 4 { result } else { RedisResult.replyFailure }
+        _ => result
+    }
+}
+func redisPing(_ connection: TcpConnection) -> RedisResult {
+    let result = redisExecuteScalarWire(connection, resp2PingRequest())
+    redisResultFinish(connection, redisExpectPong(result))
+}
+func redisEcho(_ connection: TcpConnection, _ message: Bytes) -> RedisResult {
+    guard let request = resp2EchoRequest(message) else { RedisResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    redisResultFinish(connection, redisExpectDiagnosticBulk(result))
+}
+// INFO remains opaque binary-safe text, preserving unknown fields and sections.
+func redisInfo(_ connection: TcpConnection, _ section: Bytes) -> RedisResult {
+    guard let request = resp2InfoRequest(section) else { RedisResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    redisResultFinish(connection, redisExpectDiagnosticBulk(result))
+}
+
+func redisDeletedCountValid(_ reply: RedisReply, _ expected: i32) -> bool {
+    guard let count = redisInteger(reply) else { false }
+    count > -1 && !(count > i64(expected))
+}
+func redisExpectDeletedCount(_ result: RedisResult, _ expected: i32) -> RedisResult {
+    match result {
+        .reply(reply) => if redisDeletedCountValid(reply, expected) { result } else { RedisResult.replyFailure }
+        _ => result
+    }
+}
+func redisDeleteKeys(_ connection: TcpConnection, _ keys: RedisKeys, _ mode: RedisDeleteMode) -> RedisResult {
+    guard let request = resp2DeleteKeysRequest(keys, mode) else { RedisResult.requestFailure }
+    let result = redisExecuteScalarWire(connection, request)
+    redisResultFinish(connection, redisExpectDeletedCount(result, keys.count))
 }

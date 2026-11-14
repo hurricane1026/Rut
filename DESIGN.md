@@ -10913,7 +10913,12 @@ conditional non-storage, server errors and transport/framing failures. Server,
 transport and framing failures close aliases; successful commands permit pool return without
 introducing automatic retry or release. Flags preserve unsigned 32-bit decimal
 spelling, and relative expiration rejects the wire protocol's greater-than-30-day
-absolute-time interpretation. This is an unauthenticated source-library profile,
+absolute-time interpretation. Additive typed expiry helpers accept explicit
+signed-32-bit Unix seconds for storage, CAS, TOUCH and GAT/GATS, including
+multi-key retrieval. Relative expiry APIs keep their existing bounds. Redis
+SET options and SET GET similarly support explicit EXAT/PXAT decimal Bytes,
+validated before I/O and without timestamp narrowing or clock conversion.
+This is an unauthenticated source-library profile,
 not a native protocol handler or distributed Cache backend. It adds no keywords,
 dependencies or runtime operations. CAS and counter fields preserve decimal
 unsigned-64-bit Bytes without signed narrowing. Multi-key requests admit at
@@ -11026,3 +11031,69 @@ Missing, non-string, ID-token and refresh-token types receive a challenged 401,
 regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
+
+### Bounded client diagnostics
+
+Redis PING/ECHO/INFO compose the existing scalar RESP2 executor with expected
+reply validation. Memcached VERSION/STATS use a separate ordinary source codec,
+retain unknown fields as Bytes and publish only complete END-terminated reports.
+STATS bounds are 128 records and 8192 bytes, scanned in two sequential 64-step
+collections; transport remains four fixed-deadline receives. Returned frames
+survive later I/O within an invocation. No diagnostics command reconnects or
+replays, and existing protocol-specific error/alias-close rules apply.
+See [client diagnostics](docs/client-diagnostics.md).
+
+### Finite multi-key cache invalidation
+
+Ordinary source helpers encode one Redis DEL/UNLINK for up to eight binary keys,
+revalidate the complete command before I/O and require an integer in the request's
+key-count range. Memcached composes up to eight ordered basic-text delete commands,
+publishing per-key outcomes only after complete acknowledgement of the batch.
+Public builders and accessors are revalidated. A partial write or reply is not
+proof that no deletion occurred, and no failure automatically replays a batch.
+The source library keeps the existing 8192-byte and four-receive transport profile.
+See [cache invalidation](docs/client-invalidation.md).
+
+### Authenticated RESP3 and Memcached text sessions
+
+RESP3 HELLO authentication composes binary-safe AUTH/SETNAME arguments with the
+existing strict map/proto validation, closing on any failed negotiation without
+fallback. Memcached text-token authentication requires the exact fresh `-Y`
+challenge before sending a fake SET credential payload, so ordinary cache
+endpoints are not sent that payload. Close-after-use GET/SET helpers keep
+identity out of generic pools, retain typed failure stages, validate business
+requests before credentials and never replay an uncertain write. All helpers
+use existing source/TCP/TLS facilities and remain within existing frame,
+receive and sixteen-operation budgets. See [client authentication](docs/client-authentication.md).
+
+### Atomic read mutations and metadata retrieval
+
+Ordinary Redis source helpers expose GETEX with an exclusive typed expiry option
+(including PERSIST) and GETDEL, preserving binary/empty/missing values through
+`RedisGetResult`. The Memcached meta GET profile returns value, full-width flags
+and CAS, and remaining TTL; it validates length framing and exactly one f/c/t
+metadata token each in any order. Stale/unknown flags fail closed. These helpers
+keep existing frame/read/deadline bounds, close uncertain connections, and never
+replay mutations. See [read control and metadata](docs/client-read-control.md).
+
+### Conditional expiry and version-protected deletion
+
+The standalone `redis-expiry.rut` module adds EXPIRE/PEXPIRE with typed conditions
+on the current expiry (including supported XX+GT/XX+LT combinations), exact 0/1
+acknowledgements, and signed immediate-deletion durations. `memcache-meta.rut`
+adds one-command deletion protected by an unsigned CAS token, distinguishing
+success, version conflict and missing keys. GET and DELETE reply parsers remain
+separate. Helpers preserve existing byte, receive, deadline and I/O budgets,
+close uncertain handles and never replay mutations. See
+[conditional cache mutations](docs/client-conditional-mutations.md).
+
+### Ordered MGET and CAS-conditional retrieval
+
+The standalone Redis MGET source module validates one to eight binary keys and
+publishes a complete flat array of string/missing items in request order. Public
+builders and indexed accessors revalidate their whole frames. Memcached's meta
+module distinguishes changed values, unchanged metadata and missing items,
+checking returned CAS consistency without narrowing unsigned version tokens.
+All profiles keep the existing byte, read and deadline bounds, preserve explicit
+session ownership, and close uncertain handles without retry. See
+[cache reads](docs/client-cache-reads.md).
