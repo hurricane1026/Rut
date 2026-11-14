@@ -1,0 +1,14 @@
+// MTLS_REGISTRY is a trusted compile-time snapshot. Credentials use the
+// verified TLS client's lowercase SHA-256 fingerprint as a public pin.
+
+route GET "/private" {
+    guard let identity = consumerAuthenticateMtls(env("MTLS_REGISTRY")) else { return 401 }
+    guard let consumerId = json.string(json.get(identity, "/consumerId").or(identity)) else { return 503 }
+    return response(200, body: consumerId)
+}
+route GET "/staff" {
+    guard let identity = consumerAuthenticateMtls(env("MTLS_REGISTRY")) else { return 401 }
+    guard jwtHasGroup(identity, "staff") else { return 403 }
+    return 204
+}
+route "/" { return 404 }

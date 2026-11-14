@@ -10946,6 +10946,16 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+`consumerAuthenticateMtls(configuration)` appends a dedicated consumer-auth JSON
+operation. Its runtime path obtains identity only through the existing verified
+TLS fingerprint request helper; the generic presented-credential operation
+continues to reject `mtls`, and query/form helpers remain header-key-only. The
+version-1 registry stores a public lowercase 64-hex certificate fingerprint
+under an `mtls` record's existing `secret` field, validating disabled records
+and rejecting duplicate ownership. This joins bounded registry rotation,
+groups, request-owned result projection and the existing native-program/RCU
+snapshot lifetime without a new allocator or connection state.
+
 Replay policy is composed in Rut over the existing RESP2/TCP/TLS client. One
 atomic NX claim on an authoritative external store precedes side effects; a
 successful write cannot allow before acknowledged session cleanup. Ambiguous

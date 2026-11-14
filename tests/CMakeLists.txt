@@ -4246,6 +4246,7 @@ if(RUT_ENABLE_JIT)
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_consumers.py
                         --server $<TARGET_FILE:rut>
                         --source ${PROJECT_SOURCE_DIR}/examples/mtls-consumers-auth.rut
+                        --registry-source ${PROJECT_SOURCE_DIR}/examples/consumer-mtls-registry-auth.rut
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${mtls_consumer_backend})
                 set_tests_properties(test_mtls_consumers_${mtls_consumer_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)

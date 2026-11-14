@@ -115,7 +115,8 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         if (!kSecret.len || (kMethod.eq(lit_str("basic")) ? !basic_credentials_valid(kSecret)
                              : kMethod.eq(lit_str("bearer")) || kMethod.eq(lit_str("header"))
                                  ? !bearer_key_valid(kSecret)
-                                 : true))
+                             : kMethod.eq(lit_str("mtls")) ? !sha256_hex_format_valid(kSecret)
+                                                           : true))
             return false;
         for (u32 i = 0; i < result.credential_count; ++i) {
             const auto& previous = result.credentials[i];
@@ -135,8 +136,13 @@ bool consumer_registry_valid(json::Document& document, Str configuration) {
     return load(document, configuration, registry);
 }
 
-bool consumer_registry_authenticate(
-    json::Document& document, Str configuration, Str method, Str presented, json::Writer& output) {
+static bool authenticate(json::Document& document,
+                         Str configuration,
+                         Str method,
+                         Str presented,
+                         bool allow_mtls,
+                         json::Writer& output) {
+    if (method.eq(lit_str("mtls")) && !allow_mtls) return false;
     Registry registry;
     if (!load(document, configuration, registry) || !presented.ptr || !presented.len) return false;
     u32 selected = json::kNone;
@@ -149,6 +155,11 @@ bool consumer_registry_authenticate(
         const bool kMatch =
             method.eq(lit_str("basic"))    ? basic_matches(presented, kSecret)
             : method.eq(lit_str("bearer")) ? bearer_matches(presented, kSecret)
+            : method.eq(lit_str("mtls"))
+                ? presented.len == kSecret.len &&
+                      rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
+                                          reinterpret_cast<const u8*>(kSecret.ptr),
+                                          kSecret.len)
             : method.eq(lit_str("header"))
                 ? presented.len == kSecret.len &&
                       rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
@@ -172,6 +183,19 @@ bool consumer_registry_authenticate(
     output.text(document.raw(consumer.groups));
     output.put('}');
     return output.ok;
+}
+
+bool consumer_registry_authenticate(
+    json::Document& document, Str configuration, Str method, Str presented, json::Writer& output) {
+    return authenticate(document, configuration, method, presented, false, output);
+}
+
+bool consumer_registry_authenticate_mtls(json::Document& document,
+                                         Str configuration,
+                                         Str fingerprint,
+                                         json::Writer& output) {
+    if (!sha256_hex_format_valid(fingerprint)) return false;
+    return authenticate(document, configuration, lit_str("mtls"), fingerprint, true, output);
 }
 namespace {
 i32 field_hex(char byte) {
