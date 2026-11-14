@@ -206,3 +206,6 @@ on both transport backends.
 See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
 
 See [bounded cache invalidation](client-invalidation.md) for multi-key deletion APIs and partial-write semantics.
+
+See [read control and metadata](client-read-control.md) for atomic Redis GETEX/GETDEL
+and bounded Memcached meta GET with flags, CAS and remaining TTL.

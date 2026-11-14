@@ -11065,3 +11065,13 @@ identity out of generic pools, retain typed failure stages, validate business
 requests before credentials and never replay an uncertain write. All helpers
 use existing source/TCP/TLS facilities and remain within existing frame,
 receive and sixteen-operation budgets. See [client authentication](docs/client-authentication.md).
+
+### Atomic read mutations and metadata retrieval
+
+Ordinary Redis source helpers expose GETEX with an exclusive typed expiry option
+(including PERSIST) and GETDEL, preserving binary/empty/missing values through
+`RedisGetResult`. The Memcached meta GET profile returns value, full-width flags
+and CAS, and remaining TTL; it validates length framing and exactly one f/c/t
+metadata token each in any order. Stale/unknown flags fail closed. These helpers
+keep existing frame/read/deadline bounds, close uncertain connections, and never
+replay mutations. See [read control and metadata](docs/client-read-control.md).

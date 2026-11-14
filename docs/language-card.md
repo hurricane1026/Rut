@@ -3487,3 +3487,13 @@ Missing, non-string, ID-token and refresh-token types receive a challenged 401,
 regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
+
+### Atomic read mutations and metadata retrieval
+
+Ordinary Redis source helpers expose GETEX with an exclusive typed expiry option
+(including PERSIST) and GETDEL, preserving binary/empty/missing values through
+`RedisGetResult`. The Memcached meta GET profile returns value, full-width flags
+and CAS, and remaining TTL; it validates length framing and exactly one f/c/t
+metadata token each in any order. Stale/unknown flags fail closed. These helpers
+keep existing frame/read/deadline bounds, close uncertain connections, and never
+replay mutations. See [read control and metadata](client-read-control.md).

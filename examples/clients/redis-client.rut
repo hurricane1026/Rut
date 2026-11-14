@@ -96,8 +96,7 @@ func redisSetFinish(_ connection: TcpConnection, _ result: RedisSetResult) -> Re
         result
     } else { result }
 }
-func redisGetExecute(_ connection: TcpConnection, _ key: Bytes) {
-    guard let request = resp2GetRequest(key) else { RedisGetResult.requestFailure }
+func redisGetWire(_ connection: TcpConnection, _ request: Bytes) {
     let pendingSend = connection.send(request, 1000)
     guard let sent = pendingSend else { RedisGetResult.transportFailure(netError()) }
     let pendingRead = redisReply(connection)
@@ -127,6 +126,20 @@ func redisSetExecute(_ connection: TcpConnection, _ key: Bytes, _ value: Bytes) 
     }
 }
 
+func redisGetExecute(_ connection: TcpConnection, _ key: Bytes) {
+    guard let request = resp2GetRequest(key) else { RedisGetResult.requestFailure }
+    redisGetWire(connection, request)
+}
+func redisGetDel(_ connection: TcpConnection, _ key: Bytes) -> RedisGetResult {
+    guard let request = resp2KeyRequest(b"GETDEL", key) else { RedisGetResult.requestFailure }
+    let result = redisGetWire(connection, request)
+    redisGetFinish(connection, result)
+}
+func redisGetEx(_ connection: TcpConnection, _ key: Bytes, _ expiry: RedisGetExpiry) -> RedisGetResult {
+    guard let request = resp2GetExRequest(key, expiry) else { RedisGetResult.requestFailure }
+    let result = redisGetWire(connection, request)
+    redisGetFinish(connection, result)
+}
 func redisGet(_ connection: TcpConnection, _ key: Bytes) -> RedisGetResult {
     let result = redisGetExecute(connection, key)
     redisGetFinish(connection, result)

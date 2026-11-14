@@ -1,0 +1,156 @@
+import "memcache-codec.rut"
+
+// Read-only meta GET profile: value, client flags, CAS and remaining TTL.
+// No quiet, vivify, recache, stale serving or TTL mutation flags are sent.
+struct MemcacheMetaItem { data: Bytes flags: Bytes cas: Bytes ttlSeconds: i32 }
+struct MemcacheMetaReply { kind: i32 item: MemcacheMetaItem }
+struct MemcacheMetaStream { bytes: Bytes reply: MemcacheMetaReply }
+struct MemcacheMetaHeader { size: i32 flags: Bytes cas: Bytes ttlSeconds: i32 }
+variant MemcacheMetaResult {
+    value(MemcacheMetaItem) missing serverError(Bytes) requestFailure
+    transportFailure(i32) replyFailure
+}
+func memcacheMetaGetRequest(_ key: Bytes) {
+    guard memcacheKeyValid(key) else { nil }
+    guard let prefix = concatBytes(b"mg ", key, 8192) else { nil }
+    concatBytes(prefix, b" v f c t\r\n", 8192)
+}
+func memcacheMetaEmpty(_ kind: i32) -> MemcacheMetaReply {
+    MemcacheMetaReply(kind: kind, item: MemcacheMetaItem(data: b"", flags: b"", cas: b"", ttlSeconds: -1))
+}
+// Metadata order is not a protocol guarantee. Require each requested token
+// exactly once, and reject unknown flags rather than silently serving stale data.
+func memcacheMetaToken(_ a: Bytes, _ b: Bytes, _ c: Bytes, _ prefix: Bytes) {
+    if a.slice(0, 1) == prefix {
+        guard b.slice(0, 1) != prefix && c.slice(0, 1) != prefix else { nil }
+        a.slice(1, a.count)
+    } else {
+        if b.slice(0, 1) == prefix {
+            guard c.slice(0, 1) != prefix else { nil }
+            b.slice(1, b.count)
+        } else {
+            guard c.slice(0, 1) == prefix else { nil }
+            c.slice(1, c.count)
+        }
+    }
+}
+func memcacheMetaFields(_ size: i32, _ a: Bytes, _ b: Bytes, _ c: Bytes) -> MemcacheMetaHeader {
+    guard let flags = memcacheMetaToken(a, b, c, b"f") else { nil }
+    guard let cas = memcacheMetaToken(a, b, c, b"c") else { nil }
+    guard let ttl = memcacheMetaToken(a, b, c, b"t") else { nil }
+    guard memcacheFlagsValid(flags) && memcacheUnsignedValid(cas) else { nil }
+    guard ttl == b"-1" || (ttl[0].or(0) > 47 && ttl[0].or(0) < 58) else { nil }
+    guard let seconds = parseInt(ttl) else { nil }
+    guard seconds > -2 else { nil }
+    MemcacheMetaHeader(size: size, flags: flags, cas: cas, ttlSeconds: seconds)
+}
+func memcacheMetaSize(_ digits: Bytes) {
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let size = parseInt(digits) else { nil }
+    guard size > -1 && !(size > 8192) else { nil }
+    size
+}
+func memcacheMetaHeaderTokens(_ line: Bytes, _ start: i32, _ size: i32) -> MemcacheMetaHeader {
+    guard let first = line.find(b" ", start) else { nil }
+    guard let second = line.find(b" ", first + 1) else { nil }
+    guard let a = line.slice(start, first) else { nil }
+    guard let b = line.slice(first + 1, second) else { nil }
+    guard let c = line.slice(second + 1, line.count) else { nil }
+    guard let header = memcacheMetaFields(size, a, b, c) else { nil }
+    header
+}
+func memcacheMetaHeader(_ line: Bytes) -> MemcacheMetaHeader {
+    guard line.slice(0, 3) == b"VA " else { nil }
+    guard let sizeEnd = line.find(b" ", 3) else { nil }
+    guard let digits = line.slice(3, sizeEnd) else { nil }
+    guard let size = memcacheMetaSize(digits) else { nil }
+    guard let header = memcacheMetaHeaderTokens(line, sizeEnd + 1, size) else { nil }
+    header
+}
+func memcacheMetaValue(_ bytes: Bytes, _ offset: i32, _ header: MemcacheMetaHeader) {
+    guard !(offset + header.size + 2 > 8192) else { nil }
+    if bytes.count < offset + header.size + 2 { memcacheMetaEmpty(0) } else {
+        guard bytes.count == offset + header.size + 2 else { nil }
+        guard bytes.slice(offset + header.size, bytes.count) == b"\r\n" else { nil }
+        guard let data = bytes.slice(offset, offset + header.size) else { nil }
+        MemcacheMetaReply(kind: 1, item: MemcacheMetaItem(data: data, flags: header.flags,
+            cas: header.cas, ttlSeconds: header.ttlSeconds))
+    }
+}
+func memcacheMetaParse(_ bytes: Bytes) {
+    guard !(bytes.count > 8192) else { nil }
+    guard let end = bytes.find(b"\r\n") else { memcacheMetaEmpty(0) }
+    guard let line = bytes.slice(0, end) else { nil }
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { nil }
+    if line == b"EN" {
+        guard bytes.count == end + 2 else { nil }
+        memcacheMetaEmpty(2)
+    } else {
+        if memcacheStatusReply(line).kind == 8 {
+            guard bytes.count == end + 2 else { nil }
+            memcacheMetaEmpty(8)
+        } else {
+            guard let header = memcacheMetaHeader(line) else { nil }
+            memcacheMetaValue(bytes, end + 2, header)
+        }
+    }
+}
+func memcacheMetaFeed(_ stream: MemcacheMetaStream, _ chunk: Bytes) {
+    guard stream.reply.kind == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+    guard let reply = memcacheMetaParse(bytes) else { nil }
+    MemcacheMetaStream(bytes: bytes, reply: reply)
+}
+func memcacheMetaReceive(_ connection: TcpConnection, _ stream: MemcacheMetaStream) {
+    if stream.reply.kind == 0 {
+        guard stream.bytes.count < 8192 else { nil }
+        let pending = connection.receive(8192 - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        memcacheMetaFeed(stream, chunk)
+    } else { stream }
+}
+func memcacheMetaReadPair(_ connection: TcpConnection, _ stream: MemcacheMetaStream) {
+    let firstPending = memcacheMetaReceive(connection, stream)
+    guard let first = firstPending else { nil }
+    let secondPending = memcacheMetaReceive(connection, first)
+    guard let second = secondPending else { nil }
+    second
+}
+func memcacheMetaRead(_ connection: TcpConnection) {
+    let initial = MemcacheMetaStream(bytes: b"", reply: memcacheMetaEmpty(0))
+    let firstPending = memcacheMetaReadPair(connection, initial)
+    guard let first = firstPending else { nil }
+    let secondPending = memcacheMetaReadPair(connection, first)
+    guard let second = secondPending else { nil }
+    guard second.reply.kind > 0 else { nil }
+    second
+}
+func memcacheMetaFailure(_ code: i32) -> MemcacheMetaResult {
+    if code == 0 { MemcacheMetaResult.replyFailure } else { MemcacheMetaResult.transportFailure(code) }
+}
+func memcacheMetaExecute(_ connection: TcpConnection, _ request: Bytes) -> MemcacheMetaResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheMetaResult.transportFailure(netError()) }
+    let reading = memcacheMetaRead(connection)
+    guard let stream = reading else { memcacheMetaFailure(netError()) }
+    if stream.reply.kind == 1 { MemcacheMetaResult.value(stream.reply.item) } else {
+        if stream.reply.kind == 2 { MemcacheMetaResult.missing } else {
+            MemcacheMetaResult.serverError(stream.bytes.slice(0, stream.bytes.count - 2).or(b""))
+        }
+    }
+}
+func memcacheMetaMustClose(_ result: MemcacheMetaResult) -> bool {
+    match result { .transportFailure(code) => true
+        .replyFailure => true
+        .serverError(message) => true
+        _ => false }
+}
+func memcacheMetaGet(_ connection: TcpConnection, _ key: Bytes) -> MemcacheMetaResult {
+    guard let request = memcacheMetaGetRequest(key) else { MemcacheMetaResult.requestFailure }
+    let result = memcacheMetaExecute(connection, request)
+    if memcacheMetaMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}

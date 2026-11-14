@@ -177,3 +177,30 @@ func resp2DeleteKeysRequest(_ keys: RedisKeys, _ mode: RedisDeleteMode) {
     guard let named = concatBytes(header, resp2DeleteName(mode), 8192) else { nil }
     concatBytes(named, keys.arguments, 8192)
 }
+
+// GETEX has PERSIST instead of SET's KEEPTTL. A separate type prevents
+// accidentally changing the meaning of a shared expiry option.
+variant RedisGetExpiry { unchanged persist seconds(i32) milliseconds(i32) unixSeconds(Bytes) unixMilliseconds(Bytes) }
+func resp2GetExpiry(_ expiry: RedisGetExpiry) {
+    match expiry {
+        .unchanged => b""
+        .persist => b"$7\r\nPERSIST\r\n"
+        .seconds(amount) => resp2SetExpiryNumber(b"$2\r\nEX\r\n", amount)
+        .milliseconds(amount) => resp2SetExpiryNumber(b"$2\r\nPX\r\n", amount)
+        .unixSeconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nEXAT\r\n", amount, true)
+        .unixMilliseconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nPXAT\r\n", amount, false)
+    }
+}
+func resp2GetExpiryCount(_ expiry: RedisGetExpiry) -> i32 {
+    match expiry { .unchanged => 2
+        .persist => 3
+        _ => 4 }
+}
+func resp2GetExRequest(_ key: Bytes, _ expiry: RedisGetExpiry) {
+    guard let argument = resp2BulkArgument(key, 8192) else { nil }
+    guard let expiration = resp2GetExpiry(expiry) else { nil }
+    guard let header = resp2DecimalLine(b"*", resp2GetExpiryCount(expiry), 8192) else { nil }
+    guard let named = concatBytes(header, b"$5\r\nGETEX\r\n", 8192) else { nil }
+    guard let keyed = concatBytes(named, argument, 8192) else { nil }
+    concatBytes(keyed, expiration, 8192)
+}
