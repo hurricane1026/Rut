@@ -5201,3 +5201,43 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         endforeach()
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(conditional_protocol redis memcache)
+        foreach(conditional_backend epoll io_uring)
+            foreach(conditional_opt 0 2)
+                add_test(NAME test_client_conditional_${conditional_protocol}_${conditional_backend}_opt${conditional_opt}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_conditional.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${conditional_protocol} --backend ${conditional_backend} --opt ${conditional_opt})
+                set_tests_properties(test_client_conditional_${conditional_protocol}_${conditional_backend}_opt${conditional_opt}
+                    PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+            add_test(NAME test_client_conditional_${conditional_protocol}_${conditional_backend}_tls
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_conditional.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --protocol ${conditional_protocol} --backend ${conditional_backend} --opt 2 --tls
+                    --testdata ${RUT_TLS_TESTDATA_DIR})
+            set_tests_properties(test_client_conditional_${conditional_protocol}_${conditional_backend}_tls
+                PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            foreach(conditional_transport plain tls)
+                set(conditional_tls_args)
+                if(conditional_transport STREQUAL "tls")
+                    list(APPEND conditional_tls_args --tls --testdata ${RUT_TLS_TESTDATA_DIR})
+                endif()
+                add_test(NAME test_client_conditional_${conditional_protocol}_${conditional_backend}_real_${conditional_transport}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_conditional.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${conditional_protocol} --backend ${conditional_backend} --opt 2 --real ${conditional_tls_args})
+                set_tests_properties(test_client_conditional_${conditional_protocol}_${conditional_backend}_real_${conditional_transport}
+                    PROPERTIES LABELS "integration;network;docker" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+        endforeach()
+    endforeach()
+    add_test(NAME test_client_conditional_redis_composition
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_conditional.py
+            --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+            --protocol redis --backend epoll --opt 0 --compose)
+    set_tests_properties(test_client_conditional_redis_composition
+        PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+endif()

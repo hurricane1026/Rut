@@ -11075,3 +11075,14 @@ and CAS, and remaining TTL; it validates length framing and exactly one f/c/t
 metadata token each in any order. Stale/unknown flags fail closed. These helpers
 keep existing frame/read/deadline bounds, close uncertain connections, and never
 replay mutations. See [read control and metadata](docs/client-read-control.md).
+
+### Conditional expiry and version-protected deletion
+
+The standalone `redis-expiry.rut` module adds EXPIRE/PEXPIRE with typed conditions
+on the current expiry (including supported XX+GT/XX+LT combinations), exact 0/1
+acknowledgements, and signed immediate-deletion durations. `memcache-meta.rut`
+adds one-command deletion protected by an unsigned CAS token, distinguishing
+success, version conflict and missing keys. GET and DELETE reply parsers remain
+separate. Helpers preserve existing byte, receive, deadline and I/O budgets,
+close uncertain handles and never replay mutations. See
+[conditional cache mutations](docs/client-conditional-mutations.md).

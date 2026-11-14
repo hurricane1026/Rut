@@ -121,7 +121,7 @@ The [executable example](../examples/memcache-client.rut) uses
 Verified TLS uses the unchanged `tls`, `caFile` and `serverName` policy fields.
 Use a dedicated policy for this unauthenticated basic-text profile. The separate
 [authentication library](client-authentication.md) adds challenge-gated `-Y` text
-sessions. Binary/SASL, meta operations beyond the documented metadata GET profile,
+sessions. Binary/SASL, meta operations beyond the documented metadata GET and CAS-delete profiles,
 arbitrary pipelining, UDP, failover and
 background sessions are not provided. It is not an implementation of a
 distributed Cache backend.
@@ -218,3 +218,6 @@ See [bounded cache invalidation](client-invalidation.md) for multi-key deletion 
 
 See [read control and metadata](client-read-control.md) for atomic Redis GETEX/GETDEL
 and bounded Memcached meta GET with flags, CAS and remaining TTL.
+
+See [conditional cache mutations](client-conditional-mutations.md) for the separate
+Redis conditional-expiry module and Memcached CAS-protected deletion.

@@ -4,7 +4,7 @@ import "memcache-codec.rut"
 // No quiet, vivify, recache, stale serving or TTL mutation flags are sent.
 struct MemcacheMetaItem { data: Bytes flags: Bytes cas: Bytes ttlSeconds: i32 }
 struct MemcacheMetaReply { kind: i32 item: MemcacheMetaItem }
-struct MemcacheMetaStream { bytes: Bytes reply: MemcacheMetaReply }
+struct MemcacheMetaStream { bytes: Bytes reply: MemcacheMetaReply deleting: bool }
 struct MemcacheMetaHeader { size: i32 flags: Bytes cas: Bytes ttlSeconds: i32 }
 variant MemcacheMetaResult {
     value(MemcacheMetaItem) missing serverError(Bytes) requestFailure
@@ -95,11 +95,29 @@ func memcacheMetaParse(_ bytes: Bytes) {
         }
     }
 }
+// The delete parser is separate: HD/EX/NF must never satisfy a GET reply.
+func memcacheMetaDeleteParse(_ bytes: Bytes) {
+    guard !(bytes.count > 8192) else { nil }
+    guard let end = bytes.find(b"\r\n") else { memcacheMetaEmpty(0) }
+    guard bytes.count == end + 2 else { nil }
+    guard let line = bytes.slice(0, end) else { nil }
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { nil }
+    if line == b"HD" { memcacheMetaEmpty(3) } else {
+        if line == b"EX" { memcacheMetaEmpty(4) } else {
+            if line == b"NF" { memcacheMetaEmpty(2) } else {
+                if memcacheStatusReply(line).kind == 8 { memcacheMetaEmpty(8) } else { nil }
+            }
+        }
+    }
+}
+func memcacheMetaParseMode(_ bytes: Bytes, _ deleting: bool) {
+    if deleting { memcacheMetaDeleteParse(bytes) } else { memcacheMetaParse(bytes) }
+}
 func memcacheMetaFeed(_ stream: MemcacheMetaStream, _ chunk: Bytes) {
     guard stream.reply.kind == 0 else { nil }
     guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
-    guard let reply = memcacheMetaParse(bytes) else { nil }
-    MemcacheMetaStream(bytes: bytes, reply: reply)
+    guard let reply = memcacheMetaParseMode(bytes, stream.deleting) else { nil }
+    MemcacheMetaStream(bytes: bytes, reply: reply, deleting: stream.deleting)
 }
 func memcacheMetaReceive(_ connection: TcpConnection, _ stream: MemcacheMetaStream) {
     if stream.reply.kind == 0 {
@@ -117,8 +135,8 @@ func memcacheMetaReadPair(_ connection: TcpConnection, _ stream: MemcacheMetaStr
     guard let second = secondPending else { nil }
     second
 }
-func memcacheMetaRead(_ connection: TcpConnection) {
-    let initial = MemcacheMetaStream(bytes: b"", reply: memcacheMetaEmpty(0))
+func memcacheMetaRead(_ connection: TcpConnection, _ deleting: bool) {
+    let initial = MemcacheMetaStream(bytes: b"", reply: memcacheMetaEmpty(0), deleting: deleting)
     let firstPending = memcacheMetaReadPair(connection, initial)
     guard let first = firstPending else { nil }
     let secondPending = memcacheMetaReadPair(connection, first)
@@ -132,7 +150,7 @@ func memcacheMetaFailure(_ code: i32) -> MemcacheMetaResult {
 func memcacheMetaExecute(_ connection: TcpConnection, _ request: Bytes) -> MemcacheMetaResult {
     let sending = connection.send(request, 1000)
     guard let sent = sending else { MemcacheMetaResult.transportFailure(netError()) }
-    let reading = memcacheMetaRead(connection)
+    let reading = memcacheMetaRead(connection, false)
     guard let stream = reading else { memcacheMetaFailure(netError()) }
     if stream.reply.kind == 1 { MemcacheMetaResult.value(stream.reply.item) } else {
         if stream.reply.kind == 2 { MemcacheMetaResult.missing } else {
@@ -150,6 +168,50 @@ func memcacheMetaGet(_ connection: TcpConnection, _ key: Bytes) -> MemcacheMetaR
     guard let request = memcacheMetaGetRequest(key) else { MemcacheMetaResult.requestFailure }
     let result = memcacheMetaExecute(connection, request)
     if memcacheMetaMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+
+variant MemcacheDeleteCasResult {
+    deleted exists missing serverError(Bytes) requestFailure transportFailure(i32) replyFailure
+}
+func memcacheDeleteCasRequest(_ key: Bytes, _ cas: Bytes) {
+    guard memcacheKeyValid(key) && memcacheUnsignedValid(cas) else { nil }
+    guard let named = concatBytes(b"md ", key, 8192) else { nil }
+    guard let prefix = concatBytes(named, b" C", 8192) else { nil }
+    guard let compared = concatBytes(prefix, cas, 8192) else { nil }
+    concatBytes(compared, b"\r\n", 8192)
+}
+func memcacheDeleteCasFailure(_ code: i32) -> MemcacheDeleteCasResult {
+    if code == 0 { MemcacheDeleteCasResult.replyFailure } else { MemcacheDeleteCasResult.transportFailure(code) }
+}
+func memcacheDeleteCasReply(_ stream: MemcacheMetaStream) -> MemcacheDeleteCasResult {
+    if stream.reply.kind == 3 { MemcacheDeleteCasResult.deleted } else {
+        if stream.reply.kind == 4 { MemcacheDeleteCasResult.exists } else {
+            if stream.reply.kind == 2 { MemcacheDeleteCasResult.missing } else {
+                MemcacheDeleteCasResult.serverError(stream.bytes.slice(0, stream.bytes.count - 2).or(b""))
+            }
+        }
+    }
+}
+func memcacheDeleteCasExecute(_ connection: TcpConnection, _ request: Bytes) -> MemcacheDeleteCasResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheDeleteCasResult.transportFailure(netError()) }
+    let reading = memcacheMetaRead(connection, true)
+    guard let stream = reading else { memcacheDeleteCasFailure(netError()) }
+    memcacheDeleteCasReply(stream)
+}
+func memcacheDeleteCasMustClose(_ result: MemcacheDeleteCasResult) -> bool {
+    match result { .transportFailure(code) => true
+        .replyFailure => true
+        .serverError(message) => true
+        _ => false }
+}
+func memcacheDeleteCas(_ connection: TcpConnection, _ key: Bytes, _ cas: Bytes) -> MemcacheDeleteCasResult {
+    guard let request = memcacheDeleteCasRequest(key, cas) else { MemcacheDeleteCasResult.requestFailure }
+    let result = memcacheDeleteCasExecute(connection, request)
+    if memcacheDeleteCasMustClose(result) {
         let closed = connection.close()
         result
     } else { result }

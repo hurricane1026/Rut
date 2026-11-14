@@ -94,3 +94,6 @@ backends at O0/O2, TLS at O2, and explicit Docker TCP/TLS profiles (20 cases).
 ```sh
 ctest --test-dir build -R '^test_client_read_control_' --output-on-failure -j1
 ```
+
+See [conditional cache mutations](client-conditional-mutations.md) for the separate
+Redis conditional-expiry module and Memcached CAS-protected deletion.
