@@ -3508,3 +3508,14 @@ success, version conflict and missing keys. GET and DELETE reply parsers remain
 separate. Helpers preserve existing byte, receive, deadline and I/O budgets,
 close uncertain handles and never replay mutations. See
 [conditional cache mutations](client-conditional-mutations.md).
+
+### Ordered MGET and CAS-conditional retrieval
+
+The standalone Redis MGET source module validates one to eight binary keys and
+publishes a complete flat array of string/missing items in request order. Public
+builders and indexed accessors revalidate their whole frames. Memcached's meta
+module distinguishes changed values, unchanged metadata and missing items,
+checking returned CAS consistency without narrowing unsigned version tokens.
+All profiles keep the existing byte, read and deadline bounds, preserve explicit
+session ownership, and close uncertain handles without retry. See
+[cache reads](client-cache-reads.md).

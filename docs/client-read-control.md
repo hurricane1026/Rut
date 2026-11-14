@@ -97,3 +97,6 @@ ctest --test-dir build -R '^test_client_read_control_' --output-on-failure -j1
 
 See [conditional cache mutations](client-conditional-mutations.md) for the separate
 Redis conditional-expiry module and Memcached CAS-protected deletion.
+
+See [ordered and conditional cache reads](client-cache-reads.md) for typed Redis
+MGET and Memcached retrieval conditional on an existing CAS version.

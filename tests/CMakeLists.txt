@@ -5241,3 +5241,37 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
     set_tests_properties(test_client_conditional_redis_composition
         PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(cache_reads_protocol redis memcache)
+        foreach(cache_reads_backend epoll io_uring)
+            foreach(cache_reads_opt 0 2)
+                add_test(NAME test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_opt${cache_reads_opt}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_cache_reads.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${cache_reads_protocol} --backend ${cache_reads_backend} --opt ${cache_reads_opt})
+                set_tests_properties(test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_opt${cache_reads_opt}
+                    PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+            add_test(NAME test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_tls
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_cache_reads.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                    --protocol ${cache_reads_protocol} --backend ${cache_reads_backend} --opt 2 --tls
+                    --testdata ${RUT_TLS_TESTDATA_DIR})
+            set_tests_properties(test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_tls
+                PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            foreach(cache_reads_transport plain tls)
+                set(cache_reads_tls_args)
+                if(cache_reads_transport STREQUAL "tls")
+                    list(APPEND cache_reads_tls_args --tls --testdata ${RUT_TLS_TESTDATA_DIR})
+                endif()
+                add_test(NAME test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_real_${cache_reads_transport}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_client_cache_reads.py
+                        --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                        --protocol ${cache_reads_protocol} --backend ${cache_reads_backend} --opt 2 --real ${cache_reads_tls_args})
+                set_tests_properties(test_client_cache_reads_${cache_reads_protocol}_${cache_reads_backend}_real_${cache_reads_transport}
+                    PROPERTIES LABELS "integration;network;docker" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
+        endforeach()
+    endforeach()
+endif()

@@ -79,4 +79,3 @@ func redisExpireWithCondition(_ connection: TcpConnection, _ key: Bytes, _ secon
 func redisPexpireWithCondition(_ connection: TcpConnection, _ key: Bytes, _ milliseconds: i32, _ condition: RedisExpireCondition) -> RedisExpireResult {
     redisExpireConditional(connection, key, milliseconds, true, condition)
 }
-

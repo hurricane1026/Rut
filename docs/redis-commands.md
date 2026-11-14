@@ -212,3 +212,6 @@ and bounded Memcached meta GET with flags, CAS and remaining TTL.
 
 See [conditional cache mutations](client-conditional-mutations.md) for the separate
 Redis conditional-expiry module and Memcached CAS-protected deletion.
+
+See [ordered and conditional cache reads](client-cache-reads.md) for typed Redis
+MGET and Memcached retrieval conditional on an existing CAS version.
