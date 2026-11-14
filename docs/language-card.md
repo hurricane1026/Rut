@@ -3405,6 +3405,17 @@ The offline `rut-consumers` executable validates, previews redacted replacements
 inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic
 running-gateway publication. See [offline administration](consumer-registry.md#offline-administration).
 
+`consumerAuthenticateMtls(configuration) -> Json?` is the only registry entry
+point for `method: "mtls"`. That record's `secret` field is a public canonical
+64-character lowercase hexadecimal SHA-256 certificate fingerprint pin. The
+builtin reads only the verified connection's `req.tlsClientCertSha256` internally;
+it has no caller-supplied presented-value parameter. Cleartext, ordinary TLS,
+missing/unknown pins and disabled records return nil. Generic
+`consumerAuthenticate(..., "mtls")` is rejected at compile time and denied by
+the runtime matcher; query/form APIs remain restricted to raw-key `header`
+records. All records, including disabled pins, are validated for exact
+fingerprint format and unique method/pin ownership.
+
 ## Persistent replay claim composition (implemented bounded profile)
 
 The ordinary Rut Redis module exposes `redisReplayClaim` for atomic authenticated

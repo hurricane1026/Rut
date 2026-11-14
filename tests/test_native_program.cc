@@ -23,6 +23,7 @@
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rs256_fixture.h"
+#include "rut/common/types.h"
 #include "rut/jit/native_helper_symbols.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
@@ -3684,5 +3685,83 @@ TEST(native_program, consumer_registry_retirement_preserves_pinned_dispatch) {
     CHECK_EQ(call(pinned, old_frame, old_request, old_arena).status_code, 204u);
     old_arena.destroy();
     new_arena.destroy();
+    pool.destroy();
+}
+
+TEST(native_program, mtls_consumer_registry_pins_verified_connection_identity_across_retirement) {
+    constexpr Str kOldPin =
+        lit_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    constexpr Str kNewPin =
+        lit_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    constexpr Str kOld = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["staff"]}],"credentials":[{"id":"old-cert","consumerId":"alice","method":"mtls","secret":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true}]})");
+    constexpr Str kNew = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":[]}],"credentials":[{"id":"old-cert","consumerId":"alice","method":"mtls","secret":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":false},{"id":"new-cert","consumerId":"alice","method":"mtls","secret":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","enabled":true}]})");
+    const auto kAppend = [](Source& source, Str snapshot) {
+        char quoted[8192];
+        json::Writer output{quoted};
+        if (!json::quote(snapshot, output)) return false;
+        return source.append("route GET \"/\" { guard let identity = consumerAuthenticateMtls(") &&
+               source.append(quoted, output.len) &&
+               source.append(
+                   ") else { return 401 } guard jwtHasGroup(identity, \"staff\") "
+                   "else { return 403 } return 204 }\n");
+    };
+    Source old_source, new_source;
+    REQUIRE(old_source.fd >= 0 && new_source.fd >= 0);
+    REQUIRE(kAppend(old_source, kOld));
+    REQUIRE(kAppend(new_source, kNew));
+    const Program kOldProgram, kNewProgram;
+    REQUIRE(kOldProgram.p && kNewProgram.p);
+    REQUIRE(load(old_source, *kOldProgram.p));
+    REQUIRE(load(new_source, *kNewProgram.p));
+    REQUIRE_EQ(unlink(old_source.path), 0);
+    REQUIRE_EQ(unlink(new_source.path), 0);
+    ConnectionBase conn{};
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    conn.tls_client_cert_sha256_valid = true;
+    memset(conn.tls_client_cert_sha256, 'a', sizeof(conn.tls_client_cert_sha256));
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    struct Frame {
+        jit::HandlerCtx context{};
+        u64 slots[ConnectionBase::kMaxJitHandlerSlots]{};
+        Frame() { context.slot_count = ConnectionBase::kMaxJitHandlerSlots; }
+    } old_ctx, new_old_ctx, new_new_ctx, old_again_ctx, new_clear_ctx, new_server_tls_ctx;
+    const char* request =
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Client-Cert-Sha256: "
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
+        "X-Consumer-ID: alice\r\n\r\n";
+    const auto kCall = [&](jit::HandlerFn handler, Frame& frame) {
+        return jit::HandlerResult::unpack(handler(&conn,
+                                                  &frame.context,
+                                                  reinterpret_cast<const u8*>(request),
+                                                  static_cast<u32>(strlen(request)),
+                                                  &arena));
+    };
+    const auto kPinned = kOldProgram.p->config.routes[0].fn;
+    CHECK_EQ(kCall(kPinned, old_ctx).status_code, 204u);
+    // A reused TLS connection keeps its verified old certificate fingerprint.
+    CHECK_EQ(kOldPin.len, sizeof(conn.tls_client_cert_sha256));
+    const Str kOldFingerprint{conn.tls_client_cert_sha256, sizeof(conn.tls_client_cert_sha256)};
+    CHECK(kOldFingerprint.eq(kOldPin));
+    CHECK_EQ(kCall(kNewProgram.p->config.routes[0].fn, new_old_ctx).status_code, 401u);
+    memset(conn.tls_client_cert_sha256, 'b', sizeof(conn.tls_client_cert_sha256));
+    const Str kNewFingerprint{conn.tls_client_cert_sha256, sizeof(conn.tls_client_cert_sha256)};
+    CHECK(kNewFingerprint.eq(kNewPin));
+    CHECK_EQ(kCall(kNewProgram.p->config.routes[0].fn, new_new_ctx).status_code, 403u);
+    memset(conn.tls_client_cert_sha256, 'a', sizeof(conn.tls_client_cert_sha256));
+    CHECK_EQ(kCall(kPinned, old_again_ctx).status_code, 204u);
+    conn.tls_active = false;
+    conn.tls_handshake_complete = false;
+    conn.tls_client_cert_sha256_valid = false;
+    CHECK_EQ(kCall(kNewProgram.p->config.routes[0].fn, new_clear_ctx).status_code, 401u);
+    conn.tls_active = true;
+    conn.tls_handshake_complete = true;
+    CHECK_EQ(kCall(kNewProgram.p->config.routes[0].fn, new_server_tls_ctx).status_code, 401u);
+    arena.destroy();
     pool.destroy();
 }

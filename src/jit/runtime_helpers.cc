@@ -2840,7 +2840,8 @@ extern "C" void rut_helper_json(void* conn,
         op != static_cast<u32>(json::Op::JwtHasAnyScope) &&
         op != static_cast<u32>(json::Op::ConsumerAuthenticate) &&
         op != static_cast<u32>(json::Op::ConsumerAuthenticateQuery) &&
-        op != static_cast<u32>(json::Op::ConsumerAuthenticateForm))
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateForm) &&
+        op != static_cast<u32>(json::Op::ConsumerAuthenticateMtls))
         return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
@@ -2859,6 +2860,15 @@ extern "C" void rut_helper_json(void* conn,
             return;
     } else if (operation == json::Op::ConsumerAuthenticate) {
         if (!consumer_registry_authenticate(document, {b, b_len}, {c, c_len}, {a, a_len}, writer))
+            return;
+    } else if (operation == json::Op::ConsumerAuthenticateMtls) {
+        u8 has_fingerprint = 0;
+        const char* fingerprint = nullptr;
+        u32 fingerprint_len = 0;
+        rut_helper_req_tls_client_cert_sha256(
+            conn, &has_fingerprint, &fingerprint, &fingerprint_len);
+        if (!has_fingerprint || !consumer_registry_authenticate_mtls(
+                                    document, {a, a_len}, {fingerprint, fingerprint_len}, writer))
             return;
     } else if (operation == json::Op::OauthIntrospectionRequest) {
         if (!oauth_introspection_request({a, a_len}, {b, b_len}, writer)) return;

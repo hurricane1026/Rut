@@ -53,6 +53,19 @@ def main(tool):
         identity = json.loads(inspected.stdout)
         assert identity['consumers'] == [alice]
         assert identity['credentials'] == [{k: v for k, v in key.items() if k != 'secret'}]
+        mtls = dict(id='client-cert-v1', consumerId='alice', method='mtls',
+                    secret='0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                    enabled=False)
+        private(patch, changes([alice], [mtls]))
+        mtls_snapshot = root / 'mtls.json'
+        assert run(tool, 'apply', initial, patch, mtls_snapshot).returncode == 0
+        assert run(tool, 'validate', mtls_snapshot).returncode == 0
+        mtls_inspected = run(tool, 'inspect', mtls_snapshot)
+        assert mtls_inspected.returncode == 0
+        assert json.loads(mtls_inspected.stdout)['credentials'] == [
+            {k: v for k, v in mtls.items() if k != 'secret'}]
+        assert mtls['secret'].encode() not in mtls_inspected.stdout + mtls_inspected.stderr
+        private(patch, changes([alice], [key]))
         # Preflight uses the complete runtime validator before showing metadata.
         # It creates no files, leaves inputs intact, and matches later inspection.
         before = {p.name: p.read_bytes() for p in root.iterdir()}
@@ -98,6 +111,7 @@ def main(tool):
             changes(credentials=[dict(key, secret='')]),
             changes(credentials=[dict(key, extra='private-invalid-field')]),
             changes([dict(alice, groups=['staff', 'staff'])]),
+            changes(credentials=[dict(mtls, secret='A' * 64)]),
             changes([dict(alice, enabled=1)]), changes([dict(alice, id='bad id')]),
             changes([dict(alice, id='x' * 65)]), changes([dict(alice, groups=['x' * 129])]),
             changes(remove_consumers=['alice']),  # would leave an orphan
