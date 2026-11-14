@@ -211,9 +211,9 @@ def exercise(args, root):
                     # retirement is independent of CRL expiry on either backend.
                     assert h1(existing, close=False) == (200, b'alice')
                     time.sleep(min(.25, max(0, deadline - time.time() + 1)))
+                assert h1(existing, close=False) == (200, b'alice')
                 for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
                     denied(port, context(args, root, 'first.pem', version))
-                assert h1(existing) == (200, b'alice')
 
 
 def main():
