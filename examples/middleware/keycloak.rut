@@ -1,0 +1,66 @@
+// Additional provider token-use gate, after cryptographic/claims verification.
+// Keycloak's signed payload typ is distinct from the JWS protected-header typ.
+func requireBearerAccessToken(_ document: Json) -> Json {
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard let type = json.get(document, "/typ") else { respond denied }
+    guard json.string(type).or("") == "Bearer" else { respond denied }
+    document
+}
+
+// Role metadata only: pass an already signature/issuer/audience/time-verified
+// access-token document. Neither roles nor azp authenticate the bearer token.
+func roleValid(_ role: str) -> bool {
+    role != "" && Bytes(role).count <= 128
+}
+
+// Validate the entire selected role array, including entries after a match.
+// Missing/non-array/empty/non-string entries deny; no string splitting or coercion.
+func hasRole(_ roles: Json, _ required: str) -> bool {
+    guard let projected = json.value({groups: roles}) else { false }
+    jwtHasGroup(projected, required)
+}
+
+func hasRealmRole(_ document: Json, _ required: str) -> bool {
+    guard roleValid(required) else { false }
+    guard let realm = json.get(document, "/realm_access") else { false }
+    guard json.kind(realm).or("") == "object" else { false }
+    guard let roles = json.get(realm, "/roles") else { false }
+    hasRole(roles, required)
+}
+
+// A bounded client-ID subset makes the JSON pointer unambiguous. In particular,
+// slash and tilde cannot redirect lookup into another client's role document.
+func clientValid(_ client: str) -> bool {
+    Bytes(client).count <= 128 && client.matches(re"^[A-Za-z0-9._:-]+$")
+}
+
+func hasClientRole(_ document: Json, _ client: str, _ required: str) -> bool {
+    guard clientValid(client) && roleValid(required) else { false }
+    guard let resources = json.get(document, "/resource_access") else { false }
+    guard json.kind(resources).or("") == "object" else { false }
+    guard let resource = json.get(resources, "/" + client) else { false }
+    guard json.kind(resource).or("") == "object" else { false }
+    guard let roles = json.get(resource, "/roles") else { false }
+    hasRole(roles, required)
+}
+
+func requireRealmRole(_ document: Json, _ required: str) -> Json {
+    guard roleValid(required) else { respond 503 }
+    guard hasRealmRole(document, required) else { respond 403 }
+    document
+}
+
+func requireClientRole(_ document: Json, _ client: str, _ required: str) -> Json {
+    guard clientValid(client) && roleValid(required) else { respond 503 }
+    guard hasClientRole(document, client, required) else { respond 403 }
+    document
+}
+
+// Explicit intersection: realm and client roles are independent namespaces.
+func requireRealmAndClientRole(_ document: Json, _ realmRole: str,
+                               _ client: str, _ clientRole: str) -> Json {
+    guard roleValid(realmRole) && clientValid(client) && roleValid(clientRole) else { respond 503 }
+    guard hasRealmRole(document, realmRole) && hasClientRole(document, client, clientRole) else { respond 403 }
+    document
+}

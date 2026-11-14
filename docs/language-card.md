@@ -3435,3 +3435,24 @@ decoded duplicate names/malformed fields, and return identity plus sanitized
 singleton expected Content-Type. They do not mutate the original request or add
 implicit fallback; use an explicitly rebuilt upstream request, as in
 [the source/redaction contract](consumer-registry.md#explicit-query-and-form-credentials).
+
+### Keycloak access-token role helpers
+
+`middleware/keycloak.rut` supplies `hasRealmRole(document, role)` and
+`hasClientRole(document, client, role)` for already verified access-token claims.
+`requireRealmRole`, `requireClientRole` and `requireRealmAndClientRole` preserve
+that document on success, respond 503 for invalid trusted policy and 403 for
+missing/malformed/nonmatching selected memberships. Client IDs are bounded
+ASCII `[A-Za-z0-9._:-]+`; role names are nonempty exact strings up to 128 bytes.
+Realm/client containers are objects and whole role arrays are validated. The
+[example](../examples/keycloak-role-auth.rut) authenticates through configured
+RS256 before calling them. Roles, azp, headers and query parameters never replace
+issuer/audience/signature checks. These are ordinary Rut helpers with no added
+builtin or syntax. See [Keycloak role policies](keycloak-roles.md).
+
+The example additionally calls `keycloak.requireBearerAccessToken(document)`
+after RS256 validation: the signed payload `typ` must equal `Bearer` exactly.
+Missing, non-string, ID-token and refresh-token types receive a challenged 401,
+regardless of matching roles. This provider gate is separate from the JWS header
+`typ` policy, and neither gate replaces signature/issuer/audience/time checks.
+The role metadata helpers alone do not enforce token use.
