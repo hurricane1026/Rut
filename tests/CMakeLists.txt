@@ -4333,6 +4333,11 @@ if(RUT_ENABLE_JIT)
     set_tests_properties(test_simulate_engine PROPERTIES LABELS "unit;sim;jit")
 endif()
 
+add_test(NAME test_upstream_retirement_model_manifest
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_upstream_retirement_model.py
+            --check-only)
+set_tests_properties(test_upstream_retirement_model_manifest PROPERTIES LABELS "unit;model")
+
 add_test(
     NAME test_runtime_state_model
     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py

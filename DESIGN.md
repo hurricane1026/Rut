@@ -4240,6 +4240,15 @@ segfault, or access shared memory.
 
 #### 3.4.22 Concurrent I/O
 
+The io_uring upstream retirement ledger has separate bounded TLC coverage in
+`spec/upstream_retirement.tla`: target/cancel finals, SQ-full retry, `MORE`,
+duplicate/foreign records, downstream close and two-episode slot reuse. Exact
+pending-operation accounting and final reclamation are checked with required
+safety/liveness counterexamples. Concrete C++ permutation and protection-removal
+tests connect these scenarios to dispatch; this is not a refinement proof.
+The model scope and commands are documented in
+[formal verification](docs/user-code-formal-verification.md#io_uring-upstream-retirement).
+
 Compiler verification and offline TLC exports share
 `build_handler_protocol_model`, so source/peer reference cases no longer need
 a separately hand-copied handler. The exporter follows actual RIR control and

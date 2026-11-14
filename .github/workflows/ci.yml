@@ -121,6 +121,19 @@ jobs:
           path: /tmp/wait-scheduler-tlc
           if-no-files-found: ignore
 
+      - name: Check upstream retirement safety and required counterexamples
+        run: |
+          python3 scripts/check_upstream_retirement_model.py --jar /tmp/tla2tools.jar \
+            --output-dir /tmp/upstream-retirement-tlc
+
+      - name: Preserve upstream retirement model traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-retirement-tlc
+          path: /tmp/upstream-retirement-tlc
+          if-no-files-found: ignore
+
       - name: Check synchronization design and required counterexamples
         run: python3 scripts/check_synchronization_model.py --jar /tmp/tla2tools.jar
 
@@ -214,6 +227,20 @@ jobs:
         with:
           name: wait-scheduler-cpp-mutations
           path: /tmp/wait-scheduler-mutations
+          if-no-files-found: ignore
+
+      - name: Reject upstream retirement implementation mutations
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          python3 scripts/check_upstream_retirement_mutations.py --build-dir build \
+            --output-dir /tmp/upstream-retirement-mutations
+
+      - name: Preserve upstream retirement implementation counterexamples
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-retirement-cpp-mutations
+          path: /tmp/upstream-retirement-mutations
           if-no-files-found: ignore
 
       - name: Test
