@@ -134,6 +134,19 @@ jobs:
           path: /tmp/upstream-retirement-tlc
           if-no-files-found: ignore
 
+      - name: Check timer safety, progress and required counterexamples
+        run: |
+          python3 scripts/check_timer_model.py --jar /tmp/tla2tools.jar \
+            --output-dir /tmp/timer-tlc
+
+      - name: Preserve timer model traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timer-tlc
+          path: /tmp/timer-tlc
+          if-no-files-found: ignore
+
       - name: Check synchronization design and required counterexamples
         run: python3 scripts/check_synchronization_model.py --jar /tmp/tla2tools.jar
 
@@ -241,6 +254,20 @@ jobs:
         with:
           name: upstream-retirement-cpp-mutations
           path: /tmp/upstream-retirement-mutations
+          if-no-files-found: ignore
+
+      - name: Reject timer implementation mutations
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        run: |
+          python3 scripts/check_timer_mutations.py --build-dir build \
+            --output-dir /tmp/timer-mutations
+
+      - name: Preserve timer implementation counterexamples
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: timer-cpp-mutations
+          path: /tmp/timer-mutations
           if-no-files-found: ignore
 
       - name: Test
