@@ -309,10 +309,18 @@ target_include_directories(rut_compiler PUBLIC
 )
 
 # Capture syntax is validated even by the LLVM-free frontend.
-include(${PROJECT_SOURCE_DIR}/cmake/RutPCRE2.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake)
 add_library(rut_regex_capture STATIC runtime/regex_capture.cc)
 target_include_directories(rut_regex_capture PUBLIC ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(rut_regex_capture PUBLIC rut_runtime pcre2-8-static)
+target_link_libraries(rut_regex_capture PUBLIC rut_runtime PRIVATE re2::re2)
+# RE2 is an explicitly accepted temporary C++ runtime dependency. This also
+# supplies the library when rut uses Clang -nostdlib++ or GCC's C link driver.
+foreach(_rut_cxx_lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+    if(_rut_cxx_lib STREQUAL "stdc++" OR _rut_cxx_lib STREQUAL "c++" OR
+       _rut_cxx_lib STREQUAL "c++abi" OR _rut_cxx_lib STREQUAL "supc++")
+        target_link_libraries(rut_regex_capture PRIVATE "${_rut_cxx_lib}")
+    endif()
+endforeach()
 target_link_libraries(rut_compiler PUBLIC rut_regex_capture)
 
 
@@ -437,7 +445,7 @@ if(RUT_ENABLE_JIT)
     # A source/configuration fingerprint prevents mixing compiler and server builds.
     file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
-    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/cmake/RutPCRE2.cmake"
+    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake"
         "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake")
@@ -598,7 +606,8 @@ if(RUT_STATIC_RUNTIME)
     target_link_options(rut-consumers PRIVATE -static)
 endif()
 
-# Keep the shipped server independent of the C++ standard/ABI runtime.
+# Keep first-party code and standalone tools independent of the C++ runtime.
+# JIT-enabled rut explicitly links the temporary RE2 backend runtime above.
 # LLVM tools and test executables keep their normal C++ link environment.
 # Sanitizer runtimes are development instrumentation with their own ABI needs.
 if(NOT RUT_SANITIZE)

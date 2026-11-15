@@ -48,24 +48,50 @@ string. Group 0 is the whole first match; groups 1...8 are capture ordinals.
 
 The initial ledger preferred one regex engine. Inspection confirmed that
 [Vectorscan/Hyperscan does not return capturing subexpressions](https://intel.github.io/hyperscan/dev-reference/compilation.html).
-A second bounded C backend is therefore necessary for accurate greedy,
-alternative, optional and nested captures; approximating them through repeated
-Boolean scans would change results. [PCRE2 10.49](https://github.com/PCRE2Project/pcre2/releases/tag/pcre2-10.49)
-is pinned by SHA-256 and built statically, with JIT/Unicode/tools disabled.
-Existing Vectorscan Boolean operations retain their backend and fast path.
-The pinned distribution licence is retained in [pcre2-LICENCE.md](third-party/pcre2-LICENCE.md).
+A separate capture backend is required for greedy, alternative, optional and
+nested captures; repeated Boolean scans cannot preserve those results.
+The current backend is static RE2 2025-11-05 plus Abseil 20250814.1, both pinned
+by SHA-256. Vectorscan Boolean operations are unchanged. Licences are retained in
+[RE2](third-party/re2-LICENSE) and [Abseil](third-party/abseil-LICENSE).
 
-The tradeoff is one maintained dependency and an additional static archive
-(332 KiB in this build). Capture programs own a bounded 1 MiB mmap region;
-matching uses request Arena callbacks, at most 64 KiB cumulative allocation per
-call, a 12 KiB frame-vector heap limit, depth 64 and 100000 matching steps.
-The frame-vector limit fits existing 16 KiB slices. It can reject a complex
-otherwise-valid match: this is a resource error, never an absent capture.
-PCRE2's [match/depth/heap limits](https://www.pcre.org/current/doc/html/pcre2pattern.html)
-are enforced without the PCRE JIT. Native artifacts store the bounded pattern and
-recompile at startup; execution never compiles a request-supplied pattern.
+This replaces the initial PCRE2 adapter following capture performance and
+worst-case latency experiments. RE2 uses Latin-1 byte semantics, leftmost-first
+captures and rejects backreferences/lookaround at configuration compile time.
+The existing opaque adapter is the replacement boundary: no RE2 types escape
+into compiler/native-helper callers. Native artifacts store bounded source with
+the RUTCAP2 marker and compile it at startup, never from request-supplied patterns.
+
+RE2's configured 1 MiB budget approximately bounds compiled programs and DFA
+caches, not all process allocation. Upstream RE2/Abseil use heap allocations,
+including matching paths, and the C++ runtime. This is a temporary exception
+explicitly accepted pending a separate replacement engine; it does not preserve
+the original Arena-only guarantee. Exceptions and RTTI remain disabled.
+JIT-enabled server ELF checks permit the C++ runtime but still reject LLVM and
+shared RE2/Abseil/PCRE libraries. No-JIT server and standalone tools keep their
+original no-C++-runtime checks.
 
 The following sections preserve the original audit and staged validation history.
+
+## RE2 backend validation (2026-11-15)
+
+The following checks exercise the replacement backend, separately from the
+historical PCRE2 validation below:
+
+- Release capture adapter: 5 tests / 40 checks; native routing properties:
+  8 / 72. Backreferences/lookaround reject, ambiguous failures are ordinary
+  nonmatches, and empty/unparticipating captures remain distinct.
+- Full frontend: 1306 / 22907; native loader: 141 / 53995; JIT parse-cache
+  failure cleanup regression: 1 / 12, all passed.
+- Capability CTest: 10/10, including all eight real epoll/io_uring × H1/H2 ×
+  cleartext/TLS profiles with the RE2-native artifacts and capture targets.
+- LLVM-free Debug ASan+UBSan with leak detection: adapter 5 / 40; gap frontend
+  15 / 65. This does not claim a full sanitized live-backend matrix.
+- Three ELF dependency checks passed: the server/backend policy plus the
+  unchanged strict password/consumer tool policies. JIT-enabled server imports
+  libc, libstdc++, libm and libgcc_s; it contains no PCRE2 symbols.
+- Scoped adapter clang-tidy has no first-party diagnostics; changed C++
+  formatting and whitespace checks passed. No-JIT non-sanitized server was not
+  rebuilt in this validation run; its strict check remains registered.
 
 ## Original audit validation (2026-11-15)
 

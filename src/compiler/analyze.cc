@@ -13426,7 +13426,9 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     if (expr.name.eq(lit_str("regexCapture")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail = lit_str(
-            "regexCapture expects unwrapped str, literal regex (1...1024 bytes, at most 8 groups), "
+            "regexCapture expects unwrapped str, literal RE2 regex (1...1024 bytes, at most 8 "
+            "groups; "
+            "no backreferences/lookaround), "
             "and participating group index 0...8");
         if (!route || route->is_timer || expr.args.len != 3 || pipe_lhs || first_arg_override ||
             expr.args[1]->kind != AstExprKind::RegexLit ||

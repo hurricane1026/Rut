@@ -127,7 +127,7 @@ route GET "/capture" {{
 }}
 route GET "/capture-limit" {{
     guard let subject = req.header("X-Subject") else {{ return 400 }}
-    guard let captured = regexCapture(subject, re"(*NO_AUTO_POSSESS)(*NO_START_OPT)^(a+)+$", 1) else {{ return 200 }}
+    guard let captured = regexCapture(subject, re"^(a+)+$", 1) else {{ return 200 }}
     return response(200, body: captured)
 }}
 route GET "/plain" {{ return forward(backend, load_balance: .roundRobin) }}
@@ -259,7 +259,7 @@ route "/" {
                 captures = [('/capture/v12/users/jane', {}, 200, b'/internal/v12/accounts/jane|'),
                             ('/capture/v2/users/', {}, 200, b'/internal/v2/accounts/|'),
                             ('/capture/nomatch', {}, 404, None),
-                            ('/capture-limit', {'X-Subject': 'a' * 128 + '!'}, 500, None)]
+                            ('/capture-limit', {'X-Subject': 'a' * 128 + '!'}, 200, None)]
                 for path, fields, code, expected in captures:
                     if args.h2:
                         result = h2_request(port, path, list(fields.items()), tls_context=context)

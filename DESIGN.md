@@ -130,7 +130,7 @@ This file currently remains the umbrella design doc until that split happens.
 | Userspace codegen | LLVM ORC JIT | Same C++ toolchain, zero FFI overhead, lazy compilation support for L7 handlers |
 | Packet-path codegen | eBPF / XDP | Compile `firewall {}` blocks to kernel-level packet filters for earliest-drop semantics |
 | HTTP parser | Custom (~500 lines) | llhttp is callback-based (bad fit), picohttpparser lacks strict mode; custom parser integrates directly with our Slice buffer + Arena, supports SIMD, full control over strictness (anti-smuggling) |
-| C++ stdlib | `-nostdlib++`, musl libc only | Full memory control, faster compilation |
+| C++ stdlib | First-party code uses `-nostdlib++`; temporary RE2 capture exception below | Explicit backend boundary |
 | Compiler flags | `-fno-exceptions -fno-rtti` | No overhead from unused C++ features |
 
 ---
@@ -11208,10 +11208,23 @@ from metadata-only rollback snapshots; metadata population never mutates them.
 Regex capture results use the native `regexCapture(str, re"literal", group)`
 builtin with an optional string result. This does not implement an approximate
 Swift Regex.Match carrier. Vectorscan cannot expose capturing subexpressions;
-a pinned static PCRE2 10.49 C backend is used only for captures, leaving Boolean
-matching unchanged. Capture programs have bounded mmap ownership and native
-artifacts save/recompile their bounded source at startup. Request matching uses
-Arena callbacks, no hot heap allocation, a 12 KiB frame heap, 64 KiB cumulative
-allocation, depth 64 and 100000 steps. Input/pattern/group limits are 8192/1024/8.
+a pinned static RE2 2025-11-05 backend (Abseil 20250814.1) is used only for
+captures, leaving Boolean matching unchanged. The engine is isolated behind
+`regex_capture.h`; callers and native artifacts never expose RE2 types. Native
+artifacts save/recompile bounded source at startup (RUTCAP2 marker). Matching
+uses Latin-1 byte semantics, leftmost-first captures and no backreferences or
+lookaround. RE2's approximate 1 MiB budget covers compiled programs/DFA caches,
+not a hard cap on total allocations. Input/pattern/group limits are 8192/1024/8.
+
+Temporary dependency exception explicitly accepted for this backend: RE2 and
+Abseil use the C++ standard runtime and heap allocation, including matching
+scratch/cache paths. First-party code retains its allocation policy; the
+adapter owns an mmap-placed RE2 object and calls its destructor on unload.
+Exceptions/RTTI stay disabled. JIT-enabled `rut` explicitly links the compiler's
+C++ runtime; LLVM remains confined to compiler tools. No-JIT `rut`, password
+and consumer tools retain their no-C++-runtime checks. This exception is removed
+when the replacement capture engine is available. It is not a claim of
+allocation-free matching or graceful recovery from process-wide heap exhaustion.
+
 No-match/unparticipating groups are nil; participating empty groups are present.
 Resource errors return 500 before fallback/negation can consume an absent value.

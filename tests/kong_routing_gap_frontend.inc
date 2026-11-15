@@ -264,6 +264,8 @@ route GET "/" {
 }
 )rut") == KongGapStage::Verified);
     const char* invalid[] = {
+        R"rut(route GET "/" { let x = regexCapture(req.path, re"a(?=b)", 0) return 200 })rut",
+        R"rut(route GET "/" { let x = regexCapture(req.path, re"(a)\1", 0) return 200 })rut",
         "route GET \"/\" { let x = regexCapture(req.path, re\"(x)\", 2) return 200 }",
         "route GET \"/\" { let x = regexCapture(req.path, re\"(x)\", 9) return 200 }",
         "route GET \"/\" { let x = regexCapture(req.path, re\"(\", 0) return 200 }",

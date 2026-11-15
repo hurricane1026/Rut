@@ -3663,7 +3663,7 @@ not an authenticated identity. Request headers cannot supply transport SNI.
 ### Bounded regex capture builtin
 
 `regexCapture(subject, re"pattern", group): str?` returns a capture from the
-first byte-oriented PCRE match. Group 0 is the whole matched span; 1...8 are
+first byte-oriented RE2 match. Group 0 is the whole matched span; 1...8 are
 parenthesized capture ordinals, including named groups. No match or an optional
 group that did not participate returns nil; an empty participating group returns
 present empty `str`. Unwrap before concatenating or passing `set_path:`. This is
@@ -3673,9 +3673,12 @@ Patterns and group indexes must be literals; patterns are at most 1024 bytes,
 with at most 8 groups. Input is at most 8192 bytes. Compilation occurs during
 configuration/startup, never from runtime input. Captures borrow their subject;
 `set_path:` copies the final target into request Arena storage. Capture matching
-uses pinned static PCRE2 10.49, no JIT/Unicode, with request Arena allocation,
-64 KiB cumulative allocation per call, 12 KiB frame heap, depth 64 and 100000
-matching steps. Invalid patterns/group indexes reject at compile time. Runtime
+uses pinned static RE2 2025-11-05 with Latin-1 byte semantics and an approximate
+1 MiB compiled-program/DFA-cache budget. Backreferences and lookaround are not
+supported and reject at compile time. RE2/Abseil currently use the C++ runtime
+and internal heap allocation, including some matching paths; request Arena does
+not account for those allocations. This is an explicitly accepted temporary
+backend exception, isolated behind the capture adapter for later replacement. Invalid patterns/group indexes reject at compile time. Runtime
 resource failures return 500 immediately, before nil recovery can accept them.
 Available in HTTP handlers/helpers, not timers or WebSocket callbacks. Existing
 `matches(re"...")` retains its Vectorscan full-match Boolean behavior.

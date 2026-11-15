@@ -6,7 +6,9 @@
 namespace rut {
 // Capture regexes are separate from Vectorscan's full-match Boolean databases.
 // Their serialized form is the bounded source pattern, recompiled at startup.
-inline constexpr char kCaptureRegexMarker[] = "RUTCAP1:";
+// Backend boundary: no engine types escape this header. Upstream RE2 currently
+// owns heap scratch/cache allocations independently of the request Arena.
+inline constexpr char kCaptureRegexMarker[] = "RUTCAP2:";
 inline constexpr u32 kCaptureRegexMarkerLength = 8;
 void* capture_regex_compile(Str pattern);
 void capture_regex_destroy(void* program);

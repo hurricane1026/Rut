@@ -54,7 +54,7 @@ TEST(regex_capture, missing_optional_and_empty_participation_are_distinct) {
     CHECK_EQ(capture_regex_match(empty.value, memory.arena, {"z", 1}, 1, &output), 0);
 }
 
-TEST(regex_capture, input_pattern_group_and_allocator_bounds_fail_closed) {
+TEST(regex_capture, input_pattern_group_and_connection_bounds_fail_closed) {
     CHECK(capture_regex_compile({"(", 1}) == nullptr);
     CHECK(capture_regex_compile({"()()()()()()()()()", 18}) == nullptr);
     Program program({"(a)", 3});
@@ -67,10 +67,37 @@ TEST(regex_capture, input_pattern_group_and_allocator_bounds_fail_closed) {
              2);
     CHECK_EQ(capture_regex_match(program.value, memory.arena, {"a", 1}, 2, &output), 2);
     REQUIRE(memory.arena.alloc(memory.arena.current->remaining()) != nullptr);
+    // RE2 does not use the request Arena for its internal scratch allocations.
+    CHECK_EQ(capture_regex_match(program.value, memory.arena, {"a", 1}, 1, &output), 1);
+    CHECK(output.eq({"a", 1}));
+    memory.arena.backend.pool = nullptr;
     CHECK_EQ(capture_regex_match(program.value, memory.arena, {"a", 1}, 1, &output), 2);
+    memory.arena.backend.pool = &memory.pool;
     CHECK(output.ptr == nullptr);
     memory.arena.destroy();
     CHECK_EQ(memory.pool.count - memory.pool.available(), 0u);
+}
+
+TEST(regex_capture, re2_rejects_backreferences_and_lookaround_at_compile_time) {
+    CHECK(capture_regex_compile({"(a)\\1", 5}) == nullptr);
+    CHECK(capture_regex_compile({"a(?=b)", 6}) == nullptr);
+    CHECK(capture_regex_compile({"a(?!b)", 6}) == nullptr);
+}
+
+TEST(regex_capture, ambiguous_failure_is_an_ordinary_nonmatch) {
+    Program program({"^(a+)+$", 7});
+    REQUIRE(program.value);
+    MatchArena memory;
+    REQUIRE(memory.init());
+    char subject[129];
+    __builtin_memset(subject, 'a', sizeof(subject));
+    subject[128] = '!';
+    Str output;
+    CHECK_EQ(
+        capture_regex_match(program.value, memory.arena, {subject, sizeof(subject)}, 1, &output),
+        0);
+    CHECK(output.ptr == nullptr);
+    CHECK_EQ(memory.arena.space_used(), 0u);
 }
 
 int main(int argc, char** argv) {

@@ -181,8 +181,8 @@ TEST(routing_properties, regex_capture_serialization_roundtrip_and_compile_bound
     CHECK(rut_helper_regex_capture_compile("()()()()()()()()()", 18) == nullptr);
 }
 
-TEST(routing_properties, capture_resource_failure_is_distinct_from_missing_and_releases_pool) {
-    const char* pattern = "(*NO_AUTO_POSSESS)(*NO_START_OPT)^(a+)+$";
+TEST(routing_properties, capture_ambiguous_nonmatch_and_missing_allocator_are_distinct) {
+    const char* pattern = "^(a+)+$";
     void* program = rut_helper_regex_capture_compile(pattern, __builtin_strlen(pattern));
     REQUIRE(program != nullptr);
     SlicePool pool;
@@ -197,7 +197,7 @@ TEST(routing_properties, capture_resource_failure_is_distinct_from_missing_and_r
     u32 length = 0;
     CHECK_EQ(rut_helper_regex_capture(
                  &connection, subject, sizeof(subject), program, 1, &value, &length),
-             2);
+             0);
     CHECK(value == nullptr);
     CHECK_EQ(length, 0u);
     connection.reset();

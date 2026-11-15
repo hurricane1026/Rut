@@ -609,14 +609,25 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
 
-# Verify the shipped runtime does not import a C++ standard/ABI library.
+# Verify the server dependency boundary, including the temporary RE2 exception.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT RUT_SANITIZE)
-    add_test(NAME test_runtime_no_cxx_dependencies
-        COMMAND ${CMAKE_COMMAND}
-            -DREADELF=${CMAKE_READELF}
-            -DRUT_BINARY=$<TARGET_FILE:rut>
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
-    set_tests_properties(test_runtime_no_cxx_dependencies PROPERTIES LABELS "unit;cli")
+    if(RUT_ENABLE_JIT)
+        # RE2's C++ runtime is temporary and explicit; LLVM and shared engine
+        # libraries must still stay out of the shipped server dependency graph.
+        add_test(NAME test_runtime_capture_backend_dependencies
+            COMMAND ${CMAKE_COMMAND}
+                -DREADELF=${CMAKE_READELF}
+                -DRUT_BINARY=$<TARGET_FILE:rut>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_capture_backend_deps.cmake)
+        set_tests_properties(test_runtime_capture_backend_dependencies PROPERTIES LABELS "unit;cli")
+    else()
+        add_test(NAME test_runtime_no_cxx_dependencies
+            COMMAND ${CMAKE_COMMAND}
+                -DREADELF=${CMAKE_READELF}
+                -DRUT_BINARY=$<TARGET_FILE:rut>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
+        set_tests_properties(test_runtime_no_cxx_dependencies PROPERTIES LABELS "unit;cli")
+    endif()
     if(RUT_STATIC_RUNTIME)
         add_test(NAME test_runtime_no_dynamic_dependencies
             COMMAND ${CMAKE_COMMAND}
