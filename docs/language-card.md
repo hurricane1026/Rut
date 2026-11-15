@@ -3502,6 +3502,21 @@ regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
 
+### Casdoor DefaultJWT access-token helpers
+
+`middleware/casdoor.rut` expects the verified Json returned by
+`auth.jwtDocumentRs256`. `requireAccessToken(document, org)` accepts only exact
+`tokenType == "access-token"` and exact `owner == org`. `requireGroup` and
+`requireAllGroups` authorize exact `<org>/<group>` values in the whole signed
+`groups` array. Org and group components are each 1–128 ASCII bytes from
+`[A-Za-z0-9._:-]+`; each helper validates its complete trusted selector set
+before the provider token/owner gate, after the calling route has verified the
+JWT. Invalid trusted configuration responds 503, token/owner failure 401, and
+missing/malformed/mismatching groups 403. This profile assumes
+Casdoor `TokenFormat: "JWT"` with its default/ID group format; JWT-Standard,
+Name and Path group formats are unsupported. See
+[Casdoor access-token policy](casdoor-access-token.md).
+
 ### Atomic read mutations and metadata retrieval
 
 Ordinary Redis source helpers expose GETEX with an exclusive typed expiry option

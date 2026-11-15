@@ -11057,6 +11057,27 @@ regardless of matching roles. This provider gate is separate from the JWS header
 `typ` policy, and neither gate replaces signature/issuer/audience/time checks.
 The role metadata helpers alone do not enforce token use.
 
+### Casdoor DefaultJWT access-token authorization
+
+The free `casdoor` Rut module is a bounded adapter for Casdoor v4.27.1's
+`TokenFormat: "JWT"` source profile with the default/ID token-group format,
+after configured RS256 signature, issuer, audience, subject, time and revocation
+verification. `requireAccessToken` requires exact signed
+`tokenType == "access-token"` and configured `owner` equality. `requireGroup`
+and `requireAllGroups` compare exact `<owner>/<group>` values in the complete
+signed `groups` array using the existing `jwtHasGroup` validator. Organization
+and group components are bounded 1–128 ASCII `[A-Za-z0-9._:-]+`; each policy
+helper validates selectors before provider token/owner claims, after the route
+verifies the JWT. Invalid trusted policy returns 503, wrong token type/owner 401,
+and missing or malformed membership 403. This does not dynamically detect a
+format claim: the token does not carry the application setting. JWT-Standard
+`UserStandard` omits groups and
+the separately configured Name/Path token-group formats are outside the
+profile. It adds no login, refresh, account status lookup, provider API, builtin,
+keyword, dependency or live revocation. Native HTTP/1.0, HTTP/1.1 and HTTP/2
+tests cover both backends and O0/O2 after source/module unlink; they validate the
+claim contract, not live-provider conformance. See `docs/casdoor-access-token.md`.
+
 ### Bounded client diagnostics
 
 Redis PING/ECHO/INFO compose the existing scalar RESP2 executor with expected

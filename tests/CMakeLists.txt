@@ -4080,6 +4080,17 @@ if(RUT_ENABLE_JIT)
                         LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            foreach(casdoor_backend epoll io_uring)
+                foreach(casdoor_opt 0 2)
+                    add_test(NAME test_casdoor_access_${casdoor_backend}_opt${casdoor_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_casdoor_access.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/casdoor-access-auth.rut
+                            --backend ${casdoor_backend} --opt ${casdoor_opt})
+                    set_tests_properties(test_casdoor_access_${casdoor_backend}_opt${casdoor_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(scope_backend epoll io_uring)
                 add_test(NAME test_jwt_scope_lists_${scope_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_scope_lists.py
@@ -4771,6 +4782,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
         set_tests_properties(test_memcache_client_${backend}_tls PROPERTIES
             LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME test_memcache_client_procfs_race_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client_procfs_race.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --backend ${backend})
+        set_tests_properties(test_memcache_client_procfs_race_${backend} PROPERTIES
+            LABELS "integration;network" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         foreach(memcache_tls tcp tls)
             set(memcache_tls_args)
             if(memcache_tls STREQUAL "tls")
@@ -5210,6 +5227,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             endforeach()
         endforeach()
     endforeach()
+    add_test(NAME test_redis_commands_procfs_child_race
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands_procfs_race.py
+            --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients)
+    set_tests_properties(test_redis_commands_procfs_child_race PROPERTIES
+        LABELS "integration;network" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)

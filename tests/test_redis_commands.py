@@ -358,14 +358,14 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
                 children = Path(f'/proc/{process.pid}/task/{process.pid}/children')
                 try:
                     child_ids = children.read_text().split()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     child_ids = []
                 if child_ids:
                     for child in child_ids:
                         owned_children.setdefault(child, birth(child))
                         try:
                             status = Path(f'/proc/{child}/status').read_text()
-                        except FileNotFoundError:
+                        except (FileNotFoundError, ProcessLookupError):
                             continue
                         match = re.search(r'^VmRSS:\s+(\d+) kB$', status, re.M)
                         if match:
