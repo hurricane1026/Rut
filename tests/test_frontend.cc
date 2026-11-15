@@ -19606,6 +19606,22 @@ TEST(frontend, lower_forward_route_to_rir) {
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     rir.destroy();
 }
+TEST(frontend, direct_guard_fallback_forward_keeps_route_scope) {
+    const char* src =
+        "upstream api\n"
+        "route GET \"/users\" { let target = req.pathOnly guard req.isTls else { return "
+        "forward(api, load_balance: .roundRobin, set_path: target) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ForwardUpstream));
+}
 TEST(frontend, let_if_lowers_to_branching_rir) {
     const char* src =
         "upstream api\n"

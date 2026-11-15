@@ -1165,8 +1165,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // Verified inbound mTLS identity accounts for 64 bytes; struct padding absorbs its
     // valid flag. The optional HTTP/1 TLS-upstream owner and transport links account for
     // two pointers plus 8 bytes of generation/state/queued metadata after
-    // reordering. The measured current 64-bit Connection layout is 5704 bytes.
-    CHECK_EQ(sizeof(Connection), 5704u);
+    // reordering. The bounded TLS server-name and route-host views add 512 bytes
+    // total. The measured current 64-bit Connection layout is 6216 bytes.
+    CHECK_EQ(sizeof(Connection), 6216u);
 }
 
 TEST(iouring_idle_trim,

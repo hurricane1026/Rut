@@ -1790,7 +1790,8 @@ void streaming_case(rut::test::TestCase* _tc,
             sizeof(source),
             "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2%s }\n"
             "route POST \"/test.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n"
-            "route POST \"/jit.Echo/Call\" { return forward(grpc, load_balance: .roundRobin) }\n"
+            "route POST \"/jit.Echo/Call\" { return forward(grpc, load_balance: .roundRobin, "
+            "set_path: req.pathOnly) }\n"
             "route POST \"/jitwait.Echo/Call\" { wait(100) return forward(grpc, load_balance: "
             ".roundRobin) }\n",
             get_port(server->listen_fd),
@@ -1802,6 +1803,15 @@ void streaming_case(rut::test::TestCase* _tc,
         unlink(path);
         REQUIRE(loaded);
         CHECK(compiled->program.config.upstreams[0].http2);
+        bool found_rewritten_route = false;
+        for (u32 i = 0; i < compiled->program.config.route_count; i++) {
+            const RouteEntry& route = compiled->program.config.routes[i];
+            if (Str{route.path, route.path_len}.eq(lit_str("/jit.Echo/Call"))) {
+                CHECK(route.h2_buffer_forward_body);
+                found_rewritten_route = true;
+            }
+        }
+        CHECK(found_rewritten_route);
         shard->route_config = &compiled->program.config;
     }
 #endif

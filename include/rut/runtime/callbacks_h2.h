@@ -637,6 +637,10 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
     return true;
 }
 
+inline bool h2_should_buffer_forward_body(const RouteEntry& route, const ParsedRequest& req) {
+    return route.h2_buffer_forward_body && !grpc_request(req);
+}
+
 inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_http_cache_ttl = h2.pending_http_cache_route = 0;
     h2.pending_stream = 0;
@@ -1890,7 +1894,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // when the handler does not read req.body. Such handlers still
             // avoid buffering DATA; requests without a declared length retain
             // the immediate body-agnostic dispatch path below.
-            if (!end_stream && (route->needs_req_body || route->h2_buffer_forward_body ||
+            const bool buffer_forward_body = h2_should_buffer_forward_body(*route, req);
+            if (!end_stream && (route->needs_req_body || buffer_forward_body ||
                                 (req.has_content_length && !grpc_request(req)))) {
                 h2_defer_until_data_end(
                     d,
@@ -1898,7 +1903,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                     headers,
                     nheaders,
                     req,
-                    /*buffer_body=*/route->needs_req_body || route->h2_buffer_forward_body,
+                    /*buffer_body=*/route->needs_req_body || buffer_forward_body,
                     RouteAction::JitHandler,
                     config,
                     route,

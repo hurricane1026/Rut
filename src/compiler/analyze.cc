@@ -25871,7 +25871,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 } else {
                     if (is_ast_hir_terminator(*stmt.else_stmt)) {
-                        auto fail_term = analyze_term(*stmt.else_stmt, mod);
+                        auto fail_term = analyze_term(
+                            *stmt.else_stmt, mod, &route, route.locals.data, route.locals.len);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {

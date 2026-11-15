@@ -47,9 +47,10 @@ inline bool route_host_pattern_valid(Str host) {
             if (label == 0 || host.ptr[i - 1] == '-') return false;
             label = 0;
         } else {
+            ++label;
             if (!((kByte >= 'a' && kByte <= 'z') || (kByte >= '0' && kByte <= '9') ||
                   kByte == '-') ||
-                (label == 0 && kByte == '-') || ++label > 63)
+                (label == 1 && kByte == '-') || label > 63)
                 return false;
         }
     }
