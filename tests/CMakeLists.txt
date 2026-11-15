@@ -4782,6 +4782,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend} --opt 2 --tls)
         set_tests_properties(test_memcache_client_${backend}_tls PROPERTIES
             LABELS "integration;network" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME test_memcache_client_procfs_race_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_client_procfs_race.py
+                --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+                --backend ${backend})
+        set_tests_properties(test_memcache_client_procfs_race_${backend} PROPERTIES
+            LABELS "integration;network" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         foreach(memcache_tls tcp tls)
             set(memcache_tls_args)
             if(memcache_tls STREQUAL "tls")

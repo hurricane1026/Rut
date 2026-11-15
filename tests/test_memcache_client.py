@@ -388,7 +388,7 @@ def gateway(args, endpoint, program_factory=None, extra_libraries=(), entrypoint
         def birth(pid):
             try:
                 return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return None
 
         try:
@@ -397,13 +397,13 @@ def gateway(args, endpoint, program_factory=None, extra_libraries=(), entrypoint
                 child_file = Path(f'/proc/{process.pid}/task/{process.pid}/children')
                 try:
                     child_ids = child_file.read_text().split()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     child_ids = []
                 for pid in child_ids:
                     children.setdefault(pid, birth(pid))
                     try:
                         status = Path(f'/proc/{pid}/status').read_text()
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         continue
                     rss = re.search(r'^VmRSS:\s+(\d+) kB$', status, re.M)
                     if rss:
