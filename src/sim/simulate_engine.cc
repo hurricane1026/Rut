@@ -1,5 +1,6 @@
 #include "rut/sim/simulate_engine.h"
 
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_builder.h"
@@ -230,13 +231,15 @@ static bool route_matches(const Engine::CompiledRoute& route,
     return true;
 }
 
-static const Engine::CompiledRoute* select_route(const Engine& engine,
-                                                 u8 method_key,
-                                                 const char* path,
-                                                 u32 path_len,
-                                                 RouteParam* out_params = nullptr,
-                                                 u32* out_param_count = nullptr,
-                                                 u32 out_param_cap = 0) {
+static const Engine::CompiledRoute* select_route_in_scope(const Engine& engine,
+                                                          u8 method_key,
+                                                          const char* path,
+                                                          u32 path_len,
+                                                          Str host_scope,
+                                                          bool global_scope,
+                                                          RouteParam* out_params,
+                                                          u32* out_param_count,
+                                                          u32 out_param_cap) {
     const Engine::CompiledRoute* best = nullptr;
     u32 best_depth = 0;
     u32 best_static_segments = 0;
@@ -247,6 +250,9 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
 
     for (u32 i = 0; i < engine.route_count; i++) {
         const auto& route = engine.routes[i];
+        if (global_scope ? route.host_len != 0
+                         : !route_host_equal({route.host, route.host_len}, host_scope))
+            continue;
         if (route.method != 0 && route.method != method_key) continue;
         const bool method_specific = route.method != 0;
         RouteParam candidate_params[kMaxRouteParams]{};
@@ -288,6 +294,65 @@ static const Engine::CompiledRoute* select_route(const Engine& engine,
     }
     if (out_param_count) *out_param_count = 0;
     return nullptr;
+}
+
+static const Engine::CompiledRoute* select_route(const Engine& engine,
+                                                 u8 method_key,
+                                                 const char* path,
+                                                 u32 path_len,
+                                                 Str request_host,
+                                                 RouteParam* out_params = nullptr,
+                                                 u32* out_param_count = nullptr,
+                                                 u32 out_param_cap = 0) {
+    if (out_param_count) *out_param_count = 0;
+    if (request_host.len != 0) {
+        const Engine::CompiledRoute* best = nullptr;
+        u32 best_host_score = 0;
+        RouteParam best_params[kMaxRouteParams]{};
+        u32 best_param_count = 0;
+        for (u32 i = 0; i < engine.route_count; i++) {
+            const auto& first = engine.routes[i];
+            if (first.host_len == 0) continue;
+            const Str scope{first.host, first.host_len};
+            bool previously_seen = false;
+            for (u32 j = 0; j < i; j++) {
+                const auto& earlier = engine.routes[j];
+                if (earlier.host_len != 0 &&
+                    route_host_equal({earlier.host, earlier.host_len}, scope)) {
+                    previously_seen = true;
+                    break;
+                }
+            }
+            if (previously_seen) continue;
+            const u32 host_score = route_host_match_score(scope, request_host);
+            if (host_score == 0 || host_score <= best_host_score) continue;
+            RouteParam scope_params[kMaxRouteParams]{};
+            u32 scope_param_count = 0;
+            const auto* scope_route = select_route_in_scope(engine,
+                                                            method_key,
+                                                            path,
+                                                            path_len,
+                                                            scope,
+                                                            false,
+                                                            scope_params,
+                                                            &scope_param_count,
+                                                            out_param_cap);
+            if (!scope_route) continue;
+            best = scope_route;
+            best_host_score = host_score;
+            best_param_count = scope_param_count;
+            for (u32 j = 0; j < best_param_count; j++) best_params[j] = scope_params[j];
+        }
+        if (best) {
+            if (out_params) {
+                for (u32 i = 0; i < best_param_count; i++) out_params[i] = best_params[i];
+            }
+            if (out_param_count) *out_param_count = best_param_count;
+            return best;
+        }
+    }
+    return select_route_in_scope(
+        engine, method_key, path, path_len, {}, true, out_params, out_param_count, out_param_cap);
 }
 
 static u32 visible_path_len(Str path) {
@@ -889,13 +954,19 @@ bool Engine::init(const rir::Module& module,
         void* addr = jit.lookup(symbol);
         if (!addr) return fail();
 
-        if (fn.route_pattern.len >= sizeof(next_routes[0].pattern)) return fail();
+        if (fn.route_pattern.len >= sizeof(next_routes[0].pattern) ||
+            fn.route_host.len >= sizeof(next_routes[0].host) ||
+            (fn.route_host.len != 0 && !route_host_pattern_valid(fn.route_host)))
+            return fail();
 
         auto& route = next_routes[next_route_count++];
         route.method = route_method_key_from_legacy_char(fn.http_method);
         route.pattern_len = fn.route_pattern.len;
         for (u32 j = 0; j < route.pattern_len; j++) route.pattern[j] = fn.route_pattern.ptr[j];
         route.pattern[route.pattern_len] = '\0';
+        route.host_len = static_cast<u16>(fn.route_host.len);
+        for (u32 j = 0; j < route.host_len; j++) route.host[j] = fn.route_host.ptr[j];
+        route.host[route.host_len] = '\0';
         route.fn = reinterpret_cast<jit::HandlerFn>(addr);
         route.needs_req_body = rir_function_needs_req_body(fn);
     }
@@ -934,12 +1005,31 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     for (u32 i = 0; i < copy_len; i++) result.path[i] = req.path.ptr[i];
     result.path[copy_len] = '\0';
 
+    Connection conn;
+    conn.reset();
+    bool has_host_scope = false;
+    for (u32 i = 0; i < engine.route_count; i++) {
+        if (engine.routes[i].host_len != 0) {
+            has_host_scope = true;
+            break;
+        }
+    }
+    if (has_host_scope && !conn.capture_routing_host(req)) {
+        result.action = jit::HandlerAction::ReturnStatus;
+        result.actual_status = 400;
+        result.verdict = entry.resp_status == 400 && entry.upstream_name[0] == '\0'
+                             ? Verdict::Match
+                             : Verdict::Mismatch;
+        return result;
+    }
+
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     const auto* route = select_route(engine,
                                      http_route_method_key(req.method),
                                      req.path.ptr,
                                      kPathLen,
+                                     conn.routing_host(),
                                      route_params,
                                      &route_param_count,
                                      kMaxRouteParams);
@@ -956,13 +1046,11 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
         return result;
     }
 
-    Connection conn;
     SlicePool json_pool;
     if (!json_pool.init(64)) {
         result.verdict = Verdict::Failed;
         return result;
     }
-    conn.reset();
     conn.json_arena.backend.pool = &json_pool;
     harness::HandlerExecution execution{};
     execution.init(route->fn, &conn, entry.raw_headers, entry.raw_header_len);

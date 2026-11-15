@@ -109,6 +109,8 @@ struct Engine {
         u8 method = 0;
         char pattern[128]{};
         u32 pattern_len = 0;
+        char host[254]{};
+        u16 host_len = 0;
         jit::HandlerFn fn = nullptr;
         bool needs_req_body = false;
     };
