@@ -5115,6 +5115,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         set_tests_properties(test_h1_tls_source_${h1_tls_backend} PROPERTIES
             LABELS "network;cli" TIMEOUT 60)
     endforeach()
+    add_test(NAME test_mtls_access_io_uring_skip
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_access_io_uring_skip.py
+            --testdata ${RUT_TLS_TESTDATA_DIR})
+    set_tests_properties(test_mtls_access_io_uring_skip PROPERTIES
+        LABELS "integration;auth" TIMEOUT 30)
 endif()
 
 # Explicit absolute expiry stays within the existing client transport profile.
