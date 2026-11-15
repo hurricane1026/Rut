@@ -32912,3 +32912,46 @@ TEST(jit, owned_forward_target_survives_input_changes_and_missing_pool_fails_clo
     CHECK(conn.req_path_overridden);
     CHECK(conn.req_path_override.ptr == nullptr);
 }
+
+TEST(jit, capture_failure_unprimes_request_cache_before_buffer_reuse) {
+    const char* source = R"rut(
+route GET "/" {
+    guard let captured = regexCapture(req.pathOnly, re"^(.*)$", 1) else { return 200 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule module{};
+    REQUIRE(lower_to_rir(mir.value(), module));
+    auto generated = codegen(module.module);
+    REQUIRE(generated.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(generated.mod, generated.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    static constexpr char kOld[] = "GET /old HTTP/1.1\r\nX-Probe: aaaa\r\n\r\n";
+    static constexpr char kNew[] = "GET /newer HTTP/1.1\r\nX-Probe: aa\r\n\r\n";
+    REQUIRE_EQ(sizeof(kOld), sizeof(kNew));
+    char request[sizeof(kOld)];
+    __builtin_memcpy(request, kOld, sizeof(request));
+    HandlerCtx context{};
+    // No connection allocator forces a resource error before guard recovery.
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, &context, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.status_code, 500);
+    __builtin_memcpy(request, kNew, sizeof(request));
+    const char* path = nullptr;
+    u32 length = 0;
+    rut_helper_req_path(reinterpret_cast<const u8*>(request), sizeof(request) - 1, &path, &length);
+    CHECK((Str{path, length}.eq({"/newer", 6})));
+    engine.shutdown();
+    module.destroy();
+}

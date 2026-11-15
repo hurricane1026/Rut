@@ -1986,6 +1986,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 c.builder, LLVMIntULE, state, LLVMConstInt(c.i8_ty, 1, 0), "capture.valid");
             LLVMBuildCondBr(c.builder, valid, ok, failed);
             LLVMPositionBuilderAtEnd(c.builder, failed);
+            c.emit_parse_unprime();
             LLVMBuildRet(
                 c.builder,
                 LLVMConstInt(

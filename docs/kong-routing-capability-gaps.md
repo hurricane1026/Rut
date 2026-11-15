@@ -183,7 +183,7 @@ JIT enabled, both real I/O backends, project-pinned OpenSSL/PCRE2:
   and captured target rewriting. Missing Host retains global-route eligibility.
 - Existing pinned Kong differentials: **2/2 entries**, retaining each backend's
   16 equivalences and 5 documented differences; no universal Kong parity claim.
-- Existing regex/native-helper/target JIT regressions **17 / 10485**, loader
+- Existing regex/native-helper/target JIT regressions **18 / 10497**, loader
   **141 / 53995**, harness **56 / 417**, simulation **69 / 474**, ART **43 / 1416**
   and segment trie **39 / 4651**, all passed.
 - LLVM-free Debug ASan+UBSan build: capture adapter **3 / 30**, gap frontend
@@ -202,3 +202,9 @@ broaden every legacy request-policy profile or every combination of policies.
 H2 request forwarding retains its documented total 16 KiB synth bound; capture
 resource exhaustion is an explicit 500. These limits are separate from the ten
 configuration intents proved above.
+
+Final review added a red/green JIT regression for capture resource failure:
+returning 500 must unprime the per-invocation request parse cache before the same
+buffer address/length is reused with a different path boundary. It failed before
+the cleanup was added and passed afterward (1 test / 12 checks); the 18-test JIT
+filter and all 12 capability CTest entries passed again after that fix.
