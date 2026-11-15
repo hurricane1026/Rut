@@ -484,6 +484,30 @@ TEST(simulate_engine, host_scopes_precede_path_match_and_fall_back_to_global) {
     rir.destroy();
 }
 
+TEST(simulate_engine, captured_peer_port_is_visible_to_route_handlers) {
+    const char* src =
+        "route GET \"/port\" { guard req.remotePort == 12345 else { return 500 } return 201 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    CaptureEntry entry = make_entry("GET /port HTTP/1.1\r\nHost: x\r\n\r\n", 201);
+    entry.peer_port = 12345;
+    const SimulateResult with_port = simulate_one(engine, entry);
+    CHECK_EQ(with_port.verdict, Verdict::Match);
+    CHECK_EQ(with_port.actual_status, 201u);
+
+    entry.peer_port = 0;
+    entry.resp_status = 500;
+    const SimulateResult legacy_port = simulate_one(engine, entry);
+    CHECK_EQ(legacy_port.verdict, Verdict::Match);
+    CHECK_EQ(legacy_port.actual_status, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 // Helper: compile a .rut source to an RIR module owned by `rir`.
 // The caller must keep `rir` alive for as long as the Engine.
 static bool compile_to_rir(const char* src, FrontendRirModule& rir) {

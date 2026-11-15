@@ -1007,6 +1007,7 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
 
     Connection conn;
     conn.reset();
+    conn.peer_port = entry.peer_port;
     bool has_host_scope = false;
     for (u32 i = 0; i < engine.route_count; i++) {
         if (engine.routes[i].host_len != 0) {
