@@ -1,0 +1,87 @@
+# Kong routing capability gap witnesses
+
+Audit base: `a3fe7f77de60d778ccbab68016a62277f88347c9` (2026-11-15).
+The goal is to express the same configuration intent in native Rut, not to import
+Kong JSON, introduce Kong keywords, or silently change existing Rut semantics.
+
+These are **current-behavior characterization tests**. A passing rejection test
+confirms an open gap; it does not mean that the capability is implemented. When
+implementing a capability, change its witness to positive acceptance and add
+appropriate wire/lifecycle tests rather than retaining the old rejection.
+
+## Reproduce
+
+Use the normal Linux JIT-enabled CMake build and pinned project dependencies:
+
+```sh
+cmake --build build --target test_frontend test_network
+ctest --test-dir build -L kong-gap --output-on-failure --no-tests=error
+```
+
+The label selects eight frontend tests and five deterministic runtime tests.
+The frontend controls pass parsing, semantic analysis, MIR/RIR lowering and the
+RIR verifier. The runtime witnesses exercise the production route matcher,
+request-target materializer and, where specified, Forward refusal path using the
+existing SmallLoop backend. No new test framework or dependency is introduced.
+
+## Witness ledger
+
+Every test below uses suite `kong_routing_gap`.
+
+| Configuration intent | Witness name | Expected current observation |
+| --- | --- | --- |
+| Exact path, byte prefix, regex predicate, Host/header/query conditions and method union | `expression_routing_controls_reach_verified_rir` | Seven positive source controls reach verified RIR. These capabilities are not gaps. |
+| `/users/:id` to `/internal/accounts/<id>` | `dynamic_captured_path_rejected_after_literal_control` | Literal `set_path` works; a local computed from the captured ID is rejected during parsing. |
+| Strip the byte prefix `/catalog` from `/catalogue` | `non_slash_strip_prefix_rejected_after_clean_prefix_control` | `/catalog/` is accepted; the otherwise identical `/catalog` prefix is rejected. |
+| Obtain regex captures for downstream policy/rewrite | `regex_capture_accessor_rejected_after_boolean_control` | `.matches(re"...")` works as a bool; the language-card target spelling `.match(re"...")` is rejected during parsing. This does not reject ordinary `:param` captures. |
+| Route on actual SNI, source/destination port or TLS state | `connection_metadata_accessor_probes_are_not_http_fields` | `req.httpVersion` works; candidate `req.sni`, `req.remotePort`, `req.localPort`, `req.isTls` fields reject during analysis. These probes establish absence of these accessors, not absence of native transport metadata or every imaginable alternative spelling. The request-field inventory was separately inspected. Spoofable headers are not equivalent evidence. |
+| Independent routes sharing method/path but differing by Host | `distinct_host_routes_collide_but_merged_branch_is_supported` | Separate declarations reject with `duplicate route path and method`; merged Host branching works. This is a route/policy organization limitation, not an inability to route by Host. |
+| Preserve Host together with prefix rewrite | `preserve_host_and_transform_each_work_but_combination_rejects` | The existing closed `.preserve` request policy works alone; adding the separately supported transform rejects during semantic analysis with `request_policy host: .preserve does not support this forward option`. |
+| Prefix rewrite together with chain-after response headers | `after_response_header_works_until_prefix_transform_is_added` | After-header effect works alone; the transform combination rejects with its explicit semantic diagnostic. This does not assert that every other response policy is unsupported. |
+| Ordinary prefix replacement, runtime suffix and repeated raw query keys | `clean_prefix_transform_preserves_runtime_suffix_and_raw_query` | Clean GET `/api/users?x=1&x=2` becomes `/v1/users?x=1&x=2`; bodyless POST without Content-Length also succeeds. |
+| Normalize encoded unreserved bytes, repeated slash and dot segments before rewrite | `normalization_sensitive_targets_refuse_before_upstream_contact` | Three targets reject unchanged, Forward returns 400, no upstream connection or held upstream slot. |
+| Rewrite a POST with a body, or a GET with explicit Content-Length: 0 | `request_body_and_explicit_zero_length_refuse_prefix_transform` | Both reject unchanged and return 400 without upstream connection. POST method alone is not the restriction. |
+| Prefix transform on TLS / HTTP/2 | `tls_and_h2_connection_flags_refuse_prefix_materialization_atomically` | Production materializer rejects both connection flags without buffer changes or I/O. This is a metadata-level guard witness, not a live TLS handshake/H2 stream test. |
+| Normalized selection of routes and associated policies | `dispatch_does_not_normalize_dot_segments_or_unreserved_escapes` | `/admin` and `/api/users` select their specific routes; `/api/../admin`, `/api/%75sers`, `/api//users` select `/api`. There is no normalization-to-policy equivalence in this matcher. |
+
+Both successful clean-prefix source controls and runtime controls are retained so
+that unrelated parser, configuration or fixture failures cannot masquerade as a
+gap. Negative runtime witnesses preserve the input buffer, header boundary and
+initial send length, and check refusal before upstream Connect.
+
+## Scope and follow-up
+
+The existing [Kong differential baseline](kong-compatibility-baseline.md) is a
+separate pinned Kong 3.9.1 comparison with known differences. These new tests do
+not launch Kong, Docker, epoll or io_uring, and do not claim live wire equivalence.
+They make local capability boundaries repeatable and cheap to diagnose.
+
+Kong reference semantics: [Routes](https://developer.konghq.com/gateway/entities/route/)
+and [traditional routing](https://developer.konghq.com/gateway/routing/traditional/).
+Kong supports path stripping, normalized matching/forwarding and regex captures;
+Rut may expose equivalent intent through its own existing syntax and APIs.
+
+Recommended implementation order: runtime-computed safe forwarding targets;
+request-body and transport support plus policy composition; explicit
+normalization/matching/forwarding contracts; capture results and trusted
+connection metadata. Keep route grouping/priority organization separate from
+plain predicate expressibility. Do not add arbitrary keywords or another regex
+library to satisfy this ledger.
+
+## Recorded validation (2026-11-15)
+
+Linux, Clang Release, JIT enabled, project-pinned OpenSSL and Vectorscan:
+
+- `ctest --test-dir build -L kong-gap --output-on-failure --no-tests=error`:
+  2/2 CTest entries passed; 8 frontend cases / 27 checks and 5 runtime cases /
+  107 checks passed (13 cases, 134 checks total).
+- Related frontend filter
+  `target_transform,request_policy_preserve_host,req_path_regex,analyze_rejects_duplicate_route_keys`:
+  16 cases / 329 checks passed.
+- Related network filter `target_transform`: 14 cases / 711 checks passed.
+- Changed `.inc` files pass `clang-format --dry-run --Werror`; `git diff --check`
+  passes.
+
+No live Kong differential, epoll/io_uring matrix or sanitizer suite was run for
+this test-only characterization change. No production runtime or language
+semantics were changed.

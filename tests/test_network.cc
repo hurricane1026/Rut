@@ -90315,3 +90315,5 @@ TEST(state_invariant, ready_wait_shutdown_discard_never_invokes_handler) {
     CHECK_EQ(ready_wait_calls, 0u);
     loop.close_conn(*c);
 }
+
+#include "kong_routing_gap_network.inc"

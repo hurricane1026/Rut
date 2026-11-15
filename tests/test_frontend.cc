@@ -48110,3 +48110,5 @@ route GET "/" {
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 }
+
+#include "kong_routing_gap_frontend.inc"
