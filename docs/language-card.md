@@ -2627,17 +2627,18 @@ keys. This implements explicit application type binding following
 [RFC 8725 section 3.11](https://www.rfc-editor.org/rfc/rfc8725.html#section-3.11),
 not the complete OAuth JWT access-token profile or nested JWT handling.
 
-### Bounded RS256 access-token resource helper
+### Bounded RS256/ES256 access-token resource helper
 
-`middleware/jwt_access.rut` provides `requireRs256(authorization, policy,
-maxAge, maxLifetime) -> Json`, `requireClient(document, clientId) -> Json`, and
-`requireScope(document, scope) -> Json`. It invokes `Crypto.jwtRs256` directly
-so invalid credentials receive Bearer `invalid_token`. The trusted RS256 policy
-must set `requiredType` to exactly `at+jwt` or `application/at+jwt`; there is no
-normalization or aliasing. The helper requires bounded nonempty `client_id`
+`middleware/jwt_access.rut` provides `requireRs256` and `requireEs256` with
+`(authorization, policy, maxAge, maxLifetime) -> Json`, plus
+`requireClient(document, clientId) -> Json` and `requireScope(document, scope) -> Json`.
+Each invokes its algorithm-specific verifier directly so invalid credentials
+receive Bearer `invalid_token`. The trusted policy must set `requiredType` to
+exactly `at+jwt` or `application/at+jwt`; there is no normalization or aliasing.
+The helpers require bounded nonempty `client_id`
 (≤1024 decoded bytes), `jti` (≤128 bytes), and the existing positive-`iat`
 claims-lifetime policy. Invalid profile limits and an otherwise usable policy with
-missing/unsupported `requiredType` return 503; structurally invalid RS256 policy
+missing/unsupported `requiredType` return 503; structurally invalid algorithm policy
 may fail compilation/loading. Invalid tokens return 401; wrong client or scope
 returns 403. `requireScope` accepts one RFC
 6749 scope token; malformed trusted scope configuration returns 503. This is
