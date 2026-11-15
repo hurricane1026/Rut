@@ -1,7 +1,14 @@
 // Executable capability ledger, not a specification of desired restrictions.
 // When a gap closes, replace its rejection assertion with a positive witness.
 // Included by test_frontend.cc to reuse its owning frontend fixtures.
-enum class KongGapStage { LexRejected, ParseRejected, AnalyzeRejected, LowerRejected, Verified };
+namespace {
+enum class KongGapStage : u8 {
+    LexRejected,
+    ParseRejected,
+    AnalyzeRejected,
+    LowerRejected,
+    Verified
+};
 
 static KongGapStage kong_gap_stage(rut::test::TestCase* _tc,
                                    const char* source,
@@ -22,6 +29,7 @@ static KongGapStage kong_gap_stage(rut::test::TestCase* _tc,
     if (!rir::verify_module(rir.module).ok) return KongGapStage::LowerRejected;
     return KongGapStage::Verified;
 }
+}  // namespace
 
 TEST(kong_routing_gap, expression_routing_controls_reach_verified_rir) {
     const char* sources[] = {
