@@ -254,3 +254,51 @@ route GET "/api" { return 201 }
 route GET "/api" { return 202 }
 )rut") == KongGapStage::AnalyzeRejected);
 }
+
+TEST(kong_routing_gap, native_regex_capture_accepts_bounded_groups_and_rejects_invalid_shapes) {
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    guard let version = regexCapture(req.pathOnly, re"^/v([0-9]+)/users/(.*)$", 1) else { return 404 }
+    return forward(b, load_balance: .roundRobin, set_path: "/internal/" + version)
+}
+)rut") == KongGapStage::Verified);
+    const char* invalid[] = {
+        "route GET \"/\" { let x = regexCapture(req.path, re\"(x)\", 2) return 200 }",
+        "route GET \"/\" { let x = regexCapture(req.path, re\"(x)\", 9) return 200 }",
+        "route GET \"/\" { let x = regexCapture(req.path, re\"(\", 0) return 200 }",
+        "route GET \"/\" { let x = regexCapture(req.path, \"(x)\", 1) return 200 }",
+        "route GET \"/\" { let x = regexCapture(req.header(\"X\"), re\"(x)\", 1) return 200 }",
+    };
+    for (const char* source : invalid) CHECK(kong_gap_stage(_tc, source) != KongGapStage::Verified);
+}
+
+TEST(kong_routing_gap, capture_rir_requires_literal_group_and_optional_string_result) {
+    auto tokens = lex(lit(R"rut(
+route GET "/" {
+    guard let value = regexCapture(req.pathOnly, re"^/(.*)$", 1) else { return 404 }
+    return response(200, body: value)
+}
+)rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule module{};
+    REQUIRE(lower_to_rir(mir.value(), module));
+    auto& function = module.module.functions[0];
+    auto* capture = find_nth_op(function, rir::Opcode::StrRegexCapture, 0);
+    REQUIRE(capture != nullptr);
+    REQUIRE(rir::verify_module(module.module).ok);
+    const auto& value = function.values[capture->operands[1].id];
+    auto& group = function.blocks[value.def_block.id].insts[value.def_inst];
+    group.imm.i32_val = 9;
+    CHECK_FALSE(rir::verify_module(module.module).ok);
+    group.imm.i32_val = 1;
+    CHECK(rir::verify_module(module.module).ok);
+    capture->operand_count = 1;
+    CHECK_FALSE(rir::verify_module(module.module).ok);
+}

@@ -4627,7 +4627,8 @@ TEST(target_transform, h1_static_query_invalid_specs_and_capacity_fail_atomicall
         loop.free_conn(*conn);
     };
 
-    RouteConfig query_strip{};
+    const auto kQueryStripOwner = std::make_unique<RouteConfig>();
+    RouteConfig& query_strip = *kQueryStripOwner;
     REQUIRE(query_strip.add_upstream("backend", 0x7F000001, 8080).has_value());
     REQUIRE_EQ(query_strip.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
     char* owned_strip = const_cast<char*>(query_strip.target_transforms[0].strip_prefix.ptr);
@@ -4635,7 +4636,8 @@ TEST(target_transform, h1_static_query_invalid_specs_and_capacity_fail_atomicall
     CHECK_FALSE(query_strip.target_transform_id_is_valid(1));
     reject_forged_spec(query_strip);
 
-    RouteConfig second_delimiter{};
+    const auto kSecondDelimiterOwner = std::make_unique<RouteConfig>();
+    RouteConfig& second_delimiter = *kSecondDelimiterOwner;
     REQUIRE(second_delimiter.add_upstream("backend", 0x7F000001, 8080).has_value());
     REQUIRE_EQ(second_delimiter.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
     char* owned_replace =
@@ -4644,7 +4646,8 @@ TEST(target_transform, h1_static_query_invalid_specs_and_capacity_fail_atomicall
     CHECK_FALSE(second_delimiter.target_transform_id_is_valid(1));
     reject_forged_spec(second_delimiter);
 
-    RouteConfig capacity_cfg{};
+    const auto kCapacityCfgOwner = std::make_unique<RouteConfig>();
+    RouteConfig& capacity_cfg = *kCapacityCfgOwner;
     REQUIRE(capacity_cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
     REQUIRE_EQ(capacity_cfg.add_target_transform({{"/api/", 5}, {"/v1/?fixed=1", 12}}), 1u);
     static constexpr char kCapacityPrefix[] = "GET /api/users?x=";
@@ -23258,7 +23261,8 @@ TEST(rate_limit, http1_dispatch_emits_retry_after_and_metrics) {
 TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
     REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
     pre_route_root_handler_calls = 0;
@@ -23288,7 +23292,8 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
             make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
     }
-    RouteConfig proxy{};
+    const auto kProxyOwner = std::make_unique<RouteConfig>();
+    RouteConfig& proxy = *kProxyOwner;
     REQUIRE(proxy.add_upstream("backend", 0x7f000001, 9000).has_value());
     REQUIRE(proxy.add_proxy("/", kRouteMethodAny, 0));
     loop.backend.clear_ops();
@@ -23297,7 +23302,8 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     CHECK_EQ(proxied->resp_status, 400u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     loop.close_conn(*proxied);
-    RouteConfig local{};
+    const auto kLocalOwner = std::make_unique<RouteConfig>();
+    RouteConfig& local = *kLocalOwner;
     REQUIRE(local.add_static("/", kRouteMethodAny, 204));
     auto* rejected = dispatch_unmatched_request(loop, local, requests[0]);
     REQUIRE(rejected != nullptr);
@@ -23388,7 +23394,8 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
 TEST(request_admission, absolute_target_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
     REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
     pre_route_root_handler_calls = 0;
@@ -23431,7 +23438,8 @@ TEST(request_admission, absolute_target_rejected_before_handler_or_upstream) {
             make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
     }
-    RouteConfig proxy{};
+    const auto kProxyOwner = std::make_unique<RouteConfig>();
+    RouteConfig& proxy = *kProxyOwner;
     REQUIRE(proxy.add_upstream("backend", 0x7f000001, 9000).has_value());
     REQUIRE(proxy.add_proxy("/", kRouteMethodAny, 0));
     loop.backend.clear_ops();
@@ -23440,7 +23448,8 @@ TEST(request_admission, absolute_target_rejected_before_handler_or_upstream) {
     CHECK_EQ(proxied->resp_status, 400u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     loop.close_conn(*proxied);
-    RouteConfig local{};
+    const auto kLocalOwner = std::make_unique<RouteConfig>();
+    RouteConfig& local = *kLocalOwner;
     REQUIRE(local.add_static("/", kRouteMethodAny, 204));
     auto* rejected = dispatch_unmatched_request(loop, local, requests[0]);
     REQUIRE(rejected != nullptr);
@@ -23555,7 +23564,8 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
 TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
     REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
     const char* requests[] = {
@@ -23603,13 +23613,15 @@ TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
     }
 
-    RouteConfig local{};
+    const auto kLocalOwner = std::make_unique<RouteConfig>();
+    RouteConfig& local = *kLocalOwner;
     REQUIRE(local.add_static("/admin", kRouteMethodGet, 204));
     Connection* rejected = dispatch_unmatched_request(loop, local, requests[0]);
     REQUIRE(rejected != nullptr);
     CHECK_EQ(rejected->resp_status, 400u);
     loop.close_conn(*rejected);
-    RouteConfig fallback{};
+    const auto kFallbackOwner = std::make_unique<RouteConfig>();
+    RouteConfig& fallback = *kFallbackOwner;
     rejected = dispatch_unmatched_request(loop, fallback, requests[0]);
     REQUIRE(rejected != nullptr);
     CHECK_EQ(rejected->resp_status, 400u);
@@ -25561,7 +25573,8 @@ TEST(exact_local_response,
     loop.epoch = &epoch;
     REQUIRE(loop.set_capture(&capture));
 
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(install_representation200_exact(config, "/static"));
     const RouteConfig* active = &config;
     loop.config_ptr = &active;
@@ -25616,7 +25629,8 @@ TEST(exact_local_response,
 
     // Once staged, the selected response remains owned by the request's pinned
     // config even if the active pointer changes before partial Send retirement.
-    RouteConfig replacement{};
+    const auto kReplacementOwner = std::make_unique<RouteConfig>();
+    RouteConfig& replacement = *kReplacementOwner;
     auto replacement_policy = make_representation200_policy();
     replacement_policy.body = {"replacement-body", 16};
     u16 replacement_unmatched[kStrictLocalResponseMethodSlots]{};
@@ -25707,7 +25721,8 @@ TEST(exact_local_response,
     loop.epoch = &epoch;
     REQUIRE(loop.set_capture(&capture));
 
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(install_representation200_exact(config, "/static"));
     const RouteConfig* active = &config;
     loop.config_ptr = &active;
@@ -25761,7 +25776,8 @@ TEST(exact_local_response,
 
     // The response stays bound to the request's pinned config through partial
     // Send even if the active config changes after staging.
-    RouteConfig replacement{};
+    const auto kReplacementOwner = std::make_unique<RouteConfig>();
+    RouteConfig& replacement = *kReplacementOwner;
     auto replacement_policy = make_representation200_policy();
     replacement_policy.body = {"replacement-body", 16};
     u16 replacement_unmatched[kStrictLocalResponseMethodSlots]{};
@@ -25852,7 +25868,8 @@ TEST(exact_local_response,
     loop.epoch = &epoch;
     REQUIRE(loop.set_capture(&capture));
 
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     REQUIRE(install_representation200_exact(config, "/static"));
     const RouteConfig* active = &config;
     loop.config_ptr = &active;
@@ -25907,7 +25924,8 @@ TEST(exact_local_response,
 
     // The response stays bound to the request's pinned config through partial
     // Send even if the active config changes after staging.
-    RouteConfig replacement{};
+    const auto kReplacementOwner = std::make_unique<RouteConfig>();
+    RouteConfig& replacement = *kReplacementOwner;
     auto replacement_policy = make_representation200_policy();
     replacement_policy.body = {"replacement-body", 16};
     u16 replacement_unmatched[kStrictLocalResponseMethodSlots]{};
@@ -26583,7 +26601,8 @@ TEST(unmatched_local_response,
     loop.epoch = &epoch;
     REQUIRE(loop.set_capture(&capture));
 
-    RouteConfig config{};
+    const auto kConfigOwner = std::make_unique<RouteConfig>();
+    RouteConfig& config = *kConfigOwner;
     const auto policy = make_representation200_policy();
     REQUIRE_EQ(config.add_strict_local_response_policy(policy), 1u);
     REQUIRE(config.set_unmatched_policy_id(kRouteMethodAny, 1));
@@ -26729,7 +26748,8 @@ TEST(unmatched_local_response,
     };
     closes_before_bytes(config, "GET /miss HTTP/1.0\r\nHost: x\r\n\r\n");
 
-    RouteConfig forged{};
+    const auto kForgedOwner = std::make_unique<RouteConfig>();
+    RouteConfig& forged = *kForgedOwner;
     REQUIRE_EQ(forged.add_strict_local_response_policy(policy), 1u);
     REQUIRE(forged.set_unmatched_policy_id(kRouteMethodAny, 1));
     forged.strict_local_response_policies[0].head_mode = StrictLocalResponseHeadMode::Reject;

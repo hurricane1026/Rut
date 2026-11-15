@@ -258,6 +258,7 @@ enum class Opcode : u8 {
     StrPredicate,          // two Str operands, predicate id 0/1/2/3: prefix/suffix/contains/isEmpty
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
+    StrRegexCapture,       // regexCapture(str, literal regex, literal group) -> str?
     StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
     StrInterpolate,        // %r = str.interpolate [%a, %b..]  → str (variadic)
 

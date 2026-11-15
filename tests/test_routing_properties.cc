@@ -110,13 +110,13 @@ TEST(routing_properties, host_authority_is_unambiguous_and_connection_owned) {
     ParsedRequest request{};
     request.reset();
     char host[] = "A.EXAMPLE.:8000";
-    request.headers[0] = {{"Host", 4}, {host, sizeof(host) - 1}};
+    request.headers[0] = {{"Host", 4}, {host, sizeof(host) - 1}, {}};
     request.header_count = 1;
     REQUIRE(connection.capture_routing_host(request));
     CHECK(connection.routing_host().eq({"a.example", 9}));
     __builtin_memset(host, 'x', sizeof(host));
     CHECK(connection.routing_host().eq({"a.example", 9}));
-    request.headers[1] = {{"host", 4}, {"other.example", 13}};
+    request.headers[1] = {{"host", 4}, {"other.example", 13}, {}};
     request.header_count = 2;
     CHECK_FALSE(connection.capture_routing_host(request));
     CHECK_EQ(connection.routing_host().len, 0u);
@@ -125,4 +125,105 @@ TEST(routing_properties, host_authority_is_unambiguous_and_connection_owned) {
     CHECK_FALSE(route_host_from_authority({"evil@example", 12}, output, &length));
     CHECK_FALSE(route_host_from_authority({"example:65536", 13}, output, &length));
     CHECK_FALSE(route_host_pattern_valid({"a.*.example", 11}));
+}
+
+TEST(routing_properties, regex_captures_are_bounded_and_preserve_participation) {
+    void* program = rut_helper_regex_capture_compile("^(a+)(b)?()$", 12);
+    REQUIRE(program != nullptr);
+    struct Cleanup {
+        void* handle;
+        ~Cleanup() { rut_helper_regex_free(handle); }
+    } cleanup{program};
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection connection{};
+    connection.reset();
+    connection.json_arena.backend.pool = &pool;
+    const char* value = nullptr;
+    u32 length = 0;
+    CHECK_EQ(rut_helper_regex_capture(&connection, "aaa", 3, program, 1, &value, &length), 1);
+    CHECK((Str{value, length}.eq({"aaa", 3})));
+    CHECK_EQ(rut_helper_regex_capture(&connection, "aaa", 3, program, 2, &value, &length), 0);
+    CHECK(value == nullptr);
+    CHECK_EQ(rut_helper_regex_capture(&connection, "aaa", 3, program, 3, &value, &length), 1);
+    CHECK_EQ(length, 0u);
+    CHECK(value != nullptr);
+    connection.reset();
+    CHECK_EQ(pool.count - pool.available(), 0u);
+    pool.destroy();
+}
+
+TEST(routing_properties, regex_capture_serialization_roundtrip_and_compile_bounds) {
+    void* program = rut_helper_regex_capture_compile("([a-z]+)-([0-9]+)", 17);
+    REQUIRE(program != nullptr);
+    char* bytes = nullptr;
+    u64 size = 0;
+    REQUIRE(rut_helper_regex_serialize(program, &bytes, &size));
+    void* restored = rut_helper_regex_deserialize(bytes, size);
+    rut_helper_regex_serialized_free(program, bytes, size);
+    rut_helper_regex_free(program);
+    REQUIRE(restored != nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    Connection connection{};
+    connection.reset();
+    connection.json_arena.backend.pool = &pool;
+    const char* value = nullptr;
+    u32 length = 0;
+    CHECK_EQ(rut_helper_regex_capture(&connection, "xx a-123 yy", 11, restored, 2, &value, &length),
+             1);
+    CHECK((Str{value, length}.eq({"123", 3})));
+    CHECK_EQ(rut_helper_regex_capture(&connection, "", 0, restored, 9, &value, &length), 2);
+    connection.reset();
+    pool.destroy();
+    rut_helper_regex_free(restored);
+    CHECK(rut_helper_regex_capture_compile("(", 1) == nullptr);
+    CHECK(rut_helper_regex_capture_compile("()()()()()()()()()", 18) == nullptr);
+}
+
+TEST(routing_properties, capture_resource_failure_is_distinct_from_missing_and_releases_pool) {
+    const char* pattern = "(*NO_AUTO_POSSESS)(*NO_START_OPT)^(a+)+$";
+    void* program = rut_helper_regex_capture_compile(pattern, __builtin_strlen(pattern));
+    REQUIRE(program != nullptr);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    Connection connection{};
+    connection.reset();
+    connection.json_arena.backend.pool = &pool;
+    char subject[129];
+    __builtin_memset(subject, 'a', sizeof(subject));
+    subject[128] = '!';
+    const char* value = nullptr;
+    u32 length = 0;
+    CHECK_EQ(rut_helper_regex_capture(
+                 &connection, subject, sizeof(subject), program, 1, &value, &length),
+             2);
+    CHECK(value == nullptr);
+    CHECK_EQ(length, 0u);
+    connection.reset();
+    CHECK_EQ(pool.count - pool.available(), 0u);
+    // No request allocator is a resource error, never a normal absent capture.
+    connection.json_arena.backend.pool = nullptr;
+    CHECK_EQ(rut_helper_regex_capture(&connection, "a", 1, program, 1, &value, &length), 2);
+    rut_helper_regex_free(program);
+    pool.destroy();
+}
+
+TEST(routing_properties, host_scopes_accept_ipv6_and_missing_host_global_fallback) {
+    char output[254];
+    u16 length = 0;
+    REQUIRE(route_host_from_authority({"[0:0:0:0:0:0:0:1]:8000", 22}, output, &length));
+    CHECK((Str{output, length}.eq({"[::1]", 5})));
+    CHECK(route_host_equal({"[0:0:0:0:0:0:0:1]", 17}, {"[::1]", 5}));
+    CHECK(route_host_pattern_valid({"[::1]", 5}));
+    Connection connection{};
+    connection.reset();
+    ParsedRequest request{};
+    request.reset();
+    REQUIRE(connection.capture_routing_host(request));
+    CHECK_EQ(connection.routing_host().len, 0u);
+    request.header_count = 1;
+    request.headers[0] = {{"Host", 4}, {"service~name", 12}, {}};
+    CHECK(connection.capture_routing_host(request));
+    CHECK_EQ(connection.routing_host().len, 0u);
 }

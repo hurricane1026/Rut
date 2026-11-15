@@ -119,6 +119,17 @@ route GET "/alias" {{
     guard let target = req.header("X-Target") else {{ return 400 }}
     return forward(backend, load_balance: .roundRobin, set_path: target)
 }}
+route GET "/capture" {{
+    guard let version = regexCapture(req.pathOnly, re"^/capture/v([0-9]+)/users/(.*)$", 1) else {{ return 404 }}
+    guard let user = regexCapture(req.pathOnly, re"^/capture/v([0-9]+)/users/(.*)$", 2) else {{ return 404 }}
+    let target = "/internal/v" + version + "/accounts/" + user
+    return forward(backend, load_balance: .roundRobin, set_path: target)
+}}
+route GET "/capture-limit" {{
+    guard let subject = req.header("X-Subject") else {{ return 400 }}
+    guard let captured = regexCapture(subject, re"(*NO_AUTO_POSSESS)(*NO_START_OPT)^(a+)+$", 1) else {{ return 200 }}
+    return response(200, body: captured)
+}}
 route GET "/plain" {{ return forward(backend, load_balance: .roundRobin) }}
 ''' + r'''
 func originalPath(_ req: i32, _ resp: Response) -> i32 {
@@ -161,12 +172,17 @@ route GET "/host" use chain policyB { return response(200, body: "b") }
 @host("*.example")
 route GET "/host" { return response(200, body: "wildcard") }
 route GET "/host" { return response(200, body: "global") }
+@host("[::1]")
+route GET "/host" { return response(200, body: "ipv6") }
 @host("b.example")
 route GET "/hostusers/:id" {
     wait(1ms)
     return forward(backend, load_balance: .roundRobin, set_path: "/host/" + req.params.id)
 }
 route GET "/metadata" {
+    guard req.pathOnly.matches(re"^/metadata$") else { return 422 }
+    guard let whole = regexCapture(req.pathOnly, re"^/metadata$", 0) else { return 422 }
+    guard whole == "/metadata" else { return 422 }
     guard let local = parseInt(req.header("X-Local-Port").or("")) else { return 400 }
     guard req.localPort == local && req.remotePort > 0 else { return 422 }
     let secure = req.header("X-Secure").or("") == "yes"
@@ -214,7 +230,8 @@ route "/" {
                 assert port, log.read_text(errors='replace')
                 for authority, expected in [('a.example', b'a'), ('b.example', b'b'),
                                             ('A.EXAMPLE:8000', b'a'), ('other.example', b'wildcard'),
-                                            ('localhost', b'global')]:
+                                            ('localhost', b'global'), ('service~name', b'global'),
+                                            ('[0:0:0:0:0:0:0:1]:8000', b'ipv6')]:
                     if args.h2:
                         result = h2_request(port, '/host', [], tls_context=context, authority=authority)
                     else:
@@ -228,6 +245,33 @@ route "/" {
                         finally:
                             probe.close()
                     assert result == (200, expected), ('host scope', authority, result)
+                if args.h2:
+                    host_forward = h2_request(port, '/hostusers/42', [], tls_context=context, authority='b.example')
+                else:
+                    probe = connection(port)
+                    try:
+                        probe.request('GET', '/hostusers/42', headers={'Host': 'b.example'})
+                        reply = probe.getresponse()
+                        host_forward = (reply.status, reply.read())
+                    finally:
+                        probe.close()
+                assert host_forward == (200, b'/host/42|'), ('Host scoped params/timer', host_forward)
+                captures = [('/capture/v12/users/jane', {}, 200, b'/internal/v12/accounts/jane|'),
+                            ('/capture/v2/users/', {}, 200, b'/internal/v2/accounts/|'),
+                            ('/capture/nomatch', {}, 404, None),
+                            ('/capture-limit', {'X-Subject': 'a' * 128 + '!'}, 500, None)]
+                for path, fields, code, expected in captures:
+                    if args.h2:
+                        result = h2_request(port, path, list(fields.items()), tls_context=context)
+                    else:
+                        probe = connection(port)
+                        try:
+                            probe.request('GET', path, headers=fields)
+                            reply = probe.getresponse()
+                            result = (reply.status, reply.read())
+                        finally:
+                            probe.close()
+                    assert result[0] == code and (expected is None or result[1] == expected), ('capture', path, result)
                 metadata_headers = {'X-Local-Port': str(port), 'X-Secure': 'yes' if args.tls else 'no',
                                     'X-Forwarded-Proto': 'http' if args.tls else 'https', 'SNI': 'spoof.example'}
                 expected_name = b'localhost' if args.tls else b'none'
@@ -282,7 +326,7 @@ route "/" {
                         h2_body_abort_then_probe(port, context, cancel)
                         with lock:
                             assert len(seen) == before + 1 and seen[-1][1] == '/plain', seen[before:]
-                    print(f'PASS: {args.backend} H2 tls={args.tls}: dynamic and prefix targets, body, after headers, timer continuation, refusal and body abort/reuse; 19 requests')
+                    print(f'PASS: {args.backend} H2 tls={args.tls}: dynamic and prefix targets, body, after headers, timer continuation, refusal and body abort/reuse; 31 requests')
                     return 0
                 client = connection(port)
                 try:
@@ -342,10 +386,10 @@ route "/" {
                     with lock:
                         assert len(seen) == before, (target, seen[before:])
                 with lock:
-                    assert len(seen) == len(cases) + 4, seen
-                    assert seen[6][3] == b'payload', seen
+                    assert len(seen) == len(cases) + 7, seen
+                    assert seen[9][3] == b'payload', seen
                 print(f'PASS: {args.backend} tls={args.tls}: dynamic captures, borrowed target ownership, body, '
-                      f'prefix modes, Host/after headers, streaming body and invalid-target refusal; {len(cases) + 9} requests')
+                      f'prefix modes, Host/after headers, streaming body and invalid-target refusal; {len(cases) + 21} requests')
             finally:
                 process.terminate()
                 try:

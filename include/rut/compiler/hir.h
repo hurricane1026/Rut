@@ -133,6 +133,7 @@ enum class HirExprKind : u8 {
     IntLit,
     StrLit,
     RegexMatch,
+    RegexCapture,
     StringConcat,
     StringPredicate,
     Tuple,

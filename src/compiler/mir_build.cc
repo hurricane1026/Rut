@@ -632,13 +632,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.int_value = expr.int_value;
         return v;
     }
-    if (expr.kind == HirExprKind::RegexMatch) {
+    if (expr.kind == HirExprKind::RegexMatch || expr.kind == HirExprKind::RegexCapture) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
-        v.kind = MirValueKind::RegexMatch;
-        v.type = MirTypeKind::Bool;
+        v.kind = expr.kind == HirExprKind::RegexCapture ? MirValueKind::RegexCapture
+                                                        : MirValueKind::RegexMatch;
+        v.type = expr.kind == HirExprKind::RegexCapture ? MirTypeKind::Str : MirTypeKind::Bool;
+        v.may_nil = expr.kind == HirExprKind::RegexCapture;
+        v.int_value = expr.int_value;
         v.str_value = expr.str_value;
         v.lhs = &fn->values[fn->values.len - 1];
         return v;

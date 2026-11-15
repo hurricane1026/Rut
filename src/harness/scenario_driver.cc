@@ -301,6 +301,7 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     connection.connection.keep_alive = scenario.request_len == 0 || parsed_request.keep_alive;
     connection.connection.request_config = &scenario.target->program.config;
 
+    (void)connection.connection.capture_routing_host(parsed_request);
     RouteParam route_params[kMaxRouteParams]{};
     u32 route_param_count = 0;
     const RouteEntry* route =
@@ -308,7 +309,8 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
                                                         routing_method,
                                                         route_params,
                                                         &route_param_count,
-                                                        kMaxRouteParams);
+                                                        kMaxRouteParams,
+                                                        connection.connection.routing_host());
     if (route == nullptr) {
         out.harness.outcome = Outcome::Failed;
         out.harness.cleanup = CleanupOutcome::Clean;

@@ -1575,7 +1575,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
-    if (value.kind == MirValueKind::RegexMatch) {
+    if (value.kind == MirValueKind::RegexMatch || value.kind == MirValueKind::RegexCapture) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
                                      variant_infos,
@@ -1590,7 +1590,12 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!lhs) return core::make_unexpected(lhs.error());
-        auto v = b.emit_str_regex_match(lhs.value(), value.str_value, {span.line, span.col});
+        auto v = value.kind == MirValueKind::RegexCapture
+                     ? b.emit_str_regex_capture(lhs.value(),
+                                                value.str_value,
+                                                static_cast<u32>(value.int_value),
+                                                {span.line, span.col})
+                     : b.emit_str_regex_match(lhs.value(), value.str_value, {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }

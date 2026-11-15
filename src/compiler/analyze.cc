@@ -20,6 +20,7 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/net_client.h"
 #include "rut/runtime/password.h"
+#include "rut/runtime/regex_capture.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/rs256_policy.h"
 #include "rut/runtime/slice_pool.h"
@@ -13422,6 +13423,37 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("regexCapture")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto detail = lit_str(
+            "regexCapture expects unwrapped str, literal regex (1...1024 bytes, at most 8 groups), "
+            "and participating group index 0...8");
+        if (!route || route->is_timer || expr.args.len != 3 || pipe_lhs || first_arg_override ||
+            expr.args[1]->kind != AstExprKind::RegexLit ||
+            expr.args[2]->kind != AstExprKind::IntLit)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        auto subject = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        const i64 group = expr.args[2]->int_value;
+        if (!subject || subject->type != HirTypeKind::Str || subject->may_nil ||
+            subject->may_error || group < 0 || group > 8)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        void* compiled = capture_regex_compile(expr.args[1]->str_value);
+        if (!compiled) return frontend_error(FrontendError::InvalidRegex, expr.span, detail);
+        const bool valid = static_cast<u32>(group) <= capture_regex_group_count(compiled);
+        capture_regex_destroy(compiled);
+        if (!valid) return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        HirExpr out{};
+        out.kind = HirExprKind::RegexCapture;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        out.str_value = expr.args[1]->str_value;
+        out.int_value = group;
+        if (!route->exprs.push(subject.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if ((expr.name.eq(lit_str("tcp")) || expr.name.eq(lit_str("udp"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail =
@@ -21135,6 +21167,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
+        case HirExprKind::RegexCapture:
         case HirExprKind::ReqRoutingString:
         case HirExprKind::ReqConnectionScalar:
         case HirExprKind::ReqTlsClientCertSha256:

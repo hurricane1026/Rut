@@ -171,6 +171,30 @@ inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
 }
 
 inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
+    if (inst.op == Opcode::StrRegexCapture) {
+        if (inst.operand_count != 2 || inst.extra_operands || !fn.values || !fn.blocks ||
+            !inst.imm.str_val.ptr || inst.imm.str_val.len == 0 || inst.imm.str_val.len > 1024 ||
+            inst.result == kNoValue || inst.result.id >= fn.value_count)
+            return false;
+        const auto exact = [&](ValueId id, TypeKind kind) {
+            if (id == kNoValue || id.id >= fn.value_count) return false;
+            const Type* type = fn.values[id.id].type;
+            return type && type->kind == kind && !type->inner && !type->struct_def;
+        };
+        const Type* result = fn.values[inst.result.id].type;
+        if (!exact(inst.operands[0], TypeKind::Str) || !exact(inst.operands[1], TypeKind::I32) ||
+            !result || result->kind != TypeKind::Optional || result->struct_def || !result->inner ||
+            result->inner->kind != TypeKind::Str || result->inner->inner ||
+            result->inner->struct_def)
+            return false;
+        const Value& value = fn.values[inst.operands[1].id];
+        if (value.def_block.id >= fn.block_count) return false;
+        const Block& block = fn.blocks[value.def_block.id];
+        if (!block.insts || value.def_inst >= block.inst_count) return false;
+        const Instruction& group = block.insts[value.def_inst];
+        return group.op == Opcode::ConstI32 && group.result == inst.operands[1] &&
+               group.imm.i32_val >= 0 && group.imm.i32_val <= 8;
+    }
     if (inst.op == Opcode::ReqRoutingString || inst.op == Opcode::ReqConnectionScalar) {
         if (inst.operand_count != 0 || inst.extra_operands || inst.imm.i32_val < 0 ||
             inst.imm.i32_val > 2 || inst.result == kNoValue || !fn.values ||

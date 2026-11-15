@@ -745,6 +745,8 @@ static void copy_sim_connection_state(Connection& dst, const Connection& src) {
     dst.req_size = src.req_size;
     dst.peer_addr = src.peer_addr;
     dst.peer_port = src.peer_port;
+    copy_char_array(dst.routing_host_bytes, src.routing_host_bytes);
+    dst.routing_host_length = src.routing_host_length;
     copy_char_array(dst.req_path, src.req_path);
     dst.req_path_canon = copy_req_path_canon(src, dst);
     dst.target_transform_id = src.target_transform_id;

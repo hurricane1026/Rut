@@ -308,6 +308,14 @@ target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+# Capture syntax is validated even by the LLVM-free frontend.
+include(${PROJECT_SOURCE_DIR}/cmake/RutPCRE2.cmake)
+add_library(rut_regex_capture STATIC runtime/regex_capture.cc)
+target_include_directories(rut_regex_capture PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(rut_regex_capture PUBLIC rut_runtime pcre2-8-static)
+target_link_libraries(rut_compiler PUBLIC rut_regex_capture)
+
+
 if(RUT_ENABLE_JIT)
     # Vectorscan/Hyperscan regex backend. Build only the static library and disable
     # extra targets; Rut links it into rut_jit for regex compilation and scanning.
@@ -429,7 +437,8 @@ if(RUT_ENABLE_JIT)
     # A source/configuration fingerprint prevents mixing compiler and server builds.
     file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
-    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
+    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/cmake/RutPCRE2.cmake"
+        "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake")
     list(SORT _RUT_NATIVE_ABI_FILES)
@@ -449,7 +458,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
         ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include)
-    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime)
+    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime rut_regex_capture)
 
     # JIT library — LLVM ORC JIT integration via C API.
     # Only this library links LLVM. rut_runtime stays LLVM-free so shard

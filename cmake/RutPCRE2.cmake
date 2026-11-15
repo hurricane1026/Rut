@@ -1,0 +1,23 @@
+# Capture-only backend: pinned static C library; no PCRE JIT or system fallback.
+include(FetchContent)
+function(rut_configure_pcre2)
+    set(BUILD_SHARED_LIBS OFF)
+    set(BUILD_STATIC_LIBS ON)
+    set(PCRE2_BUILD_PCRE2_8 ON CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_16 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2_32 OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+    set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_JIT OFF CACHE BOOL "" FORCE)
+    set(PCRE2_SUPPORT_UNICODE OFF CACHE BOOL "" FORCE)
+    set(PCRE2_STATIC_PIC ON CACHE BOOL "" FORCE)
+    set(PCRE2_SHOW_REPORT OFF CACHE BOOL "" FORCE)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    FetchContent_Declare(rut_pcre2
+        URL https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.49/pcre2-10.49.tar.gz
+        URL_HASH SHA256=929f0b20e62879252a15886b06c89f1edef61a363cbd5826fb041080a5e557ae)
+    FetchContent_MakeAvailable(rut_pcre2)
+endfunction()
+rut_configure_pcre2()

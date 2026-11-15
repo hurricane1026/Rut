@@ -34,6 +34,7 @@ enum class MirValueKind : u8 {
     IntConst,
     StrConst,
     RegexMatch,
+    RegexCapture,
     StringConcat,
     StringPredicate,
     Tuple,

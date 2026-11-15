@@ -5232,7 +5232,8 @@ struct Parser {
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     deco.span,
-                    lit_str("@host requires one exact DNS name or edge wildcard"));
+                    lit_str(
+                        "@host requires one DNS name, bracketed IPv6 literal or edge wildcard"));
             deco.route_host = host.value()->text;
             return deco;
         }

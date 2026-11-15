@@ -1,75 +1,73 @@
-# Kong routing capability gap witnesses
+# Kong routing capability coverage
 
 Audit base: `a3fe7f77de60d778ccbab68016a62277f88347c9` (2026-11-15).
 Tracking issue: [#1098](https://github.com/hurricane1026/Rut/issues/1098).
-The goal is to express the same configuration intent in native Rut, not to import
-Kong JSON, introduce Kong keywords, or silently change existing Rut semantics.
+Implementation branch: `feat/kong-routing-coverage`.
 
-These are **current-behavior characterization tests**. A passing rejection test
-confirms an open gap; it does not mean that the capability is implemented. When
-implementing a capability, change its witness to positive acceptance and add
-appropriate wire/lifecycle tests rather than retaining the old rejection.
+The ten audited configuration intents now have native Rut implementations and
+positive executable witnesses. Existing default routing and clean-prefix
+restrictions remain explicit legacy controls; their rejection tests do not
+represent open gaps when the corresponding opt-in API is used. This ledger
+covers these routing capabilities, not every Kong plugin or API.
 
 ## Reproduce
 
-Use the normal Linux JIT-enabled CMake build and pinned project dependencies:
-
 ```sh
-cmake --build build --target test_frontend test_network
-ctest --test-dir build -L kong-gap --output-on-failure --no-tests=error
+cmake --build build --target rut test_frontend test_network test_routing_properties test_target_transform
+ctest --test-dir build -L 'kong-gap|routing-capability' --output-on-failure --no-tests=error -j2
+ctest --test-dir build -R '^test_kong_differential_' --output-on-failure
 ```
 
-The label selects eight frontend tests and five deterministic runtime tests.
-The frontend controls pass parsing, semantic analysis, MIR/RIR lowering and the
-RIR verifier. The runtime witnesses exercise the production route matcher,
-request-target materializer and, where specified, Forward refusal path using the
-existing SmallLoop backend. No new test framework or dependency is introduced.
+The frontend ledger traverses parsing, analysis, MIR/RIR and verification.
+Deterministic network witnesses cover guard, capacity, cleanup and ownership
+paths. `test_routing_capabilities.py` observes real upstream traffic over both
+epoll and io_uring, H1/H2 and cleartext/TLS. The separate pinned Kong 3.9.1
+baseline retains its documented equivalences and known differences.
 
-## Witness ledger
+## Completed capability ledger
 
-Every test below uses suite `kong_routing_gap`.
-
-| Configuration intent | Witness name | Expected current observation |
+| Configuration intent | Native Rut API / positive witness | Explicit bounds |
 | --- | --- | --- |
-| Exact path, byte prefix, regex predicate, Host/header/query conditions and method union | `expression_routing_controls_reach_verified_rir` | Seven positive source controls reach verified RIR. These capabilities are not gaps. |
-| `/users/:id` to `/internal/accounts/<id>` | `dynamic_captured_path_reaches_verified_rir` | Literal and computed `str` targets reach verified RIR; dynamic targets use a request-owned copy. Closed by the implementation progress below. |
-| Strip the byte prefix `/catalog` from `/catalogue` | `legacy_clean_prefix_requires_slash_boundary` | `/catalog/` is accepted; the otherwise identical `/catalog` prefix is rejected. |
-| Obtain regex captures for downstream policy/rewrite | `regex_capture_accessor_rejected_after_boolean_control` | `.matches(re"...")` works as a bool; the language-card target spelling `.match(re"...")` is rejected during parsing. This does not reject ordinary `:param` captures. |
-| Route on actual SNI, source/destination port or TLS state | `connection_metadata_accessor_probes_are_not_http_fields` | `req.httpVersion` works; candidate `req.sni`, `req.remotePort`, `req.localPort`, `req.isTls` fields reject during analysis. These probes establish absence of these accessors, not absence of native transport metadata or every imaginable alternative spelling. The request-field inventory was separately inspected. Spoofable headers are not equivalent evidence. |
-| Independent routes sharing method/path but differing by Host | `distinct_host_routes_collide_but_merged_branch_is_supported` | Separate declarations reject with `duplicate route path and method`; merged Host branching works. This is a route/policy organization limitation, not an inability to route by Host. |
-| Preserve Host together with prefix rewrite | `legacy_preserve_host_rejects_clean_transform_combination` | The existing closed `.preserve` request policy works alone; adding the separately supported transform rejects during semantic analysis with `request_policy host: .preserve does not support this forward option`. |
-| Prefix rewrite together with chain-after response headers | `legacy_clean_transform_rejects_after_headers` | After-header effect works alone; the transform combination rejects with its explicit semantic diagnostic. This does not assert that every other response policy is unsupported. |
-| Ordinary prefix replacement, runtime suffix and repeated raw query keys | `clean_prefix_transform_preserves_runtime_suffix_and_raw_query` | Clean GET `/api/users?x=1&x=2` becomes `/v1/users?x=1&x=2`; bodyless POST without Content-Length also succeeds. |
-| Normalize encoded unreserved bytes, repeated slash and dot segments before rewrite | `legacy_clean_profile_refuses_normalization_sensitive_targets` | Three targets reject unchanged, Forward returns 400, no upstream connection or held upstream slot. |
-| Rewrite a POST with a body, or a GET with explicit Content-Length: 0 | `legacy_clean_profile_refuses_body_and_explicit_length` | Both reject unchanged and return 400 without upstream connection. POST method alone is not the restriction. |
-| Prefix transform on TLS / HTTP/2 | `legacy_clean_profile_refuses_tls_and_h2_materialization` | Production materializer rejects both connection flags without buffer changes or I/O. This is a metadata-level guard witness, not a live TLS handshake/H2 stream test. |
-| Normalized selection of routes and associated policies | `dispatch_does_not_normalize_dot_segments_or_unreserved_escapes` | `/admin` and `/api/users` select their specific routes; `/api/../admin`, `/api/%75sers`, `/api//users` select `/api`. There is no normalization-to-policy equivalence in this matcher. |
+| Runtime-computed upstream target | `set_path: expression`; capture/local/header-backed concatenations reach the upstream | Validated origin form, 8192 bytes, owned request Arena copy |
+| Non-slash byte-prefix stripping | `target_transform: { strip_prefix: "/catalog", replace_prefix: "/", mode: .rawPrefix }` produces `/ue` from `/catalogue` | 128-byte prefixes, 16 transform profiles |
+| Regex capture results | `regexCapture(req.pathOnly, re"^/v([0-9]+)/users/(.*)$", 1): str?`; captured strings build a forwarding target | Literal pattern 1024 bytes, 8 groups, input 8192 bytes; resource errors return 500 before guard recovery |
+| Consistent normalized selection and forwarding | Guard `req.normalizedPath` and `req.normalizedTarget`, select on the former, forward the latter | Opt-in; query bytes remain opaque; raw route dispatch unchanged |
+| Actual connection metadata | `req.sni`, `req.remotePort`, `req.localPort`, `req.isTls` | SNI at most 253 bytes, client-selected rather than authenticated; headers and H2 :scheme cannot replace transport state |
+| Independent Host policies | `@host("a.example")` / `@host("b.example")` on identical method/path, separate chains and rate namespaces | 16 scopes / 128 total routes; exact, edge wildcard, global fallback |
+| Preserve Host plus prefix rewrite | Existing `.preserve` request profile composed with explicit `.rawPrefix` | Existing closed request-policy profile remains explicit |
+| After-response headers plus prefix rewrite | Borrowed original-path response header survives explicit rewrite | Stabilize borrowed values; invalidate replay of the old raw snapshot |
+| Body / explicit CL0 plus prefix rewrite | POST payload and GET CL0 survive rewriting; H1 headers reach upstream before delayed body | H1 streams; H2 uses existing 16 KiB total synth bound |
+| TLS/H2 plus prefix rewrite | All eight real transport profiles | Oversize/invalid/cancelled requests retain fail-closed protocol behavior |
 
-Both successful clean-prefix source controls and runtime controls are retained so
-that unrelated parser, configuration or fixture failures cannot masquerade as a
-gap. Negative runtime witnesses preserve the input buffer, header boundary and
-initial send length, and check refusal before upstream Connect.
+The old `.match(re"...")` spelling remains absent; `regexCapture` is a native
+Rut domain builtin, not an approximate Swift `Regex.Match` type. Optional
+captures distinguish no match/unparticipating group from a participating empty
+string. Group 0 is the whole first match; groups 1...8 are capture ordinals.
 
-## Scope and follow-up
+## Capture backend decision
 
-The existing [Kong differential baseline](kong-compatibility-baseline.md) is a
-separate pinned Kong 3.9.1 comparison with known differences. These new tests do
-not launch Kong, Docker, epoll or io_uring, and do not claim live wire equivalence.
-They make local capability boundaries repeatable and cheap to diagnose.
+The initial ledger preferred one regex engine. Inspection confirmed that
+[Vectorscan/Hyperscan does not return capturing subexpressions](https://intel.github.io/hyperscan/dev-reference/compilation.html).
+A second bounded C backend is therefore necessary for accurate greedy,
+alternative, optional and nested captures; approximating them through repeated
+Boolean scans would change results. [PCRE2 10.49](https://github.com/PCRE2Project/pcre2/releases/tag/pcre2-10.49)
+is pinned by SHA-256 and built statically, with JIT/Unicode/tools disabled.
+Existing Vectorscan Boolean operations retain their backend and fast path.
+The pinned distribution licence is retained in [pcre2-LICENCE.md](third-party/pcre2-LICENCE.md).
 
-Kong reference semantics: [Routes](https://developer.konghq.com/gateway/entities/route/)
-and [traditional routing](https://developer.konghq.com/gateway/routing/traditional/).
-Kong supports path stripping, normalized matching/forwarding and regex captures;
-Rut may expose equivalent intent through its own existing syntax and APIs.
+The tradeoff is one maintained dependency and an additional static archive
+(332 KiB in this build). Capture programs own a bounded 1 MiB mmap region;
+matching uses request Arena callbacks, at most 64 KiB cumulative allocation per
+call, a 12 KiB frame-vector heap limit, depth 64 and 100000 matching steps.
+The frame-vector limit fits existing 16 KiB slices. It can reject a complex
+otherwise-valid match: this is a resource error, never an absent capture.
+PCRE2's [match/depth/heap limits](https://www.pcre.org/current/doc/html/pcre2pattern.html)
+are enforced without the PCRE JIT. Native artifacts store the bounded pattern and
+recompile at startup; execution never compiles a request-supplied pattern.
 
-Recommended implementation order: runtime-computed safe forwarding targets;
-request-body and transport support plus policy composition; explicit
-normalization/matching/forwarding contracts; capture results and trusted
-connection metadata. Keep route grouping/priority organization separate from
-plain predicate expressibility. Do not add arbitrary keywords or another regex
-library to satisfy this ledger.
+The following sections preserve the original audit and staged validation history.
 
-## Recorded validation (2026-11-15)
+## Original audit validation (2026-11-15)
 
 Linux, Clang Release, JIT enabled, project-pinned OpenSSL and Vectorscan:
 
@@ -166,3 +164,41 @@ Validated: 13 gap frontend cases / 47 checks, 4 standalone property cases / 38
 checks, all nine routing-capability CTest entries (eight live transports plus
 unit suite). The Host static handlers have separate after-header policies. The
 full legacy network suite and sanitizer are deferred to final combined checks.
+
+### Final combined validation (2026-11-15)
+
+All ten audited intents have positive witnesses. Normal Linux Clang Release,
+JIT enabled, both real I/O backends, project-pinned OpenSSL/PCRE2:
+
+- Full frontend: **1306 tests / 22905 checks**, all passed.
+- Full network: **1666 tests / 495440 checks**, all passed under the default
+  8 MiB stack. Eight older multi-config fixtures now hold their large configs
+  on the heap; assertions and lifecycle coverage are unchanged.
+- Target/normalizer: **19 / 277**; capture adapter **3 / 30**; transport/ownership/
+  capture helper properties **8 / 72**, all passed.
+- `kong-gap|routing-capability`: **12/12 CTest entries**. The final eight live
+  profiles passed **254 requests**, including mixed Vectorscan/capture literals,
+  named Host chains, scoped params across a timer, canonical IPv6 Host, valid
+  non-DNS authority fallback, normalization, bodies, TLS, H2 reset/length errors
+  and captured target rewriting. Missing Host retains global-route eligibility.
+- Existing pinned Kong differentials: **2/2 entries**, retaining each backend's
+  16 equivalences and 5 documented differences; no universal Kong parity claim.
+- Existing regex/native-helper/target JIT regressions **17 / 10485**, loader
+  **141 / 53995**, harness **56 / 417**, simulation **69 / 474**, ART **43 / 1416**
+  and segment trie **39 / 4651**, all passed.
+- LLVM-free Debug ASan+UBSan build: capture adapter **3 / 30**, gap frontend
+  **15 / 63**, all passed with leak detection. A separate instrumented native
+  helper/capture/property run (including instrumented PCRE2) passed **8 / 72**.
+  This is targeted instrumentation, not a full sanitized live-backend matrix.
+- Changed-file formatting and `git diff --check` passed. Scoped clang-tidy
+  reported no diagnostics in the new Host helper or capture adapter; the
+  existing const-correctness diagnostic in `arena.h` remains outside this change.
+  The normal server's ELF dependencies contain only `libc.so.6`; the build's
+  no-C++-stdlib dependency guard passed. Main remains the audited base commit.
+
+The existing closed explicit `.preserve` request-header profile remains a
+cleartext HTTP/1 capability. General prefix transforms support TLS/H2 but do not
+broaden every legacy request-policy profile or every combination of policies.
+H2 request forwarding retains its documented total 16 KiB synth bound; capture
+resource exhaustion is an explicit 500. These limits are separate from the ten
+configuration intents proved above.

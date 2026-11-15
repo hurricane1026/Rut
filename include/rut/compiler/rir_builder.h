@@ -955,6 +955,24 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_regex_capture(ValueId str,
+                                           Str pattern,
+                                           u32 group,
+                                           SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str) || group > 8 || !pattern.ptr || pattern.len == 0 ||
+            pattern.len > 1024)
+            return err(RirError::InvalidState);
+        auto index = TRY(emit_const_i32(static_cast<i32>(group), loc));
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto result = TRY(emit(Opcode::StrRegexCapture, ty, loc));
+        result.inst->operands[0] = str;
+        result.inst->operands[1] = index;
+        result.inst->operand_count = 2;
+        result.inst->imm.str_val = pattern;
+        return result.vid;
+    }
+
     Result<ValueId> emit_str_regex_match(ValueId str, Str pattern, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));

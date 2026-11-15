@@ -1483,7 +1483,9 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 
 ```
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
-         s.replace/split/slice s.matches(re"") s.match(re"")
+         s.replace/split/slice s.matches(re"")
+         regexCapture(s, re"...", 1) -> str?
+         ⏳ s.match(re"")
          s.hasPrefix(str) s.hasSuffix(str)
          ⏳ s.trimPrefix/trimSuffix
 hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
@@ -3648,7 +3650,7 @@ SNI. SNI is client-selected routing metadata, not an authenticated identity.
 
 `@host("api.example") route GET "/api" { ... }` allows independent handlers,
 chains, decorators and rate policies for identical method/path keys. A declaration
-accepts one DNS name or one edge wildcard (`*.example`, `example.*`), up to 253
+accepts one DNS name, bracketed IPv6 literal or one edge wildcard (`*.example`, `example.*`), up to 253
 bytes. Matching folds ASCII case, ignores a valid authority port and trailing
 dot. Exact Host beats wildcard; longer fixed wildcard text beats shorter text;
 equal wildcard specificity retains declaration order. Only scopes containing a
@@ -3657,3 +3659,23 @@ a scope the configured route trie keeps ordinary Rut path semantics. At most 16
 Host scopes share the existing 128 route limit. Duplicate Host fields or invalid
 authorities reject before scoped policy lookup. Host is client routing input,
 not an authenticated identity. Request headers cannot supply transport SNI.
+
+### Bounded regex capture builtin
+
+`regexCapture(subject, re"pattern", group): str?` returns a capture from the
+first byte-oriented PCRE match. Group 0 is the whole matched span; 1...8 are
+parenthesized capture ordinals, including named groups. No match or an optional
+group that did not participate returns nil; an empty participating group returns
+present empty `str`. Unwrap before concatenating or passing `set_path:`. This is
+a native Rut builtin; Swift's `Regex.Match` carrier/API remains absent.
+
+Patterns and group indexes must be literals; patterns are at most 1024 bytes,
+with at most 8 groups. Input is at most 8192 bytes. Compilation occurs during
+configuration/startup, never from runtime input. Captures borrow their subject;
+`set_path:` copies the final target into request Arena storage. Capture matching
+uses pinned static PCRE2 10.49, no JIT/Unicode, with request Arena allocation,
+64 KiB cumulative allocation per call, 12 KiB frame heap, depth 64 and 100000
+matching steps. Invalid patterns/group indexes reject at compile time. Runtime
+resource failures return 500 immediately, before nil recovery can accept them.
+Available in HTTP handlers/helpers, not timers or WebSocket callbacks. Existing
+`matches(re"...")` retains its Vectorscan full-match Boolean behavior.

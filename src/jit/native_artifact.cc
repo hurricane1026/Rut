@@ -47,6 +47,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
     struct Database {
         char* data;
         u64 size;
+        void* handle;
     };
     auto* databases = arena.alloc_array<Database>(regex_count);
     if (regex_count && !databases) return false;
@@ -54,11 +55,14 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         Database* databases;
         u32 count;
         ~DatabaseCleanup() {
-            for (u32 i = 0; i < count; i++) free(databases[i].data);
+            for (u32 i = 0; i < count; i++)
+                rut_helper_regex_serialized_free(
+                    databases[i].handle, databases[i].data, databases[i].size);
         }
     } database_cleanup{databases, regex_count};
     u64 regex_bytes = 0;
     for (u32 i = 0; i < regex_count; i++) {
+        databases[i].handle = p.engine.regex_slots[i]->db;
         if (!rut_helper_regex_serialize(
                 p.engine.regex_slots[i]->db, &databases[i].data, &databases[i].size))
             return false;

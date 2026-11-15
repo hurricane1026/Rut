@@ -11203,3 +11203,15 @@ existing index/JIT path. Scope matching allocates nothing and examines at most
 rebuilds sidecars and rate-limit namespaces include Host. RouteEntry remains at
 config offset zero for native relocations. Owning indexes are last and excluded
 from metadata-only rollback snapshots; metadata population never mutates them.
+
+
+Regex capture results use the native `regexCapture(str, re"literal", group)`
+builtin with an optional string result. This does not implement an approximate
+Swift Regex.Match carrier. Vectorscan cannot expose capturing subexpressions;
+a pinned static PCRE2 10.49 C backend is used only for captures, leaving Boolean
+matching unchanged. Capture programs have bounded mmap ownership and native
+artifacts save/recompile their bounded source at startup. Request matching uses
+Arena callbacks, no hot heap allocation, a 12 KiB frame heap, 64 KiB cumulative
+allocation, depth 64 and 100000 steps. Input/pattern/group limits are 8192/1024/8.
+No-match/unparticipating groups are nil; participating empty groups are present.
+Resource errors return 500 before fallback/negation can consume an absent value.

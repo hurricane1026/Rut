@@ -30,6 +30,7 @@
 #include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/parse_integer.h"
 #include "rut/runtime/password_gateway.h"
+#include "rut/runtime/regex_capture.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
@@ -37,6 +38,8 @@
 #include "rut/runtime/webhook.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
+
+#include <sys/mman.h>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
@@ -1838,6 +1841,7 @@ struct RegexMatchCtx {
 };
 
 struct RegexHandle {
+    void* capture_program = nullptr;
     hs_database_t* db = nullptr;
     u64 generation = 0;
     u32 active_scans = 0;
@@ -2288,16 +2292,88 @@ void* rut_helper_regex_adopt(void* database) {
     return handle;
 }
 
+void* rut_helper_regex_capture_compile(const char* pattern, u32 length) {
+    void* program = capture_regex_compile({pattern, length});
+    if (!program) return nullptr;
+    void* raw = rut_helper_regex_adopt(nullptr);
+    if (!raw) {
+        capture_regex_destroy(program);
+        return nullptr;
+    }
+    static_cast<RegexHandle*>(raw)->capture_program = program;
+    return raw;
+}
+
+u8 rut_helper_regex_capture(void* connection,
+                            const char* subject,
+                            u32 length,
+                            void* db,
+                            u32 group,
+                            const char** output,
+                            u32* output_length) {
+    *output = nullptr;
+    *output_length = 0;
+    if (!connection || !db) return 2;
+    auto& handle = *static_cast<RegexHandle*>(db);
+    pthread_mutex_lock(&handle.mutex);
+    if (handle.closing || !handle.capture_program) {
+        pthread_mutex_unlock(&handle.mutex);
+        return 2;
+    }
+    handle.active_scans++;
+    void* program = handle.capture_program;
+    pthread_mutex_unlock(&handle.mutex);
+    Str result;
+    auto& arena = static_cast<ConnectionBase*>(connection)->json_arena;
+    const u8 state = capture_regex_match(program, arena, {subject, length}, group, &result);
+    end_regex_scan(&handle);
+    if (state == 1) {
+        *output = result.ptr;
+        *output_length = result.len;
+    }
+    return state;
+}
+
+void rut_helper_regex_serialized_free(void* db, char* bytes, u64 length) {
+    if (!bytes) return;
+    if (db && static_cast<RegexHandle*>(db)->capture_program)
+        munmap(bytes, length);
+    else
+        free(bytes);
+}
+
 bool rut_helper_regex_serialize(void* db, char** bytes, u64* length) {
     if (!db || !bytes || !length) return false;
     size_t n = 0;
     auto* handle = static_cast<RegexHandle*>(db);
+    if (handle->capture_program) {
+        const Str pattern = capture_regex_pattern(handle->capture_program);
+        *length = kCaptureRegexMarkerLength + pattern.len;
+        void* region =
+            mmap(nullptr, *length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) {
+            *length = 0;
+            return false;
+        }
+        *bytes = static_cast<char*>(region);
+        __builtin_memcpy(*bytes, kCaptureRegexMarker, kCaptureRegexMarkerLength);
+        __builtin_memcpy(*bytes + kCaptureRegexMarkerLength, pattern.ptr, pattern.len);
+        return true;
+    }
     if (hs_serialize_database(handle->db, bytes, &n) != HS_SUCCESS) return false;
     *length = n;
     return true;
 }
 
 void* rut_helper_regex_deserialize(const char* bytes, u64 length) {
+    if (bytes && length >= kCaptureRegexMarkerLength &&
+        __builtin_memcmp(bytes, kCaptureRegexMarker, kCaptureRegexMarkerLength) == 0) {
+        if (length <= kCaptureRegexMarkerLength || length > kCaptureRegexMarkerLength + 1024)
+            return nullptr;
+        return rut_helper_regex_capture_compile(
+            bytes + kCaptureRegexMarkerLength,
+            static_cast<u32>(length - kCaptureRegexMarkerLength));
+    }
     hs_database_t* db = nullptr;
     if (hs_deserialize_database(bytes, length, &db) != HS_SUCCESS) return nullptr;
     return rut_helper_regex_adopt(db);
@@ -2317,6 +2393,7 @@ void rut_helper_regex_free(void* db) {
 
     unregister_regex_handle(handle);
     if (regex_db) hs_free_database(regex_db);
+    if (handle->capture_program) capture_regex_destroy(handle->capture_program);
     pthread_cond_destroy(&handle->no_active_scans);
     pthread_mutex_destroy(&handle->mutex);
     free(handle);

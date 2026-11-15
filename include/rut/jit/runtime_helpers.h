@@ -476,6 +476,15 @@ rut::u8 rut_helper_str_regex_result(const char* s, rut::u32 s_len, void* db);
 
 // Returns 1 when the Vectorscan backend is available.
 rut::u8 rut_helper_regex_backend_available();
+void* rut_helper_regex_capture_compile(const char* pattern, rut::u32 length);
+rut::u8 rut_helper_regex_capture(void* connection,
+                                 const char* subject,
+                                 rut::u32 length,
+                                 void* database,
+                                 rut::u32 group,
+                                 const char** output,
+                                 rut::u32* output_length);
+void rut_helper_regex_serialized_free(void* database, char* bytes, rut::u64 length);
 
 // Byte-exact suffix predicate; empty needle matches any valid String.
 rut::u8 rut_helper_str_has_suffix(const char* text,

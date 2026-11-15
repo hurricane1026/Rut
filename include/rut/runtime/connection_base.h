@@ -1937,8 +1937,11 @@ struct ConnectionBase {
             authority = request.headers[i].value;
             count++;
         }
-        return count == 1 &&
-               route_host_from_authority(authority, routing_host_bytes, &routing_host_length);
+        // A route without a Host condition remains eligible when Host is absent.
+        if (count == 0) return true;
+        if (count != 1 || !route_host_from_authority(authority, routing_host_bytes, &routing_host_length)) return false;
+        if (!route_host_pattern_valid(routing_host())) routing_host_length = 0;
+        return true;
     }
     Str routing_host() const { return {routing_host_bytes, routing_host_length}; }
     char req_path[kMaxReqPathLen];

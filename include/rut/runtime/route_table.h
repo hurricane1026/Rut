@@ -2061,8 +2061,12 @@ private:
         r.fn = fn;
         if (host.len != 0 && !route_host_pattern_valid(host)) return false;
         r.host_len = static_cast<u16>(host.len);
-        for (u32 i = 0; i < host.len; i++) r.host[i] = route_host_lower(host.ptr[i]);
-        r.host[host.len] = '\0';
+        if (host.len != 0 && host.ptr[0] == '[') {
+            if (!route_host_from_authority(host, r.host, &r.host_len)) return false;
+        } else {
+            for (u32 i = 0; i < host.len; i++) r.host[i] = route_host_lower(host.ptr[i]);
+            r.host[host.len] = '\0';
+        }
         r.needs_req_body = needs_req_body;
         r.needs_password_gateway = 0;
         r.forward_preflight_mode = forward_preflight_mode;
