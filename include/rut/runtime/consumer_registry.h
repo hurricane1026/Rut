@@ -8,6 +8,11 @@ namespace rut {
 bool consumer_registry_valid(json::Document& document, Str configuration);
 bool consumer_registry_authenticate(
     json::Document& document, Str configuration, Str method, Str presented, json::Writer& output);
+// Uses only the verified TLS client fingerprint supplied by the request runtime.
+bool consumer_registry_authenticate_mtls(json::Document& document,
+                                         Str configuration,
+                                         Str fingerprint,
+                                         json::Writer& output);
 // Explicit, single-source URL-encoded credentials. Output adds only sanitized
 // remaining fields, never the credential. Query input is an origin-form target.
 bool consumer_credential_name_valid(Str name);

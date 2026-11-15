@@ -1,3 +1,4 @@
+#include "rut/common/types.h"
 #include "rut/runtime/consumer_registry.h"
 #include "test.h"
 
@@ -84,6 +85,65 @@ TEST(consumer_registry, snapshot_capacity_and_ambiguous_secrets) {
         document,
         view(
             R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]},{"id":"b","enabled":true,"groups":[]}],"credentials":[{"id":"k1","consumerId":"a","method":"header","secret":"shared","enabled":true},{"id":"k2","consumerId":"b","method":"header","secret":"shared","enabled":false}]})")));
+}
+TEST(consumer_registry, mtls_fingerprints_are_public_pins_and_method_is_separated) {
+    constexpr Str kFirst =
+        lit_str("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    constexpr Str kSecond =
+        lit_str("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+    constexpr Str kRegistry = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["readers"]},{"id":"bob","enabled":true,"groups":[]}],"credentials":[{"id":"alice-cert","consumerId":"alice","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":true},{"id":"bob-cert","consumerId":"bob","method":"mtls","secret":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","enabled":false}]})");
+    json::Document document;
+    CHECK(consumer_registry_valid(document, kRegistry));
+    char bytes[8192]{};
+    json::Writer output{bytes};
+    CHECK(consumer_registry_authenticate_mtls(document, kRegistry, kFirst, output));
+    CHECK((Str{bytes, output.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"alice-cert","method":"mtls","groups":["readers"]})"))));
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate(document, kRegistry, lit_str("mtls"), kFirst, output));
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate_mtls(document, kRegistry, kSecond, output));
+    CHECK_EQ(output.len, 0u);
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate_mtls(
+        document,
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"alice","enabled":false,"groups":[]}],"credentials":[{"id":"cert","consumerId":"alice","method":"mtls","secret":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true}]})"),
+        lit_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        output));
+    CHECK_EQ(output.len, 0u);
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate_mtls(
+        document,
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":[]}],"credentials":[{"id":"cert","consumerId":"alice","method":"mtls","secret":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","enabled":true}]})"),
+        lit_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        output));
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate_fields(
+        document,
+        kRegistry,
+        lit_str("cert"),
+        lit_str("cert=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        false,
+        output));
+    CHECK_EQ(output.len, 0u);
+    output = json::Writer{bytes};
+    CHECK(!consumer_registry_authenticate_mtls(
+        document,
+        kRegistry,
+        lit_str("ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"),
+        output));
+    CHECK_EQ(output.len, 0u);
+    CHECK(!consumer_registry_valid(
+        document,
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"cert","consumerId":"a","method":"mtls","secret":"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789","enabled":false}]})")));
+    CHECK(!consumer_registry_valid(
+        document,
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]},{"id":"b","enabled":true,"groups":[]}],"credentials":[{"id":"one","consumerId":"a","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":true},{"id":"two","consumerId":"b","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":false}]})")));
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

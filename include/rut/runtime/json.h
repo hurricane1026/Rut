@@ -92,6 +92,7 @@ enum class Op : u8 {
     ConsumerAuthenticate,
     ConsumerAuthenticateQuery,
     ConsumerAuthenticateForm,
+    ConsumerAuthenticateMtls,
 
 };
 

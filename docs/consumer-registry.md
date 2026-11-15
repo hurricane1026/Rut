@@ -27,7 +27,7 @@ even disabled records are validated. Reusing a secret within a method is rejecte
 across all credentials, preventing ambiguous ownership and slot-order selection.
 An empty registry is a valid deny-all snapshot.
 
-Methods are `bearer`, `basic` and `header`. Bearer and Basic retain existing strict
+The generic method accepts `bearer`, `basic` and `header`. Bearer and Basic retain existing strict
 syntax/canonical encoding and constant-time equal-length secret comparison.
 `header` admits the bounded Bearer-key byte grammar as an exact custom-header key.
 Use `req.authorization.or("")` for Authorization or `req.uniqueHeader(name).or("")`
@@ -40,6 +40,28 @@ in the request arena. It contains no secret or full registry. Missing, malformed
 wrong, disabled or revoked credentials return nil; authorization remains separate
 (e.g. `jwtHasGroup(identity, "staff")`). There is no guest fallback. Match results
 never accept client identity/group headers as proof.
+
+## mTLS Consumer authentication
+
+The `mtls` method's existing `secret` field holds a public SHA-256 certificate
+fingerprint pin, exactly 64 lowercase hexadecimal characters. Disabled pins are
+still validated, and duplicate pins are rejected regardless of credential or
+Consumer state. Authenticate with `consumerAuthenticateMtls(configuration) ->
+Json?`; the runtime reads only the connection's verified fingerprint, never a
+caller-supplied value. Missing certificates, cleartext, ordinary server-only
+TLS, unknown pins and disabled credentials or Consumers return nil. Results use
+the same identity/group projection as other methods. On an existing TLS
+connection, each new request matches its unchanged verified fingerprint against
+the adopted snapshot.
+
+The generic `consumerAuthenticate(presented, configuration, method)` API only
+accepts `bearer`, `basic` and `header`; `"mtls"` is a compile-time error and the
+runtime generic matcher also denies it. Query/form credential APIs only match
+`header` records. This keeps public certificate fingerprints away from ordinary
+credential extraction and prevents forwarded identity headers from satisfying
+the mTLS policy. The runnable
+[Consumer mTLS registry example](../examples/consumer-mtls-registry-auth.rut)
+demonstrates projection and explicit group authorization.
 
 ## Explicit query and form credentials
 
@@ -91,6 +113,11 @@ ID. Rotate by adding a distinct credential ID/secret, publish the overlap, then
 disable/remove the old record in a subsequent snapshot. Disable a Consumer to
 reject every owned credential; replace its groups to change later authorization.
 Credential removal expunges its secret from the replacement configuration.
+For mTLS, use a distinct credential ID and fingerprint pin for each certificate
+in the overlap window, then disable or remove the previous pin. A verified
+fingerprint remains attached to its connection; new requests on an existing TLS
+connection use the adopted Consumer snapshot against that same verified
+fingerprint.
 
 The configuration host uses the existing `Shard::reload_config` publication path
 and retains each native program until its old RCU readers retire. Authentication

@@ -4067,15 +4067,17 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                     const auto kJsonOp = static_cast<json::Op>(inst.imm.i32_val);
                     const bool kConsumer = kJsonOp == json::Op::ConsumerAuthenticate ||
                                            kJsonOp == json::Op::ConsumerAuthenticateQuery ||
-                                           kJsonOp == json::Op::ConsumerAuthenticateForm;
+                                           kJsonOp == json::Op::ConsumerAuthenticateForm ||
+                                           kJsonOp == json::Op::ConsumerAuthenticateMtls;
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                         kJsonOp == json::Op::OauthIntrospectionValid ||
                         kJsonOp == json::Op::OauthClientCredentialsRequest ||
                         kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
                         kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer) {
                         const u32 kCount =
-                            (kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
-                             kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer)
+                            (kJsonOp == json::Op::ConsumerAuthenticateMtls) ? 1u
+                            : (kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
+                               kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer)
                                 ? 3u
                                 : 2u;
                         if (inst.operand_count != kCount || inst.extra_operands ||

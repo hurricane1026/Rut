@@ -4086,11 +4086,14 @@ static FrontendResult<void> normalize_consumer_registry(HirExpr& expression,
     if (expression.kind != HirExprKind::JsonOp ||
         (expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticate) &&
          expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateQuery) &&
-         expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateForm)))
+         expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateForm) &&
+         expression.int_value != static_cast<i64>(json::Op::ConsumerAuthenticateMtls)))
         return {};
-    if (expression.args.len != 3 || !expression.args[1])
+    const bool kMtls = expression.int_value == static_cast<i64>(json::Op::ConsumerAuthenticateMtls);
+    if (expression.args.len != (kMtls ? 1u : 3u) || !expression.args[kMtls ? 0 : 1])
         return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
-    const HirExpr* value = expression.args[1];
+    const u32 kConfigIndex = kMtls ? 0u : 1u;
+    const HirExpr* value = expression.args[kConfigIndex];
     // LocalRef holds a stable ref_index, which may differ from the array slot
     // after guards, shadowing, or synthesized helper locals. Never prove trust
     // using an unrelated local that happens to occupy that numeric slot.
@@ -4111,6 +4114,22 @@ static FrontendResult<void> normalize_consumer_registry(HirExpr& expression,
         return frontend_error(FrontendError::UnsupportedSyntax,
                               expression.span,
                               lit_str("Consumer registry must be compile-time configuration"));
+    }
+    if (kMtls) {
+        json::Document scratch;
+        if (!consumer_registry_valid(scratch, value->str_value))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expression.span,
+                                  lit_str("invalid Consumer registry snapshot"));
+        HirExpr literal{};
+        literal.kind = HirExprKind::StrLit;
+        literal.type = HirTypeKind::Str;
+        literal.str_value = value->str_value;
+        literal.span = expression.span;
+        if (!route->exprs.push(literal))
+            return frontend_error(FrontendError::OutOfMemory, expression.span);
+        expression.args[kConfigIndex] = &route->exprs[route->exprs.len - 1];
+        return {};
     }
     const HirExpr* method = expression.args[2];
     if (!method) return frontend_error(FrontendError::UnsupportedSyntax, expression.span);
@@ -14392,12 +14411,14 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
 
     if ((expr.name.eq(lit_str("consumerAuthenticate")) ||
          expr.name.eq(lit_str("consumerAuthenticateQuery")) ||
-         expr.name.eq(lit_str("consumerAuthenticateForm"))) &&
+         expr.name.eq(lit_str("consumerAuthenticateForm")) ||
+         expr.name.eq(lit_str("consumerAuthenticateMtls"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
-        if (expr.args.len != 3)
+        const bool kMtls = expr.name.eq(lit_str("consumerAuthenticateMtls"));
+        if (expr.args.len != (kMtls ? 1u : 3u))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
         HirExpr values[3]{};
-        for (u32 i = 0; i < 3; ++i) {
+        for (u32 i = 0; i < (kMtls ? 1u : 3u); ++i) {
             if (!expr.args[i])
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             auto value = analyze_builtin_arg(*expr.args[i]);
@@ -14406,16 +14427,18 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             values[i] = value.value();
         }
-        const auto kOperation =
-            expr.name.eq(lit_str("consumerAuthenticateQuery")) ? json::Op::ConsumerAuthenticateQuery
-            : expr.name.eq(lit_str("consumerAuthenticateForm")) ? json::Op::ConsumerAuthenticateForm
-                                                                : json::Op::ConsumerAuthenticate;
+        const auto kOperation = kMtls ? json::Op::ConsumerAuthenticateMtls
+                                : expr.name.eq(lit_str("consumerAuthenticateQuery"))
+                                    ? json::Op::ConsumerAuthenticateQuery
+                                : expr.name.eq(lit_str("consumerAuthenticateForm"))
+                                    ? json::Op::ConsumerAuthenticateForm
+                                    : json::Op::ConsumerAuthenticate;
         auto operation = make_json_op(kOperation,
                                       HirTypeKind::Json,
                                       true,
                                       &values[0],
-                                      &values[1],
-                                      &values[2],
+                                      kMtls ? nullptr : &values[1],
+                                      kMtls ? nullptr : &values[2],
                                       expr.span,
                                       route);
         if (!operation) return operation;
