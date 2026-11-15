@@ -1,0 +1,24 @@
+// RS256 access-token resource profile bound to the verified TLS client cert.
+// Run with a port plus --tls-cert, --tls-key and mandatory --tls-client-ca.
+import "middleware/jwt_access.rut"
+import "middleware/jwt_binding.rut"
+
+
+route GET "/access" {
+    let document = jwt_access.requireRs256(req.authorization.or(""),
+        env("JWT_ACCESS_RS256_POLICY"), 300, 3600)
+    let bound = jwt_binding.requireMtls(document)
+    return 204
+}
+
+route GET "/read" {
+    let document = jwt_access.requireRs256(req.authorization.or(""),
+        env("JWT_ACCESS_RS256_POLICY"), 300, 3600)
+    let bound = jwt_binding.requireMtls(document)
+    let client = jwt_access.requireClient(bound, env("JWT_ACCESS_CLIENT_ID"))
+    let scoped = jwt_access.requireScope(client, env("JWT_ACCESS_REQUIRED_SCOPE"))
+    let subject = json.string(json.get(scoped, "/sub").or(scoped)).or("")
+    return response(200, body: subject)
+}
+
+route "/" { return 404 }
