@@ -80,3 +80,14 @@ signed cross-algorithm tokens, then loads through `rut` and removes source/modul
 files before requests. The matrix covers both backends at O0/O2 and HTTP/1.0,
 HTTP/1.1 and HTTP/2. It verifies the claims contract and existing configured
 revocation behavior; it is not a live authorization-server conformance test.
+
+## Binding the access token to mTLS
+
+The [RS256](../examples/mtls-access-bound-rs256-auth.rut) and
+[ES256](../examples/mtls-access-bound-es256-auth.rut) examples compose this
+profile with `jwt_binding.requireMtls`. They verify signature and access
+claims, bind the exact `cnf.x5t#S256` to the verified TLS client certificate,
+then check client and scope authorization. Start with `--tls-cert`, `--tls-key`
+and mandatory `--tls-client-ca`. Forwarded certificate headers never supply
+binding evidence. This adds no token issuance or proxy trust; see the
+[certificate-binding contract](mtls-bound-jwt.md).

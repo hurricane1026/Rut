@@ -10759,6 +10759,11 @@ explicit, and the ordinary helper fails closed with challenged 401 when TLS or
 confirmation evidence is missing. No token issuance, proxy-header trust, DPoP or
 persistent revocation is implied. See [the contract](docs/mtls-bound-jwt.md).
 
+The bounded RS256/ES256 access-token examples compose existing signature,
+claims/lifetime, TLS-certificate binding, client and scope checks in that order.
+They add no runtime primitive or token issuance path; see
+`docs/jwt-access-profile.md` for the composed resource-server contract.
+
 
 ### Introspection certificate confirmation policy
 
