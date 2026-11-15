@@ -366,6 +366,8 @@ def gateway(args, endpoint, program_factory=program, extra_libraries=(), entrypo
                         try:
                             status = Path(f'/proc/{child}/status').read_text()
                         except (FileNotFoundError, ProcessLookupError):
+                            # The compiler may exit after it is listed in
+                            # /proc/.../children but before its status is read.
                             continue
                         match = re.search(r'^VmRSS:\s+(\d+) kB$', status, re.M)
                         if match:
