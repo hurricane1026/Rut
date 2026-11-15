@@ -11,14 +11,14 @@ static void kong_gap_transform_witness(rut::test::TestCase* _tc,
     auto* conn = setup_target_transform_request(loop, config, request, strlen(request));
     REQUIRE(conn != nullptr);
     u8 original[SmallLoop::kBufSize];
-    const u32 original_len = conn->recv_buf.len();
-    const u32 original_header_end = conn->req_header_end;
-    const u32 original_send_len = conn->req_initial_send_len;
-    __builtin_memcpy(original, conn->recv_buf.data(), original_len);
+    const u32 kOriginalLen = conn->recv_buf.len();
+    const u32 kOriginalHeaderEnd = conn->req_header_end;
+    const u32 kOriginalSendLen = conn->req_initial_send_len;
+    __builtin_memcpy(original, conn->recv_buf.data(), kOriginalLen);
     loop.backend.clear_ops();
-    const bool accepted = materialize_request_target_transform(*conn, config);
+    const bool kAccepted = materialize_request_target_transform(*conn, config);
     if (expected_target != nullptr) {
-        REQUIRE(accepted);
+        REQUIRE(kAccepted);
         HttpParser parser;
         ParsedRequest parsed{};
         parser.reset();
@@ -26,11 +26,11 @@ static void kong_gap_transform_witness(rut::test::TestCase* _tc,
                 ParseStatus::Complete);
         CHECK(parsed.path.eq({expected_target, static_cast<u32>(strlen(expected_target))}));
     } else {
-        CHECK_FALSE(accepted);
-        CHECK_EQ(conn->recv_buf.len(), original_len);
-        CHECK_EQ(conn->req_header_end, original_header_end);
-        CHECK_EQ(conn->req_initial_send_len, original_send_len);
-        CHECK_EQ(__builtin_memcmp(original, conn->recv_buf.data(), original_len), 0);
+        CHECK_FALSE(kAccepted);
+        CHECK_EQ(conn->recv_buf.len(), kOriginalLen);
+        CHECK_EQ(conn->req_header_end, kOriginalHeaderEnd);
+        CHECK_EQ(conn->req_initial_send_len, kOriginalSendLen);
+        CHECK_EQ(__builtin_memcmp(original, conn->recv_buf.data(), kOriginalLen), 0);
         CHECK_EQ(loop.backend.op_count, 0u);
         // Verify ordinary Forward dispatch refuses it before upstream effects.
         JitDispatchOutcome outcome{};
@@ -41,7 +41,7 @@ static void kong_gap_transform_witness(rut::test::TestCase* _tc,
         CHECK_EQ(conn->upstream_fd, -1);
         CHECK_FALSE(conn->upstream_slot_held);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
-        CHECK_EQ(__builtin_memcmp(original, conn->recv_buf.data(), original_len), 0);
+        CHECK_EQ(__builtin_memcmp(original, conn->recv_buf.data(), kOriginalLen), 0);
     }
     loop.free_conn(*conn);
 }
@@ -72,20 +72,20 @@ TEST(kong_routing_gap, tls_and_h2_connection_flags_refuse_prefix_materialization
     loop.setup();
     RouteConfig config{};
     REQUIRE_EQ(config.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
-    const char request[] = "GET /api/users HTTP/1.1\r\nHost: client\r\n\r\n";
+    const char kRequest[] = "GET /api/users HTTP/1.1\r\nHost: client\r\n\r\n";
     for (u32 mode = 0; mode < 2; mode++) {
-        auto* conn = setup_target_transform_request(loop, config, request, sizeof(request) - 1);
+        auto* conn = setup_target_transform_request(loop, config, kRequest, sizeof(kRequest) - 1);
         REQUIRE(conn != nullptr);
-        const auto original_protocol = conn->protocol;
+        const auto kOriginalProtocol = conn->protocol;
         conn->tls_active = mode == 0;
         if (mode == 1) conn->protocol = ConnProtocol::Http2;
         loop.backend.clear_ops();
         CHECK_FALSE(materialize_request_target_transform(*conn, config));
-        CHECK_EQ(conn->recv_buf.len(), sizeof(request) - 1);
-        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), request, sizeof(request) - 1), 0);
+        CHECK_EQ(conn->recv_buf.len(), sizeof(kRequest) - 1);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kRequest, sizeof(kRequest) - 1), 0);
         CHECK_EQ(loop.backend.op_count, 0u);
         conn->tls_active = false;
-        conn->protocol = original_protocol;
+        conn->protocol = kOriginalProtocol;
         loop.free_conn(*conn);
     }
 }
@@ -100,14 +100,14 @@ TEST(kong_routing_gap, dispatch_does_not_normalize_dot_segments_or_unreserved_es
         const char* target;
         u16 status;
     };
-    const Vector vectors[] = {
+    const Vector kVectors[] = {
         {"/admin", 202},
         {"/api/users", 203},
         {"/api/../admin", 201},
         {"/api/%75sers", 201},
         {"/api//users", 201},
     };
-    for (const auto& vector : vectors) {
+    for (const auto& vector : kVectors) {
         const auto* route =
             config.match(reinterpret_cast<const u8*>(vector.target), strlen(vector.target), 0);
         REQUIRE(route != nullptr);

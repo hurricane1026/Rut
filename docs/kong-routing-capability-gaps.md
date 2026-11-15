@@ -1,6 +1,7 @@
 # Kong routing capability gap witnesses
 
 Audit base: `a3fe7f77de60d778ccbab68016a62277f88347c9` (2026-11-15).
+Tracking issue: [#1098](https://github.com/hurricane1026/Rut/issues/1098).
 The goal is to express the same configuration intent in native Rut, not to import
 Kong JSON, introduce Kong keywords, or silently change existing Rut semantics.
 
@@ -85,3 +86,11 @@ Linux, Clang Release, JIT enabled, project-pinned OpenSSL and Vectorscan:
 No live Kong differential, epoll/io_uring matrix or sanitizer suite was run for
 this test-only characterization change. No production runtime or language
 semantics were changed.
+
+The full clang-analyzer pass over the existing large test translation units was
+stopped after several minutes; it is not recorded as passing.
+Scoped clang-tidy with analyzer checks excluded found fixture-only enum linkage,
+enum size and constant naming diagnostics; these were corrected. The frontend
+include's non-analyzer checks and the runtime include's final identifier-naming
+check completed without diagnostics in the changed files. Existing diagnostics
+outside the line filters are not claimed clean.
