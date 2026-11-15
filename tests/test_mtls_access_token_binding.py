@@ -79,7 +79,10 @@ def gateway(args, policy, mode):
             while True:
                 if process.poll() is not None:
                     startup = log.read_bytes()
-                    if args.backend == "io_uring" and b"io_uring is unavailable" in startup:
+                    io_uring_unavailable = (
+                        args.backend == "io_uring" and
+                        b"--backend io_uring requested, but io_uring is unavailable\n" in startup)
+                    if io_uring_unavailable:
                         unavailable = True
                         raise SystemExit(77)
                     raise AssertionError(startup.decode(errors="replace"))
@@ -140,7 +143,7 @@ def gateway(args, policy, mode):
                 process.wait()
                 raise AssertionError("mTLS access gateway shutdown timed out")
             if unavailable:
-                assert process.returncode in (0, 77), log.read_text(errors="replace")
+                assert process.returncode == 1, log.read_text(errors="replace")
             else:
                 assert process.returncode == 0, (process.returncode,
                                                  log.read_text(errors="replace"))
