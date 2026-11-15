@@ -837,6 +837,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.may_nil = true;
         return v;
     }
+    if (expr.kind == HirExprKind::ReqRoutingString ||
+        expr.kind == HirExprKind::ReqConnectionScalar) {
+        v.kind = expr.kind == HirExprKind::ReqRoutingString ? MirValueKind::ReqRoutingString
+                                                            : MirValueKind::ReqConnectionScalar;
+        v.type = expr.type == HirTypeKind::Bool  ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::Str ? MirTypeKind::Str
+                                                 : MirTypeKind::I32;
+        v.may_nil = expr.may_nil;
+        v.int_value = expr.int_value;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqTlsClientCertSha256) {
         v.kind = MirValueKind::ReqTlsClientCertSha256;
         v.type = MirTypeKind::Str;

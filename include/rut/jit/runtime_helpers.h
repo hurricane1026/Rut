@@ -68,6 +68,14 @@ void rut_helper_req_path_only(const rut::u8* req_data,
 
 // Expose only the immutable, verified handshake identity owned by this
 // downstream connection; absent for cleartext and ordinary server TLS.
+rut::i32 rut_helper_req_connection_scalar(void* conn, rut::i32 selector);
+void rut_helper_req_routing_string(void* conn,
+                                   const rut::u8* data,
+                                   rut::u32 length,
+                                   rut::i32 selector,
+                                   rut::u8* has,
+                                   const char** out,
+                                   rut::u32* out_length);
 void rut_helper_req_tls_client_cert_sha256(void* conn,
                                            rut::u8* out_has,
                                            const char** out_ptr,

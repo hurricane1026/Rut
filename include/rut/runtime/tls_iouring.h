@@ -510,6 +510,7 @@ void tls_process(Self* loop, Connection& c) {
             loop->close_conn(c);
             return;
         }
+        tls_capture_server_name(c.tls_engine.ssl, c.tls_server_name, c.tls_server_name_length);
         c.tls_handshake_complete = true;
         if (c.h1_tls_transport) {
             h1_tls_ready(loop, c);

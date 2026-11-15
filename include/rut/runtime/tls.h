@@ -83,5 +83,6 @@ AlpnProtocol tls_negotiated_protocol(SSL* ssl);
 // successful required-client-certificate handshake. Returns true for ordinary
 // server TLS (out_valid=false) and false on any mTLS verification/capture error.
 bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& out_valid);
+void tls_capture_server_name(SSL* ssl, char out[254], u16& length);
 
 }  // namespace rut

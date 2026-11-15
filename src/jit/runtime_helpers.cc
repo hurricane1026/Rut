@@ -6,6 +6,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/uri_normalize.h"
 #include "rut/common/ws_message.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
@@ -149,6 +150,59 @@ void rut_helper_parse_unprime() {
 }
 
 // ── Request Access ─────────────────────────────────────────────────
+
+i32 rut_helper_req_connection_scalar(void* conn, i32 selector) {
+    if (conn == nullptr) return 0;
+    const auto& connection = *static_cast<const ConnectionBase*>(conn);
+    if (selector == 0) return connection.peer_port;
+    if (selector == 1) return connection.listener_context.port;
+    if (selector == 2) return connection.tls_active && connection.tls_handshake_complete;
+    return 0;
+}
+
+void rut_helper_req_routing_string(void* conn,
+                                   const u8* data,
+                                   u32 length,
+                                   i32 selector,
+                                   u8* has,
+                                   const char** out,
+                                   u32* out_length) {
+    *has = 0;
+    *out = nullptr;
+    *out_length = 0;
+    if (conn == nullptr || selector < 0 || selector > 2) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    if (selector == 2) {
+        if (!connection.tls_active || !connection.tls_handshake_complete ||
+            connection.tls_server_name_length == 0)
+            return;
+        *out = connection.tls_server_name;
+        *out_length = connection.tls_server_name_length;
+    } else {
+        const ParseCache& pc = parse_cached(data, length);
+        if (!pc.ok) return;
+        Str target = pc.req.path;
+        if (!forward_target_valid(target)) return;
+        auto& arena = connection.json_arena;
+        if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > 262144 - target.len)
+            return;
+        auto* bytes = static_cast<char*>(arena.alloc(target.len));
+        u32 normalized_length = 0;
+        if (!bytes || !normalize_forward_target(target, bytes, target.len, &normalized_length))
+            return;
+        if (selector == 0) {
+            for (u32 i = 0; i < normalized_length; i++)
+                if (bytes[i] == '?') {
+                    normalized_length = i;
+                    break;
+                }
+        }
+        *out = bytes;
+        *out_length = normalized_length;
+    }
+    *has = 1;
+}
 
 extern "C" void rut_helper_req_tls_client_cert_sha256(void* conn,
                                                       u8* out_has,

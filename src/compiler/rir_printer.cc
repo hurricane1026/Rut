@@ -159,6 +159,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqQueryString:
             buf.put_cstr("req.queryString");
             break;
+        case Opcode::ReqRoutingString:
+            buf.put_cstr("req.routingString");
+            break;
+        case Opcode::ReqConnectionScalar:
+            buf.put_cstr("req.connectionScalar");
+            break;
         case Opcode::ReqTlsClientCertSha256:
             buf.put_cstr("req.tlsClientCertSha256");
             break;
@@ -768,6 +774,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
             break;
+        case Opcode::ReqRoutingString:
+        case Opcode::ReqConnectionScalar:
         case Opcode::WsMessageField:
             buf.put(' ');
             buf.put_i32(inst.imm.i32_val);

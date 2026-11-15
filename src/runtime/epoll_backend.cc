@@ -49,7 +49,8 @@ EpollTlsHooks default_tls_hooks = {default_ssl_accept,
                                    default_ssl_get_error,
                                    default_alpn_negotiated,
                                    tls_capture_verified_client_fingerprint,
-                                   SSL_shutdown};
+                                   SSL_shutdown,
+                                   tls_capture_server_name};
 
 const EpollTlsHooks* get_tls_hooks() {
     if (const EpollTlsHooks* hooks =
@@ -1276,6 +1277,9 @@ u32 EpollBackend::wait(
                                 out++;
                                 continue;
                             }
+                            if (get_tls_hooks()->capture_server_name)
+                                get_tls_hooks()->capture_server_name(
+                                    ssl, conn.tls_server_name, conn.tls_server_name_length);
                             conn.tls_handshake_complete = true;
                             if (conn.h1_tls_transport) {
                                 events[out] = {};

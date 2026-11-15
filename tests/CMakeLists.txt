@@ -4037,6 +4037,12 @@ if(RUT_ENABLE_JIT)
 
     endif()
 
+    add_executable(test_routing_properties test_routing_properties.cc)
+    target_link_libraries(test_routing_properties rut_jit rut_compiler)
+    target_include_directories(test_routing_properties PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+    add_test(NAME test_routing_properties COMMAND test_routing_properties)
+    set_tests_properties(test_routing_properties PROPERTIES LABELS "unit;routing-capability")
+
     add_executable(test_jit test_jit.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
     target_link_libraries(test_jit rut_jit rut_compiler)
     target_include_directories(test_jit PRIVATE

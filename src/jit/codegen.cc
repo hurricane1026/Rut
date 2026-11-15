@@ -1635,6 +1635,57 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, opt);
             break;
         }
+        case rir::Opcode::ReqConnectionScalar: {
+            LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.i32_ty, params, 2, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_connection_scalar");
+            if (fn == nullptr)
+                fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_connection_scalar", type);
+            LLVMValueRef args[] = {c.param_conn, LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0)};
+            LLVMValueRef value = LLVMBuildCall2(c.builder, type, fn, args, 2, "connection.scalar");
+            if (inst.imm.i32_val == 2)
+                value = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, value, LLVMConstInt(c.i32_ty, 0, 0), "connection.tls");
+            c.set_value(inst.result, value);
+            break;
+        }
+        case rir::Opcode::ReqRoutingString: {
+            LLVMTypeRef params[] = {
+                c.ptr_ty, c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, 7, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_routing_string");
+            if (fn == nullptr)
+                fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_routing_string", type);
+            LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "routing.has");
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "routing.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "routing.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_req_data,
+                                   c.param_req_len,
+                                   LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
+                                   has,
+                                   ptr,
+                                   len};
+            LLVMBuildCall2(c.builder, type, fn, args, 7, "");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i8_ty, has, "routing.h"),
+                                       0,
+                                       "routing.opt.has");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "routing.p"),
+                                       1,
+                                       "routing.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i32_ty, len, "routing.l"),
+                                       2,
+                                       "routing.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::ReqTlsClientCertSha256: {
             LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
             LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, 4, 0);
@@ -4053,7 +4104,23 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
                         return {nullptr, nullptr, false};
                 }
-                if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
+                if (inst.op == rir::Opcode::ReqRoutingString ||
+                    inst.op == rir::Opcode::ReqConnectionScalar) {
+                    if (inst.operand_count != 0 || inst.extra_operands || inst.imm.i32_val < 0 ||
+                        inst.imm.i32_val > 2 || inst.result == rir::kNoValue ||
+                        inst.result.id >= fn.value_count || fn.values == nullptr)
+                        return {nullptr, nullptr, false};
+                    if (inst.op == rir::Opcode::ReqConnectionScalar) {
+                        const auto* type = fn.values[inst.result.id].type;
+                        if (type == nullptr ||
+                            type->kind != (inst.imm.i32_val == 2 ? rir::TypeKind::Bool
+                                                                 : rir::TypeKind::I32) ||
+                            type->inner || type->struct_def)
+                            return {nullptr, nullptr, false};
+                    }
+                }
+                if (inst.op == rir::Opcode::ReqTlsClientCertSha256 ||
+                    inst.op == rir::Opcode::ReqRoutingString) {
                     if (inst.operand_count != 0 || inst.result == rir::kNoValue ||
                         inst.result.id >= fn.value_count || fn.values == nullptr)
                         return {nullptr, nullptr, false};

@@ -150,11 +150,24 @@ route GET "/preserve" {
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
     }, target_transform: { strip_prefix: "/preserve/", replace_prefix: "/v1/", mode: .rawPrefix })
 }
+route GET "/metadata" {
+    guard let local = parseInt(req.header("X-Local-Port").or("")) else { return 400 }
+    guard req.localPort == local && req.remotePort > 0 else { return 422 }
+    let secure = req.header("X-Secure").or("") == "yes"
+    guard req.isTls == secure else { return 403 }
+    let name = req.sni.or("none")
+    return response(200, body: name)
+}
 route "/" {
-    if req.pathOnly.hasPrefix("/catalog") {
+    guard let path = req.normalizedPath else { return 400 }
+    guard let target = req.normalizedTarget else { return 400 }
+    guard path != "/private" else { return 403 }
+    if path == "/admin" || path == "/api/users" {
+        return forward(backend, load_balance: .roundRobin, set_path: target)
+    } else { if req.pathOnly.hasPrefix("/catalog") {
         return forward(backend, load_balance: .roundRobin,
             target_transform: { strip_prefix: "/catalog", replace_prefix: "/", mode: .rawPrefix })
-    } else { return 404 }
+    } else { return 404 } }
 }
 ''')
             log = root / 'gateway.log'
@@ -183,6 +196,34 @@ route "/" {
                         raise AssertionError(data.decode(errors='replace'))
                     time.sleep(.02)
                 assert port, log.read_text(errors='replace')
+                metadata_headers = {'X-Local-Port': str(port), 'X-Secure': 'yes' if args.tls else 'no',
+                                    'X-Forwarded-Proto': 'http' if args.tls else 'https', 'SNI': 'spoof.example'}
+                expected_name = b'localhost' if args.tls else b'none'
+                if args.h2:
+                    result = h2_request(port, '/metadata', list(metadata_headers.items()), tls_context=context)
+                else:
+                    probe = connection(port)
+                    try:
+                        probe.request('GET', '/metadata', headers=metadata_headers)
+                        reply = probe.getresponse()
+                        result = (reply.status, reply.read())
+                    finally:
+                        probe.close()
+                assert result == (200, expected_name), ('metadata', result)
+                normalized = [('/api/../admin?q=%2f', b'/admin?q=%2f|'),
+                              ('/api/%75sers', b'/api/users|'), ('/api//users', b'/api/users|')]
+                for path, expected in normalized:
+                    if args.h2:
+                        result = h2_request(port, path, [], tls_context=context)
+                    else:
+                        probe = connection(port)
+                        try:
+                            probe.request('GET', path)
+                            reply = probe.getresponse()
+                            result = (reply.status, reply.read())
+                        finally:
+                            probe.close()
+                    assert result == (200, expected), ('normalized selection', path, result)
                 if args.h2:
                     cases = [
                         ('GET', '/users/7', [], b'', b'/internal/accounts/7|'),
@@ -209,7 +250,7 @@ route "/" {
                         h2_body_abort_then_probe(port, context, cancel)
                         with lock:
                             assert len(seen) == before + 1 and seen[-1][1] == '/plain', seen[before:]
-                    print(f'PASS: {args.backend} H2 tls={args.tls}: dynamic and prefix targets, body, after headers, timer continuation, refusal and body abort/reuse; 15 requests')
+                    print(f'PASS: {args.backend} H2 tls={args.tls}: dynamic and prefix targets, body, after headers, timer continuation, refusal and body abort/reuse; 19 requests')
                     return 0
                 client = connection(port)
                 try:
@@ -269,10 +310,10 @@ route "/" {
                     with lock:
                         assert len(seen) == before, (target, seen[before:])
                 with lock:
-                    assert len(seen) == len(cases) + 1, seen
-                    assert seen[3][3] == b'payload', seen
+                    assert len(seen) == len(cases) + 4, seen
+                    assert seen[6][3] == b'payload', seen
                 print(f'PASS: {args.backend} tls={args.tls}: dynamic captures, borrowed target ownership, body, '
-                      f'prefix modes, Host/after headers, streaming body and invalid-target refusal; {len(cases) + 5} requests')
+                      f'prefix modes, Host/after headers, streaming body and invalid-target refusal; {len(cases) + 9} requests')
             finally:
                 process.terminate()
                 try:

@@ -137,3 +137,18 @@ both `kong-gap` entries passed; focused frontend 24 tests / 335 checks, network
 is claimed for this stage. Standalone normalizer header clang-tidy completed;
 existing naming diagnostics in the older transform header remain outside the
 changed lines.
+
+### Explicit normalized selection and connection metadata
+
+`req.normalizedPath` / `req.normalizedTarget` are optional request-owned strings;
+root route predicates can select on the former and forward the latter. The live
+matrix verifies `/api/../admin`, encoded unreserved bytes and repeated slashes
+select and reach the corresponding normalized target while retaining query bytes.
+`req.sni`, `req.remotePort`, `req.localPort` and `req.isTls` use connection state.
+Forged SNI/Forwarded headers and H2 :scheme cannot replace transport state.
+SNI is routing input, not authenticated identity. Slot reuse clears fixed storage.
+
+Validation: 11 frontend gap tests / 44 checks; 2 helper tests / 19 checks;
+all eight live profiles passed with four additional probes per profile (158
+requests total). RIR admission validates selector and result types. No sanitizer
+or macOS/kqueue execution was performed for this stage.

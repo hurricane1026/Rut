@@ -156,7 +156,7 @@ route GET "/" { let captures = req.pathOnly.match(re"^/v([0-9]+)/users/(.*)$") r
 )rut") == KongGapStage::ParseRejected);
 }
 
-TEST(kong_routing_gap, connection_metadata_accessor_probes_are_not_http_fields) {
+TEST(kong_routing_gap, connection_metadata_accessors_reach_verified_rir) {
     CHECK(kong_gap_stage(_tc, "route GET \"/\" { let version = req.httpVersion return 200 }") ==
           KongGapStage::Verified);
     const char* sources[] = {
@@ -165,8 +165,7 @@ TEST(kong_routing_gap, connection_metadata_accessor_probes_are_not_http_fields) 
         "route GET \"/\" { let port = req.localPort return 200 }",
         "route GET \"/\" { let secure = req.isTls return 200 }",
     };
-    for (const char* source : sources)
-        CHECK(kong_gap_stage(_tc, source) == KongGapStage::AnalyzeRejected);
+    for (const char* source : sources) CHECK(kong_gap_stage(_tc, source) == KongGapStage::Verified);
 }
 
 TEST(kong_routing_gap, distinct_host_routes_collide_but_merged_branch_is_supported) {
@@ -224,4 +223,16 @@ route GET "/" use chain policy { return forward(b, load_balance: .roundRobin, ta
 )rut",
                        lit("target_transform cannot be combined with response header mutations")) ==
         KongGapStage::AnalyzeRejected);
+}
+
+TEST(kong_routing_gap, normalized_selection_and_target_are_explicit) {
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" {
+    guard let path = req.normalizedPath else { return 400 }
+    guard let target = req.normalizedTarget else { return 400 }
+    if path == "/admin" { return forward(b, load_balance: .roundRobin, set_path: target) }
+    else { return 404 }
+}
+)rut") == KongGapStage::Verified);
 }

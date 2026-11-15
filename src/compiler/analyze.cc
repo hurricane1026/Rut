@@ -11647,6 +11647,25 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 return out;
             }
+            if (expr.name.eq(lit_str("normalizedPath")) ||
+                expr.name.eq(lit_str("normalizedTarget")) || expr.name.eq(lit_str("sni"))) {
+                out.kind = HirExprKind::ReqRoutingString;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
+                out.int_value = expr.name.eq(lit_str("normalizedPath"))     ? 0
+                                : expr.name.eq(lit_str("normalizedTarget")) ? 1
+                                                                            : 2;
+                return out;
+            }
+            if (expr.name.eq(lit_str("remotePort")) || expr.name.eq(lit_str("localPort")) ||
+                expr.name.eq(lit_str("isTls"))) {
+                out.kind = HirExprKind::ReqConnectionScalar;
+                out.int_value = expr.name.eq(lit_str("remotePort"))  ? 0
+                                : expr.name.eq(lit_str("localPort")) ? 1
+                                                                     : 2;
+                out.type = out.int_value == 2 ? HirTypeKind::Bool : HirTypeKind::I32;
+                return out;
+            }
             if (expr.name.eq({"pathOnly", 8})) {
                 out.kind = HirExprKind::ReqPathOnly;
                 out.type = HirTypeKind::Str;
@@ -21115,6 +21134,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqRoutingString:
+        case HirExprKind::ReqConnectionScalar:
         case HirExprKind::ReqTlsClientCertSha256:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:

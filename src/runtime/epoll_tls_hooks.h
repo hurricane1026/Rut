@@ -19,6 +19,7 @@ struct EpollTlsHooks {
     AlpnProtocol (*alpn_negotiated)(SSL* ssl);
     bool (*capture_client_fingerprint)(SSL* ssl, char fingerprint[64], bool& valid);
     i32 (*ssl_shutdown)(SSL* ssl) = nullptr;
+    void (*capture_server_name)(SSL* ssl, char out[254], u16& length) = nullptr;
 };
 
 }  // namespace rut

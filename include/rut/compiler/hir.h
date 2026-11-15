@@ -173,6 +173,8 @@ enum class HirExprKind : u8 {
     ReqQuery,
     ReqQueryString,
     ReqTlsClientCertSha256,
+    ReqRoutingString,
+    ReqConnectionScalar,
     ReqPath,
     ReqPathOnly,
     ReqBody,

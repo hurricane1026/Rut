@@ -640,6 +640,21 @@ struct Builder {
         return TRY(emit(Opcode::ReqQueryString, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_req_routing_property(bool string, i32 selector, SourceLoc loc = {}) {
+        if (selector < 0 || selector > 2) return err(RirError::InvalidState);
+        const Type* ty;
+        if (string) {
+            auto* inner = TRY(make_type(TypeKind::Str));
+            ty = TRY(make_type(TypeKind::Optional, inner));
+        } else {
+            ty = TRY(make_type(selector == 2 ? TypeKind::Bool : TypeKind::I32));
+        }
+        auto result =
+            TRY(emit(string ? Opcode::ReqRoutingString : Opcode::ReqConnectionScalar, ty, loc));
+        result.inst->imm.i32_val = selector;
+        return result.vid;
+    }
+
     Result<ValueId> emit_req_tls_client_cert_sha256(SourceLoc loc = {}) {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));

@@ -11188,3 +11188,10 @@ checking returned CAS consistency without narrowing unsigned version tokens.
 All profiles keep the existing byte, read and deadline bounds, preserve explicit
 session ownership, and close uncertain handles without retry. See
 [cache reads](docs/client-cache-reads.md).
+
+Explicit normalized routing properties use the same bounded URI transform as
+normalized prefix forwarding, with request-owned optional strings. Selection is
+opt-in through Rut predicates; raw dispatch retains its existing semantics.
+Connection port/TLS properties use accepted socket/listener state. TLS handshake
+completion captures SNI into fixed connection-owned storage, cleared on slot
+reuse and preserved across keep-alive/H2 streams; no HTTP header supplies it.

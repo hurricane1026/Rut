@@ -3627,3 +3627,19 @@ checking returned CAS consistency without narrowing unsigned version tokens.
 All profiles keep the existing byte, read and deadline bounds, preserve explicit
 session ownership, and close uncertain handles without retry. See
 [cache reads](client-cache-reads.md).
+
+### Explicit normalized targets and connection metadata
+
+`req.normalizedPath: str?` normalizes the origin-form path; `req.normalizedTarget:
+str?` adds its unchanged query. Both use bounded request Arena storage and return
+nil for invalid input or exhaustion. They decode unreserved escapes, uppercase
+remaining escape triplets, merge slash runs and remove dot segments. Default
+route dispatch and `req.path` remain raw. To select and forward consistently,
+guard the two optionals, predicate on normalizedPath and forward normalizedTarget
+with `set_path:`. This is an explicit route policy, not global canonicalization.
+
+`req.remotePort: i32` and `req.localPort: i32` come from the accepted socket and
+bound listener. `req.isTls: bool` reports a completed TLS transport; it ignores
+Forwarded, X-Forwarded-Proto and H2 :scheme. `req.sni: str?` is the handshake's
+connection-owned server name (at most 253 bytes), absent on cleartext or absent
+SNI. SNI is client-selected routing metadata, not an authenticated identity.
