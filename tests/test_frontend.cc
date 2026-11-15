@@ -19622,6 +19622,38 @@ TEST(frontend, direct_guard_fallback_forward_keeps_route_scope) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_term.kind),
              static_cast<u8>(HirTerminatorKind::ForwardUpstream));
 }
+TEST(frontend, lower_rejects_out_of_range_request_property_selector) {
+    const char* src =
+        "route GET \"/users\" { guard let path = req.normalizedPath else { return 400 } return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule valid{};
+    REQUIRE(lower_to_rir(mir.value(), valid));
+    valid.destroy();
+
+    MirValue* property = nullptr;
+    for (u32 i = 0; i < mir->functions[0].values.len; i++) {
+        MirValue& value = mir->functions[0].values[i];
+        if (value.kind == MirValueKind::ReqRoutingString) {
+            property = &value;
+            break;
+        }
+    }
+    REQUIRE(property != nullptr);
+    property->int_value = i64{1} << 32;
+
+    FrontendRirModule malformed{};
+    CHECK_FALSE(lower_to_rir(mir.value(), malformed));
+    malformed.destroy();
+}
 TEST(frontend, let_if_lowers_to_branching_rir) {
     const char* src =
         "upstream api\n"

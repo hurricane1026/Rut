@@ -1882,8 +1882,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::ReqRoutingString ||
         value.kind == MirValueKind::ReqConnectionScalar) {
-        auto v = b.emit_req_routing_property(
-            value.kind == MirValueKind::ReqRoutingString, value.int_value, {span.line, span.col});
+        if (value.int_value < 0 || value.int_value > 2)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto v = b.emit_req_routing_property(value.kind == MirValueKind::ReqRoutingString,
+                                             static_cast<i32>(value.int_value),
+                                             {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
