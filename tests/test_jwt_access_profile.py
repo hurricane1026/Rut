@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import socket
 import subprocess
@@ -14,9 +15,12 @@ import time
 from auth_h2_fixture import request as h2_request
 from test_keycloak_roles import MODULUS, signed
 
+ALGORITHM = 'rs256'
 ISSUER = 'https://access.example/issuer'
 AUDIENCE = 'orders-api'
 CLIENT_ID = 'orders-web'
+SIGNING_POLICY = None
+TOKEN_SIGNER = None
 
 
 @contextmanager
@@ -33,14 +37,19 @@ def gateway(args, directory, required_type='at+jwt', client_id=CLIENT_ID,
         port = probe.getsockname()[1]
     source = root / 'gateway.rut'
     source.write_text(original.read_text().replace('listen :8080', f'listen :{port}'))
-    policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
-                  jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
+    if SIGNING_POLICY is None:
+        policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
+                      jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256',
+                                           n=MODULUS, e='AQAB')]))
+    else:
+        policy = dict(SIGNING_POLICY)
     if revoked_jtis is not None:
         policy['revokedJtis'] = revoked_jtis
     if required_type is not None:
         policy['requiredType'] = required_type
-    env = dict(os.environ, JWT_ACCESS_RS256_POLICY=json.dumps(policy),
-               JWT_ACCESS_CLIENT_ID=client_id, JWT_ACCESS_REQUIRED_SCOPE=scope)
+    policy_env = f'JWT_ACCESS_{ALGORITHM.upper()}_POLICY'
+    env = dict(os.environ, JWT_ACCESS_CLIENT_ID=client_id, JWT_ACCESS_REQUIRED_SCOPE=scope)
+    env[policy_env] = json.dumps(policy)
     log = root / 'gateway.log'
     with log.open('w') as output:
         process = subprocess.Popen([args.server, str(source), '--backend', args.backend,
@@ -71,9 +80,51 @@ def gateway(args, directory, required_type='at+jwt', client_id=CLIENT_ID,
             process.wait()
 
 
+@contextmanager
+def es256_signer(path):
+    process = subprocess.Popen([path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    def read_line():
+        ready, _, _ = select.select([process.stdout], [], [], 5)
+        if not ready:
+            raise TimeoutError('ES256 fixture signer timed out')
+        line = process.stdout.readline()
+        if not line:
+            raise AssertionError('ES256 fixture signer exited: ' + process.stderr.read())
+        return line.rstrip('\n')
+
+    def sign(header, claims):
+        header_text = json.dumps(header, separators=(',', ':'))
+        process.stdin.write(header_text + '\t' + claims + '\n')
+        process.stdin.flush()
+        return read_line()
+
+    try:
+        policy = json.loads(read_line())
+        yield policy, sign
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
+
 def token(claims, typ='at+jwt', header=None):
-    header = header or dict(alg='RS256', kid='current', typ=typ)
-    return signed(claims, header)
+    algorithm = 'ES256' if ALGORITHM == 'es256' else 'RS256'
+    header = header or dict(alg=algorithm, kid='current', typ=typ)
+    claims_text = claims if isinstance(claims, str) else json.dumps(claims)
+    if ALGORITHM == 'rs256':
+        return signed(claims_text, header)
+    assert TOKEN_SIGNER is not None
+    return TOKEN_SIGNER(header, claims_text)
 
 
 def request(port, path, credential, version, duplicate=False):
@@ -104,13 +155,7 @@ def raw_duplicate_claims(claims):
     return text[:-1] + ',"client_id":"orders-web"}'
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--server', required=True)
-    parser.add_argument('--source', required=True)
-    parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
-    parser.add_argument('--opt', type=int, choices=(0, 2), default=2)
-    args = parser.parse_args()
+def run_profile(args):
     now = int(time.time())
     base = dict(sub='alice', iss=ISSUER, aud=AUDIENCE, iat=now, exp=now + 600,
                 client_id=CLIENT_ID, jti='token-1', scope='orders:read')
@@ -168,6 +213,15 @@ def main():
                             checks += 1
                 good = token(accepted, required_type)
                 bad_signature = good[:-5] + ('A' if good[-5] != 'A' else 'B') + good[-4:]
+                signing_algorithm = 'ES256' if ALGORITHM == 'es256' else 'RS256'
+                confused_algorithm = 'RS256' if ALGORITHM == 'es256' else 'ES256'
+                claims_text = json.dumps(accepted, separators=(',', ':'))
+                if ALGORITHM == 'es256':
+                    cross_algorithm_token = signed(
+                        claims_text, dict(alg='RS256', kid='current', typ=required_type))
+                elif TOKEN_SIGNER is not None:
+                    cross_algorithm_token = TOKEN_SIGNER(
+                        dict(alg='ES256', kid='current', typ=required_type), claims_text)
                 bad_credentials = (
                     (None, False, None), ('malformed', False, None),
                     (bad_signature, False, None), (good, True, None),
@@ -175,11 +229,17 @@ def main():
                     (token(dict(base, typ='at+jwt'), 'JWT'), False, None),
                     (token(accepted, 'at+jwt' if required_type != 'at+jwt' else 'application/at+jwt'), False, None),
                     (good, False, dict(alg='HS256', kid='current', typ=required_type)),
-                    (good, False, dict(alg='RS256', kid='unknown', typ=required_type)),
-                    (good, False, dict(alg='RS256', kid='current', typ=required_type, crit=['bad'])),
-                    (good, False, dict(alg='RS256', kid='current')),
-                    (good, False, dict(alg='RS256', kid='current', typ=1)),
-                    (good, False, dict(alg='RS256', kid='current', typ='at+JWT')))
+                    (good, False, dict(alg=signing_algorithm, kid='unknown', typ=required_type)),
+                    (good, False, dict(alg=signing_algorithm, kid='current', typ=required_type,
+                                       crit=['bad'])),
+                    (good, False, dict(alg=signing_algorithm, kid='current')),
+                    (good, False, dict(alg=signing_algorithm, kid='current', typ=1)),
+                    (good, False, dict(alg=signing_algorithm, kid='current', typ='at+JWT')),
+                    # A signer must also not relabel its signature with the other alg.
+                    (good, False, dict(alg=confused_algorithm, kid='current', typ=required_type)))
+                if ALGORITHM == 'es256' or TOKEN_SIGNER is not None:
+                    # This token is genuinely signed with the other algorithm's key.
+                    bad_credentials += ((cross_algorithm_token, False, None),)
                 for credential, duplicate, header in bad_credentials:
                     credential = credential if header is None else token(accepted, required_type, header)
                     for version in ('HTTP/1.0', 'HTTP/1.1', 'h2'):
@@ -196,9 +256,13 @@ def main():
                 checks += 1
         # A malformed optional requiredType is rejected while loading the policy,
         # rather than reported as an HTTP response.
-        malformed_policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
-                                jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]),
-                                requiredType=1)
+        if SIGNING_POLICY is None:
+            malformed_policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
+                                    jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256',
+                                                         n=MODULUS, e='AQAB')]))
+        else:
+            malformed_policy = dict(SIGNING_POLICY)
+        malformed_policy['requiredType'] = 1
         with tempfile.TemporaryDirectory(prefix='rut-jwt-access-load-') as load_dir:
             root_path = Path(load_dir)
             (root_path / 'middleware').mkdir()
@@ -206,15 +270,15 @@ def main():
                             root_path / 'middleware' / 'jwt_access.rut')
             source = root_path / 'gateway.rut'
             source.write_text(Path(args.source).resolve().read_text().replace('listen :8080', 'listen :0'))
-            env = dict(os.environ, JWT_ACCESS_RS256_POLICY=json.dumps(malformed_policy),
-                       JWT_ACCESS_CLIENT_ID=CLIENT_ID)
+            env = dict(os.environ, JWT_ACCESS_CLIENT_ID=CLIENT_ID)
+            env[f'JWT_ACCESS_{ALGORITHM.upper()}_POLICY'] = json.dumps(malformed_policy)
             result = subprocess.run([args.server, str(source), '--backend', args.backend, '--opt', str(args.opt),
                                      '--no-pin', '--shards', '1', '--drain', '0'], env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
             if args.backend == 'io_uring' and b'io_uring is unavailable' in result.stdout:
                 raise SystemExit(77)
             diagnostic = result.stdout.decode(errors='replace')
-            assert result.returncode != 0 and 'invalid RS256 trust policy' in diagnostic, diagnostic
+            assert result.returncode != 0 and f'invalid {ALGORITHM.upper()} trust policy' in diagnostic, diagnostic
             checks += 1
         # Trusted client selection is exact and malformed config is 503.
         with gateway(args, root, 'at+jwt', 'another-client') as port:
@@ -235,6 +299,35 @@ def main():
             assert actual == 401, actual
             checks += 1
     print(f'PASS: {checks} JWT access-profile checks ({args.backend}, O{args.opt})')
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--server', required=True)
+    parser.add_argument('--source', required=True)
+    parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
+    parser.add_argument('--opt', type=int, choices=(0, 2), default=2)
+    parser.add_argument('--algorithm', choices=('rs256', 'es256'), default='rs256')
+    parser.add_argument('--signer')
+    args = parser.parse_args()
+    global ALGORITHM, ISSUER, AUDIENCE, SIGNING_POLICY, TOKEN_SIGNER
+    ALGORITHM = args.algorithm
+    SIGNING_POLICY = None
+    TOKEN_SIGNER = None
+    if ALGORITHM == 'es256' and not args.signer:
+        parser.error('--algorithm es256 requires --signer')
+    if args.signer:
+        with es256_signer(args.signer) as (policy, sign):
+            SIGNING_POLICY = policy if ALGORITHM == 'es256' else None
+            TOKEN_SIGNER = sign
+            if ALGORITHM == 'es256':
+                ISSUER, AUDIENCE = 'issuer', 'gateway'
+            run_profile(args)
+    else:
+        if ALGORITHM == 'es256':
+            parser.error('--algorithm es256 requires --signer')
+        ISSUER, AUDIENCE = 'https://access.example/issuer', 'orders-api'
+        run_profile(args)
 
 
 if __name__ == '__main__':
