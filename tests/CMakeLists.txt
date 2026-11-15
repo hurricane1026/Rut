@@ -5221,6 +5221,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             endforeach()
         endforeach()
     endforeach()
+    add_test(NAME test_redis_commands_procfs_child_race
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_redis_commands_procfs_race.py
+            --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients)
+    set_tests_properties(test_redis_commands_procfs_child_race PROPERTIES
+        LABELS "integration;network" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
