@@ -4069,6 +4069,17 @@ if(RUT_ENABLE_JIT)
 
     if(Python3_Interpreter_FOUND)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            foreach(jwt_access_backend epoll io_uring)
+                foreach(jwt_access_opt 0 2)
+                    add_test(NAME test_jwt_access_profile_${jwt_access_backend}_opt${jwt_access_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_access_profile.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/jwt-access-auth.rut
+                            --backend ${jwt_access_backend} --opt ${jwt_access_opt})
+                    set_tests_properties(test_jwt_access_profile_${jwt_access_backend}_opt${jwt_access_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(keycloak_backend epoll io_uring)
                 foreach(keycloak_opt 0 2)
                     add_test(NAME test_keycloak_roles_${keycloak_backend}_opt${keycloak_opt}

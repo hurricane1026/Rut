@@ -1,0 +1,82 @@
+import Crypto
+
+struct JwtAccessPolicy {
+    issuer: str
+    audience: str
+    requiredType: str
+}
+
+struct JwtAccessClaims {
+    client_id: str
+    jti: str
+}
+
+func validAccessType(_ requiredType: str) -> bool {
+    requiredType == "at+jwt" || requiredType == "application/at+jwt"
+}
+
+func validAccessPolicy(_ policy: str, _ maxAge: i32, _ maxLifetime: i32) -> bool {
+    guard maxAge > 0 && maxLifetime > 0 else { false }
+    guard let parsed = json.parse(policy) else { false }
+    guard let configuration = json.decode(JwtAccessPolicy, parsed) else { false }
+    configuration.issuer != "" && configuration.audience != "" &&
+        validAccessType(configuration.requiredType)
+}
+
+func validAccessClaims(_ document: Json, _ policy: str, _ maxAge: i32,
+                       _ maxLifetime: i32) -> bool {
+    guard let parsed = json.parse(policy) else { false }
+    guard let configuration = json.decode(JwtAccessPolicy, parsed) else { false }
+    guard let claims = json.decode(JwtAccessClaims, document) else { false }
+    let clientIdBytes = Bytes(claims.client_id).count
+    let tokenIdBytes = Bytes(claims.jti).count
+    clientIdBytes >= 1 && clientIdBytes <= 1024 && tokenIdBytes >= 1 && tokenIdBytes <= 128 &&
+        jwtClaimsValidWithLifetime(document,
+                                   configuration.issuer,
+                                   configuration.audience,
+                                   i64(maxAge),
+                                   i64(maxLifetime))
+}
+
+// Pass req.authorization.or("") so duplicate Authorization fields fail closed.
+// The RS256 policy must pin requiredType to exactly one supported RFC 9068 type.
+func requireRs256(_ authorization: str, _ policy: str, _ maxAge: i32,
+                  _ maxLifetime: i32) -> Json {
+    guard validAccessPolicy(policy, maxAge, maxLifetime) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard let document = Crypto.jwtRs256(bearerToken(authorization).or(""), policy) else {
+        respond denied
+    }
+    guard validAccessClaims(document, policy, maxAge, maxLifetime) else { respond denied }
+    document
+}
+
+func validClientSelector(_ clientId: str) -> bool {
+    Bytes(clientId).count >= 1 && Bytes(clientId).count <= 1024
+}
+
+func clientClaimMatches(_ document: Json, _ clientId: str) -> bool {
+    guard let claim = json.get(document, "/client_id") else { false }
+    json.string(claim).or("") == clientId
+}
+
+func requireClient(_ document: Json, _ clientId: str) -> Json {
+    guard validClientSelector(clientId) else { respond 503 }
+    guard clientClaimMatches(document, clientId) else { respond 403 }
+    document
+}
+
+func validScopeSelector(_ scope: str) -> bool {
+    guard Bytes(scope).count >= 1 && Bytes(scope).count <= 128 else { false }
+    guard let syntheticClaims = json.value({scope: scope}) else { false }
+    jwtHasScope(syntheticClaims, scope)
+}
+
+func requireScope(_ document: Json, _ scope: str) -> Json {
+    guard validScopeSelector(scope) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasScope(document, scope) else { respond denied }
+    document
+}

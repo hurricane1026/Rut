@@ -10421,6 +10421,23 @@ policy using the RFC 9068 `client_id` claim, not complete OAuth/OIDC, sender bin
 a dynamic client registry or replay protection. See the language card and
 `examples/jwt-client-auth.rut` for the executable contract.
 
+### Bounded RS256 JWT access-token resource profile
+
+The ordinary `jwt_access` Rut module composes the existing static
+`Crypto.jwtRs256` policy with `jwtClaimsValidWithLifetime`, `jwtHasScope` and
+exact trusted `client_id` matching. Its policy must require exactly `at+jwt` or
+`application/at+jwt` in the signed protected-header `typ`; no normalization or
+payload/header fallback applies. The module additionally requires nonempty
+`client_id` (at most 1024 decoded bytes), nonempty `jti` (at most 128 bytes),
+and positive bounded `iat`/lifetime claims. It returns challenged Bearer
+`invalid_token` 401 for authentication or required-claim failures, 503 for
+invalid trusted policy/limits, and 403 for client or scope denial. `requireScope`
+accepts one well-formed RFC 6749 token and treats malformed trusted scope as 503.
+This is a bounded RFC 9068-inspired resource profile, not complete RFC 9068 or
+OIDC conformance, token issuance/login, sender proof, or online revocation.
+Tests load native artifacts after source/module unlink on both backends/O0/O2
+and H1.0/H1.1/H2. See `docs/jwt-access-profile.md`.
+
 
 ### Static mTLS credential rotation
 
