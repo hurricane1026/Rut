@@ -1368,6 +1368,7 @@ struct HirRoute {
     Span span{};
     u8 method = 0;
     Str path{};
+    Str host{};
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxGuards = 8;
     // JSON struct decoding materializes bounded pointer operations for each
@@ -1424,6 +1425,7 @@ struct HirRoute {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           exprs(other.exprs),
           locals(other.locals),
           guards(other.guards),
@@ -1454,6 +1456,7 @@ struct HirRoute {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         exprs = other.exprs;
         locals = other.locals;
         guards = other.guards;
@@ -1484,6 +1487,7 @@ struct HirRoute {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           exprs(other.exprs),
           locals(other.locals),
           guards(other.guards),
@@ -1514,6 +1518,7 @@ struct HirRoute {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         exprs = other.exprs;
         locals = other.locals;
         guards = other.guards;

@@ -583,7 +583,8 @@ inline bool header_only_head_explicit_close_arm_is_stable(
                                    route_method_key(static_cast<LogHttpMethod>(c.req_method)),
                                    params,
                                    &param_count,
-                                   kMaxRouteParams) == &route;
+                                   kMaxRouteParams,
+                                   c.routing_host()) == &route;
 }
 
 // The timeout D2 copy has to retain the same HeaderOnlyHead admission proof
@@ -863,7 +864,8 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
                                    route_method_key(static_cast<LogHttpMethod>(c.req_method)),
                                    params,
                                    &param_count,
-                                   kMaxRouteParams) == &route;
+                                   kMaxRouteParams,
+                                   c.routing_host()) == &route;
 }
 
 inline bool response_read_deadline_owner_is_stable(const Connection& c,
@@ -2078,7 +2080,8 @@ inline bool header_only_head_keep_alive_arm_is_stable(const Connection& c,
                                    route_method_key(static_cast<LogHttpMethod>(c.req_method)),
                                    params,
                                    &param_count,
-                                   kMaxRouteParams) == &route;
+                                   kMaxRouteParams,
+                                   c.routing_host()) == &route;
 }
 
 inline bool bodyless_get_keep_alive_precise_arm_is_stable(
@@ -2139,7 +2142,8 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
                                    route_method_key(static_cast<LogHttpMethod>(c.req_method)),
                                    params,
                                    &param_count,
-                                   kMaxRouteParams) == &route;
+                                   kMaxRouteParams,
+                                   c.routing_host()) == &route;
 }
 
 // A fully materialized positive fixed-length HEAD upload may start the same

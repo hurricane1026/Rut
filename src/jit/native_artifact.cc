@@ -26,6 +26,8 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         ~Cleanup() { a.destroy(); }
     } cleanup{arena};
     auto& c = p.config;
+    // Route relocations are measured from config byte zero.
+    if (reinterpret_cast<const void*>(&c) != static_cast<const void*>(c.routes)) return false;
     u32 view_count = 0;
     u64 string_bytes = 0;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(&c);

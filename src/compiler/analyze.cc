@@ -1,6 +1,7 @@
 #include "rut/compiler/analyze.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
@@ -25176,6 +25177,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         ::new (static_cast<void*>(&route)) HirRoute{};
         route.span = route_decl.span;
         route.path = route_decl.path;
+        for (u32 di = 0; di < route_decl.decorators.len; di++) {
+            const auto& attribute = route_decl.decorators[di];
+            if (!attribute.name.eq(lit_str("host"))) continue;
+            if (is_timer_item || route.host.len != 0 ||
+                !route_host_pattern_valid(attribute.route_host))
+                return frontend_error(FrontendError::UnsupportedSyntax, attribute.span);
+            route.host = attribute.route_host;
+        }
         route.method = route_decl.method_is_any ? kRouteMethodAny
                                                 : route_method_key_from_token(route_decl.method);
         if (!route_decl.method_is_any && route.method == kRouteMethodAny)
@@ -25350,7 +25359,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         bool has_guarding_decorator = false;
         for (u32 di = 0; di < route_decl.decorators.len; di++) {
             const Str dn = route_decl.decorators[di].name;
-            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache"))) {
+            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache")) &&
+                !dn.eq(lit_str("host"))) {
                 has_guarding_decorator = true;
                 break;
             }
@@ -26780,6 +26790,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // Official built-in decorators are recognized here and lowered to
             // route metadata, not resolved to user functions. @rateLimit sets
             // the per-route GCRA limits (enforced in the runtime).
+            if (ast_deco.name.eq(lit_str("host"))) continue;
             if (ast_deco.name.eq(lit_str("cache"))) {
                 if (route.http_cache_ttl != 0 || route.waits.len != 0 || route_decl.method_is_any ||
                     route.method != kRouteMethodGet)
@@ -26979,7 +26990,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 ri = 0; ri < mod.routes.len; ri++) {
                 const HirRoute& existing = mod.routes[ri];
                 if (!existing.is_timer && existing.method == route.method &&
-                    existing.path.eq(route.path))
+                    existing.path.eq(route.path) && route_host_equal(existing.host, route.host))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           route_decl.span,
                                           lit_str("duplicate route path and method"));

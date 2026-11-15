@@ -1763,10 +1763,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         d.overflow = false;
         return;
     }
+    if (config->host_scope_count != 0 && !d.conn->capture_routing_host(req)) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;
-    const RouteEntry* route =
-        config->match_canonical(req.path_canon, kMethodKey, params, &param_count, kMaxRouteParams);
+    const RouteEntry* route = config->match_canonical(
+        req.path_canon, kMethodKey, params, &param_count, kMaxRouteParams, d.conn->routing_host());
 
     if (!route) {
         // H2 serialization for configured unmatched policies is intentionally

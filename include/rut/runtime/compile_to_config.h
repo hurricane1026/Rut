@@ -324,7 +324,8 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                                                  handler,
                                                  rir_function_needs_req_body(fn),
                                                  fn.forward_preflight_mode,
-                                                 fn.preflight_forward_policy_bundle_id))
+                                                 fn.preflight_forward_policy_bundle_id,
+                                                 fn.route_host))
                 return false;
             target.routes[target.route_count - 1].h2_buffer_forward_body =
                 rir_function_buffers_h2_forward_body(fn, mod);
@@ -822,10 +823,13 @@ inline bool populate_route_config(RouteConfig& cfg,
     }
     // Public compiler/config publication is one transaction: a later failure
     // in any unrelated table cannot leave strict-local selectors half-active.
-    static_assert(std::is_trivially_copyable_v<RouteConfig>);
-    std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
+    // The POD configuration prefix is snapshotted; the final owning host
+    // indexes are untouched by this metadata-only transaction.
+    static_assert(std::is_trivially_copyable_v<decltype(RouteConfig::routes)>);
+    const u32 snapshot_bytes = cfg.metadata_snapshot_size();
+    std::unique_ptr<u8[]> before(new (std::nothrow) u8[snapshot_bytes]);
     if (!before) return false;
-    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
+    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), snapshot_bytes);
     const bool populated =
         detail::populate_verified_route_config(cfg, mod, retain_response_body_views);
     const bool strict_copied =
@@ -834,7 +838,7 @@ inline bool populate_route_config(RouteConfig& cfg,
          cfg.copy_strict_local_response_table_from_owned(*strict_local_response_probe));
     const bool auth_copied = strict_copied && detail::populate_rs256_configurations(cfg, mod) &&
                              detail::populate_es256_configurations(cfg, mod);
-    if (!auth_copied) __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+    if (!auth_copied) __builtin_memcpy(static_cast<void*>(&cfg), before.get(), snapshot_bytes);
     return auth_copied;
 }
 
@@ -869,10 +873,13 @@ inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,
     // The internal compiler chain promises whole-operation atomicity. RouteConfig is
     // intentionally non-copyable and large, so keep an object-representation snapshot
     // on the heap and restore it on every later failure.
-    static_assert(std::is_trivially_copyable_v<RouteConfig>);
-    std::unique_ptr<u8[]> before(new (std::nothrow) u8[sizeof(RouteConfig)]);
+    // The POD configuration prefix is snapshotted; the final owning host
+    // indexes are untouched by this metadata-only transaction.
+    static_assert(std::is_trivially_copyable_v<decltype(RouteConfig::routes)>);
+    const u32 snapshot_bytes = cfg.metadata_snapshot_size();
+    std::unique_ptr<u8[]> before(new (std::nothrow) u8[snapshot_bytes]);
     if (!before) return false;
-    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), sizeof(RouteConfig));
+    __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), snapshot_bytes);
     const bool populated = detail::populate_verified_route_config(cfg, mod);
     const bool strict_copied =
         populated && (!strict_local_response_probe ||
@@ -880,7 +887,7 @@ inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,
                           *strict_local_response_probe));
     if (!strict_copied || !detail::populate_rs256_configurations(cfg, mod) ||
         !detail::populate_es256_configurations(cfg, mod)) {
-        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
+        __builtin_memcpy(static_cast<void*>(&cfg), before.get(), snapshot_bytes);
         return false;
     }
     return true;

@@ -1304,8 +1304,12 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;
     const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-    const RouteEntry* matched = config->match_canonical(
-        conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+    const RouteEntry* matched = config->match_canonical(conn.req_path_canon,
+                                                        method_key,
+                                                        params,
+                                                        &param_count,
+                                                        kMaxRouteParams,
+                                                        conn.routing_host());
     if (matched != &pinned) return false;
     ResponseReadDeadlineFixedUploadRequest request{};
     if (!inspect_response_read_deadline_fixed_upload_request(conn,
@@ -2925,7 +2929,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (conn.req_target_form_reject_before_pre_route) {
+    if (conn.req_target_form_reject_before_pre_route ||
+        (config != nullptr && config->host_scope_count != 0 &&
+         !conn.capture_routing_host(pre_req))) {
         loop->epoch_enter();
         if (loop->metrics) loop->metrics->on_request_start();
         conn.resp_status = 400;
@@ -3120,7 +3126,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                         request_method_key,
                                         route_params,
                                         &route_param_count,
-                                        kMaxRouteParams);
+                                        kMaxRouteParams,
+                                        conn.routing_host());
     }
 
     // Matched routes always win. Only a genuine miss consults the generic
@@ -3470,8 +3477,12 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     u32 route_param_count = 0;
     if (config) {
         const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-        route = config->match_canonical(
-            conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+        route = config->match_canonical(conn.req_path_canon,
+                                        kMethodKey,
+                                        route_params,
+                                        &route_param_count,
+                                        kMaxRouteParams,
+                                        conn.routing_host());
     }
     if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
     if (!route || route->action != RouteAction::JitHandler || !route->fn) {
@@ -5164,8 +5175,12 @@ void handle_jit_outcome(Loop* loop,
                 RouteParam params[kMaxRouteParams]{};
                 u32 param_count = 0;
                 const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-                const RouteEntry* selected = config->match_canonical(
-                    conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+                const RouteEntry* selected = config->match_canonical(conn.req_path_canon,
+                                                                     method_key,
+                                                                     params,
+                                                                     &param_count,
+                                                                     kMaxRouteParams,
+                                                                     conn.routing_host());
                 if (selected == nullptr || selected->fn != fn ||
                     !response_read_deadline_route_index(
                         *config, selected, &strict_pipeline_successor_route_index)) {
@@ -13208,8 +13223,12 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         RouteParam params[kMaxRouteParams]{};
         u32 param_count = 0;
         const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-        const RouteEntry* route = config->match_canonical(
-            conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+        const RouteEntry* route = config->match_canonical(conn.req_path_canon,
+                                                          method_key,
+                                                          params,
+                                                          &param_count,
+                                                          kMaxRouteParams,
+                                                          conn.routing_host());
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_preconnect_is_stable(
                 conn,

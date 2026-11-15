@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
@@ -5222,6 +5223,19 @@ struct Parser {
         deco.span =
             Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
 
+        if (deco.name.eq(lit_str("host"))) {
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span);
+            auto host = expect(TokenType::StringLit);
+            if (!host || !route_host_pattern_valid(host.value()->text) ||
+                !expect(TokenType::RParen))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    deco.span,
+                    lit_str("@host requires one exact DNS name or edge wildcard"));
+            deco.route_host = host.value()->text;
+            return deco;
+        }
         if (deco.name.eq(lit_str("cache"))) {
             constexpr Str kDetail = lit_str("@cache requires ttl: a duration from 1s to 24h");
             if (!expect(TokenType::LParen))

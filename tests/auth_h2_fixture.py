@@ -50,9 +50,9 @@ def status(block):
     return int(digits)
 
 
-def request(port, path, fields, body=b'', method='GET', tls_context=None):
+def request(port, path, fields, body=b'', method='GET', tls_context=None, authority='localhost'):
     headers = bytes((0x82 if method == 'GET' else 0x83, 0x86, 0x04)) + string(path)
-    headers += b'\x01' + string('localhost')
+    headers += b'\x01' + string(authority)
     for name, value in [*fields, ('content-length', str(len(body)))]:
         headers += b'\x00' + string(name.lower()) + string(value)
     transport = socket.create_connection(('127.0.0.1', port), timeout=8)

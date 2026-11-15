@@ -358,6 +358,7 @@ struct MirBlock {
 };
 
 struct MirFunction {
+    Str host{};
     struct Wait {
         Span span{};
         WaitEventKind event_kind = WaitEventKind::Timer;
@@ -407,6 +408,7 @@ struct MirFunction {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           name(other.name),
           values(other.values),
           locals(other.locals),
@@ -433,6 +435,7 @@ struct MirFunction {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         name = other.name;
         values = other.values;
         locals = other.locals;
@@ -459,6 +462,7 @@ struct MirFunction {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           name(other.name),
           values(other.values),
           locals(other.locals),
@@ -485,6 +489,7 @@ struct MirFunction {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         name = other.name;
         values = other.values;
         locals = other.locals;

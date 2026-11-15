@@ -465,6 +465,7 @@ struct Function {
     Str name;  // e.g., "handle_get_users_id"
 
     // Route metadata.
+    Str route_host{};
     Str route_pattern;  // e.g., "/users/:id"
     u8 http_method;     // route method key (0 = any, 1..9 = full HTTP method)
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit);

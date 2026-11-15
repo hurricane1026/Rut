@@ -4941,6 +4941,10 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
             out.destroy();
             return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
         }
+        if (!copy_str(out.arena, mir.functions[i].host, &fn.value()->route_host)) {
+            out.destroy();
+            return frontend_error(FrontendError::OutOfMemory, mir.functions[i].span);
+        }
         fn.value()->rate_limit = mir.functions[i].rate_limit;
         fn.value()->forward_preflight_mode = mir.functions[i].forward_preflight_mode;
         fn.value()->throttle_down_bps = mir.functions[i].throttle_down_bps;

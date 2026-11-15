@@ -6,6 +6,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -1925,6 +1926,21 @@ struct ConnectionBase {
     u32 req_size;
     u32 peer_addr;
     u16 peer_port;
+    char routing_host_bytes[254]{};
+    u16 routing_host_length = 0;
+    bool capture_routing_host(const ParsedRequest& request) {
+        routing_host_length = 0;
+        Str authority{};
+        u32 count = 0;
+        for (u32 i = 0; i < request.header_count; i++) {
+            if (!route_host_equal(request.headers[i].name, {"host", 4})) continue;
+            authority = request.headers[i].value;
+            count++;
+        }
+        return count == 1 &&
+               route_host_from_authority(authority, routing_host_bytes, &routing_host_length);
+    }
+    Str routing_host() const { return {routing_host_bytes, routing_host_length}; }
     char req_path[kMaxReqPathLen];
     // View into req_path covering the canonical-for-routing path slice
     // (leading '/' stripped, trailing '/' run trimmed, bytes after first
@@ -2428,6 +2444,7 @@ struct ConnectionBase {
         peer_addr = 0;
         peer_port = 0;
         req_path[0] = '\0';
+        routing_host_length = 0;
         req_path_canon = {nullptr, 0};
         upstream_us = 0;
         upstream_name[0] = '\0';

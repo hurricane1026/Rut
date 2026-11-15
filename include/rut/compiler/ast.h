@@ -541,6 +541,7 @@ struct AstImplDecl {
 };
 
 struct AstDecorator {
+    Str route_host{};
     Span span{};
     Str namespace_name{};  // empty unless @ns.name form
     Str name{};

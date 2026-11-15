@@ -1643,6 +1643,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         fn.span = source_route.span;
         fn.method = source_route.method;
         fn.path = source_route.path;
+        fn.host = source_route.host;
         fn.name = {"route", 5};
         fn.error_variant_index = source_route.error_variant_index;
         fn.forward_preflight_mode = source_route.forward_preflight_mode;

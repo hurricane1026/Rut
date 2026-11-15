@@ -11195,3 +11195,11 @@ opt-in through Rut predicates; raw dispatch retains its existing semantics.
 Connection port/TLS properties use accepted socket/listener state. TLS handshake
 completion captures SNI into fixed connection-owned storage, cleared on slot
 reuse and preserved across keep-alive/H2 streams; no HTTP header supplies it.
+
+Host attributes create independent immutable route scopes, with cold mmap-backed
+ART/segment indexes only for scopes actually used. Default routes keep the
+existing index/JIT path. Scope matching allocates nothing and examines at most
+16 descriptors. Each route stores its owned canonical Host; native loading
+rebuilds sidecars and rate-limit namespaces include Host. RouteEntry remains at
+config offset zero for native relocations. Owning indexes are last and excluded
+from metadata-only rollback snapshots; metadata population never mutates them.

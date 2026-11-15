@@ -150,6 +150,22 @@ route GET "/preserve" {
         strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
     }, target_transform: { strip_prefix: "/preserve/", replace_prefix: "/v1/", mode: .rawPrefix })
 }
+func hostA(_ resp: Response) -> i32 { resp.set("X-Host-Policy", "a") 0 }
+func hostB(_ resp: Response) -> i32 { resp.set("X-Host-Policy", "b") 0 }
+chain policyA { after hostA(resp) }
+chain policyB { after hostB(resp) }
+@host("a.example")
+route GET "/host" use chain policyA { return response(200, body: "a") }
+@host("b.example")
+route GET "/host" use chain policyB { return response(200, body: "b") }
+@host("*.example")
+route GET "/host" { return response(200, body: "wildcard") }
+route GET "/host" { return response(200, body: "global") }
+@host("b.example")
+route GET "/hostusers/:id" {
+    wait(1ms)
+    return forward(backend, load_balance: .roundRobin, set_path: "/host/" + req.params.id)
+}
 route GET "/metadata" {
     guard let local = parseInt(req.header("X-Local-Port").or("")) else { return 400 }
     guard req.localPort == local && req.remotePort > 0 else { return 422 }
@@ -196,6 +212,22 @@ route "/" {
                         raise AssertionError(data.decode(errors='replace'))
                     time.sleep(.02)
                 assert port, log.read_text(errors='replace')
+                for authority, expected in [('a.example', b'a'), ('b.example', b'b'),
+                                            ('A.EXAMPLE:8000', b'a'), ('other.example', b'wildcard'),
+                                            ('localhost', b'global')]:
+                    if args.h2:
+                        result = h2_request(port, '/host', [], tls_context=context, authority=authority)
+                    else:
+                        probe = connection(port)
+                        try:
+                            probe.request('GET', '/host', headers={'Host': authority})
+                            reply = probe.getresponse()
+                            result = (reply.status, reply.read())
+                            if expected in (b'a', b'b'):
+                                assert reply.getheader('X-Host-Policy') == expected.decode(), (authority, result, reply.getheaders())
+                        finally:
+                            probe.close()
+                    assert result == (200, expected), ('host scope', authority, result)
                 metadata_headers = {'X-Local-Port': str(port), 'X-Secure': 'yes' if args.tls else 'no',
                                     'X-Forwarded-Proto': 'http' if args.tls else 'https', 'SNI': 'spoof.example'}
                 expected_name = b'localhost' if args.tls else b'none'

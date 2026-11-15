@@ -152,3 +152,17 @@ Validation: 11 frontend gap tests / 44 checks; 2 helper tests / 19 checks;
 all eight live profiles passed with four additional probes per profile (158
 requests total). RIR admission validates selector and result types. No sanitizer
 or macOS/kqueue execution was performed for this stage.
+
+### Independent Host scopes
+
+`@host("a.example")` and `@host("b.example")` now attach independent handlers,
+chains and decorators to the same method/path. Exact/wildcard/global precedence,
+case/port handling and distinct rate-limit namespaces have positive witnesses.
+Cold scope indexes are owned by RouteConfig and rebuilt after native load;
+request lookup allocates nothing. The live matrix caught and fixed the native
+relocation requirement that routes remain at config offset zero.
+
+Validated: 13 gap frontend cases / 47 checks, 4 standalone property cases / 38
+checks, all nine routing-capability CTest entries (eight live transports plus
+unit suite). The Host static handlers have separate after-header policies. The
+full legacy network suite and sanitizer are deferred to final combined checks.

@@ -3643,3 +3643,17 @@ bound listener. `req.isTls: bool` reports a completed TLS transport; it ignores
 Forwarded, X-Forwarded-Proto and H2 :scheme. `req.sni: str?` is the handshake's
 connection-owned server name (at most 253 bytes), absent on cleartext or absent
 SNI. SNI is client-selected routing metadata, not an authenticated identity.
+
+### Independent Host route scopes
+
+`@host("api.example") route GET "/api" { ... }` allows independent handlers,
+chains, decorators and rate policies for identical method/path keys. A declaration
+accepts one DNS name or one edge wildcard (`*.example`, `example.*`), up to 253
+bytes. Matching folds ASCII case, ignores a valid authority port and trailing
+dot. Exact Host beats wildcard; longer fixed wildcard text beats shorter text;
+equal wildcard specificity retains declaration order. Only scopes containing a
+matching method/path participate; a miss falls through to global routes. Within
+a scope the configured route trie keeps ordinary Rut path semantics. At most 16
+Host scopes share the existing 128 route limit. Duplicate Host fields or invalid
+authorities reject before scoped policy lookup. Host is client routing input,
+not an authenticated identity. Request headers cannot supply transport SNI.

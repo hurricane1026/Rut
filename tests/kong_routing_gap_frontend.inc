@@ -236,3 +236,21 @@ route GET "/" {
 }
 )rut") == KongGapStage::Verified);
 }
+
+TEST(kong_routing_gap, independent_host_scopes_and_duplicate_rejection) {
+    CHECK(kong_gap_stage(_tc, R"rut(
+@host("a.example")
+route GET "/api" { return 201 }
+@host("b.example")
+route GET "/api" { return 202 }
+@host("*.example")
+route GET "/api" { return 203 }
+route GET "/api" { return 204 }
+)rut") == KongGapStage::Verified);
+    CHECK(kong_gap_stage(_tc, R"rut(
+@host("a.example")
+route GET "/api" { return 201 }
+@host("A.EXAMPLE")
+route GET "/api" { return 202 }
+)rut") == KongGapStage::AnalyzeRejected);
+}
