@@ -28,15 +28,6 @@ function(rut_configure_re2)
         FetchContent_Populate(rut_abseil)
         add_subdirectory("${rut_abseil_SOURCE_DIR}" "${rut_abseil_BINARY_DIR}" EXCLUDE_FROM_ALL)
     endif()
-    if(RUT_SANITIZE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        if(NOT TARGET absl_flags_reflection)
-            message(FATAL_ERROR "Expected RE2's absl_flags_reflection target for the GCC UBSan workaround")
-        endif()
-        # GCC 13 rejects Abseil's constexpr function-pointer comparison in
-        # reflection.cc when UBSan is enabled. Keep ASan on this required RE2
-        # dependency and UBSan on the rest of the project.
-        target_compile_options(absl_flags_reflection PRIVATE -fno-sanitize=undefined)
-    endif()
     FetchContent_Declare(rut_re2
         URL https://github.com/google/re2/releases/download/2025-11-05/re2-2025-11-05.tar.gz
         URL_HASH SHA256=87f6029d2f6de8aa023654240a03ada90e876ce9a4676e258dd01ea4c26ffd67)
@@ -44,6 +35,19 @@ function(rut_configure_re2)
     if(NOT rut_re2_POPULATED)
         FetchContent_Populate(rut_re2)
         add_subdirectory("${rut_re2_SOURCE_DIR}" "${rut_re2_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    endif()
+    if(RUT_SANITIZE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        if(NOT TARGET absl_flags_reflection OR NOT TARGET re2)
+            message(FATAL_ERROR "Expected RE2 and Abseil targets for the GCC UBSan workaround")
+        endif()
+        # GCC's UBSan instrumentation makes Abseil's constexpr comparison of
+        # type-erased function pointers non-constant (GCC bug 71962). This
+        # affects Abseil reflection and RE2's flat-hash instantiations. Keep
+        # ASan and every other UBSan check enabled on these third-party targets.
+        target_compile_options(absl_flags_reflection PRIVATE
+            -fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute)
+        target_compile_options(re2 PRIVATE
+            -fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute)
     endif()
 endfunction()
 rut_configure_re2()
