@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_concurrency_model import check_reference_case
 from check_upstream_retirement_model import classify as retirement_verdict
+from check_timer_model import classify as timer_verdict, run_case as timer_case, CASES as TIMER_CASES
 
 
 def exported(verdict="None", returncode=0, stderr=""):
@@ -117,6 +118,32 @@ class RetirementVerdicts(unittest.TestCase):
         for code, output, expected in cases:
             with self.subTest(code=code, output=output):
                 self.assertEqual(retirement_verdict(code, output), expected)
+
+
+class TimerVerdicts(unittest.TestCase):
+    def test_errors_and_incomplete_traces_fail_closed(self):
+        for code, output, expected in (
+                (0, "Model checking completed. No error has been found.", "success"),
+                (12, "Invariant Safety is violated. State 1:", "safety"),
+                (13, "Temporal properties were violated. State 1:", "liveness"),
+                (0, "No error has been found.", "error"),
+                (12, "Invariant Safety is violated.", "error"),
+                (13, "Temporal properties were violated.", "error"),
+                (-9, "Invariant Safety is violated. State 1:", "error"),
+                (0, "Invariant Safety is violated. State 1:", "error"),
+                (150, "Parsing or semantic analysis failed", "error")):
+            with self.subTest(code=code, output=output):
+                self.assertEqual(timer_verdict(code, output), expected)
+
+    def test_timeout_preserves_diagnostic_and_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with patch("check_timer_model.subprocess.run", side_effect=
+                       subprocess.TimeoutExpired(["java"], 120, output=b"partial trace")):
+                with self.assertRaisesRegex(RuntimeError, "timed out; no proof"):
+                    timer_case(Path("/jar"), work, TIMER_CASES[0])
+            self.assertEqual((work / "tlc.log").read_text(), "partial trace")
+            self.assertTrue((work / "instance.cfg").exists())
 
 
 if __name__ == "__main__":

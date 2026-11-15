@@ -105,28 +105,18 @@ struct YieldHeap {
         return true;
     }
 
-    // Remove every entry with this conn_id. O(n) scan — expected to be
-    // called at most once per close_conn, and n is bounded by the number
-    // of concurrent yielded handlers (≤ kMaxConns). Restores the heap
-    // invariant by sifting up/down the swapped-in tail entries. Returns
-    // the number of entries removed.
+    // Remove every entry with this conn_id in O(n). Compact before rebuilding
+    // the heap: sifting during the scan can move another matching tail entry
+    // into an already-scanned prefix and leave a stale timer behind.
     u32 remove_by_conn(u32 conn_id) {
-        u32 removed = 0;
-        u32 i = 0;
-        while (i < size) {
-            if (entries[i].conn_id != conn_id) {
-                i++;
-                continue;
-            }
-            entries[i] = entries[--size];
-            removed++;
-            // Sift the swapped entry up or down as needed. Only one of
-            // the two branches can do work because the swapped entry
-            // is either smaller than its parent (sift up) or larger
-            // than one of its children (sift down), but not both.
-            if (i < size) sift(i);
-            // Don't advance i — the slot now holds the swapped tail,
-            // which may itself match conn_id on chained yields (rare).
+        u32 kept = 0;
+        for (u32 i = 0; i < size; ++i) {
+            if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
+        }
+        const u32 removed = size - kept;
+        size = kept;
+        if (removed > 0) {
+            for (u32 i = size / 2; i > 0; --i) sift_down(i - 1);
         }
         return removed;
     }
@@ -161,12 +151,6 @@ private:
             entries[i] = tmp;
             i = smallest;
         }
-    }
-    void sift(u32 i) {
-        // A swapped-in tail entry must sift in exactly one direction; try
-        // both (each is a no-op when not applicable).
-        sift_up(i);
-        sift_down(i);
     }
 };
 
