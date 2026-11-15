@@ -86,7 +86,7 @@ func resp2KeyNumberRequest(_ name: Bytes, _ key: Bytes, _ amount: i32) {
 }
 // Closed choices prevent contradictory conditions or expiration modes.
 variant RedisSetCondition { always absent present }
-variant RedisSetExpiry { none seconds(i32) milliseconds(i32) keepTtl }
+variant RedisSetExpiry { none seconds(i32) milliseconds(i32) unixSeconds(Bytes) unixMilliseconds(Bytes) keepTtl }
 func resp2SetCondition(_ condition: RedisSetCondition) -> Bytes {
     match condition {
         .always => b""
@@ -100,11 +100,22 @@ func resp2SetExpiryNumber(_ unit: Bytes, _ amount: i32) {
     guard let number = resp2BulkArgument(Bytes(digits), 8192) else { nil }
     concatBytes(unit, number, 8192)
 }
+// Decimal bytes retain timestamps beyond i32 without requiring a source i64 type.
+func resp2SetAbsoluteExpiry(_ unit: Bytes, _ digits: Bytes, _ seconds: bool) {
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let amount = parseInt64(digits) else { nil }
+    guard amount > 0 && (!seconds || amount < 9223372036854776) else { nil }
+    guard let canonical = formatInt(amount) else { nil }
+    guard let number = resp2BulkArgument(Bytes(canonical), 8192) else { nil }
+    concatBytes(unit, number, 8192)
+}
 func resp2SetExpiry(_ expiry: RedisSetExpiry) {
     match expiry {
         .none => b""
         .seconds(amount) => resp2SetExpiryNumber(b"$2\r\nEX\r\n", amount)
         .milliseconds(amount) => resp2SetExpiryNumber(b"$2\r\nPX\r\n", amount)
+        .unixSeconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nEXAT\r\n", amount, true)
+        .unixMilliseconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nPXAT\r\n", amount, false)
         .keepTtl => b"$7\r\nKEEPTTL\r\n"
     }
 }
@@ -119,6 +130,8 @@ func resp2SetArgumentCount(_ conditional: Bytes, _ expiry: RedisSetExpiry) -> i3
         .none => if conditional.count > 0 { 4 } else { 3 }
         .seconds(amount) => if conditional.count > 0 { 6 } else { 5 }
         .milliseconds(amount) => if conditional.count > 0 { 6 } else { 5 }
+        .unixSeconds(amount) => if conditional.count > 0 { 6 } else { 5 }
+        .unixMilliseconds(amount) => if conditional.count > 0 { 6 } else { 5 }
         .keepTtl => if conditional.count > 0 { 5 } else { 4 }
     }
 }
@@ -141,4 +154,89 @@ func resp2SetGetRequest(_ key: Bytes, _ value: Bytes, _ condition: RedisSetCondi
     guard let conditioned = concatBytes(prefix, conditional, 8192) else { nil }
     guard let expiring = concatBytes(conditioned, expiration, 8192) else { nil }
     concatBytes(expiring, b"$3\r\nGET\r\n", 8192)
+}
+
+// Explicitly bounded keys for one DEL/UNLINK command. Redis keys are binary-safe
+// and may repeat; final execution revalidates the complete encoded request.
+struct RedisKeys { arguments: Bytes count: i32 }
+variant RedisDeleteMode { blocking lazy }
+func redisKeys() -> RedisKeys { RedisKeys(arguments: b"", count: 0) }
+func redisKeysAdd(_ keys: RedisKeys, _ key: Bytes) {
+    guard keys.count > -1 && keys.count < 8 else { nil }
+    guard let argument = resp2BulkArgument(key, 8192) else { nil }
+    guard let arguments = concatBytes(keys.arguments, argument, 8192) else { nil }
+    RedisKeys(arguments: arguments, count: keys.count + 1)
+}
+func resp2DeleteName(_ mode: RedisDeleteMode) -> Bytes {
+    match mode { .blocking => b"$3\r\nDEL\r\n"
+        .lazy => b"$6\r\nUNLINK\r\n" }
+}
+func resp2DeleteKeysRequest(_ keys: RedisKeys, _ mode: RedisDeleteMode) {
+    guard keys.count > 0 && keys.count < 9 else { nil }
+    guard let header = resp2DecimalLine(b"*", keys.count + 1, 8192) else { nil }
+    guard let named = concatBytes(header, resp2DeleteName(mode), 8192) else { nil }
+    concatBytes(named, keys.arguments, 8192)
+}
+
+// GETEX has PERSIST instead of SET's KEEPTTL. A separate type prevents
+// accidentally changing the meaning of a shared expiry option.
+variant RedisGetExpiry { unchanged persist seconds(i32) milliseconds(i32) unixSeconds(Bytes) unixMilliseconds(Bytes) }
+func resp2GetExpiry(_ expiry: RedisGetExpiry) {
+    match expiry {
+        .unchanged => b""
+        .persist => b"$7\r\nPERSIST\r\n"
+        .seconds(amount) => resp2SetExpiryNumber(b"$2\r\nEX\r\n", amount)
+        .milliseconds(amount) => resp2SetExpiryNumber(b"$2\r\nPX\r\n", amount)
+        .unixSeconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nEXAT\r\n", amount, true)
+        .unixMilliseconds(amount) => resp2SetAbsoluteExpiry(b"$4\r\nPXAT\r\n", amount, false)
+    }
+}
+func resp2GetExpiryCount(_ expiry: RedisGetExpiry) -> i32 {
+    match expiry { .unchanged => 2
+        .persist => 3
+        _ => 4 }
+}
+func resp2GetExRequest(_ key: Bytes, _ expiry: RedisGetExpiry) {
+    guard let argument = resp2BulkArgument(key, 8192) else { nil }
+    guard let expiration = resp2GetExpiry(expiry) else { nil }
+    guard let header = resp2DecimalLine(b"*", resp2GetExpiryCount(expiry), 8192) else { nil }
+    guard let named = concatBytes(header, b"$5\r\nGETEX\r\n", 8192) else { nil }
+    guard let keyed = concatBytes(named, argument, 8192) else { nil }
+    concatBytes(keyed, expiration, 8192)
+}
+
+// Conditions concern the existing expiry, not the presence of the key itself.
+variant RedisExpireCondition { always noExpiry hasExpiry longer shorter hasExpiryLonger hasExpiryShorter }
+func resp2ExpireCondition(_ condition: RedisExpireCondition) -> Bytes {
+    match condition {
+        .always => b""
+        .noExpiry => b"$2\r\nNX\r\n"
+        .hasExpiry => b"$2\r\nXX\r\n"
+        .longer => b"$2\r\nGT\r\n"
+        .shorter => b"$2\r\nLT\r\n"
+        .hasExpiryLonger => b"$2\r\nXX\r\n$2\r\nGT\r\n"
+        .hasExpiryShorter => b"$2\r\nXX\r\n$2\r\nLT\r\n"
+    }
+}
+func resp2ExpireCount(_ condition: RedisExpireCondition) -> i32 {
+    match condition { .always => 3
+        .hasExpiryLonger => 5
+        .hasExpiryShorter => 5
+        _ => 4 }
+}
+func resp2ExpireName(_ milliseconds: bool) -> Bytes {
+    if milliseconds { b"$7\r\nPEXPIRE\r\n" } else { b"$6\r\nEXPIRE\r\n" }
+}
+func resp2ExpireArguments(_ key: Bytes, _ amount: i32) {
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let digits = formatInt(amount) else { nil }
+    guard let number = resp2BulkArgument(Bytes(digits), 8192) else { nil }
+    concatBytes(keyed, number, 8192)
+}
+func resp2ExpireRequest(_ key: Bytes, _ amount: i32, _ milliseconds: bool, _ condition: RedisExpireCondition) {
+    guard let header = resp2DecimalLine(b"*", resp2ExpireCount(condition), 8192) else { nil }
+    guard let named = concatBytes(header, resp2ExpireName(milliseconds), 8192) else { nil }
+    guard let arguments = resp2ExpireArguments(key, amount) else { nil }
+    guard let prefix = concatBytes(named, arguments, 8192) else { nil }
+    concatBytes(prefix, resp2ExpireCondition(condition), 8192)
 }

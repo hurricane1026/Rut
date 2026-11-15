@@ -1,0 +1,128 @@
+// VERSION and read-only STATS diagnostics. No stats reset/cachedump/sizes commands.
+variant MemcacheStatsSection { general settings items slabs }
+struct MemcacheStats { frame: Bytes count: i32 }
+// status: 0 incomplete, 1 complete, 8 server error, -1 invalid.
+struct MemcacheInfoState {
+    offset: i32 count: i32 status: i32 version: bool
+}
+struct MemcacheInfoStream { bytes: Bytes kind: i32 count: i32 version: bool }
+// Framing names are nonempty opaque tokens, distinct from application keys.
+func memcacheInfoNameValid(_ name: Bytes) -> bool {
+    name.count > 0 && !(name.count > 250) && name.find(b" ") == nil &&
+        name.find(b"\x00") == nil && name.find(b"\t") == nil &&
+        name.find(b"\x0b") == nil && name.find(b"\x0c") == nil &&
+        name.find(b"\r") == nil && name.find(b"\n") == nil
+}
+func memcacheInfoError(_ line: Bytes) -> bool {
+    line == b"ERROR" || (line.count > 13 &&
+        (line.slice(0, 13) == b"CLIENT_ERROR " || line.slice(0, 13) == b"SERVER_ERROR "))
+}
+func memcacheVersionRequest() -> Bytes { b"version\r\n" }
+func memcacheStatsRequest(_ section: MemcacheStatsSection) -> Bytes {
+    match section {
+        .general => b"stats\r\n"
+        .settings => b"stats settings\r\n"
+        .items => b"stats items\r\n"
+        .slabs => b"stats slabs\r\n"
+    }
+}
+func memcacheInfoStatValid(_ line: Bytes) -> bool {
+    guard line.slice(0, 5) == b"STAT " else { false }
+    guard let split = line.find(b" ", 5) else { false }
+    guard let key = line.slice(5, split) else { false }
+    memcacheInfoNameValid(key)
+}
+func memcacheInfoVersionValid(_ line: Bytes) -> bool {
+    guard line.slice(0, 8) == b"VERSION " else { false }
+    guard let value = line.slice(8, line.count) else { false }
+    memcacheInfoNameValid(value)
+}
+func memcacheInfoTuple(_ offset: i32, _ count: i32, _ status: i32, _ version: bool, _ done: bool) -> (MemcacheInfoState, MemcacheInfoState, bool) {
+    (MemcacheInfoState(offset: offset, count: count, status: status, version: version),
+        MemcacheInfoState(offset: offset, count: count, status: status, version: version), done)
+}
+func memcacheInfoStepLine(_ bytes: Bytes, _ state: MemcacheInfoState, _ line: Bytes, _ next: i32) -> (MemcacheInfoState, MemcacheInfoState, bool) {
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { nil }
+    if line == b"END" {
+        guard !state.version && next == bytes.count else { nil }
+        memcacheInfoTuple(next, state.count, 1, false, true)
+    } else {
+        if memcacheInfoError(line) {
+            guard state.count == 0 && next == bytes.count else { nil }
+            memcacheInfoTuple(next, 0, 8, state.version, true)
+        } else {
+            if state.version {
+                guard state.count == 0 && next == bytes.count && memcacheInfoVersionValid(line) else { nil }
+                memcacheInfoTuple(next, 0, 1, true, true)
+            } else {
+                guard state.count < 128 && memcacheInfoStatValid(line) else { nil }
+                memcacheInfoTuple(next, state.count + 1, 0, false,
+                    next == bytes.count || state.count == 63 || state.count == 127)
+            }
+        }
+    }
+}
+// Each step validates a line directly, keeping expanded code and parser state small.
+func memcacheInfoStep(_ bytes: Bytes, _ state: MemcacheInfoState) -> (MemcacheInfoState, MemcacheInfoState, bool) {
+    guard let end = bytes.find(b"\r\n", state.offset) else { (state, state, true) }
+    guard let line = bytes.slice(state.offset, end) else { nil }
+    memcacheInfoStepLine(bytes, state, line, end + 2)
+}
+func memcacheInfoTerminate(_ bytes: Bytes, _ state: MemcacheInfoState) -> MemcacheInfoState {
+    if state.status != 0 || state.count != 128 { state } else {
+        guard let tail = bytes.slice(state.offset, bytes.count) else { nil }
+        guard b"END\r\n".slice(0, tail.count) == tail else { nil }
+        if tail.count == 5 { MemcacheInfoState(offset: bytes.count, count: 128, status: 1, version: false) }
+        else { state }
+    }
+}
+func memcacheInfoScanTail(_ bytes: Bytes, _ state: MemcacheInfoState) {
+    guard let states = collectBytes(bytes, state, 64, memcacheInfoStep) else { nil }
+    guard let last = states.get(states.count - 1) else { nil }
+    memcacheInfoTerminate(bytes, last)
+}
+func memcacheInfoScan(_ bytes: Bytes, _ version: bool) {
+    guard !(bytes.count > 8192) else { nil }
+    let initial = MemcacheInfoState(offset: 0, count: 0, status: 0, version: version)
+    guard let states = collectBytes(bytes, initial, 64, memcacheInfoStep) else { nil }
+    guard let last = states.get(states.count - 1) else { nil }
+    if last.count == 64 && last.status == 0 { memcacheInfoScanTail(bytes, last) }
+    else { memcacheInfoTerminate(bytes, last) }
+}
+
+func memcacheInfoFeed(_ stream: MemcacheInfoStream, _ chunk: Bytes) {
+    guard stream.kind == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, 8192) else { nil }
+    guard let state = memcacheInfoScan(bytes, stream.version) else { nil }
+    guard state.status != -1 else { nil }
+    MemcacheInfoStream(bytes: bytes, kind: state.status, count: state.count, version: stream.version)
+}
+struct MemcacheLookup { offset: i32 prefix: Bytes found: bool value: Bytes }
+func memcacheLookupValue(_ line: Bytes, _ prefix: Bytes, _ old: Bytes) -> Bytes {
+    if line.slice(0, prefix.count) == prefix { line.slice(prefix.count, line.count).or(b"") } else { old }
+}
+func memcacheLookupAdvance(_ bytes: Bytes, _ state: MemcacheLookup) -> MemcacheLookup {
+    guard let end = bytes.find(b"\r\n", state.offset) else { nil }
+    guard let line = bytes.slice(state.offset, end) else { nil }
+    MemcacheLookup(offset: end + 2, prefix: state.prefix,
+        found: state.found || line.slice(0, state.prefix.count) == state.prefix,
+        value: memcacheLookupValue(line, state.prefix, state.value))
+}
+func memcacheLookupPair(_ bytes: Bytes, _ state: MemcacheLookup) -> (MemcacheLookup, MemcacheLookup, bool) {
+    guard let first = memcacheLookupAdvance(bytes, state) else { nil }
+    if first.offset == bytes.count || bytes.slice(first.offset, bytes.count) == b"END\r\n" { (first, first, true) } else {
+        guard let second = memcacheLookupAdvance(bytes, first) else { nil }
+        (second, second, second.offset == bytes.count || bytes.slice(second.offset, bytes.count) == b"END\r\n")
+    }
+}
+// Lookup searches only complete line boundaries and revalidates the public frame.
+func memcacheStatsGet(_ stats: MemcacheStats, _ key: Bytes) {
+    guard let state = memcacheInfoScan(stats.frame, false) else { nil }
+    guard state.status == 1 && state.count == stats.count && memcacheInfoNameValid(key) else { nil }
+    guard let needle = concatBytes(b"STAT ", key, 8192) else { nil }
+    guard let prefix = concatBytes(needle, b" ", 8192) else { nil }
+    guard let steps = collectBytes(stats.frame, MemcacheLookup(offset: 0, prefix: prefix, found: false, value: b""), 64, memcacheLookupPair) else { nil }
+    guard let last = steps.get(steps.count - 1) else { nil }
+    guard last.found else { nil }
+    last.value
+}

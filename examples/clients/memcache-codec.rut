@@ -1,6 +1,7 @@
 // Memcached basic text protocol. Requests and complete replies are capped at
 // 8192 bytes, matching the generic transport's existing bounded byte profile.
 variant MemcacheStoreMode { set add replace }
+variant MemcacheExpiry { seconds(i32) unixSeconds(Bytes) }
 struct MemcacheOptions { flags: Bytes expirySeconds: i32 }
 struct MemcacheItem { data: Bytes flags: Bytes }
 // kind: 0 NeedMore, -1 Invalid, 1 VALUE, 2 END, 3 STORED,
@@ -36,6 +37,26 @@ func memcacheExpiryValid(_ seconds: i32) -> bool {
     // relative-TTL API rejects that semantic change rather than guessing.
     seconds > -1 && !(seconds > 2592000)
 }
+// Basic-text expiry is signed i32 on the pinned server; reject overflow rather
+// than allowing a nominally successful store to expire immediately.
+func memcacheRelativeExpiryField(_ amount: i32) {
+    guard memcacheExpiryValid(amount) else { nil }
+    guard let digits = formatInt(amount) else { nil }
+    Bytes(digits)
+}
+func memcacheAbsoluteExpiryField(_ digits: Bytes) {
+    guard digits[0].or(0) > 47 && digits[0].or(0) < 58 else { nil }
+    guard let amount = parseInt(digits) else { nil }
+    guard amount > 2592000 else { nil }
+    guard let canonical = formatInt(amount) else { nil }
+    Bytes(canonical)
+}
+func memcacheExpiryField(_ expiry: MemcacheExpiry) {
+    match expiry {
+        .seconds(amount) => memcacheRelativeExpiryField(amount)
+        .unixSeconds(digits) => memcacheAbsoluteExpiryField(digits)
+    }
+}
 func memcacheField(_ prefix: Bytes, _ field: Bytes) {
     guard let spaced = concatBytes(prefix, b" ", 8192) else { nil }
     concatBytes(spaced, field, 8192)
@@ -48,13 +69,18 @@ func memcacheKeyRequest(_ name: Bytes, _ key: Bytes) {
 }
 func memcacheGetRequest(_ key: Bytes) { memcacheKeyRequest(b"get", key) }
 func memcacheDeleteRequest(_ key: Bytes) { memcacheKeyRequest(b"delete", key) }
-func memcacheTouchRequest(_ key: Bytes, _ seconds: i32) {
-    guard memcacheKeyValid(key) && memcacheExpiryValid(seconds) else { nil }
-    guard let digits = formatInt(seconds) else { nil }
+
+func memcacheTouchExpiryRequest(_ key: Bytes, _ expiry: MemcacheExpiry) {
+    guard memcacheKeyValid(key) else { nil }
+    guard let digits = memcacheExpiryField(expiry) else { nil }
     guard let keyed = memcacheField(b"touch", key) else { nil }
-    guard let expiring = memcacheField(keyed, Bytes(digits)) else { nil }
+    guard let expiring = memcacheField(keyed, digits) else { nil }
     concatBytes(expiring, b"\r\n", 8192)
 }
+func memcacheTouchRequest(_ key: Bytes, _ seconds: i32) {
+    memcacheTouchExpiryRequest(key, MemcacheExpiry.seconds(seconds))
+}
+
 func memcacheStoreName(_ mode: MemcacheStoreMode) -> Bytes {
     match mode {
         .set => b"set"
@@ -62,21 +88,29 @@ func memcacheStoreName(_ mode: MemcacheStoreMode) -> Bytes {
         .replace => b"replace"
     }
 }
-func memcacheStoreHeader(_ mode: MemcacheStoreMode, _ key: Bytes, _ settings: MemcacheOptions) {
-    guard memcacheKeyValid(key) && memcacheFlagsValid(settings.flags) &&
-        memcacheExpiryValid(settings.expirySeconds) else { nil }
-    guard let digits = formatInt(settings.expirySeconds) else { nil }
+
+func memcacheStoreExpiryHeader(_ mode: MemcacheStoreMode, _ key: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry) {
+    guard memcacheKeyValid(key) && memcacheFlagsValid(flags) else { nil }
+    guard let digits = memcacheExpiryField(expiry) else { nil }
     guard let keyed = memcacheField(memcacheStoreName(mode), key) else { nil }
-    guard let flagged = memcacheField(keyed, settings.flags) else { nil }
-    memcacheField(flagged, Bytes(digits))
+    guard let flagged = memcacheField(keyed, flags) else { nil }
+    memcacheField(flagged, digits)
 }
-func memcacheStoreRequest(_ mode: MemcacheStoreMode, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) {
-    guard let header = memcacheStoreHeader(mode, key, settings) else { nil }
+func memcacheStoreHeader(_ mode: MemcacheStoreMode, _ key: Bytes, _ settings: MemcacheOptions) {
+    memcacheStoreExpiryHeader(mode, key, settings.flags, MemcacheExpiry.seconds(settings.expirySeconds))
+}
+
+func memcacheStoreExpiryRequest(_ mode: MemcacheStoreMode, _ key: Bytes, _ value: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry) {
+    guard let header = memcacheStoreExpiryHeader(mode, key, flags, expiry) else { nil }
     guard let digits = formatInt(value.count) else { nil }
     guard let sized = memcacheField(header, Bytes(digits)) else { nil }
     guard let line = concatBytes(sized, b"\r\n", 8192) else { nil }
     guard let content = concatBytes(line, value, 8192) else { nil }
     concatBytes(content, b"\r\n", 8192)
+}
+
+func memcacheStoreRequest(_ mode: MemcacheStoreMode, _ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions) {
+    memcacheStoreExpiryRequest(mode, key, value, settings.flags, MemcacheExpiry.seconds(settings.expirySeconds))
 }
 
 func memcacheEmptyReply(_ kind: i32) -> MemcacheReply {
@@ -180,15 +214,25 @@ func memcacheCasHeader(_ key: Bytes, _ settings: MemcacheOptions) -> Bytes {
     guard let tail = header.slice(3, header.count) else { nil }
     concatBytes(b"cas", tail, 8192)
 }
-func memcacheCasRequest(_ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) {
+
+func memcacheCasExpiryHeader(_ key: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry) {
+    guard let header = memcacheStoreExpiryHeader(MemcacheStoreMode.set, key, flags, expiry) else { nil }
+    guard let tail = header.slice(3, header.count) else { nil }
+    concatBytes(b"cas", tail, 8192)
+}
+func memcacheCasExpiryRequest(_ key: Bytes, _ value: Bytes, _ flags: Bytes, _ expiry: MemcacheExpiry, _ cas: Bytes) {
     guard memcacheUnsignedValid(cas) else { nil }
-    guard let named = memcacheCasHeader(key, settings) else { nil }
+    guard let named = memcacheCasExpiryHeader(key, flags, expiry) else { nil }
     guard let sized = memcacheSizeField(named, value.count) else { nil }
     guard let versioned = memcacheField(sized, cas) else { nil }
     guard let line = concatBytes(versioned, b"\r\n", 8192) else { nil }
     guard let content = concatBytes(line, value, 8192) else { nil }
     concatBytes(content, b"\r\n", 8192)
 }
+func memcacheCasRequest(_ key: Bytes, _ value: Bytes, _ settings: MemcacheOptions, _ cas: Bytes) {
+    memcacheCasExpiryRequest(key, value, settings.flags, MemcacheExpiry.seconds(settings.expirySeconds), cas)
+}
+
 func memcacheCounterName(_ decrement: bool) -> Bytes {
     if decrement { b"decr" } else { b"incr" }
 }
@@ -353,12 +397,24 @@ func memcacheRetrievalPrefix(_ mode: MemcacheRetrievalMode, _ seconds: i32) -> B
         memcacheField(name, Bytes(digits))
     } else { name }
 }
-func memcacheManyRequest(_ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) {
+func memcacheRetrievalExpiryPrefix(_ mode: MemcacheRetrievalMode, _ expiry: MemcacheExpiry) -> Bytes {
+    let name = memcacheRetrievalName(mode)
+    if name == b"gat" || name == b"gats" {
+        guard let digits = memcacheExpiryField(expiry) else { nil }
+        memcacheField(name, digits)
+    } else { name }
+}
+
+func memcacheManyExpiryRequest(_ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ expiry: MemcacheExpiry) {
     guard memcacheKeysValid(keys) else { nil }
-    guard let prefix = memcacheRetrievalPrefix(mode, seconds) else { nil }
+    guard let prefix = memcacheRetrievalExpiryPrefix(mode, expiry) else { nil }
     guard let keyed = memcacheField(prefix, keys.bytes) else { nil }
     concatBytes(keyed, b"\r\n", 8192)
 }
+func memcacheManyRequest(_ keys: MemcacheKeys, _ mode: MemcacheRetrievalMode, _ seconds: i32) {
+    memcacheManyExpiryRequest(keys, mode, MemcacheExpiry.seconds(seconds))
+}
+
 func memcacheValueEmpty(_ kind: i32, _ next: i32, _ data: Bytes) -> MemcacheValueToken {
     MemcacheValueToken(kind: kind, key: b"", data: data, flags: b"", cas: b"", next: next)
 }

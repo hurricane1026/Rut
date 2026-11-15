@@ -1,5 +1,6 @@
 import "resp3.rut"
 import "resp2.rut"
+import "resp2-command.rut"
 
 struct RedisResp3Event { frame: Bytes rest: Bytes kind: i32 content: i32 }
 variant RedisResp3Result {
@@ -104,6 +105,49 @@ func redisHello3Succeeded(_ result: RedisResp3Result) -> bool {
 }
 func redisHello3(_ connection: TcpConnection) -> RedisResp3Result {
     let result = redisHello3Wire(connection)
+    if !redisHello3Succeeded(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+
+// AUTH and protocol negotiation are one HELLO, with no RESP2 fallback.
+variant RedisClientName { unchanged value(Bytes) }
+func redisHello3AuthCount(_ name: RedisClientName) -> i32 {
+    match name { .unchanged => 5
+        .value(value) => 7 }
+}
+func redisHello3NamedBytes(_ name: Bytes) {
+    guard let argument = resp2BulkArgument(name, 8192) else { nil }
+    concatBytes(b"$7\r\nSETNAME\r\n", argument, 8192)
+}
+func redisHello3NameArgument(_ name: RedisClientName) {
+    match name {
+        .unchanged => b""
+        .value(value) => redisHello3NamedBytes(value)
+    }
+}
+func resp2Hello3AuthRequest(_ username: Bytes, _ password: Bytes, _ name: RedisClientName) {
+    guard let header = resp2DecimalLine(b"*", redisHello3AuthCount(name), 8192) else { nil }
+    guard let user = resp2BulkArgument(username, 8192) else { nil }
+    guard let secret = resp2BulkArgument(password, 8192) else { nil }
+    guard let credentials = concatBytes(user, secret, 8192) else { nil }
+    guard let prefix = concatBytes(header, b"$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n", 8192) else { nil }
+    guard let authenticated = concatBytes(prefix, credentials, 8192) else { nil }
+    guard let named = redisHello3NameArgument(name) else { nil }
+    concatBytes(authenticated, named, 8192)
+}
+func redisHello3AuthWire(_ connection: TcpConnection, _ request: Bytes) -> RedisResp3Result {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisResp3Result.transportFailure(netError()) }
+    let reading = resp3ReadPair(connection, Resp3Stream(bytes: b""))
+    guard let stream = reading else { redisResp3Failure(netError()) }
+    guard let frame = resp3Frame(stream.bytes) else { RedisResp3Result.replyFailure }
+    redisHello3Check(redisResp3FrameResult(frame))
+}
+func redisHello3Auth(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes, _ name: RedisClientName) -> RedisResp3Result {
+    guard let request = resp2Hello3AuthRequest(username, password, name) else { RedisResp3Result.requestFailure }
+    let result = redisHello3AuthWire(connection, request)
     if !redisHello3Succeeded(result) {
         let closed = connection.close()
         result

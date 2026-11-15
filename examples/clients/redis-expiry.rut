@@ -1,0 +1,81 @@
+import "resp2-command.rut"
+import "resp2.rut"
+
+// One-node scalar reader: this standalone module avoids a third import level
+// through redis-client.rut. All byte/read/deadline bounds match that client.
+func redisExpiryFeed(_ stream: Resp2Stream, _ chunk: Bytes) {
+    guard stream.cursor.status == 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+    guard let steps = collectBytes(bytes, stream.cursor, 1, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(0) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
+func redisExpiryReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let pending = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
+        guard let chunk = pending else { nil }
+        guard chunk.count > 0 else { nil }
+        redisExpiryFeed(stream, chunk)
+    } else { stream }
+}
+func redisExpiryReadPair(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let firstPending = redisExpiryReceive(connection, stream)
+    guard let first = firstPending else { nil }
+    let secondPending = redisExpiryReceive(connection, first)
+    guard let second = secondPending else { nil }
+    second
+}
+func redisExpiryToken(_ bytes: Bytes) {
+    guard let values = collectBytes(bytes, Resp2State(offset: 0, pending: 1), 1, resp2Step) else { nil }
+    guard let root = values.get(0) else { nil }
+    guard root.next == bytes.count else { nil }
+    root
+}
+func redisExpiryRead(_ connection: TcpConnection) {
+    guard let initial = resp2Stream(8192) else { nil }
+    let firstPending = redisExpiryReadPair(connection, initial)
+    guard let first = firstPending else { nil }
+    let secondPending = redisExpiryReadPair(connection, first)
+    guard let second = secondPending else { nil }
+    guard resp2Finished(second) else { nil }
+    redisExpiryToken(second.bytes)
+}
+// A rejected condition or missing key is an ordinary notApplied outcome.
+variant RedisExpireResult { applied notApplied serverError(Bytes) requestFailure transportFailure(i32) replyFailure }
+func redisExpireReply(_ reply: Resp2Token) -> RedisExpireResult {
+    if reply.kind == 2 { RedisExpireResult.serverError(reply.data) } else {
+        guard let value = resp2Integer(reply) else { RedisExpireResult.replyFailure }
+        if value == 1 { RedisExpireResult.applied } else {
+            if value == 0 { RedisExpireResult.notApplied } else { RedisExpireResult.replyFailure }
+        }
+    }
+}
+func redisExpireMustClose(_ result: RedisExpireResult) -> bool {
+    match result { .transportFailure(code) => true
+        .replyFailure => true
+        _ => false }
+}
+func redisExpireFailure(_ code: i32) -> RedisExpireResult {
+    if code == 0 { RedisExpireResult.replyFailure } else { RedisExpireResult.transportFailure(code) }
+}
+func redisExpireWire(_ connection: TcpConnection, _ request: Bytes) -> RedisExpireResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisExpireResult.transportFailure(netError()) }
+    let reading = redisExpiryRead(connection)
+    guard let reply = reading else { redisExpireFailure(netError()) }
+    redisExpireReply(reply)
+}
+func redisExpireConditional(_ connection: TcpConnection, _ key: Bytes, _ amount: i32, _ milliseconds: bool, _ condition: RedisExpireCondition) -> RedisExpireResult {
+    guard let request = resp2ExpireRequest(key, amount, milliseconds, condition) else { RedisExpireResult.requestFailure }
+    let result = redisExpireWire(connection, request)
+    if redisExpireMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func redisExpireWithCondition(_ connection: TcpConnection, _ key: Bytes, _ seconds: i32, _ condition: RedisExpireCondition) -> RedisExpireResult {
+    redisExpireConditional(connection, key, seconds, false, condition)
+}
+func redisPexpireWithCondition(_ connection: TcpConnection, _ key: Bytes, _ milliseconds: i32, _ condition: RedisExpireCondition) -> RedisExpireResult {
+    redisExpireConditional(connection, key, milliseconds, true, condition)
+}

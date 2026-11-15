@@ -158,3 +158,5 @@ the full session integration test completed in a 14 GiB, no-swap memory cgroup w
 a 3.33 GiB peak. The cache does not apply inside `LetIn` or `CollectBytes` binding
 scopes. Tests still compile serially to keep peak use predictable. No runtime or
 operation budget has been increased.
+
+See [authenticated RESP3 and Memcached sessions](client-authentication.md) for HELLO AUTH/SETNAME and close-after-use text-token sessions.

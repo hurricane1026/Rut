@@ -37,13 +37,24 @@ explicit and bounded; there are no general source loops or recursive values.
 ## SET choices
 
 `RedisSetCondition` has `.always`, `.absent` (NX) and `.present` (XX).
-`RedisSetExpiry` has `.none`, `.seconds(i32)` (EX), `.milliseconds(i32)` (PX)
+`RedisSetExpiry` has `.none`, `.seconds(i32)` (EX), `.milliseconds(i32)` (PX),
+`.unixSeconds(Bytes)` (EXAT), `.unixMilliseconds(Bytes)` (PXAT)
 and `.keepTtl` (KEEPTTL). `.keepTtl` preserves the existing expiration when
 replacing a value; a new key or an already persistent key remains persistent.
 It works with all three conditions and requires Redis 6.0 or later. `.none`
 uses ordinary SET semantics, removing any existing expiration on a successful
 write. EX/PX must be positive, up to i32 maximum. Contradictory conditions or
 expiration modes cannot be represented.
+
+Absolute timestamps use decimal Bytes, preserving values beyond i32 without
+adding a language numeric type. EXAT accepts `1...9223372036854775` seconds;
+PXAT accepts `1...9223372036854775807` milliseconds. EXAT's upper bound prevents
+overflow when Redis converts seconds to milliseconds. Leading zeros are
+canonicalized; signs, malformed decimals, zero and out-of-range values fail
+before I/O. Positive timestamps in the past retain Redis's immediate-expiration
+behavior. Both modes require Redis 6.2 or later and work with SET GET and all
+three conditions. The client does not read a local clock or retry a write.
+
 `resp2SetOptionsRequest(key, value, condition, expiry)` builds the request without
 I/O. Arguments are binary-safe.
 
@@ -59,8 +70,8 @@ Plain `redisSet` retains its existing result and exact acknowledgement contract.
 The expiration and conditional semantics follow Redis's
 [SET contract](https://redis.io/docs/latest/commands/set/); TTL preserves the
 [-1/-2 sentinels](https://redis.io/docs/latest/commands/ttl/) and counters preserve
-signed 64-bit results and server overflow errors. EXAT/PXAT and
-newer server-specific conditions have no dedicated wrapper in this profile.
+signed 64-bit results and server overflow errors. Newer server-specific
+conditions have no dedicated wrapper in this profile.
 
 ## Atomic SET with the previous value
 
@@ -185,3 +196,22 @@ selected `docker`-labelled live runs:
 ```sh
 ctest --test-dir build -R '^test_redis_set_get_' --output-on-failure -j1
 ```
+
+The focused `test_client_expiry.py` cases verify EXAT/PXAT decimal and overflow
+boundaries, all NX/XX/GET combinations, exact request-size bounds, invalid
+requests before I/O and EOF/timeout without write replay. Pinned Redis 7.2.11
+checks actual expiry times and the largest timestamps over TCP and verified TLS
+on both transport backends.
+
+See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
+
+See [bounded cache invalidation](client-invalidation.md) for multi-key deletion APIs and partial-write semantics.
+
+See [read control and metadata](client-read-control.md) for atomic Redis GETEX/GETDEL
+and bounded Memcached meta GET with flags, CAS and remaining TTL.
+
+See [conditional cache mutations](client-conditional-mutations.md) for the separate
+Redis conditional-expiry module and Memcached CAS-protected deletion.
+
+See [ordered and conditional cache reads](client-cache-reads.md) for typed Redis
+MGET and Memcached retrieval conditional on an existing CAS version.

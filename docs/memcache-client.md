@@ -47,6 +47,38 @@ TTL zero means no expiration. Positive TTL is limited to 2592000 seconds
 Memcached interprets larger fields as absolute Unix timestamps, which are
 outside this relative-TTL API. Eviction remains possible even with TTL zero.
 
+For explicit expiration, use `MemcacheExpiry.seconds(i32)` (the same relative
+`0...2592000` range) or `.unixSeconds(Bytes)` (decimal Unix seconds in
+`2592001...2147483647`). The absolute form rejects the relative discriminator
+range instead of silently changing its meaning. Leading zeros are canonicalized;
+signs, malformed decimals and overflow fail before I/O. A timestamp in the past
+expires immediately; no local clock conversion is performed. The pinned
+[Memcached 1.6.45 text parser](https://github.com/memcached/memcached/blob/1.6.45/proto_parser.c)
+parses expiry as signed 32-bit seconds; later timestamps are rejected locally to prevent premature
+expiration after an apparently successful store.
+
+| API | Arguments after `connection` |
+| --- | --- |
+| `memcacheStoreWithExpiry` | `mode: MemcacheStoreMode, key, value, flags: Bytes, expiry: MemcacheExpiry` |
+| `memcacheCasWithExpiry` | `key, value, flags: Bytes, expiry: MemcacheExpiry, cas: Bytes` |
+| `memcacheTouchWithExpiry`, `memcacheGatWithExpiry`, `memcacheGatsWithExpiry` | `key, expiry: MemcacheExpiry` |
+| `memcacheMultiGatWithExpiry`, `memcacheMultiGatsWithExpiry` | `keys: MemcacheKeys, expiry: MemcacheExpiry` |
+
+These return the same typed results and use the same framing, budgets and
+connection-close rules as their relative-TTL counterparts. Invalid expiry sends
+nothing and preserves the connection. An ambiguous write failure closes the
+connection and never replays the command. The corresponding pure builders are
+`memcacheStoreExpiryRequest`, `memcacheCasExpiryRequest`,
+`memcacheTouchExpiryRequest` and `memcacheManyExpiryRequest`.
+
+```rut
+memcacheStoreWithExpiry(connection, MemcacheStoreMode.set, b"key", b"value",
+    b"0", MemcacheExpiry.unixSeconds(b"2147483647"))
+```
+
+The expiry field interpretation follows the
+[Memcached text protocol](https://docs.memcached.org/protocols/basic/).
+
 ## Framing and ownership
 
 Keys must contain 1–250 bytes and no octet 0–32 or DEL. Invalid keys, flags,
@@ -87,8 +119,10 @@ The [executable example](../examples/memcache-client.rut) uses
 ```
 
 Verified TLS uses the unchanged `tls`, `caFile` and `serverName` policy fields.
-Use a dedicated policy for this unauthenticated basic-text profile. Text-token
-authentication (`-Y`), binary/SASL, meta commands, pipelining, UDP, failover and
+Use a dedicated policy for this unauthenticated basic-text profile. The separate
+[authentication library](client-authentication.md) adds challenge-gated `-Y` text
+sessions. Binary/SASL, meta operations beyond the documented metadata GET and CAS-delete profiles,
+arbitrary pipelining, UDP, failover and
 background sessions are not provided. It is not an implementation of a
 distributed Cache backend.
 
@@ -170,3 +204,23 @@ TCP/TLS/backend matrix for CAS conflicts, full-width unsigned counters,
 append/prepend metadata preservation, multi-key membership/order/bounds,
 GAT/GATS expiration, fragmentation and poisoned aliases. The CAS example runs
 at O2 on both backends. All native tests remove source/import files after startup.
+
+The focused `test_client_expiry.py` matrix covers explicit expiry encoding,
+relative/absolute discriminator and overflow rejection, exact 8192-byte request
+bounds, invalid requests before I/O, and EOF/timeout without mutation replay.
+Pinned real Redis and Memcached tests verify actual expiration over TCP/TLS on
+both backends. Memcached helper cases also cover CAS conflicts, TOUCH, GAT/GATS
+and multi-key expiry updates, including the largest supported timestamp.
+
+See [connection diagnostics](client-diagnostics.md) for bounded server health and statistics APIs.
+
+See [bounded cache invalidation](client-invalidation.md) for multi-key deletion APIs and partial-write semantics.
+
+See [read control and metadata](client-read-control.md) for atomic Redis GETEX/GETDEL
+and bounded Memcached meta GET with flags, CAS and remaining TTL.
+
+See [conditional cache mutations](client-conditional-mutations.md) for the separate
+Redis conditional-expiry module and Memcached CAS-protected deletion.
+
+See [ordered and conditional cache reads](client-cache-reads.md) for typed Redis
+MGET and Memcached retrieval conditional on an existing CAS version.

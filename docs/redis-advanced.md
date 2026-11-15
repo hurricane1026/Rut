@@ -85,6 +85,8 @@ are outside this finite decoder. See the official
 `redisHello3(connection)` negotiates HELLO 3 and requires a complete map response
 with exactly one top-level integer `proto: 3` entry.
 It closes on failed negotiation; there is no silent RESP2 fallback.
+`redisHello3Auth` adds one-command AUTH and optional SETNAME with the same
+strict protocol confirmation; see [authenticated clients](client-authentication.md).
 `redisResp3Execute(connection, request)` validates and sends one RESP2-encoded
 command. `redisResp3Next(connection, buffered)` continues an outstanding event
 stream without resending the command. Each uses at most two receives per frame,
