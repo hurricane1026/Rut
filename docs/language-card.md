@@ -585,6 +585,21 @@ is unchanged; the existing H2 WebSocket bridge keeps its separate transport.
 Files are loaded for each new TLS session, and its context outlives its SSL
 object. HTTP/2 TLS/configuration-file failures retain gRPC UNAVAILABLE.
 
+### Runtime forwarding targets
+
+`forward(upstream, load_balance: .roundRobin, set_path: target)` accepts an
+unwrapped `str` expression, including a local computed from `req.params`,
+request headers or ordinary string helpers. Optional values must be unwrapped
+before the call. Literal targets retain their existing fast path. Runtime
+values are copied into the request Arena before forwarding, so borrowed header
+and path views survive request-buffer growth and asynchronous upstream connect.
+Targets must be nonempty origin-form URIs beginning with `/`, at most 8192 bytes,
+with no whitespace/control bytes or fragment and with well-formed percent
+triplets. Invalid targets and allocation failures fail closed before upstream
+connection; no URI normalization is implicit. Queries are part of the supplied
+target, not automatically appended. Existing explicit request-policy combination
+restrictions still apply. See [the capability ledger](kong-routing-capability-gaps.md).
+
 ### Inbound mTLS pinned identity
 
 The server accepts `--tls-client-ca PATH` with its existing TLS certificate

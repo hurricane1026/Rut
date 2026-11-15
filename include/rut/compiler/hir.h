@@ -931,10 +931,14 @@ struct HirTerminator {
     // means "no kwarg" (parser rejects explicit empty dicts).
     static constexpr u32 kMaxHeaders = 16;
     FixedVec<HirHeaderKV, kMaxHeaders> response_headers;
-    // Request-path rewrite for `forward(name, set_path: "...")` (literal). ptr
+    // Request-path rewrite for `forward(name, set_path: "...")` (literal fast path). ptr
     // != nullptr means a path override is present; lowering emits ReqSetPath
     // before the RetForward terminator.
     Str forward_set_path{};
+    u32 forward_path_expr_index = 0xffffffffu;
+    bool has_forward_path() const {
+        return forward_set_path.ptr != nullptr || forward_path_expr_index != 0xffffffffu;
+    }
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;

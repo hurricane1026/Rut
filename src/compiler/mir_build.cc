@@ -140,7 +140,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         return common && function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
                preflight_term->kind == MirTerminatorKind::ForwardUpstream &&
                function.values.len == 0 && function.blocks[0].effects.len == 0 &&
-               preflight_term->forward_set_path.ptr == nullptr &&
+               !preflight_term->has_forward_path() &&
                preflight_term->forward_set_headers.len == 0 &&
                !preflight_term->has_forward_target_transform &&
                !preflight_term->commit_response_mutations &&
@@ -173,9 +173,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
                    term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                    !term.commit_response_mutations && term.response_body.ptr == nullptr &&
                    term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
-                   term.upstream_index < module.upstreams.len &&
-                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
-                   !term.has_forward_target_transform &&
+                   term.upstream_index < module.upstreams.len && !term.has_forward_path() &&
+                   term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
@@ -257,7 +256,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         redirect.source_kind == MirTerminatorSourceKind::Literal &&
         redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
         !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
-        redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+        redirect.response_headers.len == 0 && !redirect.has_forward_path() &&
         redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
         redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
         redirect.forward_timeout_failure_policy_id == 0 &&
@@ -290,7 +289,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
         !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
         forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
-        forward.upstream_index < module.upstreams.len && forward.forward_set_path.ptr == nullptr &&
+        forward.upstream_index < module.upstreams.len && !forward.has_forward_path() &&
         forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
         response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
         forward_response_buffering_uses_content_length_machinery(
@@ -1623,6 +1622,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
     }
 
     bool invalid_redirect_policy = false;
+    bool invalid_forward_path = false;
+    Diagnostic forward_path_error{};
     const u32 kRouteCount = standalone_route == nullptr ? module.routes.len : 1;
     for (u32 i = 0; i < kRouteCount; i++) {
         const HirRoute& source_route =
@@ -1740,6 +1741,24 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             out->response_body = term.response_body;
             out->response_body_local_index = term.response_body_local_index;
             out->forward_set_path = term.forward_set_path;
+            if (term.forward_path_expr_index != 0xffffffffu) {
+                if (term.forward_path_expr_index >= source_route.exprs.len) {
+                    invalid_forward_path = true;
+                    forward_path_error = {FrontendError::UnsupportedSyntax, term.span, {}};
+                } else {
+                    auto value =
+                        mir_value(source_route.exprs[term.forward_path_expr_index], module, &fn);
+                    if (!value) {
+                        invalid_forward_path = true;
+                        forward_path_error = value.error();
+                    } else if (!fn.values.push(value.value())) {
+                        invalid_forward_path = true;
+                        forward_path_error = {FrontendError::OutOfMemory, term.span, {}};
+                    } else {
+                        out->forward_path_value = &fn.values[fn.values.len - 1];
+                    }
+                }
+            }
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_load_balance = term.forward_load_balance;
             out->forward_response_policy_id = term.forward_response_policy_id;
@@ -2300,6 +2319,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3188,6 +3208,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3254,6 +3275,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = kTerminalIndex;
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3788,6 +3810,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             set_term_from_hir(&block.term, source_route.control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (invalid_forward_path) return core::make_unexpected(forward_path_error);
         if (!forward_preflight_metadata_valid(*mir, fn)) {
             return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }

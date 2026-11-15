@@ -534,6 +534,14 @@ let second = pair.1                          // string
 Used as return type for `wait()` with multiple handles. Arena-allocated,
 zero heap overhead.
 
+Runtime `forward(..., set_path: expression)` accepts an unwrapped string in
+request expression scopes. Dynamic values are copied into request-owned Arena
+storage before upstream connection; RIR distinguishes owned targets from the
+literal fast path and rejects borrowed nonconstant operands. The runtime admits
+only bounded (8192-byte) valid origin-form targets, preserves percent spelling
+and explicit query bytes, and fails closed on invalid input or ownership failure.
+This does not implicitly normalize routing paths or change route selection.
+
 #### 3.3.4 Request Object
 
 Request is a built-in type. Standard HTTP headers are native properties with correct types:

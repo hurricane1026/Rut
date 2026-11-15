@@ -5410,3 +5410,13 @@ add_test(NAME test_kong_routing_gap_network
     COMMAND test_network --filter=kong_routing_gap)
 set_tests_properties(test_kong_routing_gap_network PROPERTIES
     LABELS "unit;network;kong-gap" TIMEOUT 60)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(routing_backend epoll io_uring)
+        add_test(NAME test_routing_capabilities_${routing_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_capabilities.py
+                --server $<TARGET_FILE:rut> --backend ${routing_backend})
+        set_tests_properties(test_routing_capabilities_${routing_backend} PROPERTIES
+            LABELS "integration;compiler;network;routing-capability" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

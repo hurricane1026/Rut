@@ -1,6 +1,7 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include "core/placement_new.h"
+#include "rut/common/forward_target.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
@@ -579,9 +580,26 @@ void rut_helper_req_unique_header(const u8* req_data,
 // forward(set_path:) — record the path override on the connection. The proxy
 // (on_upstream_connected) rewrites the request line from this before forwarding.
 void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
+    if (conn == nullptr) return;
     auto* c = static_cast<ConnectionBase*>(conn);
     c->req_path_overridden = true;
-    c->req_path_override = Str{path, len};
+    c->req_path_override = forward_target_valid({path, len}) ? Str{path, len} : Str{};
+}
+
+void rut_helper_req_set_owned_path(void* conn, const char* path, u32 len) {
+    if (conn == nullptr) return;
+    auto& c = *static_cast<ConnectionBase*>(conn);
+    c.req_path_overridden = true;
+    c.req_path_override = {};
+    if (!forward_target_valid({path, len})) return;
+    auto& arena = c.json_arena;
+    if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+        arena.space_used() > 262144 - len)
+        return;
+    auto* copy = static_cast<char*>(arena.alloc(len));
+    if (copy == nullptr) return;
+    __builtin_memcpy(copy, path, len);
+    c.req_path_override = {copy, len};
 }
 
 void rut_helper_req_set_load_balance(void* conn, u32 encoded) {

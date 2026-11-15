@@ -497,6 +497,7 @@ void rut_helper_str_trim_prefix(const char* s,
 // opaque Connection*; `path` must point at stable memory (a JIT string
 // constant), since the proxy reads it later when rewriting the request line.
 void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
+void rut_helper_req_set_owned_path(void* conn, const char* path, rut::u32 len);
 
 // Foundation-only target-transform effect. Records one bounded 1-based ID;
 // malformed or duplicate effects are retained as a fail-closed sentinel.

@@ -364,13 +364,16 @@ struct Ctx {
 
     // void rut_helper_req_set_path(ptr conn, ptr path, i32 len)
     LLVMValueRef fn_req_set_path = nullptr;
-    LLVMValueRef get_req_set_path() {
-        if (!fn_req_set_path) {
+    LLVMValueRef fn_req_set_owned_path = nullptr;
+    LLVMValueRef get_req_set_path(bool owned = false) {
+        auto& helper = owned ? fn_req_set_owned_path : fn_req_set_path;
+        if (!helper) {
             LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
             LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
-            fn_req_set_path = LLVMAddFunction(llvm_mod, "rut_helper_req_set_path", ft);
+            helper = LLVMAddFunction(
+                llvm_mod, owned ? "rut_helper_req_set_owned_path" : "rut_helper_req_set_path", ft);
         }
-        return fn_req_set_path;
+        return helper;
     }
 
     // void rut_helper_req_set_load_balance(ptr conn, i32 id)
@@ -1370,8 +1373,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef l = LLVMBuildExtractValue(c.builder, path, 1, "setpath.len");
             LLVMValueRef args[] = {c.param_conn, p, l};
             LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_set_path()),
-                           c.get_req_set_path(),
+                           LLVMGlobalGetValueType(c.get_req_set_path(inst.imm.i32_val != 0)),
+                           c.get_req_set_path(inst.imm.i32_val != 0),
                            args,
                            3,
                            "");

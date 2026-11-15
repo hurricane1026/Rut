@@ -727,9 +727,10 @@ struct Builder {
         return {};
     }
 
-    VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
+    VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}, bool owned = false) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
+        r.inst->imm.i32_val = owned ? 1 : 0;
         r.inst->operands[0] = path;
         r.inst->operand_count = 1;
         return {};

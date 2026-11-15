@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/forward_target.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -4588,6 +4589,10 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+            if (conn.req_path_overridden && !forward_target_valid(conn.req_path_override)) {
+                reject_request_policy(loop, conn);
+                return;
+            }
 #if RUT_ENABLE_WEBSOCKET
             if (selected_route != nullptr && selected_route->ws_terminate &&
                 (selected_route->action != RouteAction::JitHandler ||
@@ -6472,7 +6477,8 @@ void resume_request_body_tls_overflow(Loop* loop, Connection& conn) {
 // recv_buf's length and req_initial_send_len are adjusted to match. No-ops on a
 // malformed request line or if the rewritten request would exceed the buffer.
 inline bool rewrite_request_line_path(Connection& conn) {
-    if (!conn.req_path_overridden || conn.req_path_override.ptr == nullptr) return true;
+    if (!conn.req_path_overridden) return true;
+    if (!forward_target_valid(conn.req_path_override)) return false;
     u8* buf = conn.recv_slice;
     const u32 total = conn.recv_buf.len();
     if (buf == nullptr || total == 0) return false;

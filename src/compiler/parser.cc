@@ -2931,9 +2931,15 @@ struct Parser {
                         if (stmt.has_forward_target_transform)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
-                        auto val = expect(TokenType::StringLit);
-                        if (!val) return core::make_unexpected(val.error());
-                        stmt.forward_set_path = val.value()->text;
+                        auto value = parse_expr();
+                        if (!value) return core::make_unexpected(value.error());
+                        if (value->kind == AstExprKind::StrLit) {
+                            stmt.forward_set_path = value->str_value;
+                        } else {
+                            auto owned = alloc_expr(value.value());
+                            if (!owned) return core::make_unexpected(owned.error());
+                            stmt.forward_set_path_expr = owned.value();
+                        }
                         stmt.has_forward_set_path = true;
                     } else if (kw_text.eq({"set_header", 10})) {
                         // set_header: { "Name": "Value", ... } — request-header

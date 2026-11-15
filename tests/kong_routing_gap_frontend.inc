@@ -50,7 +50,7 @@ TEST(kong_routing_gap, expression_routing_controls_reach_verified_rir) {
     for (const char* source : sources) CHECK(kong_gap_stage(_tc, source) == KongGapStage::Verified);
 }
 
-TEST(kong_routing_gap, dynamic_captured_path_rejected_after_literal_control) {
+TEST(kong_routing_gap, dynamic_captured_path_reaches_verified_rir) {
     CHECK(kong_gap_stage(_tc, R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/users/:id" { return forward(b, load_balance: .roundRobin, set_path: "/internal/accounts/fixed") }
@@ -61,7 +61,52 @@ route GET "/users/:id" {
     let target = "/internal/accounts/" + req.params.id
     return forward(b, load_balance: .roundRobin, set_path: target)
 }
-)rut") == KongGapStage::ParseRejected);
+)rut") == KongGapStage::Verified);
+}
+
+TEST(kong_routing_gap, dynamic_target_expression_and_branch_types) {
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/users/:id" {
+    if req.pathOnly.hasPrefix("/users/") {
+        return forward(b, load_balance: .roundRobin, set_path: "/internal/" + req.params.id)
+    } else { return 404 }
+}
+)rut") == KongGapStage::Verified);
+    const char* invalid[] = {
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, set_path: 42) "
+        "}",
+        "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, set_path: "
+        "req.header(\"X-Target\")) }",
+    };
+    for (const char* source : invalid)
+        CHECK(kong_gap_stage(_tc, source) == KongGapStage::AnalyzeRejected);
+}
+
+TEST(kong_routing_gap, dynamic_target_rir_requires_owned_string_effect) {
+    auto tokens = lex(lit(R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, load_balance: .roundRobin, set_path: req.pathOnly) }
+)rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto* effect = find_nth_op(rir.module.functions[0], rir::Opcode::ReqSetPath, 0);
+    REQUIRE(effect != nullptr);
+    CHECK_EQ(effect->imm.i32_val, 1);
+    CHECK(rir::verify_module(rir.module).ok);
+    effect->imm.i32_val = 0;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    effect->imm.i32_val = 2;
+    CHECK_FALSE(rir::verify_module(rir.module).ok);
+    effect->imm.i32_val = 1;
+    CHECK(rir::verify_module(rir.module).ok);
 }
 
 TEST(kong_routing_gap, non_slash_strip_prefix_rejected_after_clean_prefix_control) {

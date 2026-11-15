@@ -15772,7 +15772,12 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     return term;
 }
 
-static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
+static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
+                                                  const HirModule& mod,
+                                                  HirRoute* route = nullptr,
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     if (stmt.response_body_local.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -16035,7 +16040,26 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.forward_load_balance = stmt.forward_load_balance;
     term.upstream_index = upstream_index.value();
-    if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    if (stmt.has_forward_set_path) {
+        term.forward_set_path = stmt.forward_set_path;
+        if (stmt.forward_set_path_expr != nullptr) {
+            if (route == nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.span,
+                    lit_str("dynamic forwarding target requires a request expression scope"));
+            auto target =
+                analyze_expr(*stmt.forward_set_path_expr, route, mod, locals, local_count, binding);
+            if (!target) return core::make_unexpected(target.error());
+            if (target->type != HirTypeKind::Str || target->may_nil || target->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("forwarding target must be an unwrapped str"));
+            term.forward_path_expr_index = route->exprs.len;
+            if (!route->exprs.push(target.value()))
+                return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        }
+    }
     if (stmt.has_forward_request_policy)
         term.forward_request_policy_id = stmt.forward_request_policy_id;
     if (stmt.has_forward_response_policy)
@@ -16187,7 +16211,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod);
+        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -16693,7 +16717,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     }
                 } else {
                     if (is_ast_hir_terminator(*inner.else_stmt)) {
-                        auto fail_term = analyze_term(*inner.else_stmt, mod);
+                        auto fail_term = analyze_term(
+                            *inner.else_stmt, mod, route, locals, local_count, binding);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -16836,9 +16861,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -16846,7 +16871,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};
@@ -16951,16 +16976,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -17109,9 +17134,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            auto then_term = analyze_term(*stmt.then_stmt, mod);
+            auto then_term =
+                analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*stmt.else_stmt, mod);
+            auto else_term =
+                analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
@@ -18089,7 +18116,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     }
     AstStatement terminal = stmt;
     terminal.response_body_local = {};
-    auto term = analyze_term(terminal, mod);
+    auto term = analyze_term(terminal, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     if (stmt.response_body_local.len != 0) {
         const HirLocal* body = nullptr;
@@ -26125,7 +26152,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.redirect_policy_id == 0 && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_response_read_timeout_seconds != 0 &&
@@ -26144,7 +26171,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       !term.commit_response_mutations && term.forward_set_path.ptr == nullptr &&
+                       !term.commit_response_mutations && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
                        term.forward_response_policy_id == 0 &&
                        term.forward_failure_policy_id == 0 &&
@@ -26165,7 +26192,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 structural_common && timeout_term_count == 1 &&
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
-                direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
+                !direct.has_forward_path() && direct.forward_set_headers.len == 0 &&
                 !direct.has_forward_target_transform && !direct.commit_response_mutations &&
                 timeout_request_policy_is_admitted(direct) &&
                 (!complete_buffering ||
@@ -26203,7 +26230,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.redirect_policy_id == 0 && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_request_policy_id == static_cast<u16>(policy) &&

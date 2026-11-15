@@ -16,6 +16,7 @@
     X(rut_helper_req_header_count)                    \
     X(rut_helper_req_unique_header)                   \
     X(rut_helper_req_header)                          \
+    X(rut_helper_req_set_owned_path)                  \
     X(rut_helper_req_set_path)                        \
     X(rut_helper_req_set_load_balance)                \
     X(rut_helper_req_set_target_transform)            \

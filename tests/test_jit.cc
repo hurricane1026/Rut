@@ -32890,3 +32890,25 @@ TEST(jit, consumer_query_authentication_returns_sanitized_fields) {
     engine.shutdown();
     rir.destroy();
 }
+
+TEST(jit, owned_forward_target_survives_input_changes_and_missing_pool_fails_closed) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    Connection conn;
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+    char target[] = "/internal/accounts/7";
+    rut_helper_req_set_owned_path(&conn, target, sizeof(target) - 1);
+    REQUIRE(conn.req_path_overridden);
+    REQUIRE(conn.req_path_override.eq(lit("/internal/accounts/7")));
+    target[1] = 'X';
+    CHECK(conn.req_path_override.eq(lit("/internal/accounts/7")));
+    rut_helper_req_set_owned_path(&conn, "/bad\r\nInjected: yes", 19);
+    CHECK(conn.req_path_overridden);
+    CHECK(conn.req_path_override.ptr == nullptr);
+    conn.json_arena.destroy();
+    conn.json_arena.backend.pool = nullptr;
+    rut_helper_req_set_owned_path(&conn, "/valid", 6);
+    CHECK(conn.req_path_overridden);
+    CHECK(conn.req_path_override.ptr == nullptr);
+}

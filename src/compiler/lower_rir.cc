@@ -3852,6 +3852,24 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!path || !b.emit_req_set_path(path.value(), {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
         }
+        if (term.forward_path_value != nullptr) {
+            auto path = materialize_value(*term.forward_path_value,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          term.span);
+            if (!path) return core::make_unexpected(path.error());
+            if (!b.emit_req_set_path(path.value(), {term.span.line, term.span.col}, true))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        }
         // forward(set_header: {...}): one ReqSetHeader(name, const-str value) per
         // entry before the terminator (name is the op immediate, value a register).
         for (u32 i = 0; i < term.forward_set_headers.len; i++) {
@@ -4061,8 +4079,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
         return common && function.blocks.len == 1 && function.values.len == 0 &&
                &function.blocks[0].term == timeout_term && function.blocks[0].effects.len == 0 &&
                timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
-               timeout_term->forward_set_path.ptr == nullptr &&
-               timeout_term->forward_set_headers.len == 0 &&
+               !timeout_term->has_forward_path() && timeout_term->forward_set_headers.len == 0 &&
                !timeout_term->has_forward_target_transform &&
                !timeout_term->commit_response_mutations &&
                (!complete || (complete_content_length_route_method_is_admitted(function.method) &&
@@ -4093,9 +4110,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                    term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                    !term.commit_response_mutations && term.response_body.ptr == nullptr &&
                    term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
-                   term.upstream_index < module.upstreams.len &&
-                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
-                   !term.has_forward_target_transform &&
+                   term.upstream_index < module.upstreams.len && !term.has_forward_path() &&
+                   term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
@@ -4185,7 +4201,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            redirect.source_kind == MirTerminatorSourceKind::Literal &&
            redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
            !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
-           redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+           redirect.response_headers.len == 0 && !redirect.has_forward_path() &&
            redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
            redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
            redirect.forward_timeout_failure_policy_id == 0 &&
@@ -4199,9 +4215,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
            !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
            forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
-           forward.upstream_index < module.upstreams.len &&
-           forward.forward_set_path.ptr == nullptr && forward.forward_set_headers.len == 0 &&
-           !forward.has_forward_target_transform &&
+           forward.upstream_index < module.upstreams.len && !forward.has_forward_path() &&
+           forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
            response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
            forward_response_buffering_uses_content_length_machinery(
                forward.forward_response_buffering) &&

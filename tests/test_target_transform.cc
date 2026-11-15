@@ -1,3 +1,4 @@
+#include "rut/common/forward_target.h"
 #include "rut/compiler/rir.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/route_table.h"
@@ -438,4 +439,24 @@ TEST(target_transform, populate_rejects_duplicate_module_ids_atomically) {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(forward_target, validates_origin_form_without_changing_uri_spelling) {
+    const char* valid[] = {"/", "/users/7", "/x%2Fy?q=1&q=2", "/%75sers", "/a/../b"};
+    for (const char* value : valid)
+        CHECK(forward_target_valid({value, static_cast<u32>(strlen(value))}));
+    const char* invalid[] = {"",
+                             "relative",
+                             "https://example.com/x",
+                             "//x#fragment",
+                             "/x y",
+                             "/x\r\nInjected: yes",
+                             "/%",
+                             "/%2",
+                             "/%xy"};
+    for (const char* value : invalid)
+        CHECK_FALSE(forward_target_valid({value, static_cast<u32>(strlen(value))}));
+    const char embedded_nul[] = {'/', 'x', 0, 'y'};
+    CHECK_FALSE(forward_target_valid({embedded_nul, sizeof(embedded_nul)}));
+    CHECK_FALSE(forward_target_valid({nullptr, 1}));
 }

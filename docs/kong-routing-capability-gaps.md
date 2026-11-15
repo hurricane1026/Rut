@@ -32,7 +32,7 @@ Every test below uses suite `kong_routing_gap`.
 | Configuration intent | Witness name | Expected current observation |
 | --- | --- | --- |
 | Exact path, byte prefix, regex predicate, Host/header/query conditions and method union | `expression_routing_controls_reach_verified_rir` | Seven positive source controls reach verified RIR. These capabilities are not gaps. |
-| `/users/:id` to `/internal/accounts/<id>` | `dynamic_captured_path_rejected_after_literal_control` | Literal `set_path` works; a local computed from the captured ID is rejected during parsing. |
+| `/users/:id` to `/internal/accounts/<id>` | `dynamic_captured_path_reaches_verified_rir` | Literal and computed `str` targets reach verified RIR; dynamic targets use a request-owned copy. Closed by the implementation progress below. |
 | Strip the byte prefix `/catalog` from `/catalogue` | `non_slash_strip_prefix_rejected_after_clean_prefix_control` | `/catalog/` is accepted; the otherwise identical `/catalog` prefix is rejected. |
 | Obtain regex captures for downstream policy/rewrite | `regex_capture_accessor_rejected_after_boolean_control` | `.matches(re"...")` works as a bool; the language-card target spelling `.match(re"...")` is rejected during parsing. This does not reject ordinary `:param` captures. |
 | Route on actual SNI, source/destination port or TLS state | `connection_metadata_accessor_probes_are_not_http_fields` | `req.httpVersion` works; candidate `req.sni`, `req.remotePort`, `req.localPort`, `req.isTls` fields reject during analysis. These probes establish absence of these accessors, not absence of native transport metadata or every imaginable alternative spelling. The request-field inventory was separately inspected. Spoofable headers are not equivalent evidence. |
@@ -94,3 +94,19 @@ enum size and constant naming diagnostics; these were corrected. The frontend
 include's non-analyzer checks and the runtime include's final identifier-naming
 check completed without diagnostics in the changed files. Existing diagnostics
 outside the line filters are not claimed clean.
+
+## Implementation progress
+
+- Runtime-computed `set_path` targets are implemented for ordinary request
+  expression scopes, including locals, direct concatenation and if branches.
+  Literal targets retain their fast path. Optional/non-string operands reject;
+  owned RIR effects are verified, and borrowed nonconstant targets reject.
+- Target validation rejects invalid origin-form bytes before upstream contact;
+  request Arena ownership preserves header-backed targets through buffer growth.
+- Real two-shard epoll and io_uring witnesses each passed nine requests covering
+  captures, growing/shrinking header-backed targets, POST body forwarding,
+  keepalive state reset and four invalid-target refusals. Registered as
+  `test_routing_capabilities_epoll` / `test_routing_capabilities_io_uring`.
+- Focused validation: 23 frontend tests / 332 checks; owned-target helper 1 / 8;
+  target-transform and target validation 16 / 197; both live backends passed.
+  These results replace the first rejection witness, not the other open items.

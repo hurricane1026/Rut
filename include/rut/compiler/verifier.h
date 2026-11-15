@@ -171,13 +171,28 @@ inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
 }
 
 inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
-    if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate) return true;
+    if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate &&
+        inst.op != Opcode::ReqSetPath)
+        return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
     const auto kExact = [&](ValueId id, TypeKind kind) {
         if (id == kNoValue || id.id >= fn.value_count || !fn.values) return false;
         const Type* type = fn.values[id.id].type;
         return type && type->kind == kind && !type->inner && !type->struct_def;
     };
+    if (inst.op == Opcode::ReqSetPath) {
+        if (inst.result != kNoValue || inst.operand_count != 1 ||
+            !kExact(inst.operand(0), TypeKind::Str) ||
+            (inst.imm.i32_val != 0 && inst.imm.i32_val != 1))
+            return false;
+        if (inst.imm.i32_val == 1) return true;
+        const auto& value = fn.values[inst.operand(0).id];
+        if (value.def_block.id >= fn.block_count || !fn.blocks) return false;
+        const auto& block = fn.blocks[value.def_block.id];
+        return block.insts && value.def_inst < block.inst_count &&
+               block.insts[value.def_inst].op == Opcode::ConstStr &&
+               block.insts[value.def_inst].result == inst.operand(0);
+    }
     if (inst.op == Opcode::StrPredicate) {
         return inst.operand_count == 2 && inst.imm.i32_val >= 0 && inst.imm.i32_val <= 3 &&
                kExact(inst.result, TypeKind::Bool) && kExact(inst.operand(0), TypeKind::Str) &&
