@@ -5420,3 +5420,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "integration;compiler;network;routing-capability" TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(routing_backend epoll io_uring)
+        foreach(routing_profile h2 tls h2_tls)
+            set(routing_profile_args)
+            if(routing_profile MATCHES "h2")
+                list(APPEND routing_profile_args --h2)
+            endif()
+            if(routing_profile MATCHES "tls")
+                list(APPEND routing_profile_args --tls --testdata ${RUT_TLS_TESTDATA_DIR})
+            endif()
+            add_test(NAME test_routing_capabilities_${routing_backend}_${routing_profile}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_capabilities.py
+                    --server $<TARGET_FILE:rut> --backend ${routing_backend} ${routing_profile_args})
+            set_tests_properties(test_routing_capabilities_${routing_backend}_${routing_profile} PROPERTIES
+                LABELS "integration;compiler;network;routing-capability" TIMEOUT 60 SKIP_RETURN_CODE 77)
+        endforeach()
+    endforeach()
+endif()

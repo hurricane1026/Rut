@@ -15890,7 +15890,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
     if (stmt.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) &&
         (stmt.has_forward_response_read_timeout || stmt.has_forward_response_buffering ||
-         stmt.has_forward_target_transform))
+         (stmt.has_forward_target_transform &&
+          stmt.forward_target_transform.mode == ForwardTargetTransformMode::CleanPrefix)))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.span,
@@ -26003,7 +26004,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (term.kind == HirTerminatorKind::Redirect && term.commit_response_mutations)
                     return true;
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
-                       ((term.has_forward_target_transform && term.commit_response_mutations) ||
+                       ((term.has_forward_target_transform &&
+                         term.forward_target_transform.mode ==
+                             ForwardTargetTransformMode::CleanPrefix &&
+                         term.commit_response_mutations) ||
                         (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
                         (term.forward_response_policy_id != 0 && term.commit_response_mutations));
             };

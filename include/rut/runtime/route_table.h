@@ -137,6 +137,7 @@ struct RouteEntry {
     jit::HandlerFn fn = nullptr;    // JIT-compiled handler (if action == JitHandler)
     u8 needs_password_gateway = 0;  // serialized native feature requirement (0/1)
     bool needs_req_body = false;    // JIT handler reads req.body and needs the full body buffered
+    bool h2_buffer_forward_body = false;  // explicit owned/general target profiles only
     // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
     // allows `max` requests per `window_sec` metered by its own key (IP / header
     // / query / cookie / param tuple; empty key = per-client-IP). A request must
@@ -2484,6 +2485,7 @@ public:
         auto& dst = target_transforms[target_transform_count];
         copy(spec.strip_prefix, dst.strip_prefix);
         copy(spec.replace_prefix, dst.replace_prefix);
+        dst.mode = spec.mode;
         target_transform_count++;
         return static_cast<u16>(target_transform_count);
     }

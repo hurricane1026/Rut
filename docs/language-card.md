@@ -600,6 +600,38 @@ connection; no URI normalization is implicit. Queries are part of the supplied
 target, not automatically appended. Existing explicit request-policy combination
 restrictions still apply. See [the capability ledger](kong-routing-capability-gaps.md).
 
+### Explicit prefix rewrite modes
+
+`target_transform` additionally accepts `mode: .rawPrefix` or
+`mode: .normalizedPrefix`. Omitting `mode` retains the existing `.cleanPrefix`
+admission contract used by the frozen converter profiles.
+
+```swift
+return forward(api, load_balance: .roundRobin, target_transform: {
+    strip_prefix: "/catalog", replace_prefix: "/", mode: .rawPrefix
+})
+```
+
+`.rawPrefix` replaces the literal byte prefix of the path and retains the
+remaining path and raw query bytes. Prefixes need not end at a slash boundary;
+`/catalogue` above forwards as `/ue`. `.normalizedPrefix` first normalizes the
+incoming path and normalizes the resulting path after replacement: unreserved
+percent escapes decode, remaining escapes use uppercase hex, repeated slashes
+merge and dot segments resolve. Query bytes remain unchanged. Its configured
+prefixes must already be canonical. Both modes require valid origin-form targets
+and share the 128-byte configured-prefix and 8192-byte target bounds. These modes
+transform forwarding targets; ordinary route selection retains its own contract.
+
+General modes support HTTP/1 request bodies, explicit zero Content-Length,
+downstream TLS, the existing cleartext `.preserve` Host profile and chain-after
+response headers. HTTP/1 body forwarding remains streaming. For ordinary HTTP/2
+proxying, owned dynamic targets and general prefix profiles buffer a request in
+the existing `Http2Conn::kBodySynthCap` budget (headers plus body, 16 KiB); oversize
+and inconsistent lengths reject before upstream contact. Buffered-body ownership
+survives timer continuation, and peer reset releases the pending request. This
+metadata does not turn HTTP/1 handlers into body readers. Existing explicit
+HTTP/1 request-policy profiles are still not HTTP/2 serializers.
+
 ### Inbound mTLS pinned identity
 
 The server accepts `--tls-client-ca PATH` with its existing TLS certificate

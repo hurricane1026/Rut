@@ -109,7 +109,7 @@ route GET "/" { return forward(b, load_balance: .roundRobin, set_path: req.pathO
     CHECK(rir::verify_module(rir.module).ok);
 }
 
-TEST(kong_routing_gap, non_slash_strip_prefix_rejected_after_clean_prefix_control) {
+TEST(kong_routing_gap, legacy_clean_prefix_requires_slash_boundary) {
     CHECK(kong_gap_stage(_tc, R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" { return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/catalog/", replace_prefix: "/" }) }
@@ -118,6 +118,31 @@ route GET "/" { return forward(b, load_balance: .roundRobin, target_transform: {
 upstream b at "127.0.0.1:9000"
 route GET "/" { return forward(b, load_balance: .roundRobin, target_transform: { strip_prefix: "/catalog", replace_prefix: "/" }) }
 )rut") == KongGapStage::ParseRejected);
+}
+
+TEST(kong_routing_gap, general_prefix_modes_enable_byte_strip_and_after_headers) {
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+func stamp(_ resp: Response) -> i32 { resp.set("X-Gateway", "rut") 0 }
+chain policy { after stamp(resp) }
+route GET "/" use chain policy {
+    return forward(b, load_balance: .roundRobin,
+        target_transform: { strip_prefix: "/catalog", replace_prefix: "/", mode: .rawPrefix })
+}
+)rut") == KongGapStage::Verified);
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+route POST "/" { return forward(b, load_balance: .roundRobin,
+    target_transform: { mode: .normalizedPrefix, strip_prefix: "/api/", replace_prefix: "/v1/" }) }
+)rut") == KongGapStage::Verified);
+    CHECK(kong_gap_stage(_tc, R"rut(
+upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
+    version: .http11, host: .preserve, connection: .omit,
+    header_names: .lowercase, forwarded_proto: .http,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
+}, target_transform: { mode: .rawPrefix, strip_prefix: "/api/", replace_prefix: "/v1/" }) }
+)rut") == KongGapStage::Verified);
 }
 
 TEST(kong_routing_gap, regex_capture_accessor_rejected_after_boolean_control) {
@@ -159,7 +184,7 @@ route GET "/api" {
 )rut") == KongGapStage::Verified);
 }
 
-TEST(kong_routing_gap, preserve_host_and_transform_each_work_but_combination_rejects) {
+TEST(kong_routing_gap, legacy_preserve_host_rejects_clean_transform_combination) {
     CHECK(kong_gap_stage(_tc, R"rut(
 upstream b at "127.0.0.1:9000"
 route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
@@ -182,7 +207,7 @@ route GET "/" { return forward(b, load_balance: .roundRobin, request_policy: {
           KongGapStage::AnalyzeRejected);
 }
 
-TEST(kong_routing_gap, after_response_header_works_until_prefix_transform_is_added) {
+TEST(kong_routing_gap, legacy_clean_transform_rejects_after_headers) {
     CHECK(kong_gap_stage(_tc, R"rut(
 upstream b at "127.0.0.1:9000"
 func stamp(_ resp: Response) -> i32 { resp.set("X-Gateway", "rut") 0 }

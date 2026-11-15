@@ -211,6 +211,7 @@ struct Http2Conn {
     // return Forward, which must apply the same body/header validation as an
     // immediate Forward outcome without consulting reused decoder scratch.
     bool async_request_body_followed;
+    bool async_request_body_buffered_for_forward;
     bool async_request_stream_open;
     bool async_request_forwardable;
     bool async_request_has_content_length;

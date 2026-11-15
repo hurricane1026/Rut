@@ -33,16 +33,16 @@ Every test below uses suite `kong_routing_gap`.
 | --- | --- | --- |
 | Exact path, byte prefix, regex predicate, Host/header/query conditions and method union | `expression_routing_controls_reach_verified_rir` | Seven positive source controls reach verified RIR. These capabilities are not gaps. |
 | `/users/:id` to `/internal/accounts/<id>` | `dynamic_captured_path_reaches_verified_rir` | Literal and computed `str` targets reach verified RIR; dynamic targets use a request-owned copy. Closed by the implementation progress below. |
-| Strip the byte prefix `/catalog` from `/catalogue` | `non_slash_strip_prefix_rejected_after_clean_prefix_control` | `/catalog/` is accepted; the otherwise identical `/catalog` prefix is rejected. |
+| Strip the byte prefix `/catalog` from `/catalogue` | `legacy_clean_prefix_requires_slash_boundary` | `/catalog/` is accepted; the otherwise identical `/catalog` prefix is rejected. |
 | Obtain regex captures for downstream policy/rewrite | `regex_capture_accessor_rejected_after_boolean_control` | `.matches(re"...")` works as a bool; the language-card target spelling `.match(re"...")` is rejected during parsing. This does not reject ordinary `:param` captures. |
 | Route on actual SNI, source/destination port or TLS state | `connection_metadata_accessor_probes_are_not_http_fields` | `req.httpVersion` works; candidate `req.sni`, `req.remotePort`, `req.localPort`, `req.isTls` fields reject during analysis. These probes establish absence of these accessors, not absence of native transport metadata or every imaginable alternative spelling. The request-field inventory was separately inspected. Spoofable headers are not equivalent evidence. |
 | Independent routes sharing method/path but differing by Host | `distinct_host_routes_collide_but_merged_branch_is_supported` | Separate declarations reject with `duplicate route path and method`; merged Host branching works. This is a route/policy organization limitation, not an inability to route by Host. |
-| Preserve Host together with prefix rewrite | `preserve_host_and_transform_each_work_but_combination_rejects` | The existing closed `.preserve` request policy works alone; adding the separately supported transform rejects during semantic analysis with `request_policy host: .preserve does not support this forward option`. |
-| Prefix rewrite together with chain-after response headers | `after_response_header_works_until_prefix_transform_is_added` | After-header effect works alone; the transform combination rejects with its explicit semantic diagnostic. This does not assert that every other response policy is unsupported. |
+| Preserve Host together with prefix rewrite | `legacy_preserve_host_rejects_clean_transform_combination` | The existing closed `.preserve` request policy works alone; adding the separately supported transform rejects during semantic analysis with `request_policy host: .preserve does not support this forward option`. |
+| Prefix rewrite together with chain-after response headers | `legacy_clean_transform_rejects_after_headers` | After-header effect works alone; the transform combination rejects with its explicit semantic diagnostic. This does not assert that every other response policy is unsupported. |
 | Ordinary prefix replacement, runtime suffix and repeated raw query keys | `clean_prefix_transform_preserves_runtime_suffix_and_raw_query` | Clean GET `/api/users?x=1&x=2` becomes `/v1/users?x=1&x=2`; bodyless POST without Content-Length also succeeds. |
-| Normalize encoded unreserved bytes, repeated slash and dot segments before rewrite | `normalization_sensitive_targets_refuse_before_upstream_contact` | Three targets reject unchanged, Forward returns 400, no upstream connection or held upstream slot. |
-| Rewrite a POST with a body, or a GET with explicit Content-Length: 0 | `request_body_and_explicit_zero_length_refuse_prefix_transform` | Both reject unchanged and return 400 without upstream connection. POST method alone is not the restriction. |
-| Prefix transform on TLS / HTTP/2 | `tls_and_h2_connection_flags_refuse_prefix_materialization_atomically` | Production materializer rejects both connection flags without buffer changes or I/O. This is a metadata-level guard witness, not a live TLS handshake/H2 stream test. |
+| Normalize encoded unreserved bytes, repeated slash and dot segments before rewrite | `legacy_clean_profile_refuses_normalization_sensitive_targets` | Three targets reject unchanged, Forward returns 400, no upstream connection or held upstream slot. |
+| Rewrite a POST with a body, or a GET with explicit Content-Length: 0 | `legacy_clean_profile_refuses_body_and_explicit_length` | Both reject unchanged and return 400 without upstream connection. POST method alone is not the restriction. |
+| Prefix transform on TLS / HTTP/2 | `legacy_clean_profile_refuses_tls_and_h2_materialization` | Production materializer rejects both connection flags without buffer changes or I/O. This is a metadata-level guard witness, not a live TLS handshake/H2 stream test. |
 | Normalized selection of routes and associated policies | `dispatch_does_not_normalize_dot_segments_or_unreserved_escapes` | `/admin` and `/api/users` select their specific routes; `/api/../admin`, `/api/%75sers`, `/api//users` select `/api`. There is no normalization-to-policy equivalence in this matcher. |
 
 Both successful clean-prefix source controls and runtime controls are retained so
@@ -110,3 +110,30 @@ outside the line filters are not claimed clean.
 - Focused validation: 23 frontend tests / 332 checks; owned-target helper 1 / 8;
   target-transform and target validation 16 / 197; both live backends passed.
   These results replace the first rejection witness, not the other open items.
+
+### Explicit general prefix profiles
+
+`.rawPrefix` / `.normalizedPrefix` now provide positive witnesses for byte-prefix
+stripping, Host preservation, chain-after headers, body forwarding and TLS/H2
+transport. The old rejection tests are named `legacy_clean_*` and continue to
+protect the default profile's existing semantics. General modes are an explicit
+native Rut option, not a changed meaning for old configurations.
+
+The live matrix has eight combinations: epoll/io_uring, HTTP/1/HTTP/2 and
+cleartext/TLS. It observes actual upstream targets and bodies, an original-path
+response header, preserved Host, streamed HTTP/1 headers before the client body,
+HTTP/2 timer continuation and reset/length-error reuse with no aborted upstream
+request. HTTP/2 body forwarding uses the existing 16 KiB synth bound. URI
+normalization has independent idempotence and in-place vectors. Capacity failures
+leave input bytes unchanged and release Arena slices on close; borrowed response
+values survive rewriting and the old raw snapshot is made non-replayable.
+
+General forwarding normalization is implemented; explicit normalized route
+selection and the remaining connection/capture/host-scope items are still open.
+
+Validated on 2026-11-15: all eight live CTest profiles passed (126 requests),
+both `kong-gap` entries passed; focused frontend 24 tests / 335 checks, network
+22 tests / 887 checks, target/normalizer 19 tests / 277 checks. No sanitizer run
+is claimed for this stage. Standalone normalizer header clang-tidy completed;
+existing naming diagnostics in the older transform header remain outside the
+changed lines.

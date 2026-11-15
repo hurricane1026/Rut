@@ -41,7 +41,7 @@ void h2ws_open_sessions(Loop*, Connection&);
 // forwarding path temporarily presents its synthesized HTTP/1 request through
 // Connection::recv_buf so both protocols share the same validation and rewrite
 // semantics without making this standalone header depend on callbacks_impl.h.
-bool h2_apply_forward_request_overrides(Connection& conn);
+bool h2_apply_forward_request_overrides(Connection& conn, const RouteConfig* config = nullptr);
 
 inline void h2_reset_request_mutations(Connection& conn, bool release_json_body = true) {
     if (release_json_body) {
@@ -72,8 +72,13 @@ inline void h2_release_completed_jit_json(Connection& conn) {
     conn.jit_response_body_valid = false;
 }
 
-inline bool h2_prepare_forward_request(
-    Connection& conn, const u8* synth, u32 synth_len, u8* out, u32 out_cap, u32* out_len) {
+inline bool h2_prepare_forward_request(Connection& conn,
+                                       const u8* synth,
+                                       u32 synth_len,
+                                       u8* out,
+                                       u32 out_cap,
+                                       u32* out_len,
+                                       const RouteConfig* config = nullptr) {
     if (synth_len > out_cap) return false;
     __builtin_memmove(out, synth, synth_len);
     u32 header_end = 0;
@@ -96,7 +101,7 @@ inline bool h2_prepare_forward_request(
     conn.req_header_end = header_end;
     conn.req_initial_send_len = synth_len;
     conn.req_client_transfer_encoding = RequestTransferEncoding::None;
-    const bool ok = h2_apply_forward_request_overrides(conn);
+    const bool ok = h2_apply_forward_request_overrides(conn, config);
     if (ok) *out_len = conn.recv_buf.len();
     conn.recv_buf = static_cast<Buffer&&>(saved_buf);
     conn.recv_slice = saved_slice;
@@ -1080,6 +1085,7 @@ inline void h2_clear_async(Http2Conn& h2) {
     h2.async_synth_len = 0;
     h2.async_synth_sent = 0;
     h2.async_request_body_followed = false;
+    h2.async_request_body_buffered_for_forward = false;
     h2.async_request_stream_open = false;
     h2.async_request_forwardable = false;
     h2.async_request_has_content_length = false;
@@ -1121,7 +1127,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       bool request_body_followed,
                       bool request_forwardable,
                       bool is_head,
-                      const ParsedRequest* open_request = nullptr) {
+                      const ParsedRequest* open_request = nullptr,
+                      bool body_buffered_for_forward = false) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
@@ -1152,6 +1159,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
     h2->async_request_body_followed = request_body_followed;
+    h2->async_request_body_buffered_for_forward = body_buffered_for_forward;
     h2->async_request_stream_open = open_request != nullptr;
     h2->async_request_forwardable = request_forwardable;
     h2->async_request_has_content_length =
@@ -1226,7 +1234,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool request_body_followed,
                     bool request_forwardable,
                     bool is_head = false,
-                    const ParsedRequest* open_request = nullptr) {
+                    const ParsedRequest* open_request = nullptr,
+                    bool body_buffered_for_forward = false) {
     auto* passwords = request_password_gateway(d.loop);
     if (passwords && d.conn->h2->async_stream != 0 && d.conn->h2->async_stream != stream_id) {
         h2_emit_status(d, stream_id, 503);
@@ -1285,7 +1294,11 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             return;
         }
     }
-    if (d.conn->target_transform_recorded) {
+    if (d.conn->target_transform_recorded &&
+        (kOutcome.kind != JitDispatchOutcome::Kind::Forward || cfg == nullptr ||
+         !cfg->target_transform_id_is_valid(d.conn->target_transform_id) ||
+         cfg->target_transforms[d.conn->target_transform_id - 1].mode ==
+             ForwardTargetTransformMode::CleanPrefix)) {
         h2_emit_status(d, stream_id, 400);
         return;
     }
@@ -1311,7 +1324,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               request_body_followed,
                               request_forwardable,
                               is_head,
-                              open_request))
+                              open_request,
+                              body_buffered_for_forward))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         else {
             retain_json = true;
@@ -1320,6 +1334,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
+        if (d.conn->req_path_overridden && !forward_target_valid(d.conn->req_path_override)) {
+            h2_emit_status(d, stream_id, 400);
+            return;
+        }
         // Failure-policy serialization is not implemented in the H2 path;
         // never reinterpret a bundle as transparent forwarding.
         if (kOutcome.policy_bundle_id != 0) {
@@ -1345,7 +1363,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 400);
             return;
         }
-        if (request_body_followed && open_request == nullptr) {
+        if (request_body_followed && open_request == nullptr && !body_buffered_for_forward) {
             h2_emit_status(d, stream_id, 503);
             return;
         }
@@ -1361,7 +1379,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         const bool prepared =
             stable &&
             h2_prepare_forward_request(
-                *d.conn, synth, synth_len, forward_synth, sizeof(forward_synth), &forward_len);
+                *d.conn, synth, synth_len, forward_synth, sizeof(forward_synth), &forward_len, cfg);
         if (!prepared) {
             h2_emit_status(d, stream_id, 500);
             return;
@@ -1539,6 +1557,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const bool kIsHead = h2->pending_is_head;
     const RouteEntry* route = h2->pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
+    const bool kBufferedForForward =
+        route && route->h2_buffer_forward_body && h2->pending_buffer_body;
     const bool kRequestBodyFollowed = h2->pending_body_len != 0;
     const bool kRequestForwardable = h2->pending_request_forwardable;
     const u32 kRouteParamCount = h2->pending_route_param_count;
@@ -1567,7 +1587,9 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                    kLen,
                    kRequestBodyFollowed,
                    kRequestForwardable,
-                   kIsHead);
+                   kIsHead,
+                   nullptr,
+                   kBufferedForForward);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -1864,20 +1886,21 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // when the handler does not read req.body. Such handlers still
             // avoid buffering DATA; requests without a declared length retain
             // the immediate body-agnostic dispatch path below.
-            if (!end_stream &&
-                (route->needs_req_body || (req.has_content_length && !grpc_request(req)))) {
-                h2_defer_until_data_end(d,
-                                        stream_id,
-                                        headers,
-                                        nheaders,
-                                        req,
-                                        /*buffer_body=*/route->needs_req_body,
-                                        RouteAction::JitHandler,
-                                        config,
-                                        route,
-                                        params,
-                                        param_count,
-                                        200);
+            if (!end_stream && (route->needs_req_body || route->h2_buffer_forward_body ||
+                                (req.has_content_length && !grpc_request(req)))) {
+                h2_defer_until_data_end(
+                    d,
+                    stream_id,
+                    headers,
+                    nheaders,
+                    req,
+                    /*buffer_body=*/route->needs_req_body || route->h2_buffer_forward_body,
+                    RouteAction::JitHandler,
+                    config,
+                    route,
+                    params,
+                    param_count,
+                    200);
                 return;
             }
             // No body dependency to wait for — invoke now.
@@ -2492,7 +2515,11 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
     }
 
-    if (conn.target_transform_recorded) {
+    if (conn.target_transform_recorded &&
+        (kOutcome.kind != JitDispatchOutcome::Kind::Forward || h2->async_cfg == nullptr ||
+         !h2->async_cfg->target_transform_id_is_valid(conn.target_transform_id) ||
+         h2->async_cfg->target_transforms[conn.target_transform_id - 1].mode ==
+             ForwardTargetTransformMode::CleanPrefix)) {
         u8 resp[8192];
         H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
         h2_emit_status(d, kStreamId, 400);
@@ -2558,7 +2585,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
 
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
-        u16 failure_status = 0;
+        u16 failure_status =
+            conn.req_path_overridden && !forward_target_valid(conn.req_path_override) ? 400 : 0;
         if (kOutcome.policy_bundle_id != 0) failure_status = 400;
         if (kOutcome.response_policy_id != 0 &&
             (h2->async_cfg == nullptr ||
@@ -2569,7 +2597,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         if (failure_status == 0 && kOutcome.response_policy_id != 0) failure_status = 400;
         if (kOutcome.request_policy_id != 0) failure_status = 400;
         if (failure_status == 0 && h2->async_request_body_followed &&
-            !h2->async_request_stream_open) {
+            !h2->async_request_stream_open && !h2->async_request_body_buffered_for_forward) {
             failure_status = 503;
         } else if (!h2->async_request_forwardable) {
             failure_status = 400;
@@ -2591,7 +2619,8 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                                        h2->async_synth_len,
                                                        forward_synth,
                                                        sizeof(forward_synth),
-                                                       &forward_len))
+                                                       &forward_len,
+                                                       h2->async_cfg))
                 failure_status = 500;
         }
 

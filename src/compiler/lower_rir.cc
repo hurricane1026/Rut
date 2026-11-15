@@ -189,7 +189,7 @@ static FrontendResult<u16> intern_target_transform(rir::Module& mod,
     if (replace.len == 0xffffffffu) return frontend_error(FrontendError::OutOfMemory, span);
 
     const u32 index = mod.target_transform_count;
-    mod.target_transforms[index] = {strip, replace};
+    mod.target_transforms[index] = {strip, replace, spec.mode};
     mod.target_transform_count++;
     return static_cast<u16>(index + 1);
 }

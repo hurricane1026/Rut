@@ -460,3 +460,67 @@ TEST(forward_target, validates_origin_form_without_changing_uri_spelling) {
     CHECK_FALSE(forward_target_valid({embedded_nul, sizeof(embedded_nul)}));
     CHECK_FALSE(forward_target_valid({nullptr, 1}));
 }
+
+TEST(forward_target, normalized_path_and_query_vectors_are_idempotent_and_inplace_safe) {
+    struct Vector {
+        const char* input;
+        const char* output;
+    };
+    const Vector kVectors[] = {
+        {"/api//users", "/api/users"},
+        {"/api/%75sers", "/api/users"},
+        {"/api/../admin", "/admin"},
+        {"/a/./b/../c/", "/a/c/"},
+        {"/a/%2e%2e/b", "/b"},
+        {"/../../admin", "/admin"},
+        {"/a/.", "/a/"},
+        {"/a/..", "/"},
+        {"//", "/"},
+        {"/%2f/%7e/%25", "/%2F/~/%25"},
+        {"/a//b?x=%2f&x=1", "/a/b?x=%2f&x=1"},
+    };
+    for (const auto& vector : kVectors) {
+        char output[256];
+        u32 length = 0;
+        const Str kInput{vector.input, static_cast<u32>(strlen(vector.input))};
+        const Str kExpected{vector.output, static_cast<u32>(strlen(vector.output))};
+        REQUIRE(normalize_forward_target(kInput, output, sizeof(output), &length));
+        CHECK((Str{output, length}.eq(kExpected)));
+        u32 again = 0;
+        REQUIRE(normalize_forward_target({output, length}, output, sizeof(output), &again));
+        CHECK((Str{output, again}.eq(kExpected)));
+        memcpy(output, kInput.ptr, kInput.len);
+        REQUIRE(normalize_forward_target({output, kInput.len}, output, sizeof(output), &length));
+        CHECK((Str{output, length}.eq(kExpected)));
+    }
+}
+
+TEST(forward_target, normalization_rejects_invalid_input_and_insufficient_capacity_atomically) {
+    char output[16] = "unchanged";
+    u32 length = 99;
+    CHECK_FALSE(normalize_forward_target({"/bad%", 5}, output, sizeof(output), &length));
+    CHECK_EQ(length, 0u);
+    CHECK_STREQ(output, "unchanged");
+    CHECK_FALSE(normalize_forward_target({"/long/path", 10}, output, 2, &length));
+    CHECK_STREQ(output, "unchanged");
+}
+
+TEST(target_transform,
+     explicit_general_profiles_keep_modes_distinct_and_validate_canonical_prefixes) {
+    const ForwardTargetTransformSpec kRaw{
+        {"/catalog", 8}, {"/", 1}, ForwardTargetTransformMode::RawPrefix};
+    CHECK(forward_target_transform_spec_valid(kRaw));
+    auto normalized = kRaw;
+    normalized.mode = ForwardTargetTransformMode::NormalizedPrefix;
+    CHECK(forward_target_transform_spec_valid(normalized));
+    RouteConfig config{};
+    CHECK_EQ(config.add_target_transform(kRaw), 1u);
+    CHECK_EQ(config.add_target_transform(normalized), 2u);
+    CHECK_EQ(config.add_target_transform(kRaw), 1u);
+    CHECK(config.target_transforms[0].mode == ForwardTargetTransformMode::RawPrefix);
+    CHECK(config.target_transforms[1].mode == ForwardTargetTransformMode::NormalizedPrefix);
+    normalized.strip_prefix = {"/a/../b", 7};
+    CHECK_FALSE(forward_target_transform_spec_valid(normalized));
+    normalized.mode = static_cast<ForwardTargetTransformMode>(255);
+    CHECK_FALSE(forward_target_transform_spec_valid(normalized));
+}

@@ -83,6 +83,7 @@ void Http2Conn::init() {
     async_synth_len = 0;
     async_synth_sent = 0;
     async_request_body_followed = false;
+    async_request_body_buffered_for_forward = false;
     async_request_stream_open = false;
     async_request_forwardable = false;
     async_request_has_content_length = false;

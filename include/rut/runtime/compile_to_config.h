@@ -114,6 +114,24 @@ inline bool rir_function_needs_req_body(const rir::Function& fn) {
     return false;
 }
 
+inline bool rir_function_buffers_h2_forward_body(const rir::Function& fn, const rir::Module& mod) {
+    if (fn.blocks == nullptr) return false;
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        const auto& block = fn.blocks[bi];
+        if (block.insts == nullptr) return false;
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op == rir::Opcode::ReqSetPath && inst.imm.i32_val == 1) return true;
+            if (inst.op == rir::Opcode::ReqSetTargetTransform && inst.imm.i32_val > 0 &&
+                static_cast<u32>(inst.imm.i32_val) <= mod.target_transform_count &&
+                mod.target_transforms[inst.imm.i32_val - 1].mode !=
+                    ForwardTargetTransformMode::CleanPrefix)
+                return true;
+        }
+    }
+    return false;
+}
+
 inline bool configure_route_dispatch(RouteConfig& cfg, const rir::Module& mod) {
     if (cfg.route_count != 0) return false;
     cfg.http_cache_identity = http_cache_config_identity();
@@ -308,6 +326,8 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                                                  fn.forward_preflight_mode,
                                                  fn.preflight_forward_policy_bundle_id))
                 return false;
+            target.routes[target.route_count - 1].h2_buffer_forward_body =
+                rir_function_buffers_h2_forward_body(fn, mod);
             target.routes[target.route_count - 1].needs_password_gateway =
                 (rir::function_uses_password(fn) || rir::function_uses_http_call(fn)) ? 1 : 0;
             // @rateLimit decorators → stacked token-bucket rules, each with its own

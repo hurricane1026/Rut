@@ -1,15 +1,21 @@
 // Production materializer witnesses under the existing deterministic SmallLoop.
 // These do not claim live TLS handshakes, H2 stream forwarding or Kong oracle runs.
-static void kong_gap_transform_witness(rut::test::TestCase* _tc,
-                                       const char* request,
-                                       const char* expected_target) {
+static void kong_gap_transform_witness(
+    rut::test::TestCase* _tc,
+    const char* request,
+    const char* expected_target,
+    ForwardTargetTransformMode mode = ForwardTargetTransformMode::CleanPrefix) {
+    SlicePool arena_pool;
+    if (mode != ForwardTargetTransformMode::CleanPrefix) REQUIRE(arena_pool.init(8));
     SmallLoop loop;
     loop.setup();
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7f000001, 8080).has_value());
-    REQUIRE_EQ(config.add_target_transform({{"/api/", 5}, {"/v1/", 4}}), 1u);
+    REQUIRE_EQ(config.add_target_transform({{"/api/", 5}, {"/v1/", 4}, mode}), 1u);
     auto* conn = setup_target_transform_request(loop, config, request, strlen(request));
     REQUIRE(conn != nullptr);
+    if (mode != ForwardTargetTransformMode::CleanPrefix)
+        conn->json_arena.backend.pool = &arena_pool;
     u8 original[SmallLoop::kBufSize];
     const u32 kOriginalLen = conn->recv_buf.len();
     const u32 kOriginalHeaderEnd = conn->req_header_end;
@@ -54,20 +60,20 @@ TEST(kong_routing_gap, clean_prefix_transform_preserves_runtime_suffix_and_raw_q
         _tc, "POST /api/users HTTP/1.1\r\nHost: client\r\n\r\n", "/v1/users");
 }
 
-TEST(kong_routing_gap, normalization_sensitive_targets_refuse_before_upstream_contact) {
+TEST(kong_routing_gap, legacy_clean_profile_refuses_normalization_sensitive_targets) {
     kong_gap_transform_witness(_tc, "GET /api/%75sers HTTP/1.1\r\nHost: client\r\n\r\n", nullptr);
     kong_gap_transform_witness(_tc, "GET /api//users HTTP/1.1\r\nHost: client\r\n\r\n", nullptr);
     kong_gap_transform_witness(_tc, "GET /api/../admin HTTP/1.1\r\nHost: client\r\n\r\n", nullptr);
 }
 
-TEST(kong_routing_gap, request_body_and_explicit_zero_length_refuse_prefix_transform) {
+TEST(kong_routing_gap, legacy_clean_profile_refuses_body_and_explicit_length) {
     kong_gap_transform_witness(
         _tc, "POST /api/users HTTP/1.1\r\nHost: client\r\nContent-Length: 1\r\n\r\na", nullptr);
     kong_gap_transform_witness(
         _tc, "GET /api/users HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n", nullptr);
 }
 
-TEST(kong_routing_gap, tls_and_h2_connection_flags_refuse_prefix_materialization_atomically) {
+TEST(kong_routing_gap, legacy_clean_profile_refuses_tls_and_h2_materialization) {
     SmallLoop loop;
     loop.setup();
     RouteConfig config{};
@@ -113,4 +119,96 @@ TEST(kong_routing_gap, dispatch_does_not_normalize_dot_segments_or_unreserved_es
         REQUIRE(route != nullptr);
         CHECK_EQ(route->status_code, vector.status);
     }
+}
+
+TEST(kong_routing_gap, explicit_general_prefix_preserves_body_and_encoded_targets) {
+    kong_gap_transform_witness(
+        _tc,
+        "POST /api/users HTTP/1.1\r\nHost: client\r\nContent-Length: 7\r\n\r\npayload",
+        "/v1/users",
+        ForwardTargetTransformMode::RawPrefix);
+    kong_gap_transform_witness(
+        _tc,
+        "GET /api/users HTTP/1.1\r\nHost: client\r\nContent-Length: 0\r\n\r\n",
+        "/v1/users",
+        ForwardTargetTransformMode::RawPrefix);
+    kong_gap_transform_witness(_tc,
+                               "GET /api/%75sers?x=%2f HTTP/1.1\r\nHost: client\r\n\r\n",
+                               "/v1/%75sers?x=%2f",
+                               ForwardTargetTransformMode::RawPrefix);
+    kong_gap_transform_witness(_tc,
+                               "GET /api//a/../%75sers?x=%2f HTTP/1.1\r\nHost: client\r\n\r\n",
+                               "/v1/users?x=%2f",
+                               ForwardTargetTransformMode::NormalizedPrefix);
+}
+
+TEST(kong_routing_gap,
+     general_prefix_capacity_failure_preserves_request_and_releases_arena_on_close) {
+    SlicePool arena_pool;
+    REQUIRE(arena_pool.init(8));
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    char replacement[96];
+    __builtin_memset(replacement, 'x', sizeof(replacement));
+    replacement[0] = '/';
+    replacement[sizeof(replacement) - 1] = '/';
+    REQUIRE_EQ(config.add_target_transform({{"/api/", 5},
+                                            {replacement, sizeof(replacement)},
+                                            ForwardTargetTransformMode::RawPrefix}),
+               1u);
+    const u32 kInUse = arena_pool.count - arena_pool.available();
+    char request[SmallLoop::kBufSize];
+    const u32 kBody = sizeof(request) - 96;
+    const int kHeader =
+        snprintf(request,
+                 sizeof(request),
+                 "POST /api/x HTTP/1.1\r\nHost: client\r\nContent-Length: %u\r\n\r\n",
+                 kBody);
+    REQUIRE_GT(kHeader, 0);
+    REQUIRE_LT(static_cast<u32>(kHeader) + kBody, sizeof(request));
+    __builtin_memset(request + kHeader, 'b', kBody);
+    const u32 kLength = static_cast<u32>(kHeader) + kBody;
+    for (u32 attempt = 0; attempt < 4; attempt++) {
+        auto* conn = setup_target_transform_request(loop, config, request, kLength);
+        REQUIRE(conn != nullptr);
+        conn->json_arena.backend.pool = &arena_pool;
+        CHECK_FALSE(materialize_request_target_transform(*conn, config));
+        CHECK_EQ(conn->recv_buf.len(), kLength);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), request, kLength), 0);
+        CHECK_FALSE(conn->req_path_overridden);
+        CHECK(conn->target_transform_recorded);
+        loop.close_conn(*conn);
+        CHECK_EQ(arena_pool.count - arena_pool.available(), kInUse);
+    }
+}
+
+TEST(kong_routing_gap,
+     general_prefix_preserves_borrowed_after_header_and_disables_raw_snapshot_replay) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_target_transform(
+                   {{"/api/", 5}, {"/v1/", 4}, ForwardTargetTransformMode::RawPrefix}),
+               1u);
+    const char kRequest[] = "GET /api/users?x=1 HTTP/1.1\r\nHost: client\r\n\r\n";
+    auto* conn = setup_target_transform_request(loop, config, kRequest, sizeof(kRequest) - 1);
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+    conn->resp_header_mutation_count = 1;
+    conn->resp_header_mutation_pending_count = 1;
+    conn->resp_header_mutations[0] = {
+        {"X-Path", 6},
+        {reinterpret_cast<const char*>(conn->recv_buf.data() + 4), sizeof("/api/users?x=1") - 1},
+        Connection::RespHeaderMutationMode::Set};
+    REQUIRE(materialize_request_target_transform(*conn, config));
+    CHECK(
+        conn->resp_header_mutations[0].value.eq({"/api/users?x=1", sizeof("/api/users?x=1") - 1}));
+    CHECK(conn->response_mutations_snapshotted);
+    CHECK_FALSE(conn->retry_req_snapshot_replayable);
+    CHECK_FALSE(conn->target_transform_recorded);
+    loop.close_conn(*conn);
+    CHECK_EQ(pool.count - pool.available(), 0u);
 }

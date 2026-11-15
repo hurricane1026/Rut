@@ -542,6 +542,16 @@ only bounded (8192-byte) valid origin-form targets, preserves percent spelling
 and explicit query bytes, and fails closed on invalid input or ownership failure.
 This does not implicitly normalize routing paths or change route selection.
 
+Explicit `target_transform.mode` selects `.rawPrefix` byte replacement or
+`.normalizedPrefix` URI-normalized replacement; the default `.cleanPrefix`
+keeps its frozen admission contract. General modes compose with request body
+forwarding, downstream TLS and response-header effects. HTTP/1 keeps streaming;
+HTTP/2 general/owned-target routes buffer within the existing 16 KiB synth
+budget and validate length before upstream effects, retaining buffered ownership
+across timer waits and releasing it on reset. Normalization does not implicitly
+change the ordinary route matcher. Old raw request snapshots are not replayable
+after a general transform.
+
 #### 3.3.4 Request Object
 
 Request is a built-in type. Standard HTTP headers are native properties with correct types:

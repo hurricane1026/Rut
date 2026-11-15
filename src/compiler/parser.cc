@@ -2885,6 +2885,7 @@ struct Parser {
                         ForwardTargetTransformSpec transform{};
                         bool have_strip_prefix = false;
                         bool have_replace_prefix = false;
+                        bool have_mode = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2892,7 +2893,21 @@ struct Parser {
                             auto fcolon = expect(TokenType::Colon);
                             if (!fcolon) return core::make_unexpected(fcolon.error());
                             bool* seen = nullptr;
-                            if (field_name.eq({"strip_prefix", 12})) {
+                            if (field_name.eq({"mode", 4})) {
+                                seen = &have_mode;
+                                auto dot = expect(TokenType::Dot);
+                                if (!dot) return core::make_unexpected(dot.error());
+                                auto mode = expect(TokenType::Ident);
+                                if (!mode) return core::make_unexpected(mode.error());
+                                if (mode.value()->text.eq({"rawPrefix", 9}))
+                                    transform.mode = ForwardTargetTransformMode::RawPrefix;
+                                else if (mode.value()->text.eq({"normalizedPrefix", 16}))
+                                    transform.mode = ForwardTargetTransformMode::NormalizedPrefix;
+                                else if (!mode.value()->text.eq({"cleanPrefix", 11}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*mode.value()),
+                                                          mode.value()->text);
+                            } else if (field_name.eq({"strip_prefix", 12})) {
                                 seen = &have_strip_prefix;
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
