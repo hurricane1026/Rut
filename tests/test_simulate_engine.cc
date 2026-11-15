@@ -508,6 +508,58 @@ TEST(simulate_engine, captured_peer_port_is_visible_to_route_handlers) {
     rir.destroy();
 }
 
+TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported) {
+    const char* src =
+        "route GET \"/local\" { guard req.localPort == 8443 else { return 400 } return 201 }\n"
+        "route GET \"/tls\" { if req.isTls { return 201 } else { return 202 } }\n"
+        "route GET \"/sni\" { guard let name = req.sni else { return 400 } return 201 }\n"
+        "route GET \"/cert\" { guard let cert = req.tlsClientCertSha256 else { return 400 } return "
+        "201 }\n"
+        "route GET \"/remote\" { guard req.remotePort == 12345 else { return 400 } return 201 }\n"
+        "route GET \"/path\" { guard let path = req.normalizedPath else { return 400 } return 201 "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    REQUIRE_EQ(engine.route_count, 6u);
+    for (u32 i = 0; i < 4; i++) CHECK(engine.routes[i].needs_uncaptured_transport_metadata);
+    CHECK_FALSE(engine.routes[4].needs_uncaptured_transport_metadata);
+    CHECK_FALSE(engine.routes[5].needs_uncaptured_transport_metadata);
+
+    const auto check_unsupported = [&](const char* path) {
+        char request[96];
+        const u32 path_len = static_cast<u32>(strlen(path));
+        const char prefix[] = "GET ";
+        __builtin_memcpy(request, prefix, sizeof(prefix) - 1);
+        __builtin_memcpy(request + sizeof(prefix) - 1, path, path_len);
+        const char suffix[] = " HTTP/1.1\r\nHost: x\r\n\r\n";
+        const u32 request_len = static_cast<u32>(sizeof(prefix) - 1) + path_len;
+        __builtin_memcpy(request + request_len, suffix, sizeof(suffix));
+        const SimulateResult result = simulate_one(engine, make_entry(request, 201));
+        CHECK_EQ(result.verdict, Verdict::Unsupported);
+        CHECK_EQ(result.actual_status, 0u);
+    };
+    check_unsupported("/local");
+    check_unsupported("/tls");
+    check_unsupported("/sni");
+    check_unsupported("/cert");
+
+    CaptureEntry remote = make_entry("GET /remote HTTP/1.1\r\nHost: x\r\n\r\n", 201);
+    remote.peer_port = 12345;
+    const SimulateResult remote_result = simulate_one(engine, remote);
+    CHECK_EQ(remote_result.verdict, Verdict::Match);
+    CHECK_EQ(remote_result.actual_status, 201u);
+    const SimulateResult path_result =
+        simulate_one(engine, make_entry("GET /path HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(path_result.verdict, Verdict::Match);
+    CHECK_EQ(path_result.actual_status, 201u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 // Helper: compile a .rut source to an RIR module owned by `rir`.
 // The caller must keep `rir` alive for as long as the Engine.
 static bool compile_to_rir(const char* src, FrontendRirModule& rir) {

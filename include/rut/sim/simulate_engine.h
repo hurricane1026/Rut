@@ -113,6 +113,7 @@ struct Engine {
         u16 host_len = 0;
         jit::HandlerFn fn = nullptr;
         bool needs_req_body = false;
+        bool needs_uncaptured_transport_metadata = false;
     };
 
     CompiledRoute routes[kMaxRoutes];
