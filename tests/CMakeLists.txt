@@ -5319,3 +5319,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         endforeach()
     endforeach()
 endif()
+
+# Capability ledger: expected current gaps, with supported controls.
+# Passing these tests does not mean Kong routing parity has been achieved.
+if(RUT_ENABLE_JIT)
+    add_test(NAME test_kong_routing_gap_frontend
+        COMMAND test_frontend --filter=kong_routing_gap)
+    set_tests_properties(test_kong_routing_gap_frontend PROPERTIES
+        LABELS "unit;compiler;kong-gap" TIMEOUT 60)
+endif()
+add_test(NAME test_kong_routing_gap_network
+    COMMAND test_network --filter=kong_routing_gap)
+set_tests_properties(test_kong_routing_gap_network PROPERTIES
+    LABELS "unit;network;kong-gap" TIMEOUT 60)
