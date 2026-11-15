@@ -1,0 +1,28 @@
+// Casdoor v4.27.1 DefaultJWT access-token profile. JWT_RS256_POLICY pins the
+// issuer, audience and approved keys. CASDOOR_ORG and group selectors are
+// trusted configuration; request data never chooses an organization or group.
+import { jwtDocumentRs256 as verifyRs256 } from "middleware/auth.rut"
+import "middleware/casdoor.rut"
+
+listen :8080
+
+route GET "/access" {
+    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = casdoor.requireAccessToken(document, env("CASDOOR_ORG"))
+    return 204
+}
+
+route GET "/group" {
+    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = casdoor.requireGroup(document, env("CASDOOR_ORG"), env("CASDOOR_GROUP"))
+    return 204
+}
+
+route GET "/all" {
+    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = casdoor.requireAllGroups(document, env("CASDOOR_ORG"),
+        env("CASDOOR_GROUP"), env("CASDOOR_SECOND_GROUP"))
+    return 204
+}
+
+route "/" { return 404 }

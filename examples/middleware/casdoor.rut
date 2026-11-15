@@ -1,0 +1,38 @@
+// Casdoor v4.27.1 DefaultJWT adapter. Call only with the verified Json returned
+// by auth.jwtDocumentRs256; this helper does not authenticate arbitrary JSON.
+// DefaultJWT groups are qualified as <owner>/<group>. JWT-Standard is outside
+// this profile because its UserStandard payload does not include groups.
+func validSelector(_ value: str) -> bool {
+    Bytes(value).count >= 1 && Bytes(value).count <= 128 &&
+        value.matches(re"^[A-Za-z0-9._:-]+$")
+}
+
+func accessTokenClaimsMatch(_ document: Json, _ org: str) -> bool {
+    guard let token_type = json.get(document, "/tokenType") else { false }
+    guard let owner = json.get(document, "/owner") else { false }
+    json.string(token_type).or("") == "access-token" && json.string(owner).or("") == org
+}
+
+func requireAccessToken(_ document: Json, _ org: str) -> Json {
+    guard validSelector(org) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard accessTokenClaimsMatch(document, org) else { respond denied }
+    document
+}
+
+func requireGroup(_ document: Json, _ org: str, _ group: str) -> Json {
+    guard validSelector(org) && validSelector(group) else { respond 503 }
+    let access = requireAccessToken(document, org)
+    guard jwtHasGroup(access, org + "/" + group) else { respond 403 }
+    access
+}
+
+func requireAllGroups(_ document: Json, _ org: str, _ first: str, _ second: str) -> Json {
+    guard validSelector(org) && validSelector(first) && validSelector(second) else { respond 503 }
+    let access = requireAccessToken(document, org)
+    let first_matches = jwtHasGroup(access, org + "/" + first)
+    let second_matches = jwtHasGroup(access, org + "/" + second)
+    guard first_matches && second_matches else { respond 403 }
+    access
+}

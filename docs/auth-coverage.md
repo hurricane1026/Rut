@@ -33,7 +33,7 @@ whether a competing open-source edition includes them.
 | Certificate-bound JWT | **Bounded RFC 8705 resource policy implemented** | Exact signed `cnf.x5t#S256` binding to the verified TLS client certificate, strict canonical encoding, native/JIT and two-backend HTTP/1 + HTTP/2 tests. See [the contract](mtls-bound-jwt.md). AS issuance, OAuth mTLS client authentication, refresh binding, DPoP and proxy certificate assertions remain outside this profile. |
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
-| Keycloak / Casdoor | Keycloak default access-token realm/client role adapter implemented | Verified RS256 resource policy with exact independent realm/client roles and explicit intersection; two-backend native HTTP/1 + HTTP/2 matrix. See [Keycloak roles](keycloak-roles.md). Live provider conformance, Casdoor, browser login and provider management remain separate. |
+| Keycloak / Casdoor | Default access-token claim adapters implemented | Keycloak default realm/client roles and Casdoor v4.27.1 DefaultJWT exact owner/tokenType/qualified-group policy compose with verified RS256; native two-backend HTTP/1 + HTTP/2 matrices. See [Keycloak roles](keycloak-roles.md) and [Casdoor access-token policy](casdoor-access-token.md). Live-provider conformance, OIDC/browser login and provider management remain separate. |
 | Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
 | Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout, opt-in local-AOF durable revocation tombstones and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, distributed durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
 
@@ -1630,6 +1630,19 @@ default denial and policy replacement have native two-backend HTTP/1+HTTP/2
 fixtures. No external dependency or language surface is added. See
 [the supported contract](keycloak-roles.md); this is not live-provider or full
 OIDC/Casdoor conformance.
+
+### Casdoor DefaultJWT claim adapter
+
+The free `casdoor` Rut module supports the pinned Casdoor v4.27.1 DefaultJWT
+claims shape only. After the existing RS256 verifier, it requires exact signed
+`tokenType: "access-token"` and the configured exact `owner`; configured group
+components match exact `<owner>/<group>` values through `jwtHasGroup`, which
+validates every array element. Invalid selectors produce 503, wrong token type
+or owner 401, and missing/malformed/nonmatching groups 403. It adds no grant,
+provider API, builtin, dependency or live account lookup. Native two-backend
+HTTP/1+HTTP/2 tests cover O0/O2 after source/module unlink; they do not establish
+live Casdoor conformance. JWT-Standard's `UserStandard` lacks groups and is
+outside this adapter. See [the contract](casdoor-access-token.md).
 
 ### Inbound mTLS leaf CRL checking
 
