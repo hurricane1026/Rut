@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Consumer administration, atomic rejection and secret-safe filesystem policy."""
+"""Consumer administration, key generation, atomic rejection and filesystem policy."""
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -25,6 +26,86 @@ def changes(consumers=(), credentials=(), remove_consumers=(), remove_credential
                 removeConsumers=list(remove_consumers), removeCredentials=list(remove_credentials))
 
 
+def test_generated_keys(tool, root):
+    base = root / 'key-base.json'
+    assert run(tool, 'init', base).returncode == 0
+    patch = private(root / 'key-consumer.json', changes([dict(id='alice', enabled=True, groups=[])]))
+    consumer_snapshot = root / 'key-consumer-snapshot.json'
+    assert run(tool, 'apply', base, patch, consumer_snapshot).returncode == 0
+
+    def generate(source, credential_id, method, destination):
+        result = run(tool, 'generate-key', source, 'alice', credential_id, method, destination)
+        assert result.returncode == 0 and result.stdout == b'' and result.stderr == b'', result
+        snapshot = json.loads(destination.read_bytes())
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+        credential = next(item for item in snapshot['credentials'] if item['id'] == credential_id)
+        secret = credential['secret']
+        assert re.fullmatch(r'[0-9a-f]{64}', secret), secret
+        assert credential == dict(id=credential_id, consumerId='alice', method=method,
+                                  secret=secret, enabled=True)
+        assert run(tool, 'validate', destination).returncode == 0
+        inspected = run(tool, 'inspect', destination)
+        assert inspected.returncode == 0 and secret.encode() not in inspected.stdout + inspected.stderr
+        return snapshot, secret
+
+    first_path = root / 'generated-bearer.json'
+    first, bearer = generate(consumer_snapshot, 'key-v1', 'bearer', first_path)
+    second_path = root / 'generated-header.json'
+    second, header = generate(consumer_snapshot, 'key-v2', 'header', second_path)
+    assert bearer != header
+    assert json.loads(consumer_snapshot.read_bytes())['credentials'] == []
+    # Printable IDs containing JSON syntax remain valid and are quoted safely.
+    quoted_consumer = 'alice"ops'
+    quoted_base = root / 'quoted-base.json'
+    private(quoted_base, dict(version=1, consumers=[dict(id=quoted_consumer, enabled=True, groups=[])],
+                              credentials=[]))
+    quoted_out = root / 'quoted-out.json'
+    result = run(tool, 'generate-key', quoted_base, quoted_consumer, 'quoted-key', 'header', quoted_out)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    assert json.loads(quoted_out.read_bytes())['credentials'][0]['consumerId'] == quoted_consumer
+
+    invalid_cases = [
+        ('missing', 'key-v3', 'bearer'), ('alice', 'key-v1', 'bearer'),
+        ('alice', 'bad id', 'bearer'), ('alice', 'x' * 65, 'header'),
+        ('bad id', 'key-v3', 'bearer'), ('x' * 65, 'key-v3', 'header'),
+        ('alice', 'key-v3', 'basic'), ('alice', 'key-v3', 'mtls'),
+        ('alice', 'key-v3', 'Bearer'),
+    ]
+    for index, (consumer_id, credential_id, method) in enumerate(invalid_cases):
+        destination = root / f'invalid-generated-{index}.json'
+        source = first_path if credential_id == 'key-v1' else consumer_snapshot
+        result = run(tool, 'generate-key', source, consumer_id,
+                     credential_id, method, destination)
+        assert result.returncode == 2 and result.stdout == b''
+        assert bearer.encode() not in result.stderr and not destination.exists()
+    preserved = root / 'preserved-output.json'
+    preserved.write_bytes(b'unchanged')
+    result = run(tool, 'generate-key', consumer_snapshot, 'alice', 'fresh', 'bearer', preserved)
+    assert result.returncode == 2 and not result.stdout and preserved.read_bytes() == b'unchanged'
+
+    # Concurrent generators still publish at most one immutable destination.
+    raced = root / 'generated-race.json'
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        results = list(workers.map(
+            lambda _: run(tool, 'generate-key', consumer_snapshot, 'alice',
+                          'race-key', 'bearer', raced), range(8)))
+    assert sum(result.returncode == 0 for result in results) == 1
+    assert all(result.returncode in (0, 2) and not result.stdout for result in results)
+    assert stat.S_IMODE(raced.stat().st_mode) == 0o600
+    assert run(tool, 'validate', raced).returncode == 0
+
+    disabled_base = root / 'disabled-consumer.json'
+    private(disabled_base, dict(version=1,
+                                consumers=[dict(id='paused', enabled=False, groups=[])],
+                                credentials=[]))
+    disabled_out = root / 'disabled-consumer-key.json'
+    result = run(tool, 'generate-key', disabled_base, 'paused', 'staged-key', 'bearer', disabled_out)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    staged = json.loads(disabled_out.read_bytes())
+    assert staged['consumers'][0]['enabled'] is False
+    assert staged['credentials'][0]['enabled'] is True
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -34,6 +115,7 @@ def main(tool):
         assert result.returncode == 2 and not result.stdout
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
+        test_generated_keys(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())
@@ -204,6 +286,10 @@ def main(tool):
         inspected = run(tool, 'inspect', patch)
         assert inspected.returncode == 0 and len(inspected.stdout) == 8193
         assert json.loads(inspected.stdout) == full
+        capacity_output = root / 'generated-over-capacity.json'
+        capacity_key = run(tool, 'generate-key', patch, 'c0', 'capacity-key', 'bearer', capacity_output)
+        assert capacity_key.returncode == 2 and not capacity_key.stdout
+        assert not capacity_output.exists()
         no_changes = private(root / 'no-changes.json', changes())
         planned = run(tool, 'plan', patch, no_changes)
         assert planned.returncode == 0 and planned.stdout == inspected.stdout

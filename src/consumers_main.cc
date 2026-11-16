@@ -9,6 +9,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 
 namespace {
 using namespace rut;
@@ -21,6 +24,29 @@ struct Buffer {
 };
 struct SensitiveDocument : json::Document {
     ~SensitiveDocument() { rut_crypto_clear_v1(this, sizeof(*this)); }
+};
+struct GeneratedSecret {
+    u8 random[32]{};
+    char hex[64]{};
+    ~GeneratedSecret() {
+        rut_crypto_clear_v1(random, sizeof(random));
+        rut_crypto_clear_v1(hex, sizeof(hex));
+    }
+    bool generate() {
+#ifdef __linux__
+        if (getrandom(random, sizeof(random), GRND_NONBLOCK) !=
+            static_cast<ssize_t>(sizeof(random)))
+            return false;
+#else
+        if (getentropy(random, sizeof(random)) != 0) return false;
+#endif
+        constexpr char digits[] = "0123456789abcdef";
+        for (u32 i = 0; i < sizeof(random); ++i) {
+            hex[i * 2] = digits[random[i] >> 4];
+            hex[i * 2 + 1] = digits[random[i] & 0x0f];
+        }
+        return true;
+    }
 };
 
 int failure(const char* message) {
@@ -134,6 +160,30 @@ bool id_valid(json::Document& doc, u32 id) {
         if (bytes[i] < 0x21 || bytes[i] > 0x7e) return false;
     return true;
 }
+bool provision_id_valid(Str value) {
+    if (!value.ptr || !value.len || value.len > 64) return false;
+    for (u32 i = 0; i < value.len; ++i) {
+        const auto byte = static_cast<u8>(value.ptr[i]);
+        if (byte < 0x21 || byte > 0x7e) return false;
+    }
+    return true;
+}
+bool field_equals(json::Document& doc, u32 node, Str expected) {
+    char bytes[65];
+    json::Writer value{bytes, sizeof(bytes)};
+    return doc.string(node, value) && value.ok && Str{bytes, value.len}.eq(expected);
+}
+u32 bounded_argument(const char* value, u32 capacity) {
+    u32 length = 0;
+    while (length < capacity && value[length]) ++length;
+    return length < capacity ? length : 0;
+}
+bool contains_id(json::Document& doc, u32 array, Str id, bool records) {
+    if (array >= doc.count || doc.nodes[array].kind != json::Kind::Array) return false;
+    for (u32 n = doc.nodes[array].child; n != json::kNone; n = doc.nodes[n].next)
+        if (field_equals(doc, records ? field(doc, n, lit_str("id")) : n, id)) return true;
+    return false;
+}
 u32 find(json::Document& doc, u32 array, json::Document& key_doc, u32 key, bool records) {
     if (array >= doc.count || doc.nodes[array].kind != json::Kind::Array) return json::kNone;
     for (u32 n = doc.nodes[array].child; n != json::kNone; n = doc.nodes[n].next) {
@@ -237,6 +287,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
+    "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
     "Changes contains four arrays: consumers, credentials (full-record upserts),\n"
@@ -244,6 +295,8 @@ constexpr char kUsage[] =
     "Output is a new atomic 0600 snapshot; existing paths are never replaced.\n"
     "Inspect and plan omit credential secrets. Plan validates without creating files.\n"
     "No command publishes to running gateways.\n"
+    "generate-key supports bearer/header and creates a new 32-byte random key in an immutable "
+    "snapshot.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
 
@@ -255,7 +308,9 @@ int main(int argc, char** argv) {
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;
     const bool kPlan = argc == 4 && strcmp(argv[1], "plan") == 0;
     const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
-    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply) return failure(kUsage);
+    const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
+    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey)
+        return failure(kUsage);
     if (kInit) {
         const char* error =
             publish(argv[2], lit_str("{\"version\":1,\"consumers\":[],\"credentials\":[]}"));
@@ -267,6 +322,52 @@ int main(int argc, char** argv) {
     if (!consumer_registry_valid(base, input.view()))
         return failure("invalid Consumer registry snapshot\n");
     if (kValidate) return 0;
+    if (kGenerateKey) {
+        const u32 consumer_length = bounded_argument(argv[3], 65);
+        const u32 credential_length = bounded_argument(argv[4], 65);
+        const u32 method_length = bounded_argument(argv[5], 16);
+        const Str consumer_id{argv[3], consumer_length};
+        const Str credential_id{argv[4], credential_length};
+        const Str method{argv[5], method_length};
+        if (!provision_id_valid(consumer_id) || !provision_id_valid(credential_id) ||
+            !(method.eq(lit_str("bearer")) || method.eq(lit_str("header"))))
+            return failure("invalid Consumer ID, credential ID, or key method\n");
+        const u32 consumers = field(base, 0, lit_str("consumers"));
+        const u32 credentials = field(base, 0, lit_str("credentials"));
+        if (!contains_id(base, consumers, consumer_id, true))
+            return failure("Consumer does not exist in registry snapshot\n");
+        if (contains_id(base, credentials, credential_id, true))
+            return failure("credential ID already exists in registry snapshot\n");
+
+        GeneratedSecret secret;
+        if (!secret.generate()) return failure("operating-system random key generation failed\n");
+        Buffer change_bytes;
+        json::Writer change_output{change_bytes.data, json::kMaxBytes};
+        change_output.text(lit_str("{\"consumers\":[],\"credentials\":[{\"id\":"));
+        if (!json::quote(credential_id, change_output))
+            return failure("cannot encode key change\n");
+        change_output.text(lit_str(",\"consumerId\":"));
+        if (!json::quote(consumer_id, change_output)) return failure("cannot encode key change\n");
+        change_output.text(lit_str(",\"method\":\""));
+        change_output.text(method);
+        change_output.text(lit_str("\",\"secret\":\""));
+        change_output.text({secret.hex, sizeof(secret.hex)});
+        change_output.text(
+            lit_str("\",\"enabled\":true}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+        if (!change_output.ok) return failure("key change exceeds registry capacity\n");
+        SensitiveDocument patch;
+        if (!patch.parse({change_bytes.data, change_output.len}))
+            return failure("cannot encode key change\n");
+        Buffer result;
+        json::Writer output{result.data, json::kMaxBytes};
+        if (!apply(base, patch, output))
+            return failure("generated registry snapshot exceeds supported capacity\n");
+        SensitiveDocument checked;
+        if (!consumer_registry_valid(checked, {result.data, output.len}))
+            return failure("generated registry snapshot is invalid\n");
+        const char* error = publish(argv[6], {result.data, output.len});
+        return error ? failure(error) : 0;
+    }
     Buffer result;
     json::Writer output{result.data, kInspect ? json::kMaxBytes + 1 : json::kMaxBytes};
     if (kInspect) {

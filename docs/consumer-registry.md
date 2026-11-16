@@ -146,6 +146,32 @@ redaction is not implied by a header-only policy. See
 validator as `consumerAuthenticate`. It requires no LLVM, network service or new
 library. It provides these commands:
 
+`generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT` adds one generated
+credential to a new snapshot. Only `bearer` and `header` methods are accepted.
+The Consumer must already exist, and the credential ID must not appear in the
+input, including on disabled records. Consumer and credential IDs follow the
+registry's printable ASCII, 1–64 byte label rule; the tool JSON-quotes them
+before constructing the validated change. A disabled Consumer may be staged;
+its enabled state is preserved while the new credential is enabled.
+
+The CLI reads the existing private snapshot, obtains exactly 32 bytes from the
+operating-system CSPRNG (one Linux `getrandom` call with `GRND_NONBLOCK`; one
+`getentropy` call on other supported hosts), and stores the key as 64 lowercase
+hexadecimal characters. An entropy error, interruption, or short Linux read
+fails closed without retry or fallback. Temporary random bytes, encoded secret
+buffers, parsed documents and snapshot buffers are cleared before return.
+Success emits no stdout or stderr, and the secret never
+appears in command arguments or diagnostics. The immutable output uses the same
+0600, synced, atomic no-replace publication path as `apply`; the complete
+resulting snapshot is validated against runtime schema and capacity first.
+Generation does not activate the snapshot.
+
+For a rotation overlap, generate a distinct credential ID from the current
+snapshot, publish and activate that version through the host's normal trusted
+configuration path, then use `apply` to disable or remove the old ID in a later
+snapshot. `inspect` redacts the credential secret; the 0600 snapshot itself
+contains it and must be protected and retired as sensitive configuration.
+
 ```sh
 umask 077
 mkdir -m 700 consumer-config
@@ -155,6 +181,14 @@ build/src/rut-consumers plan consumer-config/empty.json consumer-config/changes.
 build/src/rut-consumers apply consumer-config/empty.json consumer-config/changes.json consumer-config/v1.json
 build/src/rut-consumers validate consumer-config/v1.json
 build/src/rut-consumers inspect consumer-config/v1.json
+```
+
+To provision a new bearer key without placing secret material in a changes file:
+
+```sh
+build/src/rut-consumers generate-key consumer-config/v1.json alice alice-key-v2 bearer consumer-config/v2.json
+build/src/rut-consumers validate consumer-config/v2.json
+build/src/rut-consumers inspect consumer-config/v2.json
 ```
 
 An apply transaction has exactly four required arrays:
@@ -214,11 +248,13 @@ standalone server, pass the selected file's contents through trusted
 `AUTH_REGISTRY` configuration when compiling/loading or restarting. Embedding
 hosts use the existing RCU publication/retirement boundary described above.
 
-The CLI regression covers creation, group replacement, rotation/disable/removal,
-capacity, whole-transaction rejection, escaped IDs, redacted preflight and competing output
-writers. The native HTTP registry fixtures consume CLI-generated snapshots on
-epoll/io_uring with HTTP/1 and HTTP/2, preserving old-program authorization while
-a replacement rejects old credentials and removes old groups. Transparent
+The CLI regression covers creation, generated bearer/header keys, exact
+lowercase-hex formatting, distinct outputs, escaped IDs, disabled-Consumer
+staging, collision/method/bounds/capacity rejection, zero-output secret
+handling, rotation/disable/removal, redacted preflight and competing output
+writers. The native HTTP registry fixtures consume generated snapshots on
+epoll/io_uring with HTTP/1 and HTTP/2, verify overlap, then reject a disabled
+old generated key while retaining the new one. Transparent
 request-target/body mutation and online administrative HTTP APIs remain separate.
 
 ## Product scope
