@@ -39,6 +39,14 @@ certificate mismatches fail closed. HTTP-level failures return 401 with
 can reject an absent or untrusted certificate earlier during the TLS handshake.
 Forwarded certificate and identity headers cannot satisfy this policy.
 
+For bounded RS256 or ES256 access tokens, use the paired
+[RS256](../examples/mtls-access-bound-rs256-auth.rut) or
+[ES256](../examples/mtls-access-bound-es256-auth.rut) example. It verifies
+signature and access claims first, applies certificate binding second, then
+authorizes the configured client and scope. This reuses the existing policies;
+see the [access-token contract](jwt-access-profile.md).
+
+
 ## Confirmation profile
 
 The signed JWT payload must contain a top-level confirmation object:

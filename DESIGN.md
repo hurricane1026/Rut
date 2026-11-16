@@ -10421,11 +10421,12 @@ policy using the RFC 9068 `client_id` claim, not complete OAuth/OIDC, sender bin
 a dynamic client registry or replay protection. See the language card and
 `examples/jwt-client-auth.rut` for the executable contract.
 
-### Bounded RS256 JWT access-token resource profile
+### Bounded RS256/ES256 JWT access-token resource profile
 
 The ordinary `jwt_access` Rut module composes the existing static
-`Crypto.jwtRs256` policy with `jwtClaimsValidWithLifetime`, `jwtHasScope` and
-exact trusted `client_id` matching. Its policy must require exactly `at+jwt` or
+`Crypto.jwtRs256` or `Crypto.jwtEs256` policy with
+`jwtClaimsValidWithLifetime`, `jwtHasScope` and exact trusted `client_id`
+matching. Its policy must require exactly `at+jwt` or
 `application/at+jwt` in the signed protected-header `typ`; no normalization or
 payload/header fallback applies. The module additionally requires nonempty
 `client_id` (at most 1024 decoded bytes), nonempty `jti` (at most 128 bytes),
@@ -10436,7 +10437,8 @@ accepts one well-formed RFC 6749 token and treats malformed trusted scope as 503
 This is a bounded RFC 9068-inspired resource profile, not complete RFC 9068 or
 OIDC conformance, token issuance/login, sender proof, or online revocation.
 Tests load native artifacts after source/module unlink on both backends/O0/O2
-and H1.0/H1.1/H2. See `docs/jwt-access-profile.md`.
+and H1.0/H1.1/H2, including real signed RSA/EC cross-algorithm rejection. See
+`docs/jwt-access-profile.md`.
 
 
 ### Static mTLS credential rotation
@@ -10756,6 +10758,11 @@ so existing operation numbers stay stable. Signature/claims/scope policy remains
 explicit, and the ordinary helper fails closed with challenged 401 when TLS or
 confirmation evidence is missing. No token issuance, proxy-header trust, DPoP or
 persistent revocation is implied. See [the contract](docs/mtls-bound-jwt.md).
+
+The bounded RS256/ES256 access-token examples compose existing signature,
+claims/lifetime, TLS-certificate binding, client and scope checks in that order.
+They add no runtime primitive or token issuance path; see
+`docs/jwt-access-profile.md` for the composed resource-server contract.
 
 
 ### Introspection certificate confirmation policy
