@@ -1,6 +1,5 @@
 #include "rut/runtime/regex_capture.h"
 
-#include "absl/strings/string_view.h"
 #include "core/placement_new.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
@@ -10,12 +9,12 @@
 
 namespace rut {
 namespace {
-// Only this translation unit knows the upstream engine or its C++ types.
-// RE2 owns its internal allocations; mmap owns the adapter object itself.
+// Only this translation unit knows the engine or its C++ types. The engine's
+// runtime-free ABI still uses C heap allocation; mmap owns this adapter object.
 struct CaptureProgram {
     re2::RE2 regex;
     explicit CaptureProgram(Str pattern) : regex(view(pattern), options()) {}
-    static absl::string_view view(Str value) { return {value.ptr, value.len}; }
+    static re2::StringView view(Str value) { return {value.ptr, value.len}; }
     static re2::RE2::Options options() {
         re2::RE2::Options result;
         result.set_encoding(re2::RE2::Options::EncodingLatin1);
@@ -64,7 +63,7 @@ u8 capture_regex_match(void* raw, SliceArena& arena, Str subject, u32 group, Str
     if (!raw || !subject.ptr || subject.len > 8192 || !arena.backend.pool) return 2;
     const auto& regex = static_cast<const CaptureProgram*>(raw)->regex;
     if (group > static_cast<u32>(regex.NumberOfCapturingGroups())) return 2;
-    absl::string_view captures[9];
+    re2::StringView captures[9];
     if (!regex.Match(CaptureProgram::view(subject),
                      0,
                      subject.len,

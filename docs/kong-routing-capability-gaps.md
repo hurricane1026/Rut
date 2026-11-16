@@ -50,9 +50,14 @@ The initial ledger preferred one regex engine. Inspection confirmed that
 [Vectorscan/Hyperscan does not return capturing subexpressions](https://intel.github.io/hyperscan/dev-reference/compilation.html).
 A separate capture backend is required for greedy, alternative, optional and
 nested captures; repeated Boolean scans cannot preserve those results.
-The current backend is static RE2 2025-11-05 plus Abseil 20250814.1, both pinned
-by SHA-256. Vectorscan Boolean operations are unchanged. Licences are retained in
-[RE2](third-party/re2-LICENSE) and [Abseil](third-party/abseil-LICENSE).
+The current backend is the static runtime-free RE2 fork pinned at
+`88190621fa40e3eeca8c337c4b1222f706440402`; the codeload source archive is
+verified by SHA-256
+`7838f989ed2a3d5f1cd45e14e77dc8091b78b6491d2449d45d88aab79d5d6d8a`.
+Vectorscan Boolean operations are unchanged. Licenses are retained for
+[RE2](third-party/re2-LICENSE), [Containa](third-party/containa-LICENSE),
+[SmallString](third-party/smallstring-LICENSE.txt), and
+[fmt](third-party/fmt-LICENSE).
 
 This replaces the initial PCRE2 adapter following capture performance and
 worst-case latency experiments. RE2 uses Latin-1 byte semantics, leftmost-first
@@ -61,14 +66,14 @@ The existing opaque adapter is the replacement boundary: no RE2 types escape
 into compiler/native-helper callers. Native artifacts store bounded source with
 the RUTCAP2 marker and compile it at startup, never from request-supplied patterns.
 
-RE2's configured 1 MiB budget approximately bounds compiled programs and DFA
-caches, not all process allocation. Upstream RE2/Abseil use heap allocations,
-including matching paths, and the C++ runtime. This is a temporary exception
-explicitly accepted pending a separate replacement engine; it does not preserve
-the original Arena-only guarantee. Exceptions and RTTI remain disabled.
-JIT-enabled server ELF checks permit the C++ runtime but still reject LLVM and
-shared RE2/Abseil/PCRE libraries. No-JIT server and standalone tools keep their
-original no-C++-runtime checks.
+The configured 1 MiB budget approximately bounds compiled programs and DFA
+caches, not all process allocation. The fork uses C heap allocation, including
+matching paths, and aborts on allocation failure, but does not require the C++
+standard runtime. This does not preserve the original Arena-only guarantee.
+Exceptions and RTTI remain disabled. JIT and no-JIT server ELF checks reject
+C++ runtime dependencies and undefined C++ ABI symbols, as well as LLVM and
+shared RE2 libraries. The historical PCRE2 benchmark and validation records
+below are retained as history; its unused license file has been removed.
 
 The following sections preserve the original audit and staged validation history.
 

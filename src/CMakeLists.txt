@@ -313,14 +313,7 @@ include(${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake)
 add_library(rut_regex_capture STATIC runtime/regex_capture.cc)
 target_include_directories(rut_regex_capture PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_regex_capture PUBLIC rut_runtime PRIVATE re2::re2)
-# RE2 is an explicitly accepted temporary C++ runtime dependency. This also
-# supplies the library when rut uses Clang -nostdlib++ or GCC's C link driver.
-foreach(_rut_cxx_lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
-    if(_rut_cxx_lib STREQUAL "stdc++" OR _rut_cxx_lib STREQUAL "c++" OR
-       _rut_cxx_lib STREQUAL "c++abi" OR _rut_cxx_lib STREQUAL "supc++")
-        target_link_libraries(rut_regex_capture PRIVATE "${_rut_cxx_lib}")
-    endif()
-endforeach()
+target_compile_definitions(rut_regex_capture PRIVATE _GLIBCXX_NO_ASSERTIONS)
 target_link_libraries(rut_compiler PUBLIC rut_regex_capture)
 
 
@@ -607,7 +600,6 @@ if(RUT_STATIC_RUNTIME)
 endif()
 
 # Keep first-party code and standalone tools independent of the C++ runtime.
-# JIT-enabled rut explicitly links the temporary RE2 backend runtime above.
 # LLVM tools and test executables keep their normal C++ link environment.
 # Sanitizer runtimes are development instrumentation with their own ABI needs.
 if(NOT RUT_SANITIZE)
@@ -638,6 +630,12 @@ endif()
 # Without compiler support, rut still builds and serves default routes.
 if(RUT_ENABLE_JIT)
     target_link_libraries(rut rut_native_loader)
+    # The unsanitized server has no C++ runtime, so provide RE2's allocation/
+    # guard ABI shim here. Sanitizer builds and compiler tools use their normal
+    # C++ runtime implementation.
+    if(NOT RUT_SANITIZE)
+        target_sources(rut PRIVATE $<TARGET_OBJECTS:rut_re2_runtime>)
+    endif()
     set_target_properties(rut PROPERTIES ENABLE_EXPORTS ON)
     if(APPLE)
         # Darwin's ENABLE_EXPORTS does not retain/export symbols pulled from

@@ -3673,12 +3673,15 @@ Patterns and group indexes must be literals; patterns are at most 1024 bytes,
 with at most 8 groups. Input is at most 8192 bytes. Compilation occurs during
 configuration/startup, never from runtime input. Captures borrow their subject;
 `set_path:` copies the final target into request Arena storage. Capture matching
-uses pinned static RE2 2025-11-05 with Latin-1 byte semantics and an approximate
-1 MiB compiled-program/DFA-cache budget. Backreferences and lookaround are not
-supported and reject at compile time. RE2/Abseil currently use the C++ runtime
-and internal heap allocation, including some matching paths; request Arena does
-not account for those allocations. This is an explicitly accepted temporary
-backend exception, isolated behind the capture adapter for later replacement. Invalid patterns/group indexes reject at compile time. Runtime
-resource failures return 500 immediately, before nil recovery can accept them.
+uses the pinned runtime-free RE2 fork at
+`88190621fa40e3eeca8c337c4b1222f706440402`, with Latin-1 byte semantics and an
+approximate 1 MiB compiled-program/DFA-cache budget. Backreferences and
+lookaround are not supported and reject at compile time. The fork does not
+require the C++ standard runtime, but it uses C heap allocation, including on
+some matching paths, and aborts on allocation failure; request Arena does not
+account for those allocations. Invalid patterns/group indexes reject at compile
+time. Adapter-detected resource/bound failures return 500 immediately, before
+nil recovery can accept them; this does not cover C heap exhaustion, which
+aborts in the fork.
 Available in HTTP handlers/helpers, not timers or WebSocket callbacks. Existing
 `matches(re"...")` retains its Vectorscan full-match Boolean behavior.
