@@ -17,12 +17,57 @@ if(NOT rut_re2_POPULATED)
     FetchContent_Populate(rut_re2)
 endif()
 
+set(_rut_re2_prog_source "${rut_re2_SOURCE_DIR}/re2/prog.cc")
+set(_rut_re2_dfa_source "${rut_re2_SOURCE_DIR}/re2/dfa.cc")
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # libc++ routes default std::sort calls for char/int through explicit
+    # __sort ABI instantiations in libc++. The no-stdlib server cannot link
+    # those symbols, so use equivalent custom comparators in build-tree copies.
+    # Keep the pinned archive pristine and fail if its exact call sites change.
+    function(rut_re2_replace_once text_variable old new)
+        set(source_text "${${text_variable}}")
+        string(LENGTH "${source_text}" source_text_length)
+        string(LENGTH "${old}" old_length)
+        string(REPLACE "${old}" "" source_without_call "${source_text}")
+        string(LENGTH "${source_without_call}" source_without_call_length)
+        math(EXPR removed_length "${source_text_length}-${source_without_call_length}")
+        if(NOT removed_length EQUAL old_length)
+            message(FATAL_ERROR
+                "Expected exactly one RE2 libc++ sort call '${old}'")
+        endif()
+        string(REPLACE "${old}" "${new}" source_text "${source_text}")
+        set(${text_variable} "${source_text}" PARENT_SCOPE)
+    endfunction()
+
+    set(_rut_re2_libcxx_source_dir "${CMAKE_CURRENT_BINARY_DIR}/rut_re2_libcxx")
+    file(MAKE_DIRECTORY "${_rut_re2_libcxx_source_dir}")
+    set(_rut_re2_prog_source "${_rut_re2_libcxx_source_dir}/prog.cc")
+    set(_rut_re2_dfa_source "${_rut_re2_libcxx_source_dir}/dfa.cc")
+    file(READ "${rut_re2_SOURCE_DIR}/re2/prog.cc" _rut_re2_prog_text)
+    rut_re2_replace_once(
+        _rut_re2_prog_text
+        "std::sort(prefix.begin(), prefix.end());"
+        "std::sort(prefix.begin(), prefix.end(), [](char lhs, char rhs) { return lhs < rhs; });")
+    file(WRITE "${_rut_re2_prog_source}" "${_rut_re2_prog_text}")
+    set(_rut_re2_dfa_source_original "${rut_re2_SOURCE_DIR}/re2/dfa.cc")
+    file(READ "${_rut_re2_dfa_source_original}" _rut_re2_dfa_text)
+    rut_re2_replace_once(
+        _rut_re2_dfa_text
+        "std::sort(ip, markp);"
+        "std::sort(ip, markp, [](int lhs, int rhs) { return lhs < rhs; });")
+    rut_re2_replace_once(
+        _rut_re2_dfa_text
+        "std::sort(ip, ep);"
+        "std::sort(ip, ep, [](int lhs, int rhs) { return lhs < rhs; });")
+    file(WRITE "${_rut_re2_dfa_source}" "${_rut_re2_dfa_text}")
+endif()
+
 find_package(Threads REQUIRED)
 add_library(re2 STATIC
     "${rut_re2_SOURCE_DIR}/re2/bitmap256.cc"
     "${rut_re2_SOURCE_DIR}/re2/bitstate.cc"
     "${rut_re2_SOURCE_DIR}/re2/compile.cc"
-    "${rut_re2_SOURCE_DIR}/re2/dfa.cc"
+    "${_rut_re2_dfa_source}"
     "${rut_re2_SOURCE_DIR}/re2/filtered_re2.cc"
     "${rut_re2_SOURCE_DIR}/re2/mimics_pcre.cc"
     "${rut_re2_SOURCE_DIR}/re2/nfa.cc"
@@ -31,7 +76,7 @@ add_library(re2 STATIC
     "${rut_re2_SOURCE_DIR}/re2/perl_groups.cc"
     "${rut_re2_SOURCE_DIR}/re2/prefilter.cc"
     "${rut_re2_SOURCE_DIR}/re2/prefilter_tree.cc"
-    "${rut_re2_SOURCE_DIR}/re2/prog.cc"
+    "${_rut_re2_prog_source}"
     "${rut_re2_SOURCE_DIR}/re2/re2.cc"
     "${rut_re2_SOURCE_DIR}/re2/regexp.cc"
     "${rut_re2_SOURCE_DIR}/re2/set.cc"
