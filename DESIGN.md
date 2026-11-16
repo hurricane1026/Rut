@@ -9443,6 +9443,17 @@ so missing/invalid credentials remain 401. Identity is a constructible ordinary
 struct, not a compiler-enforced proof of authentication. These helpers do not
 provide a dynamic group/role registry or Consumer membership lifecycle.
 
+### Bounded Consumer role/resource/action policy
+
+`examples/middleware/rbac.rut` maps a trusted `consumerAuthenticate` identity's
+groups to at most four exact tenant/role/resource/action rules. All rules and
+trusted route selectors are validated before evaluation; any matching deny
+overrides allows, and otherwise an exact allow is required. Tenant/resource/
+action are route configuration, not identity claims; this layer does not assert
+tenant ownership. Policy replacement loads a new program snapshot. This bounded
+Rut helper is not a Casbin/Wolf-compatible model or a dynamic policy store.
+See `examples/consumer-rbac-auth.rut`.
+
 ### Two-Consumer mTLS identity mapping
 
 The ordinary `mtls.Consumer` record contains trusted `consumerId`, `sha256`
