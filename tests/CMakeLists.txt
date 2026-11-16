@@ -5067,6 +5067,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
         set_tests_properties(test_mtls_jwt_binding_${backend} PROPERTIES
             LABELS "integration;network" TIMEOUT 90 SKIP_RETURN_CODE 77)
+        foreach(mtls_access_algorithm rs256 es256)
+            foreach(mtls_access_opt 0 2)
+                add_test(NAME test_mtls_access_${mtls_access_algorithm}_${backend}_opt${mtls_access_opt}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_access_token_binding.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/mtls-access-bound-${mtls_access_algorithm}-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend}
+                        --opt ${mtls_access_opt} --algorithm ${mtls_access_algorithm}
+                        --signer $<TARGET_FILE:test_es256_access_token_signer>)
+                set_tests_properties(test_mtls_access_${mtls_access_algorithm}_${backend}_opt${mtls_access_opt}
+                    PROPERTIES LABELS "integration;network;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
+            endforeach()
+        endforeach()
         add_test(NAME test_mtls_introspection_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_introspection.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
@@ -5102,6 +5115,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         set_tests_properties(test_h1_tls_source_${h1_tls_backend} PROPERTIES
             LABELS "network;cli" TIMEOUT 60)
     endforeach()
+    add_test(NAME test_mtls_access_io_uring_skip
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_access_io_uring_skip.py
+            --testdata ${RUT_TLS_TESTDATA_DIR})
+    set_tests_properties(test_mtls_access_io_uring_skip PROPERTIES
+        LABELS "integration;auth" TIMEOUT 30)
 endif()
 
 # Explicit absolute expiry stays within the existing client transport profile.

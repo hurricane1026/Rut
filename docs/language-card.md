@@ -3040,6 +3040,14 @@ headers. This adds an ordinary builtin using the existing Json carrier, with no
 keyword or dependency. See [the contract](mtls-bound-jwt.md) and
 [example](../examples/mtls-bound-jwt.rut).
 
+The bounded RS256/ES256 access-token examples compose this binding check after
+signature, type and lifetime validation, and before client/scope authorization.
+They require mandatory TLS client-certificate verification and bind the token
+to the complete certificate DER digest. This adds no token issuance or proxy
+certificate trust. See the [RS256](../examples/mtls-access-bound-rs256-auth.rut)
+and [ES256](../examples/mtls-access-bound-es256-auth.rut) examples.
+
+
 ## Request-scoped TCP and UDP clients
 
 `tcp(policy, timeoutMs) -> TcpConnection?` and

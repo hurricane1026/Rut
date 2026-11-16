@@ -3,8 +3,9 @@
 func requireMtls(_ verifiedDocument: Json) -> Json {
     let denied = response(401)
     denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
-    guard let fingerprint = req.tlsClientCertSha256 else { respond denied }
-    guard jwtCertificateBound(verifiedDocument, fingerprint) else { respond denied }
+    guard jwtCertificateBound(verifiedDocument, req.tlsClientCertSha256.or("")) else {
+        respond denied
+    }
     verifiedDocument
 }
 
