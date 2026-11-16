@@ -31,6 +31,7 @@ class Store:
         self.claims = {}
         self.mode = 'normal'
         self.commands = []
+        self.command_modes = []
         self.errors = []
         self.workers = []
         self.stopping = threading.Event()
@@ -87,6 +88,7 @@ class Store:
                     with self.lock:
                         mode = self.mode
                         self.commands.append(args)
+                        self.command_modes.append(mode)
                     if args[0] == b'AUTH':
                         assert args == [b'AUTH', b'gateway', b'service-password']
                         authenticated = mode != 'auth-error'
@@ -201,6 +203,28 @@ def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'eve
     return int(data.split(b' ',2)[1])
 
 
+def durable_replay_diagnostics(store, name):
+    with store.lock:
+        commands = zip(store.commands, store.command_modes)
+        key = next((command[1] for command, mode in commands
+                    if mode == name and command[0] == b'SET'), None)
+        if key is None:
+            first_set_count = 0
+            set_count = 0
+            claim_present = False
+        else:
+            first_set_count = sum(command[0] == b'SET' and command[1] == key and mode == name
+                                  for command, mode in zip(store.commands, store.command_modes))
+            set_count = sum(command[0] == b'SET' and command[1] == key
+                            for command in store.commands)
+            claim_present = store.claims.get(key, 0) > time.monotonic()
+        waitaof_count = sum(command[0] == b'WAITAOF' and mode == name
+                            for command, mode in zip(store.commands, store.command_modes))
+    return {'initial_SET_count': first_set_count, 'total_SET_count': set_count,
+            'WAITAOF_count': waitaof_count, 'claim_present': claim_present,
+            'key_missing': key is None}
+
+
 @contextmanager
 def gateway(args, source, store, directory):
     root=directory / str(time.monotonic_ns())
@@ -293,13 +317,24 @@ def main():
                                  'aof-type', 'aof-arity', 'aof-nested', 'aof-overflow',
                                  'aof-oversized', 'aof-trailing', 'aof-short',
                                  'aof-eof', 'aof-hang']
+                    aof_nested_first_status = None
                     for mode in uncertain + ['aof-replicas', 'aof-fragmented']:
                         with store.lock: store.mode=mode
-                        assert exchange(port,mode)==(204 if mode in ('aof-replicas','aof-fragmented') else 503),mode
+                        status=exchange(port,mode)
+                        expected=204 if mode in ('aof-replicas','aof-fragmented') else 503
+                        if mode == 'aof-nested':
+                            aof_nested_first_status=status
+                            assert status==expected,(mode,status,durable_replay_diagnostics(store,mode))
+                        else:
+                            assert status==expected,mode
                     with store.lock: store.mode='normal'
                     for name in uncertain:
                         actual = exchange(port,name)
-                        assert actual==409,(name,actual)
+                        if name == 'aof-nested':
+                            assert actual==409,(name,aof_nested_first_status,actual,
+                                                durable_replay_diagnostics(store,name))
+                        else:
+                            assert actual==409,(name,actual)
                     with store.lock: store.mode='aof-held'
                     with ThreadPoolExecutor(max_workers=1) as pool:
                         pending=pool.submit(exchange,port,'barrier-held')
