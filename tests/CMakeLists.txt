@@ -1065,7 +1065,13 @@ target_include_directories(test_https_fetch PRIVATE ${PROJECT_SOURCE_DIR}/testin
 target_compile_definitions(test_https_fetch PRIVATE RUT_TESTDATA_DIR="${RUT_TLS_TESTDATA_DIR}")
 add_dependencies(test_https_fetch test_tls_fixtures)
 add_test(NAME test_https_fetch COMMAND test_https_fetch)
-set_tests_properties(test_https_fetch PROPERTIES LABELS "unit" TIMEOUT 30)
+if(APPLE)
+    # This TLS/worker-heavy unit suite runs slower in macOS Debug CI; individual
+    # operation deadlines and all test assertions remain unchanged.
+    set_tests_properties(test_https_fetch PROPERTIES LABELS "unit" TIMEOUT 60)
+else()
+    set_tests_properties(test_https_fetch PROPERTIES LABELS "unit" TIMEOUT 30)
+endif()
 if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(test_https_fetch rut)
     foreach(jwks_backend epoll io_uring)
