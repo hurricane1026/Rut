@@ -10423,7 +10423,7 @@ a dynamic client registry or replay protection. See the language card and
 
 ### Bounded RS256/ES256 JWT access-token resource profile
 
-The ordinary `jwt_access` Rut module composes the existing static
+The ordinary `jwt_access` Rut module composes the existing static or remote
 `Crypto.jwtRs256` or `Crypto.jwtEs256` policy with
 `jwtClaimsValidWithLifetime`, `jwtHasScope` and exact trusted `client_id`
 matching. Its policy must require exactly `at+jwt` or
@@ -10437,8 +10437,11 @@ accepts one well-formed RFC 6749 token and treats malformed trusted scope as 503
 This is a bounded RFC 9068-inspired resource profile, not complete RFC 9068 or
 OIDC conformance, token issuance/login, sender proof, or online revocation.
 Tests load native artifacts after source/module unlink on both backends/O0/O2
-and H1.0/H1.1/H2, including real signed RSA/EC cross-algorithm rejection. See
-`docs/jwt-access-profile.md`.
+and H1.0/H1.1/H2, including real signed RSA/EC cross-algorithm rejection. The
+remote access-profile tests use ephemeral RSA/EC keys and a local authenticated
+origin to cover cold deny, discovery/DNS, approved-key rotation, access-claim
+ordering, destination rejection, cache expiry and recovery on both backends.
+They do not call live providers. See `docs/jwt-access-profile.md`.
 
 
 ### Static mTLS credential rotation

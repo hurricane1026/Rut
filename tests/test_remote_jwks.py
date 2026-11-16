@@ -23,13 +23,20 @@ def main():
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
     parser.add_argument("--algorithm", choices=("RS256", "ES256"), default="RS256")
     parser.add_argument("--discovery-dns", action="store_true")
+    parser.add_argument("--access-profile", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
+    if args.access_profile:
+        fixture_option = "--fixture-es256-access" if args.algorithm == "ES256" else "--fixture-access"
     if args.discovery_dns: fixture_option += "-discovery"
     fixture = json.loads(subprocess.check_output([args.helper, fixture_option], timeout=10))
     lock = threading.Lock()
     release_response = threading.Event()
-    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200, "requests": 0, "hold": False, "discovery": "valid", "dns": "valid"}
+    state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200,
+             "requests": 0, "locals": [], "dnsRequests": 0,
+             "hold": "cold" if args.access_profile else False,
+             "discovery": "valid", "dns": "valid"}
+    cold_release = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -55,8 +62,11 @@ def main():
                 return
             with lock:
                 state["requests"] += 1
+                state["locals"].append(self.connection.getsockname()[0])
                 status, body, hold = state["status"], state["body"], state["hold"]
-            if hold:
+            if hold == "cold":
+                cold_release.wait()
+            elif hold:
                 release_response.wait(timeout=5)
             try:
                 self.send_response(status)
@@ -76,8 +86,12 @@ def main():
     context.load_cert_chain(str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                             str(pathlib.Path(args.testdata) / "localhost_key.pem"))
     origin.socket = context.wrap_socket(origin.socket, server_side=True)
+    origin2 = http.server.ThreadingHTTPServer(("127.0.0.2", origin.server_port), Handler)
+    origin2.socket = context.wrap_socket(origin2.socket, server_side=True)
     worker = threading.Thread(target=origin.serve_forever, daemon=True)
     worker.start()
+    worker2 = threading.Thread(target=origin2.serve_forever, daemon=True)
+    worker2.start()
     dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dns.bind(("127.0.0.1", 0))
     dns.settimeout(.1)
@@ -87,9 +101,12 @@ def main():
             try: query, peer = dns.recvfrom(512)
             except socket.timeout: continue
             except OSError: return
-            with lock: mode = state["dns"]
+            with lock:
+                mode = state["dns"]
+                state["dnsRequests"] += 1
             if mode == "timeout": continue
-            address = socket.inet_aton("127.0.0.2" if mode == "rebind" else "127.0.0.1")
+            target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
+            address = socket.inet_aton(target)
             response = query[:2]+b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"+query[12:]
             response += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x1e\x00\x04"+address
             try: dns.sendto(response,peer)
@@ -105,24 +122,49 @@ def main():
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
         if args.discovery_dns:
             policy["remoteJwks"].update(dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
-                                       allowedAddresses=["127.0.0.1"],
+                                       allowedAddresses=(
+                                           ["127.0.0.1", "127.0.0.2"]
+                                           if args.access_profile else ["127.0.0.1"]),
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
-        verifier = "jwtEs256" if args.algorithm == "ES256" else "jwtRs256"
-        source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.' + verifier + '('
-                  'bearerToken(req.authorization.or("")).or(""), ' + literal +
-                  ') else { return 401 } return 200 }\n')
+        if args.access_profile:
+            policy["requiredType"] = "at+jwt"
+            literal = json.dumps(json.dumps(policy, separators=(",", ":")))
+            module = pathlib.Path(__file__).resolve().parent.parent / "examples/middleware/jwt_access.rut"
+            example = pathlib.Path(__file__).resolve().parent.parent / "examples" / (
+                "jwt-access-remote-es256-auth.rut" if args.algorithm == "ES256"
+                else "jwt-access-remote-rs256-auth.rut")
+        else:
+            verifier = "jwtEs256" if args.algorithm == "ES256" else "jwtRs256"
+            source = ('import Crypto\nroute GET "/" { guard let claims = Crypto.' + verifier + '('
+                      'bearerToken(req.authorization.or("")).or(""), ' + literal +
+                      ') else { return 401 } return 200 }\n')
         with tempfile.TemporaryDirectory(prefix="rut-remote-jwks-") as directory:
             source_path = pathlib.Path(directory) / "gateway.rut"
-            source_path.write_text(source)
-            process = subprocess.Popen([args.server, "0", str(source_path), "--backend",
+            if args.access_profile:
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = probe.getsockname()[1]
+                source = example.read_text().replace("listen :8080", f"listen :{port}")
+                source_path.write_text(source)
+                (pathlib.Path(directory) / "middleware").mkdir()
+                (pathlib.Path(directory) / "middleware/jwt_access.rut").write_bytes(module.read_bytes())
+            else:
+                port = 0
+                source_path.write_text(source)
+            env = dict(os.environ)
+            if args.access_profile:
+                policy_name = "JWT_ACCESS_ES256_POLICY" if args.algorithm == "ES256" else "JWT_ACCESS_RS256_POLICY"
+                env.update(JWT_ACCESS_CLIENT_ID="orders-web", JWT_ACCESS_REQUIRED_SCOPE="orders:read")
+                env[policy_name] = json.dumps(policy, separators=(",", ":"))
+            command = [args.server, str(port), str(source_path), "--backend",
                                         args.backend, "--shards", "1", "--no-pin", "--drain", "0",
-                                        "--max-connections-per-shard", "64"],
+                                        "--max-connections-per-shard", "64"]
+            process = subprocess.Popen(command, env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-            # Let the gateway retain a kernel-assigned port through bind/listen;
-            # a bind/release reservation races other parallel integration tests.
+            # Observe the actual listener rather than assuming startup completed.
             startup = b""
             deadline = time.monotonic() + 12
             port = None
@@ -145,8 +187,10 @@ def main():
 
             # The compiled native configuration owns the policy after source removal.
             source_path.unlink()
+            if args.access_profile:
+                (pathlib.Path(directory) / "middleware/jwt_access.rut").unlink()
 
-            def request(token):
+            def request(token, path="/read" if args.access_profile else "/", with_body=False):
                 if process.poll() is not None:
                     output = process.communicate()[0].decode(errors="replace")
                     if args.backend == "io_uring" and "io_uring is unavailable" in output:
@@ -155,10 +199,17 @@ def main():
                     raise AssertionError(f"gateway exited: {output}")
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=1) as connection:
-                        connection.sendall(("GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n"
+                        connection.sendall((f"GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n"
                                             "Authorization: Bearer " + token + "\r\n\r\n").encode())
-                        data = connection.recv(4096)
-                        return int(data.split(b" ", 2)[1])
+                        data = b""
+                        while True:
+                            chunk = connection.recv(4096)
+                            if not chunk:
+                                break
+                            data += chunk
+                        head, _, body = data.partition(b"\r\n\r\n")
+                        status = int(head.split(b" ", 2)[1])
+                        return (status, body) if with_body else status
                 except (ConnectionError, TimeoutError):
                     return None
 
@@ -185,8 +236,37 @@ def main():
                     time.sleep(0.01)
                 raise AssertionError("idle shard did not start the scheduled JWKS refresh")
 
+            def wait_for_dns_request(previous, limit=5):
+                deadline = time.monotonic() + limit
+                while time.monotonic() < deadline:
+                    with lock:
+                        if state["dnsRequests"] > previous:
+                            return
+                    time.sleep(0.01)
+                raise AssertionError("idle shard did not start the scheduled DNS refresh")
+
+            def wait_for_origin_address(previous, target, limit=5):
+                deadline = time.monotonic() + limit
+                while time.monotonic() < deadline:
+                    with lock:
+                        if state["requests"] > previous and state["locals"][-1] == target:
+                            return
+                    time.sleep(0.01)
+                raise AssertionError(f"JWKS request did not reach {target}; seen {state['locals']}")
+
+            if args.access_profile:
+                assert request(fixture["a"]) == 401, "remote access profile authenticated before cold fetch"
+                with lock: state["hold"] = False
+                cold_release.set()
             wait_status(fixture["a"], 200)
+            if args.access_profile:
+                assert request(fixture["a"], with_body=True) == (200, b"alice")
             assert request(fixture["b"]) == 401
+            if args.access_profile:
+                assert request(fixture["badClient"]) == 403, "signed wrong client must be forbidden"
+                assert request(fixture["badScope"]) == 403, "signed wrong scope must be forbidden"
+                for name in ("badIat", "badJti", "badKid", "badType"):
+                    assert request(fixture[name]) == 401, f"{name} did not fail as invalid_token"
             with lock:
                 requests_before_refresh = state["requests"]
             publish(json.dumps(fixture["second"]["jwks"]).encode())
@@ -218,6 +298,14 @@ def main():
                         wait_status(fixture["b"], 401)
                         with lock: state[kind] = "valid"
                         wait_status(fixture["b"], 200)
+                if args.access_profile:
+                    with lock:
+                        dns_before_move = state["dnsRequests"]
+                        origin_before_move = state["requests"]
+                        state["dns"] = "move"
+                    wait_for_dns_request(dns_before_move)
+                    wait_for_origin_address(origin_before_move, "127.0.0.2")
+                    wait_status(fixture["b"], 200)
             # Leave an authenticated fetch waiting on an origin response while
             # retiring the gateway, exercising in-flight refresh cancellation.
             with lock:
@@ -228,11 +316,12 @@ def main():
             output = process.communicate(timeout=5)[0].decode(errors="replace")
             assert process.returncode == 0, output
             release_response.set()
-            print(f"PASS: {args.algorithm} {args.backend} remote JWKS rotation, empty set, outage, malformed refresh and shutdown")
+            print(f"PASS: {args.algorithm} {args.backend} remote {'access-token ' if args.access_profile else ''}JWKS rotation, empty set, outage, malformed refresh and shutdown")
     finally:
         dns_stop.set()
         dns.close()
         dns_worker.join(timeout=2)
+        cold_release.set()
         release_response.set()
         if process is not None and process.poll() is None:
             process.kill()
@@ -240,6 +329,9 @@ def main():
         origin.shutdown()
         origin.server_close()
         worker.join(timeout=5)
+        origin2.shutdown()
+        origin2.server_close()
+        worker2.join(timeout=5)
 
 
 if __name__ == "__main__":

@@ -85,6 +85,12 @@ struct Es256Fixture {
         return {output, length};
     }
     static constexpr Str header = lit_str(R"({"alg":"ES256","kid":"current"})");
+    static constexpr Str access_header =
+        lit_str(R"({"alg":"ES256","kid":"current","typ":"at+jwt"})");
+    static constexpr Str unapproved_access_header =
+        lit_str(R"({"alg":"ES256","kid":"unapproved","typ":"at+jwt"})");
+    static constexpr Str wrong_type_access_header =
+        lit_str(R"({"alg":"ES256","kid":"current","typ":"JWT"})");
     static constexpr Str claims = lit_str(
         R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":4102444800,"scope":"read write"})");
 };

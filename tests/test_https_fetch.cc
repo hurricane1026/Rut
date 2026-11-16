@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 using namespace rut;
@@ -247,15 +248,29 @@ TEST(https_fetch, cancellation_timeout_clock_failure_and_endpoint_validation) {
 }
 
 template <typename Fixture>
-static int print_remote_fixture(bool discovery = false) {
+static int print_remote_fixture(bool discovery = false, bool access = false) {
     Fixture first, second;
     if (!first.init() || !second.init()) return 2;
+    char access_claims[512];
+    const time_t now = time(nullptr);
+    const int claims_size =
+        access
+            ? snprintf(
+                  access_claims,
+                  sizeof(access_claims),
+                  R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-1","scope":"orders:read"})",
+                  static_cast<long long>(now),
+                  static_cast<long long>(now + 600))
+            : 0;
+    if (access && (claims_size <= 0 || claims_size >= static_cast<int>(sizeof(access_claims))))
+        return 2;
     const Str claims =
-        discovery
+        access ? Str{access_claims, static_cast<u32>(strlen(access_claims))}
+        : discovery
             ? lit_str(
                   R"({"sub":"alice","iss":"https://localhost","aud":"gateway","exp":4102444800})")
             : Fixture::claims;
-    if (discovery) {
+    if (discovery || access) {
         Fixture* fixtures[] = {&first, &second};
         for (Fixture* fixture : fixtures) {
             json::Document document;
@@ -278,10 +293,11 @@ static int print_remote_fixture(bool discovery = false) {
         }
     }
     char a_bytes[4096], b_bytes[4096];
-    const Str a = first.sign(Fixture::header, claims, a_bytes);
-    const Str b = second.sign(Fixture::header, claims, b_bytes);
+    const Str header = access ? Fixture::access_header : Fixture::header;
+    const Str a = first.sign(header, claims, a_bytes);
+    const Str b = second.sign(header, claims, b_bytes);
     if (!a.len || !b.len) return 2;
-    printf("{\"first\":%.*s,\"second\":%.*s,\"a\":\"%.*s\",\"b\":\"%.*s\"}\n",
+    printf("{\"first\":%.*s,\"second\":%.*s,\"a\":\"%.*s\",\"b\":\"%.*s\"",
            first.policy.len,
            first.policy.ptr,
            second.policy.len,
@@ -290,6 +306,66 @@ static int print_remote_fixture(bool discovery = false) {
            a.ptr,
            b.len,
            b.ptr);
+    if (access) {
+        char altered[512];
+        char bad_client_bytes[4096], bad_scope_bytes[4096], bad_iat_bytes[4096];
+        char bad_jti_bytes[4096], bad_kid_bytes[4096], bad_type_bytes[4096];
+        int length = snprintf(
+            altered,
+            sizeof(altered),
+            R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"other-client","jti":"access-bad-client","scope":"orders:read"})",
+            static_cast<long long>(now),
+            static_cast<long long>(now + 600));
+        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        const Str bad_client =
+            first.sign(header, {altered, static_cast<u32>(length)}, bad_client_bytes);
+        length = snprintf(
+            altered,
+            sizeof(altered),
+            R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-scope","scope":"orders:write"})",
+            static_cast<long long>(now),
+            static_cast<long long>(now + 600));
+        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        const Str bad_scope =
+            first.sign(header, {altered, static_cast<u32>(length)}, bad_scope_bytes);
+        length = snprintf(
+            altered,
+            sizeof(altered),
+            R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-iat","scope":"orders:read"})",
+            static_cast<long long>(now + 301),
+            static_cast<long long>(now + 600));
+        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        const Str bad_iat = first.sign(header, {altered, static_cast<u32>(length)}, bad_iat_bytes);
+        length = snprintf(
+            altered,
+            sizeof(altered),
+            R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"","scope":"orders:read"})",
+            static_cast<long long>(now),
+            static_cast<long long>(now + 600));
+        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        const Str bad_jti = first.sign(header, {altered, static_cast<u32>(length)}, bad_jti_bytes);
+        const Str bad_kid = first.sign(Fixture::unapproved_access_header, claims, bad_kid_bytes);
+        const Str bad_type = first.sign(Fixture::wrong_type_access_header, claims, bad_type_bytes);
+        if (!bad_client.len || !bad_scope.len || !bad_iat.len || !bad_jti.len || !bad_kid.len ||
+            !bad_type.len)
+            return 2;
+        printf(
+            ",\"badClient\":\"%.*s\",\"badScope\":\"%.*s\",\"badIat\":\"%.*s\",\"badJti\":\"%.*s\","
+            "\"badKid\":\"%.*s\",\"badType\":\"%.*s\"",
+            bad_client.len,
+            bad_client.ptr,
+            bad_scope.len,
+            bad_scope.ptr,
+            bad_iat.len,
+            bad_iat.ptr,
+            bad_jti.len,
+            bad_jti.ptr,
+            bad_kid.len,
+            bad_kid.ptr,
+            bad_type.len,
+            bad_type.ptr);
+    }
+    puts("}");
     return 0;
 }
 
@@ -303,6 +379,14 @@ int main(int argc, char** argv) {
         return print_remote_fixture<test::Rs256Fixture>(true);
     if (argc == 2 && strcmp(argv[1], "--fixture-es256-discovery") == 0)
         return print_remote_fixture<test::Es256Fixture>(true);
+    if (argc == 2 && strcmp(argv[1], "--fixture-access") == 0)
+        return print_remote_fixture<test::Rs256Fixture>(false, true);
+    if (argc == 2 && strcmp(argv[1], "--fixture-es256-access") == 0)
+        return print_remote_fixture<test::Es256Fixture>(false, true);
+    if (argc == 2 && strcmp(argv[1], "--fixture-access-discovery") == 0)
+        return print_remote_fixture<test::Rs256Fixture>(true, true);
+    if (argc == 2 && strcmp(argv[1], "--fixture-es256-access-discovery") == 0)
+        return print_remote_fixture<test::Es256Fixture>(true, true);
     return rut::test::run_all(argc, argv);
 }
 
