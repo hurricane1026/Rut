@@ -1,0 +1,19 @@
+// Remote JWKS ES256 access-token resource profile.
+// JWT_ACCESS_ES256_POLICY is trusted compile/load-time configuration with
+// requiredType="at+jwt" and the bounded remoteJwks fields documented in
+// docs/jwt-access-profile.md. Approved kids must already be listed in kids/JWKS.
+import "middleware/jwt_access.rut"
+
+listen :8080
+
+route GET "/read" {
+    let document = jwt_access.requireEs256(req.authorization.or(""),
+        env("JWT_ACCESS_ES256_POLICY"), 300, 3600)
+    let client = jwt_access.requireClient(document, env("JWT_ACCESS_CLIENT_ID"))
+    let scoped = jwt_access.requireScope(client, env("JWT_ACCESS_REQUIRED_SCOPE"))
+    guard let subjectValue = json.get(scoped, "/sub") else { return 401 }
+    let subject = json.string(subjectValue).or("")
+    return response(200, body: subject)
+}
+
+route "/" { return 404 }

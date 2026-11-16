@@ -18,7 +18,7 @@ whether a competing open-source edition includes them.
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, broader DNS/discovery/JWKS refresh profiles, live and durable token revocation; arbitrary claims and non-HS256 signing |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, A-only DNS and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS transports beyond the bounded A-only profile, CNAME/IPv6 discovery, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Administrative membership management and larger policy sets; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -72,9 +72,10 @@ The 2026-10-27 audit separates these layers:
   slots (Bearer/Basic for each of two Consumers), rejects ambiguous ownership,
   and returns metadata from the matched configuration. This is a static bounded
   policy, not a persistent Consumer registry or a claim of plugin equivalence.
-- RS256/JWK/JWKS now has a trusted static Rut policy surface, configuration-owned
-  keys and shard-local activation. Public-key parsing stays off the request path.
-  Remote discovery/refresh and live token revocation remain outstanding.
+- RS256/ES256 JWK/JWKS policies support bounded authenticated refresh, optional
+  trusted A-only DNS and exact issuer/JWKS-URI discovery. The remote access-token
+  integration composes that cache with strict `at+jwt` claims, client and scope
+  checks. Live and durable token revocation remain outstanding.
 - Anonymous access needs a presence distinction: singleton Authorization reads
   return nil for both absence and duplicates. Falling back on nil would turn
   malformed duplicate credentials into anonymous access. No anonymous helper is
@@ -313,8 +314,8 @@ route authorization and original reads after removal.
 
 The audit retains these separate outstanding gates:
 
-- Remote JWKS discovery/refresh and token-level revocation remain separate from
-  the implemented configuration-owned RS256 integration.
+- Token-level live/durable revocation remains separate from the configuration-owned
+  RS256/ES256 verifier and bounded remote access-token profile.
 - Forward-auth/OPA/introspection need reusable bounded response-consuming callouts
   with both-backend failure/cancel/close and buffer-lifetime evidence.
 - OAuth/OIDC login, replay prevention and dynamic identity lifecycle require

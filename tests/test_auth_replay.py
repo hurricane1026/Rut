@@ -298,7 +298,8 @@ def main():
                         assert exchange(port,mode)==(204 if mode in ('aof-replicas','aof-fragmented') else 503),mode
                     with store.lock: store.mode='normal'
                     for name in uncertain:
-                        assert exchange(port,name)==409,name
+                        actual = exchange(port,name)
+                        assert actual==409,(name,actual)
                     with store.lock: store.mode='aof-held'
                     with ThreadPoolExecutor(max_workers=1) as pool:
                         pending=pool.submit(exchange,port,'barrier-held')
