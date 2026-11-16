@@ -42,10 +42,11 @@ struct GeneratedSecret {
 #else
         if (getentropy(random, sizeof(random)) != 0) return false;
 #endif
-        constexpr char digits[] = "0123456789abcdef";
+        constexpr char kDigits[] = "0123456789abcdef";
         for (u32 i = 0; i < sizeof(random); ++i) {
-            hex[i * 2] = digits[random[i] >> 4];
-            hex[i * 2 + 1] = digits[random[i] & 0x0f];
+            const size_t kOffset = static_cast<size_t>(i) * 2;
+            hex[kOffset] = kDigits[random[i] >> 4];
+            hex[kOffset + 1] = kDigits[random[i] & 0x0f];
         }
         return true;
     }
