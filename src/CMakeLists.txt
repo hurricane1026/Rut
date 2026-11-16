@@ -314,6 +314,9 @@ add_library(rut_regex_capture STATIC runtime/regex_capture.cc)
 target_include_directories(rut_regex_capture PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(rut_regex_capture PUBLIC rut_runtime PRIVATE re2::re2)
 target_compile_definitions(rut_regex_capture PRIVATE _GLIBCXX_NO_ASSERTIONS)
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(rut_regex_capture PRIVATE -include cstdlib)
+endif()
 target_link_libraries(rut_compiler PUBLIC rut_regex_capture)
 
 

@@ -46,6 +46,11 @@ target_compile_features(re2 PUBLIC cxx_std_20)
 target_include_directories(re2 PUBLIC "${rut_re2_SOURCE_DIR}")
 target_compile_options(re2 PRIVATE -fno-exceptions -fno-rtti)
 target_compile_definitions(re2 PRIVATE _GLIBCXX_NO_ASSERTIONS)
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Containa's btree_map.hpp uses std::abort without including <cstdlib>.
+    # libc++ does not expose it through the C header <stdlib.h>.
+    target_compile_options(re2 PRIVATE -include cstdlib)
+endif()
 target_link_libraries(re2 PUBLIC Threads::Threads)
 # Keep the fork's global allocator/guard definitions out of C++-linked tools.
 if(RUT_ENABLE_JIT AND NOT RUT_SANITIZE)
