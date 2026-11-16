@@ -19649,6 +19649,39 @@ TEST(frontend, direct_guard_fallback_forward_keeps_route_scope) {
     CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_term.kind),
              static_cast<u8>(HirTerminatorKind::ForwardUpstream));
 }
+TEST(frontend, guard_fallback_forward_materializes_scoped_target_local) {
+    const char* src =
+        "upstream b\n"
+        "route GET \"/\" { guard req.isTls else { let target = \"/fallback\" return "
+        "forward(b, load_balance: .roundRobin, set_path: target) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    auto* set_path = find_first_op(rir.module.functions[0], rir::Opcode::ReqSetPath);
+    REQUIRE(set_path);
+    CHECK_EQ(set_path->operand_count, 1u);
+    CHECK(find_first_op(rir.module.functions[0], rir::Opcode::RetForward) != nullptr);
+    bool found_fallback_target = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op == rir::Opcode::ConstStr && inst.imm.str_val.eq(lit("/fallback")))
+                found_fallback_target = true;
+        }
+    }
+    CHECK(found_fallback_target);
+    rir.destroy();
+}
 TEST(frontend, lower_rejects_out_of_range_request_property_selector) {
     const char* src =
         "route GET \"/users\" { guard let path = req.normalizedPath else { return 400 } return 200 "
