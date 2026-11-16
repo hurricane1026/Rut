@@ -1,0 +1,23 @@
+// Bounded RFC 9068-inspired RS256 resource profile. The trusted policy pins
+// issuer, audience, approved keys and one exact requiredType spelling.
+import "middleware/jwt_access.rut"
+
+listen :8080
+
+route GET "/access" {
+    let document = jwt_access.requireRs256(req.authorization.or(""),
+        env("JWT_ACCESS_RS256_POLICY"), 300, 3600)
+    return 204
+}
+
+route GET "/read" {
+    let document = jwt_access.requireRs256(req.authorization.or(""),
+        env("JWT_ACCESS_RS256_POLICY"), 300, 3600)
+    let client = jwt_access.requireClient(document, env("JWT_ACCESS_CLIENT_ID"))
+    let scoped = jwt_access.requireScope(client, env("JWT_ACCESS_REQUIRED_SCOPE"))
+    guard let subjectValue = json.get(scoped, "/sub") else { return 401 }
+    let subject = json.string(subjectValue).or("")
+    return response(200, body: subject)
+}
+
+route "/" { return 404 }

@@ -1,0 +1,80 @@
+# Bounded OAuth JWT access-token resource profile
+
+[`examples/middleware/jwt_access.rut`](../examples/middleware/jwt_access.rut)
+composes the existing static RS256 verifier with a strict resource-server claims
+profile. The
+[runnable example](../examples/jwt-access-auth.rut) accepts the supported RFC
+9068 protected-header type spellings and returns only the verified subject after
+client and scope authorization.
+
+This is an RFC 9068-inspired bounded profile, not full RFC 9068 conformance. It
+adds no token endpoint, OAuth/OIDC login, authorization-server issuance,
+introspection, refresh, or online revocation service. It uses existing RS256,
+claims-lifetime, scope and revocation-snapshot code without new runtime,
+compiler or crypto changes.
+
+## Trusted RS256 policy and header type
+
+`jwt_access.requireRs256(authorization, policy, maxAge, maxLifetime)` takes the
+existing trusted compile/load-time RS256 policy shape: exact issuer and
+resource audience, approved `kids`, and public `jwks`. The policy must include
+`requiredType` as exactly one of `at+jwt` or `application/at+jwt`, the two
+protected-header values described by [RFC 9068 sections 2.1, 2.2 and 4](https://www.rfc-editor.org/rfc/rfc9068.html). These are
+separate accepted configuration spellings; the verifier pins the signed JOSE
+protected-header `typ` to the configured value exactly. There is no aliasing,
+case folding or media-type normalization. A payload `typ`, `cty`, HTTP header or
+query value cannot replace the protected-header type. Duplicate Authorization
+fields fail closed when the caller passes `req.authorization.or("")`.
+
+Invalid positive-age/lifetime settings, or an otherwise valid RS256 policy
+with a missing/unsupported `requiredType`, return 503 before token verification.
+A structurally invalid RS256 policy (for example, malformed required fields or
+a non-string `requiredType`) can instead fail during compilation/loading,
+before a listener starts. A
+signature, algorithm, approved-kid, issuer, audience, expiry, optional time,
+revocation, header-type or Authorization failure returns a Bearer
+`invalid_token` 401. `Crypto.jwtRs256` owns cryptographic verification and
+key-policy activation. The wrapper parses trusted policy metadata to enforce
+the profile; it does not build or modify the key policy.
+
+## Required claims and lifetime
+
+After RS256 verification, `requireRs256` requires:
+
+- the verifier's existing nonempty `sub`, exact issuer and audience, integer
+  unexpired `exp`, and valid optional `nbf`/`iat` rules;
+- a nonempty string `client_id` of at most 1024 decoded UTF-8 bytes;
+- a nonempty string `jti` of at most 128 decoded UTF-8 bytes; and
+- mandatory positive integer `iat`, `iat <= now < exp`, with caller-configured
+  positive `maxAge` and `maxLifetime` bounds through
+  `jwtClaimsValidWithLifetime`.
+
+Malformed, missing, oversized, fractional, future or stale required claims fail
+with the same Bearer `invalid_token` 401. Existing configured `revokedJtis` and
+`issuedAfter` policy remains active. This does not add replay tracking or live
+revocation.
+
+## Client and scope authorization
+
+`jwt_access.requireClient(document, clientId)` compares the signed `client_id`
+exactly and case-sensitively to the trusted configured client. Empty or
+oversized client configuration returns 503; a valid token for another client
+returns 403. The signed client identifier does not replace `sub`.
+
+`jwt_access.requireScope(document, scope)` accepts one trusted scope token of at
+most 128 bytes and uses the existing complete `jwtHasScope` validator. Empty,
+malformed or oversized configured scope returns 503. Missing, malformed or
+nonmatching signed scope returns 403 with Bearer `insufficient_scope`. The
+example does not read client, scope or subject identity from request fields. JSON values have no
+compiler-enforced verification provenance: pass only the document returned by
+`requireRs256`, never arbitrary parsed JSON.
+
+## Tests and limits
+
+The native integration fixture signs tokens with the public RFC 7515 Appendix
+A.2 RSA test key and makes no provider calls. It tests each supported
+`requiredType` in a separate policy snapshot, then loads through `rut` and
+removes source/module files before requests. The matrix covers both backends at
+O0/O2 and HTTP/1.0, HTTP/1.1 and HTTP/2. It verifies the claims contract and
+existing configured revocation behavior; it is not a live authorization-server
+conformance test.

@@ -45,7 +45,8 @@ def main():
         nonlocal status_seen
         path_text = str(path)
         if path_text.startswith('/proc/') and path_text.endswith('/children'):
-            return FAKE_PID
+            child_ids = original_read_text(path, *read_args, **read_kwargs).split()
+            return ' '.join((*child_ids, FAKE_PID))
         if path_text == f'/proc/{FAKE_PID}/status':
             status_seen = True
             raise ProcessLookupError(3, 'No such process', path_text)
@@ -63,7 +64,10 @@ def main():
         nonlocal permission_seen
         path_text = str(path)
         if path_text.startswith('/proc/') and path_text.endswith('/children'):
-            return FAKE_PID
+            child_ids = original_read_text(path, *read_args, **read_kwargs).split()
+            if child_ids:
+                return ' '.join((*child_ids, FAKE_PID))
+            return ''
         if path_text == f'/proc/{FAKE_PID}/status':
             permission_seen = True
             raise PermissionError(13, 'Permission denied', path_text)

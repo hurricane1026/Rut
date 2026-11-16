@@ -1615,15 +1615,34 @@ void h1_websocket_h2_case(rut::test::TestCase* _tc,
                 CHECK(client.eof);
 #if RUT_GRPC_JIT || RUT_GRPC_NATIVE
                 if (inspect && (!tls || WebSocketWireProgram::kNative)) {
-                    H1WebSocketClient observer;
-                    CHECK(observer.init(get_port(lfd), tls));
                     static constexpr char kClosed[] =
                         "GET /closed HTTP/1.1\r\nHost: ws.test\r\nConnection: close\r\n\r\n";
-                    CHECK(observer.send_bytes(reinterpret_cast<const u8*>(kClosed),
-                                              sizeof(kClosed) - 1));
-                    ParsedResponse observed{};
-                    CHECK(observer.header(&observed));
-                    CHECK_EQ(observed.status_code, 204u);
+                    u32 observed_status = 0u;
+                    bool closed_callback_observed = false;
+                    const u64 close_callback_deadline = monotonic_us() + 1000000u;
+                    do {
+                        H1WebSocketClient observer;
+                        const bool observer_connected = observer.init(get_port(lfd), tls);
+                        CHECK(observer_connected);
+                        if (!observer_connected) break;
+                        const bool request_sent = observer.send_bytes(
+                            reinterpret_cast<const u8*>(kClosed), sizeof(kClosed) - 1);
+                        CHECK(request_sent);
+                        if (!request_sent) break;
+                        ParsedResponse observed{};
+                        const bool response_received = observer.header(&observed);
+                        CHECK(response_received);
+                        if (!response_received) break;
+                        observed_status = observed.status_code;
+                        if (observed_status == 204u) {
+                            closed_callback_observed = true;
+                            break;
+                        }
+                        if (observed_status != 500u) break;
+                        usleep(1000);
+                    } while (monotonic_us() < close_callback_deadline);
+                    CHECK(closed_callback_observed);
+                    CHECK_EQ(observed_status, 204u);
                 }
 #endif
                 // The first stream's FIN/Close must not cancel its sibling.
