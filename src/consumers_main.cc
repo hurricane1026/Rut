@@ -11,6 +11,8 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/random.h>
+#elif defined(__APPLE__)
+#include <sys/random.h>
 #endif
 
 namespace {
