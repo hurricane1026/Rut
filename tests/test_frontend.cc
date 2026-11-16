@@ -11820,6 +11820,33 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
 }
 
+TEST(frontend, analyze_wait_any_simple_arms_keep_route_scope_for_forward_target) {
+    const char* src =
+        "upstream api\n"
+        "route GET \"/x\" { let target = req.pathOnly wait any { "
+        "downstream.recv() => { return forward(api, load_balance: .roundRobin, set_path: "
+        "req.pathOnly) } timer(250) => { return forward(api, load_balance: .roundRobin, "
+        "set_path: target) } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    CHECK_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.then_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK_EQ(route.control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK(route.control.then_term.forward_path_expr_index < route.exprs.len);
+    CHECK(route.control.else_term.forward_path_expr_index < route.exprs.len);
+    const auto& target = route.exprs[route.control.then_term.forward_path_expr_index];
+    CHECK_EQ(target.kind, HirExprKind::LocalRef);
+    CHECK_EQ(target.local_index, 0u);
+    const auto& else_target = route.exprs[route.control.else_term.forward_path_expr_index];
+    CHECK_EQ(else_target.kind, HirExprKind::ReqPathOnly);
+}
+
 TEST(frontend, analyze_wait_any_arm_result_binding_is_arm_local) {
     const char* src =
         "route GET \"/x\" { wait any { "
