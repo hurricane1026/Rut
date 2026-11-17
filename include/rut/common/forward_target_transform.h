@@ -1,6 +1,8 @@
 #pragma once
 
+#include "rut/common/forward_target.h"
 #include "rut/common/types.h"
+#include "rut/common/uri_normalize.h"
 
 namespace rut {
 
@@ -12,9 +14,12 @@ static constexpr u32 kMaxForwardTargetTransformPrefixLen = 128;
 static constexpr u32 kForwardTargetTransformBytes = 2048;
 static constexpr u16 kInvalidForwardTargetTransformId = 0xffffu;
 
+enum class ForwardTargetTransformMode : u8 { CleanPrefix, RawPrefix, NormalizedPrefix };
+
 struct ForwardTargetTransformSpec {
     Str strip_prefix{};
     Str replace_prefix{};
+    ForwardTargetTransformMode mode = ForwardTargetTransformMode::CleanPrefix;
 };
 
 inline bool forward_target_transform_clean_prefix(Str value) {
@@ -67,6 +72,28 @@ inline bool forward_target_transform_replacement_prefix(Str value) {
 }
 
 inline bool forward_target_transform_spec_valid(const ForwardTargetTransformSpec& spec) {
+    if (spec.mode != ForwardTargetTransformMode::CleanPrefix) {
+        if (spec.mode != ForwardTargetTransformMode::RawPrefix &&
+            spec.mode != ForwardTargetTransformMode::NormalizedPrefix)
+            return false;
+        if (spec.strip_prefix.len > kMaxForwardTargetTransformPrefixLen ||
+            spec.replace_prefix.len > kMaxForwardTargetTransformPrefixLen ||
+            !forward_target_valid(spec.strip_prefix) || !forward_target_valid(spec.replace_prefix))
+            return false;
+        for (u32 i = 0; i < spec.strip_prefix.len; i++)
+            if (spec.strip_prefix.ptr[i] == '?') return false;
+        if (spec.mode == ForwardTargetTransformMode::NormalizedPrefix) {
+            char normalized[kMaxForwardTargetTransformPrefixLen];
+            u32 length = 0;
+            const Str kValues[] = {spec.strip_prefix, spec.replace_prefix};
+            for (const Str kValue : kValues) {
+                if (!normalize_forward_target(kValue, normalized, sizeof(normalized), &length) ||
+                    !Str{normalized, length}.eq(kValue))
+                    return false;
+            }
+        }
+        return true;
+    }
     return forward_target_transform_clean_prefix(spec.strip_prefix) &&
            forward_target_transform_replacement_prefix(spec.replace_prefix);
 }
@@ -78,7 +105,8 @@ inline bool forward_target_transform_id_is_valid(u16 id, u32 count) {
 
 inline bool forward_target_transform_spec_equal(const ForwardTargetTransformSpec& a,
                                                 const ForwardTargetTransformSpec& b) {
-    return a.strip_prefix.eq(b.strip_prefix) && a.replace_prefix.eq(b.replace_prefix);
+    return a.mode == b.mode && a.strip_prefix.eq(b.strip_prefix) &&
+           a.replace_prefix.eq(b.replace_prefix);
 }
 
 // Validate a complete borrowed table before any owning container copies it.

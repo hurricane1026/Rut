@@ -308,6 +308,18 @@ target_include_directories(rut_compiler PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+# Capture syntax is validated even by the LLVM-free frontend.
+include(${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake)
+add_library(rut_regex_capture STATIC runtime/regex_capture.cc)
+target_include_directories(rut_regex_capture PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(rut_regex_capture PUBLIC rut_runtime PRIVATE re2::re2)
+target_compile_definitions(rut_regex_capture PRIVATE _GLIBCXX_NO_ASSERTIONS)
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_compile_options(rut_regex_capture PRIVATE -include cstdlib)
+endif()
+target_link_libraries(rut_compiler PUBLIC rut_regex_capture)
+
+
 if(RUT_ENABLE_JIT)
     # Vectorscan/Hyperscan regex backend. Build only the static library and disable
     # extra targets; Rut links it into rut_jit for regex compilation and scanning.
@@ -429,7 +441,8 @@ if(RUT_ENABLE_JIT)
     # A source/configuration fingerprint prevents mixing compiler and server builds.
     file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
-    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
+    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake"
+        "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake")
     list(SORT _RUT_NATIVE_ABI_FILES)
@@ -449,7 +462,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
         ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include)
-    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime)
+    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime rut_regex_capture)
 
     # JIT library — LLVM ORC JIT integration via C API.
     # Only this library links LLVM. rut_runtime stays LLVM-free so shard
@@ -589,7 +602,7 @@ if(RUT_STATIC_RUNTIME)
     target_link_options(rut-consumers PRIVATE -static)
 endif()
 
-# Keep the shipped server independent of the C++ standard/ABI runtime.
+# Keep first-party code and standalone tools independent of the C++ runtime.
 # LLVM tools and test executables keep their normal C++ link environment.
 # Sanitizer runtimes are development instrumentation with their own ABI needs.
 if(NOT RUT_SANITIZE)
@@ -620,6 +633,12 @@ endif()
 # Without compiler support, rut still builds and serves default routes.
 if(RUT_ENABLE_JIT)
     target_link_libraries(rut rut_native_loader)
+    # The unsanitized server has no C++ runtime, so provide RE2's allocation/
+    # guard ABI shim here. Sanitizer builds and compiler tools use their normal
+    # C++ runtime implementation.
+    if(NOT RUT_SANITIZE)
+        target_sources(rut PRIVATE $<TARGET_OBJECTS:rut_re2_runtime>)
+    endif()
     set_target_properties(rut PROPERTIES ENABLE_EXPORTS ON)
     if(APPLE)
         # Darwin's ENABLE_EXPORTS does not retain/export symbols pulled from

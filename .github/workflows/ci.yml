@@ -900,6 +900,9 @@ jobs:
           LLVM_PROFILE_FILE=build/test_remote_jwks_metadata.profraw ./build/tests/test_remote_jwks_metadata
           LLVM_PROFILE_FILE=build/test_jwt_rs256.profraw ./build/tests/test_jwt_rs256
           LLVM_PROFILE_FILE=build/test_public_key.profraw ./build/tests/test_public_key
+          LLVM_PROFILE_FILE=build/test_regex_capture.profraw ./build/tests/test_regex_capture
+          LLVM_PROFILE_FILE=build/test_target_transform.profraw ./build/tests/test_target_transform
+          LLVM_PROFILE_FILE=build/test_routing_properties.profraw ./build/tests/test_routing_properties
 
       - name: Generate coverage report
         run: |
@@ -963,7 +966,10 @@ jobs:
             build/tests/test_consumer_registry \
             build/tests/test_remote_jwks_metadata \
             build/tests/test_jwt_rs256 \
-            build/tests/test_public_key
+            build/tests/test_public_key \
+            build/tests/test_regex_capture \
+            build/tests/test_target_transform \
+            build/tests/test_routing_properties
 
   integer-parser:
     name: Integer parser (${{ matrix.arch }})

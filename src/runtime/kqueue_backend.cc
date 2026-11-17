@@ -481,6 +481,7 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
                 event = completion(id, type, -EACCES);
                 return true;
             }
+            tls_capture_server_name(ssl, conn.tls_server_name, conn.tls_server_name_length);
             conn.tls_handshake_complete = true;
             if (conn.h1_tls_transport) {
                 event = completion(id, type, 1);

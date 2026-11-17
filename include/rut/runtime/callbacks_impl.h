@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/forward_target.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -1303,8 +1304,12 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     RouteParam params[kMaxRouteParams]{};
     u32 param_count = 0;
     const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-    const RouteEntry* matched = config->match_canonical(
-        conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+    const RouteEntry* matched = config->match_canonical(conn.req_path_canon,
+                                                        method_key,
+                                                        params,
+                                                        &param_count,
+                                                        kMaxRouteParams,
+                                                        conn.routing_host());
     if (matched != &pinned) return false;
     ResponseReadDeadlineFixedUploadRequest request{};
     if (!inspect_response_read_deadline_fixed_upload_request(conn,
@@ -2924,7 +2929,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (conn.req_target_form_reject_before_pre_route) {
+    if (conn.req_target_form_reject_before_pre_route ||
+        (config != nullptr && config->host_scope_count != 0 &&
+         !conn.capture_routing_host(pre_req))) {
         loop->epoch_enter();
         if (loop->metrics) loop->metrics->on_request_start();
         conn.resp_status = 400;
@@ -3119,7 +3126,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                         request_method_key,
                                         route_params,
                                         &route_param_count,
-                                        kMaxRouteParams);
+                                        kMaxRouteParams,
+                                        conn.routing_host());
     }
 
     // Matched routes always win. Only a genuine miss consults the generic
@@ -3469,8 +3477,12 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     u32 route_param_count = 0;
     if (config) {
         const u8 kMethodKey = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-        route = config->match_canonical(
-            conn.req_path_canon, kMethodKey, route_params, &route_param_count, kMaxRouteParams);
+        route = config->match_canonical(conn.req_path_canon,
+                                        kMethodKey,
+                                        route_params,
+                                        &route_param_count,
+                                        kMaxRouteParams,
+                                        conn.routing_host());
     }
     if (!prepare_response_read_deadline_preflight(loop, conn, route, config)) return;
     if (!route || route->action != RouteAction::JitHandler || !route->fn) {
@@ -4588,6 +4600,10 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+            if (conn.req_path_overridden && !forward_target_valid(conn.req_path_override)) {
+                reject_request_policy(loop, conn);
+                return;
+            }
 #if RUT_ENABLE_WEBSOCKET
             if (selected_route != nullptr && selected_route->ws_terminate &&
                 (selected_route->action != RouteAction::JitHandler ||
@@ -4947,6 +4963,10 @@ void handle_jit_outcome(Loop* loop,
                     reject_request_policy(loop, conn);
                     return;
                 }
+                const bool general_target =
+                    config->target_transform_id_is_valid(conn.target_transform_id) &&
+                    config->target_transforms[conn.target_transform_id - 1].mode !=
+                        ForwardTargetTransformMode::CleanPrefix;
                 const u16 target_response_policy_id = forward_response_policy_id;
                 const u16 target_failure_policy_id = forward_failure_policy_id;
                 const u16 target_timeout_failure_policy_id = forward_timeout_failure_policy_id;
@@ -4983,7 +5003,7 @@ void handle_jit_outcome(Loop* loop,
                     // above admits ID4 like any other supported policy and
                     // would otherwise let this combination reach the
                     // upstream (Codex sweep-2 review, PR #696).
-                    request_policy_preserves_host(outcome.request_policy_id)) {
+                    (!general_target && request_policy_preserves_host(outcome.request_policy_id))) {
                     reject_response_policy(loop, conn);
                     return;
                 }
@@ -5013,19 +5033,20 @@ void handle_jit_outcome(Loop* loop,
                         config->response_policies[target_response_policy_id - 1].connection ==
                         ResponsePolicyConnection::Request;
                 }
-                if (target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
-                    conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
-                    conn.req_method == static_cast<u8>(LogHttpMethod::Head) || conn.tls_active ||
-                    conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
-                    conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
-                    conn.request_body_fully_buffered ||
-                    (target_response_policy_id != 0 && !response_policy_request_connection &&
-                     !conn.req_keep_alive) ||
-                    conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
-                    conn.resp_header_mutation_count != 0 ||
-                    conn.resp_header_mutation_pending_count != 0 ||
-                    conn.resp_header_mutation_pending_overflow ||
-                    conn.resp_header_mutation_overflow) {
+                if (!general_target &&
+                    (target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
+                     conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
+                     conn.req_method == static_cast<u8>(LogHttpMethod::Head) || conn.tls_active ||
+                     conn.req_path_canon.ptr == nullptr || conn.req_wants_upgrade ||
+                     conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
+                     conn.request_body_fully_buffered ||
+                     (target_response_policy_id != 0 && !response_policy_request_connection &&
+                      !conn.req_keep_alive) ||
+                     conn.req_header_override_count != 0 || conn.req_header_override_overflow ||
+                     conn.resp_header_mutation_count != 0 ||
+                     conn.resp_header_mutation_pending_count != 0 ||
+                     conn.resp_header_mutation_pending_overflow ||
+                     conn.resp_header_mutation_overflow)) {
                     reject_request_policy(loop, conn);
                     return;
                 }
@@ -5154,8 +5175,12 @@ void handle_jit_outcome(Loop* loop,
                 RouteParam params[kMaxRouteParams]{};
                 u32 param_count = 0;
                 const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-                const RouteEntry* selected = config->match_canonical(
-                    conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+                const RouteEntry* selected = config->match_canonical(conn.req_path_canon,
+                                                                     method_key,
+                                                                     params,
+                                                                     &param_count,
+                                                                     kMaxRouteParams,
+                                                                     conn.routing_host());
                 if (selected == nullptr || selected->fn != fn ||
                     !response_read_deadline_route_index(
                         *config, selected, &strict_pipeline_successor_route_index)) {
@@ -6472,7 +6497,8 @@ void resume_request_body_tls_overflow(Loop* loop, Connection& conn) {
 // recv_buf's length and req_initial_send_len are adjusted to match. No-ops on a
 // malformed request line or if the rewritten request would exceed the buffer.
 inline bool rewrite_request_line_path(Connection& conn) {
-    if (!conn.req_path_overridden || conn.req_path_override.ptr == nullptr) return true;
+    if (!conn.req_path_overridden) return true;
+    if (!forward_target_valid(conn.req_path_override)) return false;
     u8* buf = conn.recv_slice;
     const u32 total = conn.recv_buf.len();
     if (buf == nullptr || total == 0) return false;
@@ -6745,8 +6771,82 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
 // domain.  This deliberately runs before target selection, policy materializa-
 // tion, slot acquisition, idle reuse, and socket/connect side effects.  Every
 // validation and size check happens before the first recv_buf mutation.
+// Explicit general prefix modes share the ordinary request-line rewriter.
+// The legacy clean-prefix profile below retains its existing admission contract.
+inline bool materialize_general_target_transform(Connection& conn,
+                                                 const ForwardTargetTransformSpec& spec) {
+    if (!forward_target_transform_spec_valid(spec) || conn.req_path_overridden ||
+        conn.req_malformed || conn.req_header_override_overflow ||
+        conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count ||
+        conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
+        return false;
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.req_header_end || conn.req_initial_send_len < parser.header_end ||
+        conn.req_initial_send_len > conn.recv_buf.len() || !forward_target_valid(request.path))
+        return false;
+    auto& arena = conn.json_arena;
+    auto allocate = [&](u32 bytes) -> char* {
+        if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > 262144 - bytes)
+            return nullptr;
+        return static_cast<char*>(arena.alloc(bytes));
+    };
+    Str target = request.path;
+    if (spec.mode == ForwardTargetTransformMode::NormalizedPrefix) {
+        char* normalized = allocate(target.len);
+        u32 length = 0;
+        if (!normalized || !normalize_forward_target(target, normalized, target.len, &length))
+            return false;
+        target = {normalized, length};
+    }
+    u32 path_length = 0;
+    while (path_length < target.len && target.ptr[path_length] != '?') path_length++;
+    if (spec.strip_prefix.len > path_length ||
+        __builtin_memcmp(target.ptr, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
+        return false;
+    const u32 kTail = target.len - spec.strip_prefix.len;
+    const u32 kSize = spec.replace_prefix.len + kTail;
+    if (kSize > 8192) return false;
+    char* rewritten = allocate(kSize);
+    if (rewritten == nullptr) return false;
+    __builtin_memcpy(rewritten, spec.replace_prefix.ptr, spec.replace_prefix.len);
+    __builtin_memcpy(
+        rewritten + spec.replace_prefix.len, target.ptr + spec.strip_prefix.len, kTail);
+    u32 final_length = kSize;
+    if (spec.mode == ForwardTargetTransformMode::NormalizedPrefix &&
+        !normalize_forward_target({rewritten, kSize}, rewritten, kSize, &final_length))
+        return false;
+    if (!forward_target_valid({rewritten, final_length})) return false;
+    const i64 kFinalBytes = static_cast<i64>(conn.recv_buf.len()) + final_length - request.path.len;
+    if (kFinalBytes < 0 || static_cast<u64>(kFinalBytes) > conn.recv_buf.capacity()) return false;
+    // H2 has already stabilized response values before constructing its synth;
+    // its send_buf contains protocol frames and must not be used as H1 scratch.
+    if (conn.protocol != ConnProtocol::Http2 &&
+        !snapshot_response_mutations_before_request_rewrite(conn))
+        return false;
+    conn.req_path_override = {rewritten, final_length};
+    conn.req_path_overridden = true;
+    const bool kRewritten = rewrite_request_line_path(conn);
+    conn.req_path_override = {};
+    conn.req_path_overridden = false;
+    if (!kRewritten) return false;
+    if (conn.response_mutations_snapshotted) conn.retry_req_snapshot_replayable = false;
+    conn.target_transform_recorded = false;
+    conn.target_transform_id = 0;
+    return true;
+}
+
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config) {
     if (!conn.target_transform_recorded) return true;
+    if (config.target_transform_id_is_valid(conn.target_transform_id) &&
+        config.target_transforms[conn.target_transform_id - 1].mode !=
+            ForwardTargetTransformMode::CleanPrefix)
+        return materialize_general_target_transform(
+            conn, config.target_transforms[conn.target_transform_id - 1]);
     if (!config.target_transform_id_is_valid(conn.target_transform_id) ||
         conn.protocol == ConnProtocol::Http2 || conn.tls_active || conn.req_path_overridden ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
@@ -13123,8 +13223,12 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
         RouteParam params[kMaxRouteParams]{};
         u32 param_count = 0;
         const u8 method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
-        const RouteEntry* route = config->match_canonical(
-            conn.req_path_canon, method_key, params, &param_count, kMaxRouteParams);
+        const RouteEntry* route = config->match_canonical(conn.req_path_canon,
+                                                          method_key,
+                                                          params,
+                                                          &param_count,
+                                                          kMaxRouteParams,
+                                                          conn.routing_host());
         const bool pipeline_generation_stable =
             http1_pipeline_request_generation_preconnect_is_stable(
                 conn,

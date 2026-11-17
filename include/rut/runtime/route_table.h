@@ -8,6 +8,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
+#include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
@@ -17,6 +18,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/http_cache.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/rate_limit_key.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_canon.h"   // canonicalize_request
@@ -125,6 +127,9 @@ struct UpstreamTarget {
 struct RouteEntry {
     static constexpr u32 kMaxPathLen = 128;
 
+    char host[254]{};
+    u16 host_len = 0;
+
     // Match criteria
     char path[kMaxPathLen];  // path prefix (e.g., "/api/v1/")
     u32 path_len;
@@ -137,6 +142,7 @@ struct RouteEntry {
     jit::HandlerFn fn = nullptr;    // JIT-compiled handler (if action == JitHandler)
     u8 needs_password_gateway = 0;  // serialized native feature requirement (0/1)
     bool needs_req_body = false;    // JIT handler reads req.body and needs the full body buffered
+    bool h2_buffer_forward_body = false;  // explicit owned/general target profiles only
     // Per-route rate limit (fixed window). Empty rule set = unlimited. Each rule
     // allows `max` requests per `window_sec` metered by its own key (IP / header
     // / query / cookie / param tuple; empty key = per-client-IP). A request must
@@ -221,6 +227,10 @@ inline u64 rate_limit_route_id(const RouteEntry& route) {
     hash = rate_limit_id_mix(hash, &route.method, sizeof(route.method));
     hash = rate_limit_id_mix_u32(hash, route.path_len);
     hash = rate_limit_id_mix(hash, route.path, route.path_len);
+    if (route.host_len != 0) {
+        hash = rate_limit_id_mix_u32(hash, route.host_len);
+        hash = rate_limit_id_mix(hash, route.host, route.host_len);
+    }
     return hash == 0 ? 1 : hash;
 }
 
@@ -359,7 +369,18 @@ struct RouteConfig {
     RouteConfig(const RouteConfig&) = delete;
     RouteConfig& operator=(const RouteConfig&) = delete;
 
+    static constexpr u32 kMaxHostScopes = 16;
+    struct HostScope {
+        char name[254]{};
+        u16 length = 0;
+        struct Art : ArtTrie {
+            Art() : ArtTrie(ArtMatchMode::SegmentPrefix) {}
+        };
+        MappedArray<Art> art;
+        MappedArray<RouteTrie> segments;
+    };
     RouteEntry routes[kMaxRoutes];
+    u32 host_scope_count = 0;
     u32 route_count = 0;
     u64 http_cache_identity = http_cache_config_identity();
     u32 http_cache_route_count = 0;
@@ -1492,6 +1513,30 @@ public:
     bool populate_dispatch_state(const RouteEntry& r) {
         const Str path_view{r.path, r.path_len};
         const u16 idx = static_cast<u16>(route_count);
+        if (r.host_len != 0) {
+            if (r.host_len > 253 || r.host[r.host_len] != '\0' ||
+                !route_host_pattern_valid({r.host, r.host_len}))
+                return false;
+            u32 scope = 0;
+            for (; scope < host_scope_count; scope++)
+                if (route_host_equal({host_scopes[scope].name, host_scopes[scope].length},
+                                     {r.host, r.host_len}))
+                    break;
+            if (scope == host_scope_count) {
+                if (scope == kMaxHostScopes) return false;
+                auto& created = host_scopes[scope];
+                if (dispatch_kind_ == DispatchKind::ArtJit ? !created.art.init(1)
+                                                           : !created.segments.init(1))
+                    return false;
+                __builtin_memcpy(created.name, r.host, r.host_len);
+                created.length = r.host_len;
+                host_scope_count++;
+            }
+            auto& state = host_scopes[scope];
+            return dispatch_kind_ == DispatchKind::ArtJit
+                       ? state.art[0].insert(path_view, r.method, idx)
+                       : state.segments[0].insert(path_view, r.method, idx);
+        }
         switch (dispatch_kind_) {
             case DispatchKind::ArtJit:
                 return art_state.insert(path_view, r.method, idx);
@@ -1966,7 +2011,8 @@ private:
                                   jit::HandlerFn fn,
                                   bool needs_req_body,
                                   ForwardPreflightMode forward_preflight_mode,
-                                  u16 preflight_forward_policy_bundle_id) {
+                                  u16 preflight_forward_policy_bundle_id,
+                                  Str host = {}) {
         if (route_count >= kMaxRoutes) return false;
         if (fn == nullptr) return false;
         if (!forward_preflight_mode_valid(forward_preflight_mode) ||
@@ -2013,6 +2059,14 @@ private:
         r.upstream_id = 0;
         r.status_code = 0;
         r.fn = fn;
+        if (host.len != 0 && !route_host_pattern_valid(host)) return false;
+        r.host_len = static_cast<u16>(host.len);
+        if (host.len != 0 && host.ptr[0] == '[') {
+            if (!route_host_from_authority(host, r.host, &r.host_len)) return false;
+        } else {
+            for (u32 i = 0; i < host.len; i++) r.host[i] = route_host_lower(host.ptr[i]);
+            r.host[host.len] = '\0';
+        }
         r.needs_req_body = needs_req_body;
         r.needs_password_gateway = 0;
         r.forward_preflight_mode = forward_preflight_mode;
@@ -2034,7 +2088,8 @@ public:
                          jit::HandlerFn fn,
                          bool needs_req_body,
                          ForwardPreflightMode forward_preflight_mode,
-                         u16 preflight_forward_policy_bundle_id) {
+                         u16 preflight_forward_policy_bundle_id,
+                         Str host = {}) {
         if (!forward_preflight_metadata_is_eager_runtime_safe(forward_preflight_mode,
                                                               preflight_forward_policy_bundle_id))
             return false;
@@ -2043,7 +2098,8 @@ public:
                                         fn,
                                         needs_req_body,
                                         forward_preflight_mode,
-                                        preflight_forward_policy_bundle_id);
+                                        preflight_forward_policy_bundle_id,
+                                        host);
     }
 
     // Source-compatible legacy registration. A nonzero historical marker is
@@ -2484,6 +2540,7 @@ public:
         auto& dst = target_transforms[target_transform_count];
         copy(spec.strip_prefix, dst.strip_prefix);
         copy(spec.replace_prefix, dst.replace_prefix);
+        dst.mode = spec.mode;
         target_transform_count++;
         return static_cast<u16>(target_transform_count);
     }
@@ -3219,9 +3276,35 @@ public:
                                       u8 method,
                                       RouteParam* out_params,
                                       u32* out_param_count,
-                                      u32 out_param_cap) const {
+                                      u32 out_param_cap,
+                                      Str host = {}) const {
         if (out_param_count) *out_param_count = 0;
         if (canon.ptr == nullptr) return nullptr;
+        if (host_scope_count != 0 && host.len != 0) {
+            u32 winner = kMaxHostScopes;
+            u32 score = 0;
+            for (u32 i = 0; i < host_scope_count; i++) {
+                const auto& scope = host_scopes[i];
+                const u32 kScore = route_host_match_score({scope.name, scope.length}, host);
+                if (kScore <= score) continue;
+                const u16 kIndex = dispatch_kind_ == DispatchKind::ArtJit
+                                       ? scope.art[0].match_canonical_key(canon, method)
+                                       : scope.segments[0].match_key(canon, method);
+                if (kIndex < route_count) {
+                    winner = i;
+                    score = kScore;
+                }
+            }
+            if (winner != kMaxHostScopes) {
+                const auto& scope = host_scopes[winner];
+                const u16 kIndex =
+                    dispatch_kind_ == DispatchKind::ArtJit
+                        ? scope.art[0].match_canonical_key(canon, method)
+                        : scope.segments[0].match_key(
+                              canon, method, out_params, out_param_count, out_param_cap);
+                return kIndex < route_count ? &routes[kIndex] : nullptr;
+            }
+        }
         u16 idx;
         switch (dispatch_kind_) {
             case DispatchKind::ArtJit:
@@ -3277,6 +3360,16 @@ private:
     // ArtJit and install_art_jit_fn has been called). nullptr means
     // use scalar fallback.
     jit::ArtJitMatchFn art_jit_fn_ = nullptr;
+
+public:
+    // Owning cold indexes are deliberately last and excluded from compiler
+    // metadata rollback snapshots and native serialization. Metadata population
+    // never modifies them; route registration builds them afterward.
+    HostScope host_scopes[kMaxHostScopes];
+    u32 metadata_snapshot_size() const {
+        return static_cast<u32>(reinterpret_cast<const u8*>(&host_scopes) -
+                                reinterpret_cast<const u8*>(this));
+    }
 };
 
 inline bool route_requires_response_read_timeout_preflight_close(const RouteEntry* route,

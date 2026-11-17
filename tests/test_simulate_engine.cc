@@ -8,6 +8,7 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/route_table.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
@@ -326,6 +327,8 @@ static bool write_capture_file(i32 fd,
 
 }  // namespace
 
+static bool compile_to_rir(const char* src, FrontendRirModule& rir);
+
 TEST(simulate_engine, load_manifest_file) {
     char path[] = "/tmp/rut_sim_manifest_XXXXXX";
     i32 fd = mkstemp(path);
@@ -387,6 +390,174 @@ TEST(simulate_engine, static_status_match) {
 
     engine.shutdown();
     ctx.destroy();
+}
+
+TEST(simulate_engine, host_scopes_precede_path_match_and_fall_back_to_global) {
+    const char* src =
+        "@host(\"*.example\") route GET \"/x\" { return 201 }\n"
+        "@host(\"api.*\") route GET \"/x\" { return 202 }\n"
+        "@host(\"api.example\") route GET \"/x\" { return 203 }\n"
+        "route GET \"/x\" { return 204 }\n"
+        "@host(\"only.example\") route GET \"/scoped\" { return 205 }\n"
+        "route GET \"/only\" { return 206 }\n"
+        "@host(\"*.example.com\") route GET \"/scope-only\" { return 207 }\n"
+        "@host(\"api.example.*\") route GET \"/tie\" { return 208 }\n"
+        "@host(\"*.example.com\") route GET \"/tie\" { return 209 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    u32 scoped_routes = 0;
+    for (u32 i = 0; i < engine.route_count; i++) {
+        if (engine.routes[i].host_len == 0) continue;
+        scoped_routes++;
+        CHECK(engine.routes[i].host != rir.module.functions[i].route_host.ptr);
+    }
+    CHECK_EQ(scoped_routes, 7u);
+
+    RouteConfig production_config{};
+    for (u32 i = 0; i < engine.route_count; i++) {
+        const auto& route = engine.routes[i];
+        REQUIRE(production_config.add_jit_handler(route.pattern,
+                                                  route.method,
+                                                  route.fn,
+                                                  route.needs_req_body,
+                                                  ForwardPreflightMode::None,
+                                                  0,
+                                                  {route.host, route.host_len}));
+    }
+    const auto production_select = [&](const CaptureEntry& entry,
+                                       Str canonical_path) -> const RouteEntry* {
+        HttpParser parser;
+        ParsedRequest request;
+        parser.reset();
+        request.reset();
+        if (parser.parse(entry.raw_headers, entry.raw_header_len, &request) !=
+            ParseStatus::Complete)
+            return nullptr;
+        Connection connection;
+        connection.reset();
+        if (production_config.host_scope_count != 0 && !connection.capture_routing_host(request))
+            return nullptr;
+        return production_config.match_canonical(
+            canonical_path, kRouteMethodGet, nullptr, nullptr, 0, connection.routing_host());
+    };
+    const auto verify =
+        [&](const char* request, u16 status, const char* canonical_path, u32 expected_route_index) {
+            const CaptureEntry entry = make_entry(request, status);
+            const SimulateResult result = simulate_one(engine, entry);
+            CHECK_EQ(result.verdict, Verdict::Match);
+            CHECK_EQ(result.actual_status, status);
+            const u32 path_len = static_cast<u32>(strlen(canonical_path));
+            const RouteEntry* selected = production_select(entry, {canonical_path, path_len});
+            REQUIRE(selected != nullptr);
+            CHECK(selected == &production_config.routes[expected_route_index]);
+        };
+
+    verify("GET /x HTTP/1.1\r\nHost: API.EXAMPLE:8080\r\n\r\n", 203, "x", 2);
+    verify("GET /x HTTP/1.1\r\nHost: shop.example\r\n\r\n", 201, "x", 0);
+    verify("GET /x HTTP/1.1\r\nHost: api.other\r\n\r\n", 202, "x", 1);
+    verify("GET /x HTTP/1.1\r\nHost: unknown.test\r\n\r\n", 204, "x", 3);
+    verify("GET /only HTTP/1.1\r\nHost: only.example\r\n\r\n", 206, "only", 5);
+    verify("GET /x HTTP/1.1\r\n\r\n", 204, "x", 3);
+    verify("GET /tie HTTP/1.1\r\nHost: api.example.com\r\n\r\n", 209, "tie", 8);
+
+    const CaptureEntry duplicate_host =
+        make_entry("GET /x HTTP/1.1\r\nHost: api.example\r\nHost: unknown.test\r\n\r\n", 400);
+    const SimulateResult duplicate_result = simulate_one(engine, duplicate_host);
+    CHECK_EQ(duplicate_result.verdict, Verdict::Match);
+    CHECK_EQ(duplicate_result.actual_status, 400u);
+    CHECK(production_select(duplicate_host, {"x", 1}) == nullptr);
+    HttpParser duplicate_parser;
+    ParsedRequest duplicate_request;
+    duplicate_parser.reset();
+    duplicate_request.reset();
+    REQUIRE(duplicate_parser.parse(duplicate_host.raw_headers,
+                                   duplicate_host.raw_header_len,
+                                   &duplicate_request) == ParseStatus::Complete);
+    Connection duplicate_connection;
+    duplicate_connection.reset();
+    CHECK_FALSE(duplicate_connection.capture_routing_host(duplicate_request));
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, captured_peer_port_is_visible_to_route_handlers) {
+    const char* src =
+        "route GET \"/port\" { guard req.remotePort == 12345 else { return 500 } return 201 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    CaptureEntry entry = make_entry("GET /port HTTP/1.1\r\nHost: x\r\n\r\n", 201);
+    entry.peer_port = 12345;
+    const SimulateResult with_port = simulate_one(engine, entry);
+    CHECK_EQ(with_port.verdict, Verdict::Match);
+    CHECK_EQ(with_port.actual_status, 201u);
+
+    entry.peer_port = 0;
+    entry.resp_status = 500;
+    const SimulateResult legacy_port = simulate_one(engine, entry);
+    CHECK_EQ(legacy_port.verdict, Verdict::Match);
+    CHECK_EQ(legacy_port.actual_status, 500u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported) {
+    const char* src =
+        "route GET \"/local\" { guard req.localPort == 8443 else { return 400 } return 201 }\n"
+        "route GET \"/tls\" { if req.isTls { return 201 } else { return 202 } }\n"
+        "route GET \"/sni\" { guard let name = req.sni else { return 400 } return 201 }\n"
+        "route GET \"/cert\" { guard let cert = req.tlsClientCertSha256 else { return 400 } return "
+        "201 }\n"
+        "route GET \"/remote\" { guard req.remotePort == 12345 else { return 400 } return 201 }\n"
+        "route GET \"/path\" { guard let path = req.normalizedPath else { return 400 } return 201 "
+        "}\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    REQUIRE_EQ(engine.route_count, 6u);
+    for (u32 i = 0; i < 4; i++) CHECK(engine.routes[i].needs_uncaptured_transport_metadata);
+    CHECK_FALSE(engine.routes[4].needs_uncaptured_transport_metadata);
+    CHECK_FALSE(engine.routes[5].needs_uncaptured_transport_metadata);
+
+    const auto check_unsupported = [&](const char* path) {
+        char request[96];
+        const u32 path_len = static_cast<u32>(strlen(path));
+        const char prefix[] = "GET ";
+        __builtin_memcpy(request, prefix, sizeof(prefix) - 1);
+        __builtin_memcpy(request + sizeof(prefix) - 1, path, path_len);
+        const char suffix[] = " HTTP/1.1\r\nHost: x\r\n\r\n";
+        const u32 request_len = static_cast<u32>(sizeof(prefix) - 1) + path_len;
+        __builtin_memcpy(request + request_len, suffix, sizeof(suffix));
+        const SimulateResult result = simulate_one(engine, make_entry(request, 201));
+        CHECK_EQ(result.verdict, Verdict::Unsupported);
+        CHECK_EQ(result.actual_status, 0u);
+    };
+    check_unsupported("/local");
+    check_unsupported("/tls");
+    check_unsupported("/sni");
+    check_unsupported("/cert");
+
+    CaptureEntry remote = make_entry("GET /remote HTTP/1.1\r\nHost: x\r\n\r\n", 201);
+    remote.peer_port = 12345;
+    const SimulateResult remote_result = simulate_one(engine, remote);
+    CHECK_EQ(remote_result.verdict, Verdict::Match);
+    CHECK_EQ(remote_result.actual_status, 201u);
+    const SimulateResult path_result =
+        simulate_one(engine, make_entry("GET /path HTTP/1.1\r\nHost: x\r\n\r\n", 201));
+    CHECK_EQ(path_result.verdict, Verdict::Match);
+    CHECK_EQ(path_result.actual_status, 201u);
+
+    engine.shutdown();
+    rir.destroy();
 }
 
 // Helper: compile a .rut source to an RIR module owned by `rir`.

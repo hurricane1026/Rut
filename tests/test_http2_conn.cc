@@ -1051,6 +1051,83 @@ TEST(h2_request, basic_get_maps_method_path_authority) {
     CHECK(req_has_header(req, "accept", "*/*"));
 }
 
+TEST(h2_request, authority_overrides_redundant_host_field) {
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}},
+                          {{":scheme", 7}, {"https", 5}},
+                          {{":authority", 10}, {"example.com", 11}},
+                          {{":path", 5}, {"/", 1}},
+                          {{"host", 4}, {"legacy.example", 14}}};
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 5, &req));
+    REQUIRE_EQ(req.header_count, 1u);
+    CHECK(req.headers[0].name.eq(Str{"host", 4}));
+    CHECK(req.headers[0].value.eq(Str{"example.com", 11}));
+}
+
+TEST(h2_request, authority_drives_host_scoped_route_selection) {
+    RouteConfig config;
+    auto* handler = reinterpret_cast<jit::HandlerFn>(static_cast<uintptr_t>(1));
+    REQUIRE(config.add_jit_handler(
+        "/scope", 'G', handler, false, ForwardPreflightMode::None, 0, Str{"authority.test", 14}));
+    REQUIRE(config.add_static("/scope", 'G', 204));
+
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}},
+                          {{":scheme", 7}, {"https", 5}},
+                          {{":authority", 10}, {"authority.test", 14}},
+                          {{":path", 5}, {"/scope", 6}},
+                          {{"host", 4}, {"other.test", 10}}};
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, 5, &req));
+    Connection conn;
+    conn.reset();
+    REQUIRE(conn.capture_routing_host(req));
+    CHECK(conn.routing_host().eq(Str{"authority.test", 14}));
+    const RouteEntry* match = config.match_canonical(req.path_canon,
+                                                     route_method_key_from_legacy_char('G'),
+                                                     nullptr,
+                                                     nullptr,
+                                                     0,
+                                                     conn.routing_host());
+    CHECK(match == &config.routes[0]);
+
+    hs[4].value = {"authority.test", 14};
+    REQUIRE(h2_headers_to_request(hs, 5, &req));
+    REQUIRE(conn.capture_routing_host(req));
+    CHECK(conn.routing_host().eq(Str{"authority.test", 14}));
+    match = config.match_canonical(req.path_canon,
+                                   route_method_key_from_legacy_char('G'),
+                                   nullptr,
+                                   nullptr,
+                                   0,
+                                   conn.routing_host());
+    CHECK(match == &config.routes[0]);
+}
+
+TEST(h2_request, ignored_host_does_not_consume_request_header_capacity) {
+    hpack::Header hs[kMaxHeaders + 4];
+    u32 n = 0;
+    hs[n++] = {{":method", 7}, {"GET", 3}};
+    hs[n++] = {{":scheme", 7}, {"https", 5}};
+    hs[n++] = {{":authority", 10}, {"authority.test", 14}};
+    hs[n++] = {{":path", 5}, {"/", 1}};
+    for (u32 i = 0; i < kMaxHeaders - 1; i++) hs[n++] = {{"x", 1}, {"v", 1}};
+    hs[n++] = {{"host", 4}, {"other.test", 10}};
+    ParsedRequest req;
+    REQUIRE(h2_headers_to_request(hs, n, &req));
+    CHECK_EQ(req.header_count, kMaxHeaders);
+}
+
+TEST(h2_request, grpc_forwarding_does_not_buffer_for_target_rewrite) {
+    RouteEntry route{};
+    route.h2_buffer_forward_body = true;
+    ParsedRequest req{};
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
+    CHECK_FALSE(h2_should_buffer_forward_body(route, req));
+    req.headers[0].value = Str{"application/json", 16};
+    CHECK(h2_should_buffer_forward_body(route, req));
+}
+
 TEST(h2_request, canon_strips_query_and_trailing_slash) {
     hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/api/users/?id=1", 16}}};
     ParsedRequest req;

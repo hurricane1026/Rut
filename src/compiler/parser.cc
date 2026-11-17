@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
@@ -2885,6 +2886,7 @@ struct Parser {
                         ForwardTargetTransformSpec transform{};
                         bool have_strip_prefix = false;
                         bool have_replace_prefix = false;
+                        bool have_mode = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2892,7 +2894,21 @@ struct Parser {
                             auto fcolon = expect(TokenType::Colon);
                             if (!fcolon) return core::make_unexpected(fcolon.error());
                             bool* seen = nullptr;
-                            if (field_name.eq({"strip_prefix", 12})) {
+                            if (field_name.eq({"mode", 4})) {
+                                seen = &have_mode;
+                                auto dot = expect(TokenType::Dot);
+                                if (!dot) return core::make_unexpected(dot.error());
+                                auto mode = expect(TokenType::Ident);
+                                if (!mode) return core::make_unexpected(mode.error());
+                                if (mode.value()->text.eq({"rawPrefix", 9}))
+                                    transform.mode = ForwardTargetTransformMode::RawPrefix;
+                                else if (mode.value()->text.eq({"normalizedPrefix", 16}))
+                                    transform.mode = ForwardTargetTransformMode::NormalizedPrefix;
+                                else if (!mode.value()->text.eq({"cleanPrefix", 11}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*mode.value()),
+                                                          mode.value()->text);
+                            } else if (field_name.eq({"strip_prefix", 12})) {
                                 seen = &have_strip_prefix;
                                 auto value = expect(TokenType::StringLit);
                                 if (!value) return core::make_unexpected(value.error());
@@ -2931,9 +2947,15 @@ struct Parser {
                         if (stmt.has_forward_target_transform)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
-                        auto val = expect(TokenType::StringLit);
-                        if (!val) return core::make_unexpected(val.error());
-                        stmt.forward_set_path = val.value()->text;
+                        auto value = parse_expr();
+                        if (!value) return core::make_unexpected(value.error());
+                        if (value->kind == AstExprKind::StrLit) {
+                            stmt.forward_set_path = value->str_value;
+                        } else {
+                            auto owned = alloc_expr(value.value());
+                            if (!owned) return core::make_unexpected(owned.error());
+                            stmt.forward_set_path_expr = owned.value();
+                        }
                         stmt.has_forward_set_path = true;
                     } else if (kw_text.eq({"set_header", 10})) {
                         // set_header: { "Name": "Value", ... } — request-header
@@ -5201,6 +5223,20 @@ struct Parser {
         deco.span =
             Span{at.value()->start, name_tok.value()->end, at.value()->line, at.value()->col};
 
+        if (deco.name.eq(lit_str("host"))) {
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span);
+            auto host = expect(TokenType::StringLit);
+            if (!host || !route_host_pattern_valid(host.value()->text) ||
+                !expect(TokenType::RParen))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    deco.span,
+                    lit_str(
+                        "@host requires one DNS name, bracketed IPv6 literal or edge wildcard"));
+            deco.route_host = host.value()->text;
+            return deco;
+        }
         if (deco.name.eq(lit_str("cache"))) {
             constexpr Str kDetail = lit_str("@cache requires ttl: a duration from 1s to 24h");
             if (!expect(TokenType::LParen))

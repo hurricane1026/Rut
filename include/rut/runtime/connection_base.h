@@ -6,6 +6,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -1411,6 +1412,8 @@ struct ConnectionBase {
     bool tls_handshake_complete;
     // Verified inbound mTLS identity; fixed connection-owned storage survives
     // keep-alive and H2 streams, and is cleared on connection-slot reset.
+    char tls_server_name[254]{};
+    u16 tls_server_name_length = 0;
     char tls_client_cert_sha256[64]{};
     bool tls_client_cert_sha256_valid = false;
     // Active wire protocol. Defaults to Http11; set from the ALPN result once
@@ -1431,6 +1434,8 @@ struct ConnectionBase {
         __builtin_memcpy(
             tls_client_cert_sha256, source.tls_client_cert_sha256, sizeof(tls_client_cert_sha256));
         tls_client_cert_sha256_valid = source.tls_client_cert_sha256_valid;
+        __builtin_memcpy(tls_server_name, source.tls_server_name, sizeof(tls_server_name));
+        tls_server_name_length = source.tls_server_name_length;
         // Handshake owner/state stays local to each Connection; snapshots never
         // transfer its SlicePool pointer.
     }
@@ -1921,6 +1926,26 @@ struct ConnectionBase {
     u32 req_size;
     u32 peer_addr;
     u16 peer_port;
+    char routing_host_bytes[254]{};
+    u16 routing_host_length = 0;
+    bool capture_routing_host(const ParsedRequest& request) {
+        routing_host_length = 0;
+        Str authority{};
+        u32 count = 0;
+        for (u32 i = 0; i < request.header_count; i++) {
+            if (!route_host_equal(request.headers[i].name, {"host", 4})) continue;
+            authority = request.headers[i].value;
+            count++;
+        }
+        // A route without a Host condition remains eligible when Host is absent.
+        if (count == 0) return true;
+        if (count != 1 ||
+            !route_host_from_authority(authority, routing_host_bytes, &routing_host_length))
+            return false;
+        if (!route_host_pattern_valid(routing_host())) routing_host_length = 0;
+        return true;
+    }
+    Str routing_host() const { return {routing_host_bytes, routing_host_length}; }
     char req_path[kMaxReqPathLen];
     // View into req_path covering the canonical-for-routing path slice
     // (leading '/' stripped, trailing '/' run trimmed, bytes after first
@@ -2303,6 +2328,8 @@ struct ConnectionBase {
         tls_handshake_complete = false;
         __builtin_memset(tls_client_cert_sha256, 0, sizeof(tls_client_cert_sha256));
         tls_client_cert_sha256_valid = false;
+        tls_server_name_length = 0;
+        __builtin_memset(tls_server_name, 0, sizeof(tls_server_name));
         protocol = ConnProtocol::Http11;
         downstream_completed_request_count = 0;
         h2 = nullptr;  // pool slot is released by free_conn_impl, not reset()
@@ -2422,6 +2449,7 @@ struct ConnectionBase {
         peer_addr = 0;
         peer_port = 0;
         req_path[0] = '\0';
+        routing_host_length = 0;
         req_path_canon = {nullptr, 0};
         upstream_us = 0;
         upstream_name[0] = '\0';

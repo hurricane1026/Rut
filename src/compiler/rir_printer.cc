@@ -159,6 +159,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqQueryString:
             buf.put_cstr("req.queryString");
             break;
+        case Opcode::ReqRoutingString:
+            buf.put_cstr("req.routingString");
+            break;
+        case Opcode::ReqConnectionScalar:
+            buf.put_cstr("req.connectionScalar");
+            break;
         case Opcode::ReqTlsClientCertSha256:
             buf.put_cstr("req.tlsClientCertSha256");
             break;
@@ -293,6 +299,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
+            break;
+        case Opcode::StrRegexCapture:
+            buf.put_cstr("str.regexCapture");
             break;
         case Opcode::StrRegexMatch:
             buf.put_cstr("str.regex_match");
@@ -768,6 +777,8 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
             break;
+        case Opcode::ReqRoutingString:
+        case Opcode::ReqConnectionScalar:
         case Opcode::WsMessageField:
             buf.put(' ');
             buf.put_i32(inst.imm.i32_val);
@@ -904,6 +915,14 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[0]);
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
+            break;
+        case Opcode::StrRegexCapture:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
+            buf.put_cstr(", ");
+            print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::StrRegexMatch:
             buf.put(' ');

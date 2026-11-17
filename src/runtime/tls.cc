@@ -226,6 +226,20 @@ AlpnProtocol tls_negotiated_protocol(SSL* ssl) {
     return AlpnProtocol::None;
 }
 
+void tls_capture_server_name(SSL* ssl, char out[254], u16& length) {
+    length = 0;
+    out[0] = '\0';
+    if (!ssl) return;
+    const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!name) return;
+    u32 size = 0;
+    while (name[size] && size < 254) size++;
+    if (size == 0 || size >= 254) return;
+    __builtin_memcpy(out, name, size);
+    out[size] = '\0';
+    length = static_cast<u16>(size);
+}
+
 bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& out_valid) {
     out_valid = false;
     if (out_hex == nullptr) return false;

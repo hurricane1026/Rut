@@ -21,6 +21,10 @@
 `equivalent` 项必须两端一致；`known-difference` 项必须分别符合其精确预期，且差异仍存在。
 任何一端变化都需要重新审阅，测试不会自动更新预期。`--observe` 只打印观察，不修改 fixture。
 
+原生 Rut 能否表达相同配置意图，另见
+[路由能力差距与可执行见证](kong-routing-capability-gaps.md)。其中的正向对照、编译拒绝和
+运行时拒绝测试不启动 Kong；通过这些测试只表示已复现当前边界，不表示相关缺口已补齐。
+
 ## 已验证的一致子集
 
 - GET 查询串（含重复 query）、POST 请求体、HEAD、DELETE 的普通转发。

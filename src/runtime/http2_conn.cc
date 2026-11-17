@@ -83,6 +83,7 @@ void Http2Conn::init() {
     async_synth_len = 0;
     async_synth_sent = 0;
     async_request_body_followed = false;
+    async_request_body_buffered_for_forward = false;
     async_request_stream_open = false;
     async_request_forwardable = false;
     async_request_has_content_length = false;
@@ -507,6 +508,7 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req, S
     bool have_method = false;
     bool have_path = false;
     bool have_authority = false;
+    bool have_nonempty_authority = false;
     bool have_scheme = false;
     bool have_protocol = false;
     Str scheme{};
@@ -544,8 +546,11 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req, S
                 have_path = true;
             } else if (h2_str_eq(kName, ":authority")) {
                 if (have_authority) return false;
-                if (req->header_count >= kMaxHeaders) return false;
-                req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+                if (kValue.len != 0) {
+                    if (req->header_count >= kMaxHeaders) return false;
+                    req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+                    have_nonempty_authority = true;
+                }
                 have_authority = true;
                 authority = kValue;
             } else if (h2_str_eq(kName, ":protocol")) {
@@ -569,8 +574,13 @@ bool h2_headers_to_request(const hpack::Header* hs, u32 n, ParsedRequest* req, S
         if (!h2_name_ok(kName) || !h2_value_ok(kValue)) return false;
         if (h2_is_connection_header(kName)) return false;
         if (h2_str_eq(kName, "te") && !h2_str_eq(kValue, "trailers")) return false;
-        if (req->header_count >= kMaxHeaders) return false;
-        req->headers[req->header_count++] = {kName, kValue};
+        // A non-empty :authority is the canonical Host value for HTTP/2.
+        // Ignore a redundant regular Host field, matching the synthesized
+        // HTTP/1 request path and avoiding a false duplicate-host rejection.
+        if (!(have_nonempty_authority && h2_str_eq(kName, "host"))) {
+            if (req->header_count >= kMaxHeaders) return false;
+            req->headers[req->header_count++] = {kName, kValue};
+        }
         if (h2_str_eq(kName, "content-length")) {
             u32 cl = 0;
             if (have_content_length || !h2_value_to_u32(kValue, &cl)) return false;

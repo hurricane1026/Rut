@@ -206,6 +206,8 @@ enum class Opcode : u8 {
     ReqParam,                // %r = req.param "id"           → str
     ReqQuery,                // %r = req.query "name"         → Optional(str)
     ReqQueryString,          // %r = req.queryString          → Optional(str)
+    ReqRoutingString,        // selector: normalizedPath/normalizedTarget/SNI -> Optional(str)
+    ReqConnectionScalar,     // selector: remotePort/localPort/isTls -> i32/i32/bool
     ReqTlsClientCertSha256,  // %r = req.tlsClientCertSha256 → Optional(str)
     ReqMethod,               // %r = req.method               → Method
     ReqPath,                 // %r = req.path                 → str
@@ -256,6 +258,7 @@ enum class Opcode : u8 {
     StrPredicate,          // two Str operands, predicate id 0/1/2/3: prefix/suffix/contains/isEmpty
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
+    StrRegexCapture,       // regexCapture(str, literal regex, literal group) -> str?
     StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
     StrInterpolate,        // %r = str.interpolate [%a, %b..]  → str (variadic)
 
@@ -463,6 +466,7 @@ struct Function {
     Str name;  // e.g., "handle_get_users_id"
 
     // Route metadata.
+    Str route_host{};
     Str route_pattern;  // e.g., "/users/:id"
     u8 http_method;     // route method key (0 = any, 1..9 = full HTTP method)
     // @rateLimit decorators → stacked fixed-window rules (empty = no limit);

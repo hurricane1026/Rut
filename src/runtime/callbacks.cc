@@ -42,7 +42,13 @@ template bool h1_tls_dispatch_owner_event<NativeReactorEventLoop>(NativeReactorE
                                                                   Connection&,
                                                                   IoEvent);
 
-bool h2_apply_forward_request_overrides(Connection& conn) {
+bool h2_apply_forward_request_overrides(Connection& conn, const RouteConfig* config) {
+    if (conn.target_transform_recorded &&
+        (config == nullptr || !config->target_transform_id_is_valid(conn.target_transform_id) ||
+         config->target_transforms[conn.target_transform_id - 1].mode ==
+             ForwardTargetTransformMode::CleanPrefix ||
+         !materialize_request_target_transform(conn, *config)))
+        return false;
     return rewrite_request_line_path(conn) && apply_request_header_overrides(conn);
 }
 

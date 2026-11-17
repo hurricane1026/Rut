@@ -1,10 +1,12 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include "core/placement_new.h"
+#include "rut/common/forward_target.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/uri_normalize.h"
 #include "rut/common/ws_message.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
@@ -28,6 +30,7 @@
 #include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/parse_integer.h"
 #include "rut/runtime/password_gateway.h"
+#include "rut/runtime/regex_capture.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
@@ -35,6 +38,8 @@
 #include "rut/runtime/webhook.h"
 #include "rut/runtime/ws_frame.h"
 #include "rut/runtime/ws_terminate.h"
+
+#include <sys/mman.h>
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sys/random.h>
@@ -148,6 +153,59 @@ void rut_helper_parse_unprime() {
 }
 
 // ── Request Access ─────────────────────────────────────────────────
+
+i32 rut_helper_req_connection_scalar(void* conn, i32 selector) {
+    if (conn == nullptr) return 0;
+    const auto& connection = *static_cast<const ConnectionBase*>(conn);
+    if (selector == 0) return connection.peer_port;
+    if (selector == 1) return connection.listener_context.port;
+    if (selector == 2) return connection.tls_active && connection.tls_handshake_complete;
+    return 0;
+}
+
+void rut_helper_req_routing_string(void* conn,
+                                   const u8* data,
+                                   u32 length,
+                                   i32 selector,
+                                   u8* has,
+                                   const char** out,
+                                   u32* out_length) {
+    *has = 0;
+    *out = nullptr;
+    *out_length = 0;
+    if (conn == nullptr || selector < 0 || selector > 2) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    if (selector == 2) {
+        if (!connection.tls_active || !connection.tls_handshake_complete ||
+            connection.tls_server_name_length == 0)
+            return;
+        *out = connection.tls_server_name;
+        *out_length = connection.tls_server_name_length;
+    } else {
+        const ParseCache& pc = parse_cached(data, length);
+        if (!pc.ok) return;
+        Str target = pc.req.path;
+        if (!forward_target_valid(target)) return;
+        auto& arena = connection.json_arena;
+        if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > 262144 - target.len)
+            return;
+        auto* bytes = static_cast<char*>(arena.alloc(target.len));
+        u32 normalized_length = 0;
+        if (!bytes || !normalize_forward_target(target, bytes, target.len, &normalized_length))
+            return;
+        if (selector == 0) {
+            for (u32 i = 0; i < normalized_length; i++)
+                if (bytes[i] == '?') {
+                    normalized_length = i;
+                    break;
+                }
+        }
+        *out = bytes;
+        *out_length = normalized_length;
+    }
+    *has = 1;
+}
 
 extern "C" void rut_helper_req_tls_client_cert_sha256(void* conn,
                                                       u8* out_has,
@@ -579,9 +637,26 @@ void rut_helper_req_unique_header(const u8* req_data,
 // forward(set_path:) — record the path override on the connection. The proxy
 // (on_upstream_connected) rewrites the request line from this before forwarding.
 void rut_helper_req_set_path(void* conn, const char* path, u32 len) {
+    if (conn == nullptr) return;
     auto* c = static_cast<ConnectionBase*>(conn);
     c->req_path_overridden = true;
-    c->req_path_override = Str{path, len};
+    c->req_path_override = forward_target_valid({path, len}) ? Str{path, len} : Str{};
+}
+
+void rut_helper_req_set_owned_path(void* conn, const char* path, u32 len) {
+    if (conn == nullptr) return;
+    auto& c = *static_cast<ConnectionBase*>(conn);
+    c.req_path_overridden = true;
+    c.req_path_override = {};
+    if (!forward_target_valid({path, len})) return;
+    auto& arena = c.json_arena;
+    if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+        arena.space_used() > 262144 - len)
+        return;
+    auto* copy = static_cast<char*>(arena.alloc(len));
+    if (copy == nullptr) return;
+    __builtin_memcpy(copy, path, len);
+    c.req_path_override = {copy, len};
 }
 
 void rut_helper_req_set_load_balance(void* conn, u32 encoded) {
@@ -1766,6 +1841,7 @@ struct RegexMatchCtx {
 };
 
 struct RegexHandle {
+    void* capture_program = nullptr;
     hs_database_t* db = nullptr;
     u64 generation = 0;
     u32 active_scans = 0;
@@ -2216,16 +2292,88 @@ void* rut_helper_regex_adopt(void* database) {
     return handle;
 }
 
+void* rut_helper_regex_capture_compile(const char* pattern, u32 length) {
+    void* program = capture_regex_compile({pattern, length});
+    if (!program) return nullptr;
+    void* raw = rut_helper_regex_adopt(nullptr);
+    if (!raw) {
+        capture_regex_destroy(program);
+        return nullptr;
+    }
+    static_cast<RegexHandle*>(raw)->capture_program = program;
+    return raw;
+}
+
+u8 rut_helper_regex_capture(void* connection,
+                            const char* subject,
+                            u32 length,
+                            void* db,
+                            u32 group,
+                            const char** output,
+                            u32* output_length) {
+    *output = nullptr;
+    *output_length = 0;
+    if (!connection || !db) return 2;
+    auto& handle = *static_cast<RegexHandle*>(db);
+    pthread_mutex_lock(&handle.mutex);
+    if (handle.closing || !handle.capture_program) {
+        pthread_mutex_unlock(&handle.mutex);
+        return 2;
+    }
+    handle.active_scans++;
+    void* program = handle.capture_program;
+    pthread_mutex_unlock(&handle.mutex);
+    Str result;
+    auto& arena = static_cast<ConnectionBase*>(connection)->json_arena;
+    const u8 state = capture_regex_match(program, arena, {subject, length}, group, &result);
+    end_regex_scan(&handle);
+    if (state == 1) {
+        *output = result.ptr;
+        *output_length = result.len;
+    }
+    return state;
+}
+
+void rut_helper_regex_serialized_free(void* db, char* bytes, u64 length) {
+    if (!bytes) return;
+    if (db && static_cast<RegexHandle*>(db)->capture_program)
+        munmap(bytes, length);
+    else
+        free(bytes);
+}
+
 bool rut_helper_regex_serialize(void* db, char** bytes, u64* length) {
     if (!db || !bytes || !length) return false;
     size_t n = 0;
     auto* handle = static_cast<RegexHandle*>(db);
+    if (handle->capture_program) {
+        const Str pattern = capture_regex_pattern(handle->capture_program);
+        *length = kCaptureRegexMarkerLength + pattern.len;
+        void* region =
+            mmap(nullptr, *length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) {
+            *length = 0;
+            return false;
+        }
+        *bytes = static_cast<char*>(region);
+        __builtin_memcpy(*bytes, kCaptureRegexMarker, kCaptureRegexMarkerLength);
+        __builtin_memcpy(*bytes + kCaptureRegexMarkerLength, pattern.ptr, pattern.len);
+        return true;
+    }
     if (hs_serialize_database(handle->db, bytes, &n) != HS_SUCCESS) return false;
     *length = n;
     return true;
 }
 
 void* rut_helper_regex_deserialize(const char* bytes, u64 length) {
+    if (bytes && length >= kCaptureRegexMarkerLength &&
+        __builtin_memcmp(bytes, kCaptureRegexMarker, kCaptureRegexMarkerLength) == 0) {
+        if (length <= kCaptureRegexMarkerLength || length > kCaptureRegexMarkerLength + 1024)
+            return nullptr;
+        return rut_helper_regex_capture_compile(
+            bytes + kCaptureRegexMarkerLength,
+            static_cast<u32>(length - kCaptureRegexMarkerLength));
+    }
     hs_database_t* db = nullptr;
     if (hs_deserialize_database(bytes, length, &db) != HS_SUCCESS) return nullptr;
     return rut_helper_regex_adopt(db);
@@ -2245,6 +2393,7 @@ void rut_helper_regex_free(void* db) {
 
     unregister_regex_handle(handle);
     if (regex_db) hs_free_database(regex_db);
+    if (handle->capture_program) capture_regex_destroy(handle->capture_program);
     pthread_cond_destroy(&handle->no_active_scans);
     pthread_mutex_destroy(&handle->mutex);
     free(handle);

@@ -11820,6 +11820,33 @@ TEST(frontend, analyze_wait_any_statement_lowers_to_any_wait_and_if_control) {
     CHECK_EQ(hir->routes[0].control.else_term.status_code, 204u);
 }
 
+TEST(frontend, analyze_wait_any_simple_arms_keep_route_scope_for_forward_target) {
+    const char* src =
+        "upstream api\n"
+        "route GET \"/x\" { let target = req.pathOnly wait any { "
+        "downstream.recv() => { return forward(api, load_balance: .roundRobin, set_path: "
+        "req.pathOnly) } timer(250) => { return forward(api, load_balance: .roundRobin, "
+        "set_path: target) } } }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const auto& route = hir->routes[0];
+    CHECK_EQ(route.control.kind, HirControlKind::If);
+    CHECK_EQ(route.control.then_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK_EQ(route.control.else_term.kind, HirTerminatorKind::ForwardUpstream);
+    CHECK(route.control.then_term.forward_path_expr_index < route.exprs.len);
+    CHECK(route.control.else_term.forward_path_expr_index < route.exprs.len);
+    const auto& target = route.exprs[route.control.then_term.forward_path_expr_index];
+    CHECK_EQ(target.kind, HirExprKind::LocalRef);
+    CHECK_EQ(target.local_index, 0u);
+    const auto& else_target = route.exprs[route.control.else_term.forward_path_expr_index];
+    CHECK_EQ(else_target.kind, HirExprKind::ReqPathOnly);
+}
+
 TEST(frontend, analyze_wait_any_arm_result_binding_is_arm_local) {
     const char* src =
         "route GET \"/x\" { wait any { "
@@ -19605,6 +19632,87 @@ TEST(frontend, lower_forward_route_to_rir) {
     CHECK_EQ(fn.blocks[0].insts[0].imm.i32_val, 0);
     CHECK_EQ(static_cast<u8>(fn.blocks[0].insts[1].op), static_cast<u8>(rir::Opcode::RetForward));
     rir.destroy();
+}
+TEST(frontend, direct_guard_fallback_forward_keeps_route_scope) {
+    const char* src =
+        "upstream api\n"
+        "route GET \"/users\" { let target = req.pathOnly guard req.isTls else { return "
+        "forward(api, load_balance: .roundRobin, set_path: target) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE_EQ(hir->routes[0].guards.len, 1u);
+    CHECK_EQ(static_cast<u8>(hir->routes[0].guards[0].fail_term.kind),
+             static_cast<u8>(HirTerminatorKind::ForwardUpstream));
+}
+TEST(frontend, guard_fallback_forward_materializes_scoped_target_local) {
+    const char* src =
+        "upstream b\n"
+        "route GET \"/\" { guard req.isTls else { let target = \"/fallback\" return "
+        "forward(b, load_balance: .roundRobin, set_path: target) } return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 1u);
+    auto* set_path = find_first_op(rir.module.functions[0], rir::Opcode::ReqSetPath);
+    REQUIRE(set_path);
+    CHECK_EQ(set_path->operand_count, 1u);
+    CHECK(find_first_op(rir.module.functions[0], rir::Opcode::RetForward) != nullptr);
+    bool found_fallback_target = false;
+    for (u32 bi = 0; bi < rir.module.functions[0].block_count; bi++) {
+        const auto& block = rir.module.functions[0].blocks[bi];
+        for (u32 ii = 0; ii < block.inst_count; ii++) {
+            const auto& inst = block.insts[ii];
+            if (inst.op == rir::Opcode::ConstStr && inst.imm.str_val.eq(lit("/fallback")))
+                found_fallback_target = true;
+        }
+    }
+    CHECK(found_fallback_target);
+    rir.destroy();
+}
+TEST(frontend, lower_rejects_out_of_range_request_property_selector) {
+    const char* src =
+        "route GET \"/users\" { guard let path = req.normalizedPath else { return 400 } return 200 "
+        "}\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule valid{};
+    REQUIRE(lower_to_rir(mir.value(), valid));
+    valid.destroy();
+
+    MirValue* property = nullptr;
+    for (u32 i = 0; i < mir->functions[0].values.len; i++) {
+        MirValue& value = mir->functions[0].values[i];
+        if (value.kind == MirValueKind::ReqRoutingString) {
+            property = &value;
+            break;
+        }
+    }
+    REQUIRE(property != nullptr);
+    property->int_value = i64{1} << 32;
+
+    FrontendRirModule malformed{};
+    CHECK_FALSE(lower_to_rir(mir.value(), malformed));
+    malformed.destroy();
 }
 TEST(frontend, let_if_lowers_to_branching_rir) {
     const char* src =
@@ -48110,3 +48218,5 @@ route GET "/" {
     REQUIRE(ast);
     CHECK(analyze_file_heap(ast.value()));
 }
+
+#include "kong_routing_gap_frontend.inc"

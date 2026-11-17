@@ -1,6 +1,7 @@
 #include "rut/compiler/analyze.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
@@ -19,6 +20,7 @@
 #include "rut/runtime/json.h"
 #include "rut/runtime/net_client.h"
 #include "rut/runtime/password.h"
+#include "rut/runtime/regex_capture.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/rs256_policy.h"
 #include "rut/runtime/slice_pool.h"
@@ -11647,6 +11649,25 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.type = HirTypeKind::Str;
                 return out;
             }
+            if (expr.name.eq(lit_str("normalizedPath")) ||
+                expr.name.eq(lit_str("normalizedTarget")) || expr.name.eq(lit_str("sni"))) {
+                out.kind = HirExprKind::ReqRoutingString;
+                out.type = HirTypeKind::Str;
+                out.may_nil = true;
+                out.int_value = expr.name.eq(lit_str("normalizedPath"))     ? 0
+                                : expr.name.eq(lit_str("normalizedTarget")) ? 1
+                                                                            : 2;
+                return out;
+            }
+            if (expr.name.eq(lit_str("remotePort")) || expr.name.eq(lit_str("localPort")) ||
+                expr.name.eq(lit_str("isTls"))) {
+                out.kind = HirExprKind::ReqConnectionScalar;
+                out.int_value = expr.name.eq(lit_str("remotePort"))  ? 0
+                                : expr.name.eq(lit_str("localPort")) ? 1
+                                                                     : 2;
+                out.type = out.int_value == 2 ? HirTypeKind::Bool : HirTypeKind::I32;
+                return out;
+            }
             if (expr.name.eq({"pathOnly", 8})) {
                 out.kind = HirExprKind::ReqPathOnly;
                 out.type = HirTypeKind::Str;
@@ -13402,6 +13423,39 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("regexCapture")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr auto detail = lit_str(
+            "regexCapture expects unwrapped str, literal RE2 regex (1...1024 bytes, at most 8 "
+            "groups; "
+            "no backreferences/lookaround), "
+            "and participating group index 0...8");
+        if (!route || route->is_timer || expr.args.len != 3 || pipe_lhs || first_arg_override ||
+            expr.args[1]->kind != AstExprKind::RegexLit ||
+            expr.args[2]->kind != AstExprKind::IntLit)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        auto subject = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        const i64 group = expr.args[2]->int_value;
+        if (!subject || subject->type != HirTypeKind::Str || subject->may_nil ||
+            subject->may_error || group < 0 || group > 8)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        void* compiled = capture_regex_compile(expr.args[1]->str_value);
+        if (!compiled) return frontend_error(FrontendError::InvalidRegex, expr.span, detail);
+        const bool valid = static_cast<u32>(group) <= capture_regex_group_count(compiled);
+        capture_regex_destroy(compiled);
+        if (!valid) return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        HirExpr out{};
+        out.kind = HirExprKind::RegexCapture;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        out.str_value = expr.args[1]->str_value;
+        out.int_value = group;
+        if (!route->exprs.push(subject.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if ((expr.name.eq(lit_str("tcp")) || expr.name.eq(lit_str("udp"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail =
@@ -15772,7 +15826,12 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
     return term;
 }
 
-static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
+static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
+                                                  const HirModule& mod,
+                                                  HirRoute* route = nullptr,
+                                                  const HirLocal* locals = nullptr,
+                                                  u32 local_count = 0,
+                                                  const MatchPayloadBinding* binding = nullptr) {
     HirTerminator term{};
     if (stmt.response_body_local.len != 0)
         return frontend_error(FrontendError::UnsupportedSyntax,
@@ -15885,7 +15944,8 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (stmt.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) &&
         (stmt.has_forward_response_read_timeout || stmt.has_forward_response_buffering ||
-         stmt.has_forward_target_transform))
+         (stmt.has_forward_target_transform &&
+          stmt.forward_target_transform.mode == ForwardTargetTransformMode::CleanPrefix)))
         return frontend_error(
             FrontendError::UnsupportedSyntax,
             stmt.span,
@@ -16035,7 +16095,26 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.forward_load_balance = stmt.forward_load_balance;
     term.upstream_index = upstream_index.value();
-    if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    if (stmt.has_forward_set_path) {
+        term.forward_set_path = stmt.forward_set_path;
+        if (stmt.forward_set_path_expr != nullptr) {
+            if (route == nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.span,
+                    lit_str("dynamic forwarding target requires a request expression scope"));
+            auto target =
+                analyze_expr(*stmt.forward_set_path_expr, route, mod, locals, local_count, binding);
+            if (!target) return core::make_unexpected(target.error());
+            if (target->type != HirTypeKind::Str || target->may_nil || target->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("forwarding target must be an unwrapped str"));
+            term.forward_path_expr_index = route->exprs.len;
+            if (!route->exprs.push(target.value()))
+                return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        }
+    }
     if (stmt.has_forward_request_policy)
         term.forward_request_policy_id = stmt.forward_request_policy_id;
     if (stmt.has_forward_response_policy)
@@ -16187,7 +16266,7 @@ static FrontendResult<void> analyze_guard_match_arms(
         } else {
             seen_wildcard = true;
         }
-        auto term = analyze_term(*arm.stmt, mod);
+        auto term = analyze_term(*arm.stmt, mod, route, locals, local_count);
         if (!term) return core::make_unexpected(term.error());
         hir_arm.direct_term = term.value();
         if (!guard_match_arms->push(hir_arm))
@@ -16693,7 +16772,8 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                     }
                 } else {
                     if (is_ast_hir_terminator(*inner.else_stmt)) {
-                        auto fail_term = analyze_term(*inner.else_stmt, mod);
+                        auto fail_term = analyze_term(
+                            *inner.else_stmt, mod, route, locals, local_count, binding);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -16836,9 +16916,9 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         arm->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         arm->then_term = then_term.value();
         arm->else_term = else_term.value();
@@ -16846,7 +16926,7 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
     }
 
     arm->body_kind = HirMatchArm::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     arm->direct_term = term.value();
     return {};
@@ -16951,16 +17031,16 @@ static FrontendResult<void> analyze_guard_fail_body(const AstStatement& stmt,
             cond_expr = cond.value();
         }
         body->cond = cond_expr;
-        auto then_term = analyze_term(*stmt.then_stmt, mod);
+        auto then_term = analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*stmt.else_stmt, mod);
+        auto else_term = analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
         if (!else_term) return core::make_unexpected(else_term.error());
         body->then_term = then_term.value();
         body->else_term = else_term.value();
         return {};
     }
     body->body_kind = HirGuardBody::BodyKind::Direct;
-    auto term = analyze_term(stmt, mod);
+    auto term = analyze_term(stmt, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     body->direct_term = term.value();
     return {};
@@ -17109,9 +17189,11 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
             // never referenceable — no local is injected.
             route->control.kind = HirControlKind::If;
             route->control.cond = cond_expr;
-            auto then_term = analyze_term(*stmt.then_stmt, mod);
+            auto then_term =
+                analyze_term(*stmt.then_stmt, mod, route, locals, local_count, binding);
             if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*stmt.else_stmt, mod);
+            auto else_term =
+                analyze_term(*stmt.else_stmt, mod, route, locals, local_count, binding);
             if (!else_term) return core::make_unexpected(else_term.error());
             route->control.then_term = then_term.value();
             route->control.else_term = else_term.value();
@@ -18089,7 +18171,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
     }
     AstStatement terminal = stmt;
     terminal.response_body_local = {};
-    auto term = analyze_term(terminal, mod);
+    auto term = analyze_term(terminal, mod, route, locals, local_count, binding);
     if (!term) return core::make_unexpected(term.error());
     if (stmt.response_body_local.len != 0) {
         const HirLocal* body = nullptr;
@@ -19733,9 +19815,11 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
 
         route.control.kind = HirControlKind::If;
         route.control.cond = cond;
-        auto then_term = analyze_term(*timer_arm->stmt, mod);
+        auto then_term =
+            analyze_term(*timer_arm->stmt, mod, &route, route.locals.data, route.locals.len);
         if (!then_term) return core::make_unexpected(then_term.error());
-        auto else_term = analyze_term(*recv_arm->stmt, mod);
+        auto else_term =
+            analyze_term(*recv_arm->stmt, mod, &route, route.locals.data, route.locals.len);
         if (!else_term) return core::make_unexpected(else_term.error());
         route.control.then_term = then_term.value();
         route.control.else_term = else_term.value();
@@ -21087,6 +21171,9 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
+        case HirExprKind::RegexCapture:
+        case HirExprKind::ReqRoutingString:
+        case HirExprKind::ReqConnectionScalar:
         case HirExprKind::ReqTlsClientCertSha256:
         case HirExprKind::ReqPath:
         case HirExprKind::ReqPathOnly:
@@ -25127,6 +25214,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         ::new (static_cast<void*>(&route)) HirRoute{};
         route.span = route_decl.span;
         route.path = route_decl.path;
+        for (u32 di = 0; di < route_decl.decorators.len; di++) {
+            const auto& attribute = route_decl.decorators[di];
+            if (!attribute.name.eq(lit_str("host"))) continue;
+            if (is_timer_item || route.host.len != 0 ||
+                !route_host_pattern_valid(attribute.route_host))
+                return frontend_error(FrontendError::UnsupportedSyntax, attribute.span);
+            route.host = attribute.route_host;
+        }
         route.method = route_decl.method_is_any ? kRouteMethodAny
                                                 : route_method_key_from_token(route_decl.method);
         if (!route_decl.method_is_any && route.method == kRouteMethodAny)
@@ -25301,7 +25396,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         bool has_guarding_decorator = false;
         for (u32 di = 0; di < route_decl.decorators.len; di++) {
             const Str dn = route_decl.decorators[di].name;
-            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache"))) {
+            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache")) &&
+                !dn.eq(lit_str("host"))) {
                 has_guarding_decorator = true;
                 break;
             }
@@ -25777,7 +25873,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     }
                 } else {
                     if (is_ast_hir_terminator(*stmt.else_stmt)) {
-                        auto fail_term = analyze_term(*stmt.else_stmt, mod);
+                        auto fail_term = analyze_term(
+                            *stmt.else_stmt, mod, &route, route.locals.data, route.locals.len);
                         if (!fail_term) return core::make_unexpected(fail_term.error());
                         guard.fail_term = fail_term.value();
                     } else {
@@ -25976,7 +26073,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (term.kind == HirTerminatorKind::Redirect && term.commit_response_mutations)
                     return true;
                 return term.kind == HirTerminatorKind::ForwardUpstream &&
-                       ((term.has_forward_target_transform && term.commit_response_mutations) ||
+                       ((term.has_forward_target_transform &&
+                         term.forward_target_transform.mode ==
+                             ForwardTargetTransformMode::CleanPrefix &&
+                         term.commit_response_mutations) ||
                         (term.forward_request_policy_id != 0 && term.commit_response_mutations) ||
                         (term.forward_response_policy_id != 0 && term.commit_response_mutations));
             };
@@ -26125,7 +26225,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.redirect_policy_id == 0 && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_response_read_timeout_seconds != 0 &&
@@ -26144,7 +26244,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       !term.commit_response_mutations && term.forward_set_path.ptr == nullptr &&
+                       !term.commit_response_mutations && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
                        term.forward_response_policy_id == 0 &&
                        term.forward_failure_policy_id == 0 &&
@@ -26165,7 +26265,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 structural_common && timeout_term_count == 1 &&
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
-                direct.forward_set_path.ptr == nullptr && direct.forward_set_headers.len == 0 &&
+                !direct.has_forward_path() && direct.forward_set_headers.len == 0 &&
                 !direct.has_forward_target_transform && !direct.commit_response_mutations &&
                 timeout_request_policy_is_admitted(direct) &&
                 (!complete_buffering ||
@@ -26203,7 +26303,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.source_kind == HirTerminatorSourceKind::Literal &&
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
-                       term.redirect_policy_id == 0 && term.forward_set_path.ptr == nullptr &&
+                       term.redirect_policy_id == 0 && !term.has_forward_path() &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_request_policy_id == static_cast<u16>(policy) &&
@@ -26728,6 +26828,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             // Official built-in decorators are recognized here and lowered to
             // route metadata, not resolved to user functions. @rateLimit sets
             // the per-route GCRA limits (enforced in the runtime).
+            if (ast_deco.name.eq(lit_str("host"))) continue;
             if (ast_deco.name.eq(lit_str("cache"))) {
                 if (route.http_cache_ttl != 0 || route.waits.len != 0 || route_decl.method_is_any ||
                     route.method != kRouteMethodGet)
@@ -26927,7 +27028,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 ri = 0; ri < mod.routes.len; ri++) {
                 const HirRoute& existing = mod.routes[ri];
                 if (!existing.is_timer && existing.method == route.method &&
-                    existing.path.eq(route.path))
+                    existing.path.eq(route.path) && route_host_equal(existing.host, route.host))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           route_decl.span,
                                           lit_str("duplicate route path and method"));

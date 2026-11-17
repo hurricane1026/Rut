@@ -34,6 +34,7 @@ enum class MirValueKind : u8 {
     IntConst,
     StrConst,
     RegexMatch,
+    RegexCapture,
     StringConcat,
     StringPredicate,
     Tuple,
@@ -57,6 +58,8 @@ enum class MirValueKind : u8 {
     ReqQuery,
     ReqQueryString,
     ReqTlsClientCertSha256,
+    ReqRoutingString,
+    ReqConnectionScalar,
     ReqPath,
     ReqPathOnly,
     ReqBody,
@@ -321,6 +324,10 @@ struct MirTerminator {
     // Request-path rewrite for forward(set_path:) — carried verbatim from HIR.
     // ptr != nullptr → lower_rir emits ReqSetPath before RetForward.
     Str forward_set_path{};
+    MirValue* forward_path_value = nullptr;
+    bool has_forward_path() const {
+        return forward_set_path.ptr != nullptr || forward_path_value != nullptr;
+    }
     // Request-header overrides for forward(set_header:) — carried verbatim from
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
@@ -352,6 +359,7 @@ struct MirBlock {
 };
 
 struct MirFunction {
+    Str host{};
     struct Wait {
         Span span{};
         WaitEventKind event_kind = WaitEventKind::Timer;
@@ -401,6 +409,7 @@ struct MirFunction {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           name(other.name),
           values(other.values),
           locals(other.locals),
@@ -427,6 +436,7 @@ struct MirFunction {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         name = other.name;
         values = other.values;
         locals = other.locals;
@@ -453,6 +463,7 @@ struct MirFunction {
         : span(other.span),
           method(other.method),
           path(other.path),
+          host(other.host),
           name(other.name),
           values(other.values),
           locals(other.locals),
@@ -479,6 +490,7 @@ struct MirFunction {
         span = other.span;
         method = other.method;
         path = other.path;
+        host = other.host;
         name = other.name;
         values = other.values;
         locals = other.locals;
@@ -525,6 +537,7 @@ private:
         for (u32 i = 0; i < values.len; i++) rebase_value(values[i], other);
         for (u32 i = 0; i < locals.len; i++) rebase_value(locals[i].init, other);
         for (u32 i = 0; i < blocks.len; i++) {
+            rebase_value_ptr(other, blocks[i].term.forward_path_value);
             rebase_value(blocks[i].term.cond, other);
             rebase_value(blocks[i].term.lhs, other);
             rebase_value(blocks[i].term.rhs, other);

@@ -163,14 +163,17 @@ struct CompileLockGuard {
 };
 
 bool JitEngine::prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count) {
-    static constexpr const char* kPatternPrefix = "__rut_regex_pattern_";
-    static constexpr const char* kDbPrefix = "__rut_regex_db_";
+    static constexpr const char* kNormalPatternPrefix = "__rut_regex_pattern_";
+    static constexpr const char* kNormalDbPrefix = "__rut_regex_db_";
     *out_start_count = regex_slot_count;
 
     for (LLVMValueRef global = LLVMGetFirstGlobal(mod); global;
          global = LLVMGetNextGlobal(global)) {
         size_t name_len = 0;
         const char* name = LLVMGetValueName2(global, &name_len);
+        const bool capture = name_has_prefix(name, name_len, "__rut_capture_pattern_");
+        const char* kPatternPrefix = capture ? "__rut_capture_pattern_" : kNormalPatternPrefix;
+        const char* kDbPrefix = capture ? "__rut_regex_db_capture_" : kNormalDbPrefix;
         if (!name_has_prefix(name, name_len, kPatternPrefix)) continue;
 
         const char* pattern = nullptr;
@@ -203,7 +206,8 @@ bool JitEngine::prepare_regex_symbols(LLVMModuleRef mod, u32* out_start_count) {
             return false;
         }
 
-        slot->db = rut_helper_regex_compile(pattern, pattern_len);
+        slot->db = capture ? rut_helper_regex_capture_compile(pattern, pattern_len)
+                           : rut_helper_regex_compile(pattern, pattern_len);
         if (!slot->db) {
             const char* regex_error = rut_helper_regex_last_compile_error();
             char msg[384];

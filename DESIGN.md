@@ -130,7 +130,7 @@ This file currently remains the umbrella design doc until that split happens.
 | Userspace codegen | LLVM ORC JIT | Same C++ toolchain, zero FFI overhead, lazy compilation support for L7 handlers |
 | Packet-path codegen | eBPF / XDP | Compile `firewall {}` blocks to kernel-level packet filters for earliest-drop semantics |
 | HTTP parser | Custom (~500 lines) | llhttp is callback-based (bad fit), picohttpparser lacks strict mode; custom parser integrates directly with our Slice buffer + Arena, supports SIMD, full control over strictness (anti-smuggling) |
-| C++ stdlib | `-nostdlib++`, musl libc only | Full memory control, faster compilation |
+| C++ stdlib | First-party code and the pinned capture backend use `-nostdlib++` / C-driver linking | Explicit backend boundary |
 | Compiler flags | `-fno-exceptions -fno-rtti` | No overhead from unused C++ features |
 
 ---
@@ -533,6 +533,24 @@ let second = pair.1                          // string
 
 Used as return type for `wait()` with multiple handles. Arena-allocated,
 zero heap overhead.
+
+Runtime `forward(..., set_path: expression)` accepts an unwrapped string in
+request expression scopes. Dynamic values are copied into request-owned Arena
+storage before upstream connection; RIR distinguishes owned targets from the
+literal fast path and rejects borrowed nonconstant operands. The runtime admits
+only bounded (8192-byte) valid origin-form targets, preserves percent spelling
+and explicit query bytes, and fails closed on invalid input or ownership failure.
+This does not implicitly normalize routing paths or change route selection.
+
+Explicit `target_transform.mode` selects `.rawPrefix` byte replacement or
+`.normalizedPrefix` URI-normalized replacement; the default `.cleanPrefix`
+keeps its frozen admission contract. General modes compose with request body
+forwarding, downstream TLS and response-header effects. HTTP/1 keeps streaming;
+HTTP/2 general/owned-target routes buffer within the existing 16 KiB synth
+budget and validate length before upstream effects, retaining buffered ownership
+across timer waits and releasing it on reset. Normalization does not implicitly
+change the ordinary route matcher. Old raw request snapshots are not replayable
+after a general transform.
 
 #### 3.3.4 Request Object
 
@@ -11170,3 +11188,46 @@ checking returned CAS consistency without narrowing unsigned version tokens.
 All profiles keep the existing byte, read and deadline bounds, preserve explicit
 session ownership, and close uncertain handles without retry. See
 [cache reads](docs/client-cache-reads.md).
+
+Explicit normalized routing properties use the same bounded URI transform as
+normalized prefix forwarding, with request-owned optional strings. Selection is
+opt-in through Rut predicates; raw dispatch retains its existing semantics.
+Connection port/TLS properties use accepted socket/listener state. TLS handshake
+completion captures SNI into fixed connection-owned storage, cleared on slot
+reuse and preserved across keep-alive/H2 streams; no HTTP header supplies it.
+
+Host attributes create independent immutable route scopes, with cold mmap-backed
+ART/segment indexes only for scopes actually used. Default routes keep the
+existing index/JIT path. Scope matching allocates nothing and examines at most
+16 descriptors. Each route stores its owned canonical Host; native loading
+rebuilds sidecars and rate-limit namespaces include Host. RouteEntry remains at
+config offset zero for native relocations. Owning indexes are last and excluded
+from metadata-only rollback snapshots; metadata population never mutates them.
+
+
+Regex capture results use the native `regexCapture(str, re"literal", group)`
+builtin with an optional string result. This does not implement an approximate
+Swift Regex.Match carrier. Vectorscan cannot expose capturing subexpressions;
+a pinned static runtime-free RE2 fork at
+`88190621fa40e3eeca8c337c4b1222f706440402` is used only for captures, leaving
+Boolean matching unchanged. Its source archive is verified by SHA-256
+`7838f989ed2a3d5f1cd45e14e77dc8091b78b6491d2449d45d88aab79d5d6d8a`. The
+engine is isolated behind `regex_capture.h`; callers and native artifacts never
+expose RE2 types. Native artifacts save/recompile bounded source at startup
+(RUTCAP2 marker). Matching uses Latin-1 byte semantics, leftmost-first captures
+and no backreferences or lookaround. The configured 1 MiB budget bounds
+compiled programs/DFA caches, not total allocations. Input/pattern/group limits
+are 8192/1024/8.
+
+The backend and first-party server remain free of the C++ standard runtime,
+exceptions and RTTI. The fork still allocates through the C heap, including
+matching scratch/cache paths; its allocation ABI aborts on exhaustion. The
+adapter owns an mmap-placed RE2 object and calls its destructor on unload. This
+is not a claim of allocation-free matching or graceful recovery from process-
+wide heap exhaustion. The fork and its vendored components' licenses are kept
+under `docs/third-party/`. The fork's global allocator/guard ABI shim is linked
+only into the unsanitized server; compiler tools use their normal C++ runtime
+without the fork overriding their allocator.
+
+No-match/unparticipating groups are nil; participating empty groups are present.
+Resource errors return 500 before fallback/negation can consume an absent value.

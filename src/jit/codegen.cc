@@ -172,6 +172,7 @@ struct Ctx {
     struct RegexGlobalEntry {
         Str pattern;
         LLVMValueRef db_global;
+        bool capture = false;
     };
     RegexGlobalEntry* regex_globals;
     u32 regex_global_count;
@@ -364,13 +365,16 @@ struct Ctx {
 
     // void rut_helper_req_set_path(ptr conn, ptr path, i32 len)
     LLVMValueRef fn_req_set_path = nullptr;
-    LLVMValueRef get_req_set_path() {
-        if (!fn_req_set_path) {
+    LLVMValueRef fn_req_set_owned_path = nullptr;
+    LLVMValueRef get_req_set_path(bool owned = false) {
+        auto& helper = owned ? fn_req_set_owned_path : fn_req_set_path;
+        if (!helper) {
             LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
             LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
-            fn_req_set_path = LLVMAddFunction(llvm_mod, "rut_helper_req_set_path", ft);
+            helper = LLVMAddFunction(
+                llvm_mod, owned ? "rut_helper_req_set_owned_path" : "rut_helper_req_set_path", ft);
         }
-        return fn_req_set_path;
+        return helper;
     }
 
     // void rut_helper_req_set_load_balance(ptr conn, i32 id)
@@ -777,10 +781,10 @@ struct Ctx {
         return LLVMBuildInBoundsGEP2(builder, LLVMTypeOf(str_const), global, indices, 2, name);
     }
 
-    LLVMValueRef make_regex_db_load(Str pattern) {
+    LLVMValueRef make_regex_db_load(Str pattern, bool capture = false) {
         for (u32 i = 0; i < regex_global_count; i++) {
             const Str cached = regex_globals[i].pattern;
-            if (cached.len == pattern.len &&
+            if (regex_globals[i].capture == capture && cached.len == pattern.len &&
                 (pattern.len == 0 || memcmp(cached.ptr, pattern.ptr, pattern.len) == 0)) {
                 return LLVMBuildLoad2(builder, ptr_ty, regex_globals[i].db_global, "regex.db");
             }
@@ -789,9 +793,16 @@ struct Ctx {
         char pattern_name[96];
         char db_name[96];
         const u32 id = regex_count++;
-        snprintf(
-            pattern_name, sizeof(pattern_name), "__rut_regex_pattern_%u_%u", regex_module_id, id);
-        snprintf(db_name, sizeof(db_name), "__rut_regex_db_%u_%u", regex_module_id, id);
+        snprintf(pattern_name,
+                 sizeof(pattern_name),
+                 capture ? "__rut_capture_pattern_%u_%u" : "__rut_regex_pattern_%u_%u",
+                 regex_module_id,
+                 id);
+        snprintf(db_name,
+                 sizeof(db_name),
+                 capture ? "__rut_regex_db_capture_%u_%u" : "__rut_regex_db_%u_%u",
+                 regex_module_id,
+                 id);
 
         LLVMValueRef str_const =
             LLVMConstStringInContext(llvm_ctx, pattern.ptr, pattern.len, /*DontNullTerminate=*/0);
@@ -812,7 +823,7 @@ struct Ctx {
             }
         }
         if (regex_global_count < regex_global_cap) {
-            regex_globals[regex_global_count++] = {pattern, db_global};
+            regex_globals[regex_global_count++] = {pattern, db_global, capture};
         }
         return LLVMBuildLoad2(builder, ptr_ty, db_global, "regex.db");
     }
@@ -1370,8 +1381,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef l = LLVMBuildExtractValue(c.builder, path, 1, "setpath.len");
             LLVMValueRef args[] = {c.param_conn, p, l};
             LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_set_path()),
-                           c.get_req_set_path(),
+                           LLVMGlobalGetValueType(c.get_req_set_path(inst.imm.i32_val != 0)),
+                           c.get_req_set_path(inst.imm.i32_val != 0),
                            args,
                            3,
                            "");
@@ -1629,6 +1640,57 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             opt = LLVMBuildInsertValue(c.builder, opt, h, 0, "query_string.opt.has");
             opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "query_string.opt.ptr");
             opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "query_string.opt.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqConnectionScalar: {
+            LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.i32_ty, params, 2, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_connection_scalar");
+            if (fn == nullptr)
+                fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_connection_scalar", type);
+            LLVMValueRef args[] = {c.param_conn, LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0)};
+            LLVMValueRef value = LLVMBuildCall2(c.builder, type, fn, args, 2, "connection.scalar");
+            if (inst.imm.i32_val == 2)
+                value = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, value, LLVMConstInt(c.i32_ty, 0, 0), "connection.tls");
+            c.set_value(inst.result, value);
+            break;
+        }
+        case rir::Opcode::ReqRoutingString: {
+            LLVMTypeRef params[] = {
+                c.ptr_ty, c.ptr_ty, c.i32_ty, c.i32_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.void_ty, params, 7, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_routing_string");
+            if (fn == nullptr)
+                fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_routing_string", type);
+            LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "routing.has");
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "routing.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "routing.len");
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_req_data,
+                                   c.param_req_len,
+                                   LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0),
+                                   has,
+                                   ptr,
+                                   len};
+            LLVMBuildCall2(c.builder, type, fn, args, 7, "");
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i8_ty, has, "routing.h"),
+                                       0,
+                                       "routing.opt.has");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "routing.p"),
+                                       1,
+                                       "routing.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i32_ty, len, "routing.l"),
+                                       2,
+                                       "routing.opt.len");
             c.set_value(inst.result, opt);
             break;
         }
@@ -1898,6 +1960,51 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                         1,
                                         "concat.text.len");
             c.set_value(inst.result, text);
+            break;
+        }
+        case rir::Opcode::StrRegexCapture: {
+            LLVMValueRef text = c.get_value(inst.operands[0]);
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "capture.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "capture.len");
+            LLVMTypeRef params[] = {
+                c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef type = LLVMFunctionType(c.i8_ty, params, 7, 0);
+            LLVMValueRef helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_regex_capture");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_regex_capture", type);
+            LLVMValueRef args[] = {c.param_conn,
+                                   LLVMBuildExtractValue(c.builder, text, 0, "capture.text.ptr"),
+                                   LLVMBuildExtractValue(c.builder, text, 1, "capture.text.len"),
+                                   c.make_regex_db_load(inst.imm.str_val, true),
+                                   c.get_value(inst.operands[1]),
+                                   ptr,
+                                   len};
+            LLVMValueRef state = LLVMBuildCall2(c.builder, type, helper, args, 7, "capture.state");
+            LLVMValueRef function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder));
+            auto* ok = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "capture.ok");
+            auto* failed = LLVMAppendBasicBlockInContext(c.llvm_ctx, function, "capture.failed");
+            LLVMValueRef valid = LLVMBuildICmp(
+                c.builder, LLVMIntULE, state, LLVMConstInt(c.i8_ty, 1, 0), "capture.valid");
+            LLVMBuildCondBr(c.builder, valid, ok, failed);
+            LLVMPositionBuilderAtEnd(c.builder, failed);
+            c.emit_parse_unprime();
+            LLVMBuildRet(
+                c.builder,
+                LLVMConstInt(
+                    c.i64_ty, static_cast<u64>(HandlerAction::ReturnStatus) | (u64{500} << 8), 0));
+            LLVMPositionBuilderAtEnd(c.builder, ok);
+            LLVMValueRef opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, state, 0, "capture.has");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "capture.p"),
+                                       1,
+                                       "capture.opt.ptr");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i32_ty, len, "capture.l"),
+                                       2,
+                                       "capture.opt.len");
+            c.set_value(inst.result, opt);
             break;
         }
         case rir::Opcode::StrRegexMatch: {
@@ -4050,7 +4157,25 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
                         return {nullptr, nullptr, false};
                 }
-                if (inst.op == rir::Opcode::ReqTlsClientCertSha256) {
+                if (ws_body_mode && inst.op == rir::Opcode::StrRegexCapture)
+                    return {nullptr, nullptr, false};
+                if (inst.op == rir::Opcode::ReqRoutingString ||
+                    inst.op == rir::Opcode::ReqConnectionScalar) {
+                    if (inst.operand_count != 0 || inst.extra_operands || inst.imm.i32_val < 0 ||
+                        inst.imm.i32_val > 2 || inst.result == rir::kNoValue ||
+                        inst.result.id >= fn.value_count || fn.values == nullptr)
+                        return {nullptr, nullptr, false};
+                    if (inst.op == rir::Opcode::ReqConnectionScalar) {
+                        const auto* type = fn.values[inst.result.id].type;
+                        if (type == nullptr ||
+                            type->kind != (inst.imm.i32_val == 2 ? rir::TypeKind::Bool
+                                                                 : rir::TypeKind::I32) ||
+                            type->inner || type->struct_def)
+                            return {nullptr, nullptr, false};
+                    }
+                }
+                if (inst.op == rir::Opcode::ReqTlsClientCertSha256 ||
+                    inst.op == rir::Opcode::ReqRoutingString) {
                     if (inst.operand_count != 0 || inst.result == rir::kNoValue ||
                         inst.result.id >= fn.value_count || fn.values == nullptr)
                         return {nullptr, nullptr, false};

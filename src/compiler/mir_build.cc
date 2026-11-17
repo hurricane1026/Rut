@@ -140,7 +140,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         return common && function.blocks.len == 1 && &function.blocks[0].term == preflight_term &&
                preflight_term->kind == MirTerminatorKind::ForwardUpstream &&
                function.values.len == 0 && function.blocks[0].effects.len == 0 &&
-               preflight_term->forward_set_path.ptr == nullptr &&
+               !preflight_term->has_forward_path() &&
                preflight_term->forward_set_headers.len == 0 &&
                !preflight_term->has_forward_target_transform &&
                !preflight_term->commit_response_mutations &&
@@ -173,9 +173,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
                    term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                    !term.commit_response_mutations && term.response_body.ptr == nullptr &&
                    term.response_headers.len == 0 && term.redirect_policy_id == 0 &&
-                   term.upstream_index < module.upstreams.len &&
-                   term.forward_set_path.ptr == nullptr && term.forward_set_headers.len == 0 &&
-                   !term.has_forward_target_transform &&
+                   term.upstream_index < module.upstreams.len && !term.has_forward_path() &&
+                   term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
@@ -257,7 +256,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         redirect.source_kind == MirTerminatorSourceKind::Literal &&
         redirect.local_ref_index == 0xffffffffu && redirect.status_code == 0 &&
         !redirect.commit_response_mutations && redirect.response_body.ptr == nullptr &&
-        redirect.response_headers.len == 0 && redirect.forward_set_path.ptr == nullptr &&
+        redirect.response_headers.len == 0 && !redirect.has_forward_path() &&
         redirect.forward_set_headers.len == 0 && redirect.forward_request_policy_id == 0 &&
         redirect.forward_response_policy_id == 0 && redirect.forward_failure_policy_id == 0 &&
         redirect.forward_timeout_failure_policy_id == 0 &&
@@ -290,7 +289,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         forward.local_ref_index == 0xffffffffu && forward.status_code == 0 &&
         !forward.commit_response_mutations && forward.response_body.ptr == nullptr &&
         forward.response_headers.len == 0 && forward.redirect_policy_id == 0 &&
-        forward.upstream_index < module.upstreams.len && forward.forward_set_path.ptr == nullptr &&
+        forward.upstream_index < module.upstreams.len && !forward.has_forward_path() &&
         forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
         response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
         forward_response_buffering_uses_content_length_machinery(
@@ -633,13 +632,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.int_value = expr.int_value;
         return v;
     }
-    if (expr.kind == HirExprKind::RegexMatch) {
+    if (expr.kind == HirExprKind::RegexMatch || expr.kind == HirExprKind::RegexCapture) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         if (!fn->values.push(lhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
-        v.kind = MirValueKind::RegexMatch;
-        v.type = MirTypeKind::Bool;
+        v.kind = expr.kind == HirExprKind::RegexCapture ? MirValueKind::RegexCapture
+                                                        : MirValueKind::RegexMatch;
+        v.type = expr.kind == HirExprKind::RegexCapture ? MirTypeKind::Str : MirTypeKind::Bool;
+        v.may_nil = expr.kind == HirExprKind::RegexCapture;
+        v.int_value = expr.int_value;
         v.str_value = expr.str_value;
         v.lhs = &fn->values[fn->values.len - 1];
         return v;
@@ -836,6 +838,17 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.kind = MirValueKind::ReqQueryString;
         v.type = MirTypeKind::Str;
         v.may_nil = true;
+        return v;
+    }
+    if (expr.kind == HirExprKind::ReqRoutingString ||
+        expr.kind == HirExprKind::ReqConnectionScalar) {
+        v.kind = expr.kind == HirExprKind::ReqRoutingString ? MirValueKind::ReqRoutingString
+                                                            : MirValueKind::ReqConnectionScalar;
+        v.type = expr.type == HirTypeKind::Bool  ? MirTypeKind::Bool
+                 : expr.type == HirTypeKind::Str ? MirTypeKind::Str
+                                                 : MirTypeKind::I32;
+        v.may_nil = expr.may_nil;
+        v.int_value = expr.int_value;
         return v;
     }
     if (expr.kind == HirExprKind::ReqTlsClientCertSha256) {
@@ -1623,6 +1636,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
     }
 
     bool invalid_redirect_policy = false;
+    bool invalid_forward_path = false;
+    Diagnostic forward_path_error{};
     const u32 kRouteCount = standalone_route == nullptr ? module.routes.len : 1;
     for (u32 i = 0; i < kRouteCount; i++) {
         const HirRoute& source_route =
@@ -1631,6 +1646,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         fn.span = source_route.span;
         fn.method = source_route.method;
         fn.path = source_route.path;
+        fn.host = source_route.host;
         fn.name = {"route", 5};
         fn.error_variant_index = source_route.error_variant_index;
         fn.forward_preflight_mode = source_route.forward_preflight_mode;
@@ -1718,7 +1734,9 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 return frontend_error(FrontendError::TooManyItems, local.span);
         }
 
-        auto set_term_from_hir = [&](MirTerminator* out, const HirTerminator& term) {
+        auto set_term_from_hir = [&](MirTerminator* out,
+                                     const HirTerminator& term,
+                                     const ForLoopCtx* ctx = nullptr) {
             if (term.kind == HirTerminatorKind::Redirect &&
                 (term.redirect_policy_id == 0 ||
                  term.redirect_policy_id > module.redirect_policies.len ||
@@ -1740,6 +1758,24 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             out->response_body = term.response_body;
             out->response_body_local_index = term.response_body_local_index;
             out->forward_set_path = term.forward_set_path;
+            if (term.forward_path_expr_index != 0xffffffffu) {
+                if (term.forward_path_expr_index >= source_route.exprs.len) {
+                    invalid_forward_path = true;
+                    forward_path_error = {FrontendError::UnsupportedSyntax, term.span, {}};
+                } else {
+                    auto value = mir_value(
+                        source_route.exprs[term.forward_path_expr_index], module, &fn, ctx);
+                    if (!value) {
+                        invalid_forward_path = true;
+                        forward_path_error = value.error();
+                    } else if (!fn.values.push(value.value())) {
+                        invalid_forward_path = true;
+                        forward_path_error = {FrontendError::OutOfMemory, term.span, {}};
+                    } else {
+                        out->forward_path_value = &fn.values[fn.values.len - 1];
+                    }
+                }
+            }
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_load_balance = term.forward_load_balance;
             out->forward_response_policy_id = term.forward_response_policy_id;
@@ -1807,7 +1843,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             if (guard.fail_kind == HirGuard::FailKind::Term) {
                 MirBlock fail_block{};
                 fail_block.label = fail_label();
-                set_term_from_hir(&fail_block.term, guard.fail_term);
+                set_term_from_hir(&fail_block.term, guard.fail_term, ctx);
                 if (!fn.blocks.push(fail_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
                 return {};
@@ -1849,17 +1885,17 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
                     MirBlock then_block{};
                     then_block.label = then_label();
-                    set_term_from_hir(&then_block.term, guard.fail_body.then_term);
+                    set_term_from_hir(&then_block.term, guard.fail_body.then_term, body_ctx);
                     if (!fn.blocks.push(then_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
 
                     MirBlock else_block{};
                     else_block.label = else_label();
-                    set_term_from_hir(&else_block.term, guard.fail_body.else_term);
+                    set_term_from_hir(&else_block.term, guard.fail_body.else_term, body_ctx);
                     if (!fn.blocks.push(else_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 } else {
-                    set_term_from_hir(&fail_block.term, guard.fail_body.direct_term);
+                    set_term_from_hir(&fail_block.term, guard.fail_body.direct_term, body_ctx);
                     if (!fn.blocks.push(fail_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
@@ -1911,7 +1947,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 const auto& arm = module.guard_match_arms[guard.fail_match_start + ai];
                 MirBlock case_block{};
                 case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
-                set_term_from_hir(&case_block.term, arm.direct_term);
+                set_term_from_hir(&case_block.term, arm.direct_term, ctx);
                 if (!fn.blocks.push(case_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
             }
@@ -2300,6 +2336,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -2781,7 +2818,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 MirBlock block{};
                 block.label = si == 0 ? entry_label() : cont_label();
                 if (steps[si].kind == RouteStep::Kind::Term) {
-                    set_term_from_hir(&block.term, *steps[si].term);
+                    set_term_from_hir(&block.term, *steps[si].term, step_ctx);
                     if (!fn.blocks.push(block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     continue;
@@ -2850,23 +2887,24 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     return frontend_error(FrontendError::TooManyItems, fn.span);
             }
 
+            const ForLoopCtx* terminating_ctx =
+                has_terminating_step ? route_step_ctx(steps[terminating_step_index]) : nullptr;
             if (has_terminating_step && steps[terminating_step_index].kind == RouteStep::Kind::If) {
                 const auto& body_if = *steps[terminating_step_index].body_if;
                 MirBlock then_block{};
                 then_block.label = then_label();
-                set_term_from_hir(&then_block.term, body_if.then_term);
+                set_term_from_hir(&then_block.term, body_if.then_term, terminating_ctx);
                 if (!fn.blocks.push(then_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
                 MirBlock else_block{};
                 else_block.label = else_label();
-                set_term_from_hir(&else_block.term, body_if.else_term);
+                set_term_from_hir(&else_block.term, body_if.else_term, terminating_ctx);
                 if (!fn.blocks.push(else_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
             } else if (has_terminating_step &&
                        steps[terminating_step_index].kind == RouteStep::Kind::Match) {
                 const auto& body_match = *steps[terminating_step_index].body_match;
-                const ForLoopCtx* terminating_ctx = route_step_ctx(steps[terminating_step_index]);
                 auto subject = mir_value(body_match.match_expr, module, &fn, terminating_ctx);
                 if (!subject) return core::make_unexpected(subject.error());
                 auto body_match_fallthrough_target = [&](u32 arm_index) -> u32 {
@@ -2877,26 +2915,6 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     }
                     return body_match_arm_entry_index(body_match.arms[body_match.arms.len - 1],
                                                       body_match.arms.len - 1);
-                };
-                auto set_body_match_arm_term = [&](MirBlock* out,
-                                                   const HirForLoopMatchArm& arm,
-                                                   u32 arm_index) -> FrontendResult<void> {
-                    ForLoopCtx scoped_ctx{};
-                    auto body_ctx =
-                        extend_for_loop_match_arm_ctx(arm, terminating_ctx, &scoped_ctx);
-                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
-                    if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
-                        out->term.kind = MirTerminatorKind::Branch;
-                        out->term.span = arm.cond.span;
-                        auto cond = mir_value(arm.cond, module, &fn, body_ctx.value());
-                        if (!cond) return core::make_unexpected(cond.error());
-                        out->term.cond = cond.value();
-                        out->term.then_block = body_match_then_index[arm_index];
-                        out->term.else_block = body_match_else_index[arm_index];
-                    } else {
-                        set_term_from_hir(&out->term, arm.direct_term);
-                    }
-                    return {};
                 };
                 for (u32 ai = 1; ai < body_match_non_wildcard_count; ai++) {
                     MirBlock test_block{};
@@ -2940,23 +2958,36 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 auto prelude_guards = emit_body_match_prelude_guards(body_match, terminating_ctx);
                 if (!prelude_guards) return core::make_unexpected(prelude_guards.error());
                 for (u32 ai = 0; ai < body_match.arms.len; ai++) {
+                    const auto& arm = body_match.arms[ai];
+                    ForLoopCtx scoped_ctx{};
+                    auto body_ctx =
+                        extend_for_loop_match_arm_ctx(arm, terminating_ctx, &scoped_ctx);
+                    if (!body_ctx) return core::make_unexpected(body_ctx.error());
                     MirBlock case_block{};
-                    case_block.label = body_match.arms[ai].is_wildcard ? match_default_label()
-                                                                       : match_case_label();
-                    auto armed = set_body_match_arm_term(&case_block, body_match.arms[ai], ai);
-                    if (!armed) return core::make_unexpected(armed.error());
+                    case_block.label = arm.is_wildcard ? match_default_label() : match_case_label();
+                    if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
+                        case_block.term.kind = MirTerminatorKind::Branch;
+                        case_block.term.span = arm.cond.span;
+                        auto cond = mir_value(arm.cond, module, &fn, body_ctx.value());
+                        if (!cond) return core::make_unexpected(cond.error());
+                        case_block.term.cond = cond.value();
+                        case_block.term.then_block = body_match_then_index[ai];
+                        case_block.term.else_block = body_match_else_index[ai];
+                    } else {
+                        set_term_from_hir(&case_block.term, arm.direct_term, body_ctx.value());
+                    }
                     if (!fn.blocks.push(case_block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
-                    if (body_match.arms[ai].body_kind == HirForLoopMatchArm::BodyKind::If) {
+                    if (arm.body_kind == HirForLoopMatchArm::BodyKind::If) {
                         MirBlock then_block{};
                         then_block.label = then_label();
-                        set_term_from_hir(&then_block.term, body_match.arms[ai].then_term);
+                        set_term_from_hir(&then_block.term, arm.then_term, body_ctx.value());
                         if (!fn.blocks.push(then_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
 
                         MirBlock else_block{};
                         else_block.label = else_label();
-                        set_term_from_hir(&else_block.term, body_match.arms[ai].else_term);
+                        set_term_from_hir(&else_block.term, arm.else_term, body_ctx.value());
                         if (!fn.blocks.push(else_block))
                             return frontend_error(FrontendError::TooManyItems, fn.span);
                     }
@@ -3188,6 +3219,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
 
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3254,6 +3286,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
             fn.state_zero_enters_entry = true;
             fn.resume_terminal_block = kTerminalIndex;
+            if (invalid_forward_path) return core::make_unexpected(forward_path_error);
             if (!forward_preflight_metadata_valid(*mir, fn)) {
                 return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
             }
@@ -3788,6 +3821,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             set_term_from_hir(&block.term, source_route.control.direct_term);
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
+        if (invalid_forward_path) return core::make_unexpected(forward_path_error);
         if (!forward_preflight_metadata_valid(*mir, fn)) {
             return frontend_error(FrontendError::UnsupportedSyntax, fn.span);
         }

@@ -59,6 +59,10 @@ Linux remains the production/performance target.
 ## C++ Conventions
 
 - No C++ standard library headers or libraries: use custom `FixedVec<T, Cap>`, `Str` (non-owning string view), `FlatMap<K, V, Cap>`, `ListNode` (intrusive linked list)
+  Temporary user-approved exception: the opaque regex-capture adapter uses static
+  RE2/Abseil and their C++ runtime/heap allocations pending a replacement engine.
+  The JIT-enabled server permits this runtime dependency; no-JIT server and
+  standalone tools keep the original link checks. See DESIGN.md's capture backend.
 - No `new`, no `malloc` — all allocation via mmap-backed per-shard allocators (Arena, SlabPool, SlicePool)
 - **No exceptions** (`-fno-exceptions`): code never throws. No try/catch, no `std::expected`. Errors are returned via result values or handled inline.
 - No RTTI (`-fno-rtti`)

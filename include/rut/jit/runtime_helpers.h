@@ -68,6 +68,14 @@ void rut_helper_req_path_only(const rut::u8* req_data,
 
 // Expose only the immutable, verified handshake identity owned by this
 // downstream connection; absent for cleartext and ordinary server TLS.
+rut::i32 rut_helper_req_connection_scalar(void* conn, rut::i32 selector);
+void rut_helper_req_routing_string(void* conn,
+                                   const rut::u8* data,
+                                   rut::u32 length,
+                                   rut::i32 selector,
+                                   rut::u8* has,
+                                   const char** out,
+                                   rut::u32* out_length);
 void rut_helper_req_tls_client_cert_sha256(void* conn,
                                            rut::u8* out_has,
                                            const char** out_ptr,
@@ -468,6 +476,15 @@ rut::u8 rut_helper_str_regex_result(const char* s, rut::u32 s_len, void* db);
 
 // Returns 1 when the Vectorscan backend is available.
 rut::u8 rut_helper_regex_backend_available();
+void* rut_helper_regex_capture_compile(const char* pattern, rut::u32 length);
+rut::u8 rut_helper_regex_capture(void* connection,
+                                 const char* subject,
+                                 rut::u32 length,
+                                 void* database,
+                                 rut::u32 group,
+                                 const char** output,
+                                 rut::u32* output_length);
+void rut_helper_regex_serialized_free(void* database, char* bytes, rut::u64 length);
 
 // Byte-exact suffix predicate; empty needle matches any valid String.
 rut::u8 rut_helper_str_has_suffix(const char* text,
@@ -497,6 +514,7 @@ void rut_helper_str_trim_prefix(const char* s,
 // opaque Connection*; `path` must point at stable memory (a JIT string
 // constant), since the proxy reads it later when rewriting the request line.
 void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
+void rut_helper_req_set_owned_path(void* conn, const char* path, rut::u32 len);
 
 // Foundation-only target-transform effect. Records one bounded 1-based ID;
 // malformed or duplicate effects are retained as a fail-closed sentinel.

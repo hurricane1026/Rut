@@ -585,6 +585,53 @@ is unchanged; the existing H2 WebSocket bridge keeps its separate transport.
 Files are loaded for each new TLS session, and its context outlives its SSL
 object. HTTP/2 TLS/configuration-file failures retain gRPC UNAVAILABLE.
 
+### Runtime forwarding targets
+
+`forward(upstream, load_balance: .roundRobin, set_path: target)` accepts an
+unwrapped `str` expression, including a local computed from `req.params`,
+request headers or ordinary string helpers. Optional values must be unwrapped
+before the call. Literal targets retain their existing fast path. Runtime
+values are copied into the request Arena before forwarding, so borrowed header
+and path views survive request-buffer growth and asynchronous upstream connect.
+Targets must be nonempty origin-form URIs beginning with `/`, at most 8192 bytes,
+with no whitespace/control bytes or fragment and with well-formed percent
+triplets. Invalid targets and allocation failures fail closed before upstream
+connection; no URI normalization is implicit. Queries are part of the supplied
+target, not automatically appended. Existing explicit request-policy combination
+restrictions still apply. See [the capability ledger](kong-routing-capability-gaps.md).
+
+### Explicit prefix rewrite modes
+
+`target_transform` additionally accepts `mode: .rawPrefix` or
+`mode: .normalizedPrefix`. Omitting `mode` retains the existing `.cleanPrefix`
+admission contract used by the frozen converter profiles.
+
+```swift
+return forward(api, load_balance: .roundRobin, target_transform: {
+    strip_prefix: "/catalog", replace_prefix: "/", mode: .rawPrefix
+})
+```
+
+`.rawPrefix` replaces the literal byte prefix of the path and retains the
+remaining path and raw query bytes. Prefixes need not end at a slash boundary;
+`/catalogue` above forwards as `/ue`. `.normalizedPrefix` first normalizes the
+incoming path and normalizes the resulting path after replacement: unreserved
+percent escapes decode, remaining escapes use uppercase hex, repeated slashes
+merge and dot segments resolve. Query bytes remain unchanged. Its configured
+prefixes must already be canonical. Both modes require valid origin-form targets
+and share the 128-byte configured-prefix and 8192-byte target bounds. These modes
+transform forwarding targets; ordinary route selection retains its own contract.
+
+General modes support HTTP/1 request bodies, explicit zero Content-Length,
+downstream TLS, the existing cleartext `.preserve` Host profile and chain-after
+response headers. HTTP/1 body forwarding remains streaming. For ordinary HTTP/2
+proxying, owned dynamic targets and general prefix profiles buffer a request in
+the existing `Http2Conn::kBodySynthCap` budget (headers plus body, 16 KiB); oversize
+and inconsistent lengths reject before upstream contact. Buffered-body ownership
+survives timer continuation, and peer reset releases the pending request. This
+metadata does not turn HTTP/1 handlers into body readers. Existing explicit
+HTTP/1 request-policy profiles are still not HTTP/2 serializers.
+
 ### Inbound mTLS pinned identity
 
 The server accepts `--tls-client-ca PATH` with its existing TLS certificate
@@ -1436,7 +1483,9 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 
 ```
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
-         s.replace/split/slice s.matches(re"") s.match(re"")
+         s.replace/split/slice s.matches(re"")
+         regexCapture(s, re"...", 1) -> str?
+         ⏳ s.match(re"")
          s.hasPrefix(str) s.hasSuffix(str)
          ⏳ s.trimPrefix/trimSuffix
 hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
@@ -3580,3 +3629,59 @@ checking returned CAS consistency without narrowing unsigned version tokens.
 All profiles keep the existing byte, read and deadline bounds, preserve explicit
 session ownership, and close uncertain handles without retry. See
 [cache reads](client-cache-reads.md).
+
+### Explicit normalized targets and connection metadata
+
+`req.normalizedPath: str?` normalizes the origin-form path; `req.normalizedTarget:
+str?` adds its unchanged query. Both use bounded request Arena storage and return
+nil for invalid input or exhaustion. They decode unreserved escapes, uppercase
+remaining escape triplets, merge slash runs and remove dot segments. Default
+route dispatch and `req.path` remain raw. To select and forward consistently,
+guard the two optionals, predicate on normalizedPath and forward normalizedTarget
+with `set_path:`. This is an explicit route policy, not global canonicalization.
+
+`req.remotePort: i32` and `req.localPort: i32` come from the accepted socket and
+bound listener. `req.isTls: bool` reports a completed TLS transport; it ignores
+Forwarded, X-Forwarded-Proto and H2 :scheme. `req.sni: str?` is the handshake's
+connection-owned server name (at most 253 bytes), absent on cleartext or absent
+SNI. SNI is client-selected routing metadata, not an authenticated identity.
+
+### Independent Host route scopes
+
+`@host("api.example") route GET "/api" { ... }` allows independent handlers,
+chains, decorators and rate policies for identical method/path keys. A declaration
+accepts one DNS name, bracketed IPv6 literal or one edge wildcard (`*.example`, `example.*`), up to 253
+bytes. Matching folds ASCII case, ignores a valid authority port and trailing
+dot. Exact Host beats wildcard; longer fixed wildcard text beats shorter text;
+equal wildcard specificity retains declaration order. Only scopes containing a
+matching method/path participate; a miss falls through to global routes. Within
+a scope the configured route trie keeps ordinary Rut path semantics. At most 16
+Host scopes share the existing 128 route limit. Duplicate Host fields or invalid
+authorities reject before scoped policy lookup. Host is client routing input,
+not an authenticated identity. Request headers cannot supply transport SNI.
+
+### Bounded regex capture builtin
+
+`regexCapture(subject, re"pattern", group): str?` returns a capture from the
+first byte-oriented RE2 match. Group 0 is the whole matched span; 1...8 are
+parenthesized capture ordinals, including named groups. No match or an optional
+group that did not participate returns nil; an empty participating group returns
+present empty `str`. Unwrap before concatenating or passing `set_path:`. This is
+a native Rut builtin; Swift's `Regex.Match` carrier/API remains absent.
+
+Patterns and group indexes must be literals; patterns are at most 1024 bytes,
+with at most 8 groups. Input is at most 8192 bytes. Compilation occurs during
+configuration/startup, never from runtime input. Captures borrow their subject;
+`set_path:` copies the final target into request Arena storage. Capture matching
+uses the pinned runtime-free RE2 fork at
+`88190621fa40e3eeca8c337c4b1222f706440402`, with Latin-1 byte semantics and an
+approximate 1 MiB compiled-program/DFA-cache budget. Backreferences and
+lookaround are not supported and reject at compile time. The fork does not
+require the C++ standard runtime, but it uses C heap allocation, including on
+some matching paths, and aborts on allocation failure; request Arena does not
+account for those allocations. Invalid patterns/group indexes reject at compile
+time. Adapter-detected resource/bound failures return 500 immediately, before
+nil recovery can accept them; this does not cover C heap exhaustion, which
+aborts in the fork.
+Available in HTTP handlers/helpers, not timers or WebSocket callbacks. Existing
+`matches(re"...")` retains its Vectorscan full-match Boolean behavior.

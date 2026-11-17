@@ -640,6 +640,21 @@ struct Builder {
         return TRY(emit(Opcode::ReqQueryString, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_req_routing_property(bool string, i32 selector, SourceLoc loc = {}) {
+        if (selector < 0 || selector > 2) return err(RirError::InvalidState);
+        const Type* ty;
+        if (string) {
+            auto* inner = TRY(make_type(TypeKind::Str));
+            ty = TRY(make_type(TypeKind::Optional, inner));
+        } else {
+            ty = TRY(make_type(selector == 2 ? TypeKind::Bool : TypeKind::I32));
+        }
+        auto result =
+            TRY(emit(string ? Opcode::ReqRoutingString : Opcode::ReqConnectionScalar, ty, loc));
+        result.inst->imm.i32_val = selector;
+        return result.vid;
+    }
+
     Result<ValueId> emit_req_tls_client_cert_sha256(SourceLoc loc = {}) {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
@@ -727,9 +742,10 @@ struct Builder {
         return {};
     }
 
-    VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}) {
+    VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}, bool owned = false) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
+        r.inst->imm.i32_val = owned ? 1 : 0;
         r.inst->operands[0] = path;
         r.inst->operand_count = 1;
         return {};
@@ -937,6 +953,24 @@ struct Builder {
         inst->operands[1] = prefix;
         inst->operand_count = 2;
         return vid;
+    }
+
+    Result<ValueId> emit_str_regex_capture(ValueId str,
+                                           Str pattern,
+                                           u32 group,
+                                           SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str) || group > 8 || !pattern.ptr || pattern.len == 0 ||
+            pattern.len > 1024)
+            return err(RirError::InvalidState);
+        auto index = TRY(emit_const_i32(static_cast<i32>(group), loc));
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto result = TRY(emit(Opcode::StrRegexCapture, ty, loc));
+        result.inst->operands[0] = str;
+        result.inst->operands[1] = index;
+        result.inst->operand_count = 2;
+        result.inst->imm.str_val = pattern;
+        return result.vid;
     }
 
     Result<ValueId> emit_str_regex_match(ValueId str, Str pattern, SourceLoc loc = {}) {
