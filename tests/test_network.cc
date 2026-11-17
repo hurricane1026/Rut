@@ -90822,3 +90822,113 @@ TEST(weighted_load_balance, eight_large_weights_keep_exact_cycle_counts_and_boun
     for (u32 i = 0; i < 8; ++i) CHECK_EQ(observed[i], weights[i]);
     CHECK_EQ(select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::RoundRobin}, 0, 9, 0, 0), 9u);
 }
+
+TEST(weighted_load_balance, explicit_connect_skips_disabled_backend_even_when_enabled_one_is_down) {
+    ScopedBackendHealthReset reset_health;
+    rut::test::RouteConfigFixture config;
+    REQUIRE(config.config);
+    REQUIRE(config.config->add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(config.config->add_upstream_backend(0, 0x7f000001, 9002));
+    config.config->upstreams[0].weights[0] = 0;
+    config.config->upstreams[0].weights[1] = 5;
+
+    SmallLoop loop;
+    loop.setup();
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.yield_kind = jit::YieldKind::UpstreamConnect;
+    outcome.timer_ms = 1;
+
+    for (bool enabled_backend_ejected : {false, true}) {
+        backend_health(0, 1)->active_down = enabled_backend_ejected;
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* conn = loop.find_fd(42);
+        REQUIRE(conn != nullptr);
+        conn->request_config = config.config;
+        loop.backend.clear_ops();
+        handle_jit_outcome(&loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+        CHECK_EQ(conn->upstream_backend_idx, 1u);
+        CHECK_EQ(conn->pending_handler_fn, &state_invariant_wait_recv_then_status);
+        (void)detach_upstream_close(&loop, *conn);
+        loop.close_conn(*conn);
+    }
+}
+
+TEST(weighted_load_balance, disabled_upstream_rejection_sends_503_or_reclaims_connection) {
+    rut::test::RouteConfigFixture config;
+    REQUIRE(config.config);
+    REQUIRE(config.config->add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(config.config->set_upstream_max_inflight(0, 1));
+    REQUIRE(config.config->add_proxy("/api", kRouteMethodAny, 0));
+    config.config->upstreams[0].weights[0] = 0;
+    const RouteConfig* active = config.config;
+
+    SmallLoop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    loop.upstream_cc = &concurrency;
+
+    JitDispatchOutcome wait{};
+    wait.kind = JitDispatchOutcome::Kind::EventYield;
+    wait.yield_kind = jit::YieldKind::UpstreamConnect;
+    wait.timer_ms = 1;
+    JitDispatchOutcome forward{};
+    forward.kind = JitDispatchOutcome::Kind::Forward;
+
+    // A null outcome exercises the direct proxy through the HTTP/1 callback.
+    for (const auto* outcome : {&wait, &forward, static_cast<JitDispatchOutcome*>(nullptr)}) {
+        for (bool fail_send : {false, true}) {
+            loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+            auto* conn = loop.find_fd(42);
+            REQUIRE(conn != nullptr);
+            loop.backend.clear_ops();
+            loop.backend.fail_send = fail_send;
+            loop.send_submit_attempts = 0;
+            rut::test_fault::ScopedSocketFailure fail_if_socket_created;
+            if (outcome) {
+                conn->request_config = config.config;
+                conn->forward_load_balance = {1, LoadBalancePolicy::RoundRobin};
+                handle_jit_outcome(
+                    &loop, *conn, *outcome, &state_invariant_wait_recv_then_status, true);
+            } else {
+                static constexpr u8 kRequest[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+                REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1),
+                           sizeof(kRequest) - 1);
+                loop.dispatch(make_ev(conn->id, IoEventType::Recv, sizeof(kRequest) - 1));
+            }
+
+            CHECK_EQ(rut::test_fault::state().socket_failures, 1);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(loop.send_submit_attempts, 1u);
+            CHECK_EQ(conn->upstream_fd, -1);
+            CHECK_EQ(conn->pending_handler_fn, nullptr);
+            CHECK_FALSE(conn->upstream_slot_held);
+            CHECK_EQ(concurrency.inflight[0].load(std::memory_order_relaxed), 0u);
+            if (fail_send) {
+                CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+            } else {
+                CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+                check_ordinary_local_error(_tc, *conn, 503, false);
+                loop.dispatch(make_ev(conn->id, IoEventType::Send, conn->send_buf.len()));
+            }
+            CHECK_EQ(loop.backend.count_ops(MockOp::Cancel), 1u);
+            CHECK_EQ(conn->fd, -1);
+            CHECK_EQ(conn->on_send, nullptr);
+            CHECK(conn->timer_node.empty());
+            CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+        }
+    }
+}
+
+TEST(route_config_fixture, aligns_mmap_storage_before_constructing_snapshot) {
+    rut::test::RouteConfigFixture fixture;
+    REQUIRE(fixture.config);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(fixture.config) % alignof(RouteConfig), 0u);
+    CHECK_EQ(reinterpret_cast<uintptr_t>(&fixture.config->backend_selection[0]) %
+                 alignof(BackendSelectionState),
+             0u);
+    CHECK(fixture.config->add_upstream("api", 0x7f000001, 9001));
+}

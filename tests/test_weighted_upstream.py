@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weighted forwarding over live H1/H2 downstreams and real upstream sockets."""
+"""Weighted forwarding and explicit connects against live upstream sockets."""
 
 import argparse
 from collections import Counter
@@ -58,10 +58,19 @@ def main():
 upstream api {{ backends: [{addresses}] }}
 upstream off {{ backends: [{disabled}] }}
 upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
+upstream connect_api {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 0, "127.0.0.1:{ports[1]}": 1] }}
 route GET "/rr" {{ return forward(api, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(api, load_balance: .leastRequests) }}
 route GET "/off" {{ return forward(off, load_balance: .roundRobin) }}
 route GET "/retry" {{ return forward(retry, load_balance: .roundRobin) }}
+route GET "/connect" {{
+    let ev = wait(upstream(connect_api).connect())
+    if ev.ok {{ return 204 }} else {{ return 502 }}
+}}
+route GET "/connect-off" {{
+    let ev = wait(upstream(off).connect())
+    if ev.ok {{ return 204 }} else {{ return 502 }}
+}}
 '''
         with tempfile.TemporaryDirectory(prefix='rut-weighted-upstream-') as directory:
             root = Path(directory)
@@ -110,8 +119,12 @@ route GET "/retry" {{ return forward(retry, load_balance: .roundRobin) }}
                 for _ in range(5):
                     code, body = request('/retry')
                     assert (code, body) == (200, b'B'), (protocol, 'retry', code, body)
+            for path, status in (('/connect', 204), ('/connect-off', 503)):
+                for _ in range(2):
+                    code, body = h1(path)
+                    assert code == status, (path, code, body)
             assert observed['disabled'] == 0, observed
-            print(f'Weighted forwarding passed: {args.backend}, H1/H2, 3:1 ratio, disabled targets, failover')
+            print(f'Weighted forwarding and explicit connects passed: {args.backend}')
             return 0
     finally:
         if process is not None:

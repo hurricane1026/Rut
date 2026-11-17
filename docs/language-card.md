@@ -504,6 +504,9 @@ mixed array/dictionary entries, empty collections, nonliteral, negative,
 overflowing or out-of-range weights reject at compile time. A zero-weight
 endpoint is disabled even during health fail-open and retry. An all-zero
 dictionary is valid but has no eligible upstream; HTTP forwarding returns 503.
+In HTTP/1 handlers, `wait(upstream(api).connect())` rotates among enabled
+backends with health fail-open. If none is enabled, it ends the request with
+HTTP 503 before opening an upstream connection.
 No selection argument is inferred from the upstream weights.
 
 `.roundRobin` uses smooth weighted selection. `.leastRequests` first compares

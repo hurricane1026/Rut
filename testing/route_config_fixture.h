@@ -12,7 +12,12 @@ struct RouteConfigFixture {
     RouteConfig* config = nullptr;
 
     RouteConfigFixture() {
-        if (arena.init(sizeof(RouteConfig) + 4096)) config = arena.alloc_t<RouteConfig>();
+        constexpr uintptr_t kAlignmentMask = alignof(RouteConfig) - 1;
+        if (!arena.init(sizeof(RouteConfig) + 4096)) return;
+        auto* storage = static_cast<u8*>(arena.alloc(sizeof(RouteConfig) + kAlignmentMask));
+        if (!storage) return;
+        const uintptr_t padding = -reinterpret_cast<uintptr_t>(storage) & kAlignmentMask;
+        config = ::new (storage + padding) RouteConfig();
     }
     ~RouteConfigFixture() {
         if (config) config->~RouteConfig();

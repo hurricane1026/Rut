@@ -161,23 +161,30 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
 // sweep_health_probes — instantiated in main.cc and the test TUs — and a single
 // strong symbol avoids multiple-definition across TUs that include this header.
 
-// Pick the next backend index for `upstream_id` via round-robin, skipping
-// ejected backends. If every backend is ejected, falls back to plain
-// round-robin (serving through a possibly-down backend beats refusing). A
-// single-backend upstream (count <= 1) always returns 0.
-inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
+// Round-robin over enabled backends, preferring healthy endpoints. If all
+// enabled backends are ejected, fail open to the first enabled endpoint in
+// rotation. Returning backend_count means no endpoint is enabled.
+inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us, const u16* weights) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
-    if (backend_count <= 1 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    if (backend_count == 1) return weights && weights[0] == 0 ? backend_count : 0;
+    u32 fallback = backend_count;
     for (u32 step = 0; step < backend_count; step++) {
         const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        if (weights && weights[idx] == 0) continue;
+        if (fallback == backend_count) fallback = idx;
         if (!backend_ejected(upstream_id, idx, now_us)) {
             rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
             return idx;
         }
     }
-    const u32 idx = rr_cursor[upstream_id] % backend_count;
-    rr_cursor[upstream_id] = static_cast<u16>((rr_cursor[upstream_id] + 1) % backend_count);
-    return idx;
+    if (fallback != backend_count)
+        rr_cursor[upstream_id] = static_cast<u16>((fallback + 1) % backend_count);
+    return fallback;
+}
+
+inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
+    return select_backend(upstream_id, backend_count, now_us, nullptr);
 }
 
 // Selection uses only the owning shard's sidecar in the pinned configuration.
@@ -2016,6 +2023,12 @@ void close_conn_if_live(Loop* loop, Connection& conn) {
     if (conn.fd >= 0) loop->close_conn(conn);
 }
 
+template <typename Loop>
+void send_terminal_response(Loop* loop, Connection& conn) {
+    if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
+        close_conn_if_live(loop, conn);
+}
+
 // A response has been completely sent on a connection that does not persist.
 // Backends whose close() cannot end the stream immediately send the FIN now so
 // the server, not the client, closes first (and holds TIME_WAIT), as nginx does.
@@ -3356,7 +3369,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                    ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            send_terminal_response(loop, conn);
             return;
         }
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
@@ -4146,10 +4159,6 @@ void handle_jit_outcome(Loop* loop,
                         jit::HandlerFn fn,
                         bool keep_alive,
                         const RouteEntry* selected_route) {
-    auto send_terminal_response = [&]() {
-        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
-            loop->close_conn(conn);
-    };
     if (outcome.kind != JitDispatchOutcome::Kind::TimerYield) {
         if (auto* passwords = request_password_gateway(loop)) passwords->cancel(conn.id);
     }
@@ -4254,7 +4263,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
@@ -4297,7 +4306,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 500, false, is_head, ordinary_local_response_version(conn));
                 release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
             // Distinguish "user didn't supply a body" (body_idx == 0)
@@ -4374,7 +4383,7 @@ void handle_jit_outcome(Loop* loop,
             }
             release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
-            send_terminal_response();
+            send_terminal_response(loop, conn);
             return;
         }
         case JitDispatchOutcome::Kind::Redirect: {
@@ -4398,7 +4407,7 @@ void handle_jit_outcome(Loop* loop,
             conn.keep_alive = false;
             release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
-            send_terminal_response();
+            send_terminal_response(loop, conn);
             return;
         }
         case JitDispatchOutcome::Kind::TimerYield: {
@@ -4433,7 +4442,7 @@ void handle_jit_outcome(Loop* loop,
             // on_response_sent's normal dispatch refresh would eventually
             // cover it, but only if the Send CQE arrives.
             loop->timer.add(&conn, loop->keepalive_timeout);
-            send_terminal_response();
+            send_terminal_response(loop, conn);
             return;
         }
         case JitDispatchOutcome::Kind::EventYield: {
@@ -4452,7 +4461,7 @@ void handle_jit_outcome(Loop* loop,
                                                             : HttpVersion::Http11);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
             };
             auto send_internal_error = [&]() {
                 // A failed io_uring TLS send may already have closed and reset
@@ -4468,7 +4477,7 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
             };
             auto upstream_target_matches = [&]() {
                 if (conn.upstream_fd < 0) return false;
@@ -4526,8 +4535,17 @@ void handle_jit_outcome(Loop* loop,
                     send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
                 }
-                auto& target = config->upstreams[upstream_id];
-                if (target.http2 || (target.tls.enabled && conn.req_wants_upgrade)) {
+                const auto& target = config->upstreams[upstream_id];
+                const u64 kStartUs = monotonic_us();
+                const bool kCanConnect = !target.http2 &&
+                                         !(target.tls.enabled && conn.req_wants_upgrade) &&
+                                         target.addr_count <= UpstreamTarget::kMaxBackends;
+                const u32 kBackend = kCanConnect ? select_backend(static_cast<u16>(upstream_id),
+                                                                  target.addr_count,
+                                                                  kStartUs,
+                                                                  target.weights)
+                                                 : target.addr_count;
+                if (kBackend >= target.addr_count) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -4537,7 +4555,7 @@ void handle_jit_outcome(Loop* loop,
                                            ordinary_local_response_version(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                     return;
                 }
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
@@ -4552,9 +4570,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 conn.upstream_fd = kUpstreamFd;
                 conn.upstream_idx = static_cast<u16>(upstream_id);
-                conn.upstream_start_us = monotonic_us();
-                const u32 kBackend = select_backend(
-                    static_cast<u16>(upstream_id), target.addr_count, conn.upstream_start_us);
+                conn.upstream_start_us = kStartUs;
                 conn.upstream_backend_idx = static_cast<u8>(kBackend);
                 if (!loop->submit_connect(
                         conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
@@ -5072,7 +5088,7 @@ void handle_jit_outcome(Loop* loop,
                                            ordinary_local_response_version(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                     return;
                 }
                 bool response_policy_request_connection = false;
@@ -5115,7 +5131,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
             if (outcome.request_policy_id == 0 && outcome.policy_bundle_id == 0 &&
@@ -5216,7 +5232,7 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
             if (strict_pipeline_successor) {
@@ -5323,7 +5339,7 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                send_terminal_response(loop, conn);
                 return;
             }
             conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
@@ -5504,7 +5520,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                     return;
                 }
                 conn.response_policy_id = forward_response_policy_id;
@@ -5523,7 +5539,7 @@ void handle_jit_outcome(Loop* loop,
                     conn, 500, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
             conn.state = ConnState::Proxying;
@@ -5547,7 +5563,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 503, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                     return;
                 }
                 conn.upstream_slot_held = true;
@@ -5588,7 +5604,7 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn, 500, /*keep_alive=*/false);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
-                send_terminal_response();
+                send_terminal_response(loop, conn);
                 return;
             }
 
@@ -5667,7 +5683,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                 }
                 return;
             }
@@ -5688,7 +5704,7 @@ void handle_jit_outcome(Loop* loop,
                         conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
-                    send_terminal_response();
+                    send_terminal_response(loop, conn);
                 }
                 return;
             }
@@ -5707,7 +5723,7 @@ void handle_jit_outcome(Loop* loop,
                                    ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
-            send_terminal_response();
+            send_terminal_response(loop, conn);
             return;
     }
 }
