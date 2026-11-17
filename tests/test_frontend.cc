@@ -48230,7 +48230,7 @@ route GET "/" {
 
 TEST(frontend, upstream_weights_round_trip_and_prebound_validation) {
     const char* source = R"rut(
-upstream api { weights: [3, 0, 1000], backends: ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"] }
+upstream api { weights: [3, 0, 65535], backends: ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut";
     auto tokens = lex(lit(source));
@@ -48248,14 +48248,13 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     REQUIRE(populate_route_config(cfg, rir.module));
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
     CHECK_EQ(cfg.upstreams[0].weights[1], 0u);
-    CHECK_EQ(cfg.upstreams[0].weights[2], 1000u);
+    CHECK_EQ(cfg.upstreams[0].weights[2], 65535u);
     cfg.upstreams[0].weights[0] = 9;
     REQUIRE(populate_route_config(cfg, rir.module));
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
     rir.module.upstreams[0].weight_count = 2;
     CHECK_FALSE(populate_route_config(cfg, rir.module));
-    rir.module.upstreams[0].weight_count = 3;
-    rir.module.upstreams[0].backend_weights[0] = 1001;
+    rir.module.upstreams[0].weight_count = 9;
     CHECK_FALSE(populate_route_config(cfg, rir.module));
     rir.destroy();
 }
@@ -48266,7 +48265,7 @@ TEST(frontend, upstream_weights_reject_invalid_shapes_and_integer_overflow) {
         "weights: [1]",
         "weights: [1, 2, 3]",
         "weights: [-1, 1]",
-        "weights: [1001, 1]",
+        "weights: [65536, 1]",
         "weights: [18446744073709551616000, 1]",
         "weights: [1, 1], weights: [1, 1]",
         "weights: [\"1\", 1]",

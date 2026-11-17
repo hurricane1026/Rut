@@ -53,9 +53,9 @@ def main():
         ports = [server.server_port for server in servers]
         addresses = ', '.join(f'"127.0.0.1:{port}"' for port in ports)
         source = f'''
-upstream api {{ backends: [{addresses}], weights: [3, 1, 0] }}
+upstream api {{ backends: [{addresses}], weights: [65535, 21845, 0] }}
 upstream off {{ backends: [{addresses}], weights: [0, 0, 0] }}
-upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}", "127.0.0.1:{ports[1]}"], weights: [1000, 1] }}
+upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}", "127.0.0.1:{ports[1]}"], weights: [65535, 1] }}
 route GET "/rr" {{ return forward(api, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(api, load_balance: .leastRequests) }}
 route GET "/off" {{ return forward(off, load_balance: .roundRobin) }}

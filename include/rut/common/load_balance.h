@@ -29,9 +29,9 @@ struct alignas(64) BackendSelectionState {
     // Smooth weighted selection is local to the forward site and shard.
     // Reset credits when eligibility changes so recovering/previously busy
     // backends cannot accumulate an unbounded scheduling debt.
-    // With <=8 weights in 0..1000 and a reset on eligibility changes,
-    // smooth scheduling credits (including intermediate sums) fit in i16.
-    i16 weighted_current[kMaxForwardSites][8]{};
+    // Eight 16-bit weights have a total <=524280; credits and intermediate
+    // sums fit in i32 even at Kong's maximum Target weight of 65535.
+    i32 weighted_current[kMaxForwardSites][8]{};
     u8 weighted_eligible[kMaxForwardSites]{};
 };
 }  // namespace rut

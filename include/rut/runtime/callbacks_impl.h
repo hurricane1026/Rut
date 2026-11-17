@@ -205,7 +205,6 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     const auto& weights = cfg->upstreams[uid].weights;
     bool any_healthy = false;
     for (u32 i = 0; i < count; ++i) {
-        if (weights[i] > 1000) return count;
         if (weights[i] != 0 && (excluded_backends & (1u << i)) == 0)
             any_healthy |= !backend_ejected(uid, i, now);
     }
@@ -237,11 +236,11 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
         if ((eligible & (1u << i)) == 0) continue;
-        current[i] = static_cast<i16>(current[i] + weights[i]);
+        current[i] += weights[i];
         total += weights[i];
         if (best == count || current[i] > current[best]) best = i;
     }
-    current[best] = static_cast<i16>(current[best] - total);
+    current[best] -= total;
     cursor = static_cast<u16>((best + 1) % count);
     return best;
 }

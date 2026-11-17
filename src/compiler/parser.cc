@@ -3872,7 +3872,7 @@ struct Parser {
                         u32 weight = 0;
                         for (u32 n = 0; n < lit.value()->text.len; ++n) {
                             const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
-                            if (weight > (1000u - digit) / 10u)
+                            if (weight > (65535u - digit) / 10u)
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       field_name);

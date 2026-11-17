@@ -496,7 +496,7 @@ form can remain: its callers must supply the argument. There is no default,
 inheritance, string spelling, numeric spelling, or policy alias.
 
 Optional `weights: [3, 1, 0]` assigns one literal integer per `backends`
-entry (1–8 endpoints, weights 0–1000). Omitted weights are all 1; a zero-weight
+entry (1–8 endpoints, weights 0–65535). Omitted weights are all 1; a zero-weight
 endpoint is disabled even during health fail-open and retry. `weights` requires
 an explicit `backends` list of matching length; duplicate, empty, nonliteral,
 negative, overflowing or out-of-range lists reject at compile time. An all-zero

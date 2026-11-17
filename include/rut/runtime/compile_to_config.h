@@ -599,7 +599,6 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                     up.weight_count != cfg.upstreams[i].addr_count)
                     return false;
                 for (u32 b = 0; b < up.weight_count; ++b) {
-                    if (up.backend_weights[b] > 1000) return false;
                     cfg.upstreams[i].weights[b] = up.backend_weights[b];
                 }
             }
@@ -650,7 +649,6 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                     up.weight_count != cfg.upstreams[i].addr_count)
                     return false;
                 for (u32 b = 0; b < up.weight_count; ++b) {
-                    if (up.backend_weights[b] > 1000) return false;
                     cfg.upstreams[i].weights[b] = up.backend_weights[b];
                 }
             }

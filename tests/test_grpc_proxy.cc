@@ -1,4 +1,5 @@
 #include "posix.h"
+#include "route_config_fixture.h"
 #include "rut/common/types.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/epoll_event_loop.h"
@@ -3155,7 +3156,9 @@ TEST(grpc_proxy, rejected_tls_identity_ejects_backend_once) {
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
     GrpcDriveFixture loop;
-    RouteConfig cfg;
+    rut::test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config);
+    RouteConfig& cfg = *cfg_owner.config;
     const RouteConfig* active = &cfg;
     loop.config_ptr = &active;
     Connection conn;
@@ -3185,7 +3188,9 @@ TEST(grpc_proxy, rejected_tls_identity_ejects_backend_once) {
     h2.grpc.client_tls.ssl_ctx = nullptr;
 
     health->fails = 0;
-    RouteConfig bad_tls_cfg;
+    rut::test::RouteConfigFixture bad_tls_cfg_owner;
+    REQUIRE(bad_tls_cfg_owner.config);
+    RouteConfig& bad_tls_cfg = *bad_tls_cfg_owner.config;
     REQUIRE(bad_tls_cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
     bad_tls_cfg.upstreams[0].http2 = true;
     bad_tls_cfg.upstreams[0].tls.enabled = true;
@@ -3729,8 +3734,12 @@ TEST(grpc_proxy, stale_handshake_result_does_not_touch_reloaded_backend) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
-    RouteConfig old_config;
-    RouteConfig current_config;
+    rut::test::RouteConfigFixture old_config_owner;
+    REQUIRE(old_config_owner.config);
+    RouteConfig& old_config = *old_config_owner.config;
+    rut::test::RouteConfigFixture current_config_owner;
+    REQUIRE(current_config_owner.config);
+    RouteConfig& current_config = *current_config_owner.config;
     const RouteConfig* active = &current_config;
     GrpcDriveFixture loop;
     loop.config_ptr = &active;
@@ -3754,8 +3763,12 @@ TEST(grpc_proxy, stale_connect_failure_does_not_touch_reloaded_backend) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
-    RouteConfig old_config;
-    RouteConfig current_config;
+    rut::test::RouteConfigFixture old_config_owner;
+    REQUIRE(old_config_owner.config);
+    RouteConfig& old_config = *old_config_owner.config;
+    rut::test::RouteConfigFixture current_config_owner;
+    REQUIRE(current_config_owner.config);
+    RouteConfig& current_config = *current_config_owner.config;
     const RouteConfig* active = &current_config;
     GrpcDriveFixture loop;
     loop.config_ptr = &active;
@@ -3776,8 +3789,12 @@ TEST(grpc_proxy, stale_connect_failure_does_not_touch_reloaded_backend) {
     CHECK_EQ(health->fails, 1u);
 }
 TEST(grpc_proxy, stale_idle_upstream_closes_but_active_old_config_drains) {
-    RouteConfig old_config;
-    RouteConfig current_config;
+    rut::test::RouteConfigFixture old_config_owner;
+    REQUIRE(old_config_owner.config);
+    RouteConfig& old_config = *old_config_owner.config;
+    rut::test::RouteConfigFixture current_config_owner;
+    REQUIRE(current_config_owner.config);
+    RouteConfig& current_config = *current_config_owner.config;
     const RouteConfig* active = &current_config;
     GrpcDriveFixture loop;
     loop.config_ptr = &active;
@@ -4258,8 +4275,12 @@ TEST(grpc_proxy, session_failure_excludes_idle_goaway_and_stale_config) {
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
     GrpcDriveFixture loop;
-    RouteConfig current_config;
-    RouteConfig stale_config;
+    rut::test::RouteConfigFixture current_config_owner;
+    REQUIRE(current_config_owner.config);
+    RouteConfig& current_config = *current_config_owner.config;
+    rut::test::RouteConfigFixture stale_config_owner;
+    REQUIRE(stale_config_owner.config);
+    RouteConfig& stale_config = *stale_config_owner.config;
     const RouteConfig* active = &current_config;
     loop.config_ptr = &active;
 

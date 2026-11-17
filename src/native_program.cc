@@ -559,8 +559,6 @@ bool load_native_program(const char* source,
         const auto& target = c.upstreams[i];
         if (target.addr_count == 0 || target.addr_count > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream backend count");
-        for (u32 b = 0; b < target.addr_count; ++b)
-            if (target.weights[b] > 1000) return fail("invalid native upstream weight");
     }
     // The artifact has no live compiler addresses. Restore only declared byte
     // views and native symbols, then reconstruct indices against the new owner.
