@@ -3833,9 +3833,8 @@ struct Parser {
                     item.upstream.port_is_set = true;
                     seen_port = true;
                 } else if (field_name.eq({"backends", 8})) {
-                    // `backends: ["host:port", ...]` — a non-empty list of
-                    // string literals; the forward call chooses the selection policy. Analyze
-                    // splits each into (ip, port).
+                    // String arrays retain equal weights; dictionary entries bind each
+                    // endpoint directly to its literal weight in declaration order.
                     if (item.upstream.backend_count > 0)
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
@@ -3843,50 +3842,47 @@ struct Parser {
                     if (!lbrk) return core::make_unexpected(lbrk.error());
                     if (cur().type == TokenType::RBracket)
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
+                    bool dictionary = false;
                     while (true) {
-                        auto lit = expect(TokenType::StringLit);
-                        if (!lit) return core::make_unexpected(lit.error());
-                        if (item.upstream.backend_count >= AstUpstreamDecl::kMaxBackends)
+                        auto endpoint = expect(TokenType::StringLit);
+                        if (!endpoint) return core::make_unexpected(endpoint.error());
+                        const u32 index = item.upstream.backend_count;
+                        if (index >= AstUpstreamDecl::kMaxBackends)
                             return frontend_error(FrontendError::TooManyItems,
-                                                  span_from(*lit.value()));
+                                                  span_from(*endpoint.value()));
+                        const bool has_weight = take(TokenType::Colon);
+                        if (index == 0) dictionary = has_weight;
+                        if (has_weight != dictionary)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*endpoint.value()),
+                                                  field_name);
+                        if (dictionary) {
+                            for (u32 n = 0; n < index; ++n) {
+                                if (item.upstream.backend_lits[n].eq(endpoint.value()->text))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*endpoint.value()),
+                                                          field_name);
+                            }
+                            auto lit = expect(TokenType::IntLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            u32 weight = 0;
+                            for (u32 n = 0; n < lit.value()->text.len; ++n) {
+                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
+                                if (weight > (65535u - digit) / 10u)
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*lit.value()),
+                                                          field_name);
+                                weight = weight * 10u + digit;
+                            }
+                            item.upstream.backend_weights[index] = static_cast<u16>(weight);
+                            ++item.upstream.weight_count;
+                        }
                         item.upstream.backend_lits[item.upstream.backend_count++] =
-                            lit.value()->text;
-                        if (!take(TokenType::Comma)) break;
-                        if (cur().type == TokenType::RBracket) break;  // trailing comma
+                            endpoint.value()->text;
+                        if (!take(TokenType::Comma) || cur().type == TokenType::RBracket) break;
                     }
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
-                } else if (field_name.eq({"weights", 7})) {
-                    if (item.upstream.weight_count != 0)
-                        return frontend_error(FrontendError::UnsupportedSyntax,
-                                              span_from(*field.value()),
-                                              field_name);
-                    auto open = expect(TokenType::LBracket);
-                    if (!open) return core::make_unexpected(open.error());
-                    if (cur().type == TokenType::RBracket)
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax, span_from(cur()), field_name);
-                    while (true) {
-                        auto lit = expect(TokenType::IntLit);
-                        if (!lit) return core::make_unexpected(lit.error());
-                        u32 weight = 0;
-                        for (u32 n = 0; n < lit.value()->text.len; ++n) {
-                            const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
-                            if (weight > (65535u - digit) / 10u)
-                                return frontend_error(FrontendError::InvalidInteger,
-                                                      span_from(*lit.value()),
-                                                      field_name);
-                            weight = weight * 10u + digit;
-                        }
-                        if (item.upstream.weight_count >= AstUpstreamDecl::kMaxBackends)
-                            return frontend_error(
-                                FrontendError::TooManyItems, span_from(*lit.value()), field_name);
-                        item.upstream.backend_weights[item.upstream.weight_count++] =
-                            static_cast<u16>(weight);
-                        if (!take(TokenType::Comma) || cur().type == TokenType::RBracket) break;
-                    }
-                    auto close = expect(TokenType::RBracket);
-                    if (!close) return core::make_unexpected(close.error());
                 } else if (field_name.eq({"health_check", 12})) {
                     // `health_check: { path: "...", interval: <dur>, status: N }`
                     // — active-health config (data only this slice). path and
@@ -4018,10 +4014,6 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
-            if (item.upstream.weight_count != 0 &&
-                item.upstream.weight_count != item.upstream.backend_count)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"weights", 7});
             if (item.upstream.backend_count > 0) {
                 // `backends:` is mutually exclusive with host/port — mixing
                 // them is ambiguous about which is the primary endpoint.

@@ -3769,7 +3769,7 @@ TEST(native_program, mtls_consumer_registry_pins_verified_connection_identity_ac
 TEST(native_program, weighted_upstream_metadata_survives_compiler_exit_and_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(
-upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"], weights: [3, 1, 0] }
+upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1, "127.0.0.1:9003": 0] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
     Program owner;

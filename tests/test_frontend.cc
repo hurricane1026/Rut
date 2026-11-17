@@ -48230,7 +48230,7 @@ route GET "/" {
 
 TEST(frontend, upstream_weights_round_trip_and_prebound_validation) {
     const char* source = R"rut(
-upstream api { weights: [3, 0, 65535], backends: ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"] }
+upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut";
     auto tokens = lex(lit(source));
@@ -48261,21 +48261,25 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 
 TEST(frontend, upstream_weights_reject_invalid_shapes_and_integer_overflow) {
     const char* fields[] = {
-        "weights: []",
-        "weights: [1]",
-        "weights: [1, 2, 3]",
-        "weights: [-1, 1]",
-        "weights: [65536, 1]",
-        "weights: [18446744073709551616000, 1]",
-        "weights: [1, 1], weights: [1, 1]",
-        "weights: [\"1\", 1]",
+        "backends: []",
+        "backends: [:]",
+        "backends: [\"127.0.0.1:9001\": -1]",
+        "backends: [\"127.0.0.1:9001\": 65536]",
+        "backends: [\"127.0.0.1:9001\": 18446744073709551616000]",
+        "backends: [\"127.0.0.1:9001\": \"1\"]",
+        "backends: [\"127.0.0.1:9001\": ]",
+        "backends: [\"127.0.0.1:9001\": 1, \"127.0.0.1:9001\": 2]",
+        "backends: [\"127.0.0.1:9001\": 1, \"127.0.0.1:9002\"]",
+        "backends: [\"127.0.0.1:9001\", \"127.0.0.1:9002\": 1]",
+        "backends: [\"127.0.0.1:9001\": 1], backends: [\"127.0.0.1:9002\": 1]",
+        "backends: [\"127.0.0.1:9001\"], weights: [1]",
+        "backends: [\"127.0.0.1:9000\": 1, \"127.0.0.1:9001\": 1, \"127.0.0.1:9002\": 1, "
+        "\"127.0.0.1:9003\": 1, \"127.0.0.1:9004\": 1, \"127.0.0.1:9005\": 1, \"127.0.0.1:9006\": "
+        "1, \"127.0.0.1:9007\": 1, \"127.0.0.1:9008\": 1]",
     };
     for (const char* field : fields) {
-        char source[512];
-        snprintf(source,
-                 sizeof(source),
-                 "upstream api { backends: [\"127.0.0.1:9001\", \"127.0.0.1:9002\"], %s }",
-                 field);
+        char source[1024];
+        snprintf(source, sizeof(source), "upstream api { %s }", field);
         auto tokens = lex(lit(source));
         REQUIRE(tokens);
         CHECK_FALSE(parse_file_heap(tokens.value()));

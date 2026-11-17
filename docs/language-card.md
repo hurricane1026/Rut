@@ -495,13 +495,16 @@ it does not contain or supply a selection policy. The `at "ip:port"` upstream
 form can remain: its callers must supply the argument. There is no default,
 inheritance, string spelling, numeric spelling, or policy alias.
 
-Optional `weights: [3, 1, 0]` assigns one literal integer per `backends`
-entry (1–8 endpoints, weights 0–65535). Omitted weights are all 1; a zero-weight
-endpoint is disabled even during health fail-open and retry. `weights` requires
-an explicit `backends` list of matching length; duplicate, empty, nonliteral,
-negative, overflowing or out-of-range lists reject at compile time. An all-zero
-list is valid configuration but has no eligible upstream and HTTP forwarding
-returns 503. No selection argument is inferred from the upstream weights.
+Weighted backends use a Swift dictionary literal:
+`backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]`.
+Keys are endpoint string literals and values are literal integers (0–65535;
+1–8 endpoints), kept in declaration order. Existing string arrays assign all
+weights 1. There is no separate `weights` field. Duplicate dictionary keys,
+mixed array/dictionary entries, empty collections, nonliteral, negative,
+overflowing or out-of-range weights reject at compile time. A zero-weight
+endpoint is disabled even during health fail-open and retry. An all-zero
+dictionary is valid but has no eligible upstream; HTTP forwarding returns 503.
+No selection argument is inferred from the upstream weights.
 
 `.roundRobin` uses smooth weighted selection. `.leastRequests` first compares
 active-request/weight ratios exactly, then uses the same weighted selection

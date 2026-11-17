@@ -625,7 +625,7 @@ canonical spelling for common gateway tasks.
 
 ### M3：状态、限流与高可用（清单 2、5、7）
 
-- [x] K017 静态后端权重：显式 `backends` 配套 `weights`（0–65535），
+- [x] K017 静态后端权重：`backends` 地址到权重字典（0–65535），
   平滑加权轮询、按 active/weight 的最少请求选择、零权重禁用、健康与重试排除。
   这是静态目标分流子集，不等于已完成动态 Kong Upstream/Target API、哈希粘性或全部高可用审计。
 

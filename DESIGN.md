@@ -1545,9 +1545,12 @@ a closed policy type; the initial policy vocabulary is `.roundRobin` and
 `.leastRequests`. The compiler requires this argument at every `forward` call; legacy
 `forward(api)` is rejected, including for single-backend upstreams.
 
-`upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], weights: [3, 1] }`
-adds bounded relative endpoint weights (literal 0–65535, one per explicit
-backend, default 1). Zero disables a target; all-zero pools return unavailable
+`upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1] }`
+binds each endpoint key to its relative weight (literal 0–65535) using Swift
+dictionary literal syntax. Existing string arrays assign weight 1 to every backend.
+Dictionary entries preserve declaration order; duplicate keys, mixed array/dictionary
+entries, empty collections and invalid weights reject. There is no separate `weights`
+field. Zero disables a target; all-zero pools return unavailable
 rather than bypassing disablement during health fail-open or retry. Smooth
 weighted round-robin uses fixed shard/site-local credits; least-requests
 compares exact active/weight ratios and applies weighted tie-breaking. Credits

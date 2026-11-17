@@ -51,11 +51,13 @@ def main():
             servers.append(server)
             threads.append(thread)
         ports = [server.server_port for server in servers]
-        addresses = ', '.join(f'"127.0.0.1:{port}"' for port in ports)
+        addresses = ', '.join(f'"127.0.0.1:{port}": {weight}'
+                              for port, weight in zip(ports, (65535, 21845, 0)))
+        disabled = ', '.join(f'"127.0.0.1:{port}": 0' for port in ports)
         source = f'''
-upstream api {{ backends: [{addresses}], weights: [65535, 21845, 0] }}
-upstream off {{ backends: [{addresses}], weights: [0, 0, 0] }}
-upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}", "127.0.0.1:{ports[1]}"], weights: [65535, 1] }}
+upstream api {{ backends: [{addresses}] }}
+upstream off {{ backends: [{disabled}] }}
+upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
 route GET "/rr" {{ return forward(api, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(api, load_balance: .leastRequests) }}
 route GET "/off" {{ return forward(off, load_balance: .roundRobin) }}
