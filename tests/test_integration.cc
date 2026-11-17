@@ -3,6 +3,7 @@
 #include "fixtures/envoy_milestone_s.inc"
 #include "fixtures/envoy_oracle_milestone_s.inc"
 #include "framing_selection_preflight_fixture.h"
+#include "route_config_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -3124,11 +3125,13 @@ TEST(active_health, partial_probe_response_does_not_extend_probe_deadline) {
     REQUIRE(c != nullptr);
     REQUIRE(loop->alloc_upstream_buf(*c));
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     c->set_slots(nullptr, nullptr, &on_probe_response<EpollEventLoop>, nullptr);
     REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>("H"), 1), 1u);
     set_probe_in_flight(uid, 0, true);
@@ -3277,11 +3280,13 @@ TEST(active_health, fragmented_probe_headers_rearm_until_timeout) {
     REQUIRE(c != nullptr);
     REQUIRE(loop->alloc_upstream_buf(*c));
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_backend_result(uid, 0, /*success=*/true, monotonic_us());
@@ -3409,11 +3414,13 @@ TEST(active_health, timeout_sweep_defers_until_batch_drains) {
     Connection* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     c->set_slots(nullptr, nullptr, nullptr, &on_probe_sent<EpollEventLoop>);
     REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
@@ -3695,6 +3702,7 @@ TEST(active_health, generic_probe_close_clears_inflight) {
     REQUIRE(c != nullptr);
     const u16 uid = 3;
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
@@ -3779,11 +3787,13 @@ TEST(active_health, send_registration_failure_defers_without_downing_backend) {
     Connection* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("GET / HTTP/1.1\r\n\r\n"), 18), 18u);
     REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
@@ -3848,11 +3858,13 @@ TEST(active_health, real_negative_upstream_send_marks_backend_down) {
     Connection* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_active_probe_result(uid, 0, /*healthy=*/true, monotonic_us());
@@ -3897,11 +3909,13 @@ TEST(active_health, recv_registration_failure_defers_without_downing_backend) {
     Connection* c = loop->alloc_conn();
     REQUIRE(c != nullptr);
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     REQUIRE(loop->begin_upstream_episode(*c));
     set_probe_in_flight(uid, 0, true);
     record_backend_result(uid, 0, /*success=*/true, monotonic_us());
@@ -3953,11 +3967,13 @@ TEST(active_health, probe_sent_preserves_preread_response) {
     REQUIRE(c != nullptr);
     REQUIRE(loop->alloc_upstream_buf(*c));
     c->is_health_probe = true;
+    c->set_metrics_client(false);
     c->fd = -1;
     c->upstream_fd = fds[0];
     c->upstream_idx = uid;
     c->upstream_backend_idx = 0;
     c->request_config = &cfg;
+    c->health_probe_config_identity = cfg.http_cache_identity;
     static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), sizeof(kResp) - 1),
                sizeof(kResp) - 1);
@@ -23825,7 +23841,9 @@ TEST(route, populate_route_config_accepts_failure_only_bundle_and_rejects_bad_id
     rir.module.failure_policy_count = 1;
     rir.module.policy_bundles[0] = {0, 1};
     rir.module.policy_bundle_count = 1;
-    RouteConfig cfg{};
+    rut::test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config);
+    auto& cfg = *cfg_owner.config;
     REQUIRE(populate_route_config(cfg, rir.module));
     REQUIRE_EQ(cfg.failure_policy_count, 1u);
     REQUIRE_EQ(cfg.policy_bundle_count, 1u);
@@ -23839,7 +23857,9 @@ TEST(route, populate_route_config_accepts_failure_only_bundle_and_rejects_bad_id
     bad_response.module.failure_policy_count = 1;
     bad_response.module.policy_bundles[0] = {1, 1};
     bad_response.module.policy_bundle_count = 1;
-    RouteConfig bad_cfg{};
+    rut::test::RouteConfigFixture bad_cfg_owner;
+    REQUIRE(bad_cfg_owner.config);
+    auto& bad_cfg = *bad_cfg_owner.config;
     CHECK(!populate_route_config(bad_cfg, bad_response.module));
     bad_response.destroy();
 
@@ -23847,7 +23867,9 @@ TEST(route, populate_route_config_accepts_failure_only_bundle_and_rejects_bad_id
     REQUIRE(bad_failure.init(1, 1));
     bad_failure.module.policy_bundles[0] = {0, 1};
     bad_failure.module.policy_bundle_count = 1;
-    RouteConfig bad_failure_cfg{};
+    rut::test::RouteConfigFixture bad_failure_cfg_owner;
+    REQUIRE(bad_failure_cfg_owner.config);
+    auto& bad_failure_cfg = *bad_failure_cfg_owner.config;
     CHECK(!populate_route_config(bad_failure_cfg, bad_failure.module));
     bad_failure.destroy();
 }

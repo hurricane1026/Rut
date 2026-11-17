@@ -84,8 +84,7 @@ struct UpstreamTarget {
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
 
-    // Active health-check config from `health_check: { ... }` (data only — no
-    // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
+    // Active HTTP health-check config. hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
     UpstreamTlsSpec tls{};

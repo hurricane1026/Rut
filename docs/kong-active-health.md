@@ -1,0 +1,48 @@
+# Kong 核心能力：主动 HTTP 健康检查
+
+对应 K019 的主动 HTTP 探测数据面子集。Kong 的[健康检查说明](https://developer.konghq.com/gateway/traffic-control/health-checks-circuit-breakers/)
+将周期探测用于故障摘除和恢复。Rut 沿用已有配置，不引入插件运行语言、关键字或依赖：
+
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    health_check: { path: "/healthz", interval: 1s, status: 200 }
+}
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+```
+
+- Linux epoll 和 io_uring 都会按周期发送真实 HTTP/1.1 GET，比较完整响应头中的状态码。
+  探测失败会摘除目标，后续成功探测恢复目标；普通请求连接成功不能清除主动摘除。
+- 仅支持当前明文 HTTP/1 上游；HTTPS、HTTP/2/gRPC 健康协议不在本次范围。
+  单个预期状态、统一探测周期与一次成功/失败阈值沿用既有语义。
+- 每个 shard、每个目标最多一个在途探针。权重 0 的目标不接收探测或业务流量。
+  每次 sweep 最多发出 32 个探针，并为业务连接保留 64 个空闲槽；预算不足时延后。
+- io_uring 在 sweep 发起探针时另预留 16 个 SQ 提交位置；探针使用连接自己的地址和请求/响应切片。
+  超时或关闭先取消准确的 I/O episode，SQ 满时保留取消重试账本；所有 target/cancel
+  完成之前不释放切片、连接槽或在途标记。关闭探针不改变业务请求/连接指标。
+- 探针生命周期由上游超时约束，逐包输入不会延长截止时间。排空期间不发起新探针；
+  强制排空和 shutdown 会取消已有探针。
+- 热更新重新安排周期并重置健康判定。旧探针的结果必须同时匹配配置指针和身份，
+  即使新配置复用了相同地址也不能污染其健康状态；内核不借用旧配置中的 sockaddr。
+
+Rut 原有的“所有启用目标都已摘除时 fail-open”保持不变；不宣称该行为与 Kong 的
+不可用阈值、全不可用响应完全相同。本次不实现 Kong 的 HTTP 状态数组、可配置计数阈值、
+独立健康/不健康周期、主动 HTTPS、Admin API 或节点间共享健康判定。
+
+验证入口：
+
+```bash
+cmake --build build --target test_health_probes rut
+ctest --test-dir build -R '^test_(health_probes|active_health_)' --output-on-failure
+```
+
+独立 C++ 用例通过真实 loopback sockets 验证两后端的失败/恢复、超时和取消回收、
+槽位预留、零权重、原地址配置替换、SQ 满的取消重试以及旧配置销毁后的异步 connect。
+真实网关用例分别在 epoll/io_uring 上通过 H1/H2 下游观察 A/B 分流、健康失败后的摘除和
+恢复后的重新分流，且确认禁用目标未收到探针或业务请求。
+
+本地 Linux 验证：13 个 C++ 探针测试（278 项检查）在 Release 和 ASan/UBSan 下通过，
+14 个真实网关/分流/路由/ELF CTest 项全部通过，另有 1,674 个网络、1,312 个前端、
+104 个 gRPC 与 88 个 Native artifact 回归通过。未运行 macOS kqueue 或真实 Kong 对照测试。
+
+Connection 的私有 Native ABI 新增探针配置身份，artifact 版本升为 20；旧产物需重新编译。
