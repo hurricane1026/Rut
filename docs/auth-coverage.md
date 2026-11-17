@@ -20,7 +20,7 @@ whether a competing open-source edition includes them.
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, A-only DNS and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS transports beyond the bounded A-only profile, CNAME/IPv6 discovery, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
-| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny | Administrative membership management and larger policy sets; bounded registry snapshots can replace memberships |
+| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny | Larger policy sets, identity tenant ownership, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
 | Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
@@ -34,7 +34,7 @@ whether a competing open-source edition includes them.
 | LDAP | Pending | Direct LDAP protocol, TLS, bind/search escaping, limits/timeouts, credential hygiene; an HTTP bridge does not satisfy this row |
 | SAML / CAS | Pending | Full SP flow, signed assertions/tickets, audience/destination/time checks, XML entity restrictions, signature wrapping and replay protection |
 | Keycloak / Casdoor | Default access-token claim adapters implemented | Keycloak default realm/client roles and Casdoor v4.27.1 DefaultJWT exact owner/tokenType/qualified-group policy compose with verified RS256; native two-backend HTTP/1 + HTTP/2 matrices. See [Keycloak roles](keycloak-roles.md) and [Casdoor access-token policy](casdoor-access-token.md). Live-provider conformance, OIDC/browser login and provider management remain separate. |
-| Casbin / Wolf RBAC | Pending | Named access model, trusted identity/policy mapping, policy update semantics and deny/error behavior |
+| Casbin / Wolf RBAC | Pending | This is a small Rut rule mapper, not a Casbin/Wolf integration. Named model adapters, broader policy updates and their compatibility semantics remain open |
 | Shared identity / sessions | Bounded online HS256 token permits: exact-token SHA-256 keys, mandatory authenticated Redis GET on every request, fail-closed missing/error/cleanup paths, trusted fixed-subject/scoped issuance with atomic NX/EXAT enrollment, online read/write scope authorization, current/previous HS256 verification with current-only signing, idempotent self-service exact-token logout, opt-in local-AOF durable revocation tombstones and verified service TLS tests | End-user login/registration, refresh endpoints and OIDC logout, cookie fixation/CSRF defenses, distributed durable ownership and explicit replication/failover consistency; see [JWT sessions](jwt-sessions.md) |
 
 `auth.rotatingBasic` provides a static current/previous Basic credential window
@@ -42,6 +42,21 @@ for one configured Consumer. Both slots are evaluated, current wins a tie, and
 removing the previous credential revokes it. Empty slots are disabled; empty
 metadata or two disabled slots are configuration errors. Authentication still
 uses singleton Authorization headers and rejects malformed or duplicate fields.
+
+## Bounded Consumer RBAC
+
+`middleware/rbac.rut` consumes only an identity already returned by trusted
+`consumerAuthenticate`. Up to four exact rules map tenant, role (a Consumer
+group), resource and action to `allow` or `deny`; validation covers every slot
+and every route selector before policy evaluation. Any matching deny overrides
+allows, and no matching allow returns 403. Invalid configuration returns 503.
+Routes supply tenant/resource/action as trusted program configuration. The
+Consumer registry does not claim a tenant for the identity, so matching a route
+tenant is not evidence of tenant ownership; tenant-qualified group names can
+separate role namespaces. Updated rules require a newly loaded program. The
+native example tests independent old/new program snapshots, not in-process RCU
+policy mutation. See [the language contract](language-card.md#bounded-consumer-rbac-policy)
+and [the runnable example](../examples/consumer-rbac-auth.rut).
 
 ## Audit of executable gaps
 

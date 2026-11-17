@@ -1,0 +1,47 @@
+// Exact, bounded role-to-resource/action policy. Pass only an identity returned
+// by a trusted authenticator and trusted route configuration.
+struct Rule {
+    tenant: str
+    role: str
+    resource: str
+    action: str
+    effect: str
+}
+
+func validRule(_ rule: Rule) -> bool {
+    let empty = rule.tenant == "" && rule.role == "" && rule.resource == "" &&
+        rule.action == "" && rule.effect == ""
+    let complete = Bytes(rule.tenant).count > 0 && Bytes(rule.tenant).count <= 128 &&
+        Bytes(rule.role).count > 0 && Bytes(rule.role).count <= 128 &&
+        Bytes(rule.resource).count > 0 && Bytes(rule.resource).count <= 128 &&
+        Bytes(rule.action).count > 0 && Bytes(rule.action).count <= 128 &&
+        (rule.effect == "allow" || rule.effect == "deny")
+    empty || complete
+}
+
+func matches(_ rule: Rule, _ tenant: str, _ resource: str, _ action: str) -> bool {
+    rule.tenant == tenant && rule.resource == resource && rule.action == action
+}
+
+// Validate the complete bounded policy before evaluation. Exact deny rules
+// override every matching allow rule; no match is default deny.
+func require(_ identity: Json, _ tenant: str, _ resource: str, _ action: str,
+             _ first: Rule, _ second: Rule, _ third: Rule, _ fourth: Rule) -> Json {
+    guard Bytes(tenant).count > 0 && Bytes(tenant).count <= 128 &&
+        Bytes(resource).count > 0 && Bytes(resource).count <= 128 &&
+        Bytes(action).count > 0 && Bytes(action).count <= 128 &&
+        validRule(first) && validRule(second) && validRule(third) && validRule(fourth) else { respond 503 }
+    let any = first.role != "" || second.role != "" || third.role != "" || fourth.role != ""
+    guard any else { respond 503 }
+    let denied = (matches(first, tenant, resource, action) && first.effect == "deny" && jwtHasGroup(identity, first.role)) ||
+        (matches(second, tenant, resource, action) && second.effect == "deny" && jwtHasGroup(identity, second.role)) ||
+        (matches(third, tenant, resource, action) && third.effect == "deny" && jwtHasGroup(identity, third.role)) ||
+        (matches(fourth, tenant, resource, action) && fourth.effect == "deny" && jwtHasGroup(identity, fourth.role))
+    guard !denied else { respond 403 }
+    let allowed = (matches(first, tenant, resource, action) && first.effect == "allow" && jwtHasGroup(identity, first.role)) ||
+        (matches(second, tenant, resource, action) && second.effect == "allow" && jwtHasGroup(identity, second.role)) ||
+        (matches(third, tenant, resource, action) && third.effect == "allow" && jwtHasGroup(identity, third.role)) ||
+        (matches(fourth, tenant, resource, action) && fourth.effect == "allow" && jwtHasGroup(identity, fourth.role))
+    guard allowed else { respond 403 }
+    identity
+}

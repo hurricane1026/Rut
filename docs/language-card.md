@@ -3527,6 +3527,25 @@ the runtime matcher; query/form APIs remain restricted to raw-key `header`
 records. All records, including disabled pins, are validated for exact
 fingerprint format and unique method/pin ownership.
 
+## Bounded Consumer RBAC policy
+
+`middleware/rbac.rut` maps a verified Consumer identity's exact `groups` to a
+trusted route's tenant, resource and action using at most four `Rule` values.
+Each active rule has nonempty tenant, role, resource, action (each at most 128
+bytes) and exact effect `allow` or `deny`; an unused slot must be entirely empty.
+The full policy and route selectors are validated before evaluation. Any matching
+deny takes precedence over all matching allows; otherwise an exact allow is
+required, with default 403. Invalid policy is 503. Authentication remains
+separate and must precede `rbac.require`; pass only `consumerAuthenticate` output.
+
+Tenant/resource/action arguments are trusted route configuration, not request
+headers. Consumer records have groups but no tenant claim, so this module does
+not establish tenant ownership or isolation. Use tenant-qualified group names
+in both policy and registry where role namespaces need separation. The policy
+is a bounded static mapping in the loaded program; replacing it requires loading
+a new program. See [the runnable example](../examples/consumer-rbac-auth.rut)
+and [authorization coverage](auth-coverage.md#bounded-consumer-rbac).
+
 ## Persistent replay claim composition (implemented bounded profile)
 
 The ordinary Rut Redis module exposes `redisReplayClaim` for atomic authenticated
