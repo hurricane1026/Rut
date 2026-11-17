@@ -4259,6 +4259,15 @@ in O(n), so sifting cannot move another matching entry behind the scan.
 This is bounded evidence rather than kernel or wall-clock verification; see
 `docs/user-code-formal-verification.md` for assumptions and excluded policies.
 
+The precise response-read transport timer has additional ownership coverage in
+`spec/response_timer_owner.tla`: successful SQE publication, failed arm/cancel,
+independent target/cancel finals, duplicate/stale rejection, borrowed timespec
+preservation across reset/clear, and generation exhaustion. A ghost submission
+ledger checks the owner bits, with separate target/cancel delivery fairness.
+Deterministic native SQ tests and four production-header mutations check these
+operations. Wait-batch expiry arbitration and complete slot reclamation remain
+outside this bounded owner model.
+
 Compiler verification and offline TLC exports share
 `build_handler_protocol_model`, so source/peer reference cases no longer need
 a separately hand-copied handler. The exporter follows actual RIR control and

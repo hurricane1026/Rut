@@ -448,6 +448,7 @@ set_tests_properties(test_network PROPERTIES LABELS "unit;network")
 
 set(TIMER_MODEL_CHECK_COMMAND ${CMAKE_COMMAND} -E true)
 set(TIMER_MODEL_CHECK_DEPENDS)
+set(RESPONSE_TIMER_CHECK_COMMAND ${CMAKE_COMMAND} -E true)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_timer_model test_timer_model.cc)
     target_link_libraries(test_timer_model rut_runtime)
@@ -456,7 +457,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME test_timer_model COMMAND test_timer_model)
     set_tests_properties(test_timer_model PROPERTIES LABELS "unit;network;model")
     set(TIMER_MODEL_CHECK_COMMAND $<TARGET_FILE:test_timer_model>)
-    set(TIMER_MODEL_CHECK_DEPENDS test_timer_model)
+    add_executable(test_response_timer_owner test_response_timer_owner.cc)
+    target_link_libraries(test_response_timer_owner rut_runtime)
+    target_compile_definitions(test_response_timer_owner PRIVATE RUT_TESTING=1)
+    target_include_directories(test_response_timer_owner PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+    add_test(NAME test_response_timer_owner COMMAND test_response_timer_owner)
+    set_tests_properties(test_response_timer_owner PROPERTIES LABELS "unit;network;model")
+    set(TIMER_MODEL_CHECK_DEPENDS test_timer_model test_response_timer_owner)
+    set(RESPONSE_TIMER_CHECK_COMMAND $<TARGET_FILE:test_response_timer_owner>)
 endif()
 
 add_executable(test_wait_scheduler test_wait_scheduler.cc)
@@ -4367,6 +4376,9 @@ if(RUT_ENABLE_JIT)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_response_timer_owner_manifest
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_response_timer_model.py --check-only)
+    set_tests_properties(test_response_timer_owner_manifest PROPERTIES LABELS "unit;model")
     add_test(NAME test_timer_model_manifest
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_timer_model.py --check-only)
     set_tests_properties(test_timer_model_manifest PROPERTIES LABELS "unit;model")
@@ -4430,6 +4442,8 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND ${TIMER_MODEL_CHECK_COMMAND}
+        COMMAND ${RESPONSE_TIMER_CHECK_COMMAND}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_response_timer_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_timer_model.py --check-only
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
         COMMAND $<TARGET_FILE:test_ws_lifecycle>
@@ -4522,6 +4536,8 @@ else()
         COMMAND $<TARGET_FILE:test_network>
         COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND ${TIMER_MODEL_CHECK_COMMAND}
+        COMMAND ${RESPONSE_TIMER_CHECK_COMMAND}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_response_timer_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_timer_model.py --check-only
         COMMAND $<TARGET_FILE:test_ws_shutdown_deadline>
         COMMAND $<TARGET_FILE:test_ws_lifecycle>
