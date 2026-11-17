@@ -173,6 +173,11 @@ jobs:
     name: Build & Test (${{ matrix.compiler }}, ${{ matrix.build_type }}, shard ${{ matrix.shard }}/4)
     if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 1G
     strategy:
       fail-fast: false
       matrix:
@@ -187,13 +192,23 @@ jobs:
           submodules: recursive
       - name: Verify CI test sharding
         run: python3 -m unittest discover -s tests -p test_ci_sharding.py
+      # Cache compiler outputs, never test results. ccache revalidates compiler
+      # contents, flags and included files before reusing an object.
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: |
+            ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
       - name: Install tools
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel ccache
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang-21
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
@@ -202,7 +217,8 @@ jobs:
 
       - name: Configure
         run: |
-          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm"
+          ccache --zero-stats
+          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           else
@@ -210,7 +226,18 @@ jobs:
           fi
 
       - name: Build
-        run: ninja -C build
+        run: |
+          ninja -C build
+          ccache --show-stats
+
+      # Publish immediately after building so long-running tests do not delay
+      # cache availability. Identical shards share one immutable cache key.
+      - name: Save compiler cache
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       - name: Set up Java for compiler-generated protocol models
         if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
