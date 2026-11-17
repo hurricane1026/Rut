@@ -1,0 +1,304 @@
+name: Benchmarks
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+    inputs:
+      require_avx512:
+        description: 'Require AVX-512 execution for the integer-parser diagnostic'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench-proxy:
+    name: Proxy keep-alive bench (TLS, io_uring)
+    runs-on: ubuntu-24.04
+    # Informational — proxy latency/throughput numbers go to the log so a change
+    # off the per-byte path (e.g. cancel-by-fd) can be eyeballed against history.
+    # Not a pass/fail perf gate (shared runners are too noisy); the bench itself
+    # still asserts every request completes, so a hang/truncation regression fails.
+    # Real io_uring (6.x kernel on ubuntu-24.04); Release for representative numbers.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-dev
+      - name: Configure
+        run: cmake -B build -G Ninja -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: ninja -C build test_integration
+      - name: Bench
+        # set -o pipefail so a failing test run (non-zero exit) isn't masked by grep's
+        # exit status — otherwise the bench's "every request completes" assertion is
+        # silently dropped whenever grep matches a line.
+        run: |
+          set -o pipefail
+          RUT_BENCH=1 ./build/tests/test_integration --filter=proxy_tls_iouring.keepalive_latency_bench 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
+
+  bench-simd-x86:
+    name: SIMD scan_uri bench (x86)
+    runs-on: ubuntu-24.04
+    # Informational — perf numbers go to the log so reviewers can see
+    # SIMD speedup across ISAs side-by-side. Doesn't fail on regression
+    # (would need a stable baseline + tolerance; left to follow-up).
+    #
+    # Runner pool: GitHub-hosted ubuntu-24.04 runners are a mixed pool
+    # of Intel Xeon (Ice Lake-class, AVX-512 capable) and AMD EPYC
+    # 7763 / 9V74 (Zen 3/4, AVX-512 absent or masked off in the VM
+    # SKU). The bench step runtime-checks /proc/cpuinfo flags and
+    # skips ISAs the runner can't execute, so the avx512 column may
+    # be absent depending on which CPU was scheduled. We tried
+    # ubuntu-22.04 to bias toward Intel; that pool turned out to
+    # share the same AMD-heavy distribution AND its 5.15 kernel
+    # headers don't have the io_uring features rut_runtime depends
+    # on, so we stayed on 24.04.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
+
+      - name: Report CPU capabilities
+        run: |
+          grep -m1 '^model name' /proc/cpuinfo
+          # Use only the first 'flags' line (one CPU's-worth) and
+          # extract every avx*/sse* token from it. -m1 alone on the
+          # outer grep would only print the first matched flag.
+          grep -m1 '^flags' /proc/cpuinfo | grep -oE '(avx[0-9a-z_]*|sse[0-9_]*)' | sort -u | tr '\n' ' '
+          echo
+
+      - name: Bench across x86 SIMD ISAs
+        run: |
+          mkdir -p /tmp/bench-results /tmp/dispatch-results
+          # GitHub-hosted x86 runners' CPUs vary (Intel Xeon / AMD EPYC).
+          # Skip ISAs the CPU can't execute. Per-arch isolation keeps a
+          # single failure from aborting the whole job.
+          for arch in scalar sse2 avx2 avx512; do
+            case $arch in
+              sse2)    needs="sse2" ;;
+              avx2)    needs="avx2" ;;
+              # avx512: gate on AVX512BW (byte/word ops), not just F.
+              # avx512.cc uses _mm512_cmpeq_epi8_mask / cmplt_epu8_mask /
+              # movepi8_mask, all of which require BW. Knights Landing /
+              # Mill expose F+ER+CD+PF but not BW; SkyLake-X and onward
+              # have BW. Gating on F alone would let a KNL runner build
+              # with -mavx512bw and SIGILL at runtime.
+              avx512)  needs="avx512bw" ;;
+              scalar)  needs="" ;;
+            esac
+            if [ -n "$needs" ] && ! grep -qE "^flags.*\b$needs\b" /proc/cpuinfo; then
+              echo "::notice::CPU lacks $needs — skipping SIMD_ARCH=$arch"
+              continue
+            fi
+            echo "=== building SIMD_ARCH=$arch ==="
+            rm -rf "build-$arch"
+            if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DSIMD_ARCH=$arch \
+                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
+              echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
+              cat "/tmp/cmake-$arch.err"
+              continue
+            fi
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
+              echo "::warning::build failed for SIMD_ARCH=$arch"
+              tail -30 "/tmp/build-$arch.err"
+              continue
+            fi
+            ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
+              { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
+            echo
+          done
+
+      - name: Unified comparison report
+        run: |
+          echo "==============================================================="
+          echo "scan_uri SIMD vs scalar — same hardware, different ISA backends"
+          echo "==============================================================="
+          for arch in scalar sse2 avx2 avx512; do
+            f="/tmp/bench-results/$arch.txt"
+            if [ ! -f "$f" ]; then
+              echo
+              echo "--- $arch (skipped: CPU lacks support) ---"
+              continue
+            fi
+            echo
+            echo "--- $arch ---"
+            cat "$f"
+          done
+
+          echo
+          echo "==============================================================="
+          echo "dispatch comparison — linear scan vs scalar ART vs JIT ART"
+          echo "==============================================================="
+          for arch in scalar sse2 avx2 avx512; do
+            f="/tmp/dispatch-results/$arch.txt"
+            if [ ! -f "$f" ]; then
+              echo
+              echo "--- $arch (skipped: CPU lacks support) ---"
+              continue
+            fi
+            echo
+            echo "--- $arch ---"
+            cat "$f"
+          done
+
+  bench-simd-arm:
+    name: SIMD scan_uri bench (arm64)
+    runs-on: ubuntu-24.04-arm
+    # GitHub-hosted ubuntu-24.04-arm runners are Cobalt 100 (Neoverse N2)
+    # with NEON. SVE may or may not be exposed depending on the runner
+    # configuration; the bench job below tolerates either case.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
+
+      - name: Report CPU capabilities
+        run: |
+          grep -m1 '^Features' /proc/cpuinfo || true
+          grep -m1 '^CPU implementer' /proc/cpuinfo || true
+          grep -m1 '^CPU part' /proc/cpuinfo || true
+
+      - name: Bench across arm64 SIMD ISAs
+        run: |
+          mkdir -p /tmp/bench-results /tmp/dispatch-results
+          # neon is universal on aarch64; sve only if the runner exposes it.
+          ARCHES="scalar neon"
+          if grep -q -m1 'sve' /proc/cpuinfo; then
+            ARCHES="$ARCHES sve"
+          else
+            echo "::notice::SVE not available on this runner — skipping sve build"
+          fi
+          # Each arch attempt is isolated — if one fails (e.g. compiler
+          # quirk on SVE), the others still run and the job stays green.
+          for arch in $ARCHES; do
+            echo "=== building SIMD_ARCH=$arch ==="
+            rm -rf "build-$arch"
+            if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DSIMD_ARCH=$arch \
+                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
+              echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
+              cat "/tmp/cmake-$arch.err"
+              continue
+            fi
+            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
+              echo "::warning::build failed for SIMD_ARCH=$arch"
+              tail -30 "/tmp/build-$arch.err"
+              continue
+            fi
+            ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
+              { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
+            if ! ninja -C "build-$arch" bench_dispatch_compare 2> "/tmp/dispatch-build-$arch.err"; then
+              echo "::warning::dispatch_compare build failed for SIMD_ARCH=$arch"
+              tail -30 "/tmp/dispatch-build-$arch.err"
+              continue
+            fi
+            ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
+              { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
+            echo
+          done
+
+      - name: Unified comparison report
+        run: |
+          echo "==============================================================="
+          echo "scan_uri SIMD vs scalar — arm64 backends on same hardware"
+          echo "==============================================================="
+          # Enable nullglob so an empty result set yields zero loop
+          # iterations rather than the literal pattern (which would
+          # fail under `bash -e`). If every per-arch attempt failed,
+          # we just print a notice and exit clean — the per-arch
+          # ::warning::s above already document what went wrong.
+          shopt -s nullglob
+          results=(/tmp/bench-results/*.txt)
+          if [ ${#results[@]} -eq 0 ]; then
+            echo "::notice::no per-arch scan_uri results captured — see warnings above"
+          else
+            for f in "${results[@]}"; do
+              arch=$(basename "$f" .txt)
+              echo
+              echo "--- $arch ---"
+              cat "$f"
+            done
+          fi
+
+          echo
+          echo "==============================================================="
+          echo "dispatch comparison — linear scan vs scalar ART vs JIT ART (arm64)"
+          echo "==============================================================="
+          shopt -s nullglob
+          dispatch_results=(/tmp/dispatch-results/*.txt)
+          if [ ${#dispatch_results[@]} -eq 0 ]; then
+            echo "::notice::no dispatch_compare results captured — see warnings above"
+          else
+            for f in "${dispatch_results[@]}"; do
+              arch=$(basename "$f" .txt)
+              echo
+              echo "--- $arch ---"
+              cat "$f"
+            done
+          fi
+
+  integer-parser:
+    name: Integer parser (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20
+      - name: Check every integer parser candidate and benchmark
+        env:
+          CXX: clang++-20
+          RUT_REQUIRE_AVX512: ${{ matrix.arch == 'x86' && inputs.require_avx512 && '1' || '0' }}
+        run: scripts/check_parse_integer_arch.sh build/integer-parser
+      - name: Publish architecture summary
+        if: always()
+        run: |
+          if [[ -f build/integer-parser/summary.md ]]; then
+            cat build/integer-parser/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integer-parser-${{ matrix.arch }}
+          path: |
+            build/integer-parser/environment.txt
+            build/integer-parser/summary.md
+            build/integer-parser/test-*.log
+            build/integer-parser/bench-*.csv
+          if-no-files-found: error

@@ -1,5 +1,5 @@
 # llhttp (Node.js HTTP parser) — compiled as C
-add_library(llhttp STATIC
+add_library(llhttp STATIC EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/third_party/llhttp/src/llhttp.c
     ${PROJECT_SOURCE_DIR}/third_party/llhttp/src/api.c
     ${PROJECT_SOURCE_DIR}/third_party/llhttp/src/http.c
@@ -13,6 +13,8 @@ set_target_properties(llhttp PROPERTIES
 )
 target_compile_options(llhttp PRIVATE -O2 -DNDEBUG)
 
+# Performance-only targets are built explicitly; ordinary builds retain the
+# kernel probe executables used by correctness tests.
 # Benchmark executables
 if(RUT_BUILD_EBPF_PROBE)
     find_package(Threads REQUIRED)
@@ -38,7 +40,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
-add_executable(bench_http_parser bench_http_parser.cc)
+add_executable(bench_http_parser EXCLUDE_FROM_ALL bench_http_parser.cc)
 target_link_libraries(bench_http_parser rut_runtime llhttp)
 target_include_directories(bench_http_parser PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -46,7 +48,7 @@ target_include_directories(bench_http_parser PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/llhttp/include
 )
 
-add_executable(bench_connection bench_connection.cc)
+add_executable(bench_connection EXCLUDE_FROM_ALL bench_connection.cc)
 target_link_libraries(bench_connection rut_runtime)
 target_include_directories(bench_connection PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -55,7 +57,7 @@ target_include_directories(bench_connection PRIVATE
 
 # HTTP/2 HPACK + framing hot paths. Links the vendored nghttp2 reference for a
 # decode baseline (rut vs nghttp2), mirroring bench_http_parser vs llhttp.
-add_executable(bench_hpack bench_hpack.cc)
+add_executable(bench_hpack EXCLUDE_FROM_ALL bench_hpack.cc)
 target_link_libraries(bench_hpack rut_runtime nghttp2_ref)
 target_include_directories(bench_hpack PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -66,11 +68,11 @@ target_compile_options(bench_hpack PRIVATE -O3 -DNDEBUG)
 # JIT-specialized ART vs scalar ART, exercising both the direct JIT
 # function pointer and the productized RouteConfig dispatch paths.
 if(RUT_ENABLE_JIT)
-    add_executable(bench_routing_matrix routing/dispatch_matrix.cc)
+    add_executable(bench_routing_matrix EXCLUDE_FROM_ALL routing/dispatch_matrix.cc)
     target_link_libraries(bench_routing_matrix rut_runtime rut_jit)
     target_include_directories(bench_routing_matrix PRIVATE ${PROJECT_SOURCE_DIR}/include ${LLVM_INCLUDE_DIRS})
     target_compile_options(bench_routing_matrix PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
-    add_executable(bench_art_jit_spike bench_art_jit_spike.cc)
+    add_executable(bench_art_jit_spike EXCLUDE_FROM_ALL bench_art_jit_spike.cc)
     target_link_libraries(bench_art_jit_spike rut_runtime rut_jit)
     target_include_directories(bench_art_jit_spike PRIVATE
         ${PROJECT_SOURCE_DIR}/include
@@ -86,7 +88,7 @@ endif()
 # The bench compiles SIMD_FLAGS through so the backend's intrinsics
 # match the rut_runtime build, and adds the simd/ private include
 # directory for char_tables.h (kUriTable used by the scalar reference).
-add_executable(bench_scan_uri bench_scan_uri.cc)
+add_executable(bench_scan_uri EXCLUDE_FROM_ALL bench_scan_uri.cc)
 target_link_libraries(bench_scan_uri rut_runtime)
 target_include_directories(bench_scan_uri PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -110,7 +112,7 @@ target_compile_definitions(bench_scan_uri PRIVATE BENCH_SIMD_BACKEND="${SIMD_ARC
 # scan_uri job means an Intel runner with avx512f would pick that up
 # automatically.
 if(RUT_ENABLE_JIT)
-    add_executable(bench_dispatch_compare bench_dispatch_compare.cc)
+    add_executable(bench_dispatch_compare EXCLUDE_FROM_ALL bench_dispatch_compare.cc)
     target_link_libraries(bench_dispatch_compare rut_runtime rut_jit)
     target_include_directories(bench_dispatch_compare PRIVATE
         ${PROJECT_SOURCE_DIR}/include
@@ -132,13 +134,13 @@ target_compile_options(bench_ws_mask PRIVATE -O3 -fno-exceptions -fno-rtti)
 # Decimal parser microbenchmark; libc only, no external parser dependency.
 # Keep the kernel optimized even in a Debug tree, while the benchmark driver
 # retains baseline ISA flags. Never apply the candidate ISA to the oracle.
-add_library(rut_integer_parser_bench STATIC ${PROJECT_SOURCE_DIR}/src/runtime/parse_integer.cc)
+add_library(rut_integer_parser_bench STATIC EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/src/runtime/parse_integer.cc)
 target_include_directories(rut_integer_parser_bench PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_options(rut_integer_parser_bench PRIVATE -O3 -DNDEBUG
     "$<TARGET_PROPERTY:rut_integer_parser,COMPILE_OPTIONS>")
 target_compile_definitions(rut_integer_parser_bench PRIVATE
     "$<TARGET_PROPERTY:rut_integer_parser,COMPILE_DEFINITIONS>")
-add_executable(bench_parse_integer bench_parse_integer.cc)
+add_executable(bench_parse_integer EXCLUDE_FROM_ALL bench_parse_integer.cc)
 target_link_libraries(bench_parse_integer PRIVATE rut_integer_parser_bench)
 target_include_directories(bench_parse_integer PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_compile_options(bench_parse_integer PRIVATE -O3 -DNDEBUG)
