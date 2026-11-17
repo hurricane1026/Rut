@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from auth_h2_fixture import request as h2_request
 import http.client
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ def credential(name,owner,method,secret,enabled=True):
 
 
 @contextmanager
-def gateway(args,config,root,invalid=False):
+def gateway(args,config,root,invalid=False,sensitive=()):
     root.mkdir()
     with socket.socket() as probe:
         probe.bind(('127.0.0.1',0));port=probe.getsockname()[1]
@@ -58,7 +59,7 @@ def gateway(args,config,root,invalid=False):
         process.terminate()
         try:process.wait(5)
         except subprocess.TimeoutExpired:process.kill();process.wait()
-        for secret in ['alice-current','alice-old','alice:password','custom-key','window-key']:
+        for secret in ['alice-current','alice-old','alice:password','custom-key','window-key',*sensitive]:
             assert secret not in log.read_text(),log.read_text()
 
 
@@ -127,6 +128,64 @@ def main():
                                                  if item['id'] == credential_id)
                 initial = snapshot
             assert generated['generated-bearer-v1'] != generated['generated-bearer-v2']
+            paired_snapshot = root / 'paired-bearer.snapshot.json'
+            paired_key = root / 'paired-bearer.key'
+            paired_result = subprocess.run(
+                [args.admin, 'generate-key-verifier', str(root / 'initial-snapshot.json'),
+                 'alice', 'paired-bearer-v1', 'bearer', str(paired_snapshot), str(paired_key)],
+                capture_output=True, timeout=10)
+            assert paired_result.returncode == 0 and not paired_result.stdout and not paired_result.stderr
+            bearer_bytes = paired_key.read_bytes()
+            assert len(bearer_bytes) == 64 and all(byte in b'0123456789abcdef' for byte in bearer_bytes)
+            assert paired_key.stat().st_mode & 0o777 == 0o600
+            paired_config = json.loads(paired_snapshot.read_bytes())
+            paired_record = next(item for item in paired_config['credentials']
+                                 if item['id'] == 'paired-bearer-v1')
+            assert 'secret' not in paired_record
+            bearer_verifier = hashlib.sha256(bearer_bytes).hexdigest()
+            assert paired_record['secretSha256'] == bearer_verifier
+
+            header_snapshot = root / 'paired-header.snapshot.json'
+            header_key = root / 'paired-header.key'
+            header_result = subprocess.run(
+                [args.admin, 'generate-key-verifier', str(paired_snapshot), 'alice',
+                 'paired-header-v1', 'header', str(header_snapshot), str(header_key)],
+                capture_output=True, timeout=10)
+            assert header_result.returncode == 0 and not header_result.stdout and not header_result.stderr
+            header_bytes = header_key.read_bytes()
+            assert len(header_bytes) == 64 and all(byte in b'0123456789abcdef' for byte in header_bytes)
+            assert header_key.stat().st_mode & 0o777 == 0o600
+            paired_config = json.loads(header_snapshot.read_bytes())
+            header_record = next(item for item in paired_config['credentials']
+                                 if item['id'] == 'paired-header-v1')
+            assert 'secret' not in header_record
+            header_verifier = hashlib.sha256(header_bytes).hexdigest()
+            assert header_record['secretSha256'] == header_verifier
+            compiler = Path(args.server).with_name('rut-compile')
+            artifact = subprocess.run([str(compiler), args.source, args.opt],
+                                      env=dict(os.environ, AUTH_REGISTRY=json.dumps(paired_config)),
+                                      capture_output=True, timeout=90)
+            assert artifact.returncode == 0, artifact.stderr.decode(errors='replace')
+            for raw_key in (bearer_bytes, header_bytes):
+                assert raw_key not in artifact.stdout + artifact.stderr
+            with gateway(args, paired_config, root / 'paired-keys',
+                         sensitive=(bearer_bytes.decode(), header_bytes.decode())) as paired_port:
+                assert request(paired_port, '/private',
+                               f'Authorization: Bearer {bearer_bytes.decode()}\r\n') == (200, b'alice')
+                assert request(paired_port, '/private',
+                               f'Authorization: Bearer {bearer_verifier}\r\n')[0] == 401
+                assert request(paired_port, '/key',
+                               f'X-API-Key: {header_bytes.decode()}\r\n')[0] == 204
+                assert request(paired_port, '/key',
+                               f'X-API-Key: {header_verifier}\r\n')[0] == 401
+                assert h2_request(paired_port, '/private',
+                                  [('authorization', f'Bearer {bearer_bytes.decode()}')]) == (200, b'alice')
+                assert h2_request(paired_port, '/private',
+                                  [('authorization', f'Bearer {bearer_verifier}')])[0] == 401
+                assert h2_request(paired_port, '/key',
+                                  [('x-api-key', header_bytes.decode())])[0] == 204
+                assert h2_request(paired_port, '/key',
+                                  [('x-api-key', header_verifier)])[0] == 401
         if args.admin and generated:
             activation = max(1, int(time.time()) - 10)
             expiry = int(time.time()) + 600

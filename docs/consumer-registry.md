@@ -226,6 +226,34 @@ build/src/rut-consumers validate consumer-config/v2.json
 build/src/rut-consumers inspect consumer-config/v2.json
 ```
 
+`generate-key-verifier INPUT CONSUMER_ID CREDENTIAL_ID METHOD SNAPSHOT_OUTPUT
+KEY_OUTPUT` provisions a bearer/header key without placing its raw text in the
+snapshot. It adds a `secretSha256` verifier to the new credential in the
+snapshot and writes the corresponding generated 64-byte lowercase-hex text to a
+separate key file with mode 0600 and no trailing newline. The key file is the
+one-time delivery material; the new snapshot record contains only its verifier.
+Other existing records are preserved, so raw secrets already present in the
+input may remain in the replacement snapshot. The input is unchanged, and both
+outputs are new files under the same owned directory, which must not be
+group/other-writable. The CLI opens and retains both verified directory
+descriptors and rejects equal basenames, directory mismatches, and existing
+outputs before requesting randomness.
+
+The complete replacement snapshot is built and validated before publication.
+The key file is published first, then the snapshot, each by synced 0600
+temporary file and atomic no-replace link. These are two publications, not one
+atomic transaction: if key publication fails, no snapshot is published; if
+snapshot publication fails after the key is linked, the key may remain without
+its snapshot. Fixed errors identify the stage and instruct operators to inspect
+the directory before retrying. A sync or temporary-file cleanup failure can
+leave publication state uncertain, so do not assume rollback or delete files
+automatically. Neither key nor verifier is written to stdout, stderr, or
+command arguments.
+
+```sh
+build/src/rut-consumers generate-key-verifier consumer-config/v1.json alice alice-key-v2 bearer consumer-config/v2.json consumer-config/alice-key-v2.txt
+```
+
 An apply transaction has exactly four required arrays:
 
 ```json
@@ -300,7 +328,9 @@ The CLI regression covers creation, generated bearer/header keys, exact
 lowercase-hex formatting, distinct outputs, escaped IDs, disabled-Consumer
 staging, collision/method/bounds/capacity rejection, zero-output secret
 handling, rotation/disable/removal, redacted preflight, competing output
-writers and all-or-nothing/idempotent verifier conversion. The native HTTP registry fixtures consume generated snapshots on
+writers, all-or-nothing/idempotent verifier conversion, and separate key/verifier
+provisioning with preflight and publication-fault checks. Native HTTP fixtures
+consume generated snapshots on
 epoll/io_uring with HTTP/1 and HTTP/2, verify overlap, then reject a disabled
 old generated key while retaining the new one. Transparent
 request-target/body mutation and online administrative HTTP APIs remain separate.

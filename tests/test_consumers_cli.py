@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Consumer administration, key generation, atomic rejection and filesystem policy."""
 from concurrent.futures import ThreadPoolExecutor
-import json
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -203,6 +203,160 @@ def test_hash_keys(tool, root):
     assert planned.returncode == 0 and planned_digest.encode() not in planned.stdout + planned.stderr
 
 
+def test_generated_key_verifier(tool, root):
+    credentials = [dict(id='windowed', consumerId='alice', method='bearer',
+                        secret='existing-raw-key', enabled=True,
+                        notBefore=1700000000, expiresAt=1800000000)]
+    snapshot = dict(version=1, consumers=[dict(id='alice', enabled=True, groups=['staff'])],
+                    credentials=credentials)
+    source = private(root / 'paired-input.json', snapshot)
+    original = source.read_bytes()
+
+    def provision(method, credential_id):
+        key_path = root / f'{credential_id}.key'
+        snapshot_path = root / f'{credential_id}.snapshot.json'
+        result = run(tool, 'generate-key-verifier', source, 'alice', credential_id,
+                     method, snapshot_path, key_path)
+        assert result.returncode == 0 and result.stdout == b'' and result.stderr == b'', result
+        raw_key = key_path.read_bytes()
+        assert len(raw_key) == 64 and re.fullmatch(rb'[0-9a-f]{64}', raw_key)
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(snapshot_path.stat().st_mode) == 0o600
+        output = json.loads(snapshot_path.read_bytes())
+        record = next(item for item in output['credentials'] if item['id'] == credential_id)
+        assert record['method'] == method and record['consumerId'] == 'alice'
+        assert record['secretSha256'] == hashlib.sha256(raw_key).hexdigest()
+        assert 'secret' not in record
+        assert raw_key not in snapshot_path.read_bytes()
+        assert next(item for item in output['credentials'] if item['id'] == 'windowed') == credentials[0]
+        assert run(tool, 'validate', snapshot_path).returncode == 0
+        inspected = run(tool, 'inspect', snapshot_path)
+        assert inspected.returncode == 0
+        assert raw_key not in inspected.stdout + inspected.stderr
+        assert record['secretSha256'].encode() not in inspected.stdout + inspected.stderr
+        assert source.read_bytes() == original
+        return snapshot_path, key_path, raw_key, record['secretSha256']
+
+    bearer = provision('bearer', 'paired-bearer')
+    header = provision('header', 'paired-header')
+
+    # Bad arguments and output preflight fail before either output is created.
+    invalid = [
+        ('missing', 'new-id', 'bearer'),
+        ('alice', 'windowed', 'bearer'),
+        ('alice', 'new-id', 'basic'),
+        ('alice', 'new-id', 'mtls'),
+        ('alice', 'bad id', 'header'),
+    ]
+    for index, (consumer_id, credential_id, method) in enumerate(invalid):
+        snapshot_path = root / f'invalid-paired-{index}.snapshot'
+        key_path = root / f'invalid-paired-{index}.key'
+        result = run(tool, 'generate-key-verifier', source, consumer_id, credential_id,
+                     method, snapshot_path, key_path)
+        assert result.returncode == 2 and not result.stdout
+        assert not snapshot_path.exists() and not key_path.exists()
+
+    alias_target = root / 'same-output'
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'alias-id', 'bearer',
+                 alias_target, str(root) + '/./same-output')
+    assert result.returncode == 2 and not result.stdout and not alias_target.exists()
+    alias = root / 'directory-alias'
+    alias.symlink_to(root, target_is_directory=True)
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'alias-id', 'bearer',
+                 root / 'same-parent-name', alias / 'same-parent-name')
+    assert result.returncode == 2 and not result.stdout and not (root / 'same-parent-name').exists()
+    other = root / 'different-directory'
+    other.mkdir()
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'different-dir', 'header',
+                 root / 'different-snapshot', other / 'different-key')
+    assert result.returncode == 2 and not result.stdout
+    assert not (root / 'different-snapshot').exists() and not (other / 'different-key').exists()
+    existing = root / 'existing-output'
+    existing.write_bytes(b'preserve')
+    absent = root / 'absent-key-output'
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'preflight', 'bearer',
+                 existing, absent)
+    assert result.returncode == 2 and not result.stdout
+    assert existing.read_bytes() == b'preserve' and not absent.exists()
+    existing_key = root / 'existing-key-output'
+    existing_key.write_bytes(b'preserve-key')
+    absent_snapshot = root / 'absent-snapshot-output'
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'preflight-key', 'bearer',
+                 absent_snapshot, existing_key)
+    assert result.returncode == 2 and not result.stdout
+    assert existing_key.read_bytes() == b'preserve-key' and not absent_snapshot.exists()
+    symlink_target = root / 'symlink-target'
+    symlink_target.write_bytes(b'do-not-follow')
+    symlink_output = root / 'symlink-output'
+    symlink_output.symlink_to(symlink_target)
+    symlink_peer = root / 'symlink-peer'
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'symlink-id', 'header',
+                 symlink_peer, symlink_output)
+    assert result.returncode == 2 and not result.stdout and not symlink_peer.exists()
+    assert symlink_target.read_bytes() == b'do-not-follow'
+    loose_dir = root / 'loose-output-dir'
+    loose_dir.mkdir()
+    loose_dir.chmod(0o777)
+    result = run(tool, 'generate-key-verifier', source, 'alice', 'loose-id', 'bearer',
+                 loose_dir / 'snapshot', loose_dir / 'key')
+    loose_dir.chmod(0o700)
+    assert result.returncode == 2 and not result.stdout
+    assert not (loose_dir / 'snapshot').exists() and not (loose_dir / 'key').exists()
+
+    race_snapshot = root / 'paired-race.snapshot'
+    race_key = root / 'paired-race.key'
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        results = list(workers.map(
+            lambda _: run(tool, 'generate-key-verifier', source, 'alice', 'race-paired',
+                          'bearer', race_snapshot, race_key), range(6)))
+    assert sum(result.returncode == 0 for result in results) == 1
+    assert all(result.returncode in (0, 2) and not result.stdout for result in results)
+    race_raw_key = race_key.read_bytes()
+    race_config = json.loads(race_snapshot.read_bytes())
+    race_record = next(item for item in race_config['credentials'] if item['id'] == 'race-paired')
+    assert race_record['secretSha256'] == hashlib.sha256(race_raw_key).hexdigest()
+    assert len(race_raw_key) == 64 and stat.S_IMODE(race_key.stat().st_mode) == 0o600
+
+    if sys.platform.startswith('linux'):
+        # Inject publication failures without adding a production failpoint.
+        shim_source = root / 'linkat-fault.c'
+        shim = root / 'linkat-fault.so'
+        shim_source.write_text(r'''#define _GNU_SOURCE
+#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+int linkat(int oldfd, const char *oldpath, int newfd, const char *newpath, int flags) {
+    static int calls;
+    ++calls;
+    const char *fail = getenv("RUT_TEST_LINKAT_FAIL_AT");
+    if (fail && atoi(fail) == calls) { errno = EIO; return -1; }
+    return (int)syscall(SYS_linkat, oldfd, oldpath, newfd, newpath, flags);
+}
+''')
+        built = subprocess.run(['cc', '-shared', '-fPIC', '-o', str(shim), str(shim_source)],
+                               capture_output=True, timeout=20)
+        assert built.returncode == 0, built.stderr.decode(errors='replace')
+        for fail_at in (1, 2):
+            snapshot_path = root / f'fault-{fail_at}.snapshot'
+            key_path = root / f'fault-{fail_at}.key'
+            env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_LINKAT_FAIL_AT=str(fail_at))
+            result = subprocess.run([tool, 'generate-key-verifier', str(source), 'alice',
+                                     f'fault-{fail_at}', 'bearer', str(snapshot_path), str(key_path)],
+                                    capture_output=True, timeout=10, env=env)
+            assert result.returncode == 2 and not result.stdout
+            if fail_at == 1:
+                assert not key_path.exists() and not snapshot_path.exists()
+            else:
+                raw_key = key_path.read_bytes()
+                assert key_path.exists() and len(raw_key) == 64
+                assert re.fullmatch(rb'[0-9a-f]{64}', raw_key)
+                assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+                assert not snapshot_path.exists()
+                assert b'key output was published' in result.stderr
+                assert raw_key not in result.stderr and raw_key not in result.stdout
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -215,6 +369,7 @@ def main(tool):
         test_generated_keys(tool, root)
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
+        test_generated_key_verifier(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())
@@ -249,12 +404,13 @@ def main(tool):
         private(patch, changes([alice], [key]))
         # Preflight uses the complete runtime validator before showing metadata.
         # It creates no files, leaves inputs intact, and matches later inspection.
-        before = {p.name: p.read_bytes() for p in root.iterdir()}
+        before = {p.name: p.read_bytes() for p in root.iterdir() if p.is_file() and not p.is_symlink()}
         planned = run(tool, 'plan', initial, patch)
         assert planned.returncode == 0 and not planned.stderr
         assert planned.stdout == inspected.stdout
         assert b'private-key' not in planned.stdout + planned.stderr
-        assert {p.name: p.read_bytes() for p in root.iterdir()} == before
+        assert {p.name: p.read_bytes() for p in root.iterdir()
+                if p.is_file() and not p.is_symlink()} == before
         # Rotation overlap, group replacement and explicit disable preserve IDs.
         next_key = dict(key, id='key-v2', secret='private-key-v2')
         private(patch, changes([dict(alice, groups=['readers'])], [next_key]))
