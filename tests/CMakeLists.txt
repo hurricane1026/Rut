@@ -5488,3 +5488,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
         endforeach()
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(weighted_backend epoll io_uring)
+        add_test(NAME test_weighted_upstream_${weighted_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_weighted_upstream.py
+                --server $<TARGET_FILE:rut> --backend ${weighted_backend})
+        set_tests_properties(test_weighted_upstream_${weighted_backend} PROPERTIES
+            LABELS "integration;network;load-balance;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

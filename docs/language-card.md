@@ -495,11 +495,34 @@ it does not contain or supply a selection policy. The `at "ip:port"` upstream
 form can remain: its callers must supply the argument. There is no default,
 inheritance, string spelling, numeric spelling, or policy alias.
 
+Weighted backends use a Swift dictionary literal:
+`backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]`.
+Keys are endpoint string literals and values are literal integers (0–65535;
+1–8 endpoints), kept in declaration order. Existing string arrays assign all
+weights 1. There is no separate `weights` field. Duplicate dictionary keys,
+mixed array/dictionary entries, empty collections, nonliteral, negative,
+overflowing or out-of-range weights reject at compile time. A zero-weight
+endpoint is disabled even during health fail-open and retry. An all-zero
+dictionary is valid but has no eligible upstream; HTTP forwarding returns 503.
+In HTTP/1 handlers, `wait(upstream(api).connect())` rotates among enabled
+backends with health fail-open. If none is enabled, it ends the request with
+HTTP 503 before opening an upstream connection.
+No selection argument is inferred from the upstream weights.
+
+`.roundRobin` uses smooth weighted selection. `.leastRequests` first compares
+active-request/weight ratios exactly, then uses the same weighted selection
+among equal-ratio candidates. Equal weights preserve the existing rotating
+behavior. Selection credits are per forward site and shard; changes in health,
+retry exclusions or least-request eligibility reset credits to avoid recovery
+bursts. Credits are fixed-size and allocation-free; RCU replacement configurations
+start with fresh credits while old requests retain their original active gauges.
+See [weighted-upstream.rut](../examples/weighted-upstream.rut).
+
 Round-robin cursors are per forward site and shard. Least-request counts are
 shared across routes using the same upstream backend set on that shard and
 count active requests/RPCs, not pooled connections. The policy is part of the
 forward operation, including suspended JIT handlers and native gRPC streams.
-Least-request ties rotate at the forward site. Connecting attempts count as
+Least-request ties use the weights at the forward site (rotating when equal). Connecting attempts count as
 active; completion, failure, cancellation, and reset release the count once.
 Retries release the failed attempt before selecting again. Both algorithms
 skip ejected backends when healthy ones exist and retain the existing fail-open

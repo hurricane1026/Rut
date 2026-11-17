@@ -384,6 +384,8 @@ struct AstUpstreamDecl {
     static constexpr u32 kMaxBackends = 8;
     u32 backend_count = 0;  // 0 → single-address form via host_lit/port_lit
     Str backend_lits[kMaxBackends]{};
+    u32 weight_count = 0;
+    u16 backend_weights[kMaxBackends]{};
 
     //   D. `{ ..., health_check: { path: "/healthz", interval: 5s, status: 200 } }`
     //      → hc_enabled = true. path/interval are required when the block is

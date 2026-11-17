@@ -26,7 +26,7 @@
 - **K014** 请求头、查询条件与表达式路由：核对 Kong 路由表达式与 APISIX 路由变量能力。
 - **K015** API 多版本共存：通过 Route/Service 等资源组织。
 - **K016** URL 前缀剥离、Host/URI 重写：路由配置与转换插件。
-- **K017** 多实例与加权负载均衡：Kong Upstream/Target；APISIX Upstream。
+- **K017** 多实例与加权负载均衡：Kong Upstream/Target；APISIX Upstream。静态权重与禁用目标子集见 [上游权重](kong-upstream-weights.md)；动态 API、DNS/SRV 权重及一致性哈希尚未验收。
 - **K018** 根据客户端或请求属性进行哈希、保持后端选择：核实具体算法与会话语义。
 - **K019** 主动健康检查、被动失败检测、故障摘除与恢复：两者支持对应机制。
 - **K020** 上游连接/读写超时与重试：验证重试条件、次数及非幂等请求边界。

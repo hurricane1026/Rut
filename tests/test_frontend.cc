@@ -16,6 +16,7 @@
 #include "fixtures/ws_optional_values.h"
 #include "fixtures/ws_scalar_helpers.h"
 #include "framing_selection_preflight_fixture.h"
+#include "route_config_fixture.h"
 #include "rs256_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
@@ -39941,7 +39942,9 @@ route GET "/" {
     // nothing else) is accepted by both the verifier and config population.
     REQUIRE(rir::verify_module(mod).ok);
     {
-        RouteConfig cfg{};
+        rut::test::RouteConfigFixture cfg_owner;
+        REQUIRE(cfg_owner.config);
+        RouteConfig& cfg = *cfg_owner.config;
         REQUIRE(populate_route_config(cfg, mod));
     }
 
@@ -39959,7 +39962,9 @@ route GET "/" {
         const auto verified = rir::verify_module(mod);
         CHECK_FALSE(verified.ok);
         CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
-        RouteConfig cfg{};
+        rut::test::RouteConfigFixture cfg_owner;
+        REQUIRE(cfg_owner.config);
+        RouteConfig& cfg = *cfg_owner.config;
         CHECK_FALSE(populate_route_config(cfg, mod));
     };
 
@@ -39987,7 +39992,9 @@ route GET "/" {
     // Exact restoration verifies and publishes again.
     REQUIRE(rir::verify_module(mod).ok);
     {
-        RouteConfig cfg{};
+        rut::test::RouteConfigFixture cfg_owner;
+        REQUIRE(cfg_owner.config);
+        RouteConfig& cfg = *cfg_owner.config;
         REQUIRE(populate_route_config(cfg, mod));
     }
     rir.destroy();
@@ -48220,3 +48227,64 @@ route GET "/" {
 }
 
 #include "kong_routing_gap_frontend.inc"
+
+TEST(frontend, upstream_weights_round_trip_and_prebound_validation) {
+    const char* source = R"rut(
+upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.upstreams[0].weight_count, 3u);
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
+    CHECK_EQ(cfg.upstreams[0].weights[1], 0u);
+    CHECK_EQ(cfg.upstreams[0].weights[2], 65535u);
+    cfg.upstreams[0].weights[0] = 9;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
+    rir.module.upstreams[0].weight_count = 2;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.module.upstreams[0].weight_count = 9;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.destroy();
+}
+
+TEST(frontend, upstream_weights_reject_invalid_shapes_and_integer_overflow) {
+    const char* fields[] = {
+        "backends: []",
+        "backends: [:]",
+        "backends: [\"127.0.0.1:9001\": -1]",
+        "backends: [\"127.0.0.1:9001\": 65536]",
+        "backends: [\"127.0.0.1:9001\": 18446744073709551616000]",
+        "backends: [\"127.0.0.1:9001\": \"1\"]",
+        "backends: [\"127.0.0.1:9001\": ]",
+        "backends: [\"127.0.0.1:9001\": 1, \"127.0.0.1:9001\": 2]",
+        "backends: [\"127.0.0.1:9001\": 1, \"127.0.0.1:9002\"]",
+        "backends: [\"127.0.0.1:9001\", \"127.0.0.1:9002\": 1]",
+        "backends: [\"127.0.0.1:9001\": 1], backends: [\"127.0.0.1:9002\": 1]",
+        "backends: [\"127.0.0.1:9001\"], weights: [1]",
+        "backends: [\"127.0.0.1:9000\": 1, \"127.0.0.1:9001\": 1, \"127.0.0.1:9002\": 1, "
+        "\"127.0.0.1:9003\": 1, \"127.0.0.1:9004\": 1, \"127.0.0.1:9005\": 1, \"127.0.0.1:9006\": "
+        "1, \"127.0.0.1:9007\": 1, \"127.0.0.1:9008\": 1]",
+    };
+    for (const char* field : fields) {
+        char source[1024];
+        snprintf(source, sizeof(source), "upstream api { %s }", field);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto tokens = lex(lit("upstream api { host: \"127.0.0.1\", port: 9001, weights: [1] }"));
+    REQUIRE(tokens);
+    CHECK_FALSE(parse_file_heap(tokens.value()));
+}

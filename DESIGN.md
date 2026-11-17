@@ -1545,6 +1545,25 @@ a closed policy type; the initial policy vocabulary is `.roundRobin` and
 `.leastRequests`. The compiler requires this argument at every `forward` call; legacy
 `forward(api)` is rejected, including for single-backend upstreams.
 
+`upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1] }`
+binds each endpoint key to its relative weight (literal 0–65535) using Swift
+dictionary literal syntax. Existing string arrays assign weight 1 to every backend.
+Dictionary entries preserve declaration order; duplicate keys, mixed array/dictionary
+entries, empty collections and invalid weights reject. There is no separate `weights`
+field. Zero disables a target during selection, health fail-open, and retry.
+Forwarding to an all-zero pool returns HTTP 503. In HTTP/1 handlers,
+`wait(upstream(api).connect())` uses ordinary round-robin with health fail-open
+among enabled targets and ends the request with HTTP 503 before opening a
+socket if none is enabled. Smooth weighted round-robin uses fixed
+shard/site-local credits; least-requests compares exact active/weight ratios
+and applies weighted tie-breaking. Credits reset whenever the eligible set
+changes. The 512-site × 8-backend credits plus
+eligibility masks add 16.5 KiB per shard (1056 KiB across the 64-shard bound)
+to each pinned configuration; no request-path allocation or cross-shard mutation
+is introduced. New RCU configurations begin at zero. Native artifact version
+19 records the new layout and rejects earlier artifacts for recompilation.
+
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

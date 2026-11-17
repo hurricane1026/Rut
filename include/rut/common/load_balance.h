@@ -26,5 +26,12 @@ inline bool forward_load_balance_valid(ForwardLoadBalance spec) {
 struct alignas(64) BackendSelectionState {
     u32 active[64][8]{};
     u16 cursor[kMaxForwardSites]{};
+    // Smooth weighted selection is local to the forward site and shard.
+    // Reset credits when eligibility changes so recovering/previously busy
+    // backends cannot accumulate an unbounded scheduling debt.
+    // Eight 16-bit weights have a total <=524280; credits and intermediate
+    // sums fit in i32 even at Kong's maximum Target weight of 65535.
+    i32 weighted_current[kMaxForwardSites][8]{};
+    u8 weighted_eligible[kMaxForwardSites]{};
 };
 }  // namespace rut

@@ -9,7 +9,7 @@ namespace rut::native {
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 18 combines the auth metadata and WebSocket lifecycle ABI changes.
-constexpr u32 kVersion = 18;
+constexpr u32 kVersion = 19;
 struct StreamHeader {
     u64 magic;
     u32 version;

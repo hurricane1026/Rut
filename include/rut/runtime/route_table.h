@@ -75,6 +75,7 @@ struct UpstreamTarget {
 
     struct sockaddr_in addrs[kMaxBackends];
     u32 addr_count;
+    u16 weights[kMaxBackends]{1, 1, 1, 1, 1, 1, 1, 1};
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;
@@ -108,6 +109,7 @@ struct UpstreamTarget {
     // Returns false if the backend list is full.
     bool add_addr(u32 ip, u16 port) {
         if (addr_count >= kMaxBackends) return false;
+        weights[addr_count] = 1;
         struct sockaddr_in& a = addrs[addr_count++];
         memset(&a, 0, sizeof(a));
         a.sin_family = AF_INET;

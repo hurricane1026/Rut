@@ -1148,6 +1148,7 @@ bool grpc_start_impl(Loop* loop,
     }
     const u32 backend = select_forward_backend(
         cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
+    if (backend >= target.addr_count) return false;
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
         if (kHttp1) break;
