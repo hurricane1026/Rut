@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 from auth_h2_fixture import request as h2_request
+import http.client
 import json
 import os
 from pathlib import Path
@@ -29,7 +30,7 @@ def gateway(args,config,root,invalid=False):
     source.write_text(Path(args.source).read_text().replace('listen :8080',f'listen :{port}'))
     log=root/'gateway.log'
     with log.open('w') as output:
-        process=subprocess.Popen([args.server,str(source),'--backend',args.backend,'--no-pin',
+        process=subprocess.Popen([args.server,str(source),'--backend',args.backend,'--opt',args.opt,'--no-pin',
                                   '--shards','2','--drain','0','--max-connections-per-shard','128'],
                                  env=dict(os.environ,AUTH_REGISTRY=json.dumps(config)),
                                  stdout=output,stderr=subprocess.STDOUT)
@@ -57,7 +58,7 @@ def gateway(args,config,root,invalid=False):
         process.terminate()
         try:process.wait(5)
         except subprocess.TimeoutExpired:process.kill();process.wait()
-        for secret in ['alice-current','alice-old','alice:password','custom-key']:
+        for secret in ['alice-current','alice-old','alice:password','custom-key','window-key']:
             assert secret not in log.read_text(),log.read_text()
 
 
@@ -97,6 +98,7 @@ def main():
     parser.add_argument('--server',required=True)
     parser.add_argument('--source',required=True)
     parser.add_argument('--backend',required=True)
+    parser.add_argument('--opt',choices=('0','2'),default='2')
     parser.add_argument('--admin')
     args=parser.parse_args()
     initial=dict(version=1,consumers=[consumer('alice',groups=['staff'])],credentials=[
@@ -172,6 +174,49 @@ def main():
         disabled=administer(args,root,'disabled-snapshot',disabled,root/'initial-snapshot.json')
         with gateway(args,disabled,root/'disabled') as port:
             assert request(port,'/private','Authorization: Bearer alice-current\r\n')[0]==401
+        # Keep several seconds between compile/startup and activation so slow
+        # JIT hosts still observe the pre-activation denial.
+        activation = int(time.time()) + 40
+        expiry = activation + 10
+        timed = dict(version=1, consumers=[consumer('alice',groups=['staff'])],
+                     credentials=[dict(id='window', consumerId='alice', method='bearer',
+                                       secret='window-key', enabled=True,
+                                       notBefore=activation, expiresAt=expiry)])
+        with gateway(args,timed,root/'timed') as port:
+            connection=http.client.HTTPConnection('127.0.0.1',port,timeout=8)
+            h2_headers=[('authorization','Bearer window-key')]
+            persistent_socket=None
+            def persistent_status():
+                nonlocal persistent_socket
+                connection.request('GET','/private',headers={'Authorization':'Bearer window-key'})
+                response=connection.getresponse()
+                status,body=response.status,response.read()
+                if persistent_socket is None:
+                    persistent_socket=connection.sock
+                    assert persistent_socket is not None, 'HTTP/1 client closed its connection after the first request'
+                else:
+                    assert connection.sock is persistent_socket, 'HTTP/1 client reconnected between window transitions'
+                return status,body
+            assert persistent_status()[0]==401
+            assert h2_request(port,'/private',h2_headers)[0]==401
+            while True:
+                status,body=persistent_status()
+                if status==200:
+                    assert body==b'alice' and time.time()>=activation
+                    break
+                assert status==401 and time.time()<expiry,(status,body,time.time())
+                time.sleep(.25)
+            assert h2_request(port,'/private',h2_headers)==(200,b'alice')
+            while True:
+                status,body=persistent_status()
+                if status==401:
+                    assert time.time()>=expiry,(status,body,time.time())
+                    break
+                assert status==200 and body==b'alice',(status,body)
+                assert time.time()<expiry+5,'credential did not expire within the bounded grace period'
+                time.sleep(.25)
+            assert h2_request(port,'/private',h2_headers)[0]==401
+            connection.close()
     print('PASS: Consumer creation, disable, credential retirement, groups, snapshot isolation and invalid update')
 
 

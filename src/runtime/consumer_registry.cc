@@ -3,6 +3,8 @@
 #include "rut/runtime/auth.h"
 #include "rut/runtime/crypto_c.h"
 
+#include <time.h>
+
 namespace rut {
 namespace {
 constexpr u32 kMaxConsumers = 32;
@@ -17,6 +19,8 @@ struct Credential {
     u32 method = json::kNone;
     u32 secret = json::kNone;
     u32 owner = 0;
+    i64 not_before = 0;
+    i64 expires_at = 0;
     bool enabled = false;
 };
 struct Registry {
@@ -24,6 +28,7 @@ struct Registry {
     Credential credentials[kMaxCredentials]{};
     u32 consumer_count = 0;
     u32 credential_count = 0;
+    bool has_windows = false;
 };
 u32 field(json::Document& doc, u32 object, Str name) {
     if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return json::kNone;
@@ -39,6 +44,48 @@ bool members(json::Document& doc, u32 object, u32 count) {
     u32 found = 0;
     for (u32 n = doc.nodes[object].child; n != json::kNone; n = doc.nodes[n].next) ++found;
     return found == count;
+}
+u32 key_count(json::Document& doc, u32 object, Str name) {
+    if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return 0;
+    u32 count = 0;
+    for (u32 n = doc.nodes[object].child; n != json::kNone; n = doc.nodes[n].next) {
+        char bytes[32];
+        json::Writer key{bytes, sizeof(bytes)};
+        if (!doc.string(doc.nodes[n].key, key) || !key.ok) return 0;
+        if (name.eq({bytes, key.len})) ++count;
+    }
+    return count;
+}
+bool credential_fields_valid(json::Document& doc, u32 object) {
+    const Str required[] = {lit_str("id"),
+                            lit_str("consumerId"),
+                            lit_str("method"),
+                            lit_str("secret"),
+                            lit_str("enabled")};
+    const Str optional[] = {lit_str("notBefore"), lit_str("expiresAt")};
+    if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return false;
+    for (Str key : required)
+        if (key_count(doc, object, key) != 1) return false;
+    for (Str key : optional)
+        if (key_count(doc, object, key) > 1) return false;
+    u32 count = 0;
+    for (u32 n = doc.nodes[object].child; n != json::kNone; n = doc.nodes[n].next) {
+        char bytes[32];
+        json::Writer key{bytes, sizeof(bytes)};
+        if (!doc.string(doc.nodes[n].key, key) || !key.ok) return false;
+        const Str value{bytes, key.len};
+        bool known = false;
+        for (Str candidate : required) known |= candidate.eq(value);
+        for (Str candidate : optional) known |= candidate.eq(value);
+        if (!known || ++count > 7) return false;
+    }
+    return count >= 5;
+}
+bool unix_seconds(json::Document& doc, u32 node, i64& output) {
+    if (node >= doc.count || doc.nodes[node].kind != json::Kind::Number || doc.raw(node).len == 0 ||
+        doc.raw(node).ptr[0] == '-' || !json::integer(doc.raw(node), output) || output < 0)
+        return false;
+    return true;
 }
 Str text(json::Document& doc, u32 node, char* bytes, u32 capacity) {
     json::Writer output{bytes, capacity};
@@ -93,15 +140,24 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         ++result.consumer_count;
     }
     for (u32 n = doc.nodes[kCredentials].child; n != json::kNone; n = doc.nodes[n].next) {
-        if (result.credential_count == kMaxCredentials || !members(doc, n, 5)) return false;
+        if (result.credential_count == kMaxCredentials || !credential_fields_valid(doc, n))
+            return false;
         auto& credential = result.credentials[result.credential_count];
         credential.id = field(doc, n, lit_str("id"));
         credential.method = field(doc, n, lit_str("method"));
         credential.secret = field(doc, n, lit_str("secret"));
+        const u32 kNotBefore = field(doc, n, lit_str("notBefore"));
+        const u32 kExpiresAt = field(doc, n, lit_str("expiresAt"));
         const u32 kOwner = field(doc, n, lit_str("consumerId"));
         if (!label(doc, credential.id, 64) || !label(doc, kOwner, 64) ||
             !enabled(doc, field(doc, n, lit_str("enabled")), credential.enabled))
             return false;
+        if ((kNotBefore < doc.count && !unix_seconds(doc, kNotBefore, credential.not_before)) ||
+            (kExpiresAt < doc.count && !unix_seconds(doc, kExpiresAt, credential.expires_at)) ||
+            (credential.not_before && credential.expires_at &&
+             credential.expires_at <= credential.not_before))
+            return false;
+        result.has_windows |= credential.not_before != 0 || credential.expires_at != 0;
         bool owner_found = false;
         for (u32 i = 0; i < result.consumer_count; ++i) {
             if (!same(doc, kOwner, result.consumers[i].id)) continue;
@@ -141,10 +197,22 @@ static bool authenticate(json::Document& document,
                          Str method,
                          Str presented,
                          bool allow_mtls,
-                         json::Writer& output) {
+                         json::Writer& output,
+                         bool injected_time = false,
+                         i64 injected_seconds = 0) {
     if (method.eq(lit_str("mtls")) && !allow_mtls) return false;
     Registry registry;
-    if (!load(document, configuration, registry) || !presented.ptr || !presented.len) return false;
+    if (!load(document, configuration, registry)) return false;
+    i64 now_seconds = injected_seconds;
+    if (registry.has_windows && !injected_time) {
+        timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
+            now.tv_nsec >= 1000000000)
+            return false;
+        now_seconds = static_cast<i64>(now.tv_sec);
+    }
+    if (registry.has_windows && now_seconds <= 0) return false;
+    if (!presented.ptr || !presented.len) return false;
     u32 selected = json::kNone;
     for (u32 i = 0; i < registry.credential_count; ++i) {
         const auto& credential = registry.credentials[i];
@@ -167,7 +235,10 @@ static bool authenticate(json::Document& document,
                                           kSecret.len)
                 : false;
         // Evaluate every configured credential. Disabled entries never grant.
-        if (kMatch && credential.enabled && registry.consumers[credential.owner].enabled)
+        const bool time_active = (!credential.not_before || now_seconds >= credential.not_before) &&
+                                 (!credential.expires_at || now_seconds < credential.expires_at);
+        if (kMatch && time_active && credential.enabled &&
+            registry.consumers[credential.owner].enabled)
             selected = i;
     }
     if (selected == json::kNone) return false;
@@ -190,12 +261,37 @@ bool consumer_registry_authenticate(
     return authenticate(document, configuration, method, presented, false, output);
 }
 
+bool consumer_registry_authenticate_at(json::Document& document,
+                                       Str configuration,
+                                       Str method,
+                                       Str presented,
+                                       i64 realtime_seconds,
+                                       json::Writer& output) {
+    return authenticate(
+        document, configuration, method, presented, false, output, true, realtime_seconds);
+}
+
 bool consumer_registry_authenticate_mtls(json::Document& document,
                                          Str configuration,
                                          Str fingerprint,
                                          json::Writer& output) {
     if (!sha256_hex_format_valid(fingerprint)) return false;
     return authenticate(document, configuration, lit_str("mtls"), fingerprint, true, output);
+}
+bool consumer_registry_authenticate_mtls_at(json::Document& document,
+                                            Str configuration,
+                                            Str fingerprint,
+                                            i64 realtime_seconds,
+                                            json::Writer& output) {
+    if (!sha256_hex_format_valid(fingerprint)) return false;
+    return authenticate(document,
+                        configuration,
+                        lit_str("mtls"),
+                        fingerprint,
+                        true,
+                        output,
+                        true,
+                        realtime_seconds);
 }
 namespace {
 i32 field_hex(char byte) {
@@ -235,12 +331,14 @@ bool consumer_credential_name_valid(Str name) {
     }
     return true;
 }
-bool consumer_registry_authenticate_fields(json::Document& document,
-                                           Str configuration,
-                                           Str name,
-                                           Str input,
-                                           bool query,
-                                           json::Writer& output) {
+static bool authenticate_fields(json::Document& document,
+                                Str configuration,
+                                Str name,
+                                Str input,
+                                bool query,
+                                json::Writer& output,
+                                bool injected_time,
+                                i64 injected_seconds) {
     if (!consumer_credential_name_valid(name) || !input.ptr || !input.len || input.len > 4096)
         return false;
     if (query) {
@@ -295,9 +393,14 @@ bool consumer_registry_authenticate_fields(json::Document& document,
         if (end + 1 == input.len) return false;
         begin = end + 1;
     }
-    if (!credential_length ||
-        !consumer_registry_authenticate(
-            document, configuration, lit_str("header"), {credential, credential_length}, output))
+    if (!credential_length || !authenticate(document,
+                                            configuration,
+                                            lit_str("header"),
+                                            {credential, credential_length},
+                                            false,
+                                            output,
+                                            injected_time,
+                                            injected_seconds))
         return false;
     // Authentication wrote one complete identity object. Extend only on success.
     --output.len;
@@ -305,5 +408,25 @@ bool consumer_registry_authenticate_fields(json::Document& document,
     if (!json::quote({remaining, remaining_length}, output)) return false;
     output.put('}');
     return output.ok;
+}
+
+bool consumer_registry_authenticate_fields(json::Document& document,
+                                           Str configuration,
+                                           Str name,
+                                           Str input,
+                                           bool query,
+                                           json::Writer& output) {
+    return authenticate_fields(document, configuration, name, input, query, output, false, 0);
+}
+
+bool consumer_registry_authenticate_fields_at(json::Document& document,
+                                              Str configuration,
+                                              Str name,
+                                              Str input,
+                                              bool query,
+                                              i64 realtime_seconds,
+                                              json::Writer& output) {
+    return authenticate_fields(
+        document, configuration, name, input, query, output, true, realtime_seconds);
 }
 }  // namespace rut
