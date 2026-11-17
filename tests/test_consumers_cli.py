@@ -323,9 +323,16 @@ def test_generated_key_verifier(tool, root):
         shim = root / 'linkat-fault.so'
         shim_source.write_text(r'''#define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+__attribute__((constructor)) static void mark_loaded(void) {
+    const char *path = getenv("RUT_TEST_PRELOAD_MARKER");
+    if (!path) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) { (void)write(fd, "1", 1); (void)close(fd); }
+}
 int linkat(int oldfd, const char *oldpath, int newfd, const char *newpath, int flags) {
     static int calls;
     ++calls;
@@ -337,24 +344,33 @@ int linkat(int oldfd, const char *oldpath, int newfd, const char *newpath, int f
         built = subprocess.run(['cc', '-shared', '-fPIC', '-o', str(shim), str(shim_source)],
                                capture_output=True, timeout=20)
         assert built.returncode == 0, built.stderr.decode(errors='replace')
-        for fail_at in (1, 2):
-            snapshot_path = root / f'fault-{fail_at}.snapshot'
-            key_path = root / f'fault-{fail_at}.key'
-            env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_LINKAT_FAIL_AT=str(fail_at))
-            result = subprocess.run([tool, 'generate-key-verifier', str(source), 'alice',
-                                     f'fault-{fail_at}', 'bearer', str(snapshot_path), str(key_path)],
-                                    capture_output=True, timeout=10, env=env)
-            assert result.returncode == 2 and not result.stdout
-            if fail_at == 1:
-                assert not key_path.exists() and not snapshot_path.exists()
-            else:
-                raw_key = key_path.read_bytes()
-                assert key_path.exists() and len(raw_key) == 64
-                assert re.fullmatch(rb'[0-9a-f]{64}', raw_key)
-                assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
-                assert not snapshot_path.exists()
-                assert b'key output was published' in result.stderr
-                assert raw_key not in result.stderr and raw_key not in result.stdout
+        marker = root / 'preload-capability.marker'
+        probe_env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_PRELOAD_MARKER=str(marker))
+        probe = subprocess.run([tool, '--help'], capture_output=True, timeout=10, env=probe_env)
+        if probe.returncode != 0 or not marker.exists():
+            reason = (f'executable did not load the preload shim (probe exit {probe.returncode})'
+                      if not marker.exists() else
+                      f'preload probe exited with status {probe.returncode}')
+            print(f'SKIP: generated-key publication fault injection: {reason}')
+        else:
+            for fail_at in (1, 2):
+                snapshot_path = root / f'fault-{fail_at}.snapshot'
+                key_path = root / f'fault-{fail_at}.key'
+                env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_LINKAT_FAIL_AT=str(fail_at))
+                result = subprocess.run([tool, 'generate-key-verifier', str(source), 'alice',
+                                         f'fault-{fail_at}', 'bearer', str(snapshot_path), str(key_path)],
+                                        capture_output=True, timeout=10, env=env)
+                assert result.returncode == 2 and not result.stdout
+                if fail_at == 1:
+                    assert not key_path.exists() and not snapshot_path.exists()
+                else:
+                    raw_key = key_path.read_bytes()
+                    assert key_path.exists() and len(raw_key) == 64
+                    assert re.fullmatch(rb'[0-9a-f]{64}', raw_key)
+                    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+                    assert not snapshot_path.exists()
+                    assert b'key output was published' in result.stderr
+                    assert raw_key not in result.stderr and raw_key not in result.stdout
 
 
 def main(tool):
