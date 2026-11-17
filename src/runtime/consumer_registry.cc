@@ -285,24 +285,22 @@ static bool authenticate(json::Document& document,
         const Str kSecret =
             hashed ? text(document, credential.secret_sha256, document.scratch, 64)
                    : text(document, credential.secret, document.scratch, kMaxBearerKeyBytes);
-        const bool kMatch =
-            hashed                         ? has_presented_digest &&
-                                                 rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented_digest.bytes),
-                                                                     reinterpret_cast<const u8*>(kSecret.ptr),
-                                                                     64)
-            : method.eq(lit_str("basic"))  ? basic_matches(presented, kSecret)
-            : method.eq(lit_str("bearer")) ? bearer_matches(presented, kSecret)
-            : method.eq(lit_str("mtls"))
-                ? presented.len == kSecret.len &&
-                      rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
-                                          reinterpret_cast<const u8*>(kSecret.ptr),
-                                          kSecret.len)
-            : method.eq(lit_str("header"))
-                ? presented.len == kSecret.len &&
-                      rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
-                                          reinterpret_cast<const u8*>(kSecret.ptr),
-                                          kSecret.len)
-                : false;
+        bool kMatch = false;
+        if (hashed) {
+            kMatch = has_presented_digest &&
+                     rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented_digest.bytes),
+                                         reinterpret_cast<const u8*>(kSecret.ptr),
+                                         64);
+        } else if (method.eq(lit_str("basic"))) {
+            kMatch = basic_matches(presented, kSecret);
+        } else if (method.eq(lit_str("bearer"))) {
+            kMatch = bearer_matches(presented, kSecret);
+        } else if (method.eq(lit_str("mtls")) || method.eq(lit_str("header"))) {
+            kMatch = presented.len == kSecret.len &&
+                     rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
+                                         reinterpret_cast<const u8*>(kSecret.ptr),
+                                         kSecret.len);
+        }
         // Evaluate every configured credential. Disabled entries never grant.
         const bool time_active = (!credential.not_before || now_seconds >= credential.not_before) &&
                                  (!credential.expires_at || now_seconds < credential.expires_at);
