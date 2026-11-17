@@ -11000,8 +11000,11 @@ No mutable registry state is shared across shards. Registry creation, disable,
 rotation and membership changes are replacement configuration snapshots; existing
 native-program/RouteConfig ownership and RCU retirement retain old readers.
 The offline `rut-consumers` tool reuses the runtime validator for transactional
-full-record upserts/removals, validated redacted previews and inspection. Bounded
-owned buffers hold all input and output; no mutable state or allocator enters the request path.
+full-record upserts/removals, validated redacted previews and inspection. Its
+`generate-key` command adds a 32-byte operating-system-random bearer/header key
+to a new validated snapshot, refuses existing credential IDs and never writes
+the secret to output streams. Bounded owned buffers hold all input and output;
+no mutable state or allocator enters the request path.
 Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).

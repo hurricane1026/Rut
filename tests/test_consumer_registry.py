@@ -107,6 +107,24 @@ def main():
     with tempfile.TemporaryDirectory(prefix='rut-consumers-') as tmp:
         root=Path(tmp)
         initial=administer(args,root,'initial-snapshot',initial)
+        generated = {}
+        if args.admin:
+            base = root / 'initial-snapshot.json'
+            for credential_id, method in [('generated-bearer-v1', 'bearer'),
+                                          ('generated-bearer-v2', 'bearer'),
+                                          ('generated-header-v1', 'header')]:
+                output = root / f'{credential_id}.json'
+                result = subprocess.run([args.admin, 'generate-key', str(base), 'alice',
+                                         credential_id, method, str(output)],
+                                        capture_output=True, timeout=10)
+                assert result.returncode == 0 and not result.stdout and not result.stderr, result
+                assert output.stat().st_mode & 0o777 == 0o600
+                base = output
+                snapshot = json.loads(output.read_bytes())
+                generated[credential_id] = next(item['secret'] for item in snapshot['credentials']
+                                                 if item['id'] == credential_id)
+                initial = snapshot
+            assert generated['generated-bearer-v1'] != generated['generated-bearer-v2']
         with gateway(args,initial,root/'initial') as first:
             for value,expected in [('',401),('Bearer alice-current',200),('Bearer alice-old',200),
                                    ('Bearer wrong',401),('Bearer alice-current ',200)]:
@@ -119,20 +137,33 @@ def main():
             assert request(first,'/basic','Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\n')[0]==204
             assert request(first,'/key','X-API-Key: custom-key\r\n')[0]==204
             assert request(first,'/key','X-API-Key: custom-key\r\nX-API-Key: custom-key\r\n')[0]==401
+            if generated:
+                assert request(first,'/private',f'Authorization: Bearer {generated["generated-bearer-v1"]}\r\n')==(200,b'alice')
+                assert request(first,'/private',f'Authorization: Bearer {generated["generated-bearer-v2"]}\r\n')==(200,b'alice')
+                assert request(first,'/key',f'X-API-Key: {generated["generated-header-v1"]}\r\n')[0]==204
+                assert h2_request(first,'/private',[('authorization',f'Bearer {generated["generated-bearer-v1"]}')])==(200,b'alice')
+                assert h2_request(first,'/key',[('x-api-key',generated["generated-header-v1"])])[0]==204
             assert h2_request(first,'/private',[('authorization','Bearer alice-current')])==(200,b'alice')
             assert h2_request(first,'/private',[('authorization','Bearer alice-current'),('authorization','Bearer alice-current')])[0]==401
             assert h2_request(first,'/key',[('x-api-key','custom-key'),('x-api-key','custom-key')])[0]==401
             updated=json.loads(json.dumps(initial));updated['credentials'][0]['enabled']=False
+            if generated:
+                next(item for item in updated['credentials'] if item['id']=='generated-bearer-v1')['enabled']=False
             updated['consumers'][0]['groups']=[]
             updated['consumers'].append(consumer('bob'))
             updated['credentials'].append(credential('bob','bob','bearer','bob-key'))
             updated=administer(args,root,'updated-snapshot',updated,root/'initial-snapshot.json')
             with gateway(args,updated,root/'updated') as second:
                 assert request(second,'/private','Authorization: Bearer alice-old\r\n')[0]==401
+                if generated:
+                    assert request(second,'/private',f'Authorization: Bearer {generated["generated-bearer-v1"]}\r\n')[0]==401
+                    assert request(second,'/private',f'Authorization: Bearer {generated["generated-bearer-v2"]}\r\n')==(200,b'alice')
                 assert request(second,'/staff','Authorization: Bearer alice-current\r\n')[0]==403
                 assert request(second,'/private','Authorization: Bearer bob-key\r\n')==(200,b'bob')
                 # Already published programs retain their independently owned snapshot.
                 assert request(first,'/staff','Authorization: Bearer alice-old\r\n')[0]==204
+                if generated:
+                    assert request(first,'/private',f'Authorization: Bearer {generated["generated-bearer-v1"]}\r\n')==(200,b'alice')
             invalid=json.loads(json.dumps(initial))
             invalid['credentials'].append(credential('ambiguous','alice','bearer','alice-current'))
             with gateway(args,invalid,root/'invalid',invalid=True):pass
