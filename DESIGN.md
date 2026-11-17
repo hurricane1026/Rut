@@ -11065,6 +11065,20 @@ keys remain vulnerable to offline guessing, and verifier digests still require
 protection. Conversion leaves the original snapshot intact; Basic/mTLS secrets
 and other unconverted raw fields remain in the output where present.
 
+`rut-consumers generate-key-verifier` provisions a new bearer/header credential
+as a hash-only record in its validated snapshot while writing the exact 64-byte
+lowercase-hex key text to a separate private 0600 file. It opens and retains
+both verified directory descriptors, checks they refer to the same owned
+non-group/other-writable directory, rejects equal basenames and preexisting
+outputs before generating the key, and validates the full replacement snapshot
+before publishing anything. It publishes the key first and the snapshot second
+with no-replace links. The two files are not an atomic pair: failures after key
+publication can leave an orphan key, and directory-sync or temporary-cleanup
+failures require operator inspection rather than automatic rollback. Neither
+the key nor verifier appears in output streams or command arguments. This is an
+offline provisioning facility, not completion of the broader Consumer lifecycle
+foundation (#1072).
+
 Version-1 credential records optionally carry integer Unix-second `notBefore`
 and `expiresAt` bounds; absent or zero values are unbounded. A finite start is
 inclusive, while expiry is exclusive. The runtime validates the complete exact

@@ -3556,6 +3556,11 @@ Bearer/header records may use exactly one raw `secret` or lowercase 64-hex
 secret schema. The offline `hash-keys` command converts only 64-lowercase-hex
 bearer/header keys; it does not prove key entropy. SHA-256 verifiers are
 sensitive configuration and are not a password hashing scheme.
+The offline `generate-key-verifier` command stores a new bearer/header verifier
+in its snapshot and writes the corresponding 64-byte lowercase-hex key to a
+separate 0600 file. It publishes the key first, then the snapshot; a failure
+between those publications can leave an orphan key file, so operators inspect
+both outputs before retrying. This adds no Rut syntax or runtime API.
 Credentials may include optional `notBefore` and `expiresAt` integer Unix-second
 bounds (`0` or absence is unbounded). Start is inclusive and expiry exclusive.
 When any bound is finite, every auth method checks one host `CLOCK_REALTIME`

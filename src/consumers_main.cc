@@ -61,6 +61,17 @@ struct SensitiveHashText {
     char bytes[kMaxHashHexBytes]{};
     ~SensitiveHashText() { rut_crypto_clear_v1(bytes, sizeof(bytes)); }
 };
+struct OutputTarget {
+    int directory = -1;
+    char basename[256]{};
+    ~OutputTarget() {
+        if (directory >= 0) close(directory);
+    }
+};
+struct OutputPair {
+    OutputTarget snapshot;
+    OutputTarget key;
+};
 
 int failure(const char* message) {
     (void)write(STDERR_FILENO, message, strlen(message));
@@ -150,6 +161,76 @@ const char* publish(const char* path, Str value) {
     if (!kRemoved || !kSynced)
         return "snapshot published but cleanup/directory sync failed; inspect destination\n";
     return nullptr;
+}
+
+bool output_target(const char* path, OutputTarget& target, struct stat& directory_stat) {
+    char parent[4096];
+    const size_t length = strlen(path);
+    if (!length || length >= sizeof(parent)) return false;
+    const char* slash = strrchr(path, '/');
+    const char* name = slash ? slash + 1 : path;
+    const size_t name_length = strlen(name);
+    if (!name_length || name_length >= sizeof(target.basename) || strcmp(name, ".") == 0 ||
+        strcmp(name, "..") == 0)
+        return false;
+    if (slash) {
+        const size_t prefix = slash == path ? 1 : static_cast<size_t>(slash - path);
+        __builtin_memcpy(parent, path, prefix);
+        parent[prefix] = '\0';
+    } else {
+        parent[0] = '.';
+        parent[1] = '\0';
+    }
+    target.directory = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (target.directory < 0 || fstat(target.directory, &directory_stat) != 0 ||
+        !S_ISDIR(directory_stat.st_mode) || directory_stat.st_uid != geteuid() ||
+        (directory_stat.st_mode & 0022) != 0)
+        return false;
+    __builtin_memcpy(target.basename, name, name_length + 1);
+    return true;
+}
+
+bool output_pair(const char* snapshot_path, const char* key_path, OutputPair& pair) {
+    struct stat snapshot_directory{}, key_directory{};
+    if (!output_target(snapshot_path, pair.snapshot, snapshot_directory) ||
+        !output_target(key_path, pair.key, key_directory) ||
+        snapshot_directory.st_dev != key_directory.st_dev ||
+        snapshot_directory.st_ino != key_directory.st_ino ||
+        strcmp(pair.snapshot.basename, pair.key.basename) == 0)
+        return false;
+    struct stat existing{};
+    if (fstatat(pair.snapshot.directory, pair.snapshot.basename, &existing, AT_SYMLINK_NOFOLLOW) ==
+            0 ||
+        errno != ENOENT)
+        return false;
+    if (fstatat(pair.key.directory, pair.key.basename, &existing, AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT)
+        return false;
+    return true;
+}
+
+enum class PublishAtResult : u8 { NotPublished, Published, Uncertain };
+PublishAtResult publish_at(int directory, const char* name, Str value) {
+    char temporary[64];
+    int file = -1;
+    for (u32 attempt = 0; attempt < 32; ++attempt) {
+        (void)snprintf(temporary,
+                       sizeof(temporary),
+                       ".rut-consumers-%ld-%u",
+                       static_cast<long>(getpid()),
+                       attempt);
+        file = openat(
+            directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (file >= 0 || errno != EEXIST) break;
+    }
+    if (file < 0) return PublishAtResult::NotPublished;
+    bool ready = fchmod(file, 0600) == 0 && write_all(file, value) && sync_fd(file);
+    if (close(file) != 0) ready = false;
+    const bool linked = ready && linkat(directory, temporary, directory, name, 0) == 0;
+    const bool removed = unlinkat(directory, temporary, 0) == 0;
+    const bool synced = sync_fd(directory);
+    if (!linked && removed && synced) return PublishAtResult::NotPublished;
+    return linked && removed && synced ? PublishAtResult::Published : PublishAtResult::Uncertain;
 }
 
 u32 field(json::Document& doc, u32 object, Str name) {
@@ -368,6 +449,8 @@ constexpr char kUsage[] =
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
+    "       rut-consumers generate-key-verifier INPUT CONSUMER_ID CREDENTIAL_ID METHOD "
+    "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
@@ -379,6 +462,8 @@ constexpr char kUsage[] =
     "No command publishes to running gateways.\n"
     "generate-key supports bearer/header and creates a new 32-byte random key in an immutable "
     "snapshot.\n"
+    "generate-key-verifier writes a verifier snapshot and the generated raw key to separate new "
+    "private files.\n"
     "hash-keys converts raw bearer/header keys in the 64-lowercase-hex generated-key profile.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
@@ -392,8 +477,10 @@ int main(int argc, char** argv) {
     const bool kPlan = argc == 4 && strcmp(argv[1], "plan") == 0;
     const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
     const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
+    const bool kGenerateKeyVerifier = argc == 8 && strcmp(argv[1], "generate-key-verifier") == 0;
     const bool kHashKeys = argc == 4 && strcmp(argv[1], "hash-keys") == 0;
-    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey && !kHashKeys)
+    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey &&
+        !kGenerateKeyVerifier && !kHashKeys)
         return failure(kUsage);
     if (kInit) {
         const char* error =
@@ -462,6 +549,85 @@ int main(int argc, char** argv) {
             return failure("generated registry snapshot is invalid\n");
         const char* error = publish(argv[6], {result.data, output.len});
         return error ? failure(error) : 0;
+    }
+    if (kGenerateKeyVerifier) {
+        const u32 consumer_length = bounded_argument(argv[3], 65);
+        const u32 credential_length = bounded_argument(argv[4], 65);
+        const u32 method_length = bounded_argument(argv[5], 16);
+        const Str consumer_id{argv[3], consumer_length};
+        const Str credential_id{argv[4], credential_length};
+        const Str method{argv[5], method_length};
+        if (!provision_id_valid(consumer_id) || !provision_id_valid(credential_id) ||
+            !(method.eq(lit_str("bearer")) || method.eq(lit_str("header"))))
+            return failure("invalid Consumer ID, credential ID, or key method\n");
+        const u32 consumers = field(base, 0, lit_str("consumers"));
+        const u32 credentials = field(base, 0, lit_str("credentials"));
+        if (!contains_id(base, consumers, consumer_id, true))
+            return failure("Consumer does not exist in registry snapshot\n");
+        if (contains_id(base, credentials, credential_id, true))
+            return failure("credential ID already exists in registry snapshot\n");
+
+        OutputPair outputs;
+        if (!output_pair(argv[6], argv[7], outputs))
+            return failure(
+                "outputs must be distinct new files in the same owned private directory\n");
+
+        GeneratedSecret secret;
+        if (!secret.generate()) return failure("operating-system random key generation failed\n");
+        SensitiveHashText digest;
+        u32 digest_length = 0;
+        if (!hash_hex(HashAlgorithm::Sha256,
+                      {secret.hex, sizeof(secret.hex)},
+                      {},
+                      false,
+                      digest.bytes,
+                      digest_length) ||
+            digest_length != 64)
+            return failure("cannot hash generated key for verifier snapshot\n");
+
+        Buffer change_bytes;
+        json::Writer change_output{change_bytes.data, json::kMaxBytes};
+        change_output.text(lit_str("{\"consumers\":[],\"credentials\":[{\"id\":"));
+        if (!json::quote(credential_id, change_output))
+            return failure("cannot encode verifier snapshot\n");
+        change_output.text(lit_str(",\"consumerId\":"));
+        if (!json::quote(consumer_id, change_output))
+            return failure("cannot encode verifier snapshot\n");
+        change_output.text(lit_str(",\"method\":\""));
+        change_output.text(method);
+        change_output.text(lit_str("\",\"secretSha256\":\""));
+        change_output.text({digest.bytes, digest_length});
+        change_output.text(
+            lit_str("\",\"enabled\":true}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+        if (!change_output.ok) return failure("verifier snapshot change exceeds capacity\n");
+        SensitiveDocument patch;
+        if (!patch.parse({change_bytes.data, change_output.len}))
+            return failure("cannot encode verifier snapshot\n");
+        Buffer result;
+        json::Writer snapshot{result.data, json::kMaxBytes};
+        if (!apply(base, patch, snapshot))
+            return failure("verifier snapshot exceeds supported capacity\n");
+        SensitiveDocument checked;
+        if (!consumer_registry_valid(checked, {result.data, snapshot.len}))
+            return failure("generated verifier snapshot is invalid\n");
+
+        const PublishAtResult key_result = publish_at(
+            outputs.key.directory, outputs.key.basename, {secret.hex, sizeof(secret.hex)});
+        if (key_result != PublishAtResult::Published)
+            return failure(key_result == PublishAtResult::Uncertain
+                               ? "key output or private temporary may exist; snapshot was not "
+                                 "published; inspect the directory before retrying\n"
+                               : "key output was not published; snapshot was not published\n");
+        const PublishAtResult snapshot_result = publish_at(
+            outputs.snapshot.directory, outputs.snapshot.basename, {result.data, snapshot.len});
+        if (snapshot_result != PublishAtResult::Published)
+            return failure(
+                snapshot_result == PublishAtResult::Uncertain
+                    ? "key output was published and snapshot output may exist or publication "
+                      "durability may be uncertain; inspect both outputs before retrying\n"
+                    : "key output was published but snapshot output was not; inspect both outputs "
+                      "before retrying\n");
+        return 0;
     }
     Buffer result;
     json::Writer output{result.data, kInspect ? json::kMaxBytes + 1 : json::kMaxBytes};
