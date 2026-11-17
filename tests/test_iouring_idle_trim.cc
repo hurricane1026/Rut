@@ -1166,8 +1166,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // valid flag. The optional HTTP/1 TLS-upstream owner and transport links account for
     // two pointers plus 8 bytes of generation/state/queued metadata after
     // reordering. The bounded TLS server-name and route-host views add 512 bytes
-    // total. The measured current 64-bit Connection layout is 6216 bytes.
-    CHECK_EQ(sizeof(Connection), 6216u);
+    // total. The active-health configuration identity adds 8 bytes plus 8 bytes
+    // of alignment padding. The measured current 64-bit Connection layout is
+    // 6232 bytes with or without WebSocket support (private Native ABI 20).
+    CHECK_EQ(sizeof(Connection), 6232u);
 }
 
 TEST(iouring_idle_trim,
