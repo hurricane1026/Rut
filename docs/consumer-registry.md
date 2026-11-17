@@ -27,11 +27,27 @@ even disabled records are validated. Reusing a secret within a method is rejecte
 across all credentials, preventing ambiguous ownership and slot-order selection.
 An empty registry is a valid deny-all snapshot.
 
+Bearer and header records contain exactly one of `secret` or `secretSha256`.
+`secretSha256` is the lowercase 64-hex SHA-256 digest of the exact presented
+textual key bytes (the key text is not hex-decoded). The runtime hashes a
+validated presented key once and compares the digest in constant time. Basic
+and mTLS records continue to require their existing raw `secret` field and
+reject `secretSha256`. Duplicate raw keys, duplicate verifiers, and raw/verifier
+cross-collisions within a method are invalid across all records, including
+disabled or time-windowed credentials.
+
+This verifier format is for unpredictable API keys, not passwords. SHA-256 is
+not a password hashing or stretching scheme: a low-entropy key can be guessed
+offline. Treat verifier digests as sensitive configuration. The `hash-keys`
+CLI conversion below accepts only raw bearer/header keys in the generated
+64-lowercase-hex profile; this format check does not prove that a key was
+generated with sufficient entropy.
+
 Each credential may add integer `notBefore` and/or `expiresAt` Unix-second
 fields. Both default to `0`, meaning unbounded; nonzero values must be positive
 signed-64-bit integers, and when both are finite `expiresAt` must be greater
-than `notBefore`. The complete credential object still allows only its five
-required fields and these two optional fields; duplicate or unknown names and
+than `notBefore`. The complete credential object still allows only its common
+required fields, exactly one key field, and these two optional fields; duplicate or unknown names and
 wrong numeric forms invalidate the whole snapshot, including disabled records.
 At authentication, a finite start is inclusive (`now >= notBefore`) and a finite
 expiry is exclusive (`now < expiresAt`).
@@ -238,7 +254,8 @@ without any group/other permissions and at most 8192 bytes. Symlinks, FIFOs,
 directories and publicly readable files reject. Secrets come from these files,
 never command arguments. `inspect` writes Consumer metadata and credential
 ID/owner/method/enabled fields and any `notBefore`/`expiresAt` metadata to
-stdout, omitting every credential `secret`. `apply` and `generate-key` preserve
+stdout, omitting every credential `secret` and `secretSha256`. `plan` uses the
+same redaction. `apply` and `generate-key` preserve
 existing window fields; a newly generated key has no window fields and is
 unbounded until a later snapshot explicitly adds them.
 Validation and mutation commands produce no stdout. Fixed errors contain no
@@ -250,6 +267,15 @@ format as `inspect`. It creates no files and emits no partial preview on invalid
 input. This includes validation of secrets even though they are omitted from the
 preview. A preview does not reserve an output or pin either input file: keep the
 reviewed inputs unchanged until `apply`, which validates them again.
+
+`hash-keys INPUT OUTPUT` converts every raw bearer/header key in the snapshot
+from exactly 64 lowercase hexadecimal characters to a `secretSha256` verifier.
+It rejects the whole operation if any such raw key falls outside that profile,
+validates the converted complete snapshot (including cross-collisions), and
+publishes only a new private output file. Existing verifiers are retained,
+making conversion idempotent; Basic and mTLS secrets remain raw in the output.
+The input is never modified or erased, and output records for other methods may
+still contain raw secrets. The command prints no secrets or verifier digests.
 
 Output must be a **new filename** in an owned directory without group/other write
 permission. A private 0600 temporary file is written and synced before atomic
@@ -273,8 +299,8 @@ hosts use the existing RCU publication/retirement boundary described above.
 The CLI regression covers creation, generated bearer/header keys, exact
 lowercase-hex formatting, distinct outputs, escaped IDs, disabled-Consumer
 staging, collision/method/bounds/capacity rejection, zero-output secret
-handling, rotation/disable/removal, redacted preflight and competing output
-writers. The native HTTP registry fixtures consume generated snapshots on
+handling, rotation/disable/removal, redacted preflight, competing output
+writers and all-or-nothing/idempotent verifier conversion. The native HTTP registry fixtures consume generated snapshots on
 epoll/io_uring with HTTP/1 and HTTP/2, verify overlap, then reject a disabled
 old generated key while retaining the new one. Transparent
 request-target/body mutation and online administrative HTTP APIs remain separate.

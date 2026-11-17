@@ -2,7 +2,9 @@
 
 #include "rut/runtime/auth.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/hash.h"
 
+#include <string.h>
 #include <time.h>
 
 namespace rut {
@@ -18,10 +20,12 @@ struct Credential {
     u32 id = json::kNone;
     u32 method = json::kNone;
     u32 secret = json::kNone;
+    u32 secret_sha256 = json::kNone;
     u32 owner = 0;
     i64 not_before = 0;
     i64 expires_at = 0;
     bool enabled = false;
+    char verifier_sha256[64]{};
 };
 struct Registry {
     Consumer consumers[kMaxConsumers]{};
@@ -29,6 +33,18 @@ struct Registry {
     u32 consumer_count = 0;
     u32 credential_count = 0;
     bool has_windows = false;
+    bool has_hashed_keys = false;
+    bool has_hashed_bearer = false;
+    bool has_hashed_header = false;
+    ~Registry() {
+        for (u32 i = 0; i < kMaxCredentials; ++i)
+            rut_crypto_clear_v1(credentials[i].verifier_sha256,
+                                sizeof(credentials[i].verifier_sha256));
+    }
+};
+struct SensitiveDigest {
+    char bytes[64]{};
+    ~SensitiveDigest() { rut_crypto_clear_v1(bytes, sizeof(bytes)); }
 };
 u32 field(json::Document& doc, u32 object, Str name) {
     if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return json::kNone;
@@ -57,15 +73,17 @@ u32 key_count(json::Document& doc, u32 object, Str name) {
     return count;
 }
 bool credential_fields_valid(json::Document& doc, u32 object) {
-    const Str required[] = {lit_str("id"),
-                            lit_str("consumerId"),
-                            lit_str("method"),
-                            lit_str("secret"),
-                            lit_str("enabled")};
+    const Str required[] = {
+        lit_str("id"), lit_str("consumerId"), lit_str("method"), lit_str("enabled")};
+    const Str alternatives[] = {lit_str("secret"), lit_str("secretSha256")};
     const Str optional[] = {lit_str("notBefore"), lit_str("expiresAt")};
     if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return false;
     for (Str key : required)
         if (key_count(doc, object, key) != 1) return false;
+    if (key_count(doc, object, alternatives[0]) > 1 ||
+        key_count(doc, object, alternatives[1]) > 1 ||
+        key_count(doc, object, alternatives[0]) + key_count(doc, object, alternatives[1]) != 1)
+        return false;
     for (Str key : optional)
         if (key_count(doc, object, key) > 1) return false;
     u32 count = 0;
@@ -76,6 +94,7 @@ bool credential_fields_valid(json::Document& doc, u32 object) {
         const Str value{bytes, key.len};
         bool known = false;
         for (Str candidate : required) known |= candidate.eq(value);
+        for (Str candidate : alternatives) known |= candidate.eq(value);
         for (Str candidate : optional) known |= candidate.eq(value);
         if (!known || ++count > 7) return false;
     }
@@ -109,6 +128,15 @@ bool enabled(json::Document& doc, u32 node, bool& value) {
     value = doc.raw(node).eq(lit_str("true"));
     return true;
 }
+bool sha256_hex(Str input, char (&output)[64]) {
+    char digest[kMaxHashHexBytes]{};
+    u32 length = 0;
+    const bool ok =
+        hash_hex(HashAlgorithm::Sha256, input, {}, false, digest, length) && length == 64;
+    if (ok) memcpy(output, digest, 64);
+    rut_crypto_clear_v1(digest, sizeof(digest));
+    return ok;
+}
 bool load(json::Document& doc, Str configuration, Registry& result) {
     if (!doc.parse(configuration) || !members(doc, 0, 3)) return false;
     const u32 kVersion = field(doc, 0, lit_str("version"));
@@ -139,6 +167,8 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         }
         ++result.consumer_count;
     }
+    for (u32 n = doc.nodes[kCredentials].child; n != json::kNone; n = doc.nodes[n].next)
+        result.has_hashed_keys |= field(doc, n, lit_str("secretSha256")) < doc.count;
     for (u32 n = doc.nodes[kCredentials].child; n != json::kNone; n = doc.nodes[n].next) {
         if (result.credential_count == kMaxCredentials || !credential_fields_valid(doc, n))
             return false;
@@ -146,6 +176,7 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         credential.id = field(doc, n, lit_str("id"));
         credential.method = field(doc, n, lit_str("method"));
         credential.secret = field(doc, n, lit_str("secret"));
+        credential.secret_sha256 = field(doc, n, lit_str("secretSha256"));
         const u32 kNotBefore = field(doc, n, lit_str("notBefore"));
         const u32 kExpiresAt = field(doc, n, lit_str("expiresAt"));
         const u32 kOwner = field(doc, n, lit_str("consumerId"));
@@ -167,19 +198,40 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         if (!owner_found) return false;
         char method_bytes[16];
         const Str kMethod = text(doc, credential.method, method_bytes, sizeof(method_bytes));
-        const Str kSecret = text(doc, credential.secret, doc.scratch, kMaxBearerKeyBytes);
-        if (!kSecret.len || (kMethod.eq(lit_str("basic")) ? !basic_credentials_valid(kSecret)
-                             : kMethod.eq(lit_str("bearer")) || kMethod.eq(lit_str("header"))
-                                 ? !bearer_key_valid(kSecret)
-                             : kMethod.eq(lit_str("mtls")) ? !sha256_hex_format_valid(kSecret)
-                                                           : true))
+        const bool hashed = credential.secret_sha256 < doc.count;
+        const Str kSecret = hashed ? text(doc, credential.secret_sha256, doc.scratch, 64)
+                                   : text(doc, credential.secret, doc.scratch, kMaxBearerKeyBytes);
+        if (!kSecret.len ||
+            (hashed ? (!(kMethod.eq(lit_str("bearer")) || kMethod.eq(lit_str("header"))) ||
+                       !sha256_hex_format_valid(kSecret))
+                    : (kMethod.eq(lit_str("basic")) ? !basic_credentials_valid(kSecret)
+                       : kMethod.eq(lit_str("bearer")) || kMethod.eq(lit_str("header"))
+                           ? !bearer_key_valid(kSecret)
+                       : kMethod.eq(lit_str("mtls")) ? !sha256_hex_format_valid(kSecret)
+                                                     : true)))
             return false;
+        result.has_hashed_bearer |= hashed && kMethod.eq(lit_str("bearer"));
+        result.has_hashed_header |= hashed && kMethod.eq(lit_str("header"));
+        const bool key_method = kMethod.eq(lit_str("bearer")) || kMethod.eq(lit_str("header"));
+        if (key_method && result.has_hashed_keys) {
+            if (hashed)
+                memcpy(credential.verifier_sha256, kSecret.ptr, sizeof(credential.verifier_sha256));
+            else if (!sha256_hex(kSecret, credential.verifier_sha256))
+                return false;
+        }
         for (u32 i = 0; i < result.credential_count; ++i) {
             const auto& previous = result.credentials[i];
-            if (same(doc, previous.id, credential.id) ||
-                (same(doc, previous.method, credential.method) &&
-                 same(doc, previous.secret, credential.secret)))
-                return false;
+            if (same(doc, previous.id, credential.id)) return false;
+            if (!same(doc, previous.method, credential.method)) continue;
+            const bool previous_hashed = previous.secret_sha256 < doc.count;
+            const bool duplicate =
+                hashed == previous_hashed
+                    ? (hashed ? same(doc, credential.secret_sha256, previous.secret_sha256)
+                              : same(doc, credential.secret, previous.secret))
+                    : rut_crypto_equal_v1(reinterpret_cast<const u8*>(credential.verifier_sha256),
+                                          reinterpret_cast<const u8*>(previous.verifier_sha256),
+                                          sizeof(credential.verifier_sha256));
+            if (duplicate) return false;
         }
         ++result.credential_count;
     }
@@ -213,27 +265,42 @@ static bool authenticate(json::Document& document,
     }
     if (registry.has_windows && now_seconds <= 0) return false;
     if (!presented.ptr || !presented.len) return false;
+    SensitiveDigest presented_digest;
+    bool has_presented_digest = false;
+    if ((method.eq(lit_str("bearer")) && registry.has_hashed_bearer) ||
+        (method.eq(lit_str("header")) && registry.has_hashed_header)) {
+        Str key = presented;
+        if (method.eq(lit_str("bearer"))) key = bearer_token(presented);
+        if (!key.ptr || !bearer_key_valid(key) || !sha256_hex(key, presented_digest.bytes))
+            return false;
+        has_presented_digest = true;
+    }
     u32 selected = json::kNone;
     for (u32 i = 0; i < registry.credential_count; ++i) {
         const auto& credential = registry.credentials[i];
         char method_bytes[16];
         if (!method.eq(text(document, credential.method, method_bytes, sizeof(method_bytes))))
             continue;
-        const Str kSecret = text(document, credential.secret, document.scratch, kMaxBearerKeyBytes);
-        const bool kMatch =
-            method.eq(lit_str("basic"))    ? basic_matches(presented, kSecret)
-            : method.eq(lit_str("bearer")) ? bearer_matches(presented, kSecret)
-            : method.eq(lit_str("mtls"))
-                ? presented.len == kSecret.len &&
-                      rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
-                                          reinterpret_cast<const u8*>(kSecret.ptr),
-                                          kSecret.len)
-            : method.eq(lit_str("header"))
-                ? presented.len == kSecret.len &&
-                      rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
-                                          reinterpret_cast<const u8*>(kSecret.ptr),
-                                          kSecret.len)
-                : false;
+        const bool hashed = credential.secret_sha256 < document.count;
+        const Str kSecret =
+            hashed ? text(document, credential.secret_sha256, document.scratch, 64)
+                   : text(document, credential.secret, document.scratch, kMaxBearerKeyBytes);
+        bool kMatch = false;
+        if (hashed) {
+            kMatch = has_presented_digest &&
+                     rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented_digest.bytes),
+                                         reinterpret_cast<const u8*>(kSecret.ptr),
+                                         64);
+        } else if (method.eq(lit_str("basic"))) {
+            kMatch = basic_matches(presented, kSecret);
+        } else if (method.eq(lit_str("bearer"))) {
+            kMatch = bearer_matches(presented, kSecret);
+        } else if (method.eq(lit_str("mtls")) || method.eq(lit_str("header"))) {
+            kMatch = presented.len == kSecret.len &&
+                     rut_crypto_equal_v1(reinterpret_cast<const u8*>(presented.ptr),
+                                         reinterpret_cast<const u8*>(kSecret.ptr),
+                                         kSecret.len);
+        }
         // Evaluate every configured credential. Disabled entries never grant.
         const bool time_active = (!credential.not_before || now_seconds >= credential.not_before) &&
                                  (!credential.expires_at || now_seconds < credential.expires_at);
