@@ -2449,6 +2449,22 @@ See [the deny-policy example](../examples/consumer-group-deny-auth.rut). These
 ordinary functions require a verified identity; they do not establish its origin
 or provide dynamic membership storage.
 
+### Static Consumer-to-tenant binding
+
+`middleware/rbac.rut` also exposes `TenantBinding(consumerId, tenant)` and
+`requireTenant(identity, tenant, first, second, third, fourth)`. Call it after
+authentication with trusted route tenant configuration. It validates the
+requested tenant and all four binding slots before matching: a slot is either
+fully empty or has a printable ASCII Consumer ID of 1–64 bytes and a tenant of
+1–128 bytes. At least one slot is required, and Consumer IDs must be unique
+across active slots. Invalid, partial, duplicate or all-empty configuration
+returns 503; an unknown verified Consumer or a different tenant returns 403.
+Success returns the same verified JSON identity. Client headers, groups and
+claims do not create or override bindings. This is a static route-policy map,
+not a tenant claim in the Consumer registry or a general storage-isolation
+guarantee. It can be composed before the existing role/resource/action policy;
+see `examples/consumer-tenant-rbac-auth.rut`.
+
 
 ### RS256 with a configured trust policy
 

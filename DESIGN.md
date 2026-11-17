@@ -9472,6 +9472,19 @@ tenant ownership. Policy replacement loads a new program snapshot. This bounded
 Rut helper is not a Casbin/Wolf-compatible model or a dynamic policy store.
 See `examples/consumer-rbac-auth.rut`.
 
+The same middleware can first call `requireTenant(identity, tenant, first,
+second, third, fourth)` with four static `TenantBinding(consumerId, tenant)`
+records. It validates every slot before matching; slots are fully empty or use a
+printable ASCII Consumer ID (1–64 bytes) and tenant (1–128 bytes), with at least
+one active binding and no repeated active Consumer ID. Invalid configuration
+returns 503; an unknown authenticated Consumer or a tenant mismatch returns
+403. Success returns the original verified identity, which then enters the
+existing role/resource/action check. Tenant selection comes from trusted route
+configuration, while ownership is an explicit static binding; this adds no
+tenant claim to registry records and guarantees no storage isolation.
+`examples/consumer-tenant-rbac-auth.rut` demonstrates two Consumers with the
+same group names bound to separate route tenants.
+
 ### Two-Consumer mTLS identity mapping
 
 The ordinary `mtls.Consumer` record contains trusted `consumerId`, `sha256`

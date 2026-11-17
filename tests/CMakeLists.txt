@@ -4234,6 +4234,14 @@ if(RUT_ENABLE_JIT)
                         --backend ${auth_free_backend})
                 set_tests_properties(test_consumer_rbac_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                foreach(tenant_rbac_opt 0 2)
+                    add_test(NAME test_consumer_tenant_rbac_${auth_free_backend}_O${tenant_rbac_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_tenant_rbac.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-tenant-rbac-auth.rut
+                            --backend ${auth_free_backend} --opt ${tenant_rbac_opt})
+                    set_tests_properties(test_consumer_tenant_rbac_${auth_free_backend}_O${tenant_rbac_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                endforeach()
                 add_test(NAME test_signed_replay_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signed-request-replay-auth.rut
