@@ -22,13 +22,22 @@ and test failures fail CI. Each job uploads the inventory, JUnit results and
 CTest log, including on failure. Matrix fail-fast is disabled so a failure
 does not cancel the remaining coverage. Other CI jobs retain their full suites.
 
-This trades additional builds and runner minutes for shorter elapsed time.
-The completed Clang Release baseline from PR #1100 ran 499 tests in 9797.77 s;
-the four interleaved groups account for 2314.43, 2352.68, 2750.79 and 2379.60 s
-of that historical test time. The largest group is about 46 minutes instead
-of 163 minutes. These are estimates from the serial baseline, excluding new
-builds, runner queues and machine variation; compare the uploaded results of
-the first sharded CI run before claiming an observed speedup.
+The first sharded CI run on PR #1107 passed all checks but took 2 h 11 min
+end to end. Individual matrix jobs took 43–73 minutes, with builds of up to
+16 minutes and tests of up to 56 minutes. The earlier 46-minute estimate
+covered only historical test time in one configuration and was insufficient
+as an end-to-end forecast.
+
+The primary matrix uses ccache for C/C++ objects. Cache keys separate OS,
+architecture, compiler and build type; ccache validates compiler contents,
+flags and included source/header files. Every job still configures, links and
+runs its tests. No test results or whole build trees are restored. The four
+shards share a cache key and publish after a successful build, before tests.
+ccache is a CI-only build tool: CMake's launcher support alone cannot reuse
+objects across fresh runners. Pinned OpenSSL remains built through its
+existing CMake acquisition and checksum verification. Cold-cache builds and
+linking still cost time; cache statistics are logged for measuring warm runs.
+A ten-minute end-to-end target has not yet been demonstrated.
 
 ## Compiler and JIT leak checks
 
