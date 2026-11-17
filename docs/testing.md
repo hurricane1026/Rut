@@ -39,6 +39,23 @@ existing CMake acquisition and checksum verification. Cold-cache builds and
 linking still cost time; cache statistics are logged for measuring warm runs.
 A ten-minute end-to-end target has not yet been demonstrated.
 
+## Performance measurements
+
+`.github/workflows/benchmarks.yml` runs nightly at 02:23 UTC and can be started
+manually. Proxy TLS/io_uring latency, x86/arm64 SIMD scan/dispatch and integer
+parser timing no longer run on each PR or main push. The PR integer parser
+job still compiles every ISA candidate and runs each supported candidate's
+correctness oracle, using `RUT_RUN_BENCHMARKS=0` to skip timing and benchmark
+compilation. Manual `integer-parser` mode in CI is also correctness-only;
+use the Benchmarks workflow for performance data and optional AVX-512 checks.
+
+Performance-only CMake targets are excluded from the default build; build them
+explicitly, for example `cmake --build build --target bench_scan_uri`.
+Kernel probe binaries consumed by CTest and tests of benchmark tooling remain
+in normal builds/checks because they verify correctness rather than measure
+performance. Removing performance jobs reduces runner contention but does not
+by itself establish a ten-minute full CI duration.
+
 ## Compiler and JIT leak checks
 
 Build the frontend and loader with ASan/UBSan, keeping JIT support enabled

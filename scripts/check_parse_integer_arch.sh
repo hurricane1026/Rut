@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Compile every candidate, execute only when this CPU/OS supports its ISA.
 # RUT_REQUIRE_AVX512=1 makes an absent AVX-512 execution a diagnostic failure.
+# RUT_RUN_BENCHMARKS=0 keeps all candidate correctness checks but skips timing.
 set -euo pipefail
+run_benchmarks=${RUT_RUN_BENCHMARKS:-1}
+if [[ $run_benchmarks != 0 && $run_benchmarks != 1 ]]; then
+  echo 'RUT_RUN_BENCHMARKS must be 0 or 1' >&2
+  exit 1
+fi
 cd "$(dirname "$0")/.."
 output=${1:-build/parse-integer-arch}
 mkdir -p "$output"
@@ -34,7 +40,9 @@ CPP
 # The benchmark and oracle always use baseline compiler flags. Only the parser
 # object receives ISA flags, so auto-vectorization cannot contaminate baselines.
 "$compiler" "${common[@]}" -Itesting -c tests/test_parse_integer.cc -o "$output/test.o"
-"$compiler" "${common[@]}" -c bench/bench_parse_integer.cc -o "$output/bench.o"
+if [[ $run_benchmarks == 1 ]]; then
+  "$compiler" "${common[@]}" -c bench/bench_parse_integer.cc -o "$output/bench.o"
+fi
 case $(uname -m) in
   x86_64) arches=(portable sse2 avx2 avx512) ;;
   aarch64|arm64) arches=(portable neon) ;;
@@ -60,7 +68,9 @@ for arch in "${arches[@]}"; do
   esac
   "$compiler" "${common[@]}" "${flags[@]}" -c src/runtime/parse_integer.cc -o "$output/$arch.o"
   "$compiler" "$output/test.o" "$output/$arch.o" "${link[@]}" -o "$output/test-$arch"
-  "$compiler" "$output/bench.o" "$output/$arch.o" "${link[@]}" -o "$output/bench-$arch"
+  if [[ $run_benchmarks == 1 ]]; then
+    "$compiler" "$output/bench.o" "$output/$arch.o" "${link[@]}" -o "$output/bench-$arch"
+  fi
   if ! "$output/cpu" "$arch"; then
     echo "::notice::$arch compiled; execution skipped: CPU/OS lacks the required ISA"
     printf '| %s | passed | **not run: ISA unavailable** |\n' "$arch" >> "$output/summary.md"
@@ -73,17 +83,24 @@ for arch in "${arches[@]}"; do
     echo "::error::requested $arch kernel was not selected in the executable"
     exit 1
   fi
+  if [[ $run_benchmarks == 0 ]]; then
+    printf '| %s | passed | correctness passed; benchmark disabled |\n' "$arch" >> "$output/summary.md"
+    if [[ $arch == avx512 ]]; then ran_avx512=1; fi
+    continue
+  fi
   "${pin[@]}" "$output/bench-$arch" | tee "$output/bench-$arch.csv"
   printf '| %s | passed | correctness and benchmark passed |\n' "$arch" >> "$output/summary.md"
   if [[ $arch == avx512 ]]; then ran_avx512=1; fi
 done
-printf '\n| Bits | Corpus | Selected architecture | ns/call |\n| --- | --- | --- | ---: |\n' >> "$output/summary.md"
-for arch in "${arches[@]}"; do
-  if [[ -f "$output/bench-$arch.csv" ]]; then
-    awk -F, '$3 != "scalar_cutoff" && $3 != "portable_swar" { printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }' \
-      "$output/bench-$arch.csv" >> "$output/summary.md"
-  fi
-done
+if [[ $run_benchmarks == 1 ]]; then
+  printf '\n| Bits | Corpus | Selected architecture | ns/call |\n| --- | --- | --- | ---: |\n' >> "$output/summary.md"
+  for arch in "${arches[@]}"; do
+    if [[ -f "$output/bench-$arch.csv" ]]; then
+      awk -F, '$3 != "scalar_cutoff" && $3 != "portable_swar" { printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }' \
+        "$output/bench-$arch.csv" >> "$output/summary.md"
+    fi
+  done
+fi
 cat "$output/summary.md"
 if [[ ${RUT_REQUIRE_AVX512:-0} == 1 && $ran_avx512 != 1 ]]; then
   echo '::error::AVX-512 execution was required but this runner does not expose F+BW'
