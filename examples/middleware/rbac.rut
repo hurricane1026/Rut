@@ -8,6 +8,65 @@ struct Rule {
     effect: str
 }
 
+struct TenantBinding {
+    consumerId: str
+    tenant: str
+}
+
+func validConsumerId(_ value: str) -> bool {
+    Bytes(value).count >= 1 && Bytes(value).count <= 64 &&
+        value.matches(re"^[\x21-\x7e]+$")
+}
+
+func validTenantBinding(_ binding: TenantBinding) -> bool {
+    let empty = binding.consumerId == "" && binding.tenant == ""
+    let complete = validConsumerId(binding.consumerId) &&
+        Bytes(binding.tenant).count >= 1 && Bytes(binding.tenant).count <= 128
+    empty || complete
+}
+
+func validTenantPolicy(_ tenant: str, _ first: TenantBinding,
+                       _ second: TenantBinding, _ third: TenantBinding,
+                       _ fourth: TenantBinding) -> bool {
+    let valid = Bytes(tenant).count >= 1 && Bytes(tenant).count <= 128 &&
+        validTenantBinding(first) && validTenantBinding(second) &&
+        validTenantBinding(third) && validTenantBinding(fourth)
+    let any = first.consumerId != "" || second.consumerId != "" ||
+        third.consumerId != "" || fourth.consumerId != ""
+    let unique = (first.consumerId == "" || first.consumerId != second.consumerId) &&
+        (first.consumerId == "" || first.consumerId != third.consumerId) &&
+        (first.consumerId == "" || first.consumerId != fourth.consumerId) &&
+        (second.consumerId == "" || second.consumerId != third.consumerId) &&
+        (second.consumerId == "" || second.consumerId != fourth.consumerId) &&
+        (third.consumerId == "" || third.consumerId != fourth.consumerId)
+    valid && any && unique
+}
+
+func tenantMatches(_ consumerId: str, _ tenant: str,
+                   _ first: TenantBinding, _ second: TenantBinding,
+                   _ third: TenantBinding, _ fourth: TenantBinding) -> bool {
+    (first.consumerId == consumerId && first.tenant == tenant) ||
+        (second.consumerId == consumerId && second.tenant == tenant) ||
+        (third.consumerId == consumerId && third.tenant == tenant) ||
+        (fourth.consumerId == consumerId && fourth.tenant == tenant)
+}
+
+func identityConsumerId(_ identity: Json) -> str {
+    guard let idField = json.get(identity, "/consumerId") else { "" }
+    json.string(idField).or("")
+}
+
+// Bind verified Consumer IDs to trusted route tenant names. Validate every
+// slot, including slots unrelated to this request, before matching identity.
+func requireTenant(_ identity: Json, _ tenant: str,
+                   _ first: TenantBinding, _ second: TenantBinding,
+                   _ third: TenantBinding, _ fourth: TenantBinding) -> Json {
+    guard validTenantPolicy(tenant, first, second, third, fourth) else { respond 503 }
+    let consumerId = identityConsumerId(identity)
+    guard validConsumerId(consumerId) && tenantMatches(consumerId, tenant, first, second, third, fourth) else { respond 403 }
+    identity
+}
+
 func validRule(_ rule: Rule) -> bool {
     let empty = rule.tenant == "" && rule.role == "" && rule.resource == "" &&
         rule.action == "" && rule.effect == ""

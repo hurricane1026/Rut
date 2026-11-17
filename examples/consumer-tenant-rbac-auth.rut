@@ -1,0 +1,51 @@
+import "middleware/rbac.rut"
+
+listen :8080
+
+// Tenant names and policy bindings are trusted program configuration. The
+// Consumer registry supplies verified identity and groups, but no tenant claim.
+route GET "/tenant/acme/invoices/read" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let tenantIdentity = rbac.requireTenant(identity, "acme",
+        rbac.TenantBinding(consumerId: "alice", tenant: "acme"),
+        rbac.TenantBinding(consumerId: "bob", tenant: "other"),
+        rbac.TenantBinding(consumerId: "", tenant: ""),
+        rbac.TenantBinding(consumerId: "", tenant: ""))
+    let allowed = rbac.require(tenantIdentity, "acme", "invoices", "read",
+        rbac.Rule(tenant: "acme", role: "invoice-reader", resource: "invoices", action: "read", effect: "allow"),
+        rbac.Rule(tenant: "acme", role: "invoice-admin", resource: "invoices", action: "read", effect: "allow"),
+        rbac.Rule(tenant: "acme", role: "invoice-admin", resource: "invoices", action: "delete", effect: "allow"),
+        rbac.Rule(tenant: "acme", role: "suspended", resource: "invoices", action: "read", effect: "deny"))
+    guard let subject = json.string(json.get(allowed, "/consumerId").or(allowed)) else { return 503 }
+    return response(200, body: subject)
+}
+route GET "/tenant/other/invoices/read" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let tenantIdentity = rbac.requireTenant(identity, "other",
+        rbac.TenantBinding(consumerId: "alice", tenant: "acme"),
+        rbac.TenantBinding(consumerId: "bob", tenant: "other"),
+        rbac.TenantBinding(consumerId: "", tenant: ""),
+        rbac.TenantBinding(consumerId: "", tenant: ""))
+    let allowed = rbac.require(tenantIdentity, "other", "invoices", "read",
+        rbac.Rule(tenant: "other", role: "invoice-reader", resource: "invoices", action: "read", effect: "allow"),
+        rbac.Rule(tenant: "other", role: "invoice-admin", resource: "invoices", action: "read", effect: "allow"),
+        rbac.Rule(tenant: "other", role: "invoice-admin", resource: "invoices", action: "delete", effect: "allow"),
+        rbac.Rule(tenant: "other", role: "suspended", resource: "invoices", action: "read", effect: "deny"))
+    guard let subject = json.string(json.get(allowed, "/consumerId").or(allowed)) else { return 503 }
+    return response(200, body: subject)
+}
+route DELETE "/tenant/acme/invoices" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let tenantIdentity = rbac.requireTenant(identity, "acme",
+        rbac.TenantBinding(consumerId: "alice", tenant: "acme"),
+        rbac.TenantBinding(consumerId: "bob", tenant: "other"),
+        rbac.TenantBinding(consumerId: "", tenant: ""),
+        rbac.TenantBinding(consumerId: "", tenant: ""))
+    let allowed = rbac.require(tenantIdentity, "acme", "invoices", "delete",
+        rbac.Rule(tenant: "acme", role: "invoice-reader", resource: "invoices", action: "read", effect: "allow"),
+        rbac.Rule(tenant: "acme", role: "invoice-admin", resource: "invoices", action: "delete", effect: "allow"),
+        rbac.Rule(tenant: "acme", role: "suspended", resource: "invoices", action: "delete", effect: "deny"),
+        rbac.Rule(tenant: "", role: "", resource: "", action: "", effect: ""))
+    guard let subject = json.string(json.get(allowed, "/consumerId").or(allowed)) else { return 503 }
+    return response(200, body: subject)
+}

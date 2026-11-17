@@ -20,7 +20,7 @@ whether a competing open-source edition includes them.
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, A-only DNS and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS transports beyond the bounded A-only profile, CNAME/IPv6 discovery, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
-| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny | Larger policy sets, identity tenant ownership, administrative membership management; bounded registry snapshots can replace memberships |
+| ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny; optional exact static Consumer-ID-to-route-tenant binding before RBAC | Larger policy sets, intrinsic tenant claims/ownership and storage isolation, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
 | Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
@@ -52,11 +52,16 @@ and every route selector before policy evaluation. Any matching deny overrides
 allows, and no matching allow returns 403. Invalid configuration returns 503.
 Routes supply tenant/resource/action as trusted program configuration. The
 Consumer registry does not claim a tenant for the identity, so matching a route
-tenant is not evidence of tenant ownership; tenant-qualified group names can
-separate role namespaces. Updated rules require a newly loaded program. The
-native example tests independent old/new program snapshots, not in-process RCU
-policy mutation. See [the language contract](language-card.md#bounded-consumer-rbac-policy)
-and [the runnable example](../examples/consumer-rbac-auth.rut).
+tenant alone is not evidence of tenant ownership; tenant-qualified group names
+can separate role namespaces. `requireTenant` optionally adds a static map from
+verified Consumer ID to route tenant, validating four slots as a complete
+snapshot and requiring unique active IDs. This mapping is still program
+configuration, not an intrinsic registry tenant claim or a storage-isolation
+guarantee. Updated rules/bindings require a newly loaded program. The native
+tests cover independent old/new program snapshots, not in-process RCU mutation.
+See [the language contract](language-card.md#static-consumer-to-tenant-binding),
+[the RBAC example](../examples/consumer-rbac-auth.rut), and
+[the tenant-binding example](../examples/consumer-tenant-rbac-auth.rut).
 
 ## Audit of executable gaps
 

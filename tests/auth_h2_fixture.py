@@ -51,7 +51,15 @@ def status(block):
 
 
 def request(port, path, fields, body=b'', method='GET', tls_context=None, authority='localhost'):
-    headers = bytes((0x82 if method == 'GET' else 0x83, 0x86, 0x04)) + string(path)
+    if method == 'GET':
+        headers = b'\x82'
+    elif method == 'POST':
+        headers = b'\x83'
+    else:
+        # Literal :method with the static-table name index, for methods such as
+        # DELETE that do not have a dedicated static-table value.
+        headers = b'\x02' + string(method)
+    headers += b'\x86\x04' + string(path)
     headers += b'\x01' + string(authority)
     for name, value in [*fields, ('content-length', str(len(body)))]:
         headers += b'\x00' + string(name.lower()) + string(value)
