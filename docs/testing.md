@@ -1,34 +1,77 @@
 # Testing Notes
 
-## Primary CI test shards
+## PR checks and full regressions
 
-Each Clang/GCC × Debug/Release configuration runs its non-Docker CTest suite
-on four independent runners. Each runner builds the same configuration and
-executes one interleaved quarter of the test inventory, using CTest's native
-`-I Start,,Stride` selection. Tests remain serial within each runner, so
-fixed-port fixtures, `RUN_SERIAL` and `RESOURCE_LOCK` retain their isolation.
-The compiler model/mutation checks run once, on Clang Debug shard 1.
+The CI scope job runs the CI policy/sharding controls before selecting work.
+Documentation and CI-selection-tool-only changes skip native builds. Native,
+build-system, test and unknown input changes use four isolated Clang Debug
+runners. PR CTest selection contains all `unit` tests, both integration smoke
+shards, and tests whose command names match directly changed test scripts or
+C++ test source stems. This is a bounded PR smoke policy, not complete semantic
+impact analysis: other integration tests and other compiler/configuration
+combinations are deferred to full regression. Compiler model/mutation checks
+run on relevant model/verifier/scheduler/timer/retirement changes. Formatting
+and clang-tidy run for C++ source/header changes.
+
+Main pushes, nightly runs (01:11 UTC), and manual CI runs retain the full
+Clang/GCC × Debug/Release suite, with four isolated CTest shards per
+configuration. Full runs also retain nginx/Envoy differentials, sanitizer,
+coverage, no-JIT and no-WebSocket builds. macOS, the pinned Kong baseline and
+the privileged IPv4 fixture workflows run on main, nightly and manually,
+rather than on every PR. These full regressions are intentionally no longer
+PR acceptance checks. The manual diagnostic modes remain available.
+
+Each runner verifies its actual CTest selections are nonempty, disjoint and
+complete for the selected scope. Tests stay serial within a runner to retain
+fixed-port fixture isolation, resource locks and timeouts. Each job preserves
+inventory, scope, deferred-test names, JUnit results and the CTest log. Matrix
+fail-fast remains disabled.
 
 ```bash
-python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4
-# Inspect and verify the complete partition without executing tests:
+# PR smoke scope, including a directly changed integration script:
+python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4 \
+    --pr --changed-files-json '["tests/test_redis_resp3.py"]'
+# Full regression scope, inventory only:
 python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4 --plan-only
-python3 -m unittest discover -s tests -p test_ci_sharding.py
+python3 -m unittest discover -s tests -p 'test_ci_*.py'
 ```
 
-Every shard verifies that the actual CTest selections form a complete,
-non-overlapping partition before running. Empty partitions, discovery errors
-and test failures fail CI. Each job uploads the inventory, JUnit results and
-CTest log, including on failure. Matrix fail-fast is disabled so a failure
-does not cancel the remaining coverage. Other CI jobs retain their full suites.
+The primary matrix uses ccache for C/C++ objects. Keys separate OS,
+architecture, compiler and configuration; compiler contents, flags and
+included files determine reuse. Configuration, linking and tests still run.
+Absolute compiler source paths are preserved: `CCACHE_BASEDIR` rewriting is
+not enabled because tests locate source fixtures and imports via `__FILE__`.
+A preflight compiles a fixture-reading probe twice through ccache and runs
+both binaries from a different directory. The v2 cache keys isolate objects
+from the previous path-rewriting configuration.
+No test results or whole build trees are restored. Shards share immutable
+keys and publish after a successful build, before tests. Pinned OpenSSL
+retains its existing acquisition/checksum verification. Cold builds still
+cost time; cache statistics are logged.
 
-This trades additional builds and runner minutes for shorter elapsed time.
-The completed Clang Release baseline from PR #1100 ran 499 tests in 9797.77 s;
-the four interleaved groups account for 2314.43, 2352.68, 2750.79 and 2379.60 s
-of that historical test time. The largest group is about 46 minutes instead
-of 163 minutes. These are estimates from the serial baseline, excluding new
-builds, runner queues and machine variation; compare the uploaded results of
-the first sharded CI run before claiming an observed speedup.
+The first full sharded run on PR #1107 passed but took 2 h 11 min end to end.
+The PR smoke scope selects 148 tests from the historical 499-test inventory,
+including both integration shards, versus repeating all 499 tests in each
+of four configurations. New tests change these counts. This substantially
+reduces work and runner contention, but a ten-minute end-to-end duration
+remains a target pending remote measurement, not a guaranteed timeout.
+
+## Performance measurements
+
+`.github/workflows/benchmarks.yml` runs nightly at 02:23 UTC and can be started
+manually. Proxy TLS/io_uring latency, x86/arm64 SIMD scan/dispatch and integer
+parser timing no longer run on each PR or main push. The PR integer parser
+job still compiles every ISA candidate and runs each supported candidate's
+correctness oracle, using `RUT_RUN_BENCHMARKS=0` to skip timing and benchmark
+compilation. Manual `integer-parser` mode in CI is also correctness-only;
+use the Benchmarks workflow for performance data and optional AVX-512 checks.
+
+Performance-only CMake targets are excluded from the default build; build them
+explicitly, for example `cmake --build build --target bench_scan_uri`.
+Kernel probe binaries consumed by CTest and tests of benchmark tooling remain
+in normal builds/checks because they verify correctness rather than measure
+performance. Removing performance jobs reduces runner contention but does not
+by itself establish a ten-minute full CI duration.
 
 ## Compiler and JIT leak checks
 

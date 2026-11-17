@@ -7,6 +7,8 @@ on:
   # must run CI too. pull_request uses the HEAD branch's workflow file,
   # so this takes effect as soon as the branch carries this change.
   pull_request:
+  schedule:
+    - cron: '11 1 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -29,9 +31,39 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
 
 jobs:
+  plan:
+    name: CI scope and policy checks
+    runs-on: ubuntu-24.04
+    outputs:
+      native: ${{ steps.scope.outputs.native }}
+      format: ${{ steps.scope.outputs.format }}
+      models: ${{ steps.scope.outputs.models }}
+      full: ${{ steps.scope.outputs.full }}
+      matrix: ${{ steps.scope.outputs.matrix }}
+      changed: ${{ steps.scope.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify CI selection and sharding controls
+        run: |
+          python3 -m unittest discover -s tests -p 'test_ci_*.py'
+          bash -n scripts/check_parse_integer_arch.sh
+      - name: Select validation scope
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" ]]; then
+            python3 scripts/plan_ci.py --base "$BASE_SHA" --output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/plan_ci.py --output "$GITHUB_OUTPUT"
+          fi
+
   format:
     name: clang-format
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.format == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -55,7 +87,8 @@ jobs:
 
   lint:
     name: clang-tidy
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.format == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -89,7 +122,8 @@ jobs:
 
   runtime-state-model:
     name: Runtime state model
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.models == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -171,38 +205,54 @@ jobs:
 
   test:
     name: Build & Test (${{ matrix.compiler }}, ${{ matrix.build_type }}, shard ${{ matrix.shard }}/4)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.native == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 1G
     strategy:
       fail-fast: false
-      matrix:
-        compiler: [clang, gcc]
-        build_type: [Debug, Release]
-        # Separate runners preserve isolation for tests with fixed ports and
-        # RUN_SERIAL. Every configuration still executes the complete suite.
-        shard: [1, 2, 3, 4]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
       - name: Verify CI test sharding
         run: python3 -m unittest discover -s tests -p test_ci_sharding.py
+      # Cache compiler outputs, never test results. ccache revalidates compiler
+      # contents, flags and included files before reusing an object.
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: |
+            ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
       - name: Install tools
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | \
             sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel
+          sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel ccache
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang-21
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
             sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
           fi
 
+      - name: Verify cached compiler source paths
+        env:
+          CI_COMPILER: ${{ matrix.compiler == 'clang' && 'clang-21' || 'gcc' }}
+        run: python3 scripts/check_ci_source_paths.py --compiler "$CI_COMPILER" --launcher ccache
+
       - name: Configure
         run: |
-          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm"
+          ccache --zero-stats
+          LLVM_OPT="-DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $LLVM_OPT
           else
@@ -210,24 +260,35 @@ jobs:
           fi
 
       - name: Build
-        run: ninja -C build
+        run: |
+          ninja -C build
+          ccache --show-stats
+
+      # Publish immediately after building so long-running tests do not delay
+      # cache availability. Identical shards share one immutable cache key.
+      - name: Save compiler cache
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       - name: Set up Java for compiler-generated protocol models
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Cross-check compiler-generated handler models with TLC
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         run: |
           python3 scripts/acquire_tla2tools.py /tmp/handler-tla2tools.jar
           python3 scripts/check_handler_models.py --checker build/tests/test_handler_reference \
             --jar /tmp/handler-tla2tools.jar --output-dir /tmp/handler-reference-tlc
 
       - name: Preserve compiler-generated models and counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: handler-reference-tlc
@@ -235,13 +296,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject wait scheduler implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         run: |
           python3 scripts/check_wait_scheduler_mutations.py --build-dir build \
             --output-dir /tmp/wait-scheduler-mutations
 
       - name: Preserve wait scheduler implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: wait-scheduler-cpp-mutations
@@ -249,13 +310,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject upstream retirement implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         run: |
           python3 scripts/check_upstream_retirement_mutations.py --build-dir build \
             --output-dir /tmp/upstream-retirement-mutations
 
       - name: Preserve upstream retirement implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: upstream-retirement-cpp-mutations
@@ -263,13 +324,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject timer implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         run: |
           python3 scripts/check_timer_mutations.py --build-dir build \
             --output-dir /tmp/timer-mutations
 
       - name: Preserve timer implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1 && needs.plan.outputs.models == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: timer-cpp-mutations
@@ -277,7 +338,16 @@ jobs:
           if-no-files-found: ignore
 
       - name: Test
-        run: python3 scripts/run_ci_shard.py --build-dir build --shard ${{ matrix.shard }} --shards 4
+        env:
+          CI_FULL: ${{ needs.plan.outputs.full }}
+          CI_CHANGED_FILES: ${{ needs.plan.outputs.changed }}
+          CI_SHARD: ${{ matrix.shard }}
+        run: |
+          selection=()
+          if [[ "$CI_FULL" != true ]]; then
+            selection=(--pr --changed-files-json "$CI_CHANGED_FILES")
+          fi
+          python3 scripts/run_ci_shard.py --build-dir build --shard "$CI_SHARD" --shards 4 "${selection[@]}"
 
       - name: Preserve test results and shard inventory
         if: always()
@@ -292,7 +362,8 @@ jobs:
 
   nginx-required:
     name: Required pinned nginx differentials
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -358,7 +429,8 @@ jobs:
 
   envoy-required:
     name: Required pinned Envoy differentials
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -527,7 +599,8 @@ jobs:
 
   test-no-jit:
     name: Build & Test (no JIT)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -549,7 +622,8 @@ jobs:
 
   test-no-websocket:
     name: Build & Test (no WebSocket)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     # RUT_ENABLE_WEBSOCKET=0 is a shipped config (minimal mesh sidecars that never
     # proxy WebSocket). Build it so the #if RUT_ENABLE_WEBSOCKET runtime paths compile
@@ -572,7 +646,8 @@ jobs:
 
   sanitizer:
     name: Sanitizer (ASan+UBSan)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     # ubuntu-24.04 has a 6.x kernel, so the real-io_uring integration tests
     # (proxy-over-TLS keep-alive, watermark backpressure, recv re-arm) actually
@@ -599,256 +674,10 @@ jobs:
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
           ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 300
 
-  bench-proxy:
-    name: Proxy keep-alive bench (TLS, io_uring)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
-    runs-on: ubuntu-24.04
-    # Informational — proxy latency/throughput numbers go to the log so a change
-    # off the per-byte path (e.g. cancel-by-fd) can be eyeballed against history.
-    # Not a pass/fail perf gate (shared runners are too noisy); the bench itself
-    # still asserts every request completes, so a hang/truncation regression fails.
-    # Real io_uring (6.x kernel on ubuntu-24.04); Release for representative numbers.
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libboost-dev
-      - name: Configure
-        run: cmake -B build -G Ninja -DRUT_ENABLE_JIT=OFF -DCMAKE_BUILD_TYPE=Release
-      - name: Build
-        run: ninja -C build test_integration
-      - name: Bench
-        # set -o pipefail so a failing test run (non-zero exit) isn't masked by grep's
-        # exit status — otherwise the bench's "every request completes" assertion is
-        # silently dropped whenever grep matches a line.
-        run: |
-          set -o pipefail
-          RUT_BENCH=1 ./build/tests/test_integration --filter=proxy_tls_iouring.keepalive_latency_bench 2>&1 | grep -E '\[bench\]|keepalive_latency_bench'
-
-  bench-simd-x86:
-    name: SIMD scan_uri bench (x86)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
-    runs-on: ubuntu-24.04
-    # Informational — perf numbers go to the log so reviewers can see
-    # SIMD speedup across ISAs side-by-side. Doesn't fail on regression
-    # (would need a stable baseline + tolerance; left to follow-up).
-    #
-    # Runner pool: GitHub-hosted ubuntu-24.04 runners are a mixed pool
-    # of Intel Xeon (Ice Lake-class, AVX-512 capable) and AMD EPYC
-    # 7763 / 9V74 (Zen 3/4, AVX-512 absent or masked off in the VM
-    # SKU). The bench step runtime-checks /proc/cpuinfo flags and
-    # skips ISAs the runner can't execute, so the avx512 column may
-    # be absent depending on which CPU was scheduled. We tried
-    # ubuntu-22.04 to bias toward Intel; that pool turned out to
-    # share the same AMD-heavy distribution AND its 5.15 kernel
-    # headers don't have the io_uring features rut_runtime depends
-    # on, so we stayed on 24.04.
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
-
-      - name: Report CPU capabilities
-        run: |
-          grep -m1 '^model name' /proc/cpuinfo
-          # Use only the first 'flags' line (one CPU's-worth) and
-          # extract every avx*/sse* token from it. -m1 alone on the
-          # outer grep would only print the first matched flag.
-          grep -m1 '^flags' /proc/cpuinfo | grep -oE '(avx[0-9a-z_]*|sse[0-9_]*)' | sort -u | tr '\n' ' '
-          echo
-
-      - name: Bench across x86 SIMD ISAs
-        run: |
-          mkdir -p /tmp/bench-results /tmp/dispatch-results
-          # GitHub-hosted x86 runners' CPUs vary (Intel Xeon / AMD EPYC).
-          # Skip ISAs the CPU can't execute. Per-arch isolation keeps a
-          # single failure from aborting the whole job.
-          for arch in scalar sse2 avx2 avx512; do
-            case $arch in
-              sse2)    needs="sse2" ;;
-              avx2)    needs="avx2" ;;
-              # avx512: gate on AVX512BW (byte/word ops), not just F.
-              # avx512.cc uses _mm512_cmpeq_epi8_mask / cmplt_epu8_mask /
-              # movepi8_mask, all of which require BW. Knights Landing /
-              # Mill expose F+ER+CD+PF but not BW; SkyLake-X and onward
-              # have BW. Gating on F alone would let a KNL runner build
-              # with -mavx512bw and SIGILL at runtime.
-              avx512)  needs="avx512bw" ;;
-              scalar)  needs="" ;;
-            esac
-            if [ -n "$needs" ] && ! grep -qE "^flags.*\b$needs\b" /proc/cpuinfo; then
-              echo "::notice::CPU lacks $needs — skipping SIMD_ARCH=$arch"
-              continue
-            fi
-            echo "=== building SIMD_ARCH=$arch ==="
-            rm -rf "build-$arch"
-            if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
-                  -DCMAKE_BUILD_TYPE=Release \
-                  -DSIMD_ARCH=$arch \
-                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
-              echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
-              cat "/tmp/cmake-$arch.err"
-              continue
-            fi
-            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
-              echo "::warning::build failed for SIMD_ARCH=$arch"
-              tail -30 "/tmp/build-$arch.err"
-              continue
-            fi
-            ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
-              { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
-            echo
-          done
-
-      - name: Unified comparison report
-        run: |
-          echo "==============================================================="
-          echo "scan_uri SIMD vs scalar — same hardware, different ISA backends"
-          echo "==============================================================="
-          for arch in scalar sse2 avx2 avx512; do
-            f="/tmp/bench-results/$arch.txt"
-            if [ ! -f "$f" ]; then
-              echo
-              echo "--- $arch (skipped: CPU lacks support) ---"
-              continue
-            fi
-            echo
-            echo "--- $arch ---"
-            cat "$f"
-          done
-
-          echo
-          echo "==============================================================="
-          echo "dispatch comparison — linear scan vs scalar ART vs JIT ART"
-          echo "==============================================================="
-          for arch in scalar sse2 avx2 avx512; do
-            f="/tmp/dispatch-results/$arch.txt"
-            if [ ! -f "$f" ]; then
-              echo
-              echo "--- $arch (skipped: CPU lacks support) ---"
-              continue
-            fi
-            echo
-            echo "--- $arch ---"
-            cat "$f"
-          done
-
-  bench-simd-arm:
-    name: SIMD scan_uri bench (arm64)
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
-    runs-on: ubuntu-24.04-arm
-    # GitHub-hosted ubuntu-24.04-arm runners are Cobalt 100 (Neoverse N2)
-    # with NEON. SVE may or may not be exposed depending on the runner
-    # configuration; the bench job below tolerates either case.
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-20 cmake ninja-build llvm-20-dev libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
-
-      - name: Report CPU capabilities
-        run: |
-          grep -m1 '^Features' /proc/cpuinfo || true
-          grep -m1 '^CPU implementer' /proc/cpuinfo || true
-          grep -m1 '^CPU part' /proc/cpuinfo || true
-
-      - name: Bench across arm64 SIMD ISAs
-        run: |
-          mkdir -p /tmp/bench-results /tmp/dispatch-results
-          # neon is universal on aarch64; sve only if the runner exposes it.
-          ARCHES="scalar neon"
-          if grep -q -m1 'sve' /proc/cpuinfo; then
-            ARCHES="$ARCHES sve"
-          else
-            echo "::notice::SVE not available on this runner — skipping sve build"
-          fi
-          # Each arch attempt is isolated — if one fails (e.g. compiler
-          # quirk on SVE), the others still run and the job stays green.
-          for arch in $ARCHES; do
-            echo "=== building SIMD_ARCH=$arch ==="
-            rm -rf "build-$arch"
-            if ! CC=clang CXX=clang++ cmake -B "build-$arch" -G Ninja \
-                  -DCMAKE_BUILD_TYPE=Release \
-                  -DSIMD_ARCH=$arch \
-                  -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm > /dev/null 2> "/tmp/cmake-$arch.err"; then
-              echo "::warning::cmake configure failed for SIMD_ARCH=$arch"
-              cat "/tmp/cmake-$arch.err"
-              continue
-            fi
-            if ! ninja -C "build-$arch" bench_scan_uri 2> "/tmp/build-$arch.err"; then
-              echo "::warning::build failed for SIMD_ARCH=$arch"
-              tail -30 "/tmp/build-$arch.err"
-              continue
-            fi
-            ./build-$arch/bench/bench_scan_uri 2> "/tmp/run-$arch.err" | tee "/tmp/bench-results/$arch.txt" || \
-              { echo "::warning::scan_uri run failed for SIMD_ARCH=$arch"; cat "/tmp/run-$arch.err"; }
-            if ! ninja -C "build-$arch" bench_dispatch_compare 2> "/tmp/dispatch-build-$arch.err"; then
-              echo "::warning::dispatch_compare build failed for SIMD_ARCH=$arch"
-              tail -30 "/tmp/dispatch-build-$arch.err"
-              continue
-            fi
-            ./build-$arch/bench/bench_dispatch_compare 2> "/tmp/dispatch-$arch.err" | tee "/tmp/dispatch-results/$arch.txt" || \
-              { echo "::warning::dispatch_compare run failed for SIMD_ARCH=$arch"; cat "/tmp/dispatch-$arch.err"; }
-            echo
-          done
-
-      - name: Unified comparison report
-        run: |
-          echo "==============================================================="
-          echo "scan_uri SIMD vs scalar — arm64 backends on same hardware"
-          echo "==============================================================="
-          # Enable nullglob so an empty result set yields zero loop
-          # iterations rather than the literal pattern (which would
-          # fail under `bash -e`). If every per-arch attempt failed,
-          # we just print a notice and exit clean — the per-arch
-          # ::warning::s above already document what went wrong.
-          shopt -s nullglob
-          results=(/tmp/bench-results/*.txt)
-          if [ ${#results[@]} -eq 0 ]; then
-            echo "::notice::no per-arch scan_uri results captured — see warnings above"
-          else
-            for f in "${results[@]}"; do
-              arch=$(basename "$f" .txt)
-              echo
-              echo "--- $arch ---"
-              cat "$f"
-            done
-          fi
-
-          echo
-          echo "==============================================================="
-          echo "dispatch comparison — linear scan vs scalar ART vs JIT ART (arm64)"
-          echo "==============================================================="
-          shopt -s nullglob
-          dispatch_results=(/tmp/dispatch-results/*.txt)
-          if [ ${#dispatch_results[@]} -eq 0 ]; then
-            echo "::notice::no dispatch_compare results captured — see warnings above"
-          else
-            for f in "${dispatch_results[@]}"; do
-              arch=$(basename "$f" .txt)
-              echo
-              echo "--- $arch ---"
-              cat "$f"
-            done
-          fi
-
   coverage:
     name: Code Coverage
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
+    needs: plan
+    if: needs.plan.outputs.full == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -990,7 +819,8 @@ jobs:
 
   integer-parser:
     name: Integer parser (${{ matrix.arch }})
-    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci' || inputs.mode == 'integer-parser'
+    needs: plan
+    if: needs.plan.outputs.native == 'true' && (github.event_name != 'workflow_dispatch' || inputs.mode == 'ci' || inputs.mode == 'integer-parser')
     strategy:
       fail-fast: false
       matrix:
@@ -1007,9 +837,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-20
-      - name: Check every integer parser candidate and benchmark
+      - name: Check every integer parser candidate
         env:
           CXX: clang++-20
+          RUT_RUN_BENCHMARKS: '0'
           RUT_REQUIRE_AVX512: ${{ matrix.arch == 'x86' && inputs.require_avx512 && '1' || '0' }}
         run: scripts/check_parse_integer_arch.sh build/integer-parser
       - name: Publish architecture summary
@@ -1026,5 +857,4 @@ jobs:
             build/integer-parser/environment.txt
             build/integer-parser/summary.md
             build/integer-parser/test-*.log
-            build/integer-parser/bench-*.csv
           if-no-files-found: error

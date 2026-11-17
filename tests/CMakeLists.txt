@@ -1215,6 +1215,9 @@ set_tests_properties(test_model_crosscheck PROPERTIES LABELS "unit;model")
 add_test(NAME test_ci_sharding
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ci_sharding.py)
 set_tests_properties(test_ci_sharding PROPERTIES LABELS "unit;ci")
+add_test(NAME test_ci_policy
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ci_policy.py)
+set_tests_properties(test_ci_policy PROPERTIES LABELS "unit;ci")
 
 add_executable(test_concurrency_verifier test_concurrency_verifier.cc
     ${PROJECT_SOURCE_DIR}/src/placement_new.cc)

@@ -3,7 +3,8 @@ name: Kong compatibility baseline
 on:
   push:
     branches: [main]
-  pull_request:
+  schedule:
+    - cron: '11 1 * * *'
   workflow_dispatch:
 
 concurrency:
