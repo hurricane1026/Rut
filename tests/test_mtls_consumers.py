@@ -98,12 +98,12 @@ def exercise(args):
         registry = {
             "version": 1,
             "consumers": [
-                {"id": "alice", "enabled": True, "groups": ["staff"]},
+                {"id": "alice", "enabled": True, "groups": ["staff", "writers"]},
                 {"id": "bob", "enabled": True, "groups": []},
             ],
             "credentials": [
                 {"id": "alice-cert", "consumerId": "alice", "method": "mtls", "secret": pin,
-                 "enabled": True},
+                 "enabled": True, "groups": ["staff"]},
                 {"id": "bob-cert", "consumerId": "bob", "method": "mtls", "secret": second_pin,
                  "enabled": True},
             ],
@@ -117,6 +117,11 @@ route GET "/registry-private" {
 route GET "/registry-staff" {
     guard let identity = consumerAuthenticateMtls(env("MTLS_REGISTRY")) else { return 401 }
     guard jwtHasGroup(identity, "staff") else { return 403 }
+    return 204
+}
+route GET "/registry-writer" {
+    guard let identity = consumerAuthenticateMtls(env("MTLS_REGISTRY")) else { return 401 }
+    guard jwtHasGroup(identity, "writers") else { return 403 }
     return 204
 }
 '''
@@ -210,11 +215,14 @@ route GET "/registry-staff" {
                                                      (contexts[1], b"bob", 403)):
                 assert request("/registry-private", context) == (200, consumer)
                 assert request("/registry-staff", context)[0] == group_status
+                assert request("/registry-writer", context)[0] == 403
                 assert h2_request(port, "/registry-private", [
                     ("x-client-cert-sha256", "0" * 64), ("x-consumer-id", "forged")],
                     tls_context=h2_contexts[contexts.index(context)]) == (200, consumer)
                 assert h2_request(port, "/registry-staff", [],
                                   tls_context=h2_contexts[contexts.index(context)])[0] == group_status
+                assert h2_request(port, "/registry-writer", [("x-groups", "writers")],
+                                  tls_context=h2_contexts[contexts.index(context)])[0] == 403
             try:
                 result = request("/private", without_certificate)
             except (ssl.SSLError, ConnectionResetError, BrokenPipeError,

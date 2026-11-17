@@ -11092,6 +11092,16 @@ clock windows: clock adjustment can change eligibility, and no monotonic rollbac
 pin, online scheduler or automatic reload is implied; each authentication checks
 the current interval, so expiry takes effect without program reload.
 
+Credential records may optionally narrow the owning Consumer's groups. An absent
+field inherits the current Consumer groups, while an explicit empty list grants
+none and a nonempty list must be a unique subset with at most 16 names. All
+names use the existing printable ASCII 1–128 byte group-label rule, and the full
+snapshot is checked even for disabled credentials. Explicit subsets remain
+narrow when the Consumer gains groups; a parent group cannot be removed until
+its explicit credential subsets are updated or removed in the same replacement.
+Successful bearer, Basic, custom-header, query/form and verified-mTLS identities
+project those effective groups. Caller-supplied group headers never contribute.
+
 `consumerAuthenticateMtls(configuration)` appends a dedicated consumer-auth JSON
 operation. Its runtime path obtains identity only through the existing verified
 TLS fingerprint request helper; the generic presented-credential operation

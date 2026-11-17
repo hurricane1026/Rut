@@ -18,8 +18,11 @@ def consumer(name,enabled=True,groups=None):
     return dict(id=name,enabled=enabled,groups=groups or [])
 
 
-def credential(name,owner,method,secret,enabled=True):
-    return dict(id=name,consumerId=owner,method=method,secret=secret,enabled=enabled)
+def credential(name,owner,method,secret,enabled=True,groups=None):
+    record = dict(id=name,consumerId=owner,method=method,secret=secret,enabled=enabled)
+    if groups is not None:
+        record['groups'] = groups
+    return record
 
 
 @contextmanager
@@ -102,9 +105,11 @@ def main():
     parser.add_argument('--opt',choices=('0','2'),default='2')
     parser.add_argument('--admin')
     args=parser.parse_args()
-    initial=dict(version=1,consumers=[consumer('alice',groups=['staff'])],credentials=[
+    initial=dict(version=1,consumers=[consumer('alice',groups=['staff','readers','writers'])],credentials=[
         credential('old','alice','bearer','alice-old'),
         credential('current','alice','bearer','alice-current'),
+        credential('read-only','alice','bearer','alice-read',groups=['readers']),
+        credential('write-only','alice','bearer','alice-write',groups=['writers']),
         credential('password','alice','basic','alice:password'),
         credential('key','alice','header','custom-key')])
     with tempfile.TemporaryDirectory(prefix='rut-consumers-') as tmp:
@@ -240,6 +245,10 @@ def main():
                 if status==200:assert body==b'alice'
             assert request(first,'/private','Authorization: Bearer alice-current\r\nAuthorization: Bearer alice-current\r\n')[0]==401
             assert request(first,'/staff','Authorization: Bearer alice-current\r\n')[0]==204
+            assert request(first,'/read','Authorization: Bearer alice-read\r\n')==(200,b'alice')
+            assert request(first,'/write','Authorization: Bearer alice-read\r\nX-Groups: writers\r\n')[0]==403
+            assert request(first,'/write','Authorization: Bearer alice-write\r\n')==(200,b'alice')
+            assert request(first,'/read','Authorization: Bearer alice-write\r\n')[0]==403
             assert request(first,'/basic','Authorization: Basic YWxpY2U6cGFzc3dvcmQ=\r\n')[0]==204
             assert request(first,'/key','X-API-Key: custom-key\r\n')[0]==204
             assert request(first,'/key','X-API-Key: custom-key\r\nX-API-Key: custom-key\r\n')[0]==401
@@ -250,12 +259,17 @@ def main():
                 assert h2_request(first,'/private',[('authorization',f'Bearer {generated["generated-bearer-v1"]}')])==(200,b'alice')
                 assert h2_request(first,'/key',[('x-api-key',generated["generated-header-v1"])])[0]==204
             assert h2_request(first,'/private',[('authorization','Bearer alice-current')])==(200,b'alice')
+            assert h2_request(first,'/read',[('authorization','Bearer alice-read')])==(200,b'alice')
+            assert h2_request(first,'/write',[('authorization','Bearer alice-read'),('x-groups','writers')])[0]==403
+            assert h2_request(first,'/write',[('authorization','Bearer alice-write')])==(200,b'alice')
+            assert h2_request(first,'/read',[('authorization','Bearer alice-write')])[0]==403
             assert h2_request(first,'/private',[('authorization','Bearer alice-current'),('authorization','Bearer alice-current')])[0]==401
             assert h2_request(first,'/key',[('x-api-key','custom-key'),('x-api-key','custom-key')])[0]==401
             updated=json.loads(json.dumps(initial));updated['credentials'][0]['enabled']=False
             if generated:
                 next(item for item in updated['credentials'] if item['id']=='generated-bearer-v1')['enabled']=False
-            updated['consumers'][0]['groups']=[]
+            updated['consumers'][0]['groups']=['readers']
+            next(item for item in updated['credentials'] if item['id']=='write-only')['groups']=[]
             updated['consumers'].append(consumer('bob'))
             updated['credentials'].append(credential('bob','bob','bearer','bob-key'))
             updated=administer(args,root,'updated-snapshot',updated,root/'initial-snapshot.json')
@@ -265,9 +279,12 @@ def main():
                     assert request(second,'/private',f'Authorization: Bearer {generated["generated-bearer-v1"]}\r\n')[0]==401
                     assert request(second,'/private',f'Authorization: Bearer {generated["generated-bearer-v2"]}\r\n')==(200,b'alice')
                 assert request(second,'/staff','Authorization: Bearer alice-current\r\n')[0]==403
+                assert request(second,'/read','Authorization: Bearer alice-read\r\n')==(200,b'alice')
+                assert request(second,'/write','Authorization: Bearer alice-write\r\n')[0]==403
                 assert request(second,'/private','Authorization: Bearer bob-key\r\n')==(200,b'bob')
                 # Already published programs retain their independently owned snapshot.
                 assert request(first,'/staff','Authorization: Bearer alice-old\r\n')[0]==204
+                assert request(first,'/write','Authorization: Bearer alice-write\r\n')==(200,b'alice')
                 if generated:
                     assert request(first,'/private',f'Authorization: Bearer {generated["generated-bearer-v1"]}\r\n')==(200,b'alice')
             invalid=json.loads(json.dumps(initial))
