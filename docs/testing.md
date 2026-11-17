@@ -1,43 +1,55 @@
 # Testing Notes
 
-## Primary CI test shards
+## PR checks and full regressions
 
-Each Clang/GCC × Debug/Release configuration runs its non-Docker CTest suite
-on four independent runners. Each runner builds the same configuration and
-executes one interleaved quarter of the test inventory, using CTest's native
-`-I Start,,Stride` selection. Tests remain serial within each runner, so
-fixed-port fixtures, `RUN_SERIAL` and `RESOURCE_LOCK` retain their isolation.
-The compiler model/mutation checks run once, on Clang Debug shard 1.
+The CI scope job runs the CI policy/sharding controls before selecting work.
+Documentation and CI-selection-tool-only changes skip native builds. Native,
+build-system, test and unknown input changes use four isolated Clang Debug
+runners. PR CTest selection contains all `unit` tests, both integration smoke
+shards, and tests whose command names match directly changed test scripts or
+C++ test source stems. This is a bounded PR smoke policy, not complete semantic
+impact analysis: other integration tests and other compiler/configuration
+combinations are deferred to full regression. Compiler model/mutation checks
+run on relevant model/verifier/scheduler/timer/retirement changes. Formatting
+and clang-tidy run for C++ source/header changes.
+
+Main pushes, nightly runs (01:11 UTC), and manual CI runs retain the full
+Clang/GCC × Debug/Release suite, with four isolated CTest shards per
+configuration. Full runs also retain nginx/Envoy differentials, sanitizer,
+coverage, no-JIT and no-WebSocket builds. macOS, the pinned Kong baseline and
+the privileged IPv4 fixture workflows run on main, nightly and manually,
+rather than on every PR. These full regressions are intentionally no longer
+PR acceptance checks. The manual diagnostic modes remain available.
+
+Each runner verifies its actual CTest selections are nonempty, disjoint and
+complete for the selected scope. Tests stay serial within a runner to retain
+fixed-port fixture isolation, resource locks and timeouts. Each job preserves
+inventory, scope, deferred-test names, JUnit results and the CTest log. Matrix
+fail-fast remains disabled.
 
 ```bash
-python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4
-# Inspect and verify the complete partition without executing tests:
+# PR smoke scope, including a directly changed integration script:
+python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4 \
+    --pr --changed-files-json '["tests/test_redis_resp3.py"]'
+# Full regression scope, inventory only:
 python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4 --plan-only
-python3 -m unittest discover -s tests -p test_ci_sharding.py
+python3 -m unittest discover -s tests -p 'test_ci_*.py'
 ```
 
-Every shard verifies that the actual CTest selections form a complete,
-non-overlapping partition before running. Empty partitions, discovery errors
-and test failures fail CI. Each job uploads the inventory, JUnit results and
-CTest log, including on failure. Matrix fail-fast is disabled so a failure
-does not cancel the remaining coverage. Other CI jobs retain their full suites.
+The primary matrix uses ccache for C/C++ objects. Keys separate OS,
+architecture, compiler and configuration; compiler contents, flags and
+included files determine reuse. Configuration, linking and tests still run.
+No test results or whole build trees are restored. Shards share immutable
+keys and publish after a successful build, before tests. Pinned OpenSSL
+retains its existing acquisition/checksum verification. Cold builds still
+cost time; cache statistics are logged.
 
-The first sharded CI run on PR #1107 passed all checks but took 2 h 11 min
-end to end. Individual matrix jobs took 43–73 minutes, with builds of up to
-16 minutes and tests of up to 56 minutes. The earlier 46-minute estimate
-covered only historical test time in one configuration and was insufficient
-as an end-to-end forecast.
-
-The primary matrix uses ccache for C/C++ objects. Cache keys separate OS,
-architecture, compiler and build type; ccache validates compiler contents,
-flags and included source/header files. Every job still configures, links and
-runs its tests. No test results or whole build trees are restored. The four
-shards share a cache key and publish after a successful build, before tests.
-ccache is a CI-only build tool: CMake's launcher support alone cannot reuse
-objects across fresh runners. Pinned OpenSSL remains built through its
-existing CMake acquisition and checksum verification. Cold-cache builds and
-linking still cost time; cache statistics are logged for measuring warm runs.
-A ten-minute end-to-end target has not yet been demonstrated.
+The first full sharded run on PR #1107 passed but took 2 h 11 min end to end.
+The PR smoke scope selects 148 tests from the historical 499-test inventory,
+including both integration shards, versus repeating all 499 tests in each
+of four configurations. New tests change these counts. This substantially
+reduces work and runner contention, but a ten-minute end-to-end duration
+remains a target pending remote measurement, not a guaranteed timeout.
 
 ## Performance measurements
 

@@ -93,6 +93,23 @@ class CIShardingTests(unittest.TestCase):
         self.assertIn('CI shard failed', result.stderr)
         self.assertFalse(list(self.build.glob('*.ran')))
 
+    def test_pr_scope_executes_only_selected_units(self):
+        self.suite()
+        with (self.build / 'CTestTestfile.cmake').open('a') as stream:
+            stream.write('set_tests_properties(case_0 case_2 case_3 case_4 case_5 case_7 PROPERTIES LABELS unit)\n')
+        selected = []
+        for shard in range(1, 5):
+            result = self.run_shard(shard, '--pr')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads((self.build / 'ci-shard-inventory.json').read_text())
+            self.assertEqual(report['scope'], 'pr')
+            self.assertIn('case_10', report['deferred_tests'])
+            selected.extend(p.stem for p in self.build.glob('*.ran'))
+            for marker in self.build.glob('*.ran'):
+                marker.unlink()
+        self.assertEqual(set(selected), {'case_0', 'case_2', 'case_3', 'case_4', 'case_5', 'case_7'})
+        self.assertEqual(len(selected), len(set(selected)))
+
     def test_plan_only_does_not_execute_tests(self):
         self.suite()
         result = self.run_shard(1, '--plan-only')
