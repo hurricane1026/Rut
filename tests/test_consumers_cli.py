@@ -2,6 +2,7 @@
 """Consumer administration, key generation, atomic rejection and filesystem policy."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -133,6 +134,75 @@ def test_time_window_metadata_survives_cli(tool, root):
     assert 'secret' not in existing_view
 
 
+def test_hash_keys(tool, root):
+    raw_bearer = 'a' * 64
+    raw_header = 'b' * 64
+    basic = 'alice:password'
+    mtls = '0123456789abcdef' * 4
+    existing_hash = hashlib.sha256(b'existing').hexdigest()
+    snapshot = dict(
+        version=1,
+        consumers=[dict(id='alice', enabled=True, groups=['staff'])],
+        credentials=[
+            dict(id='bearer', consumerId='alice', method='bearer', secret=raw_bearer,
+                 enabled=True, notBefore=1700000000, expiresAt=1800000000),
+            dict(id='header', consumerId='alice', method='header', secret=raw_header,
+                 enabled=False, expiresAt=1900000000),
+            dict(id='basic', consumerId='alice', method='basic', secret=basic, enabled=True),
+            dict(id='mtls', consumerId='alice', method='mtls', secret=mtls, enabled=True),
+            dict(id='already-hashed', consumerId='alice', method='header',
+                 secretSha256=existing_hash, enabled=True),
+        ])
+    source = private(root / 'hash-source.json', snapshot)
+    original = source.read_bytes()
+    output = root / 'hash-output.json'
+    result = run(tool, 'hash-keys', source, output)
+    assert result.returncode == 0 and result.stdout == b'' and result.stderr == b'', result
+    assert source.read_bytes() == original
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    hashed = json.loads(output.read_bytes())
+    by_id = {item['id']: item for item in hashed['credentials']}
+    assert by_id['bearer']['secretSha256'] == hashlib.sha256(raw_bearer.encode()).hexdigest()
+    assert by_id['header']['secretSha256'] == hashlib.sha256(raw_header.encode()).hexdigest()
+    assert 'secret' not in by_id['bearer'] and 'secret' not in by_id['header']
+    assert by_id['bearer']['notBefore'] == 1700000000
+    assert by_id['bearer']['expiresAt'] == 1800000000
+    assert by_id['header']['enabled'] is False and by_id['header']['expiresAt'] == 1900000000
+    assert by_id['basic']['secret'] == basic and by_id['mtls']['secret'] == mtls
+    assert by_id['already-hashed']['secretSha256'] == existing_hash
+    assert run(tool, 'validate', output).returncode == 0
+
+    inspected = run(tool, 'inspect', output)
+    assert inspected.returncode == 0
+    for secret in [raw_bearer, raw_header, basic, mtls, existing_hash,
+                   by_id['bearer']['secretSha256'], by_id['header']['secretSha256']]:
+        assert secret.encode() not in inspected.stdout + inspected.stderr
+    second = root / 'hash-output-again.json'
+    result = run(tool, 'hash-keys', output, second)
+    assert result.returncode == 0 and result.stdout == b'' and result.stderr == b''
+    assert json.loads(second.read_bytes()) == hashed
+
+    unsafe = dict(version=1, consumers=snapshot['consumers'], credentials=[
+        dict(id='ok', consumerId='alice', method='bearer', secret=raw_bearer, enabled=True),
+        dict(id='weak', consumerId='alice', method='header', secret='human-chosen', enabled=True),
+    ])
+    unsafe_path = private(root / 'hash-unsafe.json', unsafe)
+    rejected_output = root / 'hash-rejected.json'
+    result = run(tool, 'hash-keys', unsafe_path, rejected_output)
+    assert result.returncode == 2 and result.stdout == b'' and not rejected_output.exists()
+    preserved = root / 'hash-preserved.json'
+    preserved.write_bytes(b'unchanged')
+    result = run(tool, 'hash-keys', source, preserved)
+    assert result.returncode == 2 and result.stdout == b'' and preserved.read_bytes() == b'unchanged'
+
+    planned_digest = hashlib.sha256(b'planned').hexdigest()
+    patch = private(root / 'hash-plan.json', changes(credentials=[
+        dict(id='future', consumerId='alice', method='header', secretSha256=planned_digest,
+             enabled=True)]))
+    planned = run(tool, 'plan', source, patch)
+    assert planned.returncode == 0 and planned_digest.encode() not in planned.stdout + planned.stderr
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -144,6 +214,7 @@ def main(tool):
         root = Path(directory)
         test_generated_keys(tool, root)
         test_time_window_metadata_survives_cli(tool, root)
+        test_hash_keys(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())

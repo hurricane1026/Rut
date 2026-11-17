@@ -369,3 +369,61 @@ TEST(consumer_registry, form_plus_decodes_once_and_never_accepts_a_second_interp
         CHECK_EQ(output.len, 0u);
     }
 }
+
+TEST(consumer_registry, sha256_verifiers_match_all_supported_key_sources) {
+    constexpr Str kDigest =
+        lit_str("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const Str registry = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["staff"]}],"credentials":[{"id":"bearer-hash","consumerId":"alice","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true,"notBefore":100,"expiresAt":200},{"id":"header-hash","consumerId":"alice","method":"header","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})");
+    json::Document document;
+    CHECK(consumer_registry_valid(document, registry));
+    char bytes[8192]{};
+    json::Writer bearer{bytes};
+    CHECK(consumer_registry_authenticate_at(
+        document, registry, lit_str("bearer"), lit_str("Bearer abc"), 100, bearer));
+    json::Writer expired{bytes};
+    CHECK(!consumer_registry_authenticate_at(
+        document, registry, lit_str("bearer"), lit_str("Bearer abc"), 200, expired));
+    json::Writer header{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("header"), lit_str("abc"), header));
+    json::Writer query{bytes};
+    CHECK(consumer_registry_authenticate_fields(
+        document, registry, lit_str("api_key"), lit_str("/private?api_key=abc"), true, query));
+    json::Writer form{bytes};
+    CHECK(consumer_registry_authenticate_fields(
+        document, registry, lit_str("api_key"), lit_str("api_key=abc"), false, form));
+    char digest_token[72] = "Bearer ";
+    __builtin_memcpy(digest_token + 7, kDigest.ptr, kDigest.len);
+    json::Writer hash_as_token{bytes};
+    CHECK(!consumer_registry_authenticate(document,
+                                          registry,
+                                          lit_str("bearer"),
+                                          {digest_token, sizeof(digest_token) - 1},
+                                          hash_as_token));
+    json::Writer wrong{bytes};
+    CHECK(!consumer_registry_authenticate(document, registry, lit_str("header"), kDigest, wrong));
+}
+
+TEST(consumer_registry, sha256_verifier_schema_and_ambiguity_fail_closed) {
+    const Str
+        invalid
+            [] = {lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"abc","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"basic","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secretSha256":"BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true,"extra":1}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","secret\u0053ha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k1","consumerId":"a","method":"header","secret":"abc","enabled":false},{"id":"k2","consumerId":"a","method":"header","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k1","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":false},{"id":"k2","consumerId":"a","method":"bearer","secret":"abc","enabled":true}]})"),
+                  lit_str(
+                      R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k1","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":false},{"id":"k2","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})")};
+    json::Document document;
+    for (Str value : invalid) CHECK(!consumer_registry_valid(document, value));
+}

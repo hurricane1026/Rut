@@ -11033,6 +11033,19 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+Bearer/header credentials can store either the existing raw key or a canonical
+lowercase SHA-256 verifier of the exact presented text bytes. The runtime hashes
+one validated presented key per authentication and compares in constant time;
+Basic and mTLS records retain their raw-secret schemas. Full-snapshot validation
+rejects raw/raw, digest/digest and raw/digest ambiguity even for disabled or
+windowed records. `rut-consumers hash-keys` converts raw bearer/header keys only
+when they match the generated-key 64-lowercase-hex profile, and publishes a
+validated private replacement without modifying the input. This format
+restriction is not proof of entropy: SHA-256 is not password hashing, low-entropy
+keys remain vulnerable to offline guessing, and verifier digests still require
+protection. Conversion leaves the original snapshot intact; Basic/mTLS secrets
+and other unconverted raw fields remain in the output where present.
+
 Version-1 credential records optionally carry integer Unix-second `notBefore`
 and `expiresAt` bounds; absent or zero values are unbounded. A finite start is
 inclusive, while expiry is exclusive. The runtime validates the complete exact

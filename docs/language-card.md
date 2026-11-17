@@ -3528,6 +3528,11 @@ request header accessors; duplicates do not become guest access. No query/body
 credential source is implicitly enabled by this profile. See [Consumer registry](consumer-registry.md)
 for the exact schema, 32-Consumer/64-credential bounds, rotation, disabled state,
 RCU/native-program ownership, redaction and current publication interfaces.
+Bearer/header records may use exactly one raw `secret` or lowercase 64-hex
+`secretSha256` verifier of the presented text bytes. Basic/mTLS retain their raw
+secret schema. The offline `hash-keys` command converts only 64-lowercase-hex
+bearer/header keys; it does not prove key entropy. SHA-256 verifiers are
+sensitive configuration and are not a password hashing scheme.
 Credentials may include optional `notBefore` and `expiresAt` integer Unix-second
 bounds (`0` or absence is unbounded). Start is inclusive and expiry exclusive.
 When any bound is finite, every auth method checks one host `CLOCK_REALTIME`

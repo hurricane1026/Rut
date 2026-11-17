@@ -1,6 +1,8 @@
 #include "rut/common/types.h"
+#include "rut/runtime/auth.h"
 #include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/crypto_c.h"
+#include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 
 #include <errno.h>
@@ -50,6 +52,14 @@ struct GeneratedSecret {
         }
         return true;
     }
+};
+struct SensitiveKeyText {
+    char bytes[65]{};
+    ~SensitiveKeyText() { rut_crypto_clear_v1(bytes, sizeof(bytes)); }
+};
+struct SensitiveHashText {
+    char bytes[kMaxHashHexBytes]{};
+    ~SensitiveHashText() { rut_crypto_clear_v1(bytes, sizeof(bytes)); }
 };
 
 int failure(const char* message) {
@@ -278,9 +288,76 @@ bool inspect(json::Document& doc, json::Writer& output) {
     for (u32 n = doc.nodes[kCredentials].child; n != json::kNone; n = doc.nodes[n].next) {
         if (!first) output.put(',');
         first = false;
-        if (!doc.write(n, output, field(doc, n, lit_str("secret")), {}, true)) return false;
+        u32 hidden = field(doc, n, lit_str("secret"));
+        if (hidden == json::kNone) hidden = field(doc, n, lit_str("secretSha256"));
+        if (!doc.write(n, output, hidden, {}, true)) return false;
     }
     output.text(lit_str("]}\n"));
+    return output.ok;
+}
+
+bool hash_keys(json::Document& doc, json::Writer& output) {
+    const u32 consumers = field(doc, 0, lit_str("consumers"));
+    const u32 credentials = field(doc, 0, lit_str("credentials"));
+    if (consumers >= doc.count || credentials >= doc.count ||
+        doc.nodes[credentials].kind != json::Kind::Array)
+        return false;
+    output.text(lit_str("{\"version\":1,\"consumers\":"));
+    if (!doc.write(consumers, output)) return false;
+    output.text(lit_str(",\"credentials\":["));
+    bool first = true;
+    for (u32 record = doc.nodes[credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!first) output.put(',');
+        first = false;
+        const u32 method_node = field(doc, record, lit_str("method"));
+        const bool has_hash = field(doc, record, lit_str("secretSha256")) != json::kNone;
+        char method_bytes[16];
+        json::Writer method_writer{method_bytes, sizeof(method_bytes)};
+        if (!doc.string(method_node, method_writer)) return false;
+        const Str method{method_bytes, method_writer.len};
+        const bool convert =
+            !has_hash && (method.eq(lit_str("bearer")) || method.eq(lit_str("header")));
+        if (!convert) {
+            if (!doc.write(record, output)) return false;
+            continue;
+        }
+        SensitiveKeyText secret_buffer;
+        json::Writer secret_writer{secret_buffer.bytes, sizeof(secret_buffer.bytes)};
+        const u32 secret_node = field(doc, record, lit_str("secret"));
+        if (!doc.string(secret_node, secret_writer) || secret_writer.len != 64) {
+            return false;
+        }
+        const Str secret{secret_buffer.bytes, secret_writer.len};
+        if (!sha256_hex_format_valid(secret)) return false;
+        SensitiveHashText digest;
+        u32 digest_len = 0;
+        if (!hash_hex(HashAlgorithm::Sha256, secret, {}, false, digest.bytes, digest_len) ||
+            digest_len != 64)
+            return false;
+        output.put('{');
+        bool field_first = true;
+        for (u32 member = doc.nodes[record].child; member != json::kNone;
+             member = doc.nodes[member].next) {
+            char key_bytes[32];
+            json::Writer key_writer{key_bytes, sizeof(key_bytes)};
+            if (!doc.string(doc.nodes[member].key, key_writer)) {
+                return false;
+            }
+            if (Str{key_bytes, key_writer.len}.eq(lit_str("secret"))) continue;
+            if (!field_first) output.put(',');
+            field_first = false;
+            if (!doc.write(doc.nodes[member].key, output)) return false;
+            output.put(':');
+            if (!doc.write(member, output)) return false;
+        }
+        if (!field_first) output.put(',');
+        output.text(lit_str("\"secretSha256\":\""));
+        output.text({digest.bytes, digest_len});
+        output.text(lit_str("\"}"));
+        if (!output.ok) return false;
+    }
+    output.text(lit_str("]}"));
     return output.ok;
 }
 
@@ -291,15 +368,18 @@ constexpr char kUsage[] =
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
+    "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
     "Changes contains four arrays: consumers, credentials (full-record upserts),\n"
     "removeConsumers and removeCredentials (existing IDs). References must remain valid.\n"
     "Output is a new atomic 0600 snapshot; existing paths are never replaced.\n"
-    "Inspect and plan omit credential secrets. Plan validates without creating files.\n"
+    "Inspect and plan redact credential secrets and SHA-256 verifiers. Plan validates without "
+    "creating files.\n"
     "No command publishes to running gateways.\n"
     "generate-key supports bearer/header and creates a new 32-byte random key in an immutable "
     "snapshot.\n"
+    "hash-keys converts raw bearer/header keys in the 64-lowercase-hex generated-key profile.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
 
@@ -312,7 +392,8 @@ int main(int argc, char** argv) {
     const bool kPlan = argc == 4 && strcmp(argv[1], "plan") == 0;
     const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
     const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
-    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey)
+    const bool kHashKeys = argc == 4 && strcmp(argv[1], "hash-keys") == 0;
+    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey && !kHashKeys)
         return failure(kUsage);
     if (kInit) {
         const char* error =
@@ -325,6 +406,17 @@ int main(int argc, char** argv) {
     if (!consumer_registry_valid(base, input.view()))
         return failure("invalid Consumer registry snapshot\n");
     if (kValidate) return 0;
+    if (kHashKeys) {
+        Buffer result;
+        json::Writer hashed{result.data, json::kMaxBytes};
+        if (!hash_keys(base, hashed))
+            return failure("registry cannot be converted to SHA-256 key verifiers\n");
+        SensitiveDocument checked;
+        if (!consumer_registry_valid(checked, {result.data, hashed.len}))
+            return failure("converted registry has invalid or ambiguous credentials\n");
+        const char* error = publish(argv[3], {result.data, hashed.len});
+        return error ? failure(error) : 0;
+    }
     if (kGenerateKey) {
         const u32 consumer_length = bounded_argument(argv[3], 65);
         const u32 credential_length = bounded_argument(argv[4], 65);

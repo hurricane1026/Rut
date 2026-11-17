@@ -127,6 +127,51 @@ def main():
                                                  if item['id'] == credential_id)
                 initial = snapshot
             assert generated['generated-bearer-v1'] != generated['generated-bearer-v2']
+        if args.admin and generated:
+            activation = max(1, int(time.time()) - 10)
+            expiry = int(time.time()) + 600
+            raw_profile = dict(version=1, consumers=[consumer('alice', groups=['staff'])],
+                credentials=[
+                    dict(id='hashed-bearer', consumerId='alice', method='bearer',
+                         secret=generated['generated-bearer-v1'], enabled=True,
+                         notBefore=activation, expiresAt=expiry),
+                    dict(id='hashed-header', consumerId='alice', method='header',
+                         secret=generated['generated-header-v1'], enabled=True,
+                         notBefore=activation, expiresAt=expiry),
+                ])
+            raw_path = root / 'raw-key-profile.json'
+            raw_path.write_text(json.dumps(raw_profile))
+            raw_path.chmod(0o600)
+            hashed_path = root / 'hashed-key-profile.json'
+            converted = subprocess.run([args.admin, 'hash-keys', str(raw_path), str(hashed_path)],
+                                       capture_output=True, timeout=10)
+            assert converted.returncode == 0 and not converted.stdout and not converted.stderr, converted
+            hashed_profile = json.loads(hashed_path.read_bytes())
+            assert raw_path.read_bytes() == json.dumps(raw_profile).encode()
+            assert hashed_path.stat().st_mode & 0o777 == 0o600
+            digest_by_id = {item['id']: item['secretSha256']
+                            for item in hashed_profile['credentials']}
+            assert all('secret' not in item for item in hashed_profile['credentials'])
+            assert all(item['notBefore'] == activation and item['expiresAt'] == expiry
+                       for item in hashed_profile['credentials'])
+            compiler = Path(args.server).with_name('rut-compile')
+            artifact = subprocess.run([str(compiler), args.source, args.opt],
+                                      env=dict(os.environ, AUTH_REGISTRY=json.dumps(hashed_profile)),
+                                      capture_output=True, timeout=90)
+            assert artifact.returncode == 0, artifact.stderr.decode(errors='replace')
+            for original_key in (generated['generated-bearer-v1'], generated['generated-header-v1']):
+                assert original_key.encode() not in artifact.stdout + artifact.stderr
+            with gateway(args, hashed_profile, root / 'hashed-profile') as hashed_port:
+                bearer = generated['generated-bearer-v1']
+                header = generated['generated-header-v1']
+                assert request(hashed_port, '/private', f'Authorization: Bearer {bearer}\r\n') == (200, b'alice')
+                assert request(hashed_port, '/private', f'Authorization: Bearer {digest_by_id["hashed-bearer"]}\r\n')[0] == 401
+                assert request(hashed_port, '/key', f'X-API-Key: {header}\r\n')[0] == 204
+                assert request(hashed_port, '/key', f'X-API-Key: {digest_by_id["hashed-header"]}\r\n')[0] == 401
+                assert h2_request(hashed_port, '/private', [('authorization', f'Bearer {bearer}')]) == (200, b'alice')
+                assert h2_request(hashed_port, '/private', [('authorization', f'Bearer {digest_by_id["hashed-bearer"]}')])[0] == 401
+                assert h2_request(hashed_port, '/key', [('x-api-key', header)])[0] == 204
+                assert h2_request(hashed_port, '/key', [('x-api-key', digest_by_id['hashed-header'])])[0] == 401
         with gateway(args,initial,root/'initial') as first:
             for value,expected in [('',401),('Bearer alice-current',200),('Bearer alice-old',200),
                                    ('Bearer wrong',401),('Bearer alice-current ',200)]:
