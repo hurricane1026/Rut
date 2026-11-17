@@ -170,17 +170,23 @@ jobs:
           if-no-files-found: ignore
 
   test:
-    name: Build & Test
+    name: Build & Test (${{ matrix.compiler }}, ${{ matrix.build_type }}, shard ${{ matrix.shard }}/4)
     if: github.event_name != 'workflow_dispatch' || inputs.mode == 'ci'
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         compiler: [clang, gcc]
         build_type: [Debug, Release]
+        # Separate runners preserve isolation for tests with fixed ports and
+        # RUN_SERIAL. Every configuration still executes the complete suite.
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      - name: Verify CI test sharding
+        run: python3 -m unittest discover -s tests -p test_ci_sharding.py
       - name: Install tools
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
@@ -207,21 +213,21 @@ jobs:
         run: ninja -C build
 
       - name: Set up Java for compiler-generated protocol models
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Cross-check compiler-generated handler models with TLC
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         run: |
           python3 scripts/acquire_tla2tools.py /tmp/handler-tla2tools.jar
           python3 scripts/check_handler_models.py --checker build/tests/test_handler_reference \
             --jar /tmp/handler-tla2tools.jar --output-dir /tmp/handler-reference-tlc
 
       - name: Preserve compiler-generated models and counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         uses: actions/upload-artifact@v4
         with:
           name: handler-reference-tlc
@@ -229,13 +235,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject wait scheduler implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         run: |
           python3 scripts/check_wait_scheduler_mutations.py --build-dir build \
             --output-dir /tmp/wait-scheduler-mutations
 
       - name: Preserve wait scheduler implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         uses: actions/upload-artifact@v4
         with:
           name: wait-scheduler-cpp-mutations
@@ -243,13 +249,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject upstream retirement implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         run: |
           python3 scripts/check_upstream_retirement_mutations.py --build-dir build \
             --output-dir /tmp/upstream-retirement-mutations
 
       - name: Preserve upstream retirement implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         uses: actions/upload-artifact@v4
         with:
           name: upstream-retirement-cpp-mutations
@@ -257,13 +263,13 @@ jobs:
           if-no-files-found: ignore
 
       - name: Reject timer implementation mutations
-        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         run: |
           python3 scripts/check_timer_mutations.py --build-dir build \
             --output-dir /tmp/timer-mutations
 
       - name: Preserve timer implementation counterexamples
-        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug'
+        if: always() && matrix.compiler == 'clang' && matrix.build_type == 'Debug' && matrix.shard == 1
         uses: actions/upload-artifact@v4
         with:
           name: timer-cpp-mutations
@@ -271,7 +277,18 @@ jobs:
           if-no-files-found: ignore
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=error -j 1 --timeout 120 -LE docker
+        run: python3 scripts/run_ci_shard.py --build-dir build --shard ${{ matrix.shard }} --shards 4
+
+      - name: Preserve test results and shard inventory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ matrix.shard }}
+          path: |
+            build/ci-shard-inventory.json
+            build/ci-shard-results.xml
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
 
   nginx-required:
     name: Required pinned nginx differentials

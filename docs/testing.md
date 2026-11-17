@@ -1,5 +1,35 @@
 # Testing Notes
 
+## Primary CI test shards
+
+Each Clang/GCC × Debug/Release configuration runs its non-Docker CTest suite
+on four independent runners. Each runner builds the same configuration and
+executes one interleaved quarter of the test inventory, using CTest's native
+`-I Start,,Stride` selection. Tests remain serial within each runner, so
+fixed-port fixtures, `RUN_SERIAL` and `RESOURCE_LOCK` retain their isolation.
+The compiler model/mutation checks run once, on Clang Debug shard 1.
+
+```bash
+python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4
+# Inspect and verify the complete partition without executing tests:
+python3 scripts/run_ci_shard.py --build-dir build --shard 1 --shards 4 --plan-only
+python3 -m unittest discover -s tests -p test_ci_sharding.py
+```
+
+Every shard verifies that the actual CTest selections form a complete,
+non-overlapping partition before running. Empty partitions, discovery errors
+and test failures fail CI. Each job uploads the inventory, JUnit results and
+CTest log, including on failure. Matrix fail-fast is disabled so a failure
+does not cancel the remaining coverage. Other CI jobs retain their full suites.
+
+This trades additional builds and runner minutes for shorter elapsed time.
+The completed Clang Release baseline from PR #1100 ran 499 tests in 9797.77 s;
+the four interleaved groups account for 2314.43, 2352.68, 2750.79 and 2379.60 s
+of that historical test time. The largest group is about 46 minutes instead
+of 163 minutes. These are estimates from the serial baseline, excluding new
+builds, runner queues and machine variation; compare the uploaded results of
+the first sharded CI run before claiming an observed speedup.
+
 ## Compiler and JIT leak checks
 
 Build the frontend and loader with ASan/UBSan, keeping JIT support enabled
