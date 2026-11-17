@@ -106,6 +106,33 @@ def test_generated_keys(tool, root):
     assert staged['credentials'][0]['enabled'] is True
 
 
+def test_time_window_metadata_survives_cli(tool, root):
+    windowed = dict(version=1, consumers=[dict(id='alice', enabled=True, groups=['staff'])],
+                    credentials=[dict(id='window', consumerId='alice', method='bearer',
+                                      secret='window-secret', enabled=True,
+                                      notBefore=1700000000, expiresAt=1800000000)])
+    source = private(root / 'windowed-source.json', windowed)
+    patch = private(root / 'windowed-changes.json', changes())
+    applied = root / 'windowed-applied.json'
+    result = run(tool, 'apply', source, patch, applied)
+    assert result.returncode == 0, result
+    assert json.loads(applied.read_bytes()) == windowed
+    generated = root / 'windowed-generated.json'
+    result = run(tool, 'generate-key', source, 'alice', 'windowed-new', 'bearer', generated)
+    assert result.returncode == 0 and not result.stdout and not result.stderr, result
+    snapshot = json.loads(generated.read_bytes())
+    existing = next(item for item in snapshot['credentials'] if item['id'] == 'window')
+    assert existing == windowed['credentials'][0]
+    new = next(item for item in snapshot['credentials'] if item['id'] == 'windowed-new')
+    assert 'notBefore' not in new and 'expiresAt' not in new
+    inspected = run(tool, 'inspect', generated)
+    assert inspected.returncode == 0
+    redacted = json.loads(inspected.stdout)
+    existing_view = next(item for item in redacted['credentials'] if item['id'] == 'window')
+    assert existing_view['notBefore'] == 1700000000 and existing_view['expiresAt'] == 1800000000
+    assert 'secret' not in existing_view
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -116,6 +143,7 @@ def main(tool):
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
         test_generated_keys(tool, root)
+        test_time_window_metadata_survives_cli(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())

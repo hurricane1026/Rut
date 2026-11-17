@@ -3528,6 +3528,12 @@ request header accessors; duplicates do not become guest access. No query/body
 credential source is implicitly enabled by this profile. See [Consumer registry](consumer-registry.md)
 for the exact schema, 32-Consumer/64-credential bounds, rotation, disabled state,
 RCU/native-program ownership, redaction and current publication interfaces.
+Credentials may include optional `notBefore` and `expiresAt` integer Unix-second
+bounds (`0` or absence is unbounded). Start is inclusive and expiry exclusive.
+When any bound is finite, every auth method checks one host `CLOCK_REALTIME`
+sample and fails closed if the read is invalid; unbounded-only snapshots preserve
+the old no-clock behavior. The Rut API never accepts request time. Clock changes
+can change window decisions, and no monotonic rollback pin or scheduler is added.
 The offline `rut-consumers` executable validates, previews redacted replacements,
 inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic
 running-gateway publication. See [offline administration](consumer-registry.md#offline-administration).

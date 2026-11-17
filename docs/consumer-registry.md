@@ -27,6 +27,25 @@ even disabled records are validated. Reusing a secret within a method is rejecte
 across all credentials, preventing ambiguous ownership and slot-order selection.
 An empty registry is a valid deny-all snapshot.
 
+Each credential may add integer `notBefore` and/or `expiresAt` Unix-second
+fields. Both default to `0`, meaning unbounded; nonzero values must be positive
+signed-64-bit integers, and when both are finite `expiresAt` must be greater
+than `notBefore`. The complete credential object still allows only its five
+required fields and these two optional fields; duplicate or unknown names and
+wrong numeric forms invalidate the whole snapshot, including disabled records.
+At authentication, a finite start is inclusive (`now >= notBefore`) and a finite
+expiry is exclusive (`now < expiresAt`).
+
+Any snapshot with at least one nonzero window bound requires one successful
+`CLOCK_REALTIME` read for each authentication attempt; a failed, nonpositive or
+malformed clock sample denies authentication, including otherwise unbounded
+credentials in that snapshot. Version-1 snapshots whose credentials all omit
+the fields or specify zero retain the prior no-clock behavior. Time is sampled
+from the host clock, never from the request. Clock corrections can move a
+credential into or out of its configured interval; this feature adds no monotonic
+rollback pin, activation scheduler or reload timer. Expiry is checked on each
+new authentication, so it applies without reloading the program.
+
 The generic method accepts `bearer`, `basic` and `header`. Bearer and Basic retain existing strict
 syntax/canonical encoding and constant-time equal-length secret comparison.
 `header` admits the bounded Bearer-key byte grammar as an exact custom-header key.
@@ -218,7 +237,10 @@ Input and changes files must be regular, owned by the invoking effective user,
 without any group/other permissions and at most 8192 bytes. Symlinks, FIFOs,
 directories and publicly readable files reject. Secrets come from these files,
 never command arguments. `inspect` writes Consumer metadata and credential
-ID/owner/method/enabled fields to stdout, omitting every credential `secret`.
+ID/owner/method/enabled fields and any `notBefore`/`expiresAt` metadata to
+stdout, omitting every credential `secret`. `apply` and `generate-key` preserve
+existing window fields; a newly generated key has no window fields and is
+unbounded until a later snapshot explicitly adds them.
 Validation and mutation commands produce no stdout. Fixed errors contain no
 configuration values. Exit status is 0 on success and 2 on any failure.
 

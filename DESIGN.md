@@ -11033,6 +11033,19 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+Version-1 credential records optionally carry integer Unix-second `notBefore`
+and `expiresAt` bounds; absent or zero values are unbounded. A finite start is
+inclusive, while expiry is exclusive. The runtime validates the complete exact
+credential schema, including disabled records, and rejects duplicate/unknown
+fields, wrong numeric types, signed-64-bit overflow and inverted finite windows.
+If any record has a finite bound, the centralized bearer/basic/header/query/form
+and verified-mTLS matcher reads `CLOCK_REALTIME` once per authentication and
+fails closed on clock error or invalid time. Unbounded-only snapshots retain
+their prior no-clock path. Rut cannot provide a timestamp. These are host wall
+clock windows: clock adjustment can change eligibility, and no monotonic rollback
+pin, online scheduler or automatic reload is implied; each authentication checks
+the current interval, so expiry takes effect without program reload.
+
 `consumerAuthenticateMtls(configuration)` appends a dedicated consumer-auth JSON
 operation. Its runtime path obtains identity only through the existing verified
 TLS fingerprint request helper; the generic presented-credential operation

@@ -145,6 +145,116 @@ TEST(consumer_registry, mtls_fingerprints_are_public_pins_and_method_is_separate
         lit_str(
             R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]},{"id":"b","enabled":true,"groups":[]}],"credentials":[{"id":"one","consumerId":"a","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":true},{"id":"two","consumerId":"b","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":false}]})")));
 }
+TEST(consumer_registry, time_window_schema_and_matching_boundaries) {
+    const Str valid = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":[]}],"credentials":[{"id":"legacy","consumerId":"alice","method":"bearer","secret":"legacy-key","enabled":true},{"id":"timed","consumerId":"alice","method":"bearer","secret":"timed-key","enabled":true,"notBefore":100,"expiresAt":200},{"id":"starts-unbounded","consumerId":"alice","method":"bearer","secret":"starts-key","enabled":true,"notBefore":0,"expiresAt":200},{"id":"ends-unbounded","consumerId":"alice","method":"bearer","secret":"ends-key","enabled":true,"notBefore":100,"expiresAt":0},{"id":"header","consumerId":"alice","method":"header","secret":"header-key","enabled":true,"notBefore":100,"expiresAt":200},{"id":"disabled-window","consumerId":"alice","method":"header","secret":"disabled-header","enabled":false,"notBefore":100,"expiresAt":200},{"id":"basic","consumerId":"alice","method":"basic","secret":"alice:password","enabled":true,"notBefore":100,"expiresAt":200},{"id":"mtls","consumerId":"alice","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":true,"notBefore":100,"expiresAt":200}]})");
+    json::Document document;
+    CHECK(consumer_registry_valid(document, valid));
+    CHECK(consumer_registry_valid(
+        document,
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"max","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":9223372036854775807}]})")));
+    const Str invalid[] = {
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":"10"}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":-1}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":1.5}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":1e2}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":9223372036854775808}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":200,"expiresAt":200}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":100,"notBefore":101}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"notBefore":100,"not\u0042efore":101}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"x","enabled":true,"expiresAt":200,"extra":1}]})")};
+    for (Str value : invalid) CHECK(!consumer_registry_valid(document, value));
+
+    char output_bytes[8192];
+    const i64 times[] = {99, 100, 199, 200, 0};
+    for (i64 now : times) {
+        const bool active = now == 100 || now == 199;
+        json::Writer bearer{output_bytes};
+        CHECK(consumer_registry_authenticate_at(
+                  document, valid, lit_str("bearer"), lit_str("Bearer timed-key"), now, bearer) ==
+              active);
+        json::Writer header{output_bytes};
+        CHECK(consumer_registry_authenticate_at(
+                  document, valid, lit_str("header"), lit_str("header-key"), now, header) ==
+              active);
+        json::Writer basic{output_bytes};
+        CHECK(consumer_registry_authenticate_at(document,
+                                                valid,
+                                                lit_str("basic"),
+                                                lit_str("Basic YWxpY2U6cGFzc3dvcmQ="),
+                                                now,
+                                                basic) == active);
+        json::Writer mtls{output_bytes};
+        CHECK(consumer_registry_authenticate_mtls_at(
+                  document,
+                  valid,
+                  lit_str("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                  now,
+                  mtls) == active);
+        json::Writer query{output_bytes};
+        CHECK(consumer_registry_authenticate_fields_at(document,
+                                                       valid,
+                                                       lit_str("api_key"),
+                                                       lit_str("/private?api_key=header-key"),
+                                                       true,
+                                                       now,
+                                                       query) == active);
+        json::Writer form{output_bytes};
+        CHECK(consumer_registry_authenticate_fields_at(document,
+                                                       valid,
+                                                       lit_str("api_key"),
+                                                       lit_str("api_key=header-key"),
+                                                       false,
+                                                       now,
+                                                       form) == active);
+    }
+    json::Writer legacy{output_bytes};
+    CHECK(consumer_registry_authenticate_at(
+        document, valid, lit_str("bearer"), lit_str("Bearer legacy-key"), 150, legacy));
+    json::Writer failed_clock{output_bytes};
+    CHECK(!consumer_registry_authenticate_at(
+        document, valid, lit_str("bearer"), lit_str("Bearer legacy-key"), 0, failed_clock));
+    json::Writer disabled{output_bytes};
+    CHECK(!consumer_registry_authenticate_at(
+        document, valid, lit_str("header"), lit_str("disabled-header"), 150, disabled));
+    const i64 partial_times[] = {99, 100, 199, 200};
+    for (i64 now : partial_times) {
+        json::Writer starts_unbounded{output_bytes};
+        CHECK(consumer_registry_authenticate_at(document,
+                                                valid,
+                                                lit_str("bearer"),
+                                                lit_str("Bearer starts-key"),
+                                                now,
+                                                starts_unbounded) == (now < 200));
+        json::Writer ends_unbounded{output_bytes};
+        CHECK(consumer_registry_authenticate_at(document,
+                                                valid,
+                                                lit_str("bearer"),
+                                                lit_str("Bearer ends-key"),
+                                                now,
+                                                ends_unbounded) == (now >= 100));
+    }
+    const Str legacy_only = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":[]}],"credentials":[{"id":"legacy","consumerId":"alice","method":"bearer","secret":"legacy-key","enabled":true}]})");
+    json::Writer no_clock_legacy{output_bytes};
+    CHECK(consumer_registry_authenticate_at(document,
+                                            legacy_only,
+                                            lit_str("bearer"),
+                                            lit_str("Bearer legacy-key"),
+                                            0,
+                                            no_clock_legacy));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
