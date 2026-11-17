@@ -614,6 +614,8 @@ struct Module {
         u32 extra_count = 0;
         u32 extra_ips[kMaxExtraBackends] = {};
         u16 extra_ports[kMaxExtraBackends] = {};
+        u32 weight_count = 0;
+        u16 backend_weights[8]{};
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.

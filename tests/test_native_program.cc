@@ -3765,3 +3765,33 @@ TEST(native_program, mtls_consumer_registry_pins_verified_connection_identity_ac
     arena.destroy();
     pool.destroy();
 }
+
+TEST(native_program, weighted_upstream_metadata_survives_compiler_exit_and_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003"], weights: [3, 1, 0] }
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    owner.p->config.backend_selection[0].active[0][0] = 7;
+    owner.p->config.backend_selection[0].weighted_current[0][0] = 2;
+    Program replacement;
+    REQUIRE(replacement.p);
+    REQUIRE(load(source, *replacement.p));
+    CHECK_EQ(replacement.p->config.backend_selection[0].active[0][0], 0u);
+    CHECK_EQ(replacement.p->config.backend_selection[0].weighted_current[0][0], 0);
+    CHECK_EQ(owner.p->config.backend_selection[0].active[0][0], 7u);
+    CHECK_EQ(owner.p->config.backend_selection[0].weighted_current[0][0], 2);
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& cfg = owner.p->config;
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 3u);
+    CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
+    CHECK_EQ(cfg.upstreams[0].weights[1], 1u);
+    CHECK_EQ(cfg.upstreams[0].weights[2], 0u);
+    CHECK_EQ(cfg.backend_selection[0].weighted_eligible[0], 0u);
+    activate_native_program(*owner.p);
+    CHECK_EQ(cfg.upstreams[0].weights[2], 0u);
+}

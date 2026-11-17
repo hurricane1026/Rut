@@ -3856,6 +3856,37 @@ struct Parser {
                     }
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
+                } else if (field_name.eq({"weights", 7})) {
+                    if (item.upstream.weight_count != 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*field.value()),
+                                              field_name);
+                    auto open = expect(TokenType::LBracket);
+                    if (!open) return core::make_unexpected(open.error());
+                    if (cur().type == TokenType::RBracket)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(cur()), field_name);
+                    while (true) {
+                        auto lit = expect(TokenType::IntLit);
+                        if (!lit) return core::make_unexpected(lit.error());
+                        u32 weight = 0;
+                        for (u32 n = 0; n < lit.value()->text.len; ++n) {
+                            const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
+                            if (weight > (1000u - digit) / 10u)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*lit.value()),
+                                                      field_name);
+                            weight = weight * 10u + digit;
+                        }
+                        if (item.upstream.weight_count >= AstUpstreamDecl::kMaxBackends)
+                            return frontend_error(
+                                FrontendError::TooManyItems, span_from(*lit.value()), field_name);
+                        item.upstream.backend_weights[item.upstream.weight_count++] =
+                            static_cast<u16>(weight);
+                        if (!take(TokenType::Comma) || cur().type == TokenType::RBracket) break;
+                    }
+                    auto close = expect(TokenType::RBracket);
+                    if (!close) return core::make_unexpected(close.error());
                 } else if (field_name.eq({"health_check", 12})) {
                     // `health_check: { path: "...", interval: <dur>, status: N }`
                     // — active-health config (data only this slice). path and
@@ -3987,6 +4018,10 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (item.upstream.weight_count != 0 &&
+                item.upstream.weight_count != item.upstream.backend_count)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"weights", 7});
             if (item.upstream.backend_count > 0) {
                 // `backends:` is mutually exclusive with host/port — mixing
                 // them is ambiguous about which is the primary endpoint.

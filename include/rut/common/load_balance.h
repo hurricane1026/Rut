@@ -26,5 +26,12 @@ inline bool forward_load_balance_valid(ForwardLoadBalance spec) {
 struct alignas(64) BackendSelectionState {
     u32 active[64][8]{};
     u16 cursor[kMaxForwardSites]{};
+    // Smooth weighted selection is local to the forward site and shard.
+    // Reset credits when eligibility changes so recovering/previously busy
+    // backends cannot accumulate an unbounded scheduling debt.
+    // With <=8 weights in 0..1000 and a reset on eligibility changes,
+    // smooth scheduling credits (including intermediate sums) fit in i16.
+    i16 weighted_current[kMaxForwardSites][8]{};
+    u8 weighted_eligible[kMaxForwardSites]{};
 };
 }  // namespace rut

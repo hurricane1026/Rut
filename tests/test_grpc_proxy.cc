@@ -5084,6 +5084,11 @@ int main(int argc, char** argv) {
 TEST(load_balance, sites_shards_shared_load_and_config_lifetimes) {
     auto cfg = std::make_unique<RouteConfig>();
     auto next = std::make_unique<RouteConfig>();
+    // Selection now reads endpoint weights from the declared upstream metadata.
+    for (auto* snapshot : {cfg.get(), next.get()}) {
+        REQUIRE(snapshot->add_upstream("api", 0x7f000001, 9001));
+        REQUIRE(snapshot->add_upstream_backend(0, 0x7f000001, 9002));
+    }
     GrpcBackendHealthReset reset;
     const ForwardLoadBalance a{1, LoadBalancePolicy::RoundRobin};
     const ForwardLoadBalance b{2, LoadBalancePolicy::RoundRobin};
@@ -5104,6 +5109,8 @@ TEST(load_balance, sites_shards_shared_load_and_config_lifetimes) {
     // that endpoint out of this request's retry candidates even when it now
     // appears to have the fewest active requests.
     auto retry_cfg = std::make_unique<RouteConfig>();
+    REQUIRE(retry_cfg->add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(retry_cfg->add_upstream_backend(0, 0x7f000001, 9002));
     retry_cfg->backend_selection[0].active[0][1] = 1;
     CHECK_EQ(select_forward_backend(retry_cfg.get(), 0, least, 0, 2, 0, 1u), 1u);
     CHECK_EQ(select_forward_backend(cfg.get(), 1, least, 0, 2, 0), 0u);
@@ -5150,6 +5157,7 @@ TEST(load_balance, grpc_dispatch_balances_independent_rpcs_and_releases_on_close
     REQUIRE(cfg->add_upstream("grpc", 0x7f000001, 9001).has_value());
     REQUIRE(cfg->upstreams[0].add_addr(0x7f000001, 9002));
     cfg->upstreams[0].http2 = true;
+    cfg->upstreams[0].weights[0] = 3;
     GrpcBackendHealthReset health_reset;
     Connection* down = loop.alloc_conn();
     REQUIRE(down != nullptr);
@@ -5166,7 +5174,7 @@ TEST(load_balance, grpc_dispatch_balances_independent_rpcs_and_releases_on_close
                                 {{":path", 5}, {"/Echo", 5}},
                                 {{":authority", 10}, {"x", 1}},
                                 {{"content-type", 12}, {"application/grpc", 16}}};
-    for (u16 i = 0; i < 3; ++i) {
+    for (u16 i = 0; i < 4; ++i) {
         const u32 sid = 2u * i + 1u;
         REQUIRE(down->h2->open_stream(sid) != nullptr);
         down->forward_load_balance = {
@@ -5178,12 +5186,21 @@ TEST(load_balance, grpc_dispatch_balances_independent_rpcs_and_releases_on_close
         REQUIRE(rpc->upstream != nullptr);
         CHECK_EQ(rpc->upstream->upstream_backend_idx, i == 1 ? 1u : 0u);
     }
-    CHECK_EQ(cfg->backend_selection[0].active[0][0], 2u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 3u);
     CHECK_EQ(cfg->backend_selection[0].active[0][1], 1u);
     auto* first = grpc_find(*down->h2, 1);
     REQUIRE(first != nullptr);
     grpc_release_slot(&loop, *first);
-    CHECK_EQ(cfg->backend_selection[0].active[0][0], 1u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 2u);
+    // Weight zero also rejects a new gRPC exchange, without touching live RPCs.
+    cfg->upstreams[0].weights[0] = 0;
+    cfg->upstreams[0].weights[1] = 0;
+    REQUIRE(down->h2->open_stream(9) != nullptr);
+    down->forward_load_balance = {5, LoadBalancePolicy::RoundRobin};
+    CHECK_FALSE(grpc_start_impl(&loop, *down, 9, cfg.get(), 0, hs, 5, req, false));
+    CHECK(grpc_find(*down->h2, 9) == nullptr);
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 2u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1], 1u);
     loop.force_close_all();
     CHECK_EQ(cfg->backend_selection[0].active[0][0], 0u);
     CHECK_EQ(cfg->backend_selection[0].active[0][1], 0u);

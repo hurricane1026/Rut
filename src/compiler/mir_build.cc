@@ -1510,6 +1510,9 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_path = module.upstreams[i].hc_path;
         up.hc_interval_ms = module.upstreams[i].hc_interval_ms;
         up.hc_expected_status = module.upstreams[i].hc_expected_status;
+        up.weight_count = module.upstreams[i].weight_count;
+        for (u32 b = 0; b < up.weight_count; ++b)
+            up.backend_weights[b] = module.upstreams[i].backend_weights[b];
         if (!mir->upstreams.push(up)) return frontend_error(FrontendError::TooManyItems, up.span);
     }
 

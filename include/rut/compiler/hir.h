@@ -55,6 +55,8 @@ struct HirUpstream {
     u32 extra_count = 0;
     u32 extra_ips[kMaxExtraBackends] = {};
     u16 extra_ports[kMaxExtraBackends] = {};
+    u32 weight_count = 0;
+    u16 backend_weights[8]{};
     // Active health-check config copied from the DSL (data only; no probing in
     // this slice). hc_enabled gates the rest. path/interval required when set;
     // status defaults to 200. hc_path is a Str (like name) copied into a char

@@ -495,11 +495,28 @@ it does not contain or supply a selection policy. The `at "ip:port"` upstream
 form can remain: its callers must supply the argument. There is no default,
 inheritance, string spelling, numeric spelling, or policy alias.
 
+Optional `weights: [3, 1, 0]` assigns one literal integer per `backends`
+entry (1–8 endpoints, weights 0–1000). Omitted weights are all 1; a zero-weight
+endpoint is disabled even during health fail-open and retry. `weights` requires
+an explicit `backends` list of matching length; duplicate, empty, nonliteral,
+negative, overflowing or out-of-range lists reject at compile time. An all-zero
+list is valid configuration but has no eligible upstream and HTTP forwarding
+returns 503. No selection argument is inferred from the upstream weights.
+
+`.roundRobin` uses smooth weighted selection. `.leastRequests` first compares
+active-request/weight ratios exactly, then uses the same weighted selection
+among equal-ratio candidates. Equal weights preserve the existing rotating
+behavior. Selection credits are per forward site and shard; changes in health,
+retry exclusions or least-request eligibility reset credits to avoid recovery
+bursts. Credits are fixed-size and allocation-free; RCU replacement configurations
+start with fresh credits while old requests retain their original active gauges.
+See [weighted-upstream.rut](../examples/weighted-upstream.rut).
+
 Round-robin cursors are per forward site and shard. Least-request counts are
 shared across routes using the same upstream backend set on that shard and
 count active requests/RPCs, not pooled connections. The policy is part of the
 forward operation, including suspended JIT handlers and native gRPC streams.
-Least-request ties rotate at the forward site. Connecting attempts count as
+Least-request ties use the weights at the forward site (rotating when equal). Connecting attempts count as
 active; completion, failure, cancellation, and reset release the count once.
 Retries release the failed attempt before selecting again. Both algorithms
 skip ejected backends when healthy ones exist and retain the existing fail-open

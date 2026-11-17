@@ -594,6 +594,15 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && up.hc_enabled)) return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            if (up.weight_count != 0) {
+                if (up.weight_count > UpstreamTarget::kMaxBackends ||
+                    up.weight_count != cfg.upstreams[i].addr_count)
+                    return false;
+                for (u32 b = 0; b < up.weight_count; ++b) {
+                    if (up.backend_weights[b] > 1000) return false;
+                    cfg.upstreams[i].weights[b] = up.backend_weights[b];
+                }
+            }
             if (up.hc_enabled) {
                 if (!cfg.set_upstream_health_check(i,
                                                    up.hc_path.ptr,
@@ -636,6 +645,15 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && up.hc_enabled)) return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            if (up.weight_count != 0) {
+                if (up.weight_count > UpstreamTarget::kMaxBackends ||
+                    up.weight_count != cfg.upstreams[i].addr_count)
+                    return false;
+                for (u32 b = 0; b < up.weight_count; ++b) {
+                    if (up.backend_weights[b] > 1000) return false;
+                    cfg.upstreams[i].weights[b] = up.backend_weights[b];
+                }
+            }
             if (up.hc_enabled) {
                 if (!cfg.set_upstream_health_check(i,
                                                    up.hc_path.ptr,

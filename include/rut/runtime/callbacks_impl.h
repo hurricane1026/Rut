@@ -190,24 +190,58 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
                                   u32 count,
                                   u64 now,
                                   u8 excluded_backends) {
-    if (!cfg || shard >= kMaxShards || uid >= RouteConfig::kMaxUpstreams || count == 0) return 0;
-    if (spec.policy == LoadBalancePolicy::None) return select_backend(uid, count, now);
+    if (!cfg || shard >= kMaxShards || uid >= cfg->upstream_count || count == 0 ||
+        count > UpstreamTarget::kMaxBackends || count != cfg->upstreams[uid].addr_count)
+        return count;
     if (!forward_load_balance_valid(spec)) return count;
+    // Native callers without a compiled forward site retain their legacy path.
+    if (spec.policy == LoadBalancePolicy::None) {
+        for (u32 i = 0; i < count; ++i)
+            if (cfg->upstreams[uid].weights[i] != 1) return count;
+        return select_backend(uid, count, now);
+    }
     auto& state = cfg->backend_selection[shard];
     auto& cursor = state.cursor[spec.site - 1];
+    const auto& weights = cfg->upstreams[uid].weights;
     bool any_healthy = false;
-    for (u32 i = 0; i < count; ++i)
-        if ((excluded_backends & (1u << i)) == 0) any_healthy |= !backend_ejected(uid, i, now);
+    for (u32 i = 0; i < count; ++i) {
+        if (weights[i] > 1000) return count;
+        if (weights[i] != 0 && (excluded_backends & (1u << i)) == 0)
+            any_healthy |= !backend_ejected(uid, i, now);
+    }
+    u8 eligible = 0;
     u32 best = count;
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
-        if ((excluded_backends & (1u << i)) != 0) continue;
+        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0) continue;
         if (any_healthy && backend_ejected(uid, i, now)) continue;
-        if (best == count || (spec.policy == LoadBalancePolicy::LeastRequests &&
-                              state.active[uid][i] < state.active[uid][best]))
-            best = i;
-        if (spec.policy == LoadBalancePolicy::RoundRobin) break;
+        // Compare exact active/weight ratios without division or narrowing.
+        if (spec.policy == LoadBalancePolicy::LeastRequests && best != count) {
+            const u64 lhs = static_cast<u64>(state.active[uid][i]) * weights[best];
+            const u64 rhs = static_cast<u64>(state.active[uid][best]) * weights[i];
+            if (lhs > rhs) continue;
+            if (lhs < rhs) eligible = 0;
+        }
+        eligible |= static_cast<u8>(1u << i);
+        best = i;
     }
+    if (eligible == 0) return count;  // No fallback can reactivate weight zero.
+    auto& previous = state.weighted_eligible[spec.site - 1];
+    auto& current = state.weighted_current[spec.site - 1];
+    if (previous != eligible) {
+        for (u32 i = 0; i < count; ++i) current[i] = 0;
+        previous = eligible;
+    }
+    i32 total = 0;
+    best = count;
+    for (u32 step = 0; step < count; ++step) {
+        const u32 i = (cursor + step) % count;
+        if ((eligible & (1u << i)) == 0) continue;
+        current[i] = static_cast<i16>(current[i] + weights[i]);
+        total += weights[i];
+        if (best == count || current[i] > current[best]) best = i;
+    }
+    current[best] = static_cast<i16>(current[best] - total);
     cursor = static_cast<u16>((best + 1) % count);
     return best;
 }
@@ -324,7 +358,8 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (config == nullptr || upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[upstream_idx];
-    if (backend_idx >= target.addr_count || target.tls.enabled) return false;
+    if (backend_idx >= target.addr_count || target.tls.enabled || target.weights[backend_idx] == 0)
+        return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
     // kMaxConns a due sweep can launch up to kMaxProbesPerSweep (32) probes,
@@ -3311,6 +3346,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                                     route->upstream_id,
                                                     target.addr_count,
                                                     conn.upstream_start_us);
+        if (kBackend >= target.addr_count) {
+            release_upstream_slot(loop, conn);
+            conn.pending_handler_fn = nullptr;
+            conn.resp_status = 503;
+            format_static_response(conn,
+                                   503,
+                                   false,
+                                   http1_request_is_head(conn),
+                                   ordinary_local_response_version(conn));
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
         conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
         hold_backend_active(conn);
@@ -5264,6 +5313,20 @@ void handle_jit_outcome(Loop* loop,
                                                         static_cast<u16>(outcome.upstream_id),
                                                         target.addr_count,
                                                         monotonic_us());
+            if (kBackend >= target.addr_count) {
+                release_upstream_slot(loop, conn);
+                conn.pending_handler_fn = nullptr;
+                conn.resp_status = 503;
+                format_static_response(conn,
+                                       503,
+                                       false,
+                                       http1_request_is_head(conn),
+                                       ordinary_local_response_version(conn));
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
             if (outcome.request_policy_id != 0) {
                 if (!apply_request_policy(
@@ -9866,6 +9929,10 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
                                                 upstream_id,
                                                 target.addr_count,
                                                 conn.upstream_start_us);
+    if (kBackend >= target.addr_count) {
+        h2_proxy_fail(loop, conn, 503);
+        return;
+    }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
     hold_backend_active(conn, cfg);

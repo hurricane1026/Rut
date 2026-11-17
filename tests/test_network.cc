@@ -1,4 +1,5 @@
 #include "posix.h"
+#include "route_config_fixture.h"
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
@@ -2927,7 +2928,9 @@ TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     module.failure_policy_count = 2;
     module.failure_policies[0] = reject;
     module.failure_policies[1] = suppress;
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+    REQUIRE(config_owner.config);
+    RouteConfig& config = *config_owner.config;
     REQUIRE(populate_route_config(config, module));
     CHECK_EQ(config.failure_policy_count, 2u);
     CHECK_EQ(config.failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
@@ -2944,7 +2947,9 @@ TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
 
     rir::Module malformed = module;
     malformed.failure_policies[1].head_mode = FailurePolicyHeadMode::Invalid;
-    RouteConfig untouched{};
+    rut::test::RouteConfigFixture untouched_owner;
+    REQUIRE(untouched_owner.config);
+    RouteConfig& untouched = *untouched_owner.config;
     CHECK_FALSE(populate_route_config(untouched, malformed));
     CHECK_EQ(untouched.failure_policy_count, 0u);
     CHECK_EQ(untouched.failure_policy_bytes_used, 0u);
@@ -2957,7 +2962,9 @@ TEST(response_policy, failure_head_mode_config_copy_is_owned_and_deduplicated) {
     malformed.upstreams[0].has_address = true;
     malformed.upstreams[0].ip = 0x7F000001;
     malformed.upstreams[0].port = 8080;
-    RouteConfig prebound{};
+    rut::test::RouteConfigFixture prebound_owner;
+    REQUIRE(prebound_owner.config);
+    RouteConfig& prebound = *prebound_owner.config;
     REQUIRE(prebound.add_upstream("backend", 0x7F000001, 8080).has_value());
     const u32 before_upstreams = prebound.upstream_count;
     const u32 before_addr_count = prebound.upstreams[0].addr_count;
@@ -3081,7 +3088,11 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     module.policy_bundles[3] = {1, 1, 2, 3};
     module.policy_bundles[4] = {1, 1, 2, 3, ForwardResponseBufferingMode::CompleteContentLength};
 
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+
+    REQUIRE(config_owner.config);
+
+    RouteConfig& config = *config_owner.config;
     REQUIRE(populate_route_config(config, module));
     REQUIRE_EQ(config.policy_bundle_count, 5u);
     for (u32 i = 0; i < 5; i++) {
@@ -3102,7 +3113,9 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     CHECK_EQ(config.add_policy_bundle(0, 0, 0, 64), 0u);
 
     auto rejects = [&](const rir::Module& forged) {
-        RouteConfig untouched{};
+        rut::test::RouteConfigFixture untouched_owner;
+        REQUIRE(untouched_owner.config);
+        RouteConfig& untouched = *untouched_owner.config;
         CHECK_FALSE(populate_route_config(untouched, forged));
         CHECK_EQ(untouched.response_policy_count, 0u);
         CHECK_EQ(untouched.failure_policy_count, 0u);
@@ -3126,7 +3139,9 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     rejects(buffering_without_timeout);
 
     // Existing failure-only bundle behavior remains valid when duration is absent.
-    RouteConfig legacy{};
+    rut::test::RouteConfigFixture legacy_owner;
+    REQUIRE(legacy_owner.config);
+    RouteConfig& legacy = *legacy_owner.config;
     REQUIRE_EQ(legacy.add_failure_policy(failure), 1u);
     REQUIRE_EQ(legacy.add_policy_bundle(0, 1), 1u);
     CHECK(legacy.policy_bundle_id_is_valid(1));
@@ -34120,6 +34135,13 @@ TEST(epoll_episode_lifecycle, production_health_probe_retires_before_same_slot_r
                                           /*status=*/200));
     loop->config_ptr = &active;
 
+    // Administratively disabled targets must not receive probe traffic either.
+    cfg.upstreams[upstream_id].weights[0] = 0;
+    CHECK_FALSE(start_health_probe(loop, upstream_id, 0));
+    struct pollfd disabled_probe{listener_fd, POLLIN, 0};
+    CHECK_EQ(poll(&disabled_probe, 1, 0), 0);
+    cfg.upstreams[upstream_id].weights[0] = 1;
+
     // Production config installation owns the initial health-table reset and
     // deadline arm. Seed an observable down state only after that reset: the
     // first real 200 probe must clear it, not merely preserve a healthy default.
@@ -58987,7 +59009,9 @@ TEST(response_read_deadline, stale_owner_never_wins_and_client_close_reclaims_on
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_response_read_deadline_bundle(config));
         PrebuiltD2Fixture fixture{};
@@ -59016,7 +59040,9 @@ TEST(response_read_deadline, stale_owner_never_wins_and_client_close_reclaims_on
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_response_read_deadline_bundle(config));
         PrebuiltD2Fixture fixture{};
@@ -59064,7 +59090,9 @@ TEST(response_read_deadline, stale_owner_never_wins_and_client_close_reclaims_on
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_response_read_deadline_bundle(config));
         PrebuiltD2Fixture fixture{};
@@ -63032,7 +63060,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -63059,7 +63089,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -63089,7 +63121,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+    REQUIRE(config_owner.config);
+    RouteConfig& config = *config_owner.config;
     PrebuiltD2Fixture fixture{};
     REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
     REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -63159,7 +63193,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -63254,7 +63290,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -63294,7 +63332,9 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+    REQUIRE(config_owner.config);
+    RouteConfig& config = *config_owner.config;
     PrebuiltD2Fixture fixture{};
     REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
     REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -65519,7 +65559,9 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::CompleteContentLength));
@@ -65557,7 +65599,9 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 1, ForwardResponseBufferingMode::CompleteContentLength));
@@ -65583,7 +65627,9 @@ TEST(response_read_deadline_fixed_upload,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
             config, 1, ForwardResponseBufferingMode::CompleteContentLength));
@@ -74886,8 +74932,12 @@ TEST(response_read_deadline_get_cl0, prebuilt_purpose_is_revalidated_at_send_com
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
-        RouteConfig other_config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
+        rut::test::RouteConfigFixture other_config_owner;
+        REQUIRE(other_config_owner.config);
+        RouteConfig& other_config = *other_config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
         REQUIRE(other_config.add_upstream("backend", 0x7F000001, 9000).has_value());
@@ -74933,7 +74983,9 @@ TEST(response_read_deadline_get_cl0, prebuilt_purpose_is_revalidated_at_send_com
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+    REQUIRE(config_owner.config);
+    RouteConfig& config = *config_owner.config;
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
     PrebuiltD2Fixture fixture{};
@@ -75101,7 +75153,9 @@ TEST(response_read_deadline_get_cl0, full_frame_send_errors_and_duplicates_do_no
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
         loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
         PrebuiltD2Fixture fixture{};
@@ -75126,7 +75180,9 @@ TEST(response_read_deadline_get_cl0, full_frame_send_errors_and_duplicates_do_no
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
         PrebuiltD2Fixture fixture{};
@@ -75154,7 +75210,9 @@ TEST(response_read_deadline_get_cl0, full_frame_send_errors_and_duplicates_do_no
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    RouteConfig config{};
+    rut::test::RouteConfigFixture config_owner;
+    REQUIRE(config_owner.config);
+    RouteConfig& config = *config_owner.config;
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
     PrebuiltD2Fixture fixture{};
@@ -79929,7 +79987,9 @@ TEST(state_invariant, jit_upstream_connect_resets_old_upstream_armed_state) {
 }
 
 TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
-    RouteConfig cfg;
+    rut::test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config);
+    RouteConfig& cfg = *cfg_owner.config;
     auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
     REQUIRE(upstream.has_value());
     SmallLoop loop;
@@ -80058,7 +80118,9 @@ template <typename Loop>
 static void run_direct_proxy_head_failure(rut::test::TestCase* _tc,
                                           OrdinaryHeadFailure failure,
                                           bool is_head) {
-    RouteConfig cfg{};
+    rut::test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config);
+    RouteConfig& cfg = *cfg_owner.config;
     const auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
     REQUIRE(upstream.has_value());
     cfg.upstreams[upstream.value()].max_inflight =
@@ -80099,7 +80161,9 @@ template <typename Loop>
 static void run_jit_forward_head_failure(rut::test::TestCase* _tc,
                                          OrdinaryHeadFailure failure,
                                          bool is_head) {
-    RouteConfig cfg{};
+    rut::test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config);
+    RouteConfig& cfg = *cfg_owner.config;
     const auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
     REQUIRE(upstream.has_value());
     cfg.upstreams[upstream.value()].max_inflight =
@@ -88299,12 +88363,16 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
     for (const u8 route_method : {kRouteMethodHead, kRouteMethodAny}) {
         for (const Vector& vector : vectors) {
             std::string live_response;
-            RouteConfig replacement{};
+            rut::test::RouteConfigFixture replacement_owner;
+            REQUIRE(replacement_owner.config);
+            RouteConfig& replacement = *replacement_owner.config;
             {
                 ScopedIoUringLoopForRetirement guard;
                 if (!guard.init()) SKIP("io_uring unavailable");
                 auto* loop = guard.loop;
-                RouteConfig config{};
+                rut::test::RouteConfigFixture config_owner;
+                REQUIRE(config_owner.config);
+                RouteConfig& config = *config_owner.config;
                 PrebuiltD2Fixture fixture{};
                 REQUIRE(
                     stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
@@ -88323,7 +88391,9 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
             ScopedIoUringLoopForRetirement guard;
             if (!guard.init()) SKIP("io_uring unavailable");
             auto* loop = guard.loop;
-            RouteConfig config{};
+            rut::test::RouteConfigFixture config_owner;
+            REQUIRE(config_owner.config);
+            RouteConfig& config = *config_owner.config;
             PrebuiltD2Fixture fixture{};
             REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
             REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
@@ -88396,7 +88466,9 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -88440,7 +88512,9 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -88468,7 +88542,9 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
-        RouteConfig config{};
+        rut::test::RouteConfigFixture config_owner;
+        REQUIRE(config_owner.config);
+        RouteConfig& config = *config_owner.config;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, kRouteMethodAny, &fixture));
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
@@ -90337,3 +90413,127 @@ TEST(state_invariant, ready_wait_shutdown_discard_never_invokes_handler) {
 }
 
 #include "kong_routing_gap_network.inc"
+
+TEST(weighted_load_balance, smooth_ratio_site_shard_and_configuration_isolation) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    cfg.upstreams[0].weights[0] = 3;
+    cfg.upstreams[0].weights[1] = 1;
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    const ForwardLoadBalance rr{1, LoadBalancePolicy::RoundRobin};
+    u32 counts[2]{};
+    for (u32 i = 0; i < 400; ++i) {
+        const u32 selected = select_forward_backend(&cfg, 0, rr, 0, 2, 0, 0);
+        REQUIRE(selected < 2);
+        ++counts[selected];
+    }
+    CHECK_EQ(counts[0], 300u);
+    CHECK_EQ(counts[1], 100u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, {2, LoadBalancePolicy::RoundRobin}, 0, 2, 0, 0), 0u);
+    CHECK_EQ(select_forward_backend(&cfg, 1, rr, 0, 2, 0, 0), 0u);
+    // A new forward site has independent credits, including at the same shard.
+    CHECK_EQ(cfg.backend_selection[0].weighted_current[1][0], -1);
+    CHECK_EQ(cfg.backend_selection[1].weighted_current[0][0], -1);
+}
+
+TEST(weighted_load_balance, zero_weight_never_returns_including_fail_open_and_retry) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    cfg.upstreams[0].weights[0] = 0;
+    cfg.upstreams[0].weights[1] = 5;
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    for (auto policy : {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        const ForwardLoadBalance spec{1, policy};
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 0, 0), 1u);
+        backend_health(0, 1)->active_down = true;
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 0, 0), 1u);
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 0, 2), 2u);
+        cfg.upstreams[0].weights[1] = 0;
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 0, 0), 2u);
+        cfg.upstreams[0].weights[1] = 5;
+    }
+    *backend_health(0, 1) = {};
+}
+
+TEST(weighted_load_balance, ejection_recovery_and_exclusion_reset_credits) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    cfg.upstreams[0].weights[0] = 3;
+    const ForwardLoadBalance rr{1, LoadBalancePolicy::RoundRobin};
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    backend_health(0, 0)->eject_until_us = 100;
+    for (u32 n = 0; n < 200; ++n) CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 2, 99, 0), 1u);
+    u32 counts[2]{};
+    for (u32 n = 0; n < 400; ++n) {
+        const auto selected = select_forward_backend(&cfg, 0, rr, 0, 2, 100, 0);
+        REQUIRE(selected < 2);
+        ++counts[selected];
+    }
+    CHECK_EQ(counts[0], 300u);
+    CHECK_EQ(counts[1], 100u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 2, 100, 1), 1u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 2, 100, 3), 2u);
+    *backend_health(0, 0) = {};
+}
+
+TEST(weighted_load_balance, least_requests_compares_weighted_ratios_without_overflow) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    cfg.upstreams[0].weights[0] = 1000;
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    auto& active = cfg.backend_selection[0].active[0];
+    active[0] = 0xffffffffu;
+    active[1] = 0xfffffffeu;
+    CHECK_EQ(select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::LeastRequests}, 0, 2, 0, 0),
+             0u);
+    active[0] = 3000;
+    active[1] = 2;
+    CHECK_EQ(select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::LeastRequests}, 0, 2, 0, 0),
+             1u);
+    active[0] = 0;
+    active[1] = 0;
+    u32 counts[2]{};
+    for (u32 n = 0; n < 1001; ++n) {
+        const auto selected =
+            select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::LeastRequests}, 0, 2, 0, 0);
+        REQUIRE(selected < 2);
+        ++counts[selected];
+    }
+    CHECK_EQ(counts[0], 1000u);
+    CHECK_EQ(counts[1], 1u);
+}
+
+TEST(weighted_load_balance, eight_large_weights_keep_exact_cycle_counts_and_bounded_credits) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    for (u32 i = 1; i < 8; ++i)
+        REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, static_cast<u16>(9001 + i)));
+    const u16 weights[8]{1000, 999, 997, 991, 983, 977, 971, 967};
+    u32 total = 0;
+    for (u32 i = 0; i < 8; ++i) {
+        cfg.upstreams[0].weights[i] = weights[i];
+        total += weights[i];
+        *backend_health(0, i) = {};
+    }
+    u32 observed[8]{};
+    for (u32 n = 0; n < total; ++n) {
+        const auto selected =
+            select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::RoundRobin}, 0, 8, 0, 0);
+        REQUIRE(selected < 8);
+        ++observed[selected];
+        for (u32 i = 0; i < 8; ++i)
+            CHECK(cfg.backend_selection[0].weighted_current[0][i] >= -8000 &&
+                  cfg.backend_selection[0].weighted_current[0][i] <= 8000);
+    }
+    for (u32 i = 0; i < 8; ++i) CHECK_EQ(observed[i], weights[i]);
+    cfg.upstreams[0].weights[0] = 1001;
+    CHECK_EQ(select_forward_backend(&cfg, 0, {1, LoadBalancePolicy::RoundRobin}, 0, 8, 0, 0), 8u);
+}
