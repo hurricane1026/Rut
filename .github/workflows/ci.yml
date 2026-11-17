@@ -210,7 +210,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 1G
     strategy:
@@ -229,9 +228,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
+          key: ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
           restore-keys: |
-            ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
+            ccache-v2-${{ runner.os }}-${{ runner.arch }}-${{ matrix.compiler }}-${{ matrix.build_type }}-
       - name: Install tools
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc > /dev/null
@@ -244,6 +243,11 @@ jobs:
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
             sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
           fi
+
+      - name: Verify cached compiler source paths
+        env:
+          CI_COMPILER: ${{ matrix.compiler == 'clang' && 'clang-21' || 'gcc' }}
+        run: python3 scripts/check_ci_source_paths.py --compiler "$CI_COMPILER" --launcher ccache
 
       - name: Configure
         run: |

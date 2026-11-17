@@ -2,6 +2,10 @@
 
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 
@@ -47,6 +51,25 @@ class CIPolicyTests(unittest.TestCase):
                  test('unrelated', ['python3', '/source/tests/test_other.py'])]
         self.assertEqual(runner.pr_selection(tests, ['tests/test_redis_resp3.py', 'tests/test_foo.cc']),
                          ['unit', 'test_integration.shard_0_of_2', 'redis', 'changed_cpp'])
+
+
+@unittest.skipUnless(shutil.which('cc'), 'requires a C compiler')
+class CISourcePathTests(unittest.TestCase):
+    def test_absolute_fixture_paths_survive_different_working_directory(self):
+        module('check_ci_source_paths').check('cc')
+
+    def test_relative_source_rewriting_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix='rut-path-launcher-') as directory:
+            launcher = Path(directory) / 'rewrite-paths'
+            launcher.write_text(f'#!{sys.executable}\n' +
+                                'import os, subprocess, sys\n' +
+                                'prefix = os.path.dirname(os.getcwd())\n' +
+                                'sys.exit(subprocess.run(sys.argv[1:] + ' +
+                                '["-ffile-prefix-map=" + prefix + "=relative"]).returncode)\n')
+            launcher.chmod(0o700)
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                module('check_ci_source_paths').check('cc', str(launcher))
+            self.assertEqual(failure.exception.returncode, 2)
 
 
 if __name__ == '__main__':

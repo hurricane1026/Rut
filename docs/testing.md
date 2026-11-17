@@ -39,6 +39,11 @@ python3 -m unittest discover -s tests -p 'test_ci_*.py'
 The primary matrix uses ccache for C/C++ objects. Keys separate OS,
 architecture, compiler and configuration; compiler contents, flags and
 included files determine reuse. Configuration, linking and tests still run.
+Absolute compiler source paths are preserved: `CCACHE_BASEDIR` rewriting is
+not enabled because tests locate source fixtures and imports via `__FILE__`.
+A preflight compiles a fixture-reading probe twice through ccache and runs
+both binaries from a different directory. The v2 cache keys isolate objects
+from the previous path-rewriting configuration.
 No test results or whole build trees are restored. Shards share immutable
 keys and publish after a successful build, before tests. Pinned OpenSSL
 retains its existing acquisition/checksum verification. Cold builds still
