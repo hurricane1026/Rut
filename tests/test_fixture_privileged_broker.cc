@@ -11917,12 +11917,19 @@ static bool validate_ancestry_probe_evidence(const identity_bundle::IdentityBund
         launcher.netns != topology.holder_netns || root.cmdline != root_argv ||
         launcher.cmdline != launcher_argv || root.exe_dev != executable_status.st_dev ||
         root.exe_ino != executable_status.st_ino || launcher.exe_dev != executable_status.st_dev ||
-        launcher.exe_ino != executable_status.st_ino || root.pgid != launch.anchor.pgid ||
-        launcher.pgid != launch.anchor.pgid || root.sid != launch.anchor.sid ||
-        launcher.sid != launch.anchor.sid || !all_root_ids(root_evidence.status) ||
+        launcher.exe_ino != executable_status.st_ino || !all_root_ids(root_evidence.status) ||
         !all_root_ids(launcher_evidence.status) ||
         !same_security_status(root_evidence.status, launcher_evidence.status)) {
         error = "probe Root/Launcher IDB1 peer, process, argv, credential, or netns binding failed";
+        return false;
+    }
+    if (root.pgid != launch.anchor.pgid || launcher.pgid != launch.anchor.pgid ||
+        root.sid != launch.anchor.sid || launcher.sid != launch.anchor.sid) {
+        error = "probe Root/Launcher left the retained sudo process group or session (anchor " +
+                std::to_string(launch.anchor.pgid) + "/" + std::to_string(launch.anchor.sid) +
+                ", Root " + std::to_string(root.pgid) + "/" + std::to_string(root.sid) +
+                ", Launcher " + std::to_string(launcher.pgid) + "/" + std::to_string(launcher.sid) +
+                "); run the fixture without a controlling terminal when sudo uses a PTY";
         return false;
     }
     ProbeChainFacts facts;
@@ -15270,7 +15277,7 @@ static bool run_session(const std::string& sudo_path,
         (void)wait_identity_gone_or_reused_until(broker_proc, cleanup_deadline);
         (void)wait_identity_gone_or_reused_until(root_proc, cleanup_deadline);
     }
-    if (!success) {
+    if (!success && !wait_group_gone(launch_lease, kCleanupMs)) {
         std::string lease_error;
         if (!cleanup_group_lease(launch_lease,
                                  sudo_child,

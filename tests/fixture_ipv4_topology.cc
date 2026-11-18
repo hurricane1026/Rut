@@ -43,6 +43,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #ifndef RUT_PINNED_NGINX_IMAGE
@@ -6522,7 +6523,7 @@ static bool mount_parser_self_checks(std::uint32_t& rejections, std::string& err
     return true;
 }
 
-static bool docker_user_namespace_preflight(std::string& error) {
+static bool docker_user_namespace_preflight(bool& selinux, std::string& error) {
     CommandResult result;
     if (!run_command({"docker", "info", "-f", "{{json .SecurityOptions}}"}, result) ||
         !exited_zero(result)) {
@@ -6540,7 +6541,32 @@ static bool docker_user_namespace_preflight(std::string& error) {
         error = "rootless or userns-remapped Docker is unsupported for exact credential proof";
         return false;
     }
+    selinux = security.find("\"name=selinux\"") != std::string::npos;
     return true;
+}
+
+static bool label_exact_input_for_docker(
+    const fixture_exact_input_file_lease::ExactInputFileLease& input, bool selinux) {
+    if (!selinux) return true;
+
+    // Docker's typed --mount cannot relabel a source. Label only the newly
+    // created inode through the lease FD. Both fixture containers need to
+    // read this file, so use the shared container file level.
+    char context[512]{};
+    if (fgetxattr(input.descriptor(), "security.selinux", context, sizeof(context) - 1) < 0)
+        return false;
+    const std::string_view original(context);
+    const size_t role = original.find(':');
+    const size_t type = role == original.npos ? original.npos : original.find(':', role + 1);
+    if (type == original.npos || original.find(':', type + 1) == original.npos) {
+        errno = EPROTO;
+        return false;
+    }
+    std::string label(original.substr(0, type + 1));
+    label += "container_file_t:s0";
+    return original == label ||
+           fsetxattr(input.descriptor(), "security.selinux", label.c_str(), label.size() + 1, 0) ==
+               0;
 }
 
 static bool proc_credentials_exact(pid_t pid, std::uint64_t uid, std::uint64_t gid) {
@@ -8638,7 +8664,8 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
                       "injected exact-input mount preflight failure before mutation");
         return false;
     }
-    if (!docker_user_namespace_preflight(error) || !preflight(owner.fixture, error)) {
+    bool selinux = false;
+    if (!docker_user_namespace_preflight(selinux, error) || !preflight(owner.fixture, error)) {
         owner_failure(owner, diagnostic, ExactInputMountPhase::Preflight, error);
         return false;
     }
@@ -8677,6 +8704,14 @@ static bool setup_exact_input_mount(ExactInputMountOwner& owner,
         return false;
     }
     owner.receipt.input_acquired = true;
+    if (!label_exact_input_for_docker(owner.input, selinux)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input SELinux labeling failed",
+                      errno);
+        return false;
+    }
     char canonical[PATH_MAX]{};
     if (realpath(owner.input.path().c_str(), canonical) == nullptr ||
         owner.input.path() != canonical ||
@@ -8956,7 +8991,8 @@ static bool setup_exact_input_mount_from_topology_builder(ExactInputMountOwner& 
                       "injected exact-input mount preflight failure before mutation");
         return false;
     }
-    if (!docker_user_namespace_preflight(error) || !preflight(owner.fixture, error)) {
+    bool selinux = false;
+    if (!docker_user_namespace_preflight(selinux, error) || !preflight(owner.fixture, error)) {
         owner_failure(owner, diagnostic, ExactInputMountPhase::Preflight, error);
         return false;
     }
@@ -9150,6 +9186,14 @@ static bool setup_exact_input_mount_from_topology_builder(ExactInputMountOwner& 
     }
     owner.receipt.input_acquired = true;
     owner.receipt.builder.input_acquired_after_builder = true;
+    if (!label_exact_input_for_docker(owner.input, selinux)) {
+        owner_failure(owner,
+                      diagnostic,
+                      ExactInputMountPhase::InputFile,
+                      "exact input SELinux labeling failed",
+                      errno);
+        return false;
+    }
     char canonical[PATH_MAX]{};
     if (realpath(owner.input.path().c_str(), canonical) == nullptr ||
         owner.input.path() != canonical ||
@@ -15943,7 +15987,8 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
     };
 
     std::string error;
-    if (!docker_user_namespace_preflight(error) || !preflight(root.fixture, error) ||
+    bool selinux = false;
+    if (!docker_user_namespace_preflight(selinux, error) || !preflight(root.fixture, error) ||
         !mounted_name_and_labels_absent(token, "rut358-input-" + token, "0", error)) {
         result.prerequisite_failure = true;
         result.optional_skip_safe = true;
@@ -15999,6 +16044,11 @@ RunResult run_with_exact_input_rotation(const std::string& bytes,
         return finish_failure(false);
     }
     input_acquired = true;
+    if (!label_exact_input_for_docker(root.input, selinux)) {
+        result.error =
+            "exact-input rotation SELinux labeling failed: " + std::string(std::strerror(errno));
+        return finish_failure(false);
+    }
     if (!capture_rotation_source(root, live.initial_source, error)) {
         result.error = error;
         return finish_failure(false);

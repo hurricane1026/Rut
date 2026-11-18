@@ -1689,17 +1689,15 @@ if(RUT_ENABLE_JIT)
         "RUT_PINNED_NGINX_IMAGE=\"${_RUT_PINNED_NGINX_IMAGE}\""
     )
     add_test(NAME test_ipv4_fixture_topology COMMAND test_ipv4_fixture_topology)
-    # CI triage (37 sampled runs): green CTest durations ranged 74.6-118.7s
-    # (median ~90s), with 5/37 runs exceeding the old TIMEOUT 120 even though
-    # a direct (non-ctest) run of the same binary on the same runner passed
-    # moments later at 114-161s. This TIMEOUT overrides the workflow's
-    # `ctest --timeout`, so raise it to 300 to give the observed distribution
-    # real headroom instead of chasing a phantom hang.
+    # The fixture's Docker subprocesses can be much slower under build load.
+    # A loaded run reached the final revalidation phase at 217s and timed
+    # out at 300s, while an isolated run completed in 115s. Allow headroom
+    # for that phase and cleanup, with each subprocess still bounded.
     set_tests_properties(test_ipv4_fixture_topology PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 300
+        TIMEOUT 480
         SKIP_RETURN_CODE 77
     )
     add_executable(test_fixture_privileged_broker
@@ -1769,11 +1767,14 @@ if(RUT_ENABLE_JIT)
     endif()
     add_test(NAME test_fixture_exact_input_mount_owner
              COMMAND test_fixture_exact_input_mount_owner)
+    # The exact-input owner, builder, and rotation matrices each create and
+    # settle multiple Docker topologies. A busy host can exceed six minutes
+    # even when the individual Docker commands finish within their deadlines.
     set_tests_properties(test_fixture_exact_input_mount_owner PROPERTIES
         LABELS "integration;docker;network"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 360
+        TIMEOUT 900
         SKIP_RETURN_CODE 77
     )
     add_test(NAME test_fixture_exact_input_read_runner

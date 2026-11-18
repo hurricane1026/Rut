@@ -210,7 +210,10 @@ public:
                                    const ProcIdentity& second,
                                    std::chrono::steady_clock::time_point deadline,
                                    Diagnostic& diagnostic);
-    bool cleanup(std::chrono::steady_clock::time_point deadline, Diagnostic& diagnostic);
+    enum class CleanupMode { TerminateIfLive, WaitForExit };
+    bool cleanup(std::chrono::steady_clock::time_point deadline,
+                 Diagnostic& diagnostic,
+                 CleanupMode mode = CleanupMode::TerminateIfLive);
 
     bool active() const { return active_; }
     bool released() const { return released_; }

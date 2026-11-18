@@ -218,6 +218,13 @@ target_include_directories(rut_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT RUT_SANITIZE)
+    # Recent libstdc++ headers enable assertions at -O0, even for inline
+    # atomics. Keep runtime headers and their callers free of that ABI import.
+    target_compile_definitions(rut_runtime PUBLIC
+        "$<$<COMPILE_LANGUAGE:CXX>:_GLIBCXX_NO_ASSERTIONS>")
+endif()
+
 # Make ignoring a [[nodiscard]] result a hard error in the runtime — the automated
 # guard for the fail-closed invariant on the io_uring async-pause helpers
 # (pause_upstream_recv / _for_send / pause_recv / ws_pause_upstream_recv): they
