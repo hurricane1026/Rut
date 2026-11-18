@@ -4236,6 +4236,14 @@ if(RUT_ENABLE_JIT)
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend})
                 set_tests_properties(test_consumer_fields_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                foreach(consumer_query_opt 0 2)
+                    add_test(NAME test_consumer_query_forward_${auth_free_backend}_O${consumer_query_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_query_forward.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-query-forward-auth.rut
+                            --backend ${auth_free_backend} --opt ${consumer_query_opt})
+                    set_tests_properties(test_consumer_query_forward_${auth_free_backend}_O${consumer_query_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
+                endforeach()
                 add_test(NAME test_consumer_registry_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_registry.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-registry-auth.rut

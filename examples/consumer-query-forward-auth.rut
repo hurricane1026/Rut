@@ -1,0 +1,20 @@
+import "middleware/consumer_query.rut"
+
+// Use a log format that records request sizes without request targets.
+accessLog { path: "/tmp/rut-consumer-query-access.log", format: downstreamRequestBytes, publication: live }
+listen :8080
+upstream api at "127.0.0.1:9000"
+
+// The query source is explicit. Header removals apply only to the forwarded request.
+route "/query/:resource" {
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    req.remove("X-Consumer-ID")
+    let incoming = req.path
+    guard let identity = consumerAuthenticateQuery(incoming, env("AUTH_REGISTRY"), "api_key") else { return 401 }
+    guard jwtHasGroup(identity, "staff") else { return 403 }
+    guard let target = consumer_query.forwardingTarget(req.pathOnly, identity) else { return 503 }
+    return forward(api, load_balance: .roundRobin, set_path: target)
+}
+
+route GET "/ready" { return 204 }

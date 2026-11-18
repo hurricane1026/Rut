@@ -116,8 +116,9 @@ demonstrates projection and explicit group authorization.
 `consumerAuthenticateQuery(target, configuration, name) -> Json?` accepts the raw
 origin-form `req.path` (including its query); `consumerAuthenticateForm(body,
 configuration, name) -> Json?` accepts an application/x-www-form-urlencoded body.
-Both use raw-key registry records with method `header`. Registry and field name
-must resolve to compile-time configuration; name is 1–64 ASCII letters, digits,
+Both use registry records with method `header` and support raw and SHA-256
+key verifiers. Registry and field name must resolve to compile-time
+configuration. The field name is 1–64 ASCII letters, digits,
 `_`, `-` or `.`. Routes explicitly select one source. Authorization, cookies and
 other headers are never fallback credentials. Form routes must additionally
 require exactly one expected Content-Type before calling the function; the example
@@ -137,9 +138,9 @@ with the credential field removed, preserving every other field's exact encoded
 bytes and order. Empty remaining content is an empty string. Neither the decoded
 credential nor the full registry appears in this result. The remaining fields
 are still untrusted application input; this is not general secret classification.
-The original request bytes are unchanged. Do **not** pass the original request to
-transparent `forward` and claim it was sanitized. Build a new outbound message
-from `remaining` and the verified identity instead.
+Authentication leaves the original request bytes unchanged. Use the sanitized
+fields to build an outbound message or explicitly replace the forwarded query
+target.
 
 [consumer-fields-auth.rut](../examples/consumer-fields-auth.rut) demonstrates this
 contract: both source-specific routes submit sanitized fields as a new form POST
@@ -150,9 +151,33 @@ transparent body/target rewriting proxy. Its remote success is required before
 returning 204. Native H1/H2 tests inspect the actual upstream wire contents on both
 backends after deleting the source, and verify invalid requests make no callout.
 
-Keep credentials out of custom logs/traces. The supported downstreamRequestBytes
-and downstreamHost access-log formats do not include query/form content; this API
-does not retroactively redact external capture systems or arbitrary user logging.
+### Forwarding without the query credential
+
+[consumer-query-forward-auth.rut](../examples/consumer-query-forward-auth.rut)
+authenticates the original query, checks the verified Consumer group, and uses
+the existing owned `forward(..., set_path: target)` effect. The
+[`forwardingTarget` helper](../examples/middleware/consumer_query.rut) takes
+the same request's `req.pathOnly` and successful `consumerAuthenticateQuery`
+identity. It joins the original path to `remaining` and omits `?` when no
+fields remain. The original path spelling and remaining field bytes and order
+are preserved. A missing or wrongly typed `remaining` member yields nil.
+
+The route returns 401 for failed authentication, 403 for a missing required
+group, and 503 if it cannot project the target. The forward effect validates
+and owns the target before connecting upstream. Other parts of the request
+follow ordinary forwarding rules. The example explicitly drops Authorization,
+X-API-Key and client-supplied X-Consumer-ID before forwarding. It leaves the
+method and body intact.
+
+The example selects the `downstreamRequestBytes` access-log format, which
+records lengths without targets. `downstreamHost` also omits the target.
+The legacy `--access-log` format can record the original request target.
+Avoid that format, custom raw-target logging and unredacted captures on
+routes that authenticate query credentials. This profile covers configured
+query fields. For form credentials use the explicitly rebuilt callout above.
+
+Native H1/H2 fixtures read the exact upstream request and inspect the
+target-free access log on epoll and io_uring at O0 and O2.
 
 ## Lifecycle and publication
 
