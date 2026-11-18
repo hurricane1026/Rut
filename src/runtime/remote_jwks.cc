@@ -143,6 +143,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 3600) return false;
             next.refresh_seconds = static_cast<u32>(value);
             fields |= 32;
+        } else if (kKey.eq(lit_str("retrySeconds"))) {
+            if (value > 3600) return false;
+            next.retry_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("maxAgeSeconds"))) {
             if (value > 86400) return false;
             next.max_age_seconds = static_cast<u32>(value);
@@ -154,6 +157,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         } else
             return false;
     }
+    if (!next.retry_seconds) next.retry_seconds = next.refresh_seconds;
     next.endpoint.tls.enabled = true;
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
@@ -173,6 +177,11 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     }
     *this = next;
     return true;
+}
+
+u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
+    const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
+    return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
 }
 
 namespace {

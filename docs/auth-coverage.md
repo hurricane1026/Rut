@@ -854,6 +854,12 @@ kids can be imported. A valid empty intersection immediately removes cached keys
 There is no token-triggered fetch or redirect following. Optional bounded A/CNAME
 DNS and exact issuer/JWKS URI discovery validation now share the same cold refresh
 lifecycle; see [the trust contract](jwks-discovery.md).
+Optional integer `retrySeconds` (1–3600, defaulting to `refreshSeconds`) separates
+failure delay from successful refresh cadence for both algorithms. All failures
+wait from completion, including slow timeouts and import failures; successful
+empty sets use the refresh interval. Retry never renews cache age. Fixed-endpoint
+native fixtures measure failure spacing and HTTP/1.1/HTTP/2 expiry and recovery.
+This remains a bounded foundation; #1077 is open.
 
 The reusable bounded HTTPS state machine and existing HTTP/chunk parsers accept
 200 JSON bodies with strict framing, byte limits and authenticated transport.

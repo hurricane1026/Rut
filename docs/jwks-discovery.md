@@ -8,13 +8,30 @@ remain supported. New fields are all trusted compile/load-time configuration:
 {
   "address": "192.0.2.10", "port": 443, "serverName": "issuer.example",
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
-  "refreshSeconds": 30, "maxAgeSeconds": 120, "timeoutSeconds": 10,
+  "refreshSeconds": 30, "retrySeconds": 5, "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "dnsAddress": "192.0.2.53", "dnsPort": 53,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
   "discoveryIssuer": "https://issuer.example"
 }
 ```
+
+`retrySeconds` is optional, an integer from 1 through 3600. When omitted it
+uses `refreshSeconds`, regardless of field order. Omission preserves the interval
+value; failed attempts now measure it from completion, so slow failures no longer
+retry immediately when their prior start-based interval has elapsed.
+Successful refreshes, including valid empty key sets, schedule the next attempt
+from completion plus `refreshSeconds`. Setup, DNS, metadata, HTTPS, parsing and verifier-import failures
+schedule from their completion plus `retrySeconds`. A slow failure still waits
+the full retry interval after its timeout. Both algorithms use the same rule;
+there is no jitter, exponential backoff or token-triggered retry. Deadlines
+saturate instead of wrapping on integer overflow. An invalid maintenance clock
+cancels the attempt and clears cache freshness before a later cold attempt.
+
+Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
+renew last-success time; requests fail closed after the original maximum age
+while maintenance continues its bounded retry cadence. The attempt's total
+`timeoutSeconds` deadline still begins at attempt start and spans all stages.
 
 `dnsAddress` and a nonempty `allowedAddresses` list must appear together. Resolver
 and allowed destinations are IPv4 literals; at most eight destination addresses
@@ -88,6 +105,8 @@ and reordered CNAME chains, alias poisoning, HTTP/1.1 and HTTP/2 denial/recovery
 allowlisted address changes, prohibited rebinding, issuer/URI mismatch, redirects,
 resolver
 outage, TLS key rotation, empty-set removal, cache expiry, recovery and shutdown.
+Fixed-endpoint fixtures also measure immediate and slow-timeout failure retry
+spacing, with HTTP/1.1 and HTTP/2 maximum-age denial and recovery.
 Real native-loaded RS256 and ES256 gateways run after source removal on both
 Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.

@@ -35,7 +35,7 @@ def main():
     lock = threading.Lock()
     release_response = threading.Event()
     state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200,
-             "requests": 0, "locals": [], "dnsRequests": 0,
+             "requests": 0, "locals": [], "dnsRequests": 0, "attempts": [], "delay": 0,
              "hold": "cold" if args.access_profile else False,
              "discovery": "valid", "dns": "valid"}
     cold_release = threading.Event()
@@ -66,6 +66,10 @@ def main():
                 state["requests"] += 1
                 state["locals"].append(self.connection.getsockname()[0])
                 status, body, hold = state["status"], state["body"], state["hold"]
+                delay = state["delay"]
+                state["attempts"].append((time.monotonic(), status, delay))
+            if delay:
+                time.sleep(delay)
             if hold == "cold":
                 cold_release.wait()
             elif hold:
@@ -145,6 +149,9 @@ def main():
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
+        retry_profile = not args.discovery_dns and not args.access_profile
+        if retry_profile:
+            policy["remoteJwks"].update(retrySeconds=2, timeoutSeconds=2)
         if args.discovery_dns:
             policy["remoteJwks"].update(dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
                                        allowedAddresses=["127.0.0.1", "127.0.0.2"],
@@ -284,6 +291,42 @@ def main():
             wait_status(fixture["a"], 200)
             if args.access_profile:
                 assert request(fixture["a"], with_body=True) == (200, b"alice")
+            if retry_profile:
+                def failure_attempts(delay, count, limit=8):
+                    deadline = time.monotonic() + limit
+                    while time.monotonic() < deadline:
+                        with lock:
+                            times = [at for at, status, pause in state["attempts"]
+                                     if status == 503 and pause == delay]
+                        if len(times) >= count:
+                            return times
+                        time.sleep(.01)
+                    raise AssertionError(f"missing failed refresh attempts: {delay}, {count}, {times}")
+
+                publish(b"unavailable", 503)
+                immediate = failure_attempts(0, 2)
+                assert immediate[1] - immediate[0] >= 1.8, immediate
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+                # Ensure recovery completed, rather than accepting an old fresh cache.
+                with lock:
+                    previous = state["requests"]
+                wait_for_origin_request(previous)
+                with lock:
+                    state["delay"] = 3
+                publish(b"unavailable", 503)
+                failure_attempts(3, 1)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                delayed = failure_attempts(3, 2)
+                # timeoutSeconds=2 exceeds refreshSeconds=1: retries must wait
+                # two more seconds after timeout, not reconnect at completion.
+                assert delayed[1] - delayed[0] >= 3.8, delayed
+                with lock:
+                    state["delay"] = 0
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
             assert request(fixture["b"]) == 401
             if args.access_profile:
                 assert request(fixture["badClient"]) == 403, "signed wrong client must be forbidden"

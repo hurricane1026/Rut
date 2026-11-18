@@ -319,30 +319,35 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
         }
         if (remote->fetch.state() != HttpsFetch::State::Busy) {
             if (monotonic_ms < remote->next_attempt) continue;
-            // Attempt start schedules the next retry too; setup failures cannot
-            // turn every batch into a connection storm.
-            remote->next_attempt = monotonic_ms + static_cast<u64>(policy.refresh_seconds) * 1000;
-            (void)remote->fetch.start(monotonic_ms, policy.timeout_seconds * 1000);
-        }
-        remote->fetch.advance(monotonic_ms);
-        if (remote->fetch.state() != HttpsFetch::State::Done) continue;
-        Es256KeySet keys;
-        const auto kPrepared = policies[i].prepare_refresh(remote->fetch.body(), keys);
-        if (kPrepared != Es256Policy::Refresh::Invalid) {
-            auto& candidate = remote->use_alternate ? row.verifiers[i] : remote->alternate;
-            candidate.reset();
-            if (kPrepared == Es256Policy::Refresh::Empty || candidate.init(keys)) {
-                // This maintenance callback runs between handler batches on the
-                // same shard. Verification retains no key/verifier views.
-                auto& previous = remote->use_alternate ? remote->alternate : row.verifiers[i];
-                previous.reset();
-                remote->use_alternate = !remote->use_alternate;
-                remote->empty = kPrepared == Es256Policy::Refresh::Empty;
-                remote->last_success = monotonic_ms;
-                remote->next_attempt =
-                    monotonic_ms + static_cast<u64>(policy.refresh_seconds) * 1000;
+            if (!remote->fetch.start(monotonic_ms, policy.timeout_seconds * 1000)) {
+                remote->next_attempt = jwks_refresh_deadline(monotonic_ms, policy.retry_seconds);
+                remote->fetch.cancel();
+                continue;
             }
         }
+        remote->fetch.advance(monotonic_ms);
+        if (remote->fetch.state() == HttpsFetch::State::Busy) continue;
+        bool succeeded = false;
+        if (remote->fetch.state() == HttpsFetch::State::Done) {
+            Es256KeySet keys;
+            const auto kPrepared = policies[i].prepare_refresh(remote->fetch.body(), keys);
+            if (kPrepared != Es256Policy::Refresh::Invalid) {
+                auto& candidate = remote->use_alternate ? row.verifiers[i] : remote->alternate;
+                candidate.reset();
+                if (kPrepared == Es256Policy::Refresh::Empty || candidate.init(keys)) {
+                    // This maintenance callback runs between handler batches on the
+                    // same shard. Verification retains no key/verifier views.
+                    auto& previous = remote->use_alternate ? remote->alternate : row.verifiers[i];
+                    previous.reset();
+                    remote->use_alternate = !remote->use_alternate;
+                    remote->empty = kPrepared == Es256Policy::Refresh::Empty;
+                    remote->last_success = monotonic_ms;
+                    succeeded = true;
+                }
+            }
+        }
+        remote->next_attempt = jwks_refresh_deadline(
+            monotonic_ms, succeeded ? policy.refresh_seconds : policy.retry_seconds);
         // Release the borrowed body only after key import/activation completes.
         remote->fetch.cancel();
     }
