@@ -3,6 +3,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/auth.h"
+#include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/jwt_claims.h"
 
@@ -147,6 +148,56 @@ bool form_request(Str body, Str authorization, json::Writer& output) {
     return output.ok;
 }
 }  // namespace
+
+bool oauth_client_basic_authorization(Str client_id, Str client_secret, json::Writer& output) {
+    const auto kValid = [](Str value) {
+        if (!value.ptr || !value.len || value.len > 256) return false;
+        for (u32 i = 0; i < value.len; ++i) {
+            const auto kByte = static_cast<u8>(value.ptr[i]);
+            if (kByte < 0x20 || kByte > 0x7e) return false;
+        }
+        return true;
+    };
+    if (!kValid(client_id) || !kValid(client_secret)) return false;
+    struct Sensitive {
+        char userinfo[1530];
+        u8 encoded[2041];
+        ~Sensitive() { rut_crypto_clear_v1(this, sizeof(*this)); }
+    } scratch;
+    json::Writer form{scratch.userinfo, sizeof(scratch.userinfo)};
+    const auto kComponent = [&](Str value) {
+        constexpr char kHex[] = "0123456789ABCDEF";
+        for (u32 i = 0; i < value.len; ++i) {
+            const auto kByte = static_cast<u8>(value.ptr[i]);
+            if ((kByte >= 'a' && kByte <= 'z') || (kByte >= 'A' && kByte <= 'Z') ||
+                (kByte >= '0' && kByte <= '9') || kByte == '*' || kByte == '-' || kByte == '.' ||
+                kByte == '_') {
+                form.put(static_cast<char>(kByte));
+            } else if (kByte == ' ') {
+                form.put('+');
+            } else {
+                form.put('%');
+                form.put(kHex[kByte >> 4]);
+                form.put(kHex[kByte & 15]);
+            }
+        }
+    };
+    kComponent(client_id);
+    form.put(':');
+    kComponent(client_secret);
+    if (!form.ok) return false;
+    u32 encoded_length = 0;
+    if (!rut_crypto_base64_encode_v1(reinterpret_cast<const u8*>(form.data),
+                                     form.len,
+                                     scratch.encoded,
+                                     sizeof(scratch.encoded),
+                                     &encoded_length) ||
+        !output.ok || output.len > output.cap || encoded_length + 6 > output.cap - output.len)
+        return false;
+    output.text(lit_str("Basic "));
+    output.text({reinterpret_cast<const char*>(scratch.encoded), encoded_length});
+    return output.ok;
+}
 
 bool oauth_introspection_request(Str token, Str service_authorization, json::Writer& output) {
     if (token.len > 1024 || !bearer_key_valid(token) ||

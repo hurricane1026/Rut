@@ -48288,3 +48288,45 @@ TEST(frontend, upstream_weights_reject_invalid_shapes_and_integer_overflow) {
     REQUIRE(tokens);
     CHECK_FALSE(parse_file_heap(tokens.value()));
 }
+
+TEST(frontend, oauth_client_basic_authorization_optional_string_and_shadowing) {
+    const Str valid[] = {lit_str(R"(route GET "/" {
+            guard let header = oauthClientBasicAuthorization("client", "secret") else { return 503 }
+            let fallback = oauthClientBasicAuthorization("", "secret").or("fallback")
+            let combined = header + fallback
+            return response(200, body: combined)
+        })"),
+                         lit_str(R"(func oauthClientBasicAuthorization(_ x: i32) -> i32 => x
+            route GET "/" { if oauthClientBasicAuthorization(1) == 1 { return 200 } else { return 500 } })")};
+    for (Str source : valid) {
+        auto tokens = lex(source);
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+    const Str invalid[] = {
+        lit_str(R"(route GET "/" { let x = oauthClientBasicAuthorization("client") return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientBasicAuthorization("client", "secret", "extra") return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientBasicAuthorization(1, "secret") return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientBasicAuthorization("client", true) return 204 })"),
+        lit_str(
+            R"(route GET "/" { let x = oauthClientBasicAuthorization(req.header("X-Client"), "secret") return 204 })")};
+    for (Str source : invalid) {
+        auto tokens = lex(source);
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}

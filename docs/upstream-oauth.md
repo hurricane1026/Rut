@@ -15,8 +15,9 @@ The configured field must begin with canonical `Basic ` and contain a payload.
 JSON encoding escapes it safely; the existing callout validator rejects unsafe
 HTTP header bytes or exceeded storage bounds before network I/O. The AS validates
 the actual credential. Malformed configuration/construction fails with 503.
-Provision the Basic value using OAuth's client-authentication encoding rules;
-the library neither accepts raw client secrets nor implements their provisioning.
+Existing pre-encoded Basic entry points remain available. The raw configured
+credential helper below constructs the header using OAuth client-authentication
+encoding rules.
 
 `TOKEN_ENDPOINT` fixes the IPv4 address, HTTPS server identity, CA and token path.
 The caller cannot choose these through request headers, URL or body. TLS
@@ -26,6 +27,57 @@ The default scope must be configured for this client at the AS: this slice omits
 the optional request scope. For an explicit scope list, use the scoped helper below.
 A single HTTPS resource indicator is supported as described below. Provider-specific
 `audience` parameters and token exchange remain outside this profile.
+
+## Raw configured client credentials
+
+`oauthClientBasicAuthorization(clientId: str, clientSecret: str) -> str?` constructs
+one Basic header value from trusted configuration. The source wrapper
+`oauth_client.basicAuthorization(clientId, clientSecret)` returns that value or
+responds 503 before contacting the AS. It accepts 1–256 bytes per component from
+ASCII space through `~`. Empty values, NUL, controls, DEL and non-ASCII bytes fail.
+
+Each component is independently form encoded. Letters, digits, `*`, `-`, `.`,
+and `_` remain literal. Spaces become `+`. All other accepted bytes use uppercase
+percent escapes, including colon, plus, percent and tilde. The encoded components
+are joined with one colon, then standard padded Base64 and the `Basic ` prefix
+are applied. This follows [RFC 6749 client password authentication](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1)
+and [its form encoding rules](https://www.rfc-editor.org/rfc/rfc6749.html#appendix-B)
+within the stated ASCII bounds.
+
+Combined encoded userinfo is limited to 1530 bytes. The complete header is at
+most 2046 bytes and fits the existing 2048-byte service-authorization bound.
+Inputs at their individual limits can exceed the combined bound and return nil.
+Sensitive intermediate buffers are cleared on every return. Failure publishes no
+partial output. The Rut/JIT result is owned by the request arena and remains valid
+through later builtin calls and network yields. This primitive uses the existing
+crypto encoder because the source language has no callable Base64 or OAuth client
+component encoder. It adds no keyword, dependency or generic per-request buffer.
+
+For configured `TOKEN_CLIENT_ID` and `TOKEN_CLIENT_SECRET`, an authenticated route
+can use the generated value with the existing default-scope request builder:
+
+```rut
+let serviceAuthorization = oauth_client.basicAuthorization(env("TOKEN_CLIENT_ID"), env("TOKEN_CLIENT_SECRET"))
+let message = oauth_client.clientCredentials(serviceAuthorization)
+let pending = httpCall(env("TOKEN_ENDPOINT"), message, 1000)
+guard let reply = pending else { return 503 }
+let authorization = oauth_client.authorization(reply, "reports:read")
+match authorization.isEmpty {
+    false => {
+        req.set("Authorization", authorization)
+        return forward(backend, load_balance: .roundRobin)
+    }
+    _ => { return 503 }
+}
+```
+
+The complete [raw client example](../examples/upstream-oauth-client-basic.rut)
+includes caller authentication and the fixed upstream. The AS supplies default
+scopes. The generated header also composes with the existing explicit-scope and
+resource helpers. Client ID/secret are not added to the request body and are not
+selected from downstream headers. The downstream receives only the upstream
+result. This is confidential-client Basic construction, with no public-client
+fallback, credential provisioning or alternative endpoint authentication method.
 
 ## Explicit configured scopes
 
@@ -156,7 +208,12 @@ enforcement, grant/service headers; strict token,
 expiry, scope and error fields; duplicate JSON/Authorization; missing caller
 credentials; wrong TLS identity; AS denial/outage/redirect/truncation; unsafe
 configuration; timeout; disconnected callers; fresh concurrent tokens and no
-secret logging or implicit token-endpoint response propagation. Unavailable
+secret logging or implicit token-endpoint response propagation.
+`test_oauth_client_basic_epoll` and `test_oauth_client_basic_io_uring` cover raw
+configured Basic with independent AS decoding of both form components. They verify
+header ownership after HTTPS yields and another constructor call, and reject invalid
+configuration before AS contact. Unit and compiler/JIT tests cover exact bounds, padding,
+caller-output aliases, optional results and malformed RIR shapes. Unavailable
 io_uring is explicitly skipped with code 77. The fixture implements this protocol
 profile, not a full OAuth provider or a persistent authorization server.
 

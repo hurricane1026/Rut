@@ -3083,7 +3083,19 @@ or replace audience/scope checks. See
 
 ### Upstream OAuth client credentials
 
-Import `middleware/oauth_client.rut`. `oauth_client.clientCredentials(auth)`
+Import `middleware/oauth_client.rut`.
+`oauthClientBasicAuthorization(clientId: str, clientSecret: str) -> str?` accepts
+trusted raw configured ASCII credentials. Each is 1–256 bytes from space through
+`~`. It form encodes each component independently with spaces as `+` and literal
+alphanumeric/`* - . _`, joins them with one colon and uses standard padded Base64
+with a `Basic ` prefix. Combined encoded userinfo is limited to 1530 bytes and the
+header to 2046 bytes. Invalid input or capacity returns nil. The source wrapper
+`oauth_client.basicAuthorization` responds 503 on failure before AS contact.
+Results are request-owned through later builtin calls and network yields, and
+sensitive intermediates are cleared. See [raw client credentials](upstream-oauth.md#raw-configured-client-credentials)
+and the [runnable example](../examples/upstream-oauth-client-basic.rut).
+
+`oauth_client.clientCredentials(auth)`
 constructs a `grant_type=client_credentials` form POST using trusted configured
 Basic service authorization and the AS's default scope. Bind and unwrap its
 `httpCall` result, then `oauth_client.authorization(reply, requiredScope)` returns

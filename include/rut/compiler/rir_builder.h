@@ -1159,7 +1159,8 @@ struct Builder {
             op == static_cast<u32>(json::Op::OauthTokenExchangeRequest);
         const bool kIntrospectionRequest =
             op == static_cast<u32>(json::Op::OauthIntrospectionRequest) ||
-            op == static_cast<u32>(json::Op::OauthClientCredentialsRequest) || kResource;
+            op == static_cast<u32>(json::Op::OauthClientCredentialsRequest) ||
+            op == static_cast<u32>(json::Op::OauthClientBasicAuthorization) || kResource;
         const bool kIntrospectionValid = op == static_cast<u32>(json::Op::OauthIntrospectionValid);
         if (kIntrospectionRequest || kIntrospectionValid) {
             if (count != (kResource ? 3u : 2u) || !args || !val_has_type(args[0], TypeKind::Str) ||

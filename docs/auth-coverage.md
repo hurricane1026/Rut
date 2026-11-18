@@ -844,6 +844,19 @@ for syntax and rollout semantics.
 
 
 
+## Configured OAuth client Basic construction
+
+`oauthClientBasicAuthorization` and `oauth_client.basicAuthorization` construct
+a bounded Basic header from raw configured ASCII client ID/secret. Components
+are independently form encoded before colon joining and padded Base64. Each input
+is 1–256 bytes, combined encoded userinfo is at most 1530 bytes, and output is at
+most 2046 bytes. Invalid configuration fails before AS contact. Request-owned
+results survive subsequent builtins and HTTPS yields, with sensitive intermediates
+cleared. Existing pre-encoded APIs remain supported. Native HTTP/1 and HTTP/2
+fixtures on both Linux backends independently decode the AS credential and check
+caller isolation and no downstream credential propagation. See [the contract](upstream-oauth.md#raw-configured-client-credentials).
+Credential provisioning and other endpoint authentication methods remain open.
+
 ## Bounded remote JWKS refresh
 
 Compiled RS256 and ES256 policies accept a trusted `remoteJwks` endpoint with

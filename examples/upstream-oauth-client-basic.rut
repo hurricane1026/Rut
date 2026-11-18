@@ -1,0 +1,24 @@
+// TOKEN_CLIENT_ID and TOKEN_CLIENT_SECRET are trusted raw OAuth client credentials.
+// TOKEN_ENDPOINT fixes the verified HTTPS AS endpoint. The AS supplies default scopes.
+// DOWNSTREAM_KEY authenticates callers separately. Use TLS for client traffic.
+import "middleware/oauth_client.rut"
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+route GET "/raw-client-reports" {
+    guard bearerMatches(req.authorization.or(""), env("DOWNSTREAM_KEY")) else {
+        return response(401, headers: {"WWW-Authenticate": "Bearer"})
+    }
+    let serviceAuthorization = oauth_client.basicAuthorization(env("TOKEN_CLIENT_ID"), env("TOKEN_CLIENT_SECRET"))
+    let message = oauth_client.clientCredentials(serviceAuthorization)
+    let pending = httpCall(env("TOKEN_ENDPOINT"), message, 1000)
+    guard let reply = pending else { return 503 }
+    let authorization = oauth_client.authorization(reply, "reports:read")
+    match authorization.isEmpty {
+        false => {
+            req.set("Authorization", authorization)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        _ => { return 503 }
+    }
+}

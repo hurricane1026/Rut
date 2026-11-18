@@ -4,6 +4,8 @@
 #include "rut/runtime/oauth_introspection.h"
 #include "test.h"
 
+#include <string.h>
+
 using namespace rut;
 
 TEST(jwt_claims, required_claims_and_time_boundaries) {
@@ -937,4 +939,79 @@ TEST(jwt_claims, any_scope_bounds_and_scratch_aliases) {
     CHECK(jwt_has_any_scope(
         scratch, lit_str(R"({"scope":"read write"})"), {scratch.scratch, policy.len}));
     CHECK(!jwt_has_any_scope(scratch, lit_str(R"({"scope":"read write"})"), lit_str("reader")));
+}
+
+TEST(oauth_client, basic_authorization_encodes_components_before_base64) {
+    const struct {
+        Str id;
+        Str secret;
+        Str expected;
+    } cases[] = {{lit_str("s6BhdRkqt3"),
+                  lit_str("7Fjfp0ZBr1KtDRbnfVdmIw"),
+                  lit_str("Basic czZCaGRSa3F0Mzo3RmpmcDBaQnIxS3REUmJuZlZkbUl3")},
+                 {lit_str("id: +%~*"),
+                  lit_str("secret:/+ %&="),
+                  lit_str("Basic aWQlM0ErJTJCJTI1JTdFKjpzZWNyZXQlM0ElMkYlMkIrJTI1JTI2JTNE")},
+                 {lit_str("a"), lit_str("b"), lit_str("Basic YTpi")},
+                 {lit_str("aa"), lit_str("b"), lit_str("Basic YWE6Yg==")},
+                 {lit_str("aaa"), lit_str("b"), lit_str("Basic YWFhOmI=")}};
+    for (const auto& item : cases) {
+        char bytes[2048];
+        json::Writer output{bytes, sizeof(bytes)};
+        REQUIRE(oauth_client_basic_authorization(item.id, item.secret, output));
+        CHECK((Str{bytes, output.len}.eq(item.expected)));
+    }
+    char alias[2048]{};
+    memcpy(alias, "id: +%~*", 8);
+    memcpy(alias + 64, "secret:/+ %&=", 13);
+    json::Writer overlapping{alias, sizeof(alias)};
+    REQUIRE(oauth_client_basic_authorization({alias, 8}, {alias + 64, 13}, overlapping));
+    CHECK((Str{alias, overlapping.len}.eq(cases[1].expected)));
+}
+
+TEST(oauth_client, basic_authorization_bounds_and_failure_leave_output_unchanged) {
+    char bytes[2052];
+    memset(bytes, 'z', sizeof(bytes));
+    const Str invalid[] = {Str{},
+                           lit_str(""),
+                           {nullptr, 1},
+                           lit_str("bad\r\nvalue"),
+                           lit_str("bad\tvalue"),
+                           lit_str("bad\0value"),
+                           lit_str("\x7f"),
+                           lit_str("\xc3\xa9")};
+    for (Str value : invalid) {
+        json::Writer output{bytes + 1, 2048};
+        CHECK(!oauth_client_basic_authorization(value, lit_str("secret"), output));
+        CHECK_EQ(output.len, 0u);
+        CHECK(!oauth_client_basic_authorization(lit_str("client"), value, output));
+        CHECK_EQ(output.len, 0u);
+        CHECK(bytes[0] == 'z' && bytes[1] == 'z' && bytes[2049] == 'z');
+    }
+    char plain[257];
+    memset(plain, 'a', sizeof(plain));
+    json::Writer maximum_plain{bytes + 1, 2048};
+    CHECK(oauth_client_basic_authorization({plain, 256}, {plain, 256}, maximum_plain));
+    CHECK_EQ(maximum_plain.len, 690u);
+    json::Writer overbound{bytes, sizeof(bytes)};
+    CHECK(!oauth_client_basic_authorization({plain, 257}, lit_str("b"), overbound));
+    CHECK_EQ(overbound.len, 0u);
+    char id[256], secret[256];
+    memset(id, '%', sizeof(id));
+    memset(secret, '%', sizeof(secret));
+    secret[253] = secret[254] = secret[255] = 'a';
+    json::Writer encoded_limit{bytes, 2048};
+    REQUIRE(oauth_client_basic_authorization({id, 256}, {secret, 255}, encoded_limit));
+    CHECK_EQ(encoded_limit.len, 2046u);
+    json::Writer encoded_overflow{bytes, 2048};
+    CHECK(!oauth_client_basic_authorization({id, 256}, {secret, 256}, encoded_overflow));
+    CHECK_EQ(encoded_overflow.len, 0u);
+    memset(secret, '%', sizeof(secret));
+    CHECK(!oauth_client_basic_authorization({id, 256}, {secret, 256}, encoded_overflow));
+    memset(bytes, 'z', sizeof(bytes));
+    json::Writer too_small{bytes + 1, 8};
+    too_small.text(lit_str("old"));
+    CHECK(!oauth_client_basic_authorization(lit_str("a"), lit_str("b"), too_small));
+    CHECK_EQ(too_small.len, 3u);
+    CHECK(memcmp(bytes + 1, "oldzzzzz", 8) == 0 && bytes[0] == 'z' && bytes[9] == 'z');
 }

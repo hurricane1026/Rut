@@ -14422,6 +14422,31 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return out;
     }
 
+    if (expr.name.eq(lit_str("oauthClientBasicAuthorization")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 2)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+        HirExpr values[2]{};
+        for (u32 i = 0; i < 2; ++i) {
+            if (!expr.args[i])
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            auto value = analyze_builtin_arg(*expr.args[i]);
+            if (!value) return core::make_unexpected(value.error());
+            if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, expr.args[i]->span, expr.name);
+            values[i] = value.value();
+        }
+        return make_json_op(json::Op::OauthClientBasicAuthorization,
+                            HirTypeKind::Str,
+                            true,
+                            &values[0],
+                            &values[1],
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
     if ((expr.name.eq(lit_str("oauthIntrospectionRequest")) ||
          expr.name.eq(lit_str("oauthIntrospectionValid")) ||
          expr.name.eq(lit_str("oauthClientCredentialsRequest")) ||
