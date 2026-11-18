@@ -182,6 +182,49 @@ u16 read16(const u8* data) {
 Str ctext(const char* text) {
     return {text, static_cast<u32>(strlen(text))};
 }
+// Only previously decoded label boundaries are legal compression targets. This
+// cold JWKS profile intentionally rejects arbitrary DNS packet offsets.
+bool jwks_dns_name(
+    const u8* packet, u32 length, u32& offset, bool (&known)[512], char (&out)[254]) {
+    u32 at = offset, used = 0, jumps = 0;
+    bool jumped = false;
+    for (u32 labels = 0; labels < 128; ++labels) {
+        if (at >= length) return false;
+        const u32 start = at;
+        const u8 count = packet[at++];
+        if ((count & 0xc0) == 0xc0) {
+            if (at >= length || ++jumps > 16) return false;
+            const u32 target = ((count & 63u) << 8) | packet[at++];
+            if (target < 12 || target >= start || !known[target]) return false;
+            known[start] = true;
+            if (!jumped) offset = at;
+            jumped = true;
+            at = target;
+            continue;
+        }
+        if (count & 0xc0) return false;
+        if (!count) {
+            if (!used) return false;
+            known[start] = true;
+            if (!jumped) offset = at;
+            out[used] = 0;
+            return true;
+        }
+        if (at + count > length || used + count + (used ? 1u : 0u) > 253 || packet[at] == '-' ||
+            packet[at + count - 1] == '-')
+            return false;
+        if (used) out[used++] = '.';
+        for (u32 i = 0; i < count; ++i) {
+            const u8 byte = packet[at++];
+            const char value = static_cast<char>(byte >= 'A' && byte <= 'Z' ? byte + 32 : byte);
+            if ((value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '-')
+                return false;
+            out[used++] = value;
+        }
+        known[start] = true;
+    }
+    return false;
+}
 }  // namespace
 
 bool jwks_discovery_valid(json::Document& document, Str body, const RemoteJwks& configuration) {
@@ -234,33 +277,80 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
         return false;
     const u32 answers = read16(bytes + 6);
     if (!answers || answers > 8) return false;
+    bool boundaries[512]{};
+    char current[254]{};
+    u32 question_end = 12;
+    if (!jwks_dns_name(bytes, packet.len, question_end, boundaries, current) ||
+        question_end + 4 != query.len || read16(bytes + question_end) != 1 ||
+        read16(bytes + question_end + 2) != 1)
+        return false;
+    struct Record {
+        char owner[254]{};
+        char target[254]{};
+        char address[16]{};
+        u16 type = 0;
+        bool used = false;
+    };
+    Record records[8]{};
     u32 offset = query.len;
     for (u32 i = 0; i < answers; ++i) {
-        // This A-only profile permits the echoed owner or compression to that
-        // exact question. It never follows CNAME, arbitrary pointers or glue.
-        if (packet.len - offset >= 2 && bytes[offset] == 0xc0 && bytes[offset + 1] == 12)
-            offset += 2;
-        else {
-            const u32 name_length = query.len - 16;
-            if (packet.len - offset < name_length ||
-                memcmp(packet.ptr + offset, query.ptr + 12, name_length) != 0)
-                return false;
-            offset += name_length;
-        }
-        if (packet.len - offset < 14 || read16(bytes + offset) != 1 ||
-            read16(bytes + offset + 2) != 1 || read16(bytes + offset + 8) != 4 ||
-            !(bytes[offset + 4] || bytes[offset + 5] || bytes[offset + 6] || bytes[offset + 7]))
+        auto& record = records[i];
+        if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
+            packet.len - offset < 10)
             return false;
-        char candidate[16]{};
-        if (!inet_ntop(AF_INET, bytes + offset + 10, candidate, sizeof(candidate))) return false;
-        bool allowed = false;
-        for (u32 n = 0; n < configuration.allowed_count; ++n)
-            if (ctext(candidate).eq(ctext(configuration.allowed_addresses[n]))) allowed = true;
-        if (!allowed) return false;
-        if (!i) __builtin_memcpy(address, candidate, sizeof(candidate));
-        offset += 14;
+        record.type = read16(bytes + offset);
+        const u32 ttl =
+            (static_cast<u32>(read16(bytes + offset + 4)) << 16) | read16(bytes + offset + 6);
+        const u32 size = read16(bytes + offset + 8);
+        if (read16(bytes + offset + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
+        offset += 10;
+        if (size > packet.len - offset) return false;
+        const u32 end = offset + size;
+        if (record.type == 5) {
+            if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.target) ||
+                offset != end)
+                return false;
+        } else if (record.type == 1) {
+            if (size != 4 ||
+                !inet_ntop(AF_INET, bytes + offset, record.address, sizeof(record.address)))
+                return false;
+            bool allowed = false;
+            for (u32 n = 0; n < configuration.allowed_count; ++n)
+                allowed |= ctext(record.address).eq(ctext(configuration.allowed_addresses[n]));
+            if (!allowed) return false;
+            offset = end;
+        } else {
+            return false;
+        }
     }
-    return offset == packet.len;
+    if (offset != packet.len) return false;
+    for (u32 depth = 0; depth <= 4; ++depth) {
+        u32 alias = answers, addresses = 0;
+        char selected[16]{};
+        for (u32 i = 0; i < answers; ++i) {
+            auto& record = records[i];
+            if (strcmp(record.owner, current) != 0) continue;
+            if (record.used) return false;
+            record.used = true;
+            if (record.type == 5) {
+                if (alias != answers) return false;
+                alias = i;
+            } else {
+                if (!addresses) __builtin_memcpy(selected, record.address, sizeof(selected));
+                ++addresses;
+            }
+        }
+        if (addresses) {
+            if (alias != answers) return false;
+            for (u32 i = 0; i < answers; ++i)
+                if (!records[i].used) return false;
+            __builtin_memcpy(address, selected, sizeof(address));
+            return true;
+        }
+        if (alias == answers || depth == 4) return false;
+        __builtin_memcpy(current, records[alias].target, sizeof(current));
+    }
+    return false;
 }
 
 JwksFetch::~JwksFetch() {

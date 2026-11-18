@@ -2586,7 +2586,7 @@ mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a literal IPv4;
 there is no blocking DNS, redirect following or token-driven fetch. Optional
-`dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A-only DNS; optional
+`dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A/CNAME DNS; optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
 validation. Neither profile accepts request-selected destinations. See
 [JWKS DNS/discovery](jwks-discovery.md) for schema, ownership and failure limits.
@@ -2733,7 +2733,8 @@ returns 403. `requireScope` accepts one RFC
 an RFC 9068-inspired resource profile, not full OAuth/OIDC conformance. See
 [the access-token contract](jwt-access-profile.md).
 The underlying verifier may use static keys or the trusted bounded remote JWKS
-extension, including optional A-only DNS and exact issuer/JWKS-URI discovery.
+extension, including optional bounded A/CNAME DNS and exact issuer/JWKS-URI
+discovery.
 Remote mode still requires a successful authenticated fetch before accepting
 tokens; destination fields are never taken from a request. See
 [remote JWKS discovery](jwks-discovery.md) and the runnable [RS256](../examples/jwt-access-remote-rs256-auth.rut)/[ES256](../examples/jwt-access-remote-es256-auth.rut)
