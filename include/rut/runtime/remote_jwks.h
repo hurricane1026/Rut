@@ -17,6 +17,7 @@ struct RemoteJwks {
     char discovery_issuer[1024]{};
     u32 refresh_seconds = 0;
     u32 retry_seconds = 0;
+    bool conditional_requests = false;
     u32 max_age_seconds = 0;
     u32 timeout_seconds = 0;
     bool enabled() const { return refresh_seconds != 0; }
@@ -28,6 +29,17 @@ struct JwksDnsAddresses {
     u32 count = 0;
 };
 
+// Owned validator bound to the accepted key representation and selected IPv4.
+struct JwksValidator {
+    char tag[129]{};
+    char address[16]{};
+    void clear();
+    bool bind(Str entity_tag, Str selected_address);
+    Str matching(Str selected_address) const;
+};
+bool jwks_response_etag(const ParsedResponse& response, Str& entity_tag);
+bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds);
+
 // Shared cold, nonblocking resolver/discovery/JWKS lifecycle. Only configured
 // addresses and URI are admitted; token metadata never selects a destination.
 class JwksFetch {
@@ -35,14 +47,23 @@ public:
     using State = HttpsFetch::State;
     ~JwksFetch();
     bool init(const RemoteJwks& configuration);
-    bool start(u64 monotonic_ms, u32 timeout_ms);
+    bool start(u64 monotonic_ms,
+               u32 timeout_ms,
+               const JwksValidator* validator = nullptr,
+               u64 validator_deadline = 0);
     void advance(u64 monotonic_ms);
     void cancel();
     State state() const { return state_; }
+    bool not_modified() const { return state_ == State::Done && keys_.status() == 304; }
+    const JwksValidator& validator() const { return response_validator_; }
     Str body() const { return state_ == State::Done ? keys_.body() : Str{}; }
 
 private:
     RemoteJwks configuration_{};
+    JwksValidator request_validator_{};
+    JwksValidator response_validator_{};
+    bool sent_validator_ = false;
+    u64 validator_deadline_ = 0;
     HttpsFetch keys_;
     HttpsFetch discovery_;
     State state_ = State::Idle;

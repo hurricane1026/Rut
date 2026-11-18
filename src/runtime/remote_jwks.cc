@@ -1,5 +1,6 @@
 #include "rut/runtime/remote_jwks.h"
 
+#include "rut/common/http_header_validation.h"
 #include "rut/platform/socket.h"
 
 #include <arpa/inet.h>
@@ -86,6 +87,11 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
                     return false;
             }
             fields |= 256;
+            continue;
+        }
+        if (kKey.eq(lit_str("conditionalRequests"))) {
+            if (document.nodes[entry].kind != json::Kind::Boolean) return false;
+            next.conditional_requests = document.raw(entry).eq(lit_str("true"));
             continue;
         }
         char* target = nullptr;
@@ -182,6 +188,43 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
     const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
     return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
+}
+
+void JwksValidator::clear() {
+    *this = {};
+}
+bool JwksValidator::bind(Str entity_tag, Str selected_address) {
+    clear();
+    if (!strong_etag_valid(entity_tag) || !selected_address.ptr || !selected_address.len ||
+        selected_address.len >= sizeof(address))
+        return false;
+    __builtin_memcpy(address, selected_address.ptr, selected_address.len);
+    in_addr parsed{};
+    if (strlen(address) != selected_address.len || inet_pton(AF_INET, address, &parsed) != 1) {
+        clear();
+        return false;
+    }
+    __builtin_memcpy(tag, entity_tag.ptr, entity_tag.len);
+    return true;
+}
+Str JwksValidator::matching(Str selected_address) const {
+    if (!tag[0] || !Str{address, static_cast<u32>(strlen(address))}.eq(selected_address)) return {};
+    return {tag, static_cast<u32>(strlen(tag))};
+}
+bool jwks_response_etag(const ParsedResponse& response, Str& entity_tag) {
+    entity_tag = {};
+    u32 count = 0;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const auto& kHeader = response.headers[i];
+        if (!http_header_name_eq_ci(kHeader.name.ptr, kHeader.name.len, "ETag", 4)) continue;
+        if (++count > 1 || !strong_etag_valid(kHeader.value)) return false;
+        entity_tag = kHeader.value;
+    }
+    return true;
+}
+bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
+    return now && last_success && now >= last_success &&
+           now - last_success < static_cast<u64>(max_age_seconds) * 1000;
 }
 
 namespace {
@@ -393,6 +436,10 @@ void JwksFetch::cancel() {
     discovery_.cancel();
     addresses_.count = 0;
     address_index_ = 0;
+    request_validator_.clear();
+    response_validator_.clear();
+    sent_validator_ = false;
+    validator_deadline_ = 0;
     state_ = State::Cancelled;
 }
 bool JwksFetch::fail() {
@@ -414,13 +461,30 @@ bool JwksFetch::can_try_next_address(const HttpsFetch& fetch) const {
     return fetch.connect_failed() && address_index_ + 1 < addresses_.count;
 }
 bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
+    if (&fetch == &keys_ && configuration_.conditional_requests) {
+        const Str kAddress = addresses_.count ? ctext(addresses_.values[address_index_])
+                                              : ctext(configuration_.endpoint.address);
+        const Str kTag = address_index_ == 0 && now < validator_deadline_
+                             ? request_validator_.matching(kAddress)
+                             : Str{};
+        if (!keys_.set_jwks_condition(kTag)) return fail();
+        sent_validator_ = kTag.len != 0;
+    }
     // A synchronous connect error uses the same next-address path as SO_ERROR.
     return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
            can_try_next_address(fetch) || fail();
 }
-bool JwksFetch::start(u64 now, u32 timeout_ms) {
+bool JwksFetch::start(u64 now,
+                      u32 timeout_ms,
+                      const JwksValidator* validator,
+                      u64 validator_deadline) {
     if (!initialized_ || state_ == State::Busy || !now || !timeout_ms) return false;
+    const JwksValidator kSaved = validator ? *validator : JwksValidator{};
     cancel();
+    if (configuration_.conditional_requests && validator) {
+        request_validator_ = kSaved;
+        validator_deadline_ = validator_deadline;
+    }
     started_ = now;
     timeout_ = timeout_ms;
     state_ = State::Busy;
@@ -500,7 +564,29 @@ void JwksFetch::advance(u64 now) {
         discovery_.cancel();
         discovering_ = false;
         (void)start_http(keys_, now);
-    } else
+    } else {
+        if (configuration_.conditional_requests) {
+            ParsedResponse response{};
+            Str tag{};
+            if (!keys_.headers(response) || !jwks_response_etag(response, tag)) {
+                (void)fail();
+                return;
+            }
+            if (keys_.status() == 304) {
+                if (!sent_validator_ || !tag.eq(ctext(request_validator_.tag))) {
+                    (void)fail();
+                    return;
+                }
+            } else if (tag.len) {
+                const Str kAddress = addresses_.count ? ctext(addresses_.values[address_index_])
+                                                      : ctext(configuration_.endpoint.address);
+                if (!response_validator_.bind(tag, kAddress)) {
+                    (void)fail();
+                    return;
+                }
+            }
+        }
         state_ = State::Done;
+    }
 }
 }  // namespace rut

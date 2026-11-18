@@ -859,7 +859,14 @@ failure delay from successful refresh cadence for both algorithms. All failures
 wait from completion, including slow timeouts and import failures; successful
 empty sets use the refresh interval. Retry never renews cache age. Fixed-endpoint
 native fixtures measure failure spacing and HTTP/1.1/HTTP/2 expiry and recovery.
-This remains a bounded foundation; #1077 is open.
+Optional Boolean `conditionalRequests` adds same-address, initial-candidate strong
+ETag revalidation. Authenticated matching 304s retain keys/empty state and renew
+age only before hard expiry. Cold/expired caches require full 200. Duplicate,
+weak, malformed or mismatching validators fail closed. Validators commit with
+accepted keys and never change issuer, TLS or kid trust. Native conditional
+RS256/ES256 tests cover both Linux backends, HTTP/1.1/HTTP/2 verification, delayed
+expiry and unconditional address-change/failover. This remains a bounded
+foundation. #1077 is open.
 
 The reusable bounded HTTPS state machine and existing HTTP/chunk parsers accept
 200 JSON bodies with strict framing, byte limits and authenticated transport.

@@ -1429,3 +1429,33 @@ TEST(https_fetch, jwks_discovery_rejects_mismatched_origin_and_uninitialized_fet
     CHECK(!partial.start(jwt_monotonic_ms(), 1000));
     CHECK_EQ(partial.state(), JwksFetch::State::Idle);
 }
+
+TEST(https_fetch, conditional_jwks_bodyless_profile_is_opt_in) {
+    const Str not_modified = lit_str(
+        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n"
+        "Content-Length: 100000\r\n\r\n");
+    BoundedJsonResponse normal, authorization, conditional;
+    authorization.reset(true);
+    conditional.reset_conditional_jwks();
+    CHECK(normal.append(not_modified) == BoundedJsonResponse::Result::Error);
+    CHECK(authorization.append(not_modified) == BoundedJsonResponse::Result::Error);
+    CHECK(conditional.append(not_modified) == BoundedJsonResponse::Result::Complete);
+    CHECK_EQ(conditional.status(), 304u);
+    CHECK(!conditional.body().len);
+    const Str invalid[] = {
+        lit_str("HTTP/1.1 304 Not Modified\r\n\r\nbody"),
+        lit_str("HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"),
+        lit_str("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n"),
+        lit_str("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+        lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")};
+    for (Str message : invalid) {
+        conditional.reset_conditional_jwks();
+        CHECK(conditional.append(message) == BoundedJsonResponse::Result::Error);
+    }
+    conditional.reset_conditional_jwks();
+    CHECK(conditional.append(lit_str("HTTP/1.1 304 Not Modified\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    conditional.reset();
+    CHECK(conditional.append(lit_str("HTTP/1.1 304 Not Modified\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Error);
+}

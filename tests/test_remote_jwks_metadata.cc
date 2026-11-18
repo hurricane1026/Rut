@@ -512,3 +512,121 @@ TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     CHECK_EQ(jwks_refresh_deadline(~u64{0} - 999, 1), ~u64{0});
     CHECK_EQ(jwks_refresh_deadline(~u64{0}, 3600), ~u64{0});
 }
+
+TEST(remote_jwks_metadata, conditional_requests_boolean_and_reset) {
+    const char* base =
+        "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\","
+        "\"ca\":\"ca.pem\",\"path\":\"/keys\",\"refreshSeconds\":1,"
+        "\"maxAgeSeconds\":3,\"timeoutSeconds\":1";
+    char bytes[1024];
+    json::Document document;
+    RemoteJwks configuration;
+    int length = snprintf(bytes, sizeof(bytes), "{%s}", base);
+    CHECK(document.parse({bytes, static_cast<u32>(length)}));
+    CHECK(configuration.load(document, 0));
+    CHECK(!configuration.conditional_requests);
+    const char* valid[] = {"true", "false"};
+    for (const char* value : valid) {
+        length = snprintf(bytes, sizeof(bytes), "{%s,\"conditionalRequests\":%s}", base, value);
+        CHECK(document.parse({bytes, static_cast<u32>(length)}));
+        CHECK(configuration.load(document, 0));
+        CHECK_EQ(configuration.conditional_requests, strcmp(value, "true") == 0);
+    }
+    const char* invalid[] = {"0", "1", "\"true\"", "null", "[]", "{}"};
+    for (const char* value : invalid) {
+        configuration.conditional_requests = true;
+        length = snprintf(bytes, sizeof(bytes), "{%s,\"conditionalRequests\":%s}", base, value);
+        CHECK(document.parse({bytes, static_cast<u32>(length)}));
+        CHECK(!configuration.load(document, 0));
+        CHECK(!configuration.conditional_requests);
+    }
+    length = snprintf(bytes,
+                      sizeof(bytes),
+                      "{%s,\"conditionalRequests\":true,\"conditionalRequests\":false}",
+                      base);
+    CHECK(!document.parse({bytes, static_cast<u32>(length)}));
+}
+
+TEST(remote_jwks_metadata, owned_strong_etag_address_binding_and_hard_expiry) {
+    CHECK(strong_etag_valid(lit_str("\"\"")));
+    CHECK(strong_etag_valid(lit_str("\"opaque,tag\\value\"")));
+    const Str invalid[] = {lit_str("W/\"weak\""),
+                           lit_str("w/\"weak\""),
+                           lit_str("unquoted"),
+                           lit_str("\"bad tag\""),
+                           lit_str("\"bad\ttag\""),
+                           lit_str("\"bad\"tag\""),
+                           lit_str("\"a\",\"b\""),
+                           lit_str("\"bad\r\ntag\""),
+                           lit_str("\"\xff\"")};
+    for (Str value : invalid) CHECK(!strong_etag_valid(value));
+    char limit[129]{};
+    memset(limit, 'a', sizeof(limit));
+    limit[0] = limit[127] = '"';
+    CHECK(strong_etag_valid({limit, 128}));
+    limit[127] = 'a';
+    limit[128] = '"';
+    CHECK(!strong_etag_valid({limit, 129}));
+    JwksValidator validator;
+    CHECK(!validator.matching(lit_str("192.0.2.1")).len);
+    char tag[] = "\"owned\"";
+    char address[] = "192.0.2.1";
+    CHECK(validator.bind({tag, 7}, {address, 9}));
+    tag[1] = 'x';
+    address[8] = '2';
+    CHECK(validator.matching(lit_str("192.0.2.1")).eq(lit_str("\"owned\"")));
+    CHECK(!validator.matching(lit_str("192.0.2.2")).len);
+    JwksValidator attempt = validator;
+    validator.clear();
+    CHECK(!validator.matching(lit_str("192.0.2.1")).len);
+    CHECK(attempt.matching(lit_str("192.0.2.1")).eq(lit_str("\"owned\"")));
+    CHECK(!attempt.bind(lit_str("W/\"bad\""), lit_str("192.0.2.1")));
+    CHECK(!attempt.tag[0]);
+    CHECK(!attempt.bind(lit_str("\"good\""), lit_str("invalid")));
+    CHECK(!attempt.tag[0] && !attempt.address[0]);
+    CHECK(jwks_cache_fresh(3999, 1000, 3));
+    CHECK(!jwks_cache_fresh(4000, 1000, 3));
+    CHECK(!jwks_cache_fresh(999, 1000, 3));
+    CHECK(!jwks_cache_fresh(0, 1000, 3));
+    CHECK(!jwks_cache_fresh(1000, 0, 3));
+    CHECK(jwks_cache_fresh(~u64{0} - 1, ~u64{0} - 2, 3));
+}
+
+TEST(remote_jwks_metadata, conditional_response_etag_is_unique_and_strong) {
+    const char* invalid[] = {"ETag: W/\"weak\"\r\n",
+                             "ETag: \"bad tag\"\r\n",
+                             "ETag: unquoted\r\n",
+                             "ETag: \"a\"\r\netag: \"a\"\r\n"};
+    for (const char* extra : invalid) {
+        char bytes[512];
+        const int length = snprintf(bytes,
+                                    sizeof(bytes),
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                    "Content-Length: 2\r\n%s\r\n{}",
+                                    extra);
+        BoundedJsonResponse response;
+        response.reset_conditional_jwks();
+        CHECK(response.append({bytes, static_cast<u32>(length)}) ==
+              BoundedJsonResponse::Result::Complete);
+        ParsedResponse headers{};
+        CHECK(response.headers(headers));
+        Str tag{};
+        CHECK(!jwks_response_etag(headers, tag));
+    }
+    BoundedJsonResponse response;
+    response.reset_conditional_jwks();
+    CHECK(response.append(lit_str("HTTP/1.1 304 Not Modified\r\neTaG: \"v1\"\r\n\r\n")) ==
+          BoundedJsonResponse::Result::Complete);
+    ParsedResponse headers{};
+    CHECK(response.headers(headers));
+    Str tag{};
+    CHECK(jwks_response_etag(headers, tag));
+    CHECK(tag.eq(lit_str("\"v1\"")));
+    response.reset_conditional_jwks();
+    CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                  "Content-Length: 2\r\n\r\n{}")) ==
+          BoundedJsonResponse::Result::Complete);
+    CHECK(response.headers(headers));
+    CHECK(jwks_response_etag(headers, tag));
+    CHECK(!tag.len);
+}

@@ -1109,6 +1109,13 @@ if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
                     --algorithm ${discovery_algorithm} --discovery-dns)
             set_tests_properties(test_jwks_discovery_${discovery_algorithm}_${jwks_backend} PROPERTIES
                 LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            add_test(NAME test_jwks_conditional_${discovery_algorithm}_${jwks_backend}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
+                    --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend}
+                    --algorithm ${discovery_algorithm} --discovery-dns --conditional)
+            set_tests_properties(test_jwks_conditional_${discovery_algorithm}_${jwks_backend} PROPERTIES
+                LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(access_algorithm RS256 ES256)
             string(TOLOWER ${access_algorithm} access_algorithm_lower)

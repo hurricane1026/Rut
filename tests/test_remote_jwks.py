@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--algorithm", choices=("RS256", "ES256"), default="RS256")
     parser.add_argument("--discovery-dns", action="store_true")
     parser.add_argument("--access-profile", action="store_true")
+    parser.add_argument("--conditional", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -37,7 +38,9 @@ def main():
     state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200,
              "requests": 0, "locals": [], "dnsRequests": 0, "attempts": [], "delay": 0,
              "hold": "cold" if args.access_profile else False,
-             "discovery": "valid", "dns": "valid"}
+             "discovery": "valid", "dns": "valid",
+             "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
+             "conditionalRequests": [], "discoveries": [], "discoveryDelay": 0}
     cold_release = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -45,7 +48,12 @@ def main():
 
         def do_GET(self):
             if self.path == "/.well-known/openid-configuration" and args.discovery_dns:
-                with lock: mode = state["discovery"]
+                with lock:
+                    mode = state["discovery"]
+                    discovery_delay = state["discoveryDelay"]
+                    state["discoveries"].append((self.headers.get("If-None-Match"), discovery_delay))
+                if discovery_delay:
+                    time.sleep(discovery_delay)
                 metadata = dict(issuer=fixture["first"]["issuer"],
                                 jwks_uri=f"https://localhost:{origin.server_port}/keys")
                 if mode == "issuer": metadata["issuer"] = "https://evil.example"
@@ -68,6 +76,29 @@ def main():
                 status, body, hold = state["status"], state["body"], state["hold"]
                 delay = state["delay"]
                 state["attempts"].append((time.monotonic(), status, delay))
+                tags = []
+                if args.conditional:
+                    mode, tag = state["conditionalMode"], state["etag"]
+                    incoming = self.headers.get("If-None-Match")
+                    if mode == "force304" or mode in ("missing304", "mismatch304", "weak304", "duplicate304"):
+                        status = 304
+                    elif mode == "auto" and status == 200 and tag is not None and incoming == tag:
+                        status = 304
+                    if tag is not None:
+                        tags = [tag]
+                    if mode in ("weak200", "weak304"):
+                        tags = ['W/"weak"']
+                    if mode in ("duplicate200", "duplicate304"):
+                        tags = [tag, tag]
+                    if mode == "missing304":
+                        tags = []
+                    if mode == "mismatch304":
+                        tags = ['"mismatch"']
+                    if status == 304:
+                        body = b""
+                    state["conditionalRequests"].append(dict(
+                        incoming=incoming, status=status, tag=tag, mode=mode,
+                        address=self.connection.getsockname()[0], delay=delay))
             if delay:
                 time.sleep(delay)
             if hold == "cold":
@@ -76,7 +107,10 @@ def main():
                 release_response.wait(timeout=5)
             try:
                 self.send_response(status)
-                self.send_header("Content-Type", "application/jwk-set+json")
+                if status != 304:
+                    self.send_header("Content-Type", "application/jwk-set+json")
+                for tag in tags:
+                    self.send_header("ETag", tag)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -151,7 +185,9 @@ def main():
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
-        retry_profile = not args.discovery_dns and not args.access_profile
+        if args.conditional:
+            policy["remoteJwks"].update(conditionalRequests=True, timeoutSeconds=5, retrySeconds=1)
+        retry_profile = not args.discovery_dns and not args.access_profile and not args.conditional
         if retry_profile:
             policy["remoteJwks"].update(retrySeconds=2, timeoutSeconds=2)
         if args.discovery_dns:
@@ -289,129 +325,263 @@ def main():
                     time.sleep(0.01)
                 raise AssertionError(f"JWKS request did not reach {target}; seen {state['locals']}")
 
-            if args.access_profile:
-                assert request(fixture["a"]) == 401, "remote access profile authenticated before cold fetch"
-                with lock: state["hold"] = False
-                cold_release.set()
-            wait_status(fixture["a"], 200)
-            if args.access_profile:
-                assert request(fixture["a"], with_body=True) == (200, b"alice")
-            if retry_profile:
-                def failure_attempts(delay, count, limit=8):
+            if args.conditional:
+                def observed(predicate, start=0, count=1, limit=12):
                     deadline = time.monotonic() + limit
                     while time.monotonic() < deadline:
                         with lock:
-                            times = [at for at, status, pause in state["attempts"]
-                                     if status == 503 and pause == delay]
-                        if len(times) >= count:
-                            return times
-                        time.sleep(.01)
-                    raise AssertionError(f"missing failed refresh attempts: {delay}, {count}, {times}")
+                            values = [item for item in state["conditionalRequests"][start:] if predicate(item)]
+                        if len(values) >= count:
+                            return values
+                        request(fixture["a"])
+                        time.sleep(.025)
+                    raise AssertionError(f"missing conditional observation: {values}")
 
-                publish(b"unavailable", 503)
-                immediate = failure_attempts(0, 2)
-                assert immediate[1] - immediate[0] >= 1.8, immediate
-                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                def marker():
+                    with lock:
+                        return len(state["conditionalRequests"])
+
+                def both(token, expected):
+                    assert request(token) == expected
+                    assert h2_request(port, "/", [("authorization", "Bearer " + token)])[0] == expected
+
+                def configure(tag, body, mode="auto"):
+                    with lock:
+                        state.update(etag=tag, body=body, status=200, conditionalMode=mode)
+
+                # A cold unsolicited304 cannot install even the configured initial keys.
+                observed(lambda item: item["status"] == 304)
+                both(fixture["a"], 401)
+                configure('"v1"', json.dumps(fixture["first"]["jwks"]).encode())
                 wait_status(fixture["a"], 200)
-                # Ensure recovery completed, rather than accepting an old fresh cache.
+                start = marker()
+                deadline = time.monotonic() + 4.2
+                while time.monotonic() < deadline:
+                    both(fixture["a"], 200)
+                    time.sleep(.1)
+                confirmations = observed(lambda item: item["status"] == 304, start, count=3)
+                assert all(item["incoming"] == '"v1"' for item in confirmations)
+
+                configure('"v2"', json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                both(fixture["a"], 401)
+                start = marker()
+                observed(lambda item: item["incoming"] == '"v2"' and item["status"] == 304, start)
+                configure('"empty"', b'{"keys":[]}')
+                wait_status(fixture["b"], 401)
+                start = marker()
+                observed(lambda item: item["incoming"] == '"empty"' and item["status"] == 304, start, count=3)
+                both(fixture["b"], 401)
+                configure('"v3"', json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+
+                # Bad200 metadata/body must not replace the active validator or keys.
+                invalid_key = json.loads(json.dumps(fixture["first"]["jwks"]))
+                invalid_key["keys"][0]["n" if args.algorithm == "RS256" else "x"] = "bad"
+                for mode, body in (("weak200", json.dumps(fixture["first"]["jwks"]).encode()),
+                                   ("duplicate200", json.dumps(fixture["first"]["jwks"]).encode()),
+                                   ("auto", b"{bad"),
+                                   ("auto", json.dumps(invalid_key).encode())):
+                    start = marker()
+                    configure('"uncommitted"', body, mode)
+                    attempts = observed(lambda item: item["tag"] == '"uncommitted"', start, count=2)
+                    assert attempts[0]["incoming"] == '"v3"', attempts
+                    assert all(item["incoming"] != '"uncommitted"' for item in attempts), attempts
+                    both(fixture["a"], 401)
+                    wait_status(fixture["b"], 401)
+                    configure('"v3"', json.dumps(fixture["second"]["jwks"]).encode())
+                    wait_status(fixture["b"], 200)
+                for mode in ("missing304", "mismatch304", "weak304", "duplicate304"):
+                    configure('"v3"', json.dumps(fixture["second"]["jwks"]).encode(), mode)
+                    wait_status(fixture["b"], 401)
+                    both(fixture["b"], 401)
+                    configure('"v3"', json.dumps(fixture["second"]["jwks"]).encode())
+                    wait_status(fixture["b"], 200)
+
+                # Missing ETag on an accepted200 clears the previously committed validator.
+                start = marker()
+                configure(None, json.dumps(fixture["second"]["jwks"]).encode())
+                observed(lambda item: item["tag"] is None, start)
+                unconditional = observed(lambda item: item["tag"] is None and item["incoming"] is None,
+                                          start, count=2)
+                assert all(item["status"] == 200 for item in unconditional)
+                configure('"v4"', json.dumps(fixture["second"]["jwks"]).encode())
+                start = marker()
+                observed(lambda item: item["incoming"] == '"v4"' and item["status"] == 304, start)
+
+                # An already-sent conditional request cannot renew age after hard expiry.
+                start = marker()
                 with lock:
-                    previous = state["requests"]
-                wait_for_origin_request(previous)
-                with lock:
-                    state["delay"] = 3
-                publish(b"unavailable", 503)
-                failure_attempts(3, 1)
-                wait_status(fixture["a"], 401)
-                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
-                delayed = failure_attempts(3, 2)
-                # timeoutSeconds=2 exceeds refreshSeconds=1: retries must wait
-                # two more seconds after timeout, not reconnect at completion.
-                assert delayed[1] - delayed[0] >= 3.8, delayed
+                    state["delay"] = 3.2
+                observed(lambda item: item["delay"] == 3.2 and item["incoming"] == '"v4"', start)
                 with lock:
                     state["delay"] = 0
-                publish(json.dumps(fixture["first"]["jwks"]).encode())
-                wait_status(fixture["a"], 200)
-                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
-            assert request(fixture["b"]) == 401
-            if args.access_profile:
-                assert request(fixture["badClient"]) == 403, "signed wrong client must be forbidden"
-                assert request(fixture["badScope"]) == 403, "signed wrong scope must be forbidden"
-                for name in ("badIat", "badJti", "badKid", "badType"):
-                    assert request(fixture[name]) == 401, f"{name} did not fail as invalid_token"
-            with lock:
-                requests_before_refresh = state["requests"]
-            publish(json.dumps(fixture["second"]["jwks"]).encode())
-            # No gateway request is made while the one-second refresh becomes
-            # due or while its TLS handshake/read advances on the idle shard.
-            wait_for_origin_request(requests_before_refresh)
-            time.sleep(0.1)
-            assert request(fixture["b"]) == 200, "idle refresh did not install the rotated key"
-            assert request(fixture["a"]) == 401, "replaced key still authenticates"
-            publish(b'{"keys":[]}')
-            wait_status(fixture["b"], 401)
-            publish(json.dumps(fixture["second"]["jwks"]).encode())
-            wait_status(fixture["b"], 200)
-            publish(b"unavailable", 503)
-            assert request(fixture["b"]) == 200, "fresh cache was discarded on outage"
-            wait_status(fixture["b"], 401)
-            publish(json.dumps(fixture["second"]["jwks"]).encode())
-            wait_status(fixture["b"], 200)
-            publish(b"{bad")
-            wait_status(fixture["b"], 401)
-            if args.discovery_dns:
-                publish(json.dumps(fixture["second"]["jwks"]).encode())
-                for kind, modes in [("discovery", ["issuer", "uri", "redirect"]),
-                                    ("dns", ["rebind", "timeout"])]:
-                    with lock: state[kind] = "valid"
+                wait_status(fixture["b"], 401)
+                both(fixture["b"], 401)
+                late = observed(lambda item: item["delay"] == 0 and item["incoming"] is None, start)
+                assert late[0]["status"] == 200
+                wait_status(fixture["b"], 200)
+
+                if args.discovery_dns:
+                    # DNS/discovery time consumes validator freshness before the keysGET.
+                    with lock:
+                        discovery_start = len(state["discoveries"])
+                        state["discoveryDelay"] = 3.2
+                    deadline = time.monotonic() + 8
+                    while True:
+                        with lock:
+                            delayed = any(delay == 3.2 for _, delay in state["discoveries"][discovery_start:])
+                        if delayed:
+                            break
+                        assert time.monotonic() < deadline
+                        request(fixture["b"])
+                        time.sleep(.025)
+                    start = marker()
+                    with lock:
+                        state["discoveryDelay"] = 0
+                    wait_status(fixture["b"], 401)
+                    item = observed(lambda item: True, start)[0]
+                    assert item["incoming"] is None, item
                     wait_status(fixture["b"], 200)
-                    for mode in modes:
-                        with lock: state[kind] = mode
-                        wait_status(fixture["b"], 401)
+                    # A changedIP and a failover onto the old boundIP both require a fullGET.
+                    for mode in ("move", "cname-failover"):
+                        start = marker()
+                        with lock:
+                            state["dns"] = mode
+                        item = observed(lambda item: item["address"] == "127.0.0.2", start)[0]
+                        assert item["incoming"] is None, item
+                        both(fixture["b"], 200)
+                        if mode == "move":
+                            # Commit the newIP's validator before failing over onto that sameIP.
+                            observed(lambda item: item["address"] == "127.0.0.2" and
+                                     item["incoming"] == '"v4"' and item["status"] == 304, start)
+                    with lock:
+                        assert all(tag is None for tag, _ in state["discoveries"])
+                        state["dns"] = "valid"
+            else:
+                if args.access_profile:
+                    assert request(fixture["a"]) == 401, "remote access profile authenticated before cold fetch"
+                    with lock: state["hold"] = False
+                    cold_release.set()
+                wait_status(fixture["a"], 200)
+                if args.access_profile:
+                    assert request(fixture["a"], with_body=True) == (200, b"alice")
+                if retry_profile:
+                    def failure_attempts(delay, count, limit=8):
+                        deadline = time.monotonic() + limit
+                        while time.monotonic() < deadline:
+                            with lock:
+                                times = [at for at, status, pause in state["attempts"]
+                                         if status == 503 and pause == delay]
+                            if len(times) >= count:
+                                return times
+                            time.sleep(.01)
+                        raise AssertionError(f"missing failed refresh attempts: {delay}, {count}, {times}")
+
+                    publish(b"unavailable", 503)
+                    immediate = failure_attempts(0, 2)
+                    assert immediate[1] - immediate[0] >= 1.8, immediate
+                    publish(json.dumps(fixture["first"]["jwks"]).encode())
+                    wait_status(fixture["a"], 200)
+                    # Ensure recovery completed, rather than accepting an old fresh cache.
+                    with lock:
+                        previous = state["requests"]
+                    wait_for_origin_request(previous)
+                    with lock:
+                        state["delay"] = 3
+                    publish(b"unavailable", 503)
+                    failure_attempts(3, 1)
+                    wait_status(fixture["a"], 401)
+                    assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                    delayed = failure_attempts(3, 2)
+                    # timeoutSeconds=2 exceeds refreshSeconds=1: retries must wait
+                    # two more seconds after timeout, not reconnect at completion.
+                    assert delayed[1] - delayed[0] >= 3.8, delayed
+                    with lock:
+                        state["delay"] = 0
+                    publish(json.dumps(fixture["first"]["jwks"]).encode())
+                    wait_status(fixture["a"], 200)
+                    assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
+                assert request(fixture["b"]) == 401
+                if args.access_profile:
+                    assert request(fixture["badClient"]) == 403, "signed wrong client must be forbidden"
+                    assert request(fixture["badScope"]) == 403, "signed wrong scope must be forbidden"
+                    for name in ("badIat", "badJti", "badKid", "badType"):
+                        assert request(fixture[name]) == 401, f"{name} did not fail as invalid_token"
+                with lock:
+                    requests_before_refresh = state["requests"]
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                # No gateway request is made while the one-second refresh becomes
+                # due or while its TLS handshake/read advances on the idle shard.
+                wait_for_origin_request(requests_before_refresh)
+                time.sleep(0.1)
+                assert request(fixture["b"]) == 200, "idle refresh did not install the rotated key"
+                assert request(fixture["a"]) == 401, "replaced key still authenticates"
+                publish(b'{"keys":[]}')
+                wait_status(fixture["b"], 401)
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                publish(b"unavailable", 503)
+                assert request(fixture["b"]) == 200, "fresh cache was discarded on outage"
+                wait_status(fixture["b"], 401)
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                publish(b"{bad")
+                wait_status(fixture["b"], 401)
+                if args.discovery_dns:
+                    publish(json.dumps(fixture["second"]["jwks"]).encode())
+                    for kind, modes in [("discovery", ["issuer", "uri", "redirect"]),
+                                        ("dns", ["rebind", "timeout"])]:
                         with lock: state[kind] = "valid"
                         wait_status(fixture["b"], 200)
-                def h2_status(token, expected):
-                    status, _ = h2_request(port, "/read" if args.access_profile else "/",
-                                           [("authorization", "Bearer " + token)])
-                    assert status == expected, f"CNAME HTTP/2 expected {expected}, got {status}"
+                        for mode in modes:
+                            with lock: state[kind] = mode
+                            wait_status(fixture["b"], 401)
+                            with lock: state[kind] = "valid"
+                            wait_status(fixture["b"], 200)
+                    def h2_status(token, expected):
+                        status, _ = h2_request(port, "/read" if args.access_profile else "/",
+                                               [("authorization", "Bearer " + token)])
+                        assert status == expected, f"CNAME HTTP/2 expected {expected}, got {status}"
 
-                with lock:
-                    state["dns"] = "cname"
-                    requests_before_cname = state["requests"]
-                publish(json.dumps(fixture["first"]["jwks"]).encode())
-                wait_for_origin_request(requests_before_cname)
-                wait_status(fixture["a"], 200)
-                assert request(fixture["b"]) == 401
-                h2_status(fixture["a"], 200)
-                h2_status(fixture["b"], 401)
-                with lock:
-                    state["dns"] = "cname-reordered"
-                publish(json.dumps(fixture["second"]["jwks"]).encode())
-                wait_status(fixture["b"], 200)
-                h2_status(fixture["b"], 200)
-                for mode in ("cname-poison", "cname-cycle", "cname-zero-ttl", "cname-unrelated"):
                     with lock:
-                        state["dns"] = mode
-                        dns_before_failure = state["dnsRequests"]
-                    # A new DNS attempt follows completion of any previous fetch.
-                    wait_for_dns_request(dns_before_failure)
-                    with lock:
-                        origin_before_failure = state["requests"]
-                    # Failed DNS must not renew the last successful key age.
-                    wait_status(fixture["b"], 401)
+                        state["dns"] = "cname"
+                        requests_before_cname = state["requests"]
+                    publish(json.dumps(fixture["first"]["jwks"]).encode())
+                    wait_for_origin_request(requests_before_cname)
+                    wait_status(fixture["a"], 200)
+                    assert request(fixture["b"]) == 401
+                    h2_status(fixture["a"], 200)
                     h2_status(fixture["b"], 401)
                     with lock:
-                        assert state["requests"] == origin_before_failure, mode
-                        state["dns"] = "cname"
+                        state["dns"] = "cname-reordered"
+                    publish(json.dumps(fixture["second"]["jwks"]).encode())
                     wait_status(fixture["b"], 200)
                     h2_status(fixture["b"], 200)
-                with lock:
-                    dns_before_move = state["dnsRequests"]
-                    origin_before_move = state["requests"]
-                    state["dns"] = "cname-failover"
-                wait_for_dns_request(dns_before_move)
-                wait_for_origin_address(origin_before_move, "127.0.0.2")
-                wait_status(fixture["b"], 200)
-                h2_status(fixture["b"], 200)
+                    for mode in ("cname-poison", "cname-cycle", "cname-zero-ttl", "cname-unrelated"):
+                        with lock:
+                            state["dns"] = mode
+                            dns_before_failure = state["dnsRequests"]
+                        # A new DNS attempt follows completion of any previous fetch.
+                        wait_for_dns_request(dns_before_failure)
+                        with lock:
+                            origin_before_failure = state["requests"]
+                        # Failed DNS must not renew the last successful key age.
+                        wait_status(fixture["b"], 401)
+                        h2_status(fixture["b"], 401)
+                        with lock:
+                            assert state["requests"] == origin_before_failure, mode
+                            state["dns"] = "cname"
+                        wait_status(fixture["b"], 200)
+                        h2_status(fixture["b"], 200)
+                    with lock:
+                        dns_before_move = state["dnsRequests"]
+                        origin_before_move = state["requests"]
+                        state["dns"] = "cname-failover"
+                    wait_for_dns_request(dns_before_move)
+                    wait_for_origin_address(origin_before_move, "127.0.0.2")
+                    wait_status(fixture["b"], 200)
+                    h2_status(fixture["b"], 200)
             # Leave an authenticated fetch waiting on an origin response while
             # retiring the gateway, exercising in-flight refresh cancellation.
             with lock:

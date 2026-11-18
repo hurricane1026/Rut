@@ -2590,8 +2590,8 @@ succeed before any claims are returned; revocation failure is the usual nil/401.
 
 The compile-time `Crypto.jwtRs256(token, policy)` and
 `Crypto.jwtEs256(token, policy)` policies can include an optional `remoteJwks`
-object with these eight required members (and optional `retrySeconds` plus the
-trusted DNS/discovery fields described below):
+object with these eight required members (and optional `retrySeconds`,
+`conditionalRequests` and trusted DNS/discovery fields described below):
 
 ```json
 {"address":"192.0.2.10","port":443,"serverName":"issuer.example",
@@ -2639,9 +2639,19 @@ The response must be status 200 with one `application/json` or
 `application/jwk-set+json` Content-Type. Headers are bounded to 8192 bytes, body
 to 8192 bytes, and total decoded HTTP wire bytes to 16384. Content-Length,
 chunked and authenticated TLS-close-delimited bodies are supported. Duplicate or
-conflicting framing, truncated headers, redirects, 304, compression, malformed
-chunks and unclean EOF are rejected. No ETag, Cache-Control-derived lifetime,
-HTTP/2 or compressed response handling is advertised by this profile.
+conflicting framing, truncated headers, redirects, compression, malformed
+chunks and unclean EOF are rejected. By default 304 is also rejected. Optional
+Boolean `conditionalRequests` enables strong quoted ASCII ETags bounded to 128
+bytes and exact authenticated 304 revalidation. Validators commit only with a
+successful 200 key activation. Missing ETag clears them. Duplicate/weak or
+malformed ETag rejects the enabled-profile attempt. Conditional GETs require the
+same initial IPv4 candidate and a still-fresh cache. Changed-IP/failover GETs are
+unconditional. A 304 requires the exact sent tag and fresh cache at completion,
+keeps the verifier bank/empty state, and renews age on success. Cold/expired caches
+need full 200 responses, and discovery is always unconditional/200-only. See
+[the conditional contract](jwks-discovery.md#conditional-key-refresh).
+Cache-Control-derived lifetimes, HTTP/2 origin fetches and compressed responses
+remain outside this profile.
 
 A fetched set contains at most 16 objects with distinct nonempty bounded kids.
 Only the intersection with the configured approved kids can become trusted;
@@ -2654,8 +2664,8 @@ than falling back to old keys.
 A replacement verifier is completely prepared on the owning shard before its
 cache is switched. Signature/claims/revocation checks remain unchanged. Fetch,
 HTTP, JSON, key-import and activation failures retain the last successful cache
-only until its configured maximum age. Only successful validation of a fresh 200
-response renews that age. At exact expiry, before first success, after clock
+only until its configured maximum age. Successful validation of a fresh 200 or
+an eligible opt-in 304 before hard expiry renews that age. At exact expiry, before first success, after clock
 failure or after authoritative key removal, verification returns nil (the auth
 wrapper challenges with 401). A failed refresh never extends a lease. Age uses
 monotonic time; JWT claim dates still use realtime. There is no stale-forever or
