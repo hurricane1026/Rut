@@ -372,6 +372,150 @@ int linkat(int oldfd, const char *oldpath, int newfd, const char *newpath, int f
                     assert not snapshot_path.exists()
                     assert b'key output was published' in result.stderr
                     assert raw_key not in result.stderr and raw_key not in result.stdout
+                rotated_snapshot = root / f'rotation-fault-{fail_at}.snapshot'
+                rotated_key = root / f'rotation-fault-{fail_at}.key'
+                before = source.read_bytes()
+                result = subprocess.run([tool, 'rotate-key-verifier', str(source), 'windowed',
+                                         f'rotation-fault-{fail_at}', str(rotated_snapshot), str(rotated_key)],
+                                        capture_output=True, timeout=10, env=env)
+                assert result.returncode == 2 and not result.stdout
+                assert source.read_bytes() == before and not rotated_snapshot.exists()
+                assert b'existing-raw-key' not in result.stderr
+                if fail_at == 1:
+                    assert not rotated_key.exists()
+                else:
+                    raw_key = rotated_key.read_bytes()
+                    assert re.fullmatch(rb'[0-9a-f]{64}', raw_key)
+                    assert stat.S_IMODE(rotated_key.stat().st_mode) == 0o600
+                    assert b'key output was published' in result.stderr and raw_key not in result.stderr
+
+
+def test_rotated_key_verifier(tool, root):
+    owner = dict(id='rotation-owner', enabled=True, groups=['readers', 'staff'])
+    original_key = 'old-private-key'
+    counter = 0
+
+    def invoke(snapshot, old='old', new='new', key_output=None, snapshot_output=None):
+        nonlocal counter
+        counter += 1
+        source = private(root / f'rotation-{counter}.input', snapshot)
+        before = source.read_bytes()
+        output = snapshot_output or root / f'rotation-{counter}.snapshot'
+        key = key_output or root / f'rotation-{counter}.key'
+        result = run(tool, 'rotate-key-verifier', source, old, new, output, key)
+        assert source.read_bytes() == before
+        assert not result.stdout and original_key.encode() not in result.stderr
+        return result, output, key
+
+    for method in ('bearer', 'header'):
+        for hashed in (False, True):
+            for groups in (None, [], ['readers']):
+                for window in ({}, dict(notBefore=0, expiresAt=0),
+                               dict(notBefore=1, expiresAt=2), dict(notBefore=4102444800)):
+                    source_record = dict(id='old', consumerId=owner['id'], method=method,
+                                         enabled=True)
+                    if hashed:
+                        source_record['secretSha256'] = hashlib.sha256(original_key.encode()).hexdigest()
+                    else:
+                        source_record['secret'] = original_key
+                    if groups is not None:
+                        source_record['groups'] = groups
+                    source_record.update(window)
+                    snapshot = dict(version=1, consumers=[owner], credentials=[source_record])
+                    result, output, key = invoke(snapshot)
+                    assert result.returncode == 0 and not result.stderr, result
+                    raw = key.read_bytes()
+                    assert re.fullmatch(rb'[0-9a-f]{64}', raw)
+                    assert stat.S_IMODE(key.stat().st_mode) == stat.S_IMODE(output.stat().st_mode) == 0o600
+                    actual = json.loads(output.read_bytes())
+                    assert actual['consumers'] == [owner]
+                    expected = dict(source_record, enabled=False)
+                    assert actual['credentials'][0] == expected
+                    expected = {k: v for k, v in source_record.items() if k not in ('secret', 'secretSha256')}
+                    expected.update(id='new', secretSha256=hashlib.sha256(raw).hexdigest())
+                    assert actual['credentials'][1] == expected
+                    assert raw not in output.read_bytes()
+                    assert run(tool, 'validate', output).returncode == 0
+                    inspection = run(tool, 'inspect', output)
+                    assert raw not in inspection.stdout + inspection.stderr
+                    assert expected['secretSha256'].encode() not in inspection.stdout + inspection.stderr
+
+    record = dict(id='old', consumerId=owner['id'], method='bearer', enabled=True,
+                  secret=original_key, groups=['readers'], notBefore=1, expiresAt=2)
+    snapshot = dict(version=1, consumers=[owner], credentials=[record])
+    paused = dict(snapshot, consumers=[dict(owner, enabled=False)])
+    result, output, _ = invoke(paused)
+    assert result.returncode == 0 and json.loads(output.read_bytes())['consumers'] == paused['consumers']
+    for old, new in [('missing', 'new'), ('old', 'old'), ('old', ''), ('old', 'bad id'),
+                     ('old', 'x' * 65), ('bad id', 'new'), ('x' * 65, 'new'),
+                     ('', 'new'), ('old', 'n\n'), ('old', 'é')]:
+        result, output, key = invoke(snapshot, old, new)
+        assert result.returncode == 2 and not output.exists() and not key.exists()
+    for replacement in [dict(record, enabled=False), dict(record, method='basic', secret='u:p'),
+                        dict(record, method='mtls', secret='a' * 64)]:
+        result, output, key = invoke(dict(snapshot, credentials=[replacement]))
+        assert result.returncode == 2 and not output.exists() and not key.exists()
+    used = dict(record, id='used', enabled=False, secret='other-key')
+    result, output, key = invoke(dict(snapshot, credentials=[record, used]), new='used')
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    # All credentials, including disabled ones, consume the retained-history capacity.
+    full = [record] + [dict(id=f'o{i}', consumerId=owner['id'], method='bearer',
+                            enabled=False, secret=f'k{i}') for i in range(63)]
+    result, output, key = invoke(dict(snapshot, credentials=full))
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    assert run(tool, 'validate', root / f'rotation-{counter}.input').returncode == 0
+    result, output, key = invoke(dict(snapshot, credentials=full[:-1]))
+    assert result.returncode == 0 and len(json.loads(output.read_bytes())['credentials']) == 64
+    result, output, key = invoke(b'{bad')
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    loose_input = private(root / 'rotation-loose-input', snapshot)
+    loose_input.chmod(0o644)
+    before = loose_input.read_bytes()
+    output, key = root / 'rotation-loose-input.snapshot', root / 'rotation-loose-input.key'
+    result = run(tool, 'rotate-key-verifier', loose_input, 'old', 'new', output, key)
+    assert result.returncode == 2 and not result.stdout and not output.exists() and not key.exists()
+    assert loose_input.read_bytes() == before
+    quoted = dict(record, id='old"id')
+    result, output, _ = invoke(dict(snapshot, credentials=[quoted]), old='old"id', new='new"id')
+    assert result.returncode == 0 and json.loads(output.read_bytes())['credentials'][1]['id'] == 'new"id'
+    result, output, key = invoke(dict(snapshot, credentials=[dict(record, groups=['unknown'])]))
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    alias = root / 'rotation-same-output'
+    result, _, _ = invoke(snapshot, key_output=alias, snapshot_output=alias)
+    assert result.returncode == 2 and not alias.exists()
+    existing = private(root / 'rotation-existing', b'preserve')
+    result, output, _ = invoke(snapshot, key_output=existing)
+    assert result.returncode == 2 and not output.exists() and existing.read_bytes() == b'preserve'
+    result, _, key = invoke(snapshot, snapshot_output=existing)
+    assert result.returncode == 2 and not key.exists() and existing.read_bytes() == b'preserve'
+    link = root / 'rotation-symlink'
+    link.symlink_to(existing)
+    result, output, _ = invoke(snapshot, key_output=link)
+    assert result.returncode == 2 and not output.exists() and existing.read_bytes() == b'preserve'
+    other = root / 'rotation-other-directory'
+    other.mkdir(mode=0o700)
+    result, output, key = invoke(snapshot, key_output=other / 'key')
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    loose = root / 'rotation-loose'
+    loose.mkdir(mode=0o777)
+    loose.chmod(0o777)
+    result, output, key = invoke(snapshot, key_output=loose / 'key', snapshot_output=loose / 'snapshot')
+    loose.chmod(0o700)
+    assert result.returncode == 2 and not output.exists() and not key.exists()
+    source = private(root / 'rotation-race.input', snapshot)
+    before = source.read_bytes()
+    output, key = root / 'rotation-race.snapshot', root / 'rotation-race.key'
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        results = list(workers.map(lambda _: run(tool, 'rotate-key-verifier', source,
+                                  'old', 'new', output, key), range(6)))
+    assert sum(result.returncode == 0 for result in results) == 1
+    assert all(result.returncode in (0, 2) and not result.stdout for result in results)
+    assert source.read_bytes() == before
+    raw = key.read_bytes()
+    actual = json.loads(output.read_bytes())
+    assert actual['credentials'][0] == dict(record, enabled=False)
+    assert actual['credentials'][1]['secretSha256'] == hashlib.sha256(raw).hexdigest()
+    assert all(raw not in result.stderr for result in results)
 
 
 def test_credential_groups_preserve_and_reject_parent_removal(tool, root):
@@ -435,6 +579,7 @@ def main(tool):
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
         test_generated_key_verifier(tool, root)
+        test_rotated_key_verifier(tool, root)
         test_credential_groups_preserve_and_reject_parent_removal(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0

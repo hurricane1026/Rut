@@ -191,6 +191,41 @@ def main():
                                   [('x-api-key', header_bytes.decode())])[0] == 204
                 assert h2_request(paired_port, '/key',
                                   [('x-api-key', header_verifier)])[0] == 401
+            # Rotate both existing hashed methods, retaining a least-privilege subset.
+            bearer_record = next(item for item in paired_config['credentials']
+                                 if item['id'] == 'paired-bearer-v1')
+            bearer_record.update(groups=['readers'], notBefore=1, expiresAt=int(time.time()) + 600)
+            rotation_input = root / 'rotation-input.json'
+            rotation_input.write_text(json.dumps(paired_config))
+            rotation_input.chmod(0o600)
+            rotated_keys = {}
+            for old_id in ('paired-bearer-v1', 'paired-header-v1'):
+                rotation_output = root / f'{old_id}-rotated.json'
+                rotation_key = root / f'{old_id}-rotated.key'
+                before = rotation_input.read_bytes()
+                result = subprocess.run([args.admin, 'rotate-key-verifier', str(rotation_input),
+                                         old_id, old_id + '-rotated', str(rotation_output), str(rotation_key)],
+                                        capture_output=True, timeout=10)
+                assert result.returncode == 0 and not result.stdout and not result.stderr, result
+                assert rotation_input.read_bytes() == before
+                rotated_keys[old_id] = rotation_key.read_text()
+                rotation_input = rotation_output
+            rotated = json.loads(rotation_input.read_bytes())
+            with gateway(args, rotated, root / 'rotated-keys',
+                         sensitive=(bearer_bytes.decode(), header_bytes.decode(),
+                                    *rotated_keys.values())) as rotation_port:
+                for path, field, old, new, expected in (
+                    ('/private', 'Authorization', 'Bearer ' + bearer_bytes.decode(),
+                     'Bearer ' + rotated_keys['paired-bearer-v1'], 200),
+                    ('/key', 'X-API-Key', header_bytes.decode(), rotated_keys['paired-header-v1'], 204)):
+                    assert request(rotation_port, path, f'{field}: {old}\r\n')[0] == 401
+                    assert h2_request(rotation_port, path, [(field.lower(), old)])[0] == 401
+                    assert request(rotation_port, path, f'{field}: {new}\r\n')[0] == expected
+                    assert h2_request(rotation_port, path, [(field.lower(), new)])[0] == expected
+                authorization = 'Bearer ' + rotated_keys['paired-bearer-v1']
+                for path, expected in (('/read', 200), ('/staff', 403), ('/write', 403)):
+                    assert request(rotation_port, path, f'Authorization: {authorization}\r\n')[0] == expected
+                    assert h2_request(rotation_port, path, [('authorization', authorization)])[0] == expected
         if args.admin and generated:
             activation = max(1, int(time.time()) - 10)
             expiry = int(time.time()) + 600
@@ -302,14 +337,26 @@ def main():
         timed = dict(version=1, consumers=[consumer('alice',groups=['staff'])],
                      credentials=[dict(id='window', consumerId='alice', method='bearer',
                                        secret='window-key', enabled=True,
-                                       notBefore=activation, expiresAt=expiry)])
-        with gateway(args,timed,root/'timed') as port:
+                                       notBefore=activation, expiresAt=expiry, groups=[])])
+        timed_key = 'window-key'
+        if args.admin:
+            timed_source = root / 'timed-rotation-input.json'
+            timed_source.write_text(json.dumps(timed))
+            timed_source.chmod(0o600)
+            timed_output, timed_key_output = root / 'timed-rotation.json', root / 'timed-rotation.key'
+            result = subprocess.run([args.admin, 'rotate-key-verifier', str(timed_source),
+                                     'window', 'window-rotated', str(timed_output), str(timed_key_output)],
+                                    capture_output=True, timeout=10)
+            assert result.returncode == 0 and not result.stdout and not result.stderr, result
+            timed = json.loads(timed_output.read_bytes())
+            timed_key = timed_key_output.read_text()
+        with gateway(args,timed,root/'timed',sensitive=(timed_key,)) as port:
             connection=http.client.HTTPConnection('127.0.0.1',port,timeout=8)
-            h2_headers=[('authorization','Bearer window-key')]
+            h2_headers=[('authorization','Bearer ' + timed_key)]
             persistent_socket=None
             def persistent_status():
                 nonlocal persistent_socket
-                connection.request('GET','/private',headers={'Authorization':'Bearer window-key'})
+                connection.request('GET','/private',headers={'Authorization':'Bearer ' + timed_key})
                 response=connection.getresponse()
                 status,body=response.status,response.read()
                 if persistent_socket is None:
@@ -328,6 +375,11 @@ def main():
                 assert status==401 and time.time()<expiry,(status,body,time.time())
                 time.sleep(.25)
             assert h2_request(port,'/private',h2_headers)==(200,b'alice')
+            assert request(port, '/staff', f'Authorization: Bearer {timed_key}\r\n')[0] == 403
+            assert h2_request(port, '/staff', h2_headers)[0] == 403
+            if args.admin:
+                assert request(port, '/private', 'Authorization: Bearer window-key\r\n')[0] == 401
+                assert h2_request(port, '/private', [('authorization', 'Bearer window-key')])[0] == 401
             while True:
                 status,body=persistent_status()
                 if status==401:

@@ -3580,6 +3580,13 @@ in its snapshot and writes the corresponding 64-byte lowercase-hex key to a
 separate 0600 file. It publishes the key first, then the snapshot; a failure
 between those publications can leave an orphan key file, so operators inspect
 both outputs before retrying. This adds no Rut syntax or runtime API.
+`rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID SNAPSHOT_OUTPUT
+KEY_OUTPUT` uses the same output contract to disable an existing enabled
+bearer/header credential and add a new hash-only credential. It preserves the
+exact owner, method, optional groups and time bounds, including expired windows,
+and does not enable a disabled Consumer. The new ID must be unused even among
+disabled records; retaining the old record requires a free credential slot.
+Rotation is offline and deployment remains explicit (#1072 remains open).
 
 Credentials may optionally set `groups`: omission inherits the Consumer's
 groups, `[]` removes all group authority, and a nonempty list may only select
