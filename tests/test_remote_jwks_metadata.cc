@@ -158,3 +158,302 @@ TEST(remote_jwks_metadata, dns_configuration_pairs_bounds_and_failure_reset) {
     CHECK(!configuration.load(document, document.count));
     CHECK_EQ(configuration.allowed_count, 0u);
 }
+
+namespace {
+struct DnsPacket {
+    u8 bytes[1024]{};
+    u32 length = 12;
+    u32 question_length = 0;
+    u16 answers = 0;
+    explicit DnsPacket(const char* host = "a.example") {
+        bytes[0] = 0x12;
+        bytes[1] = 0x34;
+        bytes[2] = 0x81;
+        bytes[3] = 0x80;
+        bytes[5] = 1;
+        name(host);
+        word(1);
+        word(1);
+        question_length = length;
+    }
+    void word(u16 value) {
+        bytes[length++] = static_cast<u8>(value >> 8);
+        bytes[length++] = static_cast<u8>(value);
+    }
+    void name(const char* host) {
+        for (const char* start = host; *start;) {
+            const char* end = strchr(start, '.');
+            if (!end) end = start + strlen(start);
+            bytes[length++] = static_cast<u8>(end - start);
+            while (start != end) bytes[length++] = static_cast<u8>(*start++);
+            if (*start == '.') ++start;
+        }
+        bytes[length++] = 0;
+    }
+    void pointer(u32 target) { word(static_cast<u16>(0xc000 | target)); }
+    u32 record(const char* owner, u16 type, u32 ttl = 30) {
+        if (owner)
+            name(owner);
+        else
+            pointer(12);
+        word(type);
+        word(1);
+        word(static_cast<u16>(ttl >> 16));
+        word(static_cast<u16>(ttl));
+        const u32 size = length;
+        word(0);
+        ++answers;
+        bytes[6] = static_cast<u8>(answers >> 8);
+        bytes[7] = static_cast<u8>(answers);
+        return size;
+    }
+    void size(u32 at) {
+        const u32 value = length - at - 2;
+        bytes[at] = static_cast<u8>(value >> 8);
+        bytes[at + 1] = static_cast<u8>(value);
+    }
+    u32 cname(const char* owner, const char* target, u32 ttl = 30) {
+        const u32 at = record(owner, 5, ttl), target_at = length;
+        name(target);
+        size(at);
+        return target_at;
+    }
+    void a(const char* owner, u8 last = 1, u32 ttl = 30) {
+        const u32 at = record(owner, 1, ttl);
+        bytes[length++] = 192;
+        bytes[length++] = 0;
+        bytes[length++] = 2;
+        bytes[length++] = last;
+        size(at);
+    }
+    Str view() const { return {reinterpret_cast<const char*>(bytes), length}; }
+    Str query(u8 (&storage)[272]) const {
+        memcpy(storage, bytes, question_length);
+        storage[2] = 1;
+        storage[3] = 0;
+        storage[6] = storage[7] = 0;
+        return {reinterpret_cast<const char*>(storage), question_length};
+    }
+};
+bool accepts(const DnsPacket& packet, RemoteJwks& configuration, char (&address)[16]) {
+    u8 query[272]{};
+    return jwks_dns_answer(packet.view(), packet.query(query), configuration, address);
+}
+void rejected(rut::test::TestCase* _tc, const DnsPacket& packet, RemoteJwks& configuration) {
+    char address[16] = "unchanged";
+    CHECK(!accepts(packet, configuration, address));
+    CHECK(strcmp(address, "unchanged") == 0);
+}
+}  // namespace
+
+TEST(remote_jwks_metadata, cname_chain_literal_compressed_reordered_and_limits) {
+    auto configuration = policy();
+    strcpy(configuration.allowed_addresses[1], "192.0.2.2");
+    configuration.allowed_count = 2;
+    char address[16]{};
+    DnsPacket literal;
+    literal.cname(nullptr, "keys.example");
+    literal.a("keys.example");
+    CHECK(accepts(literal, configuration, address));
+    CHECK(strcmp(address, "192.0.2.1") == 0);
+
+    DnsPacket compressed;
+    const u32 target = compressed.cname(nullptr, "keys.example");
+    compressed.pointer(target);
+    const u32 header = compressed.length;
+    compressed.word(1);
+    compressed.word(1);
+    compressed.word(0);
+    compressed.word(30);
+    compressed.word(4);
+    compressed.bytes[compressed.length++] = 192;
+    compressed.bytes[compressed.length++] = 0;
+    compressed.bytes[compressed.length++] = 2;
+    compressed.bytes[compressed.length++] = 2;
+    compressed.bytes[7] = 2;
+    CHECK(header > target);
+    CHECK(accepts(compressed, configuration, address));
+    CHECK(strcmp(address, "192.0.2.2") == 0);
+
+    // CNAME RDATA may combine a new label with an already decoded suffix.
+    DnsPacket suffix;
+    const u32 suffix_size = suffix.record(nullptr, 5);
+    suffix.bytes[suffix.length++] = 4;
+    for (char value : "keys")
+        if (value) suffix.bytes[suffix.length++] = static_cast<u8>(value);
+    suffix.pointer(14);  // The question's example label.
+    suffix.size(suffix_size);
+    suffix.a("keys.example");
+    CHECK(accepts(suffix, configuration, address));
+
+    DnsPacket reordered("A.Example");
+    reordered.a("KEYS.example", 2);
+    reordered.cname("a.EXAMPLE", "keys.EXAMPLE");
+    reordered.a("keys.example");
+    CHECK(accepts(reordered, configuration, address));
+    CHECK(strcmp(address, "192.0.2.2") == 0);
+
+    DnsPacket four;
+    four.cname(nullptr, "b.example");
+    four.cname("b.example", "c.example");
+    four.cname("c.example", "d.example");
+    four.cname("d.example", "e.example");
+    for (u32 i = 0; i < 4; ++i) four.a("e.example", static_cast<u8>(1 + i % 2));
+    CHECK(accepts(four, configuration, address));
+    four.a("e.example");
+    rejected(_tc, four, configuration);
+}
+
+TEST(remote_jwks_metadata, cname_graph_and_address_poisoning_fail_closed) {
+    auto configuration = policy();
+    DnsPacket absent;
+    absent.cname(nullptr, "keys.example");
+    rejected(_tc, absent, configuration);
+    DnsPacket cycle;
+    cycle.cname(nullptr, "b.example");
+    cycle.cname("b.example", "a.example");
+    rejected(_tc, cycle, configuration);
+    DnsPacket self;
+    self.cname(nullptr, "a.example");
+    rejected(_tc, self, configuration);
+    DnsPacket fork;
+    fork.cname(nullptr, "keys.example");
+    fork.cname(nullptr, "other.example");
+    fork.a("keys.example");
+    rejected(_tc, fork, configuration);
+    DnsPacket duplicate;
+    duplicate.cname(nullptr, "keys.example");
+    duplicate.cname(nullptr, "keys.example");
+    duplicate.a("keys.example");
+    rejected(_tc, duplicate, configuration);
+    DnsPacket mixed;
+    mixed.cname(nullptr, "keys.example");
+    mixed.a(nullptr);
+    mixed.a("keys.example");
+    rejected(_tc, mixed, configuration);
+    DnsPacket unrelated;
+    unrelated.cname(nullptr, "keys.example");
+    unrelated.a("keys.example");
+    unrelated.a("other.example");
+    rejected(_tc, unrelated, configuration);
+    DnsPacket poison;
+    poison.cname(nullptr, "keys.example");
+    poison.a("keys.example");
+    poison.a("keys.example", 2);
+    rejected(_tc, poison, configuration);
+    DnsPacket five;
+    five.cname(nullptr, "b.example");
+    five.cname("b.example", "c.example");
+    five.cname("c.example", "d.example");
+    five.cname("d.example", "e.example");
+    five.cname("e.example", "f.example");
+    five.a("f.example");
+    rejected(_tc, five, configuration);
+    const u32 invalid_ttls[] = {0u, 0x80000000u};
+    for (u32 ttl : invalid_ttls) {
+        DnsPacket alias_ttl;
+        alias_ttl.cname(nullptr, "keys.example", ttl);
+        alias_ttl.a("keys.example");
+        rejected(_tc, alias_ttl, configuration);
+        DnsPacket address_ttl;
+        address_ttl.cname(nullptr, "keys.example");
+        address_ttl.a("keys.example", 1, ttl);
+        rejected(_tc, address_ttl, configuration);
+    }
+    DnsPacket aaaa;
+    const u32 at = aaaa.record(nullptr, 28);
+    for (u32 i = 0; i < 16; ++i) aaaa.bytes[aaaa.length++] = 0;
+    aaaa.size(at);
+    rejected(_tc, aaaa, configuration);
+    DnsPacket glue;
+    glue.a(nullptr);
+    glue.bytes[11] = 1;
+    rejected(_tc, glue, configuration);
+}
+
+TEST(remote_jwks_metadata, cname_compression_rdata_and_truncation_are_strict) {
+    auto configuration = policy();
+    DnsPacket valid;
+    valid.cname(nullptr, "keys.example");
+    valid.a("keys.example");
+    for (u32 length = 0; length < valid.length; ++length) {
+        DnsPacket cut = valid;
+        cut.length = length;
+        rejected(_tc, cut, configuration);
+    }
+    DnsPacket trailing = valid;
+    trailing.bytes[trailing.length++] = 0;
+    rejected(_tc, trailing, configuration);
+    DnsPacket oversized = valid;
+    oversized.length = 513;
+    rejected(_tc, oversized, configuration);
+    DnsPacket malformed;
+    const u32 at = malformed.record(nullptr, 5);
+    malformed.bytes[malformed.length++] = 0xc0;
+    malformed.size(at);
+    rejected(_tc, malformed, configuration);
+    const u32 invalid_targets[] = {0u, 13u, 511u};
+    for (u32 target : invalid_targets) {
+        DnsPacket bad;
+        const u32 size = bad.record(nullptr, 5);
+        bad.pointer(target);
+        bad.size(size);
+        rejected(_tc, bad, configuration);
+    }
+    // Offset 13 is inside a valid label, but would itself decode as 48 a's
+    // under a decoder that accepts arbitrary backwards offsets.
+    char host[50]{};
+    host[0] = '0';
+    memset(host + 1, 'a', 48);
+    DnsPacket middle(host);
+    const u32 middle_size = middle.record(nullptr, 5);
+    middle.pointer(13);
+    middle.size(middle_size);
+    rejected(_tc, middle, configuration);
+    DnsPacket self;
+    const u32 self_size = self.record(nullptr, 5);
+    self.pointer(self.length);
+    self.size(self_size);
+    rejected(_tc, self, configuration);
+    DnsPacket extra;
+    const u32 size = extra.record(nullptr, 5);
+    extra.name("keys.example");
+    extra.bytes[extra.length++] = 0;
+    extra.size(size);
+    extra.a("keys.example");
+    rejected(_tc, extra, configuration);
+    DnsPacket wrong;
+    wrong.cname(nullptr, "keys.example");
+    wrong.a("keys.example");
+    wrong.bytes[2] |= 2;
+    rejected(_tc, wrong, configuration);
+}
+
+TEST(remote_jwks_metadata, cname_hostname_bounds) {
+    auto configuration = policy();
+    char address[16]{};
+    char host[255]{};
+    memset(host, 'a', 63);
+    DnsPacket label63(host);
+    label63.a(nullptr);
+    CHECK(accepts(label63, configuration, address));
+    host[63] = 'a';
+    DnsPacket label64(host);
+    label64.a(nullptr);
+    rejected(_tc, label64, configuration);
+    memset(host, 'a', 253);
+    host[63] = host[127] = host[191] = '.';
+    DnsPacket expanded253(host);
+    expanded253.a(nullptr);
+    CHECK(accepts(expanded253, configuration, address));
+    host[253] = 'a';
+    DnsPacket expanded254(host);
+    expanded254.a(nullptr);
+    rejected(_tc, expanded254, configuration);
+    const char* invalid[] = {"-a.example", "a-.example", ""};
+    for (const char* name : invalid) {
+        DnsPacket bad(name);
+        bad.a(nullptr);
+        rejected(_tc, bad, configuration);
+    }
+}

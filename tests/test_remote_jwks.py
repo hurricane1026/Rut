@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 
+from auth_h2_fixture import request as h2_request
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -107,8 +109,31 @@ def main():
             if mode == "timeout": continue
             target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
             address = socket.inet_aton(target)
-            response = query[:2]+b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"+query[12:]
-            response += b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x1e\x00\x04"+address
+            def name(host):
+                return b"".join(bytes((len(label),)) + label.encode() for label in host.split(".")) + b"\0"
+            def record(owner, kind, data, ttl=30):
+                return owner + kind.to_bytes(2, "big") + b"\0\1" + ttl.to_bytes(4, "big") + len(data).to_bytes(2, "big") + data
+            records = [record(b"\xc0\x0c", 1, address)]
+            if mode.startswith("cname"):
+                alias = name("keys.example")
+                records = [record(b"\xc0\x0c", 5, alias)]
+                # The A owner points to the already decoded CNAME RDATA.
+                alias_offset = len(query) + 12
+                pointer = (0xc000 | alias_offset).to_bytes(2, "big")
+                records.append(record(pointer, 1, address))
+                if mode == "cname-reordered":
+                    records = [record(alias, 1, address), record(b"\xc0\x0c", 5, alias)]
+                elif mode == "cname-move":
+                    records[-1] = record(pointer, 1, socket.inet_aton("127.0.0.2"))
+                elif mode == "cname-poison":
+                    records.append(record(pointer, 1, socket.inet_aton("127.0.0.3")))
+                elif mode == "cname-cycle":
+                    records[-1] = record(pointer, 5, b"\xc0\x0c")
+                elif mode == "cname-zero-ttl":
+                    records[0] = record(b"\xc0\x0c", 5, alias, ttl=0)
+                elif mode == "cname-unrelated":
+                    records.append(record(name("unrelated.example"), 1, address))
+            response = query[:2] + b"\x81\x80\0\1" + len(records).to_bytes(2, "big") + b"\0\0\0\0" + query[12:] + b"".join(records)
             try: dns.sendto(response,peer)
             except OSError: return
     dns_worker=threading.Thread(target=resolve,daemon=True)
@@ -122,9 +147,7 @@ def main():
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
         if args.discovery_dns:
             policy["remoteJwks"].update(dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
-                                       allowedAddresses=(
-                                           ["127.0.0.1", "127.0.0.2"]
-                                           if args.access_profile else ["127.0.0.1"]),
+                                       allowedAddresses=["127.0.0.1", "127.0.0.2"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
@@ -298,14 +321,49 @@ def main():
                         wait_status(fixture["b"], 401)
                         with lock: state[kind] = "valid"
                         wait_status(fixture["b"], 200)
-                if args.access_profile:
+                def h2_status(token, expected):
+                    status, _ = h2_request(port, "/read" if args.access_profile else "/",
+                                           [("authorization", "Bearer " + token)])
+                    assert status == expected, f"CNAME HTTP/2 expected {expected}, got {status}"
+
+                with lock:
+                    state["dns"] = "cname"
+                    requests_before_cname = state["requests"]
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_for_origin_request(requests_before_cname)
+                wait_status(fixture["a"], 200)
+                assert request(fixture["b"]) == 401
+                h2_status(fixture["a"], 200)
+                h2_status(fixture["b"], 401)
+                with lock:
+                    state["dns"] = "cname-reordered"
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                h2_status(fixture["b"], 200)
+                for mode in ("cname-poison", "cname-cycle", "cname-zero-ttl", "cname-unrelated"):
                     with lock:
-                        dns_before_move = state["dnsRequests"]
-                        origin_before_move = state["requests"]
-                        state["dns"] = "move"
-                    wait_for_dns_request(dns_before_move)
-                    wait_for_origin_address(origin_before_move, "127.0.0.2")
+                        state["dns"] = mode
+                        dns_before_failure = state["dnsRequests"]
+                    # A new DNS attempt follows completion of any previous fetch.
+                    wait_for_dns_request(dns_before_failure)
+                    with lock:
+                        origin_before_failure = state["requests"]
+                    # Failed DNS must not renew the last successful key age.
+                    wait_status(fixture["b"], 401)
+                    h2_status(fixture["b"], 401)
+                    with lock:
+                        assert state["requests"] == origin_before_failure, mode
+                        state["dns"] = "cname"
                     wait_status(fixture["b"], 200)
+                    h2_status(fixture["b"], 200)
+                with lock:
+                    dns_before_move = state["dnsRequests"]
+                    origin_before_move = state["requests"]
+                    state["dns"] = "cname-move"
+                wait_for_dns_request(dns_before_move)
+                wait_for_origin_address(origin_before_move, "127.0.0.2")
+                wait_status(fixture["b"], 200)
+                h2_status(fixture["b"], 200)
             # Leave an authenticated fetch waiting on an origin response while
             # retiring the gateway, exercising in-flight refresh cancellation.
             with lock:

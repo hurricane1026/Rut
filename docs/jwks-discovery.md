@@ -26,19 +26,27 @@ No blocking libc resolver, system search list, request-selected name or new DNS
 library is used.
 
 The deliberately bounded DNS profile sends one random-ID IN A query (labels at
-most 63 bytes) without EDNS. It accepts one echoed question and 1–8 A answers,
-with positive TTL, exact question ownership (literal or pointer to offset 12),
-transaction match and no trailing authority/additional sections. Every returned
-address must be allowed; it does not select a convenient allowed answer from a
-mixed poisoned set. Truncation, DNS errors, unrelated owners, CNAME, AAAA,
-arbitrary compression chains and replies over 512 bytes fail this attempt.
-There is no TCP fallback or independent DNS cache: refresh controls bound retries,
-and resolved addresses are used only within that attempt's total deadline.
-The configured resolver must provide this A-only response profile.
+most 63 bytes) without EDNS. It accepts one echoed question and 1–8 total answer
+records in a single reply of at most 512 bytes. Answers must form exactly one
+chain from the echoed question, with at most four CNAME hops followed by one or
+more A records. Record order and hostname case do not matter. Every record must
+have a positive 31-bit TTL; zero and high-bit-set TTLs are rejected. Every terminal
+A address must be allowed, including answers after the first selected address.
+It does not select a convenient allowed answer from a mixed poisoned set.
 
-TLS SNI/certificate hostname and CA remain fixed even when an allowed address
-changes. DNS is not claimed to be DNSSEC-authenticated; address allowlisting plus
-mandatory HTTPS identity validation preserves the configured destination trust
+Names are bounded to 253 expanded bytes and 63 bytes per label. Compression may
+only point backwards to a previously decoded valid label boundary, with bounded
+pointer traversal. Forks, duplicate CNAMEs, cycles, an owner with both A and CNAME,
+missing terminal A records, unrelated answers, malformed or trailing RDATA/bytes,
+AAAA, truncation, DNS errors and authority/additional sections fail the attempt.
+There are no follow-up alias queries, TCP fallback or independent DNS cache:
+refresh controls bound retries, and the address is used only within that attempt's
+total deadline. The configured resolver must provide this bounded A/CNAME profile.
+
+TLS SNI/certificate hostname and CA remain fixed to the configured original
+server name even when a CNAME target or an allowed address changes. DNS is not
+claimed to be DNSSEC-authenticated; address allowlisting plus mandatory HTTPS
+identity validation preserves the configured destination trust
 boundary and prevents rebinding to an unconfigured internal service.
 
 ## Discovery contract
@@ -58,6 +66,11 @@ trust to remote input. Configure issuer-specific well-known paths explicitly.
 The trust rule follows the exact issuer comparison in
 [OpenID Connect Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationValidation).
 The bounded wire format derives from [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035).
+TTL interpretation and alias ownership are informed by
+[RFC 2181 section 8](https://www.rfc-editor.org/rfc/rfc2181#section-8) and
+[section 10.1](https://www.rfc-editor.org/rfc/rfc2181#section-10.1). This profile
+deliberately rejects zero and high-bit-set TTLs instead of accepting zero or
+normalizing a high-bit-set value to zero as described by the RFC.
 
 One shard-owned `JwksFetch` coordinates DNS, discovery and the key GET under one
 timeout. At most one stage is in flight per policy/shard. No token, unknown kid,
@@ -70,11 +83,13 @@ configuration retirement and shutdown close resolver and HTTPS workspaces.
 
 ## Evidence and limits
 
-Tests cover deterministic malformed/truncated DNS and metadata, allowlisted
-address changes, prohibited rebinding, issuer/URI mismatch, redirects, resolver
+Tests cover deterministic malformed/truncated DNS and metadata, bounded compressed
+and reordered CNAME chains, alias poisoning, HTTP/1.1 and HTTP/2 denial/recovery,
+allowlisted address changes, prohibited rebinding, issuer/URI mismatch, redirects,
+resolver
 outage, TLS key rotation, empty-set removal, cache expiry, recovery and shutdown.
 Real native-loaded RS256 and ES256 gateways run after source removal on both
 Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
-Other DNS transports, CNAME/IPv6/discovery origins, automatic kid inventory and
-full OIDC provider workflows remain outside this profile (#1077).
+Other DNS transports, IPv6, alternative discovery origins, automatic kid inventory
+and full OIDC provider workflows remain outside this profile. #1077 remains open.
