@@ -140,6 +140,8 @@ private:
                                 executable::ExecutableLease& executable_owner,
                                 Diagnostic& diagnostic) const;
     bool settle_after_reap(State success_state, Diagnostic& diagnostic);
+    bool cleanup_child(std::chrono::steady_clock::time_point deadline,
+                       child::Diagnostic& diagnostic);
     bool reject(Diagnostic& diagnostic, FailurePhase phase, int error_number);
     void record_attempt(bool result, bool& attempted, bool& succeeded);
     void retain_terminal_failure(const Diagnostic& diagnostic);

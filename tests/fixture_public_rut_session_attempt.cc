@@ -361,6 +361,27 @@ bool PublicRutAttemptLease::close_evidence(Diagnostic& diagnostic) {
     return true;
 }
 
+bool PublicRutAttemptLease::cleanup_child(Clock::time_point deadline,
+                                          child::Diagnostic& diagnostic) {
+    // A failure frame is emitted just before _exit. The status pipe can
+    // reach EOF before waitpid can reap the child. Preserve its natural exit.
+    using CleanupMode = child::PausedChildLease::CleanupMode;
+    const bool exec_failed = observation_.outcome == handoff::ExecOutcome::PreExecFailure ||
+                             observation_.outcome == handoff::ExecOutcome::ExecFailure;
+    if (exec_failed) return child_.cleanup(deadline, diagnostic, CleanupMode::WaitForExit);
+
+    // An unclassified exit can also race with the liveness check. Retry
+    // only while the child still owns its resources and has not been signaled.
+    while (!child_.cleanup(deadline, diagnostic)) {
+        if (!child_.active() || diagnostic.phase != child::FailurePhase::Pidfd ||
+            diagnostic.error_number != EIO || !settlement_ || settlement_->terminal ||
+            settlement_->reaped || settlement_->sigkill_sent || remaining_ms(deadline) <= 0)
+            return false;
+        (void)poll(nullptr, 0, 1);
+    }
+    return true;
+}
+
 bool PublicRutAttemptLease::cleanup(Clock::time_point deadline, Diagnostic& diagnostic) {
     diagnostic = {};
     ++cleanup_->explicit_cleanup_calls;
@@ -373,21 +394,7 @@ bool PublicRutAttemptLease::cleanup(Clock::time_point deadline, Diagnostic& diag
     Diagnostic first_failure;
     if (child_.active()) {
         child::Diagnostic child_diagnostic;
-        bool settled = child_.cleanup(deadline, child_diagnostic);
-        // Exec failure is published immediately before the child exits.  If
-        // that transition wins the pidfd liveness check, the child cleanup
-        // reports Pidfd/EIO without signalling or detaching anything. Retry
-        // only that explicit transition race under the unchanged deadline;
-        // the next waitpid observes and reaps the already-dead direct child.
-        while (!settled && child_.active() &&
-               child_diagnostic.phase == child::FailurePhase::Pidfd &&
-               child_diagnostic.error_number == EIO && settlement_ && !settlement_->terminal &&
-               !settlement_->reaped && !settlement_->sigkill_sent && Clock::now() < deadline) {
-            const int timeout = remaining_ms(deadline);
-            if (timeout <= 0) break;
-            (void)poll(nullptr, 0, timeout > 1 ? 1 : timeout);
-            settled = child_.cleanup(deadline, child_diagnostic);
-        }
+        const bool settled = cleanup_child(deadline, child_diagnostic);
         record_attempt(settled, cleanup_->child_attempted, cleanup_->child_settled);
         if (!settled)
             first_failure = {FailurePhase::Child, nonzero(child_diagnostic.error_number, EIO)};
@@ -454,7 +461,7 @@ void PublicRutAttemptLease::destructor_cleanup() {
     const auto until = Clock::now() + std::chrono::seconds(7);
     if (child_.active()) {
         child::Diagnostic child_diagnostic;
-        const bool settled = child_.cleanup(until, child_diagnostic);
+        const bool settled = cleanup_child(until, child_diagnostic);
         record_attempt(settled, cleanup_->child_attempted, cleanup_->child_settled);
         if (!settled)
             diagnostic = {FailurePhase::Child, nonzero(child_diagnostic.error_number, EIO)};

@@ -1546,10 +1546,15 @@ bool PausedChildLease::attest_post_exec_identity(const ProcIdentity& first,
 }
 
 bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
-                               Diagnostic& diagnostic) {
+                               Diagnostic& diagnostic,
+                               CleanupMode mode) {
     diagnostic = {};
     if (!active_) {
         fail(diagnostic, FailurePhase::Argument, EALREADY);
+        record_cleanup(false, diagnostic);
+        return false;
+    }
+    if (mode == CleanupMode::WaitForExit && !wait_reap(deadline, diagnostic)) {
         record_cleanup(false, diagnostic);
         return false;
     }

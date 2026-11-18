@@ -355,7 +355,8 @@ bool exec_failure(Owners& owners) {
             lease.cleanup(Clock::now() + std::chrono::seconds(2), diagnostic);
         result = check(bounded_cleanup, "exec-failure bounded cleanup") &&
                  check(settlement && settlement->terminal && settlement->reaped &&
-                           settlement->error_number == 0 && WIFEXITED(settlement->wait_status) &&
+                           settlement->error_number == 0 && settlement->sigkill_attempts == 0 &&
+                           WIFEXITED(settlement->wait_status) &&
                            WEXITSTATUS(settlement->wait_status) == 131,
                        "exec-failure natural settlement receipt") &&
                  result;

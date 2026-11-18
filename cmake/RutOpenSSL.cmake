@@ -36,6 +36,11 @@ rut_openssl_compiler_environment(_rut_openssl_cc _rut_openssl_cflags
     "${CMAKE_C_COMPILER}" "${CMAKE_C_COMPILER_ARG1}"
     "${CMAKE_C_COMPILER_TARGET}" "${CMAKE_SYSROOT}"
     "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_rut_openssl_build_type}}")
+if(RUT_SANITIZE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # Follow newer OpenSSL's Clang UBSan configuration. Its typed stack macros
+    # pass callbacks through erased function pointers in libcrypto.
+    string(APPEND _rut_openssl_cflags " -fno-sanitize=function")
+endif()
 
 ExternalProject_Add(rut_openssl
     PREFIX "${_rut_openssl_prefix}"

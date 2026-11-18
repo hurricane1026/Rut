@@ -3,6 +3,56 @@
 The user selected completion and merge of #374, #376, then #269 on
 2026-09-13. This supersedes the earlier handoff instruction to keep #269 draft.
 
+## Running the privileged fixtures locally
+
+The broker and generated differential require the retained sudo process and
+its descendants to share a process group and session. Sudo's `use_pty`
+setting can introduce a monitor and a new session when started from a
+controlling terminal. The CI runner starts the tests without one.
+
+From the repository root, use this command when the installed policy allows
+the fixture's `sudo -n` commands in a detached session.
+
+```bash
+setsid --wait env RUT_NGINX_DIFFERENTIAL_REQUIRED=1 \
+    ctest --test-dir build --output-on-failure --no-tests=error -j 1 \
+    -R '^test_fixture_(privileged_broker|generated_nginx_differential)$'
+```
+
+If sudo must prompt for authentication and uses the default timestamp policy,
+run the following helper from an interactive shell at the repository root. It
+keeps the terminal open for the password prompt, starts a session without a
+controlling terminal, and validates sudo from the same process that will
+become the ordinary fixture parent. Sudo can then reuse its parent-process
+timestamp for subsequent `sudo -n` invocations.
+
+```bash
+run_privileged_fixture() (
+    mode=$(stty -g) || exit
+    restore_echo() { stty "$mode"; }
+    trap restore_echo EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    stty -echo || exit
+    setsid --wait bash -c '
+        sudo -S -v || exit
+        stty "$1" || exit
+        shift
+        export RUT_NGINX_DIFFERENTIAL_REQUIRED=1
+        exec "$@"
+    ' bash "$mode" build/tests/test_fixture_privileged_broker build/src/rut "$@"
+)
+
+run_privileged_fixture &&
+    run_privileged_fixture --generated-nginx-differential
+```
+
+The test binary must run under the ordinary account. The helper uses the
+installed sudo policy and sends the password directly from the terminal to
+sudo. Hosts with a custom sudo timestamp policy may need the dedicated
+`Required IPv4 fixture` CI job.
+
 ## #374: replace the preservation spike with accepted infrastructure
 
 The original `3b00c6af` spike was rejected. Its two-file implementation is
