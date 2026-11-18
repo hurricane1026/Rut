@@ -299,7 +299,7 @@ bool ws_handle_timer_tick(Loop* loop, Connection& conn);
 // connect a fresh socket, GET <hc_path>, parse the status, and feed the result
 // into the shared BackendHealth via record_backend_result. Invoked from the
 // per-shard 1s sweep (EventLoopCRTP::sweep_health_probes). Defined in
-// callbacks_impl.h; EPOLL ONLY this slice. No-op if the slot pool is exhausted
+// callbacks_impl.h. No-op if the slot pool is exhausted
 // (never starve real traffic with probes).
 // Returns true iff a probe socket was submitted (may consume one epoll
 // pending-ring slot); false if skipped/aborted before submit. sweep_health_probes
@@ -312,8 +312,11 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 // intentional in-flight skip from a local launch deferral.
 bool probe_in_flight(u16 upstream_id, u32 backend_idx);
 
-// Minimal teardown for a health-probe Connection: clears the in-flight guard for
-// the probe's (upstream, backend) then routes through Loop::free_health_probe.
+// Release the single-probe guard only after the backend has retired all I/O.
+void release_health_probe_guard(Connection& conn);
+
+// Backend-specific probe teardown. The in-flight guard is released only after
+// all I/O ownership has drained (immediate for reactor backends).
 // Invoked from the per-shard timer tick to reap a stalled probe. Defined in
 // callbacks_impl.h.
 template <typename Loop>

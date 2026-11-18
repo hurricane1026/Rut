@@ -1564,6 +1564,19 @@ is introduced. New RCU configurations begin at zero. Native artifact version
 19 records the new layout and rejects earlier artifacts for recompilation.
 
 
+Active HTTP probes use the existing upstream `health_check` object on both Linux
+backends. io_uring uses one-shot receives into probe-owned slices, immutable
+address bytes in the otherwise-unused send slice, and the existing exact-episode
+retirement ledger for close/cancel retry. The per-target in-flight guard is
+released with slot reclamation, after every target/cancel completion. Probe
+callbacks do not refresh the absolute upstream deadline or change client metrics.
+Each sweep is bounded to 32 issues and reserves 64 client slots plus backend
+submission headroom (16 SQ entries on io_uring). Drain suppresses new probes.
+Pointer plus configuration identity rejects old verdicts after reload/address
+reuse. All-ejected fail-open behavior remains the legacy selection contract.
+HTTPS and gRPC health protocols remain absent. Native artifact version 20 also
+records the added Connection probe identity. See [scope and tests](docs/kong-active-health.md).
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

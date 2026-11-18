@@ -660,6 +660,7 @@ public:
     // side-effects apply. Removes the probe socket from kqueue, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
+        release_health_probe_guard(c);
         (void)backend.detach_upstream(c);
         if (c.id < KqueueBackend::kMaxFdMap) {
             backend.downstream_fd_map[c.id] = -1;

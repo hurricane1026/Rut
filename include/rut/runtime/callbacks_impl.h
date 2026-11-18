@@ -262,7 +262,7 @@ inline void hold_backend_active(Connection& conn, const RouteConfig* cfg = nullp
     ++*conn.backend_active;
 }
 
-// --- Active health-check probes (Phase 5 slice 2) — EPOLL ONLY ---
+// --- Active HTTP health-check probes ---
 //
 // A probe is a Connection with fd == -1 (no downstream client) whose upstream_fd
 // is a fresh socket to ONE backend of an hc_enabled upstream. The 1s sweep
@@ -270,8 +270,8 @@ inline void hold_backend_active(Connection& conn, const RouteConfig* cfg = nullp
 // probe connects, sends `GET <hc_path> HTTP/1.1`, parses the response status, and
 // feeds the result into the SAME per-shard BackendHealth used by passive
 // ejection (record_backend_result), so select_backend honors both signals — no
-// parallel health state. Teardown goes through free_probe_conn (never the full
-// close_conn, which moves per-request metrics/epoch/access-log counters).
+// parallel health state. Teardown goes through free_probe_conn; io_uring uses
+// its close ledger with client metrics disabled, while reactors reclaim directly.
 //
 // Format "<ipv4>:<port>" (network-order sockaddr_in) for the probe Host header.
 // out must hold >= 22 bytes ("255.255.255.255:65535"). Returns bytes written.
@@ -322,16 +322,8 @@ template <typename Loop>
 void free_probe_conn(Loop* loop, Connection& conn) {
     // Minimal teardown — close the probe socket (EPOLL_CTL_DEL first) and return
     // the slot. Never touches metrics/epoch/access-log/keepalive (the probe is
-    // not a real request). free_health_probe is epoll-only; probes never run on
-    // io_uring this slice, so this is only instantiated for the epoll loop.
-    //
-    // Clearing the in-flight guard here covers every connected/sent/response
-    // teardown path (success and error). The probe carries the SAME
-    // (upstream_idx, backend_idx) it was launched against, so the flag is cleared
-    // at exactly the slot that was marked. The one mark-then-exit path that does
-    // NOT route through here — the create_socket-failure branch in
-    // start_health_probe (which calls free_conn directly) — clears it inline.
-    set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    // not a real request). Reactor backends reclaim immediately; io_uring keeps
+    // the buffers and in-flight guard until exact target/cancel ownership drains.
     loop->free_health_probe(conn);
 }
 
@@ -343,7 +335,8 @@ void free_probe_conn(Loop* loop, Connection& conn) {
 template <typename Loop>
 inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
     const RouteConfig* cur = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (cur == conn.request_config)
+    if (cur != nullptr && cur == conn.request_config &&
+        cur->http_cache_identity == conn.health_probe_config_identity)
         record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us);
 }
 
@@ -354,11 +347,9 @@ void on_probe_sent(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void on_probe_connected(void* lp, Connection& conn, IoEvent ev);
 
-// Returns true iff a probe socket was actually submitted (a connect that may
-// queue one synchronous completion into the epoll pending ring). Returns false
-// when the probe was skipped (already in-flight) or aborted before submit
-// (invalid index / local resource failure) — i.e. when no pending-ring slot was
-// consumed. sweep_health_probes uses this to budget probes against the ring.
+// Returns true iff a probe connect was submitted. Returns false for a skipped
+// probe or a local setup failure. sweep_health_probes budgets successful issues
+// against the reactor pending ring or io_uring SQ headroom.
 template <typename Loop>
 bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
@@ -372,14 +363,14 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // and a stalled health endpoint pins each probe slot until upstream_timeout
     // (~30s). Without a floor those probes could consume the last free slots
     // and real accepts would be refused for that whole window. Refuse to
-    // allocate a probe when free slots are below the reserve; the deferred
+    // allocate a probe when it would consume the reserve; the deferred
     // probe simply retries on the next sweep (probe_in_flight is left unset, so
     // the retry is idempotent). The reserve (64) comfortably exceeds a full
     // 32-probe sweep burst yet is negligible against kMaxConns (16384), so it
     // never meaningfully reduces real-traffic capacity. Checked before
     // set_probe_in_flight so a deferral leaves no guard to clear.
     static constexpr u32 kHealthProbeSlotReserve = 64;
-    if (loop->free_conn_slots() < kHealthProbeSlotReserve) return false;
+    if (loop->free_conn_slots() <= kHealthProbeSlotReserve) return false;
 
     // At most one outstanding probe per backend (see probe_in_flight). A backend
     // that accepts but never responds otherwise accumulates a probe Connection per
@@ -396,11 +387,14 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     }
     Connection& conn = *cptr;
     conn.is_health_probe = true;
+    conn.set_metrics_client(false);
     conn.fd = -1;
     conn.upstream_idx = upstream_idx;
     conn.upstream_backend_idx = static_cast<u8>(backend_idx);
-    // Pin the launching config so on_probe_* drops results after a hot swap.
+    // Capture identity without retaining pointers into configuration storage.
+    // A replacement at the same address must not accept this probe's verdict.
     conn.request_config = config;
+    conn.health_probe_config_identity = config->http_cache_identity;
 
     // Probe-SETUP failures below (create_socket / alloc_buf / submit_connect) are
     // LOCAL resource or kernel-submission failures, not backend health signals —
@@ -427,9 +421,14 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     conn.reset_request_receive_buffer();
     build_probe_request(conn, target, backend_idx);
 
+    // io_uring reads the connect address after submission. Keep it in an owned,
+    // otherwise unused send slice instead of borrowing a reloadable config.
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>(&target.addrs[backend_idx]),
+                        sizeof(target.addrs[backend_idx]));
+
     conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
-    if (!loop->submit_connect(
-            conn, &target.addrs[backend_idx], sizeof(target.addrs[backend_idx]))) {
+    if (!loop->submit_connect(conn, conn.send_buf.data(), sizeof(target.addrs[backend_idx]))) {
         free_probe_conn(loop, conn);
         return false;
     }
@@ -531,7 +530,8 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // comparison — after a swap the response is meaningless, so free without
     // recording (the stale result must not touch the new backend at this index).
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (config != conn.request_config) {
+    if (config == nullptr || config != conn.request_config ||
+        config->http_cache_identity != conn.health_probe_config_identity) {
         free_probe_conn(loop, conn);
         return;
     }

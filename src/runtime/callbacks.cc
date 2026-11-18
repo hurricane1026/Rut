@@ -1227,10 +1227,18 @@ template void throttle_resume<NativeReactorEventLoop>(NativeReactorEventLoop*, C
 #if RUT_ENABLE_WEBSOCKET
 template bool ws_handle_timer_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 #endif
-// Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
-// re-arms deadlines but issues no probes), so only the epoll instantiation is
-// emitted. This pulls in the on_probe_* callbacks + free_probe_conn transitively.
+// Emit probe callbacks for the native reactor and io_uring loops.
 template bool start_health_probe<NativeReactorEventLoop>(NativeReactorEventLoop*, u16, u32);
+#ifdef __linux__
+template bool start_health_probe<IoUringEventLoop>(IoUringEventLoop*, u16, u32);
+template void record_probe_if_current<IoUringEventLoop>(IoUringEventLoop*, Connection&, bool, u64);
+#endif
+
+void release_health_probe_guard(Connection& conn) {
+    if (!conn.is_health_probe) return;
+    set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    conn.is_health_probe = false;
+}
 
 // Out-of-line definition (declared in callbacks.h, documented in callbacks_impl.h)
 // — odr-used from sweep_health_probes in multiple TUs, so a single strong symbol

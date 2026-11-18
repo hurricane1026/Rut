@@ -528,6 +528,25 @@ Retries release the failed attempt before selecting again. Both algorithms
 skip ejected backends when healthy ones exist and retain the existing fail-open
 behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md §3.4.1](../DESIGN.md#341-listening-tls-and-upstream).
 
+## Active HTTP upstream health checks
+
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    health_check: { path: "/healthz", interval: 1s, status: 200 }
+}
+```
+
+Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
+A complete expected status restores the target; connect/read errors, malformed
+responses, unexpected status and timeout eject it until a successful probe.
+Each shard/target has at most one probe, including cancellation drain. Weight 0
+suppresses probes and forwarding. Probe capacity is bounded and reserved away
+from client slots; drain starts no new probes. Configuration replacement drops
+old results, including reuse of a configuration address. Existing all-ejected
+fail-open selection remains unchanged. HTTPS and HTTP/2/gRPC probes are absent.
+See [active-health scope and verification](kong-active-health.md).
+
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

@@ -493,16 +493,13 @@ public:
         }
     }
 
-    // --- Active health-check probes (`health_check { ... }`) — EPOLL ONLY ---
+    // --- Active HTTP health-check probes ---
     // Per-upstream probe deadlines, mirroring timer_deadline_ns. Re-armed (from
-    // activation) whenever the active config changes — same generation guard as
-    // fire_due_timers — so an upstream's `interval` measures from config install,
-    // not from a stale deadline. Lives in the CRTP base so the re-arm bookkeeping
-    // runs on BOTH backends; the actual probe issue is gated to epoll this slice
-    // (Derived::kSupportsHealthProbe), since only the epoll loop can synchronously
-    // tear a probe Connection down. io_uring probing is a deliberate follow-up.
+    // activation) whenever the active config changes. Each backend bounds issue
+    // by its submission capacity and reclaims probes using its own I/O lifetime.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
     const RouteConfig* health_armed_config = nullptr;
+    u64 health_armed_identity = 0;
     u32 health_probe_sweep_cursor = 0;
 
     // Detect a config swap (first install or hot reload) and, if so, reset the
@@ -523,12 +520,15 @@ public:
     // in that window would route off stale numeric-slot verdicts. It advances
     // health_armed_config, so the subsequent sweep on the Timeout path sees no
     // change and does NOT double-reset (reset happens exactly once per swap).
-    // Runs on BOTH backends (probe issue below stays epoll-only).
+    // Runs before request dispatch on both backends.
     bool arm_health_on_config_change() {
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
-        if (cfg == health_armed_config) return false;
+        if (cfg == health_armed_config &&
+            (cfg == nullptr || cfg->http_cache_identity == health_armed_identity))
+            return false;
         health_armed_config = cfg;
+        health_armed_identity = cfg ? cfg->http_cache_identity : 0;
         if (password_gateway) password_gateway->net_clients.adopt_config(cfg);
         health_probe_sweep_cursor = 0;
         reset_backend_health();
@@ -555,9 +555,10 @@ public:
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
         const u64 now = monotonic_ns();
         if (cfg == nullptr || cfg->upstream_count == 0) return;
-        // The config-change re-arm (arm_health_on_config_change) runs on both
-        // backends; the probe issue below is epoll only. On io_uring this
-        // returns here (a safe no-op for the sweep).
+        if constexpr (requires { self().is_draining(); }) {
+            if (self().is_draining()) return;
+        }
+        // Loops that opt out still perform generation-aware health resets.
         if constexpr (!Derived::kSupportsHealthProbe) {
             return;
         } else {
@@ -581,11 +582,17 @@ public:
             // that complete quickly cannot consume the whole budget every tick.
             static constexpr u32 kMaxProbesPerSweep = 32;
             static constexpr u32 kProbePendingReserve = 16;
-            const u32 ring = self().backend.kPendingCap;
-            const u32 pend = self().backend.pending_count;
-            const u32 avail =
-                (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
-            u32 budget = avail < kMaxProbesPerSweep ? avail : kMaxProbesPerSweep;
+            u32 budget = kMaxProbesPerSweep;
+            if constexpr (requires { self().health_probe_issue_budget(); }) {
+                const u32 available = self().health_probe_issue_budget();
+                if (available < budget) budget = available;
+            } else {
+                const u32 ring = self().backend.kPendingCap;
+                const u32 pend = self().backend.pending_count;
+                const u32 avail =
+                    (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
+                if (avail < budget) budget = avail;
+            }
             const u32 start = (n == 0) ? 0 : (health_probe_sweep_cursor % n);
             u32 next_cursor = start;
             bool cursor_advanced = false;
@@ -600,6 +607,7 @@ public:
                 }
                 bool all_issued = true;
                 for (u32 b = 0; b < up.addr_count; b++) {
+                    if (up.weights[b] == 0) continue;
                     if (probe_in_flight(static_cast<u16>(u), b)) continue;
                     if (budget == 0) {
                         all_issued = false;

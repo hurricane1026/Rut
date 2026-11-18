@@ -1908,7 +1908,8 @@ u32 IoUringBackend::wait(
                     conn.response_read_deadline_owner_generation != 0 &&
                     conn.response_read_deadline_owner_generation ==
                         conn.response_read_deadline_generation;
-                stale_direct = aux != 0 || conn.fd < 0 ||
+                stale_direct = aux != 0 ||
+                               (conn.fd < 0 && !(conn.is_health_probe && conn.upstream_fd >= 0)) ||
                                (!conn.upstream_recv_armed && !conn.upstream_recv_cancel_inflight);
             }
 
@@ -2028,9 +2029,12 @@ u32 IoUringBackend::wait(
                 type != IoEventType::UpstreamSend ||
                 (valid_upstream_episode(upstream_episode) &&
                  ss.upstream_episode == upstream_episode &&
-                 (conns == nullptr || (conn_id < max_conns && conns[conn_id].fd >= 0 &&
-                                       conns[conn_id].upstream_episode == upstream_episode &&
-                                       conns[conn_id].upstream_send_armed)));
+                 (conns == nullptr ||
+                  (conn_id < max_conns &&
+                   (conns[conn_id].fd >= 0 ||
+                    (conns[conn_id].is_health_probe && conns[conn_id].upstream_fd >= 0)) &&
+                   conns[conn_id].upstream_episode == upstream_episode &&
+                   conns[conn_id].upstream_send_armed)));
             if (!live_upstream_send_owned) {
                 // This CQE belongs to a previous upstream episode (or is
                 // malformed). Never apply its byte count to the state now

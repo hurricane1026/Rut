@@ -377,10 +377,8 @@ private:
 public:
     static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
     u32 connection_capacity = 0;
-    // Active health-check probing requires synchronous probe teardown; the
-    // io_uring loop doesn't support that yet, so sweep_health_probes only re-arms
-    // deadlines here and issues no connects (epoll-only this slice).
-    static constexpr bool kSupportsHealthProbe = false;
+    // Probe cancellation uses the same exact-episode retirement as requests.
+    static constexpr bool kSupportsHealthProbe = true;
     static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
     static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
@@ -730,9 +728,7 @@ public:
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
-        // Reset/arm active-health state at activation (#161 F4). io_uring issues
-        // no probes this slice, but the reset still clears stale numeric-slot
-        // verdicts that routing reads.
+        // Reset verdicts and arm probe deadlines from this configuration install.
         this->arm_health_on_config_change();
         IoEvent events[kMaxEventsPerWait];
 
@@ -885,6 +881,9 @@ public:
 
     void shutdown() {
         this->discard_ready_jit_handlers();
+        for (u32 i = 0; i < slots_initialized; ++i) {
+            if (conns[i].is_health_probe && conns[i].upstream_fd >= 0) free_health_probe(conns[i]);
+        }
         close_deferred_idle_return_fds();
         reclaim_pending();
         if (idle_trim_pidfd >= 0) {
@@ -892,6 +891,7 @@ public:
             idle_trim_pidfd = -1;
         }
         backend.shutdown();
+        for (u32 i = 0; i < slots_initialized; ++i) release_health_probe_guard(conns[i]);
         // No further CQE can retire relay polls after the backend has stopped.
         // Close every connection-owned pipe explicitly before destroying the
         // mmap-backed slots; integer pipe descriptors are not owned by reset().
@@ -944,6 +944,7 @@ public:
     }
 
     u32 active_count() const { return connection_capacity - free_top; }
+    u32 free_conn_slots() const { return free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
     // Only called when a connection starts proxying — non-proxy connections
@@ -3165,6 +3166,7 @@ public:
         // Every deferred slot enters pending_free in free_conn_impl. Refusing
         // an unowned reclaim makes duplicate finals idempotent.
         if (!was_pending) return;
+        if (conns[cid].is_health_probe) release_health_probe_guard(conns[cid]);
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -3216,6 +3218,7 @@ public:
                 !conns[cid].relay_owner.write_cancel_retry &&
                 !conns[cid].relay_owner.close_pending && conns[cid].relay_owner.segment_len == 0 &&
                 conns[cid].response_read_timer_owner_is_neutral()) {
+                if (conns[cid].is_health_probe) release_health_probe_guard(conns[cid]);
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -3368,6 +3371,7 @@ public:
             if (c.upstream_relay_slice) pool.free(c.upstream_relay_slice);
             if (c.response_header_slice) pool.free(c.response_header_slice);
             c.response_body_tail.release();
+            if (c.is_health_probe) release_health_probe_guard(c);
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             release_deferred_epoch(c);
@@ -3407,7 +3411,16 @@ public:
         const bool deadline_send_close_cancel_owned =
             c.response_read_deadline_send_close_cancel_owned;
         const bool epoch_leave_deferred = c.epoch_leave_deferred;
+        const bool health_probe_guard_owned = c.is_health_probe;
+        const u16 health_probe_upstream = c.upstream_idx;
+        const u8 health_probe_backend = c.upstream_backend_idx;
         c.reset();
+        if (health_probe_guard_owned) {
+            c.is_health_probe = true;
+            c.set_metrics_client(false);
+            c.upstream_idx = health_probe_upstream;
+            c.upstream_backend_idx = health_probe_backend;
+        }
         conns[cid].id = cid;
         conns[cid].shard_id = allocated_shard;
         conns[cid].ws_c2u_out = ws_c2u_out;
@@ -4629,6 +4642,20 @@ public:
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
+        if (c.is_health_probe) {
+            if (c.upstream_recv_armed) return true;
+            const u32 available = c.upstream_recv_buf.write_avail();
+            if (available == 0 || !backend.add_recv_upstream_direct(c.upstream_fd,
+                                                                    c.id,
+                                                                    c.upstream_episode,
+                                                                    c.upstream_recv_buf.write_ptr(),
+                                                                    available))
+                return false;
+            c.upstream_recv_direct_armed = true;
+            ++c.pending_ops;
+            c.upstream_recv_armed = true;
+            return true;
+        }
         if (c.upstream_recv_paused_for_send) {
             c.upstream_recv_pause_rearm_pending = true;
             return true;
@@ -7495,7 +7522,54 @@ public:
                send.remaining == remaining - send.offset;
     }
 
+    // Leave SQ headroom for ordinary traffic and close-path cancellation.
+    u32 health_probe_issue_budget() const {
+        if (!backend.sq_head || !backend.sq_tail) return 0;
+        const u32 used = __atomic_load_n(backend.sq_tail, __ATOMIC_RELAXED) -
+                         __atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE);
+        constexpr u32 kReserve = 16;
+        return used < backend.sq_ring_entries && backend.sq_ring_entries - used > kReserve
+                   ? backend.sq_ring_entries - used - kReserve
+                   : 0;
+    }
+
+    void free_health_probe(Connection& c) {
+        // The ordinary exact-episode close ledger retains buffers and the guard
+        // until every target/cancel CQE drains. Probe slots have no client or
+        // request metrics, so this does not account a fictitious request.
+        this->close_conn(c);
+    }
+
+    bool dispatch_health_probe_event(Connection& c, const IoEvent& ev) {
+        if (!c.is_health_probe || c.upstream_fd < 0) return false;
+        // A probe owns only one one-shot operation at a time. Closed probes use
+        // the ordinary close ledger below, never these live callbacks.
+        if (ev.aux != 0 || ev.more || ev.upstream_episode != c.upstream_episode) return true;
+        bool* armed = nullptr;
+        if (ev.type == IoEventType::UpstreamConnect) armed = &c.upstream_connect_armed;
+        if (ev.type == IoEventType::UpstreamSend) armed = &c.upstream_send_armed;
+        if (ev.type == IoEventType::UpstreamRecv) armed = &c.upstream_recv_armed;
+        if (!armed || !*armed || c.pending_ops == 0) return true;
+        *armed = false;
+        --c.pending_ops;
+        if (ev.type == IoEventType::UpstreamRecv) c.upstream_recv_direct_armed = false;
+        this->dispatch_event(c, ev);
+        return true;
+    }
+
     void close_conn_impl(Connection& c) {
+        if (c.is_health_probe && c.upstream_fd >= 0) {
+            u8 targets = 0;
+            if (c.upstream_connect_armed) targets |= kUpstreamOpConnect;
+            if (c.upstream_send_armed) targets |= kUpstreamOpSend;
+            if (c.upstream_recv_armed) targets |= kUpstreamOpRecv;
+            // Reuse exact-episode retirement, including its SQ-pressure retry
+            // ledger. Closing an fd alone cannot cancel a kernel-owned recv.
+            if (targets != 0 && !begin_upstream_retirement_impl(c, targets, false, true)) {
+                backend.fatal_error.store(EPROTO, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+            }
+        }
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
             // logical plaintext continuation. The common ledger survives
@@ -8283,6 +8357,11 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+                        if (c->is_health_probe && c->upstream_fd >= 0) {
+                            record_probe_if_current(this, *c, false, monotonic_us());
+                            free_health_probe(*c);
+                            return;
+                        }
 #if RUT_ENABLE_WEBSOCKET
                         if (ws_handle_timer_tick(this, *c)) return;
 #endif
@@ -8322,8 +8401,7 @@ public:
                     });
                 }
                 this->fire_due_timers();
-                // io_uring: sweep re-arms health-probe deadlines but issues no
-                // probes (kSupportsHealthProbe == false). EPOLL-only this slice.
+                // Budget active probes against SQ capacity and client slot reserves.
                 this->sweep_health_probes();
                 // Evict idle pooled upstream sockets past the keepalive deadline
                 // (1s-granular) — bounds dead-socket accumulation for endpoints that
@@ -8358,6 +8436,7 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < slots_initialized) {
                     auto& conn = conns[ev.conn_id];
+                    if (dispatch_health_probe_event(conn, ev)) break;
                     if (ev.type == IoEventType::Send && consume_tagged_send_close_event(conn, ev))
                         break;
                     if (ev.type == IoEventType::Send && consume_tls_ciphertext_send_event(conn, ev))
@@ -9086,7 +9165,7 @@ private:
 
     void close_live_clients() {
         for (u32 i = 0; i < slots_initialized; i++) {
-            if (conns[i].fd >= 0) {
+            if (conns[i].fd >= 0 || (conns[i].is_health_probe && conns[i].upstream_fd >= 0)) {
                 // A LIVE keep-alive client can also hold a parked idle_return_fd while
                 // its upstream recv cancel drains. close_conn takes the deferred path
                 // here (keeps the conn allocated, leaves idle_return_fd for a future

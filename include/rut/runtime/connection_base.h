@@ -479,6 +479,7 @@ struct ConnectionBase {
     // backend (fd == -1, no downstream; upstream_fd is the probe socket). Gates
     // close_conn to the minimal probe teardown (no metrics/epoch/access-log).
     bool is_health_probe;
+    u64 health_probe_config_identity;
     // io_uring h2-proxy reuse guards (epoll is synchronous → both stay false there).
     // h2_proxy_recv_draining: a multishot upstream recv from a torn-down h2 proxy
     // episode may still deliver a terminal CQE; the next episode must not arm its
@@ -2190,6 +2191,7 @@ struct ConnectionBase {
         idle_return_config = nullptr;
         close_after_idle_return = false;
         is_health_probe = false;
+        health_probe_config_identity = 0;
         h2_proxy_recv_draining = false;
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;

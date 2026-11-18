@@ -431,6 +431,19 @@ target_include_directories(test_exact_path_view PRIVATE
 add_test(NAME test_exact_path_view COMMAND test_exact_path_view)
 set_tests_properties(test_exact_path_view PROPERTIES LABELS "unit")
 
+set(HEALTH_PROBE_CHECK_COMMAND)
+set(HEALTH_PROBE_CHECK_DEPENDS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_health_probes test_health_probes.cc)
+    target_link_libraries(test_health_probes PRIVATE rut_runtime)
+    target_include_directories(test_health_probes PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+    target_compile_definitions(test_health_probes PRIVATE RUT_TESTING=1)
+    add_test(NAME test_health_probes COMMAND test_health_probes)
+    set_tests_properties(test_health_probes PROPERTIES LABELS "unit;network;kong-core" TIMEOUT 60)
+    set(HEALTH_PROBE_CHECK_COMMAND COMMAND $<TARGET_FILE:test_health_probes>)
+    set(HEALTH_PROBE_CHECK_DEPENDS test_health_probes)
+endif()
+
 add_executable(test_network
     test_network.cc
     test_password_gateway.cc
@@ -4524,6 +4537,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
+        ${HEALTH_PROBE_CHECK_COMMAND}
         COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND ${TIMER_MODEL_CHECK_COMMAND}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_timer_model.py --check-only
@@ -4603,7 +4617,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_routing_properties test_regex_capture
+        DEPENDS test_network ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_routing_properties test_regex_capture
         COMMENT "Running all tests..."
     )
 else()
@@ -4618,6 +4632,7 @@ else()
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
         COMMAND $<TARGET_FILE:test_network>
+        ${HEALTH_PROBE_CHECK_COMMAND}
         COMMAND $<TARGET_FILE:test_wait_scheduler>
         COMMAND ${TIMER_MODEL_CHECK_COMMAND}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_timer_model.py --check-only
@@ -4691,7 +4706,7 @@ else()
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_regex_capture
+        DEPENDS test_network ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_regex_capture
         COMMENT "Running non-JIT tests..."
     )
 endif()
@@ -5496,5 +5511,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --backend ${weighted_backend})
         set_tests_properties(test_weighted_upstream_${weighted_backend} PROPERTIES
             LABELS "integration;network;load-balance;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(health_backend epoll io_uring)
+        add_test(NAME test_active_health_${health_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_active_health.py
+                --server $<TARGET_FILE:rut> --backend ${health_backend})
+        set_tests_properties(test_active_health_${health_backend} PROPERTIES
+            LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
