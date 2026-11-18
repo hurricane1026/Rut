@@ -3595,6 +3595,13 @@ and does not enable a disabled Consumer. The new ID must be unused even among
 disabled records; retaining the old record requires a free credential slot.
 Rotation is offline and deployment remains explicit (#1072 remains open).
 
+Offline `rut-consumers diff BEFORE AFTER` validates both existing private
+snapshots and emits structured added/removed/changed metadata. Credential key
+fields are omitted; changed records expose only key-material and representation
+change booleans. Decoded IDs/strings and group sets ignore encoding/order-only
+edits, while optional groups/window presence is retained. It creates no files
+and does not publish to gateways; see [the audit contract](consumer-registry.md#offline-administration).
+
 Credentials may optionally set `groups`: omission inherits the Consumer's
 groups, `[]` removes all group authority, and a nonempty list may only select
 unique existing owner groups. This least-privilege subset is validated for the
