@@ -46,19 +46,26 @@ The deliberately bounded DNS profile sends one random-ID IN A query (labels at
 most 63 bytes) without EDNS. It accepts one echoed question and 1–8 total answer
 records in a single reply of at most 512 bytes. Answers must form exactly one
 chain from the echoed question, with at most four CNAME hops followed by one or
-more A records. Record order and hostname case do not matter. Every record must
-have a positive 31-bit TTL; zero and high-bit-set TTLs are rejected. Every terminal
-A address must be allowed, including answers after the first selected address.
-It does not select a convenient allowed answer from a mixed poisoned set.
+more A records. Chain validation accepts records in any order and compares names
+case-insensitively. Every record must have a positive 31-bit TTL. Before making
+any HTTPS connection, the gateway validates the whole reply and requires each
+terminal A address to be allowlisted, including later answers.
 
 Names are bounded to 253 expanded bytes and 63 bytes per label. Compression may
 only point backwards to a previously decoded valid label boundary, with bounded
 pointer traversal. Forks, duplicate CNAMEs, cycles, an owner with both A and CNAME,
 missing terminal A records, unrelated answers, malformed or trailing RDATA/bytes,
 AAAA, truncation, DNS errors and authority/additional sections fail the attempt.
-There are no follow-up alias queries, TCP fallback or independent DNS cache:
-refresh controls bound retries, and the address is used only within that attempt's
-total deadline. The configured resolver must provide this bounded A/CNAME profile.
+The configured resolver must provide this bounded UDP A/CNAME profile. The
+gateway uses the response only for the current refresh attempt.
+
+Within an attempt the gateway tries distinct terminal A addresses in their
+original answer order. It moves to the next address only when TCP establishment
+reports a connection refusal or another definitive network error. TLS, HTTP,
+metadata and key validation failures end the attempt. The next address uses
+the same total deadline and starts at discovery when discovery is configured.
+The remaining addresses are discarded when the deadline expires, including when
+an earlier address stalls. Each attempt uses one DNS query.
 
 TLS SNI/certificate hostname and CA remain fixed to the configured original
 server name even when a CNAME target or an allowed address changes. DNS is not
@@ -102,9 +109,9 @@ configuration retirement and shutdown close resolver and HTTPS workspaces.
 
 Tests cover deterministic malformed/truncated DNS and metadata, bounded compressed
 and reordered CNAME chains, alias poisoning, HTTP/1.1 and HTTP/2 denial/recovery,
-allowlisted address changes, prohibited rebinding, issuer/URI mismatch, redirects,
-resolver
-outage, TLS key rotation, empty-set removal, cache expiry, recovery and shutdown.
+allowlisted TCP failover, authoritative HTTP failure, prohibited rebinding,
+issuer/URI mismatch, redirects, resolver outage, TLS key rotation, empty-set
+removal, cache expiry, recovery and shutdown.
 Fixed-endpoint fixtures also measure immediate and slow-timeout failure retry
 spacing, with HTTP/1.1 and HTTP/2 maximum-age denial and recovery.
 Real native-loaded RS256 and ES256 gateways run after source removal on both

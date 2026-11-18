@@ -41,7 +41,7 @@ struct TlsOrigin {
     u32 fragment = 16384;
     bool clean_close = true;
     char request[2048]{};
-    bool init() {
+    bool init(u32 host_address = INADDR_LOOPBACK, u16 bind_port = 0) {
         context = SSL_CTX_new(TLS_server_method());
         if (!context ||
             SSL_CTX_use_certificate_chain_file(context, RUT_TESTDATA_DIR "/localhost_cert.pem") !=
@@ -53,7 +53,8 @@ struct TlsOrigin {
         if (listener < 0) return false;
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_addr.s_addr = htonl(host_address);
+        address.sin_port = htons(bind_port);
         if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
             listen(listener, 8) != 0)
             return false;
@@ -1242,33 +1243,37 @@ struct DnsOrigin {
         port = ntohs(address.sin_port);
         return true;
     }
-    bool reply(bool allowed) {
+    bool reply(u8 first, u8 second) {
         u8 packet[512]{};
         sockaddr_in peer{};
         socklen_t size = sizeof(peer);
         const auto length =
-            recvfrom(fd, packet, sizeof(packet) - 16, 0, reinterpret_cast<sockaddr*>(&peer), &size);
+            recvfrom(fd, packet, sizeof(packet) - 32, 0, reinterpret_cast<sockaddr*>(&peer), &size);
         if (length < 0) return false;
         packet[2] = 0x81;
         packet[3] = 0x80;
-        packet[7] = 1;
-        const u8 answer[] = {
-            0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, static_cast<u8>(allowed ? 1 : 2)};
+        packet[7] = second ? 2 : 1;
+        u8 answer[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 127, 0, 0, first};
         __builtin_memcpy(packet + length, answer, sizeof(answer));
+        if (second) {
+            answer[sizeof(answer) - 1] = second;
+            __builtin_memcpy(packet + length + sizeof(answer), answer, sizeof(answer));
+        }
+        const auto kResponseSize = length + packet[7] * static_cast<ssize_t>(sizeof(answer));
         return sendto(fd,
                       packet,
-                      static_cast<u32>(length) + sizeof(answer),
+                      static_cast<u32>(kResponseSize),
                       0,
                       reinterpret_cast<sockaddr*>(&peer),
-                      size) == length + static_cast<ssize_t>(sizeof(answer));
+                      size) == kResponseSize;
     }
     ~DnsOrigin() {
         if (fd >= 0) close(fd);
     }
 };
-void complete_jwks(JwksFetch& fetch, DnsOrigin* resolver = nullptr, bool allowed = true) {
+void complete_jwks(JwksFetch& fetch, DnsOrigin* resolver = nullptr, u8 first = 1, u8 second = 0) {
     for (u32 i = 0; i < 3000 && fetch.state() == JwksFetch::State::Busy; ++i) {
-        if (resolver) (void)resolver->reply(allowed);
+        if (resolver) (void)resolver->reply(first, second);
         fetch.advance(jwt_monotonic_ms());
         usleep(1000);
     }
@@ -1280,6 +1285,27 @@ TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
     REQUIRE(dns.init());
     TlsOrigin origin;
     REQUIRE(origin.init());
+#ifdef __linux__
+    // Reserve the first destination without listening so its TCP connection is refused.
+    struct RefusingSocket {
+        int fd = test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
+        ~RefusingSocket() {
+            if (fd >= 0) close(fd);
+        }
+    } unavailable;
+    REQUIRE(unavailable.fd >= 0);
+    sockaddr_in refused{};
+    refused.sin_family = AF_INET;
+    refused.sin_addr.s_addr = htonl(INADDR_LOOPBACK + 1);
+    refused.sin_port = htons(origin.port);
+    REQUIRE(bind(unavailable.fd, reinterpret_cast<sockaddr*>(&refused), sizeof(refused)) == 0);
+    constexpr u8 kFirst = 2;
+    constexpr u8 kSecond = 1;
+#else
+    // Additional addresses in 127/8 can require interface aliases on macOS.
+    constexpr u8 kFirst = 1;
+    constexpr u8 kSecond = 0;
+#endif
     char discovery[2048];
     char body[1024];
     const int body_length =
@@ -1307,7 +1333,8 @@ TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
     strcpy(configuration.discovery_issuer, "https://localhost/tenant");
     strcpy(configuration.dns_address, "127.0.0.1");
     strcpy(configuration.allowed_addresses[0], "127.0.0.1");
-    configuration.allowed_count = 1;
+    strcpy(configuration.allowed_addresses[1], "127.0.0.2");
+    configuration.allowed_count = 2;
     configuration.dns_port = dns.port;
     JwksFetch fetch;
     REQUIRE(fetch.init(configuration));
@@ -1317,17 +1344,22 @@ TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
     CHECK(!fetch.init(RemoteJwks{}));
     CHECK(!fetch.start(jwt_monotonic_ms(), 3000));
     CHECK(fetch.body().len == 0);
-    complete_jwks(fetch, &dns);
+    complete_jwks(fetch, &dns, kFirst, kSecond);
     REQUIRE_EQ(fetch.state(), JwksFetch::State::Done);
     CHECK(fetch.body().eq(lit_str("{\"keys\":[]}")));
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 2u);
     fetch.advance(0);  // A completed result is stable until explicit restart/cancel.
     CHECK_EQ(fetch.state(), JwksFetch::State::Done);
     REQUIRE(fetch.start(jwt_monotonic_ms(), 3000));
-    complete_jwks(fetch, &dns, false);
+    complete_jwks(fetch, &dns, 1, 3);
     CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
     CHECK_EQ(fetch.body().len, 0u);
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 2u);
     const u64 now = jwt_monotonic_ms();
     REQUIRE(fetch.start(now, 100));
+    REQUIRE(dns.reply(kFirst, kSecond));
+    fetch.advance(now + 99);
+    fetch.advance(now + 99);
     fetch.advance(now + 100);
     CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
     REQUIRE(fetch.start(now, 100));
@@ -1339,6 +1371,38 @@ TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
     fetch.advance(now + 1);
     CHECK_EQ(fetch.state(), JwksFetch::State::Cancelled);
 }
+#ifdef __linux__
+TEST(https_fetch, jwks_dns_http_failure_does_not_try_another_address) {
+    signal(SIGPIPE, SIG_IGN);
+    DnsOrigin dns;
+    REQUIRE(dns.init());
+    TlsOrigin primary;
+    primary.responses[0] = lit_str("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+    primary.count = 1;
+    REQUIRE(primary.init(INADDR_LOOPBACK + 1));
+    TlsOrigin alternative;
+    alternative.responses[0] = lit_str(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        "11\r\n\r\n{\"keys\":[]}");
+    alternative.count = 1;
+    REQUIRE(alternative.init(INADDR_LOOPBACK, primary.port));
+    RemoteJwks configuration;
+    configuration.endpoint = alternative.endpoint();
+    strcpy(configuration.dns_address, "127.0.0.1");
+    strcpy(configuration.allowed_addresses[0], "127.0.0.1");
+    strcpy(configuration.allowed_addresses[1], "127.0.0.2");
+    configuration.allowed_count = 2;
+    configuration.dns_port = dns.port;
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    REQUIRE(fetch.start(jwt_monotonic_ms(), 3000));
+    complete_jwks(fetch, &dns, 2, 1);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    CHECK_EQ(fetch.body().len, 0u);
+    CHECK_EQ(__atomic_load_n(&primary.served, __ATOMIC_ACQUIRE), 1u);
+    CHECK_EQ(__atomic_load_n(&alternative.served, __ATOMIC_ACQUIRE), 0u);
+}
+#endif
 TEST(https_fetch, jwks_discovery_rejects_mismatched_origin_and_uninitialized_fetch) {
     signal(SIGPIPE, SIG_IGN);
     TlsOrigin origin;

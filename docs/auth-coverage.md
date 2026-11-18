@@ -1617,9 +1617,9 @@ JIT tests also cover the 1024/1025-byte bound. See
   both backends. Eviction policy, volume integrity and replicated failover remain
   deployment responsibilities (#1076).
 - [JWKS DNS/discovery](jwks-discovery.md): bounded nonblocking A/CNAME resolution,
-  finite address allowlist, exact issuer and pre-authorized URI, both asymmetric
-  algorithms and both Linux backends. This is not unrestricted DNS/OIDC or
-  automatic admission of new kid inventory (#1077).
+  finite address allowlist, sequential failover after definitive TCP connect
+  failures, exact issuer and pre-authorized URI, both asymmetric algorithms
+  and both Linux backends (#1077).
 
 These profiles are proposed free foundations. Their security fixes and necessary
 failure protection do not depend on a commercial tier. Enterprise governance,

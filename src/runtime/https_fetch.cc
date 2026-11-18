@@ -210,6 +210,12 @@ bool HttpsFetch::fail() {
     state_ = State::Failed;
     return false;
 }
+bool HttpsFetch::fail_connect(int error) {
+    connect_failed_ = error == ECONNREFUSED || error == ECONNRESET || error == ETIMEDOUT ||
+                      error == EHOSTUNREACH || error == ENETUNREACH || error == EHOSTDOWN ||
+                      error == ENETDOWN;
+    return fail();
+}
 void HttpsFetch::cancel() {
     close();
     response_.reset();
@@ -269,6 +275,7 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     started_ = monotonic_ms;
     timeout_ms_ = timeout_ms;
     sent_ = 0;
+    connect_failed_ = false;
     state_ = State::Busy;
     fd_ = platform::stream_socket();
     if (fd_ < 0) return fail();
@@ -277,8 +284,8 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     address.sin_port = htons(endpoint_.port);
     if (inet_pton(AF_INET, endpoint_.address, &address.sin_addr) != 1) return fail();
     const int kResult = connect(fd_, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
-    if (kResult != 0 && errno != EINPROGRESS) return fail();
-    step_ = connected;
+    if (kResult != 0 && errno != EINPROGRESS) return fail_connect(errno);
+    step_ = kResult == 0 ? start_tls : connected;
     return true;
 }
 void HttpsFetch::advance(u64 monotonic_ms) {
@@ -297,8 +304,11 @@ bool HttpsFetch::connected(HttpsFetch& self) {
     if (!kReady) return false;
     int error = 0;
     socklen_t length = sizeof(error);
-    if (getsockopt(self.fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error)
-        return self.fail();
+    if (getsockopt(self.fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0) return self.fail();
+    if (error) return self.fail_connect(error);
+    return start_tls(self);
+}
+bool HttpsFetch::start_tls(HttpsFetch& self) {
     auto ssl = create_tls_client_ssl(self.context_, self.fd_, self.endpoint_.tls.server_name);
     if (!ssl) return self.fail();
     self.ssl_ = ssl.value();

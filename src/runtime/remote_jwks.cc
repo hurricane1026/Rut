@@ -275,7 +275,10 @@ bool jwks_discovery_valid(json::Document& document, Str body, const RemoteJwks& 
     return issuer && uri;
 }
 
-bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, char (&address)[16]) {
+bool jwks_dns_answer(Str packet,
+                     Str query,
+                     const RemoteJwks& configuration,
+                     JwksDnsAddresses& addresses) {
     if (!packet.ptr || !query.ptr || query.len < 17 || query.len > 272 || packet.len > 512 ||
         packet.len < query.len)
         return false;
@@ -285,7 +288,10 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
         memcmp(packet.ptr + 12, query.ptr + 12, query.len - 12) != 0)
         return false;
     const u32 answers = read16(bytes + 6);
-    if (!answers || answers > 8) return false;
+    constexpr u32 kMaxAnswers = 8;
+    if (!answers || answers > kMaxAnswers ||
+        configuration.allowed_count > RemoteJwks::kMaxDnsAddresses)
+        return false;
     bool boundaries[512]{};
     char current[254]{};
     u32 question_end = 12;
@@ -300,7 +306,7 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
         u16 type = 0;
         bool used = false;
     };
-    Record records[8]{};
+    Record records[kMaxAnswers]{};
     u32 offset = query.len;
     for (u32 i = 0; i < answers; ++i) {
         auto& record = records[i];
@@ -334,8 +340,8 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
     }
     if (offset != packet.len) return false;
     for (u32 depth = 0; depth <= 4; ++depth) {
-        u32 alias = answers, addresses = 0;
-        char selected[16]{};
+        u32 alias = answers;
+        JwksDnsAddresses selected;
         for (u32 i = 0; i < answers; ++i) {
             auto& record = records[i];
             if (strcmp(record.owner, current) != 0) continue;
@@ -345,15 +351,19 @@ bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, cha
                 if (alias != answers) return false;
                 alias = i;
             } else {
-                if (!addresses) __builtin_memcpy(selected, record.address, sizeof(selected));
-                ++addresses;
+                bool duplicate = false;
+                for (u32 n = 0; n < selected.count; ++n)
+                    duplicate |= strcmp(selected.values[n], record.address) == 0;
+                if (!duplicate)
+                    __builtin_memcpy(
+                        selected.values[selected.count++], record.address, sizeof(record.address));
             }
         }
-        if (addresses) {
+        if (selected.count) {
             if (alias != answers) return false;
             for (u32 i = 0; i < answers; ++i)
                 if (!records[i].used) return false;
-            __builtin_memcpy(address, selected, sizeof(address));
+            addresses = selected;
             return true;
         }
         if (alias == answers || depth == 4) return false;
@@ -381,6 +391,8 @@ void JwksFetch::cancel() {
     dns_fd_ = -1;
     keys_.cancel();
     discovery_.cancel();
+    addresses_.count = 0;
+    address_index_ = 0;
     state_ = State::Cancelled;
 }
 bool JwksFetch::fail() {
@@ -390,8 +402,21 @@ bool JwksFetch::fail() {
 }
 bool JwksFetch::begin_http(u64 now) {
     discovering_ = configuration_.discovery_path[0] != 0;
+    if (addresses_.count) {
+        const Str kAddress = ctext(addresses_.values[address_index_]);
+        if (!keys_.set_address(kAddress) || (discovering_ && !discovery_.set_address(kAddress)))
+            return fail();
+    }
     auto& fetch = discovering_ ? discovery_ : keys_;
-    return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) || fail();
+    return start_http(fetch, now);
+}
+bool JwksFetch::can_try_next_address(const HttpsFetch& fetch) const {
+    return fetch.connect_failed() && address_index_ + 1 < addresses_.count;
+}
+bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
+    // A synchronous connect error uses the same next-address path as SO_ERROR.
+    return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
+           can_try_next_address(fetch) || fail();
 }
 bool JwksFetch::start(u64 now, u32 timeout_ms) {
     if (!initialized_ || state_ == State::Busy || !now || !timeout_ms) return false;
@@ -442,28 +467,28 @@ void JwksFetch::advance(u64 now) {
         char packet[513];
         const auto count = ::recv(dns_fd_, packet, sizeof(packet), 0);
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
-        char address[16]{};
         if (count <= 0 || !jwks_dns_answer({packet, static_cast<u32>(count)},
                                            {reinterpret_cast<const char*>(query_), query_length_},
                                            configuration_,
-                                           address)) {
+                                           addresses_)) {
             (void)fail();
             return;
         }
         ::close(dns_fd_);
         dns_fd_ = -1;
-        if (!keys_.set_address(ctext(address)) ||
-            (configuration_.discovery_path[0] && !discovery_.set_address(ctext(address))) ||
-            !begin_http(now)) {
-            (void)fail();
-            return;
-        }
+        (void)begin_http(now);
+        return;
     }
     auto& fetch = discovering_ ? discovery_ : keys_;
     fetch.advance(now);
     if (fetch.state() == State::Busy) return;
     if (fetch.state() != State::Done) {
-        (void)fail();
+        if (can_try_next_address(fetch)) {
+            ++address_index_;
+            (void)begin_http(now);
+        } else {
+            (void)fail();
+        }
         return;
     }
     if (discovering_) {
@@ -474,7 +499,7 @@ void JwksFetch::advance(u64 now) {
         }
         discovery_.cancel();
         discovering_ = false;
-        if (!keys_.start(now, timeout_ - static_cast<u32>(now - started_))) (void)fail();
+        (void)start_http(keys_, now);
     } else
         state_ = State::Done;
 }
