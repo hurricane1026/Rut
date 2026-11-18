@@ -294,6 +294,33 @@ Deploy the replacement snapshot explicitly; this offline command does not revoke
 keys in already running programs or publish to gateways. Broader Consumer
 administration, distribution and durable lifecycle work remains open in #1072.
 
+`prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT` writes a new snapshot
+without credentials that are explicitly disabled or have a finite positive
+`expiresAt` less than or equal to the supplied cutoff. The cutoff is a canonical
+positive decimal integer from 1 through 9223372036854775807: signs, leading zeros,
+whitespace, fractions, exponents and overflow are rejected. The CLI never reads
+the clock; the operator may deliberately choose a past or future cutoff.
+
+All Consumers remain, including disabled ones. A disabled Consumer alone does
+not remove its enabled credentials. Missing or zero expiry is unbounded, and
+`notBefore` does not select records for pruning. Retained credentials keep their
+original order, full metadata, optional-field presence and raw/hash key form.
+The whole input, including records selected for removal, and the complete result
+must pass runtime validation before existing private 0600 atomic no-replace
+publication. A no-op still publishes a new validated copy; success is silent.
+Invalid input, cutoff or output leaves the source unchanged and reports no key
+material. Existing destinations are never replaced.
+
+```sh
+build/src/rut-consumers prune-credentials consumer-config/v3.json 1800000000 consumer-config/v4.json
+```
+
+Pruning frees credential slots and removes those IDs from the new snapshot, so a
+later snapshot can reuse them. It is not a durable revocation list or history
+store. Existing input files still contain their old records and secrets;
+retention and secure retirement remain host responsibilities. Running gateways
+keep their loaded snapshots until explicit deployment. #1072 remains open.
+
 An apply transaction has exactly four required arrays:
 
 ```json

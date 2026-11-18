@@ -27,6 +27,133 @@ def changes(consumers=(), credentials=(), remove_consumers=(), remove_credential
                 removeConsumers=list(remove_consumers), removeCredentials=list(remove_credentials))
 
 
+def test_prune_credentials(tool, root):
+    for args in (['prune-credentials'], ['prune-credentials', 'a', '1'],
+                 ['prune-credentials', 'a', '1', 'b', 'c']):
+        result = run(tool, *args)
+        assert result.returncode == 2 and not result.stdout
+    consumers = [dict(id='alice', enabled=True, groups=['staff', 'readers']),
+                 dict(id='paused', enabled=False, groups=['staff', 'readers'])]
+    def credential(name, method='bearer', **fields):
+        record = dict(id=name, consumerId='alice', method=method, enabled=True,
+                      secret='private-' + name)
+        record.update(fields)
+        return record
+
+    raw = 'private-hashed-key'
+    hashed = dict(consumerId='alice', method='header', enabled=True,
+                  secretSha256=hashlib.sha256(raw.encode()).hexdigest())
+    records = [credential('unbounded'),
+               credential('header-raw', 'header', notBefore=0, expiresAt=0, groups=['readers']),
+               credential('mtls-unbounded', 'mtls', secret='b' * 64, groups=['staff']),
+               dict(hashed, id='zero-expiry', expiresAt=0, groups=[]),
+               dict(hashed, id='hashed-bearer', method='bearer',
+                    secretSha256=hashlib.sha256(b'private-hashed-bearer').hexdigest(), groups=['staff']),
+               credential('future-basic', 'basic', secret='user:private-password',
+                          notBefore=10, expiresAt=101, groups=['readers']),
+               credential('boundary-mtls', 'mtls', secret='a' * 64, expiresAt=100),
+               credential('retired', enabled=False, expiresAt=9223372036854775807),
+               dict(hashed, id='retired-hash', enabled=False),
+               credential('future-start', notBefore=200),
+               credential('paused-owner', consumerId='paused', expiresAt=101),
+               dict(hashed, id='expired-hash', secretSha256=hashlib.sha256(b'expired-private-key').hexdigest(),
+                    expiresAt=99)]
+    # Hashed credentials still obey full-snapshot ambiguity checks, including retired records.
+    next(item for item in records if item['id'] == 'retired-hash')['secretSha256'] = hashlib.sha256(b'retired-private-key').hexdigest()
+    snapshot = dict(version=1, consumers=consumers, credentials=records)
+    source = private(root / 'prune-input.json', snapshot)
+    original = source.read_bytes()
+    assert run(tool, 'validate', source).returncode == 0
+    counter = 0
+    def prune(input_path, cutoff, expected, destination=None):
+        nonlocal counter
+        counter += 1
+        output = destination or root / f'pruned-{counter}.json'
+        before = input_path.read_bytes()
+        result = run(tool, 'prune-credentials', input_path, cutoff, output)
+        assert input_path.read_bytes() == before and not result.stdout
+        for record in records:
+            secret = record.get('secret', record.get('secretSha256')).encode()
+            assert secret not in result.stderr
+        if expected is None:
+            assert result.returncode == 2
+            if output != input_path and not output.is_symlink():
+                assert not output.exists()
+        else:
+            assert result.returncode == 0 and not result.stderr, result
+            assert json.loads(output.read_bytes()) == expected
+            assert stat.S_IMODE(output.stat().st_mode) == 0o600
+            assert run(tool, 'validate', output).returncode == 0
+        return output
+
+    retained = [record for record in records if record['id'] in
+                ('unbounded', 'header-raw', 'mtls-unbounded', 'zero-expiry', 'hashed-bearer',
+                 'future-basic', 'future-start', 'paused-owner')]
+    expected = dict(snapshot, credentials=retained)
+    pruned = prune(source, '100', expected)
+    prune(pruned, '1', expected)  # A no-op still publishes a separate validated private snapshot.
+    assert source.read_bytes() == original
+    boundary = dict(snapshot, credentials=[credential('at-one', expiresAt=1),
+                                          credential('after-one', expiresAt=2)])
+    boundary_source = private(root / 'prune-boundary.json', boundary)
+    prune(boundary_source, '1', dict(boundary, credentials=boundary['credentials'][1:]))
+    prune(boundary_source, '9223372036854775807', dict(boundary, credentials=[]))
+    empty_source = private(root / 'prune-empty.json', dict(snapshot, credentials=[]))
+    prune(empty_source, '1', dict(snapshot, credentials=[]))
+    for cutoff in ('', '0', '-0', '-1', '+1', '01', ' 1', '1 ', '1.0', '1e3',
+                   '9223372036854775808', '18446744073709551615', '9' * 100):
+        prune(source, cutoff, None)
+    for invalid in (b'{bad', dict(snapshot, credentials=[credential('bad-owner', consumerId='missing', enabled=False)]),
+                    dict(snapshot, credentials=[credential('bad-group', groups=['unknown'], enabled=False)]),
+                    dict(snapshot, credentials=[credential('bad-window', notBefore=2, expiresAt=1, enabled=False)])):
+        bad = private(root / f'prune-invalid-{counter}.json', invalid)
+        prune(bad, '100', None)
+    prune(source, '100', None, destination=source)
+    existing = private(root / 'prune-existing-output', b'preserve')
+    collision = run(tool, 'prune-credentials', source, '100', existing)
+    assert collision.returncode == 2 and not collision.stdout and existing.read_bytes() == b'preserve'
+    link = root / 'prune-output-link'
+    link.symlink_to(source)
+    prune(source, '100', None, destination=link)
+    loose = root / 'prune-loose-directory'
+    loose.mkdir(mode=0o777)
+    loose.chmod(0o777)
+    prune(source, '100', None, destination=loose / 'output')
+    loose.chmod(0o700)
+    loose_input = private(root / 'prune-loose-input', snapshot)
+    loose_input.chmod(0o644)
+    prune(loose_input, '100', None)
+    source_link = root / 'prune-input-link'
+    source_link.symlink_to(source)
+    prune(source_link, '100', None)
+    assert source.read_bytes() == original
+
+    # Retiring one disabled credential frees a slot and removes its reserved ID.
+    full_records = [credential('retired-slot', enabled=False)] + [credential(f'k{i}') for i in range(63)]
+    full = dict(snapshot, credentials=full_records)
+    full_source = private(root / 'prune-capacity.json', full)
+    assert run(tool, 'validate', full_source).returncode == 0
+    rotated, key = root / 'prune-full-rotate.json', root / 'prune-full-rotate.key'
+    rejected = run(tool, 'rotate-key-verifier', full_source, 'k0', 'retired-slot', rotated, key)
+    assert rejected.returncode == 2 and not rejected.stdout and not rotated.exists() and not key.exists()
+    freed = prune(full_source, '1', dict(full, credentials=full_records[1:]))
+    result = run(tool, 'rotate-key-verifier', freed, 'k0', 'retired-slot', rotated, key)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    final = json.loads(rotated.read_bytes())
+    assert len(final['credentials']) == 64
+    replacement = next(item for item in final['credentials'] if item['id'] == 'retired-slot')
+    assert replacement['secretSha256'] == hashlib.sha256(key.read_bytes()).hexdigest()
+
+    raced = root / 'prune-race.json'
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        results = list(workers.map(lambda _: run(tool, 'prune-credentials', source, '100', raced), range(6)))
+    assert sum(result.returncode == 0 for result in results) == 1
+    assert all(result.returncode in (0, 2) and not result.stdout for result in results)
+    assert json.loads(raced.read_bytes()) == expected
+    assert stat.S_IMODE(raced.stat().st_mode) == 0o600 and source.read_bytes() == original
+    assert not list(root.glob('.rut-consumers-*'))
+
+
 def test_generated_keys(tool, root):
     base = root / 'key-base.json'
     assert run(tool, 'init', base).returncode == 0
@@ -575,6 +702,7 @@ def main(tool):
         assert result.returncode == 2 and not result.stdout
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
+        test_prune_credentials(tool, root)
         test_generated_keys(tool, root)
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
