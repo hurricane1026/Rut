@@ -15,6 +15,7 @@ struct RemoteJwks {
     char discovery_path[1024]{};
     char discovery_issuer[1024]{};
     u32 refresh_seconds = 0;
+    u32 retry_seconds = 0;
     u32 max_age_seconds = 0;
     u32 timeout_seconds = 0;
     bool enabled() const { return refresh_seconds != 0; }
@@ -49,6 +50,9 @@ private:
     bool begin_http(u64 now);
     bool fail();
 };
+// Saturating completion-based maintenance deadline, shared by both JWT algorithms.
+u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds);
+
 // Exposed for deterministic wire/metadata rejection tests, no I/O.
 bool jwks_discovery_valid(json::Document& document, Str body, const RemoteJwks& configuration);
 bool jwks_dns_answer(Str packet, Str query, const RemoteJwks& configuration, char (&address)[16]);

@@ -457,3 +457,53 @@ TEST(remote_jwks_metadata, cname_hostname_bounds) {
         rejected(_tc, bad, configuration);
     }
 }
+
+TEST(remote_jwks_metadata, retry_configuration_defaults_order_bounds_and_reset) {
+    const char* base =
+        "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\","
+        "\"ca\":\"ca.pem\",\"path\":\"/keys\",\"refreshSeconds\":7,"
+        "\"maxAgeSeconds\":9,\"timeoutSeconds\":1";
+    char bytes[1024];
+    json::Document document;
+    RemoteJwks configuration;
+    int length = snprintf(bytes, sizeof(bytes), "{%s}", base);
+    CHECK(document.parse({bytes, static_cast<u32>(length)}));
+    CHECK(configuration.load(document, 0));
+    CHECK_EQ(configuration.retry_seconds, 7u);
+    const u32 valid[] = {1, 3600, 8};
+    for (u32 value : valid) {
+        length = snprintf(bytes, sizeof(bytes), "{\"retrySeconds\":%u,%s}", value, base);
+        CHECK(document.parse({bytes, static_cast<u32>(length)}));
+        CHECK(configuration.load(document, 0));
+        CHECK_EQ(configuration.refresh_seconds, 7u);
+        CHECK_EQ(configuration.retry_seconds, value);
+        length = snprintf(bytes, sizeof(bytes), "{%s,\"retrySeconds\":%u}", base, value);
+        CHECK(document.parse({bytes, static_cast<u32>(length)}));
+        CHECK(configuration.load(document, 0));
+        CHECK_EQ(configuration.retry_seconds, value);
+    }
+    CHECK_EQ(configuration.retry_seconds, 8u);
+    length = snprintf(bytes, sizeof(bytes), "{%s,\"retrySeconds\":2,\"retrySeconds\":3}", base);
+    CHECK(!document.parse({bytes, static_cast<u32>(length)}));
+    const char* invalid[] = {
+        "0", "-1", "3601", "1.5", "true", "null", "\"2\"", "[]", "{}", "18446744073709551615"};
+    for (const char* value : invalid) {
+        configuration.retry_seconds = 42;
+        length = snprintf(bytes, sizeof(bytes), "{%s,\"retrySeconds\":%s}", base, value);
+        CHECK(document.parse({bytes, static_cast<u32>(length)}));
+        CHECK(!configuration.load(document, 0));
+        CHECK_EQ(configuration.retry_seconds, 0u);
+        CHECK(!configuration.enabled());
+    }
+}
+
+TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
+    // A slow attempt completes after its previous refresh interval. Its retry
+    // still waits a full configured interval from this later completion time.
+    CHECK_EQ(jwks_refresh_deadline(12500, 2), 14500u);
+    CHECK_EQ(jwks_refresh_deadline(12500, 7), 19500u);
+    CHECK_EQ(jwks_refresh_deadline(1, 3600), 3600001u);
+    CHECK_EQ(jwks_refresh_deadline(~u64{0} - 1000, 1), ~u64{0});
+    CHECK_EQ(jwks_refresh_deadline(~u64{0} - 999, 1), ~u64{0});
+    CHECK_EQ(jwks_refresh_deadline(~u64{0}, 3600), ~u64{0});
+}

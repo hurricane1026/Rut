@@ -10236,6 +10236,14 @@ refreshes preserve the last cache only within its monotonic maximum age; they do
 not renew it. Missing/expired caches and failed clocks reject. Refresh cadence and
 total connection timeout are explicit bounded configuration, independent of
 untrusted Cache-Control and token traffic.
+Optional `remoteJwks.retrySeconds` is a strict integer in 1–3600, defaulting to
+`refreshSeconds`. RS256 and ES256 schedule successful activation, including an
+empty trusted set, from completion plus the refresh interval. Every failed
+attempt, including setup and key-import failures, schedules from completion plus
+the retry interval. Deadlines saturate on overflow. Existing invalid-clock
+handling cancels work and clears freshness; retry never renews last-success or
+maximum key age. Attempt timeouts still span DNS, metadata and key-fetch stages
+from their start; there is no jitter, exponential backoff or request-driven fetch.
 
 Both event-loop implementations poll this same task; the specialized epoll/kqueue
 loops use the same maintenance hook. Config replacement cancels the retiring shard's

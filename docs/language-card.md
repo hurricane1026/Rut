@@ -2590,8 +2590,8 @@ succeed before any claims are returned; revocation failure is the usual nil/401.
 
 The compile-time `Crypto.jwtRs256(token, policy)` and
 `Crypto.jwtEs256(token, policy)` policies can include an optional `remoteJwks`
-object with these eight required members (and the optional trusted DNS/discovery
-fields described below):
+object with these eight required members (and optional `retrySeconds` plus the
+trusted DNS/discovery fields described below):
 
 ```json
 {"address":"192.0.2.10","port":443,"serverName":"issuer.example",
@@ -2614,8 +2614,14 @@ be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
 implicit and cleartext endpoints are unavailable.
 
 `port` is 1–65535; `refreshSeconds` is 1–3600; `maxAgeSeconds` is 1–86400 and
-strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Address,
-server name, CA path and request path are owned, bounded strings with no embedded
+strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Optional
+`retrySeconds` is an integer from 1–3600 and defaults to `refreshSeconds`.
+Successful refreshes (including valid empty sets) wait `refreshSeconds` from
+completion; all failed attempts wait `retrySeconds` from failure completion.
+Slow failures therefore wait the full delay after timeout. Retry never extends
+maximum key age and can exceed it; there is no jitter or exponential backoff.
+Address, server name, CA path and request path are owned, bounded strings with no
+embedded
 NUL; paths start with `/` and cannot contain whitespace, controls, fragments or
 backslashes. The entire enclosing policy retains its 8192-byte bound. CA files
 are loaded at shard activation. Failure leaves that shard's policy row unavailable.
