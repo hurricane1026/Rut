@@ -566,11 +566,142 @@ def test_credential_groups_preserve_and_reject_parent_removal(tool, root):
     assert final_read['groups'] == []
 
 
+def test_snapshot_diff(tool, root):
+    def empty():
+        return dict(consumers=dict(added=[], removed=[], changed=[]),
+                    credentials=dict(added=[], removed=[], changed=[]))
+
+    def redact(record):
+        return {key: value for key, value in record.items() if key not in ('secret', 'secretSha256')}
+
+    counter = 0
+    def compare(before, after, expected=None):
+        nonlocal counter
+        counter += 1
+        left = private(root / f'diff-{counter}.before', before)
+        right = private(root / f'diff-{counter}.after', after)
+        originals = left.read_bytes(), right.read_bytes()
+        names = set(root.iterdir())
+        result = run(tool, 'diff', left, right)
+        assert left.read_bytes() == originals[0] and right.read_bytes() == originals[1]
+        assert set(root.iterdir()) == names
+        if expected is None:
+            assert result.returncode == 2 and not result.stdout
+        else:
+            assert result.returncode == 0 and not result.stderr and result.stdout.endswith(b'\n'), result
+            assert json.loads(result.stdout) == expected
+            assert b'"secret"' not in result.stdout and b'"secretSha256"' not in result.stdout
+            for value in (before, after):
+                value = json.loads(value) if isinstance(value, bytes) else value
+                for record in value['credentials']:
+                    secret = record.get('secret', record.get('secretSha256')).encode()
+                    assert secret not in result.stdout + result.stderr
+            repeated = run(tool, 'diff', left, right)
+            assert repeated.stdout == result.stdout and repeated.stderr == result.stderr
+        return result
+
+    owner = dict(id='alice', enabled=True, groups=['readers', 'staff'])
+    record = dict(id='key', consumerId='alice', method='bearer', secret='private-key-text', enabled=True)
+    before = dict(version=1, consumers=[owner], credentials=[record])
+    compare(before, before, empty())
+    other = dict(record, id='other', secret='other-private-key')
+    ordered = dict(before, credentials=[record, other])
+    reordered = dict(before, consumers=[dict(groups=['staff', 'readers'], enabled=True, id='alice')],
+                     credentials=[other, record])
+    escaped = json.dumps(reordered).replace('alice', r'\u0061lice').replace('private-key-text', r'\u0070rivate-key-text').encode()
+    compare(ordered, escaped, empty())
+
+    def changed(replacement, key_changed=False, representation_changed=False, source=record):
+        expected = empty()
+        expected['credentials']['changed'] = [dict(before=redact(source), after=redact(replacement),
+            keyChanged=key_changed, keyRepresentationChanged=representation_changed)]
+        return expected
+
+    # Metadata-only edits, explicit empty subsets, and explicit zero windows are audit changes.
+    for replacement in (dict(record, enabled=False), dict(record, groups=[]),
+                        dict(record, groups=['readers']), dict(record, notBefore=0),
+                        dict(record, expiresAt=0), dict(record, notBefore=1, expiresAt=2)):
+        compare(before, dict(before, credentials=[replacement]), changed(replacement))
+    zero = dict(before, credentials=[dict(record, notBefore=0)])
+    negative_zero = json.dumps(zero).replace('"notBefore": 0', '"notBefore": -0').encode()
+    compare(zero, negative_zero)
+    paused = dict(record, enabled=False)
+    compare(dict(before, credentials=[paused]), dict(before, credentials=[record]), changed(record, source=paused))
+
+    for method in ('bearer', 'header'):
+        for raw in ('private-key-text', 'x' * 4096):
+            source = dict(record, method=method, secret=raw)
+            converted = {key: value for key, value in source.items() if key != 'secret'}
+            converted['secretSha256'] = hashlib.sha256(raw.encode()).hexdigest()
+            compare(dict(before, credentials=[source]), dict(before, credentials=[converted]),
+                    changed(converted, representation_changed=True, source=source))
+            compare(dict(before, credentials=[converted]), dict(before, credentials=[source]),
+                    changed(source, representation_changed=True, source=converted))
+            compare(dict(before, credentials=[converted]), dict(before, credentials=[converted]), empty())
+            replacement = dict(source, secret='different-private-material')
+            compare(dict(before, credentials=[source]), dict(before, credentials=[replacement]),
+                    changed(replacement, key_changed=True, source=source))
+            different_hash = dict(converted, secretSha256=hashlib.sha256(b'different-private-material').hexdigest())
+            compare(dict(before, credentials=[source]), dict(before, credentials=[different_hash]),
+                    changed(different_hash, key_changed=True, representation_changed=True, source=source))
+    for method, old, new in [('basic', 'user:private-password', 'user:other-password'),
+                              ('mtls', 'a' * 64, 'b' * 64)]:
+        source, replacement = dict(record, method=method, secret=old), dict(record, method=method, secret=new)
+        compare(dict(before, credentials=[source]), dict(before, credentials=[replacement]),
+                changed(replacement, key_changed=True, source=source))
+    replacement = dict(record, method='header')
+    compare(before, dict(before, credentials=[replacement]), changed(replacement, key_changed=True))
+
+    bob = dict(id='bob', enabled=False, groups=[])
+    cara = dict(id='cara', enabled=True, groups=[])
+    removed = dict(record, id='removed', consumerId='bob', enabled=False, secret='removed-private-key')
+    added = dict(record, id='added', consumerId='cara', secret='added-private-key')
+    disabled = dict(record, enabled=False)
+    expected = empty()
+    expected['consumers'].update(added=[cara], removed=[bob])
+    expected['credentials'].update(added=[redact(added)], removed=[redact(removed)],
+        changed=[dict(before=redact(record), after=redact(disabled), keyChanged=False, keyRepresentationChanged=False)])
+    compare(dict(before, consumers=[owner, bob], credentials=[removed, record]),
+            dict(before, consumers=[cara, owner], credentials=[disabled, added]), expected)
+
+    # Full valid32/64 snapshots produce a complete structured output larger than one input.
+    full = dict(version=1, consumers=[dict(id=f'c{i}', enabled=True, groups=[]) for i in range(32)],
+                credentials=[dict(id=f'k{i}', consumerId=f'c{i % 32}', method='bearer',
+                                  secret=f'private-material-{i}', enabled=True) for i in range(64)])
+    updated = dict(version=1, consumers=[dict(item, enabled=False) for item in full['consumers']],
+                   credentials=[dict(item, enabled=False) for item in full['credentials']])
+    expected = empty()
+    expected['consumers']['changed'] = [dict(before=a, after=b) for a, b in zip(full['consumers'], updated['consumers'])]
+    expected['credentials']['changed'] = [dict(before=redact(a), after=redact(b), keyChanged=False,
+        keyRepresentationChanged=False) for a, b in zip(full['credentials'], updated['credentials'])]
+    encoded = [json.dumps(value, separators=(',', ':')).encode() for value in (full, updated)]
+    assert all(len(value) <= 8192 for value in encoded)
+    result = compare(*encoded, expected)
+    assert len(result.stdout) > 8192
+
+    for invalid in (b'{bad', dict(before, credentials=[dict(record, consumerId='missing')]),
+                    dict(before, credentials=[record, record]),
+                    dict(before, credentials=[dict(record, notBefore=2, expiresAt=1)])):
+        compare(before, invalid)
+        compare(invalid, before)
+    valid_path = private(root / 'diff-private-valid', before)
+    loose = private(root / 'diff-private-loose', before)
+    loose.chmod(0o644)
+    link = root / 'diff-private-link'
+    link.symlink_to(valid_path)
+    for invalid in (loose, link, root / 'diff-missing', root):
+        for left, right in ((valid_path, invalid), (invalid, valid_path)):
+            result = run(tool, 'diff', left, right)
+            assert result.returncode == 2 and not result.stdout
+            assert record['secret'].encode() not in result.stderr
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
                  ['plan', 'a'], ['plan', 'a', 'b', 'c'], ['init', 'a', 'b'],
-                 ['apply', 'a', 'b', 'c', 'd'], ['unknown']]:
+                 ['apply', 'a', 'b', 'c', 'd'], ['diff'], ['diff', 'a'],
+                 ['diff', 'a', 'b', 'c'], ['unknown']]:
         result = run(tool, *args)
         assert result.returncode == 2 and not result.stdout
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
@@ -581,6 +712,7 @@ def main(tool):
         test_generated_key_verifier(tool, root)
         test_rotated_key_verifier(tool, root)
         test_credential_groups_preserve_and_reject_parent_removal(tool, root)
+        test_snapshot_diff(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())

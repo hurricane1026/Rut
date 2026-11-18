@@ -11073,6 +11073,15 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+Offline `rut-consumers diff BEFORE AFTER` validates both private snapshots and
+buffers a bounded redacted change report before stdout. Stable decoded IDs match
+records; metadata compares decoded values and group sets while preserving optional
+field presence. Added/removed records and before/after changed records omit all
+credential key fields. Changed credentials report only key-material and
+raw/verifier-representation booleans, including equivalent raw-to-SHA-256
+conversion. The tool creates no files or deployment state and changes no runtime
+or language semantics; the broader lifecycle foundation (#1072) remains open.
+
 Bearer/header credentials can store either the existing raw key or a canonical
 lowercase SHA-256 verifier of the exact presented text bytes. The runtime hashes
 one validated presented key per authentication and compares in constant time;

@@ -1603,13 +1603,15 @@ JIT tests also cover the 1024/1025-byte bound. See
   adds a bounded registry plus opt-in query/form authentication and sanitized
   fields for explicitly rebuilt requests. Offline `rut-consumers` administration
   supports full-record updates/removals, credential rotation, group replacement,
-  redacted inspection/preflight and validated atomic private files. The paired
-  `rotate-key-verifier` command retains the old disabled record and creates a
-  fresh hash-only replacement with the exact owner, method, optional groups and
-  time bounds. It requires an unused ID and free slot, preserves expired windows,
-  and uses private key-first/snapshot-second publication. It does not publish to
-  gateways. Online management APIs and transparent target/body mutation remain
-  separate interfaces; #1072 remains open.
+  redacted inspection/preflight, structured snapshot diff and validated atomic
+  private files. The paired `rotate-key-verifier` command retains the old disabled
+  record and creates a fresh hash-only replacement with the exact owner, method,
+  optional groups and time bounds. It requires an unused ID and free slot,
+  preserves expired windows, and uses private key-first/snapshot-second publication.
+  Diff validates both private inputs before output, omits key fields and reports
+  only metadata plus key-material/representation booleans. It creates no files.
+  Neither command publishes configuration. Online management APIs and transparent
+  target/body mutation remain separate interfaces; #1072 remains open.
 - [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
   Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
   and gateway-restart retention. The opt-in local-AOF profile adds a confirmed

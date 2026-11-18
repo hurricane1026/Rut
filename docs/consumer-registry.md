@@ -194,6 +194,46 @@ redaction is not implied by a header-only policy. See
 validator as `consumerAuthenticate`. It requires no LLVM, network service or new
 library. It provides these commands:
 
+`diff BEFORE AFTER` compares two existing snapshots without creating files or
+publishing configuration. Both inputs must pass the same private-file guards and
+full runtime validation before any stdout is written. Successful comparisons
+return 0, including an empty diff; usage, input or output failure returns 2.
+The command emits one structured JSON object followed by a newline:
+
+```json
+{"consumers":{"added":[],"removed":[],"changed":[]},
+ "credentials":{"added":[],"removed":[],"changed":[]}}
+```
+
+Added and removed arrays contain records. Changed Consumer entries contain
+`before` and `after` records; changed credential entries additionally contain
+boolean `keyChanged` and `keyRepresentationChanged`. Credential records in all
+arrays omit both `secret` and `secretSha256`. Key text and digests are never
+included in diagnostics or the report. The complete report is buffered within
+32 KiB before writing, so invalid input or a comparison failure emits no partial
+JSON. Input snapshots remain unchanged.
+
+Stable IDs and strings compare by decoded bytes. JSON whitespace, object-member
+order, escape spelling, record-array order and group-set order do not create
+changes. Optional field presence is preserved: omitted `groups` differs from
+`[]`, and omitted time bounds differ from explicit zero. Integer bounds compare
+by value. Added records follow AFTER order; removed and changed records follow
+BEFORE order, so output is deterministic for a given input pair.
+
+`keyChanged` reports different decoded raw key material, different effective
+SHA-256 material when either bearer/header record is hashed, or a method change.
+`keyRepresentationChanged` reports a switch between `secret` and `secretSha256`.
+Converting a raw bearer/header key to its equivalent SHA-256 verifier therefore
+sets only the representation flag. Basic/mTLS raw keys compare by decoded bytes.
+These flags also apply to disabled records; metadata-only changes set both false.
+
+```sh
+build/src/rut-consumers diff consumer-config/v1.json consumer-config/v2.json
+```
+
+The audit compares supplied immutable snapshots; deployment and historical
+retention remain host responsibilities. #1072 remains open.
+
 `generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT` adds one generated
 credential to a new snapshot. Only `bearer` and `header` methods are accepted.
 The Consumer must already exist, and the credential ID must not appear in the

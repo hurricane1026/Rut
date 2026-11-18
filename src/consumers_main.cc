@@ -377,6 +377,166 @@ bool inspect(json::Document& doc, json::Writer& output) {
     return output.ok;
 }
 
+bool audit_string_equal(json::Document& before, u32 left, json::Document& after, u32 right) {
+    json::Writer a{before.scratch}, b{after.scratch};
+    return before.string(left, a) && after.string(right, b) &&
+           Str{a.data, a.len}.eq({b.data, b.len});
+}
+
+bool audit_value_equal(json::Document& before, u32 left, json::Document& after, u32 right) {
+    if (left == json::kNone || right == json::kNone) return left == right;
+    const auto kind = before.nodes[left].kind;
+    if (kind != after.nodes[right].kind) return false;
+    if (kind == json::Kind::String) return audit_string_equal(before, left, after, right);
+    if (kind == json::Kind::Number) {
+        i64 a = 0, b = 0;
+        return json::integer(before.raw(left), a) && json::integer(after.raw(right), b) && a == b;
+    }
+    if (kind != json::Kind::Array) return before.raw(left).eq(after.raw(right));
+    // The only metadata arrays are validated unique group sets.
+    u32 left_count = 0, right_count = 0;
+    for (u32 a = before.nodes[left].child; a != json::kNone; a = before.nodes[a].next) {
+        ++left_count;
+        bool found = false;
+        for (u32 b = after.nodes[right].child; b != json::kNone; b = after.nodes[b].next)
+            found |= audit_string_equal(before, a, after, b);
+        if (!found) return false;
+    }
+    for (u32 b = after.nodes[right].child; b != json::kNone; b = after.nodes[b].next) ++right_count;
+    return left_count == right_count;
+}
+
+bool audit_metadata_equal(json::Document& before, u32 left, json::Document& after, u32 right) {
+    const Str fields[] = {lit_str("id"),
+                          lit_str("consumerId"),
+                          lit_str("method"),
+                          lit_str("enabled"),
+                          lit_str("groups"),
+                          lit_str("notBefore"),
+                          lit_str("expiresAt")};
+    for (Str name : fields)
+        if (!audit_value_equal(before, field(before, left, name), after, field(after, right, name)))
+            return false;
+    return true;
+}
+
+bool audit_key_digest(json::Document& doc, u32 record, SensitiveHashText& digest) {
+    const u32 hashed = field(doc, record, lit_str("secretSha256"));
+    if (hashed != json::kNone) {
+        json::Writer text{digest.bytes, sizeof(digest.bytes)};
+        return doc.string(hashed, text) && text.len == 64;
+    }
+    const u32 raw = field(doc, record, lit_str("secret"));
+    Buffer secret;
+    json::Writer text{secret.data, json::kMaxBytes};
+    u32 length = 0;
+    return doc.string(raw, text) &&
+           hash_hex(
+               HashAlgorithm::Sha256, {secret.data, text.len}, {}, false, digest.bytes, length) &&
+           length == 64;
+}
+
+bool audit_key_changes(json::Document& before,
+                       u32 left,
+                       json::Document& after,
+                       u32 right,
+                       bool& changed,
+                       bool& representation_changed) {
+    const bool left_hash = field(before, left, lit_str("secretSha256")) != json::kNone;
+    const bool right_hash = field(after, right, lit_str("secretSha256")) != json::kNone;
+    representation_changed = left_hash != right_hash;
+    if (!audit_string_equal(before,
+                            field(before, left, lit_str("method")),
+                            after,
+                            field(after, right, lit_str("method")))) {
+        changed = true;
+        return true;
+    }
+    if (!left_hash && !right_hash) {
+        changed = !audit_string_equal(before,
+                                      field(before, left, lit_str("secret")),
+                                      after,
+                                      field(after, right, lit_str("secret")));
+        return true;
+    }
+    SensitiveHashText a, b;
+    if (!audit_key_digest(before, left, a) || !audit_key_digest(after, right, b)) return false;
+    changed = !Str{a.bytes, 64}.eq({b.bytes, 64});
+    return true;
+}
+
+bool audit_record(json::Document& doc, u32 record, bool credential, json::Writer& output) {
+    u32 hidden = json::kNone;
+    if (credential) {
+        hidden = field(doc, record, lit_str("secret"));
+        if (hidden == json::kNone) hidden = field(doc, record, lit_str("secretSha256"));
+    }
+    return doc.write(record, output, hidden, {}, true);
+}
+
+bool audit_records(json::Document& before,
+                   json::Document& after,
+                   Str name,
+                   bool credential,
+                   json::Writer& output) {
+    const u32 left = field(before, 0, name), right = field(after, 0, name);
+    output.text(lit_str("{\"added\":["));
+    bool first = true;
+    for (u32 n = after.nodes[right].child; n != json::kNone; n = after.nodes[n].next) {
+        if (find(before, left, after, field(after, n, lit_str("id")), true) != json::kNone)
+            continue;
+        if (!first) output.put(',');
+        first = false;
+        if (!audit_record(after, n, credential, output)) return false;
+    }
+    output.text(lit_str("],\"removed\":["));
+    first = true;
+    for (u32 n = before.nodes[left].child; n != json::kNone; n = before.nodes[n].next) {
+        if (find(after, right, before, field(before, n, lit_str("id")), true) != json::kNone)
+            continue;
+        if (!first) output.put(',');
+        first = false;
+        if (!audit_record(before, n, credential, output)) return false;
+    }
+    output.text(lit_str("],\"changed\":["));
+    first = true;
+    for (u32 n = before.nodes[left].child; n != json::kNone; n = before.nodes[n].next) {
+        const u32 other = find(after, right, before, field(before, n, lit_str("id")), true);
+        if (other == json::kNone) continue;
+        bool key_changed = false, representation_changed = false;
+        if (credential &&
+            !audit_key_changes(before, n, after, other, key_changed, representation_changed))
+            return false;
+        if (!key_changed && !representation_changed &&
+            audit_metadata_equal(before, n, after, other))
+            continue;
+        if (!first) output.put(',');
+        first = false;
+        output.text(lit_str("{\"before\":"));
+        if (!audit_record(before, n, credential, output)) return false;
+        output.text(lit_str(",\"after\":"));
+        if (!audit_record(after, other, credential, output)) return false;
+        if (credential) {
+            output.text(lit_str(",\"keyChanged\":"));
+            output.text(key_changed ? lit_str("true") : lit_str("false"));
+            output.text(lit_str(",\"keyRepresentationChanged\":"));
+            output.text(representation_changed ? lit_str("true") : lit_str("false"));
+        }
+        output.put('}');
+    }
+    output.text(lit_str("]}"));
+    return output.ok;
+}
+
+bool audit_diff(json::Document& before, json::Document& after, json::Writer& output) {
+    output.text(lit_str("{\"consumers\":"));
+    if (!audit_records(before, after, lit_str("consumers"), false, output)) return false;
+    output.text(lit_str(",\"credentials\":"));
+    if (!audit_records(before, after, lit_str("credentials"), true, output)) return false;
+    output.text(lit_str("}\n"));
+    return output.ok;
+}
+
 bool hash_keys(json::Document& doc, json::Writer& output) {
     const u32 consumers = field(doc, 0, lit_str("consumers"));
     const u32 credentials = field(doc, 0, lit_str("credentials"));
@@ -471,6 +631,7 @@ constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
     "       rut-consumers inspect INPUT\n"
+    "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
@@ -486,6 +647,7 @@ constexpr char kUsage[] =
     "Output is a new atomic 0600 snapshot; existing paths are never replaced.\n"
     "Inspect and plan redact credential secrets and SHA-256 verifiers. Plan validates without "
     "creating files.\n"
+    "Diff validates both snapshots and emits structured redacted changes without creating files.\n"
     "No command publishes to running gateways.\n"
     "generate-key supports bearer/header and creates a new 32-byte random key in an immutable "
     "snapshot.\n"
@@ -503,13 +665,14 @@ int main(int argc, char** argv) {
     const bool kInit = argc == 3 && strcmp(argv[1], "init") == 0;
     const bool kValidate = argc == 3 && strcmp(argv[1], "validate") == 0;
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;
+    const bool kDiff = argc == 4 && strcmp(argv[1], "diff") == 0;
     const bool kPlan = argc == 4 && strcmp(argv[1], "plan") == 0;
     const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
     const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
     const bool kGenerateKeyVerifier = argc == 8 && strcmp(argv[1], "generate-key-verifier") == 0;
     const bool kRotateKeyVerifier = argc == 7 && strcmp(argv[1], "rotate-key-verifier") == 0;
     const bool kHashKeys = argc == 4 && strcmp(argv[1], "hash-keys") == 0;
-    if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey &&
+    if (!kInit && !kValidate && !kInspect && !kDiff && !kPlan && !kApply && !kGenerateKey &&
         !kGenerateKeyVerifier && !kRotateKeyVerifier && !kHashKeys)
         return failure(kUsage);
     if (kInit) {
@@ -523,6 +686,19 @@ int main(int argc, char** argv) {
     if (!consumer_registry_valid(base, input.view()))
         return failure("invalid Consumer registry snapshot\n");
     if (kValidate) return 0;
+    if (kDiff) {
+        Buffer input_after;
+        SensitiveDocument after;
+        if (!read_private(argv[3], input_after))
+            return failure("cannot read private registry file\n");
+        if (!consumer_registry_valid(after, input_after.view()))
+            return failure("invalid Consumer registry snapshot\n");
+        char bytes[4 * json::kMaxBytes];
+        json::Writer output{bytes, sizeof(bytes)};
+        if (!audit_diff(base, after, output))
+            return failure("cannot produce redacted registry diff\n");
+        return write_all(STDOUT_FILENO, {bytes, output.len}) ? 0 : 2;
+    }
     if (kHashKeys) {
         Buffer result;
         json::Writer hashed{result.data, json::kMaxBytes};
