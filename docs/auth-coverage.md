@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion and separate key/verifier provisioning into validated private outputs | Online administrative registry APIs, online scheduling/revocation and transparent target/body mutation; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
+| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion, separate key/verifier provisioning and constrained rotation preserving owner/groups/windows in validated private outputs | Online administrative registry APIs, online scheduling/revocation and transparent target/body mutation; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
@@ -1597,8 +1597,13 @@ JIT tests also cover the 1024/1025-byte bound. See
   adds a bounded registry plus opt-in query/form authentication and sanitized
   fields for explicitly rebuilt requests. Offline `rut-consumers` administration
   supports full-record updates/removals, credential rotation, group replacement,
-  redacted inspection/preflight and validated atomic private files. Online management APIs
-  and transparent target/body mutation remain separate interfaces for #1072.
+  redacted inspection/preflight and validated atomic private files. The paired
+  `rotate-key-verifier` command retains the old disabled record and creates a
+  fresh hash-only replacement with the exact owner, method, optional groups and
+  time bounds. It requires an unused ID and free slot, preserves expired windows,
+  and uses private key-first/snapshot-second publication. It does not publish to
+  gateways. Online management APIs and transparent target/body mutation remain
+  separate interfaces; #1072 remains open.
 - [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
   Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
   and gateway-restart retention. The opt-in local-AOF profile adds a confirmed

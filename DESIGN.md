@@ -11092,6 +11092,15 @@ the key nor verifier appears in output streams or command arguments. This is an
 offline provisioning facility, not completion of the broader Consumer lifecycle
 foundation (#1072).
 
+`rut-consumers rotate-key-verifier` reuses that paired private publication path
+for an existing enabled bearer/header credential. It retains the complete old
+record disabled and adds a new enabled hash-only record with a fresh generated
+key. Owner, method, optional group subset and time bounds are copied exactly;
+rotation never expands authority or renews an expired window. Disabled Consumers
+remain disabled. New IDs must be globally unused, including disabled records,
+and retaining history requires a free credential slot. The input and running
+gateways are unchanged; deployment remains explicit and #1072 remains open.
+
 Version-1 credential records optionally carry integer Unix-second `notBefore`
 and `expiresAt` bounds; absent or zero values are unbounded. A finite start is
 inclusive, while expiry is exclusive. The runtime validates the complete exact

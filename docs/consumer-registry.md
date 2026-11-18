@@ -267,6 +267,33 @@ command arguments.
 build/src/rut-consumers generate-key-verifier consumer-config/v1.json alice alice-key-v2 bearer consumer-config/v2.json consumer-config/alice-key-v2.txt
 ```
 
+`rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID SNAPSHOT_OUTPUT
+KEY_OUTPUT` replaces an existing enabled bearer/header credential with a freshly
+generated key and SHA-256 verifier. The old credential may contain raw `secret`
+or `secretSha256`; its complete record remains in the replacement snapshot with
+`enabled: false`. The new enabled record inherits its exact `consumerId`, method,
+optional `groups`, `notBefore` and `expiresAt`. Omitted fields remain omitted;
+explicit empty groups and zero bounds remain explicit. Rotation does not widen
+groups or renew time bounds, including already expired or future windows. The
+CLI does not read the clock. A disabled Consumer remains disabled and may have
+new credentials staged under it.
+
+Both IDs must be valid, and the new ID must be unused across all credentials,
+including disabled records. Rotation retains the old record, so the input needs
+one free slot within the 64-credential limit and the resulting snapshot must fit
+the existing byte/node bounds. Unknown or disabled source credentials and
+Basic/mTLS sources are rejected. The original input is unchanged. Output
+preflight, private key delivery, redaction and key-first/snapshot-second failure
+semantics are exactly those described above for `generate-key-verifier`.
+
+```sh
+build/src/rut-consumers rotate-key-verifier consumer-config/v2.json alice-key-v2 alice-key-v3 consumer-config/v3.json consumer-config/alice-key-v3.txt
+```
+
+Deploy the replacement snapshot explicitly; this offline command does not revoke
+keys in already running programs or publish to gateways. Broader Consumer
+administration, distribution and durable lifecycle work remains open in #1072.
+
 An apply transaction has exactly four required arrays:
 
 ```json

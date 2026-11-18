@@ -442,6 +442,31 @@ bool hash_keys(json::Document& doc, json::Writer& output) {
     return output.ok;
 }
 
+bool rotate_key_change(
+    json::Document& doc, u32 source, Str replacement_id, Str digest, json::Writer& output) {
+    output.text(lit_str("{\"consumers\":[],\"credentials\":["));
+    if (!doc.write(source, output, field(doc, source, lit_str("enabled")), lit_str("false")))
+        return false;
+    output.text(lit_str(",{\"id\":"));
+    if (!json::quote(replacement_id, output)) return false;
+    for (u32 member = doc.nodes[source].child; member != json::kNone;
+         member = doc.nodes[member].next) {
+        if (member == field(doc, source, lit_str("id")) ||
+            member == field(doc, source, lit_str("enabled")) ||
+            member == field(doc, source, lit_str("secret")) ||
+            member == field(doc, source, lit_str("secretSha256")))
+            continue;
+        output.put(',');
+        if (!doc.write(doc.nodes[member].key, output)) return false;
+        output.put(':');
+        if (!doc.write(member, output)) return false;
+    }
+    output.text(lit_str(",\"enabled\":true,\"secretSha256\":\""));
+    output.text(digest);
+    output.text(lit_str("\"}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+    return output.ok;
+}
+
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
@@ -450,6 +475,8 @@ constexpr char kUsage[] =
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
     "       rut-consumers generate-key-verifier INPUT CONSUMER_ID CREDENTIAL_ID METHOD "
+    "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
+    "       rut-consumers rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID "
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
@@ -464,6 +491,8 @@ constexpr char kUsage[] =
     "snapshot.\n"
     "generate-key-verifier writes a verifier snapshot and the generated raw key to separate new "
     "private files.\n"
+    "rotate-key-verifier disables the old key and inherits its owner, method, groups and time "
+    "bounds.\n"
     "hash-keys converts raw bearer/header keys in the 64-lowercase-hex generated-key profile.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
@@ -478,9 +507,10 @@ int main(int argc, char** argv) {
     const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
     const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
     const bool kGenerateKeyVerifier = argc == 8 && strcmp(argv[1], "generate-key-verifier") == 0;
+    const bool kRotateKeyVerifier = argc == 7 && strcmp(argv[1], "rotate-key-verifier") == 0;
     const bool kHashKeys = argc == 4 && strcmp(argv[1], "hash-keys") == 0;
     if (!kInit && !kValidate && !kInspect && !kPlan && !kApply && !kGenerateKey &&
-        !kGenerateKeyVerifier && !kHashKeys)
+        !kGenerateKeyVerifier && !kRotateKeyVerifier && !kHashKeys)
         return failure(kUsage);
     if (kInit) {
         const char* error =
@@ -550,25 +580,43 @@ int main(int argc, char** argv) {
         const char* error = publish(argv[6], {result.data, output.len});
         return error ? failure(error) : 0;
     }
-    if (kGenerateKeyVerifier) {
+    if (kGenerateKeyVerifier || kRotateKeyVerifier) {
         const u32 consumer_length = bounded_argument(argv[3], 65);
         const u32 credential_length = bounded_argument(argv[4], 65);
         const u32 method_length = bounded_argument(argv[5], 16);
         const Str consumer_id{argv[3], consumer_length};
         const Str credential_id{argv[4], credential_length};
         const Str method{argv[5], method_length};
-        if (!provision_id_valid(consumer_id) || !provision_id_valid(credential_id) ||
-            !(method.eq(lit_str("bearer")) || method.eq(lit_str("header"))))
-            return failure("invalid Consumer ID, credential ID, or key method\n");
         const u32 consumers = field(base, 0, lit_str("consumers"));
         const u32 credentials = field(base, 0, lit_str("credentials"));
-        if (!contains_id(base, consumers, consumer_id, true))
-            return failure("Consumer does not exist in registry snapshot\n");
+        u32 source = json::kNone;
+        if (kRotateKeyVerifier) {
+            if (!provision_id_valid(consumer_id) || !provision_id_valid(credential_id))
+                return failure("invalid old or new credential ID\n");
+            u32 count = 0;
+            for (u32 n = base.nodes[credentials].child; n != json::kNone; n = base.nodes[n].next) {
+                ++count;
+                if (field_equals(base, field(base, n, lit_str("id")), consumer_id)) source = n;
+            }
+            if (count >= 64) return failure("rotation exceeds credential capacity\n");
+            if (source == json::kNone ||
+                !base.raw(field(base, source, lit_str("enabled"))).eq(lit_str("true")) ||
+                !(field_equals(base, field(base, source, lit_str("method")), lit_str("bearer")) ||
+                  field_equals(base, field(base, source, lit_str("method")), lit_str("header"))))
+                return failure("rotation requires an enabled bearer/header credential\n");
+        } else {
+            if (!provision_id_valid(consumer_id) || !provision_id_valid(credential_id) ||
+                !(method.eq(lit_str("bearer")) || method.eq(lit_str("header"))))
+                return failure("invalid Consumer ID, credential ID, or key method\n");
+            if (!contains_id(base, consumers, consumer_id, true))
+                return failure("Consumer does not exist in registry snapshot\n");
+        }
         if (contains_id(base, credentials, credential_id, true))
             return failure("credential ID already exists in registry snapshot\n");
 
         OutputPair outputs;
-        if (!output_pair(argv[6], argv[7], outputs))
+        if (!output_pair(
+                argv[kRotateKeyVerifier ? 5 : 6], argv[kRotateKeyVerifier ? 6 : 7], outputs))
             return failure(
                 "outputs must be distinct new files in the same owned private directory\n");
 
@@ -587,18 +635,24 @@ int main(int argc, char** argv) {
 
         Buffer change_bytes;
         json::Writer change_output{change_bytes.data, json::kMaxBytes};
-        change_output.text(lit_str("{\"consumers\":[],\"credentials\":[{\"id\":"));
-        if (!json::quote(credential_id, change_output))
-            return failure("cannot encode verifier snapshot\n");
-        change_output.text(lit_str(",\"consumerId\":"));
-        if (!json::quote(consumer_id, change_output))
-            return failure("cannot encode verifier snapshot\n");
-        change_output.text(lit_str(",\"method\":\""));
-        change_output.text(method);
-        change_output.text(lit_str("\",\"secretSha256\":\""));
-        change_output.text({digest.bytes, digest_length});
-        change_output.text(
-            lit_str("\",\"enabled\":true}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+        if (kRotateKeyVerifier) {
+            if (!rotate_key_change(
+                    base, source, credential_id, {digest.bytes, digest_length}, change_output))
+                return failure("cannot encode rotated verifier snapshot\n");
+        } else {
+            change_output.text(lit_str("{\"consumers\":[],\"credentials\":[{\"id\":"));
+            if (!json::quote(credential_id, change_output))
+                return failure("cannot encode verifier snapshot\n");
+            change_output.text(lit_str(",\"consumerId\":"));
+            if (!json::quote(consumer_id, change_output))
+                return failure("cannot encode verifier snapshot\n");
+            change_output.text(lit_str(",\"method\":\""));
+            change_output.text(method);
+            change_output.text(lit_str("\",\"secretSha256\":\""));
+            change_output.text({digest.bytes, digest_length});
+            change_output.text(
+                lit_str("\",\"enabled\":true}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+        }
         if (!change_output.ok) return failure("verifier snapshot change exceeds capacity\n");
         SensitiveDocument patch;
         if (!patch.parse({change_bytes.data, change_output.len}))
