@@ -74,6 +74,8 @@ public:
     void advance(u64 monotonic_ms);
     void cancel();
     State state() const { return state_; }
+    // A definitive network error from TCP establishment.
+    bool connect_failed() const { return state_ == State::Failed && connect_failed_; }
     Str body() const { return state_ == State::Done ? response_.body() : Str{}; }
 
 private:
@@ -83,6 +85,7 @@ private:
     i32 fd_ = -1;
     bool authorization_ = false;
     bool callout_ = false;
+    bool connect_failed_ = false;
     char request_[6144]{};
     u32 request_len_ = 0;
     u32 sent_ = 0;
@@ -93,7 +96,9 @@ private:
     bool (*step_)(HttpsFetch&) = nullptr;
     void close();
     bool fail();
+    bool fail_connect(int error);
     static bool connected(HttpsFetch& self);
+    static bool start_tls(HttpsFetch& self);
     static bool handshake(HttpsFetch& self);
     static bool write(HttpsFetch& self);
     static bool read(HttpsFetch& self);

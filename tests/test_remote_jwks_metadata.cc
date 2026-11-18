@@ -52,30 +52,31 @@ TEST(remote_jwks_metadata, dns_wire_allowlist_and_rebinding) {
                              1,    0xc0, 0x0c, 0,    1, 0, 1, 0, 0, 0, 30, 0, 4, 192, 0, 2, 1};
     const Str request{reinterpret_cast<const char*>(query), sizeof(query)};
     const auto answer = [&] { return Str{reinterpret_cast<const char*>(reply), sizeof(reply)}; };
-    char address[16]{};
-    CHECK(jwks_dns_answer(answer(), request, configuration, address));
-    CHECK(strcmp(address, "192.0.2.1") == 0);
+    JwksDnsAddresses addresses;
+    CHECK(jwks_dns_answer(answer(), request, configuration, addresses));
+    CHECK_EQ(addresses.count, 1u);
+    CHECK(strcmp(addresses.values[0], "192.0.2.1") == 0);
     reply[sizeof(reply) - 1] = 2;
-    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(!jwks_dns_answer(answer(), request, configuration, addresses));
     strcpy(configuration.allowed_addresses[1], "192.0.2.2");
     configuration.allowed_count = 2;
-    CHECK(jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(jwks_dns_answer(answer(), request, configuration, addresses));
     reply[0] = 0xff;
-    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(!jwks_dns_answer(answer(), request, configuration, addresses));
     reply[0] = 0x12;
     reply[2] |= 2;
-    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(!jwks_dns_answer(answer(), request, configuration, addresses));
     reply[2] &= 0xfd;
     reply[3] |= 64;
-    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(!jwks_dns_answer(answer(), request, configuration, addresses));
     reply[3] &= 191;
     reply[21] = 0;
     reply[22] = 5;
-    CHECK(!jwks_dns_answer(answer(), request, configuration, address));
+    CHECK(!jwks_dns_answer(answer(), request, configuration, addresses));
     reply[22] = 1;
     for (u32 length = 0; length < sizeof(reply); ++length)
         CHECK(!jwks_dns_answer(
-            {reinterpret_cast<const char*>(reply), length}, request, configuration, address));
+            {reinterpret_cast<const char*>(reply), length}, request, configuration, addresses));
 }
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
@@ -235,14 +236,15 @@ struct DnsPacket {
         return {reinterpret_cast<const char*>(storage), question_length};
     }
 };
-bool accepts(const DnsPacket& packet, RemoteJwks& configuration, char (&address)[16]) {
+bool accepts(const DnsPacket& packet, RemoteJwks& configuration, JwksDnsAddresses& addresses) {
     u8 query[272]{};
-    return jwks_dns_answer(packet.view(), packet.query(query), configuration, address);
+    return jwks_dns_answer(packet.view(), packet.query(query), configuration, addresses);
 }
 void rejected(rut::test::TestCase* _tc, const DnsPacket& packet, RemoteJwks& configuration) {
-    char address[16] = "unchanged";
-    CHECK(!accepts(packet, configuration, address));
-    CHECK(strcmp(address, "unchanged") == 0);
+    JwksDnsAddresses addresses{{"unchanged"}, 1};
+    CHECK(!accepts(packet, configuration, addresses));
+    CHECK_EQ(addresses.count, 1u);
+    CHECK(strcmp(addresses.values[0], "unchanged") == 0);
 }
 }  // namespace
 
@@ -250,12 +252,12 @@ TEST(remote_jwks_metadata, cname_chain_literal_compressed_reordered_and_limits) 
     auto configuration = policy();
     strcpy(configuration.allowed_addresses[1], "192.0.2.2");
     configuration.allowed_count = 2;
-    char address[16]{};
+    JwksDnsAddresses addresses;
     DnsPacket literal;
     literal.cname(nullptr, "keys.example");
     literal.a("keys.example");
-    CHECK(accepts(literal, configuration, address));
-    CHECK(strcmp(address, "192.0.2.1") == 0);
+    CHECK(accepts(literal, configuration, addresses));
+    CHECK(strcmp(addresses.values[0], "192.0.2.1") == 0);
 
     DnsPacket compressed;
     const u32 target = compressed.cname(nullptr, "keys.example");
@@ -272,8 +274,8 @@ TEST(remote_jwks_metadata, cname_chain_literal_compressed_reordered_and_limits) 
     compressed.bytes[compressed.length++] = 2;
     compressed.bytes[7] = 2;
     CHECK(header > target);
-    CHECK(accepts(compressed, configuration, address));
-    CHECK(strcmp(address, "192.0.2.2") == 0);
+    CHECK(accepts(compressed, configuration, addresses));
+    CHECK(strcmp(addresses.values[0], "192.0.2.2") == 0);
 
     // CNAME RDATA may combine a new label with an already decoded suffix.
     DnsPacket suffix;
@@ -284,14 +286,17 @@ TEST(remote_jwks_metadata, cname_chain_literal_compressed_reordered_and_limits) 
     suffix.pointer(14);  // The question's example label.
     suffix.size(suffix_size);
     suffix.a("keys.example");
-    CHECK(accepts(suffix, configuration, address));
+    CHECK(accepts(suffix, configuration, addresses));
 
     DnsPacket reordered("A.Example");
     reordered.a("KEYS.example", 2);
     reordered.cname("a.EXAMPLE", "keys.EXAMPLE");
     reordered.a("keys.example");
-    CHECK(accepts(reordered, configuration, address));
-    CHECK(strcmp(address, "192.0.2.2") == 0);
+    reordered.a("keys.example", 2);
+    CHECK(accepts(reordered, configuration, addresses));
+    CHECK_EQ(addresses.count, 2u);
+    CHECK(strcmp(addresses.values[0], "192.0.2.2") == 0);
+    CHECK(strcmp(addresses.values[1], "192.0.2.1") == 0);
 
     DnsPacket four;
     four.cname(nullptr, "b.example");
@@ -299,7 +304,7 @@ TEST(remote_jwks_metadata, cname_chain_literal_compressed_reordered_and_limits) 
     four.cname("c.example", "d.example");
     four.cname("d.example", "e.example");
     for (u32 i = 0; i < 4; ++i) four.a("e.example", static_cast<u8>(1 + i % 2));
-    CHECK(accepts(four, configuration, address));
+    CHECK(accepts(four, configuration, addresses));
     four.a("e.example");
     rejected(_tc, four, configuration);
 }
@@ -431,12 +436,12 @@ TEST(remote_jwks_metadata, cname_compression_rdata_and_truncation_are_strict) {
 
 TEST(remote_jwks_metadata, cname_hostname_bounds) {
     auto configuration = policy();
-    char address[16]{};
+    JwksDnsAddresses addresses;
     char host[255]{};
     memset(host, 'a', 63);
     DnsPacket label63(host);
     label63.a(nullptr);
-    CHECK(accepts(label63, configuration, address));
+    CHECK(accepts(label63, configuration, addresses));
     host[63] = 'a';
     DnsPacket label64(host);
     label64.a(nullptr);
@@ -445,7 +450,7 @@ TEST(remote_jwks_metadata, cname_hostname_bounds) {
     host[63] = host[127] = host[191] = '.';
     DnsPacket expanded253(host);
     expanded253.a(nullptr);
-    CHECK(accepts(expanded253, configuration, address));
+    CHECK(accepts(expanded253, configuration, addresses));
     host[253] = 'a';
     DnsPacket expanded254(host);
     expanded254.a(nullptr);

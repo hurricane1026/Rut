@@ -127,8 +127,9 @@ def main():
                 records.append(record(pointer, 1, address))
                 if mode == "cname-reordered":
                     records = [record(alias, 1, address), record(b"\xc0\x0c", 5, alias)]
-                elif mode == "cname-move":
-                    records[-1] = record(pointer, 1, socket.inet_aton("127.0.0.2"))
+                elif mode == "cname-failover":
+                    records[-1] = record(pointer, 1, socket.inet_aton("127.0.0.4"))
+                    records.append(record(pointer, 1, socket.inet_aton("127.0.0.2")))
                 elif mode == "cname-poison":
                     records.append(record(pointer, 1, socket.inet_aton("127.0.0.3")))
                 elif mode == "cname-cycle":
@@ -143,6 +144,7 @@ def main():
     dns_worker=threading.Thread(target=resolve,daemon=True)
     dns_worker.start()
     process = None
+    refusing = None
     try:
         policy = fixture["first"]
         policy["remoteJwks"] = {"address": "127.0.0.1", "port": origin.server_port,
@@ -153,8 +155,11 @@ def main():
         if retry_profile:
             policy["remoteJwks"].update(retrySeconds=2, timeoutSeconds=2)
         if args.discovery_dns:
+            # Reserve the allowlisted first address without listening on it.
+            refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            refusing.bind(("127.0.0.4", origin.server_port))
             policy["remoteJwks"].update(dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
-                                       allowedAddresses=["127.0.0.1", "127.0.0.2"],
+                                       allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
@@ -402,7 +407,7 @@ def main():
                 with lock:
                     dns_before_move = state["dnsRequests"]
                     origin_before_move = state["requests"]
-                    state["dns"] = "cname-move"
+                    state["dns"] = "cname-failover"
                 wait_for_dns_request(dns_before_move)
                 wait_for_origin_address(origin_before_move, "127.0.0.2")
                 wait_status(fixture["b"], 200)
@@ -419,6 +424,8 @@ def main():
             release_response.set()
             print(f"PASS: {args.algorithm} {args.backend} remote {'access-token ' if args.access_profile else ''}JWKS rotation, empty set, outage, malformed refresh and shutdown")
     finally:
+        if refusing is not None:
+            refusing.close()
         dns_stop.set()
         dns.close()
         dns_worker.join(timeout=2)

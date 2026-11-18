@@ -11176,7 +11176,9 @@ nonblocking UDP A query with a bounded CNAME answer chain and optional
 authenticated metadata fetch before the JWKS GET. A single response permits at
 most four alias hops and eight total answer records; every terminal IPv4 address
 must match an explicit finite allowlist. TLS name/CA, issuer, endpoint URI and
-kid/algorithm inventory remain configuration-owned.
+kid/algorithm inventory remain configuration-owned. The validated terminal
+addresses are tried in answer order after definitive TCP establishment failures.
+Each address runs its own discovery and key exchange within the shared deadline.
 DNS/discovery/key stages share one deadline and retry cadence; failures do not
 renew key age. No libc DNS wait, redirects, request-selected endpoints, new
 library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).
