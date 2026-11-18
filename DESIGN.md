@@ -11118,6 +11118,15 @@ remain disabled. New IDs must be globally unused, including disabled records,
 and retaining history requires a free credential slot. The input and running
 gateways are unchanged; deployment remains explicit and #1072 remains open.
 
+`rut-consumers prune-credentials` removes explicitly disabled credentials and
+finite expiries at or before an operator-supplied canonical positive signed-64-bit
+Unix-second cutoff. It does not read the clock. All Consumers and full retained
+records stay in order; a disabled owner alone does not select an enabled key.
+Input and result both pass full validation before private no-replace publication,
+including a no-op copy. Removed IDs become reusable and capacity is reclaimed;
+old snapshot files and running gateways are unchanged. This is offline snapshot
+maintenance, not durable revocation or a history store (#1072 remains open).
+
 Version-1 credential records optionally carry integer Unix-second `notBefore`
 and `expiresAt` bounds; absent or zero values are unbounded. A finite start is
 inclusive, while expiry is exclusive. The runtime validates the complete exact

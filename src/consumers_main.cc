@@ -627,6 +627,63 @@ bool rotate_key_change(
     return output.ok;
 }
 
+bool prune_cutoff(const char* text, i64& cutoff) {
+    if (!text || text[0] < '1' || text[0] > '9') return false;
+    u64 value = 0;
+    constexpr u64 kMax = ~u64{0} >> 1;
+    for (u32 i = 0; text[i]; ++i) {
+        if (text[i] < '0' || text[i] > '9') return false;
+        const u64 digit = static_cast<u64>(text[i] - '0');
+        if (value > (kMax - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    cutoff = static_cast<i64>(value);
+    return true;
+}
+
+bool prune_credentials(json::Document& doc, i64 cutoff, json::Writer& output) {
+    output.text(lit_str("{\"version\":1,\"consumers\":"));
+    if (!doc.write(field(doc, 0, lit_str("consumers")), output)) return false;
+    output.text(lit_str(",\"credentials\":["));
+    const u32 credentials = field(doc, 0, lit_str("credentials"));
+    bool first = true;
+    for (u32 record = doc.nodes[credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        const u32 expiry = field(doc, record, lit_str("expiresAt"));
+        i64 expires_at = 0;
+        if (expiry != json::kNone && !json::integer(doc.raw(expiry), expires_at)) return false;
+        if (doc.raw(field(doc, record, lit_str("enabled"))).eq(lit_str("false")) ||
+            (expires_at > 0 && expires_at <= cutoff))
+            continue;
+        if (!first) output.put(',');
+        first = false;
+        if (!doc.write(record, output)) return false;
+    }
+    output.text(lit_str("]}"));
+    return output.ok;
+}
+
+int prune_credentials_command(const char* source,
+                              const char* cutoff_text,
+                              const char* destination) {
+    i64 cutoff = 0;
+    if (!prune_cutoff(cutoff_text, cutoff)) return failure("invalid credential pruning cutoff\n");
+    Buffer input;
+    SensitiveDocument base;
+    if (!read_private(source, input)) return failure("cannot read private registry file\n");
+    if (!consumer_registry_valid(base, input.view()))
+        return failure("invalid Consumer registry snapshot\n");
+    Buffer result;
+    json::Writer output{result.data, json::kMaxBytes};
+    if (!prune_credentials(base, cutoff, output))
+        return failure("cannot encode pruned Consumer registry snapshot\n");
+    SensitiveDocument checked;
+    if (!consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid pruned Consumer registry snapshot\n");
+    const char* error = publish(destination, {result.data, output.len});
+    return error ? failure(error) : 0;
+}
+
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
@@ -639,6 +696,7 @@ constexpr char kUsage[] =
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID "
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
+    "       rut-consumers prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
@@ -655,6 +713,8 @@ constexpr char kUsage[] =
     "private files.\n"
     "rotate-key-verifier disables the old key and inherits its owner, method, groups and time "
     "bounds.\n"
+    "prune-credentials removes disabled or expired-at-cutoff credentials without reading the "
+    "clock.\n"
     "hash-keys converts raw bearer/header keys in the 64-lowercase-hex generated-key profile.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
@@ -662,6 +722,8 @@ constexpr char kUsage[] =
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--help") == 0)
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
+    if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
+        return prune_credentials_command(argv[2], argv[3], argv[4]);
     const bool kInit = argc == 3 && strcmp(argv[1], "init") == 0;
     const bool kValidate = argc == 3 && strcmp(argv[1], "validate") == 0;
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;

@@ -3594,6 +3594,14 @@ exact owner, method, optional groups and time bounds, including expired windows,
 and does not enable a disabled Consumer. The new ID must be unused even among
 disabled records; retaining the old record requires a free credential slot.
 Rotation is offline and deployment remains explicit (#1072 remains open).
+`prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT` writes a validated private
+replacement without explicitly disabled credentials or positive `expiresAt`
+values at/before the supplied cutoff. It accepts canonical positive decimal
+1–9223372036854775807 and never reads the clock. All Consumers and full retained
+credentials remain; disabled ownership alone does not prune an enabled key.
+No-op copies are published too. Pruning frees slots and IDs, while old files and
+running gateways retain their snapshots until explicitly retired/replaced.
+This adds no Rut syntax or durable revocation/history service.
 
 Offline `rut-consumers diff BEFORE AFTER` validates both existing private
 snapshots and emits structured added/removed/changed metadata. Credential key

@@ -1597,6 +1597,12 @@ JIT tests also cover the 1024/1025-byte bound. See
 
 ## Free auth foundation profiles
 
+- [Offline credential pruning](consumer-registry.md#offline-administration):
+  `prune-credentials` reclaims disabled or expired-at-cutoff records with a strict
+  operator-supplied timestamp, preserving all Consumers and full retained records.
+  It validates before private publication, reads no clock and does not update
+  running gateways. Pruned IDs can be reused; durable history and revocation are
+  not supplied by this operation (#1072 remains open).
 - [Consumer registry snapshots](consumer-registry.md): 32 Consumers, 64 credentials,
   exact stable IDs, disabled/retired credentials and group updates, compiler
   validation, identity-only results and native-program lifetime isolation. This
