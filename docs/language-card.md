@@ -3561,6 +3561,14 @@ in its snapshot and writes the corresponding 64-byte lowercase-hex key to a
 separate 0600 file. It publishes the key first, then the snapshot; a failure
 between those publications can leave an orphan key file, so operators inspect
 both outputs before retrying. This adds no Rut syntax or runtime API.
+
+Credentials may optionally set `groups`: omission inherits the Consumer's
+groups, `[]` removes all group authority, and a nonempty list may only select
+unique existing owner groups. This least-privilege subset is validated for the
+entire snapshot, including disabled credentials. An explicit subset does not
+grow when the Consumer receives new groups; removing an explicit member requires
+updating that credential in the same replacement snapshot.
+
 Credentials may include optional `notBefore` and `expiresAt` integer Unix-second
 bounds (`0` or absence is unbounded). Start is inclusive and expiry exclusive.
 When any bound is finite, every auth method checks one host `CLOCK_REALTIME`

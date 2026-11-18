@@ -27,6 +27,17 @@ even disabled records are validated. Reusing a secret within a method is rejecte
 across all credentials, preventing ambiguous ownership and slot-order selection.
 An empty registry is a valid deny-all snapshot.
 
+A credential may optionally include `groups`. When absent, its successful
+identity inherits all groups from its owning Consumer. An explicit empty array
+grants no groups; a nonempty array narrows the identity to at most 16 unique
+1–128 byte printable ASCII names already present in that Consumer's `groups`.
+This field only removes authority from the Consumer's group list. Adding groups
+to a Consumer does not expand a credential with an explicit subset; the
+credential must be updated separately. Removing a Consumer group still used by
+an explicit credential makes the entire replacement snapshot invalid until the
+credential is narrowed or removed. All entries are checked even when the
+credential or Consumer is disabled.
+
 Bearer and header records contain exactly one of `secret` or `secretSha256`.
 `secretSha256` is the lowercase 64-hex SHA-256 digest of the exact presented
 textual key bytes (the key text is not hex-decoded). The runtime hashes a
@@ -47,7 +58,8 @@ Each credential may add integer `notBefore` and/or `expiresAt` Unix-second
 fields. Both default to `0`, meaning unbounded; nonzero values must be positive
 signed-64-bit integers, and when both are finite `expiresAt` must be greater
 than `notBefore`. The complete credential object still allows only its common
-required fields, exactly one key field, and these two optional fields; duplicate or unknown names and
+required fields, exactly one key field, and the optional `notBefore`, `expiresAt`
+and `groups` fields; duplicate or unknown names and
 wrong numeric forms invalidate the whole snapshot, including disabled records.
 At authentication, a finite start is inclusive (`now >= notBefore`) and a finite
 expiry is exclusive (`now < expiresAt`).
@@ -70,7 +82,8 @@ for a custom header: duplicates become absent, never an anonymous grant. These
 methods never implicitly extract query, cookie or body credentials. Explicit
 query/form admission is available through the separate functions below.
 
-A successful result owns only `consumerId`, `credentialId`, `method`, and `groups`
+A successful result owns only `consumerId`, `credentialId`, `method`, and the
+effective `groups` list
 in the request arena. It contains no secret or full registry. Missing, malformed,
 wrong, disabled or revoked credentials return nil; authorization remains separate
 (e.g. `jwtHasGroup(identity, "staff")`). There is no guest fallback. Match results
@@ -283,9 +296,11 @@ directories and publicly readable files reject. Secrets come from these files,
 never command arguments. `inspect` writes Consumer metadata and credential
 ID/owner/method/enabled fields and any `notBefore`/`expiresAt` metadata to
 stdout, omitting every credential `secret` and `secretSha256`. `plan` uses the
-same redaction. `apply` and `generate-key` preserve
-existing window fields; a newly generated key has no window fields and is
-unbounded until a later snapshot explicitly adds them.
+same redaction. `inspect` also shows optional window and group metadata.
+`apply` and `generate-key` preserve existing window and group fields; newly
+generated credentials have no time window (and are therefore unbounded) and
+omit `groups`, inheriting their Consumer's groups. `hash-keys` preserves group
+metadata.
 Validation and mutation commands produce no stdout. Fixed errors contain no
 configuration values. Exit status is 0 on success and 2 on any failure.
 

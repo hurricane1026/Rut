@@ -142,12 +142,12 @@ def test_hash_keys(tool, root):
     existing_hash = hashlib.sha256(b'existing').hexdigest()
     snapshot = dict(
         version=1,
-        consumers=[dict(id='alice', enabled=True, groups=['staff'])],
+        consumers=[dict(id='alice', enabled=True, groups=['staff', 'readers'])],
         credentials=[
             dict(id='bearer', consumerId='alice', method='bearer', secret=raw_bearer,
-                 enabled=True, notBefore=1700000000, expiresAt=1800000000),
+                 enabled=True, notBefore=1700000000, expiresAt=1800000000, groups=['readers']),
             dict(id='header', consumerId='alice', method='header', secret=raw_header,
-                 enabled=False, expiresAt=1900000000),
+                 enabled=False, expiresAt=1900000000, groups=[]),
             dict(id='basic', consumerId='alice', method='basic', secret=basic, enabled=True),
             dict(id='mtls', consumerId='alice', method='mtls', secret=mtls, enabled=True),
             dict(id='already-hashed', consumerId='alice', method='header',
@@ -168,6 +168,7 @@ def test_hash_keys(tool, root):
     assert by_id['bearer']['notBefore'] == 1700000000
     assert by_id['bearer']['expiresAt'] == 1800000000
     assert by_id['header']['enabled'] is False and by_id['header']['expiresAt'] == 1900000000
+    assert by_id['bearer']['groups'] == ['readers'] and by_id['header']['groups'] == []
     assert by_id['basic']['secret'] == basic and by_id['mtls']['secret'] == mtls
     assert by_id['already-hashed']['secretSha256'] == existing_hash
     assert run(tool, 'validate', output).returncode == 0
@@ -373,6 +374,54 @@ int linkat(int oldfd, const char *oldpath, int newfd, const char *newpath, int f
                     assert raw_key not in result.stderr and raw_key not in result.stdout
 
 
+def test_credential_groups_preserve_and_reject_parent_removal(tool, root):
+    key = 'a' * 64
+    alice = dict(id='alice', enabled=True, groups=['staff', 'readers'])
+    restricted = dict(id='read', consumerId='alice', method='bearer', secret=key,
+                      enabled=True, groups=['readers'])
+    inherited = dict(id='inherit', consumerId='alice', method='header', secret='header-key',
+                     enabled=True)
+    snapshot = dict(version=1, consumers=[alice], credentials=[restricted, inherited])
+    source = private(root / 'groups-source.json', snapshot)
+    patch = private(root / 'groups-noop.json', changes())
+    applied = root / 'groups-applied.json'
+    result = run(tool, 'apply', source, patch, applied)
+    assert result.returncode == 0 and json.loads(applied.read_bytes()) == snapshot
+    inspected = run(tool, 'inspect', applied)
+    assert inspected.returncode == 0
+    inspect_snapshot = json.loads(inspected.stdout)
+    assert inspect_snapshot['credentials'][0]['groups'] == ['readers']
+    assert 'groups' not in inspect_snapshot['credentials'][1]
+
+    hashed = root / 'groups-hashed.json'
+    result = run(tool, 'hash-keys', source, hashed)
+    assert result.returncode == 2 and not hashed.exists(), 'weak header should reject whole conversion'
+    # Convert a valid-profile header too; both credential group forms must survive.
+    valid_snapshot = dict(snapshot)
+    valid_snapshot['credentials'] = [restricted, dict(inherited, secret='b' * 64)]
+    valid_source = private(root / 'groups-valid-hash-source.json', valid_snapshot)
+    result = run(tool, 'hash-keys', valid_source, hashed)
+    assert result.returncode == 0
+    hashed_records = {item['id']: item for item in json.loads(hashed.read_bytes())['credentials']}
+    assert hashed_records['read']['groups'] == ['readers']
+    assert 'groups' not in hashed_records['inherit']
+
+    removal = private(root / 'groups-remove-parent.json', changes(
+        consumers=[dict(id='alice', enabled=True, groups=['staff'])]))
+    rejected = root / 'groups-removal-rejected.json'
+    result = run(tool, 'apply', source, removal, rejected)
+    assert result.returncode == 2 and not result.stdout and not rejected.exists()
+    narrowed = private(root / 'groups-narrow-and-remove.json', changes(
+        consumers=[dict(id='alice', enabled=True, groups=['staff'])],
+        credentials=[dict(restricted, groups=[])]))
+    replacement = root / 'groups-removal-replacement.json'
+    result = run(tool, 'apply', source, narrowed, replacement)
+    assert result.returncode == 0
+    final = json.loads(replacement.read_bytes())
+    final_read = next(item for item in final['credentials'] if item['id'] == 'read')
+    assert final_read['groups'] == []
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -386,6 +435,7 @@ def main(tool):
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
         test_generated_key_verifier(tool, root)
+        test_credential_groups_preserve_and_reject_parent_removal(tool, root)
         initial = root / 'initial.json'
         assert run(tool, 'init', initial).returncode == 0
         empty = json.loads(initial.read_bytes())

@@ -12,6 +12,12 @@ constexpr Str kRegistry = lit_str(
 Str view(const char* value) {
     return {value, static_cast<u32>(strlen(value))};
 }
+bool contains(Str haystack, Str needle) {
+    if (!haystack.ptr || !needle.ptr || needle.len > haystack.len) return false;
+    for (u32 i = 0; i <= haystack.len - needle.len; ++i)
+        if (memcmp(haystack.ptr + i, needle.ptr, needle.len) == 0) return true;
+    return false;
+}
 }  // namespace
 TEST(consumer_registry, identity_projection_and_revocation) {
     json::Document document;
@@ -426,4 +432,109 @@ TEST(consumer_registry, sha256_verifier_schema_and_ambiguity_fail_closed) {
                       R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":[]}],"credentials":[{"id":"k1","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":false},{"id":"k2","consumerId":"a","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true}]})")};
     json::Document document;
     for (Str value : invalid) CHECK(!consumer_registry_valid(document, value));
+}
+
+TEST(consumer_registry, credential_groups_inherit_narrow_and_project_across_methods) {
+    const Str registry = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["readers","writers","staff"]}],"credentials":[{"id":"inherit","consumerId":"alice","method":"bearer","secret":"inherit-key","enabled":true},{"id":"none","consumerId":"alice","method":"bearer","secret":"none-key","enabled":true,"groups":[]},{"id":"subset","consumerId":"alice","method":"bearer","secret":"subset-key","enabled":true,"groups":["readers"],"notBefore":100,"expiresAt":200},{"id":"basic","consumerId":"alice","method":"basic","secret":"alice:pw","enabled":true,"groups":[]},{"id":"header","consumerId":"alice","method":"header","secret":"header-key","enabled":true,"groups":["writers"]},{"id":"query","consumerId":"alice","method":"header","secret":"query-key","enabled":true,"groups":["readers"]},{"id":"hash-bearer","consumerId":"alice","method":"bearer","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true,"groups":["readers"]},{"id":"hash-header","consumerId":"alice","method":"header","secretSha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","enabled":true,"groups":["writers"]},{"id":"mtls","consumerId":"alice","method":"mtls","secret":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enabled":true,"groups":["staff"]}]})");
+    json::Document document;
+    CHECK(consumer_registry_valid(document, registry));
+    char bytes[8192]{};
+    json::Writer inherited{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("bearer"), lit_str("Bearer inherit-key"), inherited));
+    CHECK((Str{bytes, inherited.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"inherit","method":"bearer","groups":["readers","writers","staff"]})"))));
+    json::Writer no_groups{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("bearer"), lit_str("Bearer none-key"), no_groups));
+    CHECK((Str{bytes, no_groups.len}.eq(
+        lit_str(R"({"consumerId":"alice","credentialId":"none","method":"bearer","groups":[]})"))));
+    json::Writer subset{bytes};
+    CHECK(consumer_registry_authenticate_at(
+        document, registry, lit_str("bearer"), lit_str("Bearer subset-key"), 100, subset));
+    CHECK((Str{bytes, subset.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"subset","method":"bearer","groups":["readers"]})"))));
+    json::Writer subset_expired{bytes};
+    CHECK(!consumer_registry_authenticate_at(
+        document, registry, lit_str("bearer"), lit_str("Bearer subset-key"), 200, subset_expired));
+    json::Writer basic{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("basic"), lit_str("Basic YWxpY2U6cHc="), basic));
+    CHECK((Str{bytes, basic.len}.eq(
+        lit_str(R"({"consumerId":"alice","credentialId":"basic","method":"basic","groups":[]})"))));
+    json::Writer header{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("header"), lit_str("header-key"), header));
+    CHECK((Str{bytes, header.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"header","method":"header","groups":["writers"]})"))));
+    json::Writer query{bytes};
+    CHECK(consumer_registry_authenticate_fields(document,
+                                                registry,
+                                                lit_str("api_key"),
+                                                lit_str("/private?api_key=query-key"),
+                                                true,
+                                                query));
+    CHECK(contains({bytes, query.len}, lit_str(R"("groups":["readers"])")));
+    json::Writer form{bytes};
+    CHECK(consumer_registry_authenticate_fields(
+        document, registry, lit_str("api_key"), lit_str("api_key=query-key"), false, form));
+    CHECK(contains({bytes, form.len}, lit_str(R"("groups":["readers"])")));
+    json::Writer hashed_bearer{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("bearer"), lit_str("Bearer abc"), hashed_bearer));
+    CHECK((Str{bytes, hashed_bearer.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"hash-bearer","method":"bearer","groups":["readers"]})"))));
+    json::Writer hashed_header{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, registry, lit_str("header"), lit_str("abc"), hashed_header));
+    CHECK((Str{bytes, hashed_header.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"hash-header","method":"header","groups":["writers"]})"))));
+    json::Writer mtls{bytes};
+    CHECK(consumer_registry_authenticate_mtls(
+        document,
+        registry,
+        lit_str("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        mtls));
+    CHECK((Str{bytes, mtls.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"mtls","method":"mtls","groups":["staff"]})"))));
+}
+
+TEST(consumer_registry, credential_group_schema_is_strict_and_membership_is_snapshot_validated) {
+    const Str invalid[] = {
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["readers"]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"key","enabled":true,"groups":"readers"}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["readers"]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"key","enabled":true,"groups":["unknown"]}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["readers"]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"key","enabled":false,"groups":["readers","\u0072eaders"]}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["readers"]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"key","enabled":false,"groups":["r\u00e9aders"]}]})"),
+        lit_str(
+            R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["readers"]}],"credentials":[{"id":"k","consumerId":"a","method":"bearer","secret":"key","enabled":false,"groups":["readers"],"\u0067roups":[]}]})")};
+    json::Document document;
+    for (Str value : invalid) CHECK(!consumer_registry_valid(document, value));
+
+    char bytes[8192];
+    const u32 length = static_cast<u32>(snprintf(
+        bytes,
+        sizeof(bytes),
+        R"({"version":1,"consumers":[{"id":"a","enabled":true,"groups":["g0","g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g14","g15"]}],"credentials":[{"id":"k","consumerId":"a","method":"header","secret":"key","enabled":false,"groups":["g0","g1","g2","g3","g4","g5","g6","g7","g8","g9","g10","g11","g12","g13","g14","g15","g16"]}]})"));
+    CHECK(!consumer_registry_valid(document, {bytes, length}));
+
+    const Str expanded_snapshot = lit_str(
+        R"({"version":1,"consumers":[{"id":"alice","enabled":true,"groups":["reader","admin"]}],"credentials":[{"id":"limited","consumerId":"alice","method":"bearer","secret":"limited-key","enabled":true,"groups":["reader"]},{"id":"inherited","consumerId":"alice","method":"bearer","secret":"inherited-key","enabled":true}]})");
+    json::Writer limited{bytes};
+    CHECK(consumer_registry_authenticate(
+        document, expanded_snapshot, lit_str("bearer"), lit_str("Bearer limited-key"), limited));
+    CHECK((Str{bytes, limited.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"limited","method":"bearer","groups":["reader"]})"))));
+    json::Writer inherited{bytes};
+    CHECK(consumer_registry_authenticate(document,
+                                         expanded_snapshot,
+                                         lit_str("bearer"),
+                                         lit_str("Bearer inherited-key"),
+                                         inherited));
+    CHECK((Str{bytes, inherited.len}.eq(lit_str(
+        R"({"consumerId":"alice","credentialId":"inherited","method":"bearer","groups":["reader","admin"]})"))));
 }

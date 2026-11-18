@@ -21,6 +21,7 @@ struct Credential {
     u32 method = json::kNone;
     u32 secret = json::kNone;
     u32 secret_sha256 = json::kNone;
+    u32 groups = json::kNone;
     u32 owner = 0;
     i64 not_before = 0;
     i64 expires_at = 0;
@@ -76,7 +77,7 @@ bool credential_fields_valid(json::Document& doc, u32 object) {
     const Str required[] = {
         lit_str("id"), lit_str("consumerId"), lit_str("method"), lit_str("enabled")};
     const Str alternatives[] = {lit_str("secret"), lit_str("secretSha256")};
-    const Str optional[] = {lit_str("notBefore"), lit_str("expiresAt")};
+    const Str optional[] = {lit_str("notBefore"), lit_str("expiresAt"), lit_str("groups")};
     if (object >= doc.count || doc.nodes[object].kind != json::Kind::Object) return false;
     for (Str key : required)
         if (key_count(doc, object, key) != 1) return false;
@@ -96,7 +97,7 @@ bool credential_fields_valid(json::Document& doc, u32 object) {
         for (Str candidate : required) known |= candidate.eq(value);
         for (Str candidate : alternatives) known |= candidate.eq(value);
         for (Str candidate : optional) known |= candidate.eq(value);
-        if (!known || ++count > 7) return false;
+        if (!known || ++count > 8) return false;
     }
     return count >= 5;
 }
@@ -177,6 +178,7 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
         credential.method = field(doc, n, lit_str("method"));
         credential.secret = field(doc, n, lit_str("secret"));
         credential.secret_sha256 = field(doc, n, lit_str("secretSha256"));
+        credential.groups = field(doc, n, lit_str("groups"));
         const u32 kNotBefore = field(doc, n, lit_str("notBefore"));
         const u32 kExpiresAt = field(doc, n, lit_str("expiresAt"));
         const u32 kOwner = field(doc, n, lit_str("consumerId"));
@@ -196,6 +198,24 @@ bool load(json::Document& doc, Str configuration, Registry& result) {
             owner_found = true;
         }
         if (!owner_found) return false;
+        if (credential.groups < doc.count) {
+            if (doc.nodes[credential.groups].kind != json::Kind::Array) return false;
+            u32 group_count = 0;
+            for (u32 group = doc.nodes[credential.groups].child; group != json::kNone;
+                 group = doc.nodes[group].next) {
+                if (++group_count > 16 || !label(doc, group, 128)) return false;
+                bool owner_group = false;
+                for (u32 owner_group_node =
+                         doc.nodes[result.consumers[credential.owner].groups].child;
+                     owner_group_node != json::kNone;
+                     owner_group_node = doc.nodes[owner_group_node].next)
+                    owner_group |= same(doc, group, owner_group_node);
+                if (!owner_group) return false;
+                for (u32 previous = doc.nodes[credential.groups].child; previous != group;
+                     previous = doc.nodes[previous].next)
+                    if (same(doc, previous, group)) return false;
+            }
+        }
         char method_bytes[16];
         const Str kMethod = text(doc, credential.method, method_bytes, sizeof(method_bytes));
         const bool hashed = credential.secret_sha256 < doc.count;
@@ -318,7 +338,8 @@ static bool authenticate(json::Document& document,
     output.text(lit_str(",\"method\":"));
     output.text(document.raw(credential.method));
     output.text(lit_str(",\"groups\":"));
-    output.text(document.raw(consumer.groups));
+    const u32 kGroups = credential.groups < document.count ? credential.groups : consumer.groups;
+    output.text(document.raw(kGroups));
     output.put('}');
     return output.ok;
 }
