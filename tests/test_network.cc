@@ -91002,3 +91002,47 @@ TEST(route_config_fixture, aligns_mmap_storage_before_constructing_snapshot) {
              0u);
     CHECK(fixture.config->add_upstream("api", 0x7f000001, 9001));
 }
+
+TEST(weighted_load_balance, minimum_healthy_capacity_uses_configured_weight) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9003));
+    auto& target = cfg.upstreams[0];
+    target.weights[0] = 3;
+    target.weights[1] = 1;
+    target.weights[2] = 0;
+    const ForwardLoadBalance rr{1, LoadBalancePolicy::RoundRobin};
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    *backend_health(0, 2) = {};
+    backend_health(0, 0)->active_down = true;
+    target.minimum_healthy_weight_percent = 25;
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 3, 0, 0), 1u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 3, 0, 2), 3u);
+    target.minimum_healthy_weight_percent = 26;
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 3, 0, 0), 3u);
+    CHECK_EQ(select_strict_backend(target, 0, 0, 0), 3u);
+    target.minimum_healthy_weight_percent = 0;
+    backend_health(0, 1)->eject_until_us = 100;
+    CHECK_LT(select_forward_backend(&cfg, 0, rr, 0, 3, 0, 0), 2u);
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+}
+
+TEST(weighted_load_balance, reload_result_admission_uses_current_capacity_policy) {
+    RouteConfig old_cfg;
+    RouteConfig new_cfg;
+    REQUIRE(old_cfg.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(new_cfg.add_upstream("api", 0x7f000001, 9002));
+    const RouteConfig* current = &new_cfg;
+    struct Loop {
+        const RouteConfig** config_ptr;
+    } loop{&current};
+    CHECK(admit_passive_health_result(&loop, &old_cfg, 0));
+    new_cfg.upstreams[0].minimum_healthy_weight_percent = 50;
+    CHECK_FALSE(admit_passive_health_result(&loop, &old_cfg, 0));
+    CHECK(admit_passive_health_result(&loop, &new_cfg, 0));
+    CHECK(admit_passive_health_result(&loop, nullptr, 0));
+    CHECK_FALSE(current_health_generation(&loop, &old_cfg));
+}

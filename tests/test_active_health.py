@@ -31,8 +31,8 @@ def main():
             class Origin(BaseHTTPRequestHandler):
                 def do_GET(self):
                     with lock:
-                        if self.path == '/healthz':
-                            probes[label] += 1
+                        if self.path in ('/healthz', '/strict-healthz'):
+                            probes[self.path, label] += 1
                             code = 200 if healthy[label] else 500
                         else:
                             data_requests[label] += 1
@@ -64,7 +64,18 @@ upstream api {{
         failure_threshold: 2, success_threshold: 3
     }}
 }}
+upstream strict {{
+    backends: [{entries}]
+    minimum_healthy_weight_percent: 51
+    health_check: {{ path: "/strict-healthz", interval: 1s, status: 200,
+                    failure_threshold: 2, success_threshold: 3 }}
+}}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
+route GET "/strict" {{ return forward(strict, load_balance: .roundRobin) }}
+route GET "/strict-connect" {{
+    let ev = wait(upstream(strict).connect())
+    if ev.ok {{ return 204 }} else {{ return 502 }}
+}}
 '''
         with tempfile.TemporaryDirectory(prefix='rut-active-health-') as directory:
             root = Path(directory)
@@ -89,10 +100,10 @@ route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
             else:
                 raise AssertionError('gateway startup timed out\n' + log.read_text(errors='replace'))
 
-            def h1():
+            def h1(path='/'):
                 connection = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
                 try:
-                    connection.request('GET', '/')
+                    connection.request('GET', path)
                     response = connection.getresponse()
                     return response.status, response.read()
                 finally:
@@ -108,30 +119,50 @@ route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
                     time.sleep(.025)
                 raise AssertionError(message + '\n' + log.read_text(errors='replace'))
 
-            wait_for(lambda: probes['A'] > 0 and probes['B'] > 0, 'no periodic health probes')
-            for protocol, request in [('H1', h1), ('H2', lambda: h2_request(port, '/', []))]:
+            normal_a = ('/healthz', 'A')
+            strict_a = ('/strict-healthz', 'A')
+            wait_for(lambda: all(probes[path, label] > 0
+                                 for path in ('/healthz', '/strict-healthz')
+                                 for label in ('A', 'B')), 'no periodic health probes')
+            for protocol, request, strict in [
+                    ('H1', h1, lambda: h1('/strict')),
+                    ('H2', lambda: h2_request(port, '/', []),
+                     lambda: h2_request(port, '/strict', []))]:
                 initial = Counter(request() for _ in range(20))
                 assert initial == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, initial)
+                assert h1('/strict-connect')[0] == 204
                 with lock:
                     healthy['A'] = False
-                    before = probes['A']
-                wait_for(lambda: probes['A'] > before, 'unhealthy endpoint was not probed')
+                    before = probes[normal_a]
+                    strict_before = probes[strict_a]
+                wait_for(lambda: probes[normal_a] > before, 'unhealthy endpoint was not probed')
                 wait_for(lambda: all(request() == (200, b'B') for _ in range(4)),
                          'unhealthy endpoint was not ejected')
                 with lock:
-                    assert probes['A'] - before >= 2, (protocol, probes)
+                    assert probes[normal_a] - before >= 2, (protocol, probes)
                 assert all(request() == (200, b'B') for _ in range(20)), protocol
+                wait_for(lambda: strict()[0] == 503, 'strict capacity did not close')
+                before_requests = sum(data_requests.values())
+                assert strict()[0] == 503
+                assert h1('/strict-connect')[0] == 503
+                assert sum(data_requests.values()) == before_requests
                 with lock:
+                    assert probes[strict_a] - strict_before >= 2, (protocol, probes)
                     healthy['A'] = True
-                    before = probes['A']
-                wait_for(lambda: probes['A'] > before, 'disabled-by-health target was not reprobed')
+                    before = probes[normal_a]
+                    strict_before = probes[strict_a]
+                wait_for(lambda: probes[normal_a] > before, 'disabled-by-health target was not reprobed')
                 wait_for(lambda: request() == (200, b'A'), 'recovered target was not re-enabled')
                 with lock:
-                    assert probes['A'] - before >= 3, (protocol, probes)
+                    assert probes[normal_a] - before >= 3, (protocol, probes)
+                wait_for(lambda: strict()[0] == 200, 'strict capacity did not recover')
+                assert h1('/strict-connect')[0] == 204
+                with lock:
+                    assert probes[strict_a] - strict_before >= 3, (protocol, probes)
                 recovered = Counter(request() for _ in range(20))
                 assert recovered == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, recovered)
             with lock:
-                assert probes['disabled'] == 0, probes
+                assert probes['/healthz', 'disabled'] == probes['/strict-healthz', 'disabled'] == 0, probes
                 assert data_requests['disabled'] == 0, data_requests
                 print(args.backend, 'H1/H2 active health ejection/recovery passed', dict(probes))
     finally:

@@ -109,7 +109,7 @@ constexpr Str kPipePlaceholderDetail = lit_str(
     "where the value lands");
 constexpr Str kReqHeaderMutationDetail = lit_str(
     "req.set/add expect a literal safe header name and a non-optional string value "
-    "(req.add requires a literal), and may only be used as a statement");
+    "and may only be used as a statement");
 constexpr Str kReqHeaderRemoveDetail =
     lit_str("req.remove expects one literal safe header name and may only be used as a statement");
 constexpr Str kReqHeaderRemoveOrderDetail = lit_str(
@@ -4919,8 +4919,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         const bool is_add = expr.name.eq({"add", 3});
         if (!route->req_header_mutation_stmt_ok || expr.args.len != (is_remove ? 1u : 2u) ||
             expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
-            (!is_remove &&
-             (expr.args[1] == nullptr || (is_add && expr.args[1]->kind != AstExprKind::StrLit))))
+            (!is_remove && expr.args[1] == nullptr))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
@@ -21959,6 +21958,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_expected_status = item.upstream.hc_expected_status;
         up.hc_thresholds = item.upstream.hc_thresholds;
+        up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

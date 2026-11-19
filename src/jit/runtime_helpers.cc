@@ -713,8 +713,8 @@ void rut_helper_req_set_header(void* conn, const char* name, u32 nlen, const cha
     record_req_header(conn, name, nlen, val, vlen, false);
 }
 
-void rut_helper_req_set_owned_header(
-    void* conn, void* arena, const char* name, u32 nlen, const char* val, u32 vlen) {
+static void record_req_owned_header(
+    void* conn, void* arena, const char* name, u32 nlen, const char* val, u32 vlen, bool append) {
     if (conn == nullptr) return;
     auto& c = *static_cast<ConnectionBase*>(conn);
     if (c.req_header_override_overflow) return;
@@ -742,7 +742,17 @@ void rut_helper_req_set_owned_header(
     __builtin_memcpy(storage, name, nlen);
     if (vlen != 0) __builtin_memcpy(storage + nlen, val, vlen);
     c.req_header_owned_bytes += nlen + vlen;
-    record_req_header(&c, storage, nlen, storage + nlen, vlen, false);
+    record_req_header(&c, storage, nlen, storage + nlen, vlen, append);
+}
+
+void rut_helper_req_set_owned_header(
+    void* conn, void* arena, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_owned_header(conn, arena, name, nlen, val, vlen, false);
+}
+
+void rut_helper_req_add_owned_header(
+    void* conn, void* arena, const char* name, u32 nlen, const char* val, u32 vlen) {
+    record_req_owned_header(conn, arena, name, nlen, val, vlen, true);
 }
 
 void rut_helper_req_add_header(void* conn, const char* name, u32 nlen, const char* val, u32 vlen) {

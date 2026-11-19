@@ -422,6 +422,17 @@ struct Ctx {
         return fn_req_set_owned_header;
     }
 
+    LLVMValueRef fn_req_add_owned_header = nullptr;
+    LLVMValueRef get_req_add_owned_header() {
+        if (!fn_req_add_owned_header) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 6, 0);
+            fn_req_add_owned_header =
+                LLVMAddFunction(llvm_mod, "rut_helper_req_add_owned_header", ft);
+        }
+        return fn_req_add_owned_header;
+    }
+
     // void rut_helper_req_add_header(ptr conn, ptr name, i32 nlen, ptr val, i32 vlen)
     LLVMValueRef fn_req_add_header = nullptr;
     LLVMValueRef get_req_add_header() {
@@ -1404,7 +1415,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::ReqSetHeader:
-        case rir::Opcode::ReqSetOwnedHeader: {
+        case rir::Opcode::ReqSetOwnedHeader:
+        case rir::Opcode::ReqAddOwnedHeader: {
             // imm.str_val is the header name (a literal); operands[0] is the value
             // (a Str register). Record both on the connection; the proxy injects or
             // replaces the line in the outbound request before forwarding.
@@ -1414,14 +1426,13 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef value = c.get_value(inst.operands[0]);
             LLVMValueRef vptr = LLVMBuildExtractValue(c.builder, value, 0, "setheader.vptr");
             LLVMValueRef vlen = LLVMBuildExtractValue(c.builder, value, 1, "setheader.vlen");
-            if (inst.op == rir::Opcode::ReqSetOwnedHeader) {
+            if (inst.op == rir::Opcode::ReqSetOwnedHeader ||
+                inst.op == rir::Opcode::ReqAddOwnedHeader) {
+                LLVMValueRef helper = inst.op == rir::Opcode::ReqAddOwnedHeader
+                                          ? c.get_req_add_owned_header()
+                                          : c.get_req_set_owned_header();
                 LLVMValueRef args[] = {c.param_conn, c.param_arena, name_ptr, name_len, vptr, vlen};
-                LLVMBuildCall2(c.builder,
-                               LLVMGlobalGetValueType(c.get_req_set_owned_header()),
-                               c.get_req_set_owned_header(),
-                               args,
-                               6,
-                               "");
+                LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 6, "");
             } else {
                 LLVMValueRef args[] = {c.param_conn, name_ptr, name_len, vptr, vlen};
                 LLVMBuildCall2(c.builder,

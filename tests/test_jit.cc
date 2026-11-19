@@ -2413,6 +2413,7 @@ TEST(jit, frontend_req_set_and_add_record_request_header_modes) {
 route GET "/users" {
     req.set("X-Mode", "replace")
     req.add("X-Tag", "tail")
+    req.add("X-Tag", req.path)
     return 200
 }
 )rut";
@@ -2435,22 +2436,29 @@ route GET "/users" {
     auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
     REQUIRE(handler != nullptr);
 
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
     Connection conn;
     conn.reset();
     const auto result = HandlerResult::unpack(handler(&conn,
                                                       nullptr,
                                                       reinterpret_cast<const u8*>(kGetApiRequest),
                                                       sizeof(kGetApiRequest) - 1,
-                                                      nullptr));
+                                                      &arena));
     CHECK(result.action == HandlerAction::ReturnStatus);
     CHECK_EQ(result.status_code, 200);
-    REQUIRE_EQ(conn.req_header_override_count, 2u);
+    REQUIRE_EQ(conn.req_header_override_count, 3u);
     CHECK(conn.req_header_overrides[0].name.eq(lit("X-Mode")));
     CHECK(conn.req_header_overrides[0].value.eq(lit("replace")));
     CHECK(conn.req_header_overrides[1].name.eq(lit("X-Tag")));
     CHECK(conn.req_header_overrides[1].value.eq(lit("tail")));
-    CHECK_EQ(conn.req_header_append_mask, 2u);
+    CHECK(conn.req_header_overrides[2].value.eq(lit("/api/users")));
+    CHECK_EQ(conn.req_header_append_mask, 6u);
 
+    arena.destroy();
+    pool.destroy();
     engine.shutdown();
     rir.destroy();
 }
@@ -28884,13 +28892,20 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     CHECK_EQ(conn.req_header_owned_bytes, 18u);
     CHECK(!conn.req_header_override_overflow);
     CHECK_EQ(conn.req_header_append_mask, 0u);
-    rut_helper_req_set_owned_header(&conn, &arena, "X-Empty", 7, nullptr, 0);
+    char appended[] = "tail";
+    rut_helper_req_add_owned_header(&conn, &arena, "X-Tag", 5, appended, 4);
+    appended[0] = 'z';
     REQUIRE_EQ(conn.req_header_override_count, 2u);
-    CHECK(conn.req_header_overrides[1].value.empty());
+    CHECK(conn.req_header_overrides[1].value.eq(lit("tail")));
+    CHECK_EQ(conn.req_header_append_mask, 2u);
+    conn.reset();
+    rut_helper_req_set_owned_header(&conn, &arena, "X-Empty", 7, nullptr, 0);
+    REQUIRE_EQ(conn.req_header_override_count, 1u);
+    CHECK(conn.req_header_overrides[0].value.empty());
     const char* invalid_values[] = {"a\r\nb", "a\nb", "a\x7f"};
     for (const char* invalid : invalid_values) {
         conn.reset();
-        rut_helper_req_set_owned_header(&conn, &arena, "X-Test", 6, invalid, lit(invalid).len);
+        rut_helper_req_add_owned_header(&conn, &arena, "X-Test", 6, invalid, lit(invalid).len);
         CHECK(conn.req_header_override_overflow);
         CHECK_EQ(conn.req_header_override_count, 0u);
     }
@@ -28901,16 +28916,16 @@ TEST(jit, owned_request_headers_copy_borrowed_inputs_and_fail_closed) {
     conn.reset();
     char large[ConnectionBase::kMaxReqHeaderOwnedBytes];
     __builtin_memset(large, 'a', sizeof(large));
-    rut_helper_req_set_owned_header(&conn, &arena, "X", 1, large, sizeof(large) - 1);
+    rut_helper_req_add_owned_header(&conn, &arena, "X", 1, large, sizeof(large) - 1);
     REQUIRE_EQ(conn.req_header_owned_bytes, ConnectionBase::kMaxReqHeaderOwnedBytes);
-    rut_helper_req_set_owned_header(&conn, &arena, "X", 1, "", 0);
+    rut_helper_req_add_owned_header(&conn, &arena, "X", 1, "", 0);
     CHECK(conn.req_header_override_overflow);
     CHECK_EQ(conn.req_header_override_count, 1u);
     conn.reset();
     CHECK_EQ(conn.req_header_owned_bytes, 0u);
     CHECK(!conn.req_header_override_overflow);
     for (u32 i = 0; i <= ConnectionBase::kMaxReqHeaderOverrides; ++i)
-        rut_helper_req_set_owned_header(&conn, &arena, "X", 1, "a", 1);
+        rut_helper_req_add_owned_header(&conn, &arena, "X", 1, "a", 1);
     CHECK(conn.req_header_override_overflow);
     CHECK_EQ(conn.req_header_override_count, ConnectionBase::kMaxReqHeaderOverrides);
     conn.reset();

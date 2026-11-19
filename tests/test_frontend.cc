@@ -38569,14 +38569,14 @@ route GET "/x" {
 TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
     const char* src =
         "route GET \"/x\" { req.set(\"X-Mode\", \"replace\") req.add(\"X-Tag\", \"a\") "
-        "return 200 }\n";
+        "req.add(\"X-Dynamic\", req.path) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
              static_cast<u8>(HirExprKind::ReqSetHeader));
     CHECK(hir->routes[0].locals[0].init.str_value.eq(lit("X-Mode")));
@@ -38586,7 +38586,7 @@ TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
-    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 3u);
     CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
              static_cast<u8>(MirValueKind::ReqSetHeader));
     CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
@@ -38598,6 +38598,7 @@ TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
     REQUIRE_EQ(rir.module.func_count, 1u);
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqSetHeader));
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqAddHeader));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqAddOwnedHeader));
     rir.destroy();
 }
 
@@ -38607,7 +38608,8 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         "route GET \"/x\" { req.set(\"Content-Length\", \"1\") return 200 }\n",
         "route GET \"/x\" { req.set(\"Bad Header\", \"v\") return 200 }\n",
         "route GET \"/x\" { req.set(\"X-Test\", req.header(\"Maybe\")) return 200 }\n",
-        "route GET \"/x\" { req.add(\"X-Test\", req.path) return 200 }\n",
+        "route GET \"/x\" { req.add(\"X-Test\", req.header(\"Maybe\")) return 200 }\n",
+        "route GET \"/x\" { req.add(req.path, \"v\") return 200 }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));
@@ -38618,7 +38620,7 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(
             lit("req.set/add expect a literal safe header name and a non-optional string value "
-                "(req.add requires a literal), and may only be used as a statement")));
+                "and may only be used as a statement")));
     }
 }
 
@@ -48256,7 +48258,7 @@ route GET "/" {
 
 TEST(frontend, upstream_weights_round_trip_and_prebound_validation) {
     const char* source = R"rut(
-upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
+upstream api { minimum_healthy_weight_percent: 50, backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut";
     auto tokens = lex(lit(source));
@@ -48270,8 +48272,10 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
     CHECK_EQ(rir.module.upstreams[0].weight_count, 3u);
+    CHECK_EQ(rir.module.upstreams[0].minimum_healthy_weight_percent, 50u);
     RouteConfig cfg;
     REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].minimum_healthy_weight_percent, 50u);
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
     CHECK_EQ(cfg.upstreams[0].weights[1], 0u);
     CHECK_EQ(cfg.upstreams[0].weights[2], 65535u);
@@ -48354,5 +48358,49 @@ TEST(frontend, oauth_client_basic_authorization_optional_string_and_shadowing) {
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         CHECK(!analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, minimum_healthy_weight_percent_bounds_and_prebound) {
+    for (const char* value : {"0", "50", "100"}) {
+        char source[160];
+        snprintf(
+            source, sizeof(source), "upstream api { minimum_healthy_weight_percent: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(ast->items[0].upstream.has_address);
+    }
+    auto tokens = lex(lit("upstream api { minimum_healthy_weight_percent: 50 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].minimum_healthy_weight_percent, 50u);
+    rir.module.upstreams[0].minimum_healthy_weight_percent = 101;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].minimum_healthy_weight_percent, 50u);
+    rir.destroy();
+    auto duplicate =
+        lex(lit("upstream api { minimum_healthy_weight_percent: 0, "
+                "minimum_healthy_weight_percent: 1 }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+    for (const char* value : {"101", "999999999999999999999", "-1"}) {
+        char source[160];
+        snprintf(
+            source, sizeof(source), "upstream api { minimum_healthy_weight_percent: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
     }
 }

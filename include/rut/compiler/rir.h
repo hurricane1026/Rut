@@ -235,6 +235,7 @@ enum class Opcode : u8 {
     ReqSetHeader,           // req.set_header "Name", %val
     ReqSetOwnedHeader,      // validated request-owned copy of a runtime value
     ReqAddHeader,           // req.add_header "Name", %val
+    ReqAddOwnedHeader,      // validated request-owned append of a runtime value
     ReqRemoveHeader,        // Remove all case-insensitive matches before forwarding.
     RespHeader,             // %opt = resp.header "Name", %fallback_opt
     RespSetHeader,          // resp.set_header "Name", %val
@@ -615,6 +616,7 @@ struct Module {
         u32 extra_count = 0;
         u32 extra_ips[kMaxExtraBackends] = {};
         u16 extra_ports[kMaxExtraBackends] = {};
+        u8 minimum_healthy_weight_percent = 0;
         u32 weight_count = 0;
         u16 backend_weights[8]{};
         // Active health-check config carried verbatim from MIR (data only; the

@@ -6,6 +6,7 @@
 ```swift
 upstream api {
     backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    minimum_healthy_weight_percent: 50
     health_check: { path: "/healthz", interval: 1s, status: 200 }
 }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
@@ -27,9 +28,10 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 - 热更新重新安排周期并重置健康判定。旧探针的结果必须同时匹配配置指针和身份，
   即使新配置复用了相同地址也不能污染其健康状态；内核不借用旧配置中的 sockaddr。
 
-Rut 原有的“所有启用目标都已摘除时 fail-open”保持不变；不宣称该行为与 Kong 的
-不可用阈值、全不可用响应完全相同。HTTP 状态数组、独立健康/不健康周期、主动 HTTPS、Admin API
-和节点间共享健康判定仍超出该能力的范围。
+`minimum_healthy_weight_percent` 默认为 0，所有启用目标都被摘除时沿用 fail-open。
+设置为正数时，Rut 根据主动与被动健康判定计算健康目标的权重占比。占比低于门槛时，
+新转发或显式上游连接返回 503。示例中，权重为 3 的目标被摘除后，只剩 25% 健康容量。
+健康判定和容量计算均在各 shard 内完成。
 
 验证入口：
 
@@ -40,11 +42,12 @@ ctest --test-dir build -R '^test_(health_probes|active_health_)' --output-on-fai
 
 独立 C++ 用例通过真实 loopback sockets 验证两后端的失败/恢复、超时和取消回收、
 槽位预留、零权重、原地址配置替换、SQ 满的取消重试以及旧配置销毁后的异步 connect。
-真实网关用例分别在 epoll/io_uring 上通过 H1/H2 下游观察 A/B 分流、健康失败后的摘除和
-恢复后的重新分流，且确认禁用目标未收到探针或业务请求。
+真实网关用例分别在 epoll/io_uring 上通过 H1/H2 下游观察 A/B 分流、健康失败后的摘除、
+门槛触发时的 503 和恢复后的重新分流，同时验证显式上游连接也遵守门槛。
+权重为 0 的目标在测试中未收到探针或业务请求。
 
-本地 Linux 验证：13 个 C++ 探针测试（278 项检查）在 Release 和 ASan/UBSan 下通过，
+主动探针合入时的 Linux 验证记录：13 个 C++ 探针测试（278 项检查）在 Release 和 ASan/UBSan 下通过，
 14 个真实网关/分流/路由/ELF CTest 项全部通过，另有 1,674 个网络、1,312 个前端、
 104 个 gRPC 与 88 个 Native artifact 回归通过。未运行 macOS kqueue 或真实 Kong 对照测试。
 
-Native artifact 版本 21 记录探测阈值，并保留版本 20 引入的探针配置身份。旧产物需重新编译。
+Native artifact 版本 22 记录健康权重百分比，并保留探测阈值和探针配置身份。旧产物需重新编译。

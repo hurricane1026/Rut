@@ -96,6 +96,27 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
 }
 
+template <typename Loop>
+inline bool current_health_generation(Loop* loop, const RouteConfig* pinned) {
+    if constexpr (requires { loop->config_ptr; }) {
+        const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
+        return !current || !pinned || current == pinned;
+    }
+    return true;
+}
+
+template <typename Loop>
+inline bool admit_passive_health_result(Loop* loop, const RouteConfig* pinned, u16 uid) {
+    if constexpr (requires { loop->config_ptr; }) {
+        const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
+        // A configured capacity floor uses only the current target's health.
+        if (current && pinned && current != pinned && uid < current->upstream_count &&
+            current->upstreams[uid].minimum_healthy_weight_percent != 0)
+            return false;
+    }
+    return true;
+}
+
 // Active verdicts use consecutive probe outcomes and stay in force until the
 // opposite threshold is reached. Business connects update only passive state.
 inline void record_active_probe_result(u16 upstream_id,
@@ -164,20 +185,26 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
 // Round-robin over enabled backends, preferring healthy endpoints. If all
 // enabled backends are ejected, fail open to the first enabled endpoint in
 // rotation. Returning backend_count means no endpoint is enabled.
-inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us, const u16* weights) {
+inline u32 select_backend(u16 upstream_id,
+                          u32 backend_count,
+                          u64 now_us,
+                          const u16* weights,
+                          bool strict = false,
+                          u8 excluded = 0) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
     if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
-    if (backend_count == 1) return weights && weights[0] == 0 ? backend_count : 0;
+    if (backend_count == 1 && !strict) return weights && weights[0] == 0 ? backend_count : 0;
     u32 fallback = backend_count;
     for (u32 step = 0; step < backend_count; step++) {
         const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
-        if (weights && weights[idx] == 0) continue;
+        if ((weights && weights[idx] == 0) || (excluded & (1u << idx))) continue;
         if (fallback == backend_count) fallback = idx;
         if (!backend_ejected(upstream_id, idx, now_us)) {
             rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
             return idx;
         }
     }
+    if (strict) return backend_count;
     if (fallback != backend_count)
         rr_cursor[upstream_id] = static_cast<u16>((fallback + 1) % backend_count);
     return fallback;
@@ -185,6 +212,26 @@ inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us, const 
 
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
     return select_backend(upstream_id, backend_count, now_us, nullptr);
+}
+
+// Capacity is computed over configured enabled weights, independently of request retries.
+inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u64 now) {
+    if (target.minimum_healthy_weight_percent == 0) return true;
+    if (target.minimum_healthy_weight_percent > 100 ||
+        target.addr_count > UpstreamTarget::kMaxBackends)
+        return false;
+    u64 configured = 0;
+    u64 healthy = 0;
+    for (u32 i = 0; i < target.addr_count; ++i) {
+        configured += target.weights[i];
+        if (!backend_ejected(uid, i, now)) healthy += target.weights[i];
+    }
+    return configured != 0 && healthy * 100 >= configured * target.minimum_healthy_weight_percent;
+}
+
+inline u32 select_strict_backend(const UpstreamTarget& target, u16 uid, u64 now, u8 excluded) {
+    if (!upstream_capacity_available(target, uid, now)) return target.addr_count;
+    return select_backend(uid, target.addr_count, now, target.weights, true, excluded);
 }
 
 // Selection uses only the owning shard's sidecar in the pinned configuration.
@@ -201,12 +248,16 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         count > UpstreamTarget::kMaxBackends || count != cfg->upstreams[uid].addr_count)
         return count;
     if (!forward_load_balance_valid(spec)) return count;
+    const auto& target = cfg->upstreams[uid];
+    const bool strict = target.minimum_healthy_weight_percent != 0;
     // Native callers without a compiled forward site retain their legacy path.
     if (spec.policy == LoadBalancePolicy::None) {
         for (u32 i = 0; i < count; ++i)
             if (cfg->upstreams[uid].weights[i] != 1) return count;
+        if (strict) return select_strict_backend(target, uid, now, excluded_backends);
         return select_backend(uid, count, now);
     }
+    if (strict && !upstream_capacity_available(target, uid, now)) return count;
     auto& state = cfg->backend_selection[shard];
     auto& cursor = state.cursor[spec.site - 1];
     const auto& weights = cfg->upstreams[uid].weights;
@@ -220,7 +271,7 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
         if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0) continue;
-        if (any_healthy && backend_ejected(uid, i, now)) continue;
+        if ((strict || any_healthy) && backend_ejected(uid, i, now)) continue;
         // Compare exact active/weight ratios without division or narrowing.
         if (spec.policy == LoadBalancePolicy::LeastRequests && best != count) {
             const u64 lhs = static_cast<u64>(state.active[uid][i]) * weights[best];
@@ -2461,6 +2512,19 @@ inline bool request_fully_resendable(const Connection& conn) {
 template <typename Loop>
 bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!conn.upstream_reused) return false;
+    if (conn.request_config && conn.upstream_idx < conn.request_config->upstream_count) {
+        const auto& target = conn.request_config->upstreams[conn.upstream_idx];
+        const u64 now = monotonic_us();
+        if (target.minimum_healthy_weight_percent != 0 &&
+            !current_health_generation(loop, conn.request_config))
+            return false;
+        if (target.minimum_healthy_weight_percent != 0 &&
+            (conn.upstream_backend_idx >= target.addr_count ||
+             !upstream_capacity_available(target, conn.upstream_idx, now) ||
+             target.weights[conn.upstream_backend_idx] == 0 ||
+             backend_ejected(conn.upstream_idx, conn.upstream_backend_idx, now)))
+            return false;
+    }
     // Paired strict HEAD failures are a one-shot connect-establishment
     // contract; never replay a request from a pooled socket under that policy.
     if (conn.failure_policy_suppress_body ||
@@ -4540,11 +4604,14 @@ void handle_jit_outcome(Loop* loop,
                 const bool kCanConnect = !target.http2 &&
                                          !(target.tls.enabled && conn.req_wants_upgrade) &&
                                          target.addr_count <= UpstreamTarget::kMaxBackends;
-                const u32 kBackend = kCanConnect ? select_backend(static_cast<u16>(upstream_id),
-                                                                  target.addr_count,
-                                                                  kStartUs,
-                                                                  target.weights)
-                                                 : target.addr_count;
+                const u32 kBackend =
+                    !kCanConnect ? target.addr_count
+                    : target.minimum_healthy_weight_percent != 0
+                        ? select_strict_backend(target, static_cast<u16>(upstream_id), kStartUs, 0)
+                        : select_backend(static_cast<u16>(upstream_id),
+                                         target.addr_count,
+                                         kStartUs,
+                                         target.weights);
                 if (kBackend >= target.addr_count) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
@@ -5827,6 +5894,8 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     const RouteConfig* config = conn.request_config;
     if (!config || conn.upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[conn.upstream_idx];
+    if (target.minimum_healthy_weight_percent != 0 && !current_health_generation(loop, config))
+        return false;
     const u32 kBudget =
         target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
     if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
@@ -8714,8 +8783,9 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         // backend (passive health → ejection past the threshold), then try the
         // next backend within the retry budget; only answer 502 once all
         // candidates are exhausted.
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
+            record_backend_result(
+                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
             loop->close_conn(conn);
             return;
@@ -8745,8 +8815,9 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // A fresh TCP connect succeeded — clear this backend's passive-health record.
     // Reused pooled sockets only prove health once they return a response.
     if (!conn.upstream_reused) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
+            record_backend_result(
+                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
     }
 
     if (conn.req_malformed) {
@@ -9806,13 +9877,15 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     Http2Conn* h2 = conn.h2;
     if (ev.result < 0) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        if (admit_passive_health_result(loop, h2 ? h2->async_cfg : nullptr, conn.upstream_idx))
+            record_backend_result(
+                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         h2_proxy_fail(loop, conn, 502, /*connect_failure=*/true);
         return;
     }
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    if (admit_passive_health_result(loop, h2 ? h2->async_cfg : nullptr, conn.upstream_idx))
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
     if (!loop->alloc_upstream_buf(conn)) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -13638,8 +13711,9 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
         return;
     }
 
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+    if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
 
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
@@ -15132,8 +15206,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     };
     auto record_reused_response_health = [&]() {
         if (!conn.upstream_reused) return;
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+        if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
+            record_backend_result(
+                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
         conn.upstream_reused = false;
     };
     const bool configured_head_candidate =

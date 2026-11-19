@@ -2965,17 +2965,23 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!val) return core::make_unexpected(val.error());
-        const bool emitted = value.kind == MirValueKind::ReqRemoveHeader
-                                 ? static_cast<bool>(b.emit_req_remove_header(
-                                       value.str_value, {span.line, span.col}))
-                             : value.kind == MirValueKind::ReqAddHeader
-                                 ? static_cast<bool>(b.emit_req_add_header(
-                                       value.str_value, val.value(), {span.line, span.col}))
-                             : value.lhs->kind != MirValueKind::StrConst
-                                 ? static_cast<bool>(b.emit_req_set_owned_header(
-                                       value.str_value, val.value(), {span.line, span.col}))
-                                 : static_cast<bool>(b.emit_req_set_header(
-                                       value.str_value, val.value(), {span.line, span.col}));
+        bool emitted = false;
+        const auto loc = rir::SourceLoc{span.line, span.col};
+        if (value.kind == MirValueKind::ReqRemoveHeader) {
+            emitted = static_cast<bool>(b.emit_req_remove_header(value.str_value, loc));
+        } else if (value.kind == MirValueKind::ReqAddHeader) {
+            emitted =
+                value.lhs->kind == MirValueKind::StrConst
+                    ? static_cast<bool>(b.emit_req_add_header(value.str_value, val.value(), loc))
+                    : static_cast<bool>(
+                          b.emit_req_add_owned_header(value.str_value, val.value(), loc));
+        } else {
+            emitted =
+                value.lhs->kind == MirValueKind::StrConst
+                    ? static_cast<bool>(b.emit_req_set_header(value.str_value, val.value(), loc))
+                    : static_cast<bool>(
+                          b.emit_req_set_owned_header(value.str_value, val.value(), loc));
+        }
         if (!emitted) return frontend_error(FrontendError::OutOfMemory, span);
         return val.value();
     }
@@ -4318,6 +4324,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
         out.module.upstreams[i].hc_thresholds = mir.upstreams[i].hc_thresholds;
+        out.module.upstreams[i].minimum_healthy_weight_percent =
+            mir.upstreams[i].minimum_healthy_weight_percent;
         out.module.upstreams[i].weight_count = mir.upstreams[i].weight_count;
         for (u32 b = 0; b < mir.upstreams[i].weight_count; ++b)
             out.module.upstreams[i].backend_weights[b] = mir.upstreams[i].backend_weights[b];
