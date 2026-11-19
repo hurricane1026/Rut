@@ -725,6 +725,22 @@ bool provision_profile(json::Document& base, json::Document& profile) {
            find(base, kConsumers, profile, kNewId, true) == json::kNone;
 }
 
+enum class RegistryAction : u8 {
+    InspectConsumer,
+    InspectCredential,
+};
+
+struct RegistryCommand {
+    const char* name;
+    int argc;
+    RegistryAction action;
+};
+
+constexpr RegistryCommand kRegistryCommands[] = {
+    {"inspect-consumer", 4, RegistryAction::InspectConsumer},
+    {"inspect-credential", 4, RegistryAction::InspectCredential},
+};
+
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
     for (u32 record = doc.nodes[records].child; record != json::kNone;
          record = doc.nodes[record].next) {
@@ -733,19 +749,26 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
-int registry_command(char** args) {
+int registry_command(RegistryAction action, char** args) {
     Buffer input;
     SensitiveDocument doc;
     if (!read_private(args[2], input) || !consumer_registry_valid(doc, input.view()))
         return failure("cannot read valid private registry snapshot\n");
     const Str id{args[3], bounded_argument(args[3], 65)};
     const u32 kConsumers = field(doc, 0, lit_str("consumers"));
-    const u32 kTarget = provision_id_valid(id) ? record_by_id(doc, kConsumers, id) : json::kNone;
+    const u32 kCredentials = field(doc, 0, lit_str("credentials"));
+    const bool kInspectConsumer = action == RegistryAction::InspectConsumer;
+    const u32 kTarget = provision_id_valid(id)
+                            ? record_by_id(doc, kInspectConsumer ? kConsumers : kCredentials, id)
+                            : json::kNone;
     if (kTarget == json::kNone) return failure("registry record not found\n");
 
     Buffer result;
     json::Writer output{result.data, json::kMaxBytes};
-    if (!doc.write(kTarget, output)) return failure("cannot encode redacted registry record\n");
+    u32 hidden = field(doc, kTarget, lit_str("secret"));
+    if (hidden == json::kNone) hidden = field(doc, kTarget, lit_str("secretSha256"));
+    if (!doc.write(kTarget, output, hidden, {}, true))
+        return failure("cannot encode redacted registry record\n");
     output.put('\n');
     return output.ok && write_all(STDOUT_FILENO, {result.data, output.len}) ? 0 : 2;
 }
@@ -828,6 +851,7 @@ constexpr char kUsage[] =
     "       rut-consumers validate INPUT\n"
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
+    "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
@@ -865,7 +889,9 @@ constexpr char kUsage[] =
 int main(int argc, char** argv) {
     if (argc == 2 && strcmp(argv[1], "--help") == 0)
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
-    if (argc == 4 && strcmp(argv[1], "inspect-consumer") == 0) return registry_command(argv);
+    for (const RegistryCommand& command : kRegistryCommands)
+        if (argc == command.argc && strcmp(argv[1], command.name) == 0)
+            return registry_command(command.action, argv);
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
         return prune_credentials_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)

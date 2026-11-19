@@ -61,6 +61,12 @@ def test_targeted_registry_commands(tool, root):
 
     inspect('inspect-consumer', alice['id'], alice)
     inspect('inspect-consumer', 'missing', None)
+    inspect('inspect-credential', parked['id'],
+            {k: v for k, v in parked.items() if k != 'secretSha256'})
+    inspect('inspect-credential', raw['id'],
+            {k: v for k, v in raw.items() if k != 'secret'})
+    inspect('inspect-credential', alice['id'], None)
+    inspect('inspect-credential', 'x' * 65, None)
     assert source.read_bytes() == original
 
 
