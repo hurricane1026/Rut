@@ -123,12 +123,25 @@ func requirePrincipal(_ document: Json, _ issuer: str, _ clientId: str, _ expect
     document
 }
 
-// Apply after requireActive using the same trusted audience.
+func lifetimeMatches(_ document: Json, _ issuer: str, _ audience: str, _ maxAge: i32, _ maxLifetime: i32) -> bool {
+    let actualIssuer = json.string(json.get(document, "/iss").or(document)).or("")
+    let issued = json.int(json.get(document, "/iat").or(document)).or(0)
+    let expires = json.int(json.get(document, "/exp").or(document)).or(0)
+    // The JWT timing primitive requires a subject. This internal projection
+    // lets it check the dates while the original metadata supplies AS policy.
+    guard let times = json.value({
+        sub: "introspection-lifetime", iss: issuer, aud: audience, iat: issued, exp: expires
+    }) else { false }
+    actualIssuer == issuer && oauthIntrospectionValid(document, audience) &&
+        jwtClaimsValidWithLifetime(times, issuer, audience, i64(maxAge), i64(maxLifetime))
+}
+
+// Apply to metadata parsed from the fixed HTTPS introspection response.
 func requireLifetime(_ document: Json, _ issuer: str, _ audience: str, _ maxAge: i32, _ maxLifetime: i32) -> Json {
     guard issuer != "" && audience != "" && maxAge > 0 && maxLifetime > 0 else { respond 503 }
     let denied = response(401)
     denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
-    guard jwtClaimsValidWithLifetime(document, issuer, audience, i64(maxAge), i64(maxLifetime)) else { respond denied }
+    guard lifetimeMatches(document, issuer, audience, maxAge, maxLifetime) else { respond denied }
     document
 }
 

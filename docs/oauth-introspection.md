@@ -195,7 +195,7 @@ response from the configured HTTPS authorization server:
 - `requireLifetime(document, issuer, audience, maxAge, maxLifetime)` requires a
   positive issued-at time and enforces the configured maximum age and maximum
   expiry-to-issuance lifetime. Set both limits in seconds and reuse the trusted
-  audience from `requireActive`.
+  audience from `requireActive`. Subjectless tokens remain eligible for this policy.
 
 Scope lists are nonempty, space-separated and at most 1024 bytes. Invalid
 configuration produces 503. A scope policy denial returns 403 with the Bearer

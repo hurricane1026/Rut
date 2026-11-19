@@ -56,6 +56,9 @@ def main():
                 'audit-only': dict(scope='reports:audit'),
                 'all-scopes': dict(scope='reports:audit reports:write reports:read'),
                 'short-token': dict(iat=now - 10, exp=now + 50),
+                'subjectless-short': dict(iat=now - 10, exp=now + 50),
+                'short-wrong-issuer': dict(iat=now - 10, exp=now + 50, iss='https://other.example'),
+                'short-wrong-audience': dict(iat=now - 10, exp=now + 50, aud='other-api'),
                 'long-token': dict(iat=now - 10, exp=now + 130),
                 'old-token': dict(iat=now - 70, exp=now + 20),
                 'bad-iat': dict(iat='yesterday', exp=now + 50),
@@ -89,7 +92,7 @@ def main():
                 del body['exp']
             if token == 'no-scope':
                 del body['scope']
-            if token == 'no-subject':
+            if token in ('no-subject', 'subjectless-short'):
                 del body['sub']
             if token == 'no-issuer':
                 del body['iss']
@@ -380,15 +383,17 @@ route GET "/{path}" {{
                             assert status == 403
                             assert headers['WWW-Authenticate'] == 'Bearer error="insufficient_scope"'
                         assert request('typed-scope', '/no-forbidden-scopes')[0] == 401
-                        assert request('short-token', '/bounded-lifetime')[0] == 204
-                        for token in ('valid', 'long-token', 'old-token', 'bad-iat', 'future-iat'):
+                        for token in ('short-token', 'subjectless-short'):
+                            assert request(token, '/bounded-lifetime')[0] == 204
+                        for token in ('valid', 'long-token', 'old-token', 'bad-iat', 'future-iat',
+                                      'short-wrong-issuer', 'short-wrong-audience'):
                             status, headers, _ = request(token, '/bounded-lifetime')
                             assert status == 401
                             assert headers['WWW-Authenticate'] == 'Bearer error="invalid_token"'
                         for path, token in (
                                 ('/any-scope-list', 'audit-only'), ('/all-scope-list', 'all-scopes'),
                                 ('/pinned-subject', 'valid'), ('/no-forbidden-scopes', 'read-only'),
-                                ('/bounded-lifetime', 'short-token')):
+                                ('/bounded-lifetime', 'subjectless-short')):
                             headers, data = h2_request(path, token)
                             assert headers.startswith(b'\x89') and not data, (path, headers, data)
                         headers, data = h2_request('/no-forbidden-scopes', 'all-scopes')
