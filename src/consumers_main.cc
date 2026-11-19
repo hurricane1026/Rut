@@ -782,11 +782,25 @@ bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
     return true;
 }
 
+bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
+    i64 minimum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, minimum)) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) &&
+            policy_time(doc, record, lit_str("expiresAt")) - snapshot.now < minimum)
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
     {lit_str("requireExpiryForEnabledCredentials"), true, policy_expiry},
     {lit_str("maxCredentialLifetimeSeconds"), false, policy_max_lifetime},
+    {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
