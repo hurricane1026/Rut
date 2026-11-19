@@ -10,7 +10,7 @@ route GET "/exchanged-reports" {
     let message = oauth_client.tokenExchange(req.authorization.or(""), env("TOKEN_SERVICE_AUTH"), policy)
     let pending = httpCall(env("TOKEN_ENDPOINT"), message, 1000)
     guard let reply = pending else { return 503 }
-    let authorization = oauth_client.exchangeAuthorization(reply, "reports:read")
+    let authorization = oauth_client.exchangeAuthorizationForScopes(reply, env("UPSTREAM_SCOPE"))
     match authorization.isEmpty {
         false => {
             req.set("Authorization", authorization)

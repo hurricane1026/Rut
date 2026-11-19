@@ -177,6 +177,31 @@ credential separation, spoofed headers and upstream non-forwarding on rejection.
 It runs on epoll and io_uring with existing timeout/revocation/isolation cases.
 No builtin, runtime ABI, dependency, cache or provider-specific discovery is added.
 
+## Scoped and principal-specific authorization
+
+Apply these policies after `introspection.requireActive` validates a completed
+response from the configured HTTPS authorization server:
+
+- `requireAnyScope(document, required)` accepts at least one exact permission
+  from a configured scope list. `requireAllScopes(document, required)` requires
+  every permission, with order independent of the token's grant.
+- `requireNoScopes(document, forbidden)` denies any listed permission, even when
+  the token also has an otherwise sufficient grant. A missing scope claim is an
+  empty grant for this check. `requireActive` rejects malformed scope metadata
+  before this policy runs. Apply the deny rule before forwarding.
+- `requirePrincipal(document, issuer, clientId, subject)` matches all three
+  trusted configuration values exactly. Use it for a route pinned to a specific
+  principal within an issuer and OAuth client.
+- `requireLifetime(document, issuer, audience, maxAge, maxLifetime)` requires a
+  positive issued-at time and enforces the configured maximum age and maximum
+  expiry-to-issuance lifetime. Set both limits in seconds and reuse the trusted
+  audience from `requireActive`. Subjectless tokens remain eligible for this policy.
+
+Scope lists are nonempty, space-separated and at most 1024 bytes. Invalid
+configuration produces 503. A scope policy denial returns 403 with the Bearer
+`insufficient_scope` challenge. A principal or lifetime mismatch returns 401 with
+the Bearer `invalid_token` challenge.
+
 ## Optional mTLS certificate binding
 
 For opaque certificate-bound access tokens, call

@@ -67,11 +67,22 @@ func tokenExchange(_ authorization: str, _ serviceAuthorization: str, _ policy: 
     message
 }
 
-// Only an OAuth access token may enter the normal Bearer/expiry/scope policy.
-func exchangeAuthorization(_ reply: Json, _ requiredScope: str) -> str {
+// Only a completed exchange that issued an OAuth access token may authorize.
+func exchangeDocument(_ reply: Json) -> Json {
     guard let document = introspection.replyDocument(reply) else { respond 503 }
     guard json.string(json.get(document, "/issued_token_type").or(document)).or("") == "urn:ietf:params:oauth:token-type:access_token" else { respond 503 }
-    authorizationDocument(document, requiredScope)
+    document
+}
+
+func exchangeAuthorization(_ reply: Json, _ requiredScope: str) -> str {
+    authorizationDocument(exchangeDocument(reply), requiredScope)
+}
+
+// Verify the whole configured grant before replacing upstream Authorization.
+func exchangeAuthorizationForScopes(_ reply: Json, _ requiredScopes: str) -> str {
+    let document = exchangeDocument(reply)
+    guard jwtHasAllScopes(document, requiredScopes) else { respond 503 }
+    tokenAuthorizationDocument(document)
 }
 
 // Require every permission in a trusted nonempty scope list (at most 1024 bytes).
