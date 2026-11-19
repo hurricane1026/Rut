@@ -867,6 +867,18 @@ bool policy_credential_groups(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+bool policy_max_credentials(PolicySnapshot& snapshot, u32 value) {
+    i64 maximum = 0;
+    if (!policy_quantity(snapshot.policy, value, 0, maximum) || maximum > 64) return false;
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (policy_count_credentials(snapshot, consumer, false) > static_cast<u32>(maximum))
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
@@ -877,6 +889,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireActiveCredentialForEnabledConsumers"), true, policy_each_consumer_active},
     {lit_str("requireGroupsForEnabledConsumers"), true, policy_consumer_groups},
     {lit_str("requireExplicitCredentialGroups"), true, policy_credential_groups},
+    {lit_str("maxCredentialsPerConsumer"), false, policy_max_credentials},
 };
 
 int evaluate_deployment_policy(json::Document& registry, const char* policy_path, i64 now) {
