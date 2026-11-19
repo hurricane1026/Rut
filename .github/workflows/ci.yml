@@ -835,8 +835,11 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-20
+          if ! command -v clang++-20 >/dev/null || ! clang++-20 --version >/dev/null; then
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends clang-20
+          fi
+          clang++-20 --version
       - name: Check every integer parser candidate
         env:
           CXX: clang++-20

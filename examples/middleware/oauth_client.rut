@@ -1,5 +1,12 @@
 import "introspection.rut"
 
+// Trusted raw configured client credentials. RFC 6749 encodes each component
+// before joining them, so colons/form metacharacters cannot change identity.
+func basicAuthorization(_ clientId: str, _ clientSecret: str) -> str {
+    guard let built = oauthClientBasicAuthorization(clientId, clientSecret) else { respond 503 }
+    built
+}
+
 // Construct headers with JSON escaping; never interpolate raw credentials.
 func clientCredentialsMessage(_ serviceAuthorization: str) -> Json {
     guard let quoted = json.encode(serviceAuthorization) else { nil }

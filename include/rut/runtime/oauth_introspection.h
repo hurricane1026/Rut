@@ -8,6 +8,11 @@ struct Writer;
 }  // namespace rut::json
 
 namespace rut {
+// RFC 6749 client Basic: form-encode each trusted ASCII component before Base64.
+// Inputs are 1..256 bytes each; combined encoded userinfo is at most 1530 bytes.
+// Caller-owned raw header output, published only on success. No retained views.
+bool oauth_client_basic_authorization(Str client_id, Str client_secret, json::Writer& output);
+
 // Bounded RFC 7662 access-token request. Both inputs are borrowed only during
 // this call; service authorization comes from trusted configuration. No I/O.
 bool oauth_introspection_request(Str token, Str service_authorization, json::Writer& output);

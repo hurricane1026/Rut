@@ -4197,6 +4197,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                     if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                         kJsonOp == json::Op::OauthIntrospectionValid ||
                         kJsonOp == json::Op::OauthClientCredentialsRequest ||
+                        kJsonOp == json::Op::OauthClientBasicAuthorization ||
                         kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
                         kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer) {
                         const u32 kCount =
@@ -4220,6 +4221,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         const auto* result = fn.values[inst.result.id].type;
                         if (kJsonOp == json::Op::OauthIntrospectionRequest ||
                             kJsonOp == json::Op::OauthClientCredentialsRequest ||
+                            kJsonOp == json::Op::OauthClientBasicAuthorization ||
                             kJsonOp == json::Op::OauthClientCredentialsResourceRequest ||
                             kJsonOp == json::Op::OauthTokenExchangeRequest || kConsumer) {
                             if (result->kind != rir::TypeKind::Optional || !result->inner ||

@@ -10706,6 +10706,19 @@ scope. The append-only operation preserves previous operation IDs and the generi
 C ABI. No keyword or dependency is added. See [the profile](docs/upstream-oauth.md)
 for ownership, relative lifetime limits and two-backend native validation.
 
+`oauthClientBasicAuthorization` adds optional-string construction from two raw
+configured client credentials, exposed through `oauth_client.basicAuthorization`.
+It uses OAuth form encoding for each component before the separating colon and
+standard padded Base64. Inputs are 1–256 printable ASCII bytes each, including
+space, with a 1530-byte combined encoded bound and at most 2046 header bytes.
+Invalid inputs return nil and the wrapper responds 503 before endpoint contact.
+The new operation is appended without changing existing IDs or the generic C ABI.
+A dedicated raw-result branch copies into the existing request arena and clears
+its bounded sensitive scratch. It does not add generic JSON scratch or request
+state. Existing pre-encoded entry points are unchanged. The primitive is needed
+because ordinary Rut has no callable Base64 or OAuth client component encoder.
+See [the raw client contract](docs/upstream-oauth.md#raw-configured-client-credentials).
+
 The existing request builtin also accepts a third string for a single configured
 HTTPS resource identifier (RFC 8707). It appends an operation without changing old
 operation IDs or the generic helper C ABI. Construction validates bounded URI

@@ -2959,6 +2959,37 @@ extern "C" u8 rut_helper_ws_json_count_compare_at_path(
                : 0u;
 }
 
+namespace {
+void oauth_client_basic_result(void* conn,
+                               void* arena,
+                               Str client_id,
+                               Str client_secret,
+                               u8* has_value,
+                               const char** out_ptr,
+                               u32* out_len) {
+    struct Sensitive {
+        char bytes[2048];
+        ~Sensitive() { rut_crypto_clear_v1(this, sizeof(*this)); }
+    } result;
+    json::Writer output{result.bytes, sizeof(result.bytes)};
+    if (!oauth_client_basic_authorization(client_id, client_secret, output)) return;
+    if (!arena && conn) {
+        auto& owned = static_cast<ConnectionBase*>(conn)->json_arena;
+        if (!owned.backend.pool || (!owned.current && !owned.init(owned.backend.pool))) return;
+        arena = &owned;
+    }
+    if (!arena) return;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage->space_used() > 262144 - output.len) return;
+    auto* bytes = static_cast<char*>(storage->alloc(output.len));
+    if (!bytes) return;
+    __builtin_memcpy(bytes, output.data, output.len);
+    *has_value = 1;
+    *out_ptr = bytes;
+    *out_len = output.len;
+}
+}  // namespace
+
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,
                                 u32 op,
@@ -2977,6 +3008,10 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
+    if (op == static_cast<u32>(json::Op::OauthClientBasicAuthorization)) {
+        oauth_client_basic_result(conn, arena, {a, a_len}, {b, b_len}, has_value, out_ptr, out_len);
+        return;
+    }
     if (op > static_cast<u32>(json::Op::Sha256HexValid) &&
         op != static_cast<u32>(json::Op::JwtVerifyEs256) &&
         op != static_cast<u32>(json::Op::OauthIntrospectionRequest) &&
