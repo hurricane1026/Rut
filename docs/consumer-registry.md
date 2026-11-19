@@ -615,6 +615,7 @@ continues to adopt snapshots through its existing deployment path.
 | `requireActiveCredentialForEnabledConsumers` | Require every enabled Consumer to own at least one active credential at the supplied time. Disabled Consumers are exempt. |
 | `requireGroupsForEnabledConsumers` | Require every enabled Consumer to declare at least one group. This is a deployment check of its metadata, independent of any credential-specific restriction. |
 | `requireExplicitCredentialGroups` | Require enabled credentials to declare their own group array. An explicit empty subset is allowed and does not inherit owner groups. |
+| `maxCredentialsPerConsumer` | Cap the total credential records per Consumer. Counts disabled owners, disabled credentials and records outside their validity windows. Accepts integers from 0 to 64. |
 
 ### Targeted credential validity windows
 
