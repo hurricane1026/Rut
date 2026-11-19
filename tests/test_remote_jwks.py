@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--dns-cache", action="store_true")
     parser.add_argument("--retry-after", action="store_true")
     parser.add_argument("--retry-backoff", action="store_true")
+    parser.add_argument("--stage-timeout", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -39,7 +40,7 @@ def main():
     lock = threading.Lock()
     release_response = threading.Event()
     state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200,
-             "requests": 0, "locals": [], "dnsRequests": 0, "attempts": [], "delay": 0,
+             "requests": 0, "locals": [], "dnsRequests": 0, "dnsTimes": [], "attempts": [], "delay": 0,
              "hold": "cold" if args.access_profile else False,
              "discovery": "valid", "dns": "valid",
              "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
@@ -56,6 +57,8 @@ def main():
                     mode = state["discovery"]
                     discovery_delay = state["discoveryDelay"]
                     state["discoveries"].append((self.headers.get("If-None-Match"), discovery_delay))
+                    if args.stage_timeout:
+                        state.setdefault("discoveryTimes", []).append(time.monotonic())
                 if discovery_delay:
                     time.sleep(discovery_delay)
                 metadata = dict(issuer=fixture["first"]["issuer"],
@@ -152,6 +155,8 @@ def main():
             with lock:
                 mode = state["dns"]
                 state["dnsRequests"] += 1
+                if args.stage_timeout:
+                    state["dnsTimes"].append(time.monotonic())
             if mode == "timeout": continue
             target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
             address = socket.inet_aton(target)
@@ -210,6 +215,11 @@ def main():
                                        allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
+        if args.stage_timeout:
+            assert args.discovery_dns
+            policy["remoteJwks"].update(timeoutSeconds=6, dnsTimeoutSeconds=1,
+                                        discoveryTimeoutSeconds=1)
+            state["dns"] = "timeout"
         if args.dns_cache:
             assert args.discovery_dns
             policy["remoteJwks"]["dnsCacheSeconds"] = 4
@@ -345,7 +355,30 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.retry_backoff:
+            if args.stage_timeout:
+                # Each capped stage aborts and waits for the normal retry tick.
+                # The six-second overall timeout alone cannot meet either bound.
+                wait_for_dns_request(1)
+                with lock:
+                    dns_times = state["dnsTimes"]
+                    assert 1.8 <= dns_times[1] - dns_times[0] < 5, dns_times
+                    assert not state["discoveries"] and not state["requests"]
+                    state.update(dns="valid", discoveryDelay=3)
+                deadline = time.monotonic() + 11
+                while time.monotonic() < deadline:
+                    with lock:
+                        discoveries = state.get("discoveryTimes", ())
+                        if len(discoveries) >= 2:
+                            assert 1.8 <= discoveries[1] - discoveries[0] < 5, discoveries
+                            assert not state["requests"]
+                            state.update(discoveryDelay=0)
+                            break
+                    time.sleep(.02)
+                else:
+                    raise AssertionError("metadata timeout did not retry")
+                wait_status(fixture["a"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
+            elif args.retry_backoff:
                 def failures(expected, limit):
                     with lock:
                         begin = len(state["attempts"])

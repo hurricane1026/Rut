@@ -145,6 +145,12 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_port = static_cast<u16>(value);
             fields |= 4096;
+        } else if (kKey.eq(lit_str("dnsTimeoutSeconds"))) {
+            if (value > 60) return false;
+            next.dns_timeout_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("discoveryTimeoutSeconds"))) {
+            if (value > 60) return false;
+            next.discovery_timeout_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("dnsCacheSeconds"))) {
             if (value > 3600) return false;
             next.dns_cache_seconds = static_cast<u32>(value);
@@ -174,17 +180,20 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     }
     if (!next.retry_seconds) next.retry_seconds = next.refresh_seconds;
     if (next.max_retry_seconds && next.max_retry_seconds < next.retry_seconds) return false;
+    if (next.dns_timeout_seconds > next.timeout_seconds ||
+        next.discovery_timeout_seconds > next.timeout_seconds)
+        return false;
     next.endpoint.tls.enabled = true;
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
         return false;
-    if ((fields & (256 | 512 | 4096)) || next.dns_cache_seconds) {
+    if ((fields & (256 | 512 | 4096)) || next.dns_cache_seconds || next.dns_timeout_seconds) {
         in_addr resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
             inet_pton(AF_INET, next.dns_address, &resolver) != 1)
             return false;
     }
-    if (fields & (1024 | 2048)) {
+    if ((fields & (1024 | 2048)) || next.discovery_timeout_seconds) {
         if (!(fields & 1024) || !(fields & 2048) || !discovery_issuer_valid(next.discovery_issuer))
             return false;
         HttpsEndpoint discovery = next.endpoint;
@@ -534,10 +543,12 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         if (!keys_.set_jwks_condition(kTag)) return fail();
         sent_validator_ = kTag.len != 0;
     }
+    u32 stage_timeout = timeout_ - static_cast<u32>(now - started_);
+    const u32 kDiscoveryTimeout = configuration_.discovery_timeout_seconds * 1000;
+    if (&fetch == &discovery_ && kDiscoveryTimeout && kDiscoveryTimeout < stage_timeout)
+        stage_timeout = kDiscoveryTimeout;
     // A synchronous connect error uses the same next-address path as SO_ERROR.
-    if (fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
-        can_try_next_address(fetch))
-        return true;
+    if (fetch.start(now, stage_timeout) || can_try_next_address(fetch)) return true;
     if (fetch.connect_failed()) clear_dns_cache();
     return fail();
 }
@@ -605,6 +616,11 @@ void JwksFetch::advance(u64 now) {
         return;
     }
     if (dns_fd_ >= 0) {
+        const u32 kDnsTimeout = configuration_.dns_timeout_seconds * 1000;
+        if (kDnsTimeout && now - started_ >= kDnsTimeout) {
+            (void)fail();
+            return;
+        }
         char packet[513];
         const auto count = ::recv(dns_fd_, packet, sizeof(packet), 0);
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;

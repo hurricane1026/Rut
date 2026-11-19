@@ -112,6 +112,36 @@ TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     CHECK(valid("https://issuer.example:443"));
 }
 
+TEST(remote_jwks_metadata, stage_timeouts_require_their_stage_and_fit_the_total) {
+    const char* base =
+        R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+        R"("path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":5)";
+    const char* dns = R"(,"dnsAddress":"192.0.2.53","allowedAddresses":["192.0.2.1"])";
+    const char* discovery =
+        R"(,"discoveryPath":"/metadata","discoveryIssuer":"https://issuer.example")";
+    RemoteJwks config;
+    const auto load = [&](const char* stage, const char* fields) {
+        char bytes[512];
+        const int length = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, stage, fields);
+        json::Document document;
+        return length > 0 && static_cast<u32>(length) < sizeof(bytes) &&
+               document.parse({bytes, static_cast<u32>(length)}) && config.load(document, 0);
+    };
+    REQUIRE(load("", ""));
+    CHECK_EQ(config.dns_timeout_seconds, 0u);
+    CHECK_EQ(config.discovery_timeout_seconds, 0u);
+    CHECK_FALSE(load("", R"(,"dnsTimeoutSeconds":1)"));
+    CHECK_FALSE(load("", R"(,"discoveryTimeoutSeconds":1)"));
+    CHECK_FALSE(load(dns, R"(,"dnsTimeoutSeconds":0)"));
+    CHECK_FALSE(load(dns, R"(,"dnsTimeoutSeconds":6)"));
+    CHECK_FALSE(load(discovery, R"(,"discoveryTimeoutSeconds":1.5)"));
+    CHECK_FALSE(load(discovery, R"(,"discoveryTimeoutSeconds":6)"));
+    REQUIRE(load(dns, R"(,"dnsTimeoutSeconds":5)"));
+    CHECK_EQ(config.dns_timeout_seconds, 5u);
+    REQUIRE(load(discovery, R"(,"discoveryTimeoutSeconds":1)"));
+    CHECK_EQ(config.discovery_timeout_seconds, 1u);
+}
+
 TEST(remote_jwks_metadata, dns_configuration_pairs_bounds_and_failure_reset) {
     const char* base =
         "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\",\"ca\":\"ca."

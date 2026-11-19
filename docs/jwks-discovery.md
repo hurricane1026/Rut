@@ -37,6 +37,14 @@ key refresh, accepted 304, or a maintenance reset clears the progression.
 Server hints can extend the scheduled delay without changing the next local
 backoff step. Request traffic never triggers a refresh.
 
+Optional `dnsTimeoutSeconds` and `discoveryTimeoutSeconds` limit those
+stages to a positive integer number of seconds no greater than
+`timeoutSeconds`. Each requires its corresponding DNS or discovery profile
+and is measured from stage entry. The earlier of the stage limit and total
+deadline wins. Stage timeout ends the attempt through the normal failure and
+retry path, without trying another address or issuing another DNS query.
+Omitting either setting gives that stage the full remaining attempt budget.
+
 Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
 renew last-success time; requests fail closed after the original maximum age
 while maintenance continues its bounded retry cadence. The attempt's total

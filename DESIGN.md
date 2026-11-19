@@ -10257,7 +10257,11 @@ attempt, including setup and key-import failures, schedules from completion plus
 the retry interval. Deadlines saturate on overflow. Existing invalid-clock
 handling cancels work and clears freshness; retry never renews last-success or
 maximum key age. Attempt timeouts still span DNS, metadata and key-fetch stages
-from their start; there is no jitter, exponential backoff or request-driven fetch.
+from their start. Optional `dnsTimeoutSeconds` and `discoveryTimeoutSeconds`
+can shorten those stages without changing the outer deadline or permitting
+failover on timeout. Optional `maxRetrySeconds` caps exponential backoff and
+`maxRetryAfterSeconds` can honor bounded authenticated key-server throttle hints.
+There is no jitter or request-driven fetch.
 
 Optional Boolean `remoteJwks.conditionalRequests` enables bounded authenticated
 ETag revalidation for both algorithms. Strong quoted ASCII tags (at most 128

@@ -2632,7 +2632,10 @@ be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
 implicit and cleartext endpoints are unavailable.
 
 `port` is 1–65535; `refreshSeconds` is 1–3600; `maxAgeSeconds` is 1–86400 and
-strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Optional
+strictly greater than the refresh interval; `timeoutSeconds` is 1–60.
+Optional `dnsTimeoutSeconds` and `discoveryTimeoutSeconds` require their
+respective stages and cap stage time at 1–`timeoutSeconds` seconds while
+preserving the original total deadline. Optional
 `retrySeconds` is an integer from 1–3600 and defaults to `refreshSeconds`.
 Successful refreshes (including valid empty sets) wait `refreshSeconds` from
 completion. Failures default to waiting `retrySeconds` from completion.
