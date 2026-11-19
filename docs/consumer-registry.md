@@ -531,6 +531,7 @@ a new private snapshot under the same no-replace rules as `apply`.
 | `inspect-credential INPUT CREDENTIAL_ID` | Print the selected credential's metadata as one JSON object. Raw secrets and SHA-256 verifiers are omitted. |
 | `remove-consumer INPUT CONSUMER_ID OUTPUT` | Remove a Consumer that owns no credentials, including disabled credentials. |
 | `remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT` | Remove the Consumer and all its credentials in one replacement snapshot. |
+| `remove-credential INPUT CREDENTIAL_ID OUTPUT` | Remove one credential by stable ID. |
 
 Removal frees
 IDs for reuse and becomes effective when the replacement is deployed. The input

@@ -730,6 +730,7 @@ enum class RegistryAction : u8 {
     InspectCredential,
     RemoveConsumer,
     RemoveConsumerWithCredentials,
+    RemoveCredential,
 };
 
 struct RegistryCommand {
@@ -743,6 +744,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"inspect-credential", 4, RegistryAction::InspectCredential},
     {"remove-consumer", 5, RegistryAction::RemoveConsumer},
     {"remove-consumer-with-credentials", 5, RegistryAction::RemoveConsumerWithCredentials},
+    {"remove-credential", 5, RegistryAction::RemoveCredential},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -788,7 +790,9 @@ int registry_command(RegistryAction action, int argc, char** args) {
     bool first = true;
     for (u32 record = doc.nodes[kCredentials].child; record != json::kNone;
          record = doc.nodes[record].next) {
-        if (kCascade && field_equals(doc, field(doc, record, lit_str("consumerId")), id)) continue;
+        if ((action == RegistryAction::RemoveCredential && record == kTarget) ||
+            (kCascade && field_equals(doc, field(doc, record, lit_str("consumerId")), id)))
+            continue;
         if (!first) output.put(',');
         first = false;
         if (!doc.write(record, output)) return failure("cannot encode credential record\n");
@@ -883,6 +887,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
     "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
+    "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
