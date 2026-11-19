@@ -11156,6 +11156,15 @@ remain disabled. New IDs must be globally unused, including disabled records,
 and retaining history requires a free credential slot. The input and running
 gateways are unchanged; deployment remains explicit and #1072 remains open.
 
+Targeted `rut-consumers set-consumer-enabled`, `set-credential-enabled` and
+`set-consumer-groups` preserve all unselected record fields in validated immutable
+snapshots. The state commands accept exact booleans and never renew time bounds.
+Private group arrays replace the Consumer set with no credential rewriting.
+Inherited groups follow the replacement, while invalid explicit credential
+subsets reject the whole update. Existing atomic private no-replace publication
+is reused. No runtime or language semantics change, and deployment remains
+explicit. See [targeted lifecycle updates](docs/consumer-registry.md#targeted-state-and-group-updates).
+
 `rut-consumers provision-key-verifier` accepts an exact private provisioning
 profile for new Consumer registration with a first key, or constrained key
 creation under an existing owner. Optional new Consumer records are creation-only.

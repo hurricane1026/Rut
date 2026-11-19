@@ -336,6 +336,42 @@ command arguments.
 build/src/rut-consumers generate-key-verifier consumer-config/v1.json alice alice-key-v2 bearer consumer-config/v2.json consumer-config/alice-key-v2.txt
 ```
 
+### Targeted state and group updates
+
+Three commands update existing records without requiring a complete secret-bearing
+record in a changes file:
+
+```sh
+build/src/rut-consumers set-consumer-enabled INPUT CONSUMER_ID false OUTPUT
+build/src/rut-consumers set-credential-enabled INPUT CREDENTIAL_ID true OUTPUT
+build/src/rut-consumers set-consumer-groups INPUT CONSUMER_ID GROUPS_FILE OUTPUT
+```
+
+The state commands accept only exact `true` or `false`. The Consumer command
+changes only that Consumer's enabled state and retains every credential's own
+state. The credential command changes only the selected credential for all four
+existing methods, preserving its supported raw/verifier key representation. Reactivation does not bypass a
+disabled owner, renew expiry, change activation bounds or regenerate key material.
+Both commands require an existing stable ID, including on disabled records.
+
+`GROUPS_FILE` is an owned private JSON file containing one complete array of group
+names, for example `["readers","writers"]`. Existing schema bounds apply: at most
+16 unique nonempty visible ASCII names (`0x21`–`0x7e`), each at most 128 bytes. `[]` removes all
+owner groups when the resulting snapshot remains valid. Credentials with omitted
+groups inherit the new owner set, so adding owner groups expands their authority.
+Explicit credential subsets and explicit empty arrays remain unchanged. Removing
+a group still referenced by an explicit credential rejects the entire update,
+even if that credential or owner is disabled. Use a coordinated `apply` transaction
+when both owner and credential membership must change together.
+
+The whole source and replacement are validated. Record order, raw/verifier key
+representation, optional fields and time bounds are preserved. No clock is read.
+A no-op still publishes a new private 0600 snapshot through the existing atomic
+no-replace path. Input files remain unchanged, diagnostics include no record/key
+bytes, and success is silent. Deployment remains explicit. Loaded programs keep
+their adopted snapshots, and these commands add no durable revocation history or
+online administration. #1072 remains open.
+
 ### Registering Consumers and provisioning constrained keys
 
 `provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT` reads a private
