@@ -833,6 +833,16 @@ bool policy_minimum_active(PolicySnapshot& snapshot, u32 value) {
     return count >= static_cast<u32>(minimum);
 }
 
+bool policy_each_consumer_active(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (policy_enabled(doc, consumer) && !policy_count_credentials(snapshot, consumer, true))
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
@@ -840,6 +850,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("maxCredentialLifetimeSeconds"), false, policy_max_lifetime},
     {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},
     {lit_str("minimumActiveCredentials"), false, policy_minimum_active},
+    {lit_str("requireActiveCredentialForEnabledConsumers"), true, policy_each_consumer_active},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
