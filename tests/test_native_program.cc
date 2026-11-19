@@ -421,6 +421,33 @@ TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     CHECK((Str{c.header_values[0].data, c.header_values[0].len}.eq(lit_str("yes"))));
 }
 
+TEST(native_program, dynamic_added_header_survives_source_mutation) {
+    Source source;
+    REQUIRE(source.append(R"rut(route GET "/users" {
+        req.add("X-Tag", req.path)
+        return 200
+    })rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    ConnectionBase conn{};
+    conn.reset();
+    char request[] = "GET /users HTTP/1.1\r\nHost: test\r\n\r\n";
+    const auto result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        &conn, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    REQUIRE_EQ(conn.req_header_override_count, 1u);
+    request[5] = 'X';
+    CHECK(conn.req_header_overrides[0].value.eq(lit_str("/users")));
+    CHECK_EQ(conn.req_header_append_mask, 1u);
+    arena.destroy();
+    pool.destroy();
+}
+
 TEST(native_program, password_header_suspends_after_compiler_exit_and_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(route GET "/login" {

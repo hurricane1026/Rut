@@ -304,7 +304,7 @@ req.authorization (str?)   req.host  req.userAgent  req.origin (str?)
 req.header("X-Request-ID")   // str?
 req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
 req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only; string values may be dynamic
-req.add("X-Tag", "a")        // ✅ preserve existing fields and append; literal value
+req.add("X-Tag", "a")        // ✅ preserve existing fields and append; string values may be dynamic
 req.remove("Authorization")  // ✅ delete every matching field before forwarding
 req.getAll("Accept")         // ⏳ [str]
 
@@ -340,6 +340,11 @@ redirect, and proxy/failure policy responses remain HTTP/1.1; generic
 proxy/upstream errors keep their existing HTTP/1.1 default. Ordinary JIT-local
 error publishers, including EventYield invalid-target errors, use the captured
 request version. HTTP/2 uses its separate serializer.
+
+`req.set` and `req.add` take literal header names and non-optional string
+values. A request can record up to 16 header mutations and copy up to 8 KiB of
+names and values for dynamic mutations into request-owned storage. Invalid
+runtime values or exhausted bounds stop forwarding.
 
 Dynamic handler-local Response mutations require a direct route with no guards,
 decorators, `wait`, or `for`, exactly one builder, and that builder must be
@@ -1502,7 +1507,7 @@ route GET "/id" {
 
 Linux makes one nonblocking `getrandom` call; macOS uses `getentropy`. Failures, including short reads, return nil without fallback or retry. Each call is fresh; reusing a bound local preserves its value. Results use the existing request-owned JSON arena and share its 256 KiB used-byte budget (40 bytes per UUID after alignment). Views remain valid until request retirement/reset, and HTTP/2 local responses copy their body into stream-owned storage before that reset.
 
-The call must directly initialize a top-level route `let`, as above. Calls in `guard let`/`if let` expressions, inside helpers, and nested in larger expressions are rejected until single evaluation of fresh values is supported there. ID values already generated may be passed to ordinary helpers. No arguments or implicit pipe stage are accepted. User functions/bindings named `uuid` shadow it. `wait` routes reject UUID calls; timers and randomness inside `chain after` header effects are unsupported. Request set/add still require literal values, so UUID generation does not yet provide complete request-ID forwarding middleware. Random UUIDs do not promise absolute uniqueness or ordered IDs. `randomBytes(n)` remains a target API, not an alias for `uuid()`.
+The call must directly initialize a top-level route `let`, as above. Calls in `guard let`/`if let` expressions, inside helpers, and nested in larger expressions are rejected until single evaluation of fresh values is supported there. ID values already generated may be passed to ordinary helpers or forwarded using `req.set` or `req.add` after unwrapping. No arguments or implicit pipe stage are accepted. User functions/bindings named `uuid` shadow it. `wait` routes reject UUID calls. Timers and randomness inside `chain after` header effects are unsupported. Random UUIDs do not promise absolute uniqueness or ordered IDs. `randomBytes(n)` remains a target API, not an alias for `uuid()`.
 
 ## Math library (implemented)
 

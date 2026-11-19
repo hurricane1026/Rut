@@ -235,6 +235,7 @@ enum class Opcode : u8 {
     ReqSetHeader,           // req.set_header "Name", %val
     ReqSetOwnedHeader,      // validated request-owned copy of a runtime value
     ReqAddHeader,           // req.add_header "Name", %val
+    ReqAddOwnedHeader,      // validated request-owned append of a runtime value
     ReqRemoveHeader,        // Remove all case-insensitive matches before forwarding.
     RespHeader,             // %opt = resp.header "Name", %fallback_opt
     RespSetHeader,          // resp.set_header "Name", %val

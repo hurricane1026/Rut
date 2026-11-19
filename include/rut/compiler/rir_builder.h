@@ -690,6 +690,15 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_add_owned_header(Str name, ValueId val, SourceLoc loc = {}) {
+        if (!val_has_type(val, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqAddOwnedHeader, nullptr, loc));
+        r.inst->imm.str_val = name;
+        r.inst->operands[0] = val;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_req_remove_header(Str name, SourceLoc loc = {}) {
         auto r = TRY(emit(Opcode::ReqRemoveHeader, nullptr, loc));
         r.inst->imm.str_val = name;

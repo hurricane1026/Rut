@@ -34,6 +34,7 @@ def main():
             with lock:
                 fields = dict(self.headers)
                 fields['_once_count'] = len(self.headers.get_all('X-Once', []))
+                fields['_tags'] = self.headers.get_all('X-Tag', [])
                 received.append((self.path, fields, body))
             mode = self.headers.get('X-Mode', '')
             if mode == 'slow':
@@ -158,6 +159,8 @@ route POST "/choose" {
 }
 route POST "/proxy" {
     req.add("X-Once", "yes")
+    req.add("X-Tag", "first")
+    req.add("X-Tag", req.path)
     guard let request = json.parse(req.body) else { return 400 }
     let result = httpCall(env("CALLOUT_FIRST"), request, 300)
     guard let reply = result else { return 503 }
@@ -170,6 +173,11 @@ route POST "/proxy" {
         }
         _ => { return 403 }
     }
+}
+route POST "/proxy-h2" {
+    req.add("X-Tag", "first")
+    req.add("X-Tag", req.path)
+    return forward(backend, load_balance: .roundRobin)
 }
 route POST "/param/:id" {
     let saved = req.param("id").or("missing")
@@ -212,12 +220,15 @@ route POST "/param/:id" {
                 assert port, log.read_text(errors='replace')
                 program.unlink()  # Native artifact must own policy/code after source removal.
 
-                def request(path='/compose', mode='', saved='saved', headers=None, body='input', choice='first'):
+                def request(path='/compose', mode='', saved='saved', headers=None, body='input', choice='first', tag=None):
                     message = json.dumps(dict(method='POST', headers=dict({'X-Mode': mode}, **(headers or {})), body=body))
                     conn = http.client.HTTPConnection('127.0.0.1', port, timeout=4)
                     try:
-                        conn.request('POST', path, message, {'X-Saved': saved, 'Authorization': 'Bearer must-not-leak',
-                                                           'X-User': 'forged', 'Cookie': 'client=secret', 'X-Choice': choice})
+                        request_headers = {'X-Saved': saved, 'Authorization': 'Bearer must-not-leak',
+                                           'X-User': 'forged', 'Cookie': 'client=secret', 'X-Choice': choice}
+                        if tag is not None:
+                            request_headers['X-Tag'] = tag
+                        conn.request('POST', path, message, request_headers)
                         reply = conn.getresponse()
                         return reply.status, reply.headers, reply.read()
                     finally:
@@ -227,12 +238,14 @@ route POST "/param/:id" {
                     return len(payload).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + payload
 
                 def h2_send(sock, stream, path='/compose', mode='', saved='h2-snapshot',
-                            end_stream=False):
+                            end_stream=False, tag=None):
                     data = json.dumps(dict(method='POST', headers={'X-Mode': mode}, body='input')).encode()
                     # Literal HPACK fields without Huffman or a dynamic table.
                     content_length = 0 if end_stream else len(data)
                     fields = [(':method', 'POST'), (':scheme', 'http'), (':path', path),
                               (':authority', 'localhost'), ('content-length', str(content_length)), ('x-saved', saved)]
+                    if tag is not None:
+                        fields.append(('x-tag', tag))
                     block = b''
                     for name, value in fields:
                         name, value = name.encode(), value.encode()
@@ -299,11 +312,19 @@ route POST "/param/:id" {
                     status, _, data = request('/choose', choice=choice)
                     assert status == 200 and json.loads(data)['ok'], (status, data)
                     assert len(received) == before + 1 and received[-1][0] == path, received
-                status, _, data = request('/proxy')
+                status, _, data = request('/proxy', tag='h1-original')
                 assert status == 200, (status, data)
                 assert received[-1][0] == '/proxy' and received[-1][1]['_once_count'] == 1, received[-1]
+                assert received[-1][1]['_tags'] == ['h1-original', 'first', '/proxy'], received[-1]
                 assert received[-1][1].get('X-Identity') == 'alice', received[-1]
                 assert 'Authorization' not in received[-1][1], received[-1]
+                before = len(received)
+                with h2_open() as sock:
+                    h2_send(sock, 1, path='/proxy-h2', end_stream=True, tag='h2-original')
+                    assert h2_body(sock, 1) == b'accepted:'
+                assert len(received) == before + 1, received
+                assert received[-1][0] == '/proxy-h2', received[-1]
+                assert received[-1][1]['_tags'] == ['h2-original', 'first', '/proxy-h2'], received[-1]
                 before = len(received)
                 assert request(mode='deny')[0] == 403
                 assert len(received) == before + 1, 'failed guard executed the second call'

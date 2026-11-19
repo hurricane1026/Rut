@@ -580,8 +580,7 @@ req.header("X-Timestamp")    // string?
 // Setting headers
 req.set("X-User-ID", "123")
 req.remove("Authorization")  // remove all matching fields before upstream forwarding
-// Target only: unwrap uuid() with guard let, then set the ID.
-// req.set accepts a non-optional runtime string; req.add still requires a literal.
+// req.set and req.add accept non-optional runtime strings.
 
 // Route parameters — path captures live in the req.params namespace,
 // so a capture can never shadow a built-in property (req.path, req.host, ...)
@@ -1811,12 +1810,12 @@ func auth(_ req: Request, role: string) -> User {
 // over Cache<IP, i64> lands with the pending state/library stack; Counter is
 // deleted (§3.3.6).
 
-// Target sketch: generator helpers and dynamic request-header values are pending.
+// Target sketch: generating a UUID inside a helper remains pending.
 func requestId(_ req: Request) {
     if req.header("X-Request-ID") == nil {
         let pending = uuid()
         guard let id = pending else { respond 503 }
-        req.set("X-Request-ID", id)  // target only: dynamic request values pending
+        req.set("X-Request-ID", id)
     }
 }
 
@@ -4665,8 +4664,8 @@ uuid()                        // implemented: str? — RFC 9562 UUID v4
 // expression or helper is rejected to avoid re-materializing fresh values.
 // Wait routes, timer bodies, and response-time
 // chain-after random effects are rejected until their lifetime/evaluation model
-// can preserve freshness. Request-header set/add still require literal values;
-// uuid() alone does not complete request-ID propagation middleware.
+// can preserve freshness. A direct route can set or append an unwrapped ID
+// to an upstream request header.
 
 // --- Encoding / Decoding ---
 base64(data)                  // string
@@ -5043,7 +5042,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature | Current boundary |
 |---------|------------------|
-| Request ID / Correlation ID | Request-local `uuid() -> str?` generation is implemented in direct route-let initializers; dynamic request-header propagation and generator helpers remain pending. |
+| Request ID / Correlation ID | A direct route-let initializer can generate `uuid() -> str?` and forward an unwrapped ID with `req.set` or `req.add`. Generation inside helpers remains pending. |
 
 #### Fully Covered (built-in)
 

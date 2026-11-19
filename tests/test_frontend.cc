@@ -38569,14 +38569,14 @@ route GET "/x" {
 TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
     const char* src =
         "route GET \"/x\" { req.set(\"X-Mode\", \"replace\") req.add(\"X-Tag\", \"a\") "
-        "return 200 }\n";
+        "req.add(\"X-Dynamic\", req.path) return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    REQUIRE_EQ(hir->routes[0].locals.len, 2u);
+    REQUIRE_EQ(hir->routes[0].locals.len, 3u);
     CHECK_EQ(static_cast<u8>(hir->routes[0].locals[0].init.kind),
              static_cast<u8>(HirExprKind::ReqSetHeader));
     CHECK(hir->routes[0].locals[0].init.str_value.eq(lit("X-Mode")));
@@ -38586,7 +38586,7 @@ TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
 
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
-    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 3u);
     CHECK_EQ(static_cast<u8>(mir->functions[0].locals[0].init.kind),
              static_cast<u8>(MirValueKind::ReqSetHeader));
     CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
@@ -38598,6 +38598,7 @@ TEST(frontend, req_set_statement_lowers_to_request_header_effect) {
     REQUIRE_EQ(rir.module.func_count, 1u);
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqSetHeader));
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqAddHeader));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqAddOwnedHeader));
     rir.destroy();
 }
 
@@ -38607,7 +38608,8 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         "route GET \"/x\" { req.set(\"Content-Length\", \"1\") return 200 }\n",
         "route GET \"/x\" { req.set(\"Bad Header\", \"v\") return 200 }\n",
         "route GET \"/x\" { req.set(\"X-Test\", req.header(\"Maybe\")) return 200 }\n",
-        "route GET \"/x\" { req.add(\"X-Test\", req.path) return 200 }\n",
+        "route GET \"/x\" { req.add(\"X-Test\", req.header(\"Maybe\")) return 200 }\n",
+        "route GET \"/x\" { req.add(req.path, \"v\") return 200 }\n",
     };
     for (const char* src : cases) {
         auto lexed = lex(lit(src));
@@ -38618,7 +38620,7 @@ TEST(frontend, req_set_is_statement_only_and_validates_arguments) {
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(
             lit("req.set/add expect a literal safe header name and a non-optional string value "
-                "(req.add requires a literal), and may only be used as a statement")));
+                "and may only be used as a statement")));
     }
 }
 

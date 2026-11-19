@@ -530,6 +530,8 @@ void rut_helper_req_set_header(
 // Invalid input, exhausted storage or overflow poisons forwarding (fail closed).
 void rut_helper_req_set_owned_header(
     void* conn, void* arena, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
+void rut_helper_req_add_owned_header(
+    void* conn, void* arena, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_add_header(
     void* conn, const char* name, rut::u32 nlen, const char* val, rut::u32 vlen);
 void rut_helper_req_remove_header(void* conn, const char* name, rut::u32 nlen);

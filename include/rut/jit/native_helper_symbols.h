@@ -25,6 +25,7 @@
     X(rut_helper_req_set_target_transform)            \
     X(rut_helper_req_set_header)                      \
     X(rut_helper_req_set_owned_header)                \
+    X(rut_helper_req_add_owned_header)                \
     X(rut_helper_req_add_header)                      \
     X(rut_helper_req_remove_header)                   \
     X(rut_helper_resp_set_header)                     \

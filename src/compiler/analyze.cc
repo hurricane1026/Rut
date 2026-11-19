@@ -109,7 +109,7 @@ constexpr Str kPipePlaceholderDetail = lit_str(
     "where the value lands");
 constexpr Str kReqHeaderMutationDetail = lit_str(
     "req.set/add expect a literal safe header name and a non-optional string value "
-    "(req.add requires a literal), and may only be used as a statement");
+    "and may only be used as a statement");
 constexpr Str kReqHeaderRemoveDetail =
     lit_str("req.remove expects one literal safe header name and may only be used as a statement");
 constexpr Str kReqHeaderRemoveOrderDetail = lit_str(
@@ -4919,8 +4919,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         const bool is_add = expr.name.eq({"add", 3});
         if (!route->req_header_mutation_stmt_ok || expr.args.len != (is_remove ? 1u : 2u) ||
             expr.args[0] == nullptr || expr.args[0]->kind != AstExprKind::StrLit ||
-            (!is_remove &&
-             (expr.args[1] == nullptr || (is_add && expr.args[1]->kind != AstExprKind::StrLit))))
+            (!is_remove && expr.args[1] == nullptr))
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   is_remove ? kReqHeaderRemoveDetail : kReqHeaderMutationDetail);
