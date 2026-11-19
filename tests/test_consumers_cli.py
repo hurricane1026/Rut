@@ -67,6 +67,15 @@ def test_deployment_policy(tool, root):
     check({'requireHashedKeys': True}, records=[raw, parked], rule='requireHashedKeys')
     check({'requireHashedKeys': True}, records=[dict(raw, enabled=False)], rule='requireHashedKeys')
     check({'requireHashedKeys': 1}, rule='requireHashedKeys')
+    check({'allowedMethods': ['bearer', 'header']}, ok=True)
+    check({'allowedMethods': ['bearer']}, rule='allowedMethods')
+    for invalid in ([], ['bearer', 'bearer'], ['cookie'], ['bearer', 1], 'bearer'):
+        check({'allowedMethods': invalid}, rule='allowedMethods')
+    basic = dict(raw, method='basic', secret='operator:fixture-password')
+    mtls = dict(raw, method='mtls', secret='b' * 64)
+    check({'allowedMethods': ['basic']}, ok=True, records=[basic])
+    check({'allowedMethods': ['mtls']}, ok=True, records=[mtls])
+    check({'allowedMethods': ['header']}, records=[basic], rule='allowedMethods')
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):

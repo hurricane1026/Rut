@@ -713,8 +713,37 @@ bool policy_hashed_keys(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+u32 policy_method_bit(json::Document& doc, u32 node) {
+    if (field_equals(doc, node, lit_str("bearer"))) return 1;
+    if (field_equals(doc, node, lit_str("header"))) return 2;
+    if (field_equals(doc, node, lit_str("basic"))) return 4;
+    if (field_equals(doc, node, lit_str("mtls"))) return 8;
+    return 0;
+}
+
+bool policy_allowed_methods(PolicySnapshot& snapshot, u32 value) {
+    auto& policy = snapshot.policy;
+    if (policy.nodes[value].kind != json::Kind::Array) return false;
+    u32 methods = 0;
+    for (u32 node = policy.nodes[value].child; node != json::kNone;
+         node = policy.nodes[node].next) {
+        const u32 bit = policy_method_bit(policy, node);
+        if (!bit || (methods & bit)) return false;
+        methods |= bit;
+    }
+    if (!methods) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!(methods & policy_method_bit(doc, field(doc, record, lit_str("method")))))
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
+    {lit_str("allowedMethods"), false, policy_allowed_methods},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
