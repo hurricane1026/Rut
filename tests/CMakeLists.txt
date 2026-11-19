@@ -1516,6 +1516,17 @@ target_include_directories(test_access_log PRIVATE
 add_test(NAME test_access_log COMMAND test_access_log)
 set_tests_properties(test_access_log PROPERTIES LABELS "unit")
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(access_log_backend epoll io_uring)
+        add_test(NAME test_access_log_path_only_${access_log_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_access_log_path_only.py
+                --server $<TARGET_FILE:rut> --backend ${access_log_backend}
+                --decompress-helper $<TARGET_FILE:test_access_log_zstd_decompress_helper>)
+        set_tests_properties(test_access_log_path_only_${access_log_backend} PROPERTIES
+            LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()
+
 add_executable(test_access_log_live test_access_log_live.cc)
 target_link_libraries(test_access_log_live rut_runtime)
 target_include_directories(test_access_log_live PRIVATE

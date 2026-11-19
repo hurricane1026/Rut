@@ -202,7 +202,7 @@ struct Shard {
 
     // Allocate and wire the per-shard access log ring.
     // Call before spawn(), only when access logging is enabled.
-    core::Expected<void, Error> init_access_log() {
+    core::Expected<void, Error> init_access_log(bool path_only = false) {
         if (!loop || thread_spawned)
             return core::make_unexpected(Error::make(EBUSY, Error::Source::Thread));
         if (live_log_ring) return core::make_unexpected(Error::make(EINVAL, Error::Source::Thread));
@@ -216,7 +216,7 @@ struct Shard {
         if (ring_mem == MAP_FAILED)
             return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         log_ring = new (ring_mem) AccessLogRing();
-        log_ring->init();
+        log_ring->init(path_only);
         if (loop) loop->access_log = log_ring;
         return {};
     }

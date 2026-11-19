@@ -14,18 +14,26 @@ resolve_access_log_startup(const AccessLogStartupInputs& inputs) {
 
     AccessLogStartupResolution resolved{};
     if (!inputs.source.present) {
-        if (!inputs.cli_path_present) return resolved;
+        if (!inputs.cli_path_present) {
+            if (inputs.cli_path_only)
+                return core::make_unexpected(
+                    AccessLogStartupResolutionError::CliPathOnlyRequiresLegacyLog);
+            return resolved;
+        }
         if (inputs.cli_path == nullptr)
             return core::make_unexpected(AccessLogStartupResolutionError::InvalidCliPath);
         resolved.mode = AccessLogStartupMode::LegacyCli;
         resolved.legacy_path = inputs.cli_path;
         resolved.legacy_compression = inputs.cli_compression;
+        resolved.legacy_path_only = inputs.cli_path_only;
         resolved.legacy_level = inputs.cli_level;
         return resolved;
     }
 
     if (inputs.cli_path_present)
         return core::make_unexpected(AccessLogStartupResolutionError::ConflictingCliPath);
+    if (inputs.cli_path_only)
+        return core::make_unexpected(AccessLogStartupResolutionError::ConflictingCliPathOnly);
     if (inputs.cli_compression_present)
         return core::make_unexpected(AccessLogStartupResolutionError::ConflictingCliCompression);
     if (inputs.cli_level_present)

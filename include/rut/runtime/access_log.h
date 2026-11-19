@@ -37,6 +37,13 @@ inline constexpr u32 kAccessLogDownstreamRequestBytesLineCapacity = 11;
 static_assert(kAccessLogObservedStrictH1TargetMax <= static_cast<u32>(~u16{0}));
 static_assert(kAccessLogDownstreamRequestBytesLineCapacity == sizeof("4294967295\n") - 1u);
 
+// Use only after validating the complete target. Preserve the encoded path.
+inline Str access_log_target_path_prefix(Str target) {
+    for (u32 i = 0; i < target.len; ++i)
+        if (target.ptr[i] == '?') return {target.ptr, i};
+    return target;
+}
+
 enum class AccessLogTargetState : u8 {
     LegacyNullTerminated = 0,
     Complete = 1,
@@ -135,10 +142,11 @@ struct AccessLogRing {
 
     // Cache-line aligned to prevent false sharing between producer and consumer.
     alignas(64) std::atomic<u32> write_pos;  // written by shard thread only
+    bool path_only = false;                  // set at startup before producer and consumer run
     alignas(64) std::atomic<u32> read_pos;   // written by flusher thread only
     AccessLogEntry entries[kCapacity];
 
-    void init();
+    void init(bool capture_path_only = false);
 
     // Producer: write an entry. Returns false if full (entry dropped).
     // Called from shard thread only — no contention on write_pos.
@@ -159,6 +167,8 @@ struct AccessLogRing {
 };
 
 static_assert(sizeof(AccessLogRing) == 98432, "AccessLogRing layout must remain explicitly pinned");
+static_assert(offsetof(AccessLogRing, read_pos) == 64);
+static_assert(offsetof(AccessLogRing, entries) == 72);
 
 // Format an access log entry as a text line into buf.
 // Returns bytes written. Format: "ts method path status duration_us req_size resp_size addr

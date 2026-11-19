@@ -854,8 +854,10 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   validated atomic no-replace private snapshots (`rut-consumers`).
 - [x] Opt-in Consumer query credential hiding for proxy routes using verified
   remaining fields and the owned forwarding target effect.
-- [ ] Remaining #1072 interfaces include online administrative management,
-  transparent form-body mutation and redaction in legacy request-target logs.
+- [x] Opt-in legacy access logging without query fields, including denied
+  requests and admitted HTTP/2 gRPC targets.
+- [ ] Remaining #1072 interfaces include online administrative management and
+  transparent form-body mutation.
 - [ ] Replicated persistence/failover verification for the replay authority beyond
   the tested single-instance intact-AOF recovery profile;
   broad DNS profiles/automatic kid onboarding remain separately scoped.

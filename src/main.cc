@@ -401,6 +401,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    const char* access_log_path,
                                    bool access_log_compress,
                                    i32 access_log_level,
+                                   bool access_log_path_only,
                                    SourceAccessLogFd* source_live_fd,
                                    AccessLogFormatProfile source_live_format,
                                    const RouteConfig* route_config,
@@ -536,7 +537,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         }
         // Allocate per-shard access log rings.
         for (u32 i = 0; i < shard_count; i++) {
-            auto rc = shards[i].init_access_log();
+            auto rc = shards[i].init_access_log(access_log_path_only);
             if (!rc) {
                 write_str("Failed to init access log ring for shard ");
                 write_u32(i);
@@ -975,6 +976,7 @@ int main(int argc, char** argv) {
     AccessLogSinkSpec source_access_log{};
     const char* access_log_path = nullptr;
     bool cli_access_log_path_present = false;
+    bool cli_access_log_path_only = false;
     bool access_log_compress = false;
     bool cli_access_log_compress_present = false;
     bool environment_access_log_compress_present = false;
@@ -999,7 +1001,7 @@ int main(int argc, char** argv) {
     //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
     //                      [--tls-client-crl PATH]
-    //                      [--access-log PATH] [--access-log-compress]
+    //                      [--access-log PATH] [--access-log-compress] [--access-log-path-only]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
     //   NOTE: this RESERVES the /metrics path — GET /metrics (and /metrics/,
@@ -1204,6 +1206,7 @@ int main(int argc, char** argv) {
             access_log_compress = true;
             cli_access_log_compress_present = true;
         }
+        if (str_eq(argv[i], "--access-log-path-only")) cli_access_log_path_only = true;
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
@@ -1383,6 +1386,7 @@ int main(int argc, char** argv) {
     access_log_inputs.cli_level_present = cli_access_log_level_present;
     access_log_inputs.cli_level = access_log_level;
     access_log_inputs.environment_compression_present = environment_access_log_compress_present;
+    access_log_inputs.cli_path_only = cli_access_log_path_only;
     auto resolved_access_log = resolve_access_log_startup(access_log_inputs);
     if (!resolved_access_log) {
         switch (resolved_access_log.error()) {
@@ -1403,6 +1407,12 @@ int main(int argc, char** argv) {
                 break;
             case AccessLogStartupResolutionError::ConflictingEnvironmentCompression:
                 write_str("Conflicting source accessLog and RUE_ACCESS_LOG_COMPRESS=1\n");
+                break;
+            case AccessLogStartupResolutionError::CliPathOnlyRequiresLegacyLog:
+                write_str("--access-log-path-only requires --access-log\n");
+                break;
+            case AccessLogStartupResolutionError::ConflictingCliPathOnly:
+                write_str("Conflicting source accessLog and --access-log-path-only\n");
                 break;
         }
 #ifdef RUT_ENABLE_JIT
@@ -1532,6 +1542,7 @@ int main(int argc, char** argv) {
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level,
+                                          resolved_access_log->legacy_path_only,
                                           source_live_fd_ptr,
                                           source_live_format,
                                           route_config,
@@ -1563,6 +1574,7 @@ int main(int argc, char** argv) {
             access_log_path,
             access_log_compress,
             access_log_level,
+            resolved_access_log->legacy_path_only,
             source_live_fd_ptr,
             source_live_format,
             route_config,
@@ -1582,6 +1594,7 @@ int main(int argc, char** argv) {
                                                  access_log_path,
                                                  access_log_compress,
                                                  access_log_level,
+                                                 resolved_access_log->legacy_path_only,
                                                  source_live_fd_ptr,
                                                  source_live_format,
                                                  route_config,
@@ -1601,6 +1614,7 @@ int main(int argc, char** argv) {
                                              access_log_path,
                                              access_log_compress,
                                              access_log_level,
+                                             resolved_access_log->legacy_path_only,
                                              source_live_fd_ptr,
                                              source_live_format,
                                              route_config,

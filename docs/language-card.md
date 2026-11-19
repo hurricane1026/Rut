@@ -283,6 +283,15 @@ create a second line. States are `complete`, `empty`, `absent`, `duplicate`,
 or claim upstream-attempt history. H2 stream publication is not part of this
 profile. The existing `downstreamRequestBytes` output remains byte-identical.
 
+When using the legacy CLI sink `--access-log PATH`, add
+`--access-log-path-only` to omit queries from logged targets. The mode records
+the original encoded path without the first literal `?` or anything after it.
+Encoded `%3F` remains part of the path. It applies before the 128-byte output
+bound to available strict HTTP/1 targets and admitted HTTP/2 gRPC targets.
+Invalid and unavailable targets retain their markers. The option works with
+`--access-log-compress` and is rejected with source `accessLog` or without a
+legacy sink. Ordinary HTTP/2 target availability is unchanged.
+
 ## Request / Response
 
 ```swift

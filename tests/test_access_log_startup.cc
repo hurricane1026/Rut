@@ -117,8 +117,31 @@ TEST(access_log_startup, resolution_preserves_legacy_absence_semantics) {
     CHECK(legacy->mode == AccessLogStartupMode::LegacyCli);
     CHECK_EQ(legacy->legacy_path, path);
     CHECK(legacy->legacy_compression);
+    CHECK_FALSE(legacy->legacy_path_only);
     CHECK_EQ(legacy->legacy_level, 4);
     CHECK_FALSE(legacy->source_live.present);
+}
+
+TEST(access_log_startup, path_only_requires_legacy_log) {
+    AccessLogStartupInputs inputs{};
+    inputs.cli_path_only = true;
+    auto absent = resolve_access_log_startup(inputs);
+    REQUIRE_FALSE(absent);
+    CHECK(absent.error() == AccessLogStartupResolutionError::CliPathOnlyRequiresLegacyLog);
+
+    inputs.cli_path_present = true;
+    inputs.cli_path = "/tmp/legacy-access.log";
+    auto legacy = resolve_access_log_startup(inputs);
+    REQUIRE(legacy);
+    CHECK(legacy->mode == AccessLogStartupMode::LegacyCli);
+    CHECK(legacy->legacy_path_only);
+
+    inputs.cli_path_present = false;
+    inputs.cli_path = nullptr;
+    inputs.source = source_spec("/tmp/source-access.log");
+    auto conflict = resolve_access_log_startup(inputs);
+    REQUIRE_FALSE(conflict);
+    CHECK(conflict.error() == AccessLogStartupResolutionError::ConflictingCliPathOnly);
 }
 
 TEST(access_log_startup, source_resolution_is_owned_and_every_explicit_control_conflicts) {
