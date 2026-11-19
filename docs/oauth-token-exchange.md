@@ -73,16 +73,17 @@ its token.
 ## Issued-token policy
 
 After unwrapping `httpCall`, use
-`oauth_client.exchangeAuthorization(reply, requiredScope)`. It first requires a
-completed HTTP 200 with strictly parsed JSON and exact string
+`oauth_client.exchangeAuthorizationForScopes(reply, requiredScopes)` to enforce
+the full configured scope list. The single-scope `exchangeAuthorization` helper
+is also available. Both first require a completed HTTP 200 with strictly parsed JSON and exact string
 `issued_token_type` equal to `urn:ietf:params:oauth:token-type:access_token`.
 Missing, typed, case-changed, JWT/ID-token or other issued types fail even if the
 response also contains otherwise usable-looking token fields.
 
 The shared [upstream token policy](upstream-oauth.md#token-response-policy) then
 requires a nonempty valid Bearer access token, case-insensitive Bearer usage type,
-positive integer `expires_in`, an explicit valid scope list containing the route's
-exact required scope, and no `error` field. Duplicate decoded JSON keys fail.
+positive integer `expires_in`, an explicit valid scope list containing every
+required scope exactly, and no `error` field. Duplicate decoded JSON keys fail.
 Requiring explicit scope and lifetime is a local profile; it does not claim that
 all these fields are universally mandatory in RFC 8693 responses. Unused refresh
 tokens and extension metadata are ignored. Metadata helpers consume only a trusted

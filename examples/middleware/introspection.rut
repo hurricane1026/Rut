@@ -64,6 +64,38 @@ func requireBothScopes(_ document: Json, _ first: str, _ second: str) -> Json {
     document
 }
 
+func scopeListPolicyValid(_ required: str) -> bool {
+    guard let policy = json.value({scope: required}) else { false }
+    jwtHasAnyScope(policy, required)
+}
+
+// A bounded list of alternative permissions in trusted route configuration.
+func requireAnyScope(_ document: Json, _ required: str) -> Json {
+    guard scopeListPolicyValid(required) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAnyScope(document, required) else { respond denied }
+    document
+}
+
+// Require the entire trusted scope list.
+func requireAllScopes(_ document: Json, _ required: str) -> Json {
+    guard scopeListPolicyValid(required) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard jwtHasAllScopes(document, required) else { respond denied }
+    document
+}
+
+// Apply only to metadata that passed requireActive.
+func requireNoScopes(_ document: Json, _ forbidden: str) -> Json {
+    guard scopeListPolicyValid(forbidden) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    guard !jwtHasAnyScope(document, forbidden) else { respond denied }
+    document
+}
+
 // Exact metadata comparison only: this cannot authenticate caller-supplied JSON.
 func bindingMatches(_ document: Json, _ issuer: str, _ clientId: str) -> bool {
     issuer != "" && clientId != "" && json.kind(document).or("") == "object" &&
@@ -78,6 +110,25 @@ func requireBinding(_ document: Json, _ issuer: str, _ clientId: str) -> Json {
     let denied = response(401)
     denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
     guard bindingMatches(document, issuer, clientId) else { respond denied }
+    document
+}
+
+// Bind an active token to an exact issuer, client and subject together.
+func requirePrincipal(_ document: Json, _ issuer: str, _ clientId: str, _ expectedSubject: str) -> Json {
+    guard issuer != "" && clientId != "" && expectedSubject != "" else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    let actual = json.string(json.get(document, "/sub").or(document)).or("")
+    guard bindingMatches(document, issuer, clientId) && actual == expectedSubject else { respond denied }
+    document
+}
+
+// Apply after requireActive using the same trusted audience.
+func requireLifetime(_ document: Json, _ issuer: str, _ audience: str, _ maxAge: i32, _ maxLifetime: i32) -> Json {
+    guard issuer != "" && audience != "" && maxAge > 0 && maxLifetime > 0 else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard jwtClaimsValidWithLifetime(document, issuer, audience, i64(maxAge), i64(maxLifetime)) else { respond denied }
     document
 }
 

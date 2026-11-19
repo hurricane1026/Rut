@@ -67,7 +67,8 @@ def main():
                 'space-token': dict(access_token='a b'), 'bad-padding': dict(access_token='ab=c'),
                 'expired': dict(expires_in=0), 'typed-expiry': dict(expires_in='60'),
                 'fractional-expiry': dict(expires_in=1.5), 'overflow-expiry': dict(expires_in=2**63),
-                'wrong-scope': dict(scope='reports:reader'), 'typed-scope': dict(scope=['reports:read']),
+                'wrong-scope': dict(scope='reports:reader'),
+                'partial-grant': dict(scope='reports:read'), 'typed-scope': dict(scope=['reports:read']),
                 'bad-scope': dict(scope='reports:read  write'), 'error-field': dict(error='invalid_request'),
                 'null-error': dict(error=None),
             }
@@ -229,7 +230,7 @@ def main():
                     bad = ('id-token', 'jwt-token', 'typed-issued', 'empty-issued', 'case-issued', 'no-issued',
                            'wrong-type', 'typed-type', 'spaced-type', 'empty-token', 'typed-token',
                            'injected-token', 'space-token', 'bad-padding', 'expired', 'typed-expiry',
-                           'fractional-expiry', 'overflow-expiry', 'wrong-scope', 'typed-scope', 'bad-scope',
+                           'fractional-expiry', 'overflow-expiry', 'wrong-scope', 'partial-grant', 'typed-scope', 'bad-scope',
                            'error-field', 'null-error', 'no-token', 'no-type', 'no-expiry', 'no-scope',
                            'duplicate', 'aliased-duplicate', 'malformed', 'non-object', 'large', 'truncated',
                            'unavailable', 'redirect', 'denied', 'invalid-target')

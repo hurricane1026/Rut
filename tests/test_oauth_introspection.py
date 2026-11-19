@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--server', required=True)
     parser.add_argument('--testdata', required=True)
     parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
+    parser.add_argument('--additional-policies', action='store_true')
     args = parser.parse_args()
     received, forwarded = [], []
     lock = threading.Lock()
@@ -52,6 +53,12 @@ def main():
                 'typed-exp': dict(exp=str(now + 3600)), 'typed-scope': dict(scope=['reports:read']),
                 'wrong-scope': dict(scope='reports:reader'), 'wrong-type': dict(token_type='MAC'),
                 'read-only': dict(scope='reports:read'), 'write-only': dict(scope='reports:write'),
+                'audit-only': dict(scope='reports:audit'),
+                'all-scopes': dict(scope='reports:audit reports:write reports:read'),
+                'short-token': dict(iat=now - 10, exp=now + 50),
+                'long-token': dict(iat=now - 10, exp=now + 130),
+                'old-token': dict(iat=now - 70, exp=now + 20),
+                'bad-iat': dict(iat='yesterday', exp=now + 50),
                 'scope-case': dict(scope='Reports:read Reports:write'),
                 'scope-prefix': dict(scope='reports:reader reports:writer'),
                 'scope-repeated': dict(scope='reports:read reports:read reports:write'),
@@ -236,6 +243,33 @@ route GET "/same-scope-{helper}" {{
     return 204
 }}
 '''
+            if args.additional_policies:
+                source = 'import "middleware/introspection.rut"\n'
+                policies = (
+                    ('any-scope-list', 'requireAnyScope', 'reports:read reports:write reports:audit'),
+                    ('all-scope-list', 'requireAllScopes', 'reports:read reports:write reports:audit'),
+                    ('invalid-any-scope-list', 'requireAnyScope', 'reports:read bad"scope'),
+                    ('invalid-all-scope-list', 'requireAllScopes', 'reports:read  reports:write'),
+                    ('pinned-subject', 'requirePrincipal', '"https://issuer.example", "reports-client", "subject-valid"'),
+                    ('empty-pinned-subject', 'requirePrincipal', '"https://issuer.example", "reports-client", ""'),
+                    ('no-forbidden-scopes', 'requireNoScopes', json.dumps('admin root reports:audit')),
+                    ('invalid-forbidden-scopes', 'requireNoScopes', json.dumps('admin  root')),
+                    ('bounded-lifetime', 'requireLifetime', '"https://issuer.example", "reports-api", 60, 120'),
+                    ('invalid-lifetime', 'requireLifetime', '"https://issuer.example", "reports-api", 0, 120'),
+                )
+                for path, helper, policy in policies:
+                    if helper in ('requireAnyScope', 'requireAllScopes'):
+                        policy = json.dumps(policy)
+                    source += f'''
+route GET "/{path}" {{
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else {{ return 503 }}
+    let document = introspection.requireActive(reply, "reports-api")
+    let authorized = introspection.{helper}(document, {policy})
+    return 204
+}}
+'''
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, INTROSPECTION_AUTH=service_auth, INTROSPECTION_ENDPOINT=json.dumps(endpoint),
@@ -276,6 +310,92 @@ route GET "/same-scope-{helper}" {{
                             return response.status, dict(response.headers), response.read()
                         finally:
                             connection.close()
+
+                    def h2_request(path, token):
+                        def frame(kind, flags, stream, data=b''):
+                            return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
+
+                        with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
+                            authorization = ('Bearer ' + token).encode()
+                            block = (b'\x82\x86\x04' + bytes((len(path),)) + path.encode() +
+                                     b'\x01\x09localhost\x0f\x08' + bytes((len(authorization),)) +
+                                     authorization)
+                            sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
+
+                            def exact(length):
+                                data = b''
+                                while len(data) < length:
+                                    part = sock.recv(length - len(data))
+                                    assert part, 'HTTP/2 closed before introspection completed'
+                                    data += part
+                                return data
+
+                            headers, data = b'', b''
+                            while True:
+                                header = exact(9)
+                                payload = exact(int.from_bytes(header[:3], 'big'))
+                                kind, flags = header[3], header[4]
+                                stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
+                                if kind == 4 and not flags & 1:
+                                    sock.sendall(frame(4, 1, 0))
+                                assert kind != 7, payload
+                                if stream != 1:
+                                    continue
+                                assert kind != 3, payload
+                                if kind == 0:
+                                    data += payload
+                                elif kind == 1:
+                                    headers += payload
+                                if kind in (0, 1) and flags & 1:
+                                    break
+                            return headers, data
+
+                    if args.additional_policies:
+                        for token in ('read-only', 'write-only', 'audit-only', 'all-scopes'):
+                            assert request(token, '/any-scope-list')[0] == 204
+                        for token in ('wrong-scope', 'no-scope'):
+                            status, headers, _ = request(token, '/any-scope-list')
+                            assert status == 403
+                            assert headers['WWW-Authenticate'] == 'Bearer error="insufficient_scope"'
+                        assert request('all-scopes', '/all-scope-list')[0] == 204
+                        for token in ('read-only', 'write-only', 'audit-only', 'valid'):
+                            status, headers, _ = request(token, '/all-scope-list')
+                            assert status == 403
+                            assert headers['WWW-Authenticate'] == 'Bearer error="insufficient_scope"'
+                        for path in ('/invalid-any-scope-list', '/invalid-all-scope-list',
+                                     '/empty-pinned-subject', '/invalid-forbidden-scopes',
+                                     '/invalid-lifetime'):
+                            status, headers, _ = request('valid', path)
+                            assert status == 503 and 'WWW-Authenticate' not in headers
+                        assert request('valid', '/pinned-subject')[0] == 204
+                        for token in ('read-only', 'no-subject', 'typed-subject',
+                                      'wrong-issuer', 'wrong-client', 'inactive'):
+                            status, headers, _ = request(token, '/pinned-subject')
+                            assert status == 401
+                            assert headers['WWW-Authenticate'] == 'Bearer error="invalid_token"'
+                        for token in ('valid', 'read-only', 'no-scope'):
+                            assert request(token, '/no-forbidden-scopes')[0] == 204
+                        for token in ('all-scopes', 'audit-only'):
+                            status, headers, _ = request(token, '/no-forbidden-scopes')
+                            assert status == 403
+                            assert headers['WWW-Authenticate'] == 'Bearer error="insufficient_scope"'
+                        assert request('typed-scope', '/no-forbidden-scopes')[0] == 401
+                        assert request('short-token', '/bounded-lifetime')[0] == 204
+                        for token in ('valid', 'long-token', 'old-token', 'bad-iat', 'future-iat'):
+                            status, headers, _ = request(token, '/bounded-lifetime')
+                            assert status == 401
+                            assert headers['WWW-Authenticate'] == 'Bearer error="invalid_token"'
+                        for path, token in (
+                                ('/any-scope-list', 'audit-only'), ('/all-scope-list', 'all-scopes'),
+                                ('/pinned-subject', 'valid'), ('/no-forbidden-scopes', 'read-only'),
+                                ('/bounded-lifetime', 'short-token')):
+                            headers, data = h2_request(path, token)
+                            assert headers.startswith(b'\x89') and not data, (path, headers, data)
+                        headers, data = h2_request('/no-forbidden-scopes', 'all-scopes')
+                        assert headers and not headers.startswith(b'\x89') and not data
+                        assert not forwarded
+                        print(f'PASS: {args.backend} bounded introspection scope lists and subject pinning')
+                        return 0
 
                     for authorization in ('', 'Basic abc', 'Bearer a&token=stolen', 'Bearer a=b'):
                         before = len(received)
@@ -408,40 +528,9 @@ route GET "/same-scope-{helper}" {{
                             assert 'insufficient_scope' in headers.get('WWW-Authenticate', '')
                         else:
                             assert (status, data) == (200, b'subject-valid'), (i, status, data)
-                    def frame(kind, flags, stream, data=b''):
-                        return len(data).to_bytes(3, 'big') + bytes((kind, flags)) + stream.to_bytes(4, 'big') + data
-
                     for h2_path in ('/reports', '/bound-reports', *scope_paths):
-                        with socket.create_connection(('127.0.0.1', port), timeout=4) as sock:
-                            block = (b'\x82\x86\x04' + bytes((len(h2_path),)) + h2_path.encode() +
-                                     b'\x01\x09localhost\x0f\x08\x09Bearer h2')
-                            sock.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(4, 0, 0) + frame(1, 5, 1, block))
-
-                            def exact(length):
-                                data = b''
-                                while len(data) < length:
-                                    part = sock.recv(length - len(data))
-                                    assert part, 'HTTP/2 closed before introspection completed'
-                                    data += part
-                                return data
-
-                            data = b''
-                            while True:
-                                header = exact(9)
-                                payload = exact(int.from_bytes(header[:3], 'big'))
-                                kind, flags = header[3], header[4]
-                                stream = int.from_bytes(header[5:], 'big') & 0x7fffffff
-                                if kind == 4 and not flags & 1:
-                                    sock.sendall(frame(4, 1, 0))
-                                assert kind != 7, payload
-                                if stream != 1:
-                                    continue
-                                assert kind != 3, payload
-                                if kind == 0:
-                                    data += payload
-                                if kind in (0, 1) and flags & 1:
-                                    break
-                            assert data == b'subject-h2', data
+                        _, data = h2_request(h2_path, 'h2')
+                        assert data == b'subject-h2', data
                     # Duplicate Authorization must fail before contacting the AS.
                     for path in ('/reports', '/bound-reports', *scope_paths):
                         before = len(received)
