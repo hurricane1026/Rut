@@ -27,6 +27,43 @@ def changes(consumers=(), credentials=(), remove_consumers=(), remove_credential
                 removeConsumers=list(remove_consumers), removeCredentials=list(remove_credentials))
 
 
+def test_targeted_registry_commands(tool, root):
+    alice = dict(id='ali"ce', enabled=True, groups=['staff', 'readers'])
+    bob = dict(id='bob', enabled=True, groups=['readers'])
+    vacant = dict(id='vacant', enabled=False, groups=[])
+    raw = dict(id='raw', consumerId=alice['id'], method='bearer',
+               enabled=True, secret='private-targeted-fixture')
+    digest = hashlib.sha256(b'targeted-verifier-fixture').hexdigest()
+    parked = dict(id='parked', consumerId=alice['id'], method='header',
+                  enabled=False, secretSha256=digest, groups=['readers'],
+                  notBefore=10, expiresAt=100)
+    inherited = dict(id='inherited', consumerId=alice['id'], method='header',
+                     enabled=False, secret='private-inherited-fixture')
+    consumers = [alice, bob, vacant]
+    records = [raw, parked, inherited]
+    snapshot = dict(version=1, consumers=consumers, credentials=records)
+    source = private(root / 'targeted-input.json', snapshot)
+    original = source.read_bytes()
+    secrets = [raw['secret'].encode(), digest.encode(), inherited['secret'].encode()]
+
+    def check_output(result):
+        for secret in secrets:
+            assert secret not in result.stdout and secret not in result.stderr
+
+    def inspect(command, record_id, expected):
+        result = run(tool, command, source, record_id)
+        check_output(result)
+        if expected is None:
+            assert result.returncode == 2 and not result.stdout
+        else:
+            assert result.returncode == 0 and not result.stderr, result
+            assert json.loads(result.stdout) == expected
+
+    inspect('inspect-consumer', alice['id'], alice)
+    inspect('inspect-consumer', 'missing', None)
+    assert source.read_bytes() == original
+
+
 def test_prune_credentials(tool, root):
     for args in (['prune-credentials'], ['prune-credentials', 'a', '1'],
                  ['prune-credentials', 'a', '1', 'b', 'c']):
@@ -978,6 +1015,7 @@ def main(tool):
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
         test_prune_credentials(tool, root)
+        test_targeted_registry_commands(tool, root)
         test_generated_keys(tool, root)
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)

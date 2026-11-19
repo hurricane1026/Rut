@@ -520,6 +520,14 @@ epoll/io_uring with HTTP/1 and HTTP/2, verify overlap, then reject a disabled
 old generated key while retaining the new one. Transparent
 request-target/body mutation and online administrative HTTP APIs remain separate.
 
+### Targeted lifecycle commands
+
+All commands take a validated private input snapshot.
+
+| Command after `rut-consumers` | Effect |
+| --- | --- |
+| `inspect-consumer INPUT CONSUMER_ID` | Print the selected Consumer's metadata as one JSON object. |
+
 ## Product scope
 
 This bounded registry, ordinary rotation/revocation and authorization correctness
