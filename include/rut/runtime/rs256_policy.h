@@ -85,8 +85,10 @@ private:
         JwksFetch fetch;
         JwksValidator validator;
         Rs256VerifierSet alternate;
+        u64 last_maintenance = 0;
         u64 last_success = 0;
         u64 next_attempt = 0;
+        JwksRetry retry{};
         bool use_alternate = false;
         bool empty = false;
     };

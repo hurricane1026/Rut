@@ -155,6 +155,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         } else if (kKey.eq(lit_str("retrySeconds"))) {
             if (value > 3600) return false;
             next.retry_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("maxRetrySeconds"))) {
+            if (value > 3600) return false;
+            next.max_retry_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("maxRetryAfterSeconds"))) {
             if (value > 3600) return false;
             next.max_retry_after_seconds = static_cast<u32>(value);
@@ -170,6 +173,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             return false;
     }
     if (!next.retry_seconds) next.retry_seconds = next.refresh_seconds;
+    if (next.max_retry_seconds && next.max_retry_seconds < next.retry_seconds) return false;
     next.endpoint.tls.enabled = true;
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
@@ -191,9 +195,25 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     return true;
 }
 
+bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
+    const bool kValid = now_ms && now_ms >= previous_ms;
+    previous_ms = now_ms;
+    return kValid;
+}
+
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
     const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
     return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
+}
+
+u32 JwksRetry::failure(const RemoteJwks& policy, u32 server_hint) {
+    const u32 kCap = policy.max_retry_seconds;
+    if (!kCap || !local_seconds_) {
+        local_seconds_ = policy.retry_seconds;
+    } else {
+        local_seconds_ = local_seconds_ > kCap / 2 ? kCap : local_seconds_ * 2;
+    }
+    return server_hint > local_seconds_ ? server_hint : local_seconds_;
 }
 
 void JwksValidator::clear() {

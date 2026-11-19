@@ -502,6 +502,17 @@ TEST(remote_jwks_metadata, retry_configuration_defaults_order_bounds_and_reset) 
     }
 }
 
+TEST(remote_jwks_metadata, maintenance_observes_idle_clock_reversal) {
+    u64 previous = 0;
+    REQUIRE(jwks_observe_time(previous, 1000));      // Last successful key refresh.
+    REQUIRE(jwks_observe_time(previous, 2000));      // A later failed refresh.
+    REQUIRE(jwks_observe_time(previous, 2300));      // Idle before the retry deadline.
+    CHECK_FALSE(jwks_observe_time(previous, 1900));  // Still newer than the successful refresh.
+    CHECK(jwks_observe_time(previous, 1900));
+    CHECK_FALSE(jwks_observe_time(previous, 0));
+    CHECK(jwks_observe_time(previous, 100));
+}
+
 TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     // A slow attempt completes after its previous refresh interval. Its retry
     // still waits a full configured interval from this later completion time.
@@ -511,6 +522,39 @@ TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     CHECK_EQ(jwks_refresh_deadline(~u64{0} - 1000, 1), ~u64{0});
     CHECK_EQ(jwks_refresh_deadline(~u64{0} - 999, 1), ~u64{0});
     CHECK_EQ(jwks_refresh_deadline(~u64{0}, 3600), ~u64{0});
+}
+
+TEST(remote_jwks_metadata, local_retry_backoff_caps_resets_and_keeps_hints_separate) {
+    RemoteJwks policy;
+    policy.retry_seconds = 3;
+    JwksRetry delay;
+    CHECK_EQ(delay.failure(policy), 3u);
+    CHECK_EQ(delay.failure(policy), 3u);
+    policy.max_retry_seconds = 14;
+    delay.reset();
+    CHECK_EQ(delay.failure(policy), 3u);
+    CHECK_EQ(delay.failure(policy, 20), 20u);
+    CHECK_EQ(delay.failure(policy), 12u);
+    CHECK_EQ(delay.failure(policy), 14u);
+    CHECK_EQ(delay.failure(policy), 14u);
+    delay.reset();
+    CHECK_EQ(delay.failure(policy), 3u);
+
+    const Str invalid =
+        lit_str(R"({"address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+                R"("path":"/keys","refreshSeconds":7,"maxAgeSeconds":9,"timeoutSeconds":1,)"
+                R"("maxRetrySeconds":6})");
+    const Str valid = lit_str(
+        R"({"maxRetrySeconds":6,"address":"192.0.2.1","port":443,"serverName":"issuer.example",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":7,"maxAgeSeconds":9,"timeoutSeconds":1,)"
+        R"("retrySeconds":4})");
+    json::Document document;
+    REQUIRE(document.parse(invalid));
+    CHECK_FALSE(policy.load(document, 0));
+    REQUIRE(document.parse(valid));
+    REQUIRE(policy.load(document, 0));
+    CHECK_EQ(policy.max_retry_seconds, 6u);
+    CHECK_EQ(policy.retry_seconds, 4u);
 }
 
 TEST(remote_jwks_metadata, retry_after_requires_one_bounded_decimal_on_throttle_status) {

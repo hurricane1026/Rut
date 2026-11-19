@@ -11219,6 +11219,12 @@ DNS/discovery/key stages share one deadline and retry cadence; failures do not
 renew key age. No libc DNS wait, redirects, request-selected endpoints, new
 library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).
 
+Local retry starts at `retrySeconds` on failure and optionally doubles up to
+`maxRetrySeconds` until successful publication. A fully framed authenticated
+key-endpoint HTTP 429 or 503 can independently request a delay bounded by
+`maxRetryAfterSeconds`. The greater delay sets the next completion-based
+deadline. Neither throttle failures nor retries extend the approved key age.
+
 
 ### Explicit encoded Consumer credential sources
 

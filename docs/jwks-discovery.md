@@ -8,7 +8,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
 {
   "address": "192.0.2.10", "port": 443, "serverName": "issuer.example",
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
-  "refreshSeconds": 30, "retrySeconds": 5, "maxRetryAfterSeconds": 30,
+  "refreshSeconds": 30, "retrySeconds": 5, "maxRetrySeconds": 60, "maxRetryAfterSeconds": 30,
   "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "conditionalRequests": true,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
@@ -23,12 +23,19 @@ uses `refreshSeconds`, regardless of field order. Omission preserves the interva
 value; failed attempts now measure it from completion, so slow failures no longer
 retry immediately when their prior start-based interval has elapsed.
 Successful refreshes, including valid empty key sets, schedule the next attempt
-from completion plus `refreshSeconds`. Setup, DNS, metadata, HTTPS, parsing and verifier-import failures
-schedule from their completion plus `retrySeconds`. A slow failure still waits
-the full retry interval after its timeout. Both algorithms use the same rule;
-there is no jitter, exponential backoff or token-triggered retry. Deadlines
-saturate instead of wrapping on integer overflow. An invalid maintenance clock
-cancels the attempt and clears cache freshness before a later cold attempt.
+from completion plus `refreshSeconds`. By default, setup, DNS, metadata, HTTPS,
+parsing and verifier-import failures schedule from completion plus
+`retrySeconds`. A slow failure still waits the full retry interval after its
+timeout. Both algorithms use the same rule. Deadlines saturate on overflow.
+An invalid maintenance clock cancels the attempt and clears cache freshness
+before a later cold attempt.
+
+Optional `maxRetrySeconds` (integer `retrySeconds`–3600) enables capped
+exponential retry backoff. The first failure waits `retrySeconds` and each
+consecutive failure doubles the local interval up to the cap. A successful
+key refresh, accepted 304, or a maintenance reset clears the progression.
+Server hints can extend the scheduled delay without changing the next local
+backoff step. Request traffic never triggers a refresh.
 
 Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
 renew last-success time; requests fail closed after the original maximum age

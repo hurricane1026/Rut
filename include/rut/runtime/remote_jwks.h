@@ -18,12 +18,23 @@ struct RemoteJwks {
     char discovery_issuer[1024]{};
     u32 refresh_seconds = 0;
     u32 retry_seconds = 0;
+    u32 max_retry_seconds = 0;
     u32 max_retry_after_seconds = 0;
     bool conditional_requests = false;
     u32 max_age_seconds = 0;
     u32 timeout_seconds = 0;
     bool enabled() const { return refresh_seconds != 0; }
     bool load(json::Document& document, u32 node);
+};
+
+// Shard-local delay between failed attempts. A server hint does not affect
+// the local backoff progression.
+struct JwksRetry {
+    u32 failure(const RemoteJwks& policy, u32 server_hint = 0);
+    void reset() { local_seconds_ = 0; }
+
+private:
+    u32 local_seconds_ = 0;
 };
 
 struct JwksDnsAddresses {
@@ -92,6 +103,9 @@ private:
     void clear_dns_cache();
     bool fail();
 };
+// Observe before checking deadlines so idle rows still detect clock resets.
+bool jwks_observe_time(u64& previous_ms, u64 now_ms);
+
 // Saturating completion-based maintenance deadline, shared by both JWT algorithms.
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds);
 

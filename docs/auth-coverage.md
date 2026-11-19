@@ -1647,8 +1647,9 @@ JIT tests also cover the 1024/1025-byte bound. See
   deployment responsibilities (#1076).
 - [JWKS DNS/discovery](jwks-discovery.md): bounded nonblocking A/CNAME resolution,
   finite address allowlist, sequential failover after definitive TCP connect
-  failures, exact issuer and pre-authorized URI, both asymmetric algorithms
-  and both Linux backends (#1077).
+  failures, exact issuer and pre-authorized URI, opt-in TTL-bounded DNS reuse,
+  capped exponential retries and bounded authenticated Retry-After hints.
+  Both asymmetric algorithms and both Linux backends are covered (#1077).
 
 These profiles are proposed free foundations. Their security fixes and necessary
 failure protection do not depend on a commercial tier. Enterprise governance,
