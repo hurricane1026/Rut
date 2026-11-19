@@ -844,6 +844,19 @@ for syntax and rollout semantics.
 
 
 
+## Consumer registration and constrained key provisioning
+
+Offline `rut-consumers provision-key-verifier` supports new Consumer registration
+with its first generated key and explicit key groups/time bounds for existing
+owners. Exact private profiles reject secrets, verifier fields, duplicate names,
+unknown names, existing IDs and cross-owner registration. Complete runtime
+validation precedes private no-replace key/snapshot publication. CLI regressions
+cover metadata preservation, disabled staging, capacity, filesystem guards, races
+and publication failures. Native H1/H2 fixtures exercise generated keys, inherited
+and narrowed groups, disabled owners/keys, and future/expired windows on both
+backends. See [the provisioning contract](consumer-registry.md#registering-consumers-and-provisioning-constrained-keys).
+Online administration and deployment remain open in #1072.
+
 ## Configured OAuth client Basic construction
 
 `oauthClientBasicAuthorization` and `oauth_client.basicAuthorization` construct

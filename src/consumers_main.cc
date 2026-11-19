@@ -684,6 +684,120 @@ int prune_credentials_command(const char* source,
     return error ? failure(error) : 0;
 }
 
+bool provision_profile(json::Document& base, json::Document& profile) {
+    if (!profile.count || profile.nodes[0].kind != json::Kind::Object) return false;
+    const u32 kConsumer = field(profile, 0, lit_str("consumer"));
+    const u32 kCredential = field(profile, 0, lit_str("credential"));
+    if (kCredential == json::kNone || profile.nodes[kCredential].kind != json::Kind::Object)
+        return false;
+    for (u32 n = profile.nodes[0].child; n != json::kNone; n = profile.nodes[n].next)
+        if (n != kConsumer && n != kCredential) return false;
+    constexpr Str kFields[] = {lit_str("id"),
+                               lit_str("consumerId"),
+                               lit_str("method"),
+                               lit_str("enabled"),
+                               lit_str("groups"),
+                               lit_str("notBefore"),
+                               lit_str("expiresAt")};
+    for (u32 n = profile.nodes[kCredential].child; n != json::kNone; n = profile.nodes[n].next) {
+        bool accepted = false;
+        for (const Str kName : kFields)
+            if (field(profile, kCredential, kName) == n) accepted = true;
+        if (!accepted) return false;
+    }
+    const u32 kId = field(profile, kCredential, lit_str("id"));
+    const u32 kOwner = field(profile, kCredential, lit_str("consumerId"));
+    const u32 kEnabled = field(profile, kCredential, lit_str("enabled"));
+    if (!id_valid(profile, kId) || !id_valid(profile, kOwner) || kEnabled == json::kNone ||
+        profile.nodes[kEnabled].kind != json::Kind::Boolean ||
+        !(field_equals(
+              profile, field(profile, kCredential, lit_str("method")), lit_str("bearer")) ||
+          field_equals(
+              profile, field(profile, kCredential, lit_str("method")), lit_str("header"))) ||
+        find(base, field(base, 0, lit_str("credentials")), profile, kId, true) != json::kNone)
+        return false;
+    const u32 kConsumers = field(base, 0, lit_str("consumers"));
+    if (kConsumer == json::kNone)
+        return find(base, kConsumers, profile, kOwner, true) != json::kNone;
+    const u32 kNewId = field(profile, kConsumer, lit_str("id"));
+    return profile.nodes[kConsumer].kind == json::Kind::Object && id_valid(profile, kNewId) &&
+           equal(profile, kNewId, profile, kOwner) &&
+           find(base, kConsumers, profile, kNewId, true) == json::kNone;
+}
+
+bool provision_change(json::Document& profile, Str digest, json::Writer& output) {
+    const u32 kConsumer = field(profile, 0, lit_str("consumer"));
+    const u32 kCredential = field(profile, 0, lit_str("credential"));
+    output.text(lit_str("{\"consumers\":["));
+    if (kConsumer != json::kNone && !profile.write(kConsumer, output)) return false;
+    output.text(lit_str("],\"credentials\":[{"));
+    for (u32 n = profile.nodes[kCredential].child; n != json::kNone; n = profile.nodes[n].next) {
+        if (!profile.write(profile.nodes[n].key, output)) return false;
+        output.put(':');
+        if (!profile.write(n, output)) return false;
+        output.put(',');
+    }
+    output.text(lit_str("\"secretSha256\":\""));
+    output.text(digest);
+    output.text(lit_str("\"}],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+    return output.ok;
+}
+
+int provision_key_verifier_command(const char* source,
+                                   const char* profile_path,
+                                   const char* snapshot_path,
+                                   const char* key_path) {
+    Buffer input, profile_input;
+    SensitiveDocument base, profile;
+    if (!read_private(source, input) || !read_private(profile_path, profile_input))
+        return failure("cannot read private registry or provisioning profile\n");
+    if (!consumer_registry_valid(base, input.view()))
+        return failure("invalid Consumer registry snapshot\n");
+    if (!profile.parse(profile_input.view()) || !provision_profile(base, profile))
+        return failure("invalid Consumer key provisioning profile\n");
+    OutputPair outputs;
+    if (!output_pair(snapshot_path, key_path, outputs))
+        return failure("outputs must be distinct new files in the same owned private directory\n");
+    GeneratedSecret secret;
+    if (!secret.generate()) return failure("operating-system random key generation failed\n");
+    SensitiveHashText digest;
+    u32 digest_length = 0;
+    if (!hash_hex(HashAlgorithm::Sha256,
+                  {secret.hex, sizeof(secret.hex)},
+                  {},
+                  false,
+                  digest.bytes,
+                  digest_length) ||
+        digest_length != 64)
+        return failure("cannot hash generated key for verifier snapshot\n");
+    Buffer changes, result;
+    json::Writer change_output{changes.data, json::kMaxBytes};
+    if (!provision_change(profile, {digest.bytes, digest_length}, change_output))
+        return failure("provisioning profile exceeds supported capacity\n");
+    SensitiveDocument patch, checked;
+    json::Writer snapshot{result.data, json::kMaxBytes};
+    if (!patch.parse({changes.data, change_output.len}) || !apply(base, patch, snapshot) ||
+        !consumer_registry_valid(checked, {result.data, snapshot.len}))
+        return failure("invalid provisioned Consumer registry snapshot\n");
+    const PublishAtResult kKeyResult =
+        publish_at(outputs.key.directory, outputs.key.basename, {secret.hex, sizeof(secret.hex)});
+    if (kKeyResult != PublishAtResult::Published)
+        return failure(kKeyResult == PublishAtResult::Uncertain
+                           ? "key output or private temporary may exist; snapshot was not "
+                             "published; inspect the directory before retrying\n"
+                           : "key output was not published; snapshot was not published\n");
+    const PublishAtResult kSnapshotResult = publish_at(
+        outputs.snapshot.directory, outputs.snapshot.basename, {result.data, snapshot.len});
+    if (kSnapshotResult != PublishAtResult::Published)
+        return failure(
+            kSnapshotResult == PublishAtResult::Uncertain
+                ? "key output was published and snapshot output may exist or publication "
+                  "durability may be uncertain; inspect both outputs before retrying\n"
+                : "key output was published but snapshot output was not; inspect both "
+                  "outputs before retrying\n");
+    return 0;
+}
+
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
@@ -697,6 +811,7 @@ constexpr char kUsage[] =
     "       rut-consumers rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID "
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT\n"
+    "       rut-consumers provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
@@ -715,6 +830,8 @@ constexpr char kUsage[] =
     "bounds.\n"
     "prune-credentials removes disabled or expired-at-cutoff credentials without reading the "
     "clock.\n"
+    "provision-key-verifier reads a private registration/key policy profile and writes separate "
+    "new snapshot and key files.\n"
     "hash-keys converts raw bearer/header keys in the 64-lowercase-hex generated-key profile.\n"
     "Exit: 0 success, 2 usage/validation/OS failure.\n";
 }  // namespace
@@ -724,6 +841,8 @@ int main(int argc, char** argv) {
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
         return prune_credentials_command(argv[2], argv[3], argv[4]);
+    if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)
+        return provision_key_verifier_command(argv[2], argv[3], argv[4], argv[5]);
     const bool kInit = argc == 3 && strcmp(argv[1], "init") == 0;
     const bool kValidate = argc == 3 && strcmp(argv[1], "validate") == 0;
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;

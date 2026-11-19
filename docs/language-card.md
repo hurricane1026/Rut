@@ -3632,6 +3632,14 @@ exact owner, method, optional groups and time bounds, including expired windows,
 and does not enable a disabled Consumer. The new ID must be unused even among
 disabled records; retaining the old record requires a free credential slot.
 Rotation is offline and deployment remains explicit (#1072 remains open).
+`provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT` accepts a private
+exact JSON profile. It can register a new Consumer with its first generated key,
+or add a key under an existing owner with explicit credential groups/time bounds.
+The optional Consumer record is creation-only. Credential IDs remain unique,
+secrets/verifier fields are rejected in the profile, and omitted versus empty
+groups retain existing semantics. Generated key delivery and full validated
+snapshot publication use the same private output-pair contract. No clock is read.
+See [the profile](consumer-registry.md#registering-consumers-and-provisioning-constrained-keys).
 `prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT` writes a validated private
 replacement without explicitly disabled credentials or positive `expiresAt`
 values at/before the supplied cutoff. It accepts canonical positive decimal
