@@ -190,6 +190,19 @@ route GET "/metadata" {
     let name = req.sni.or("none")
     return response(200, body: name)
 }
+route GET "/get-all" {
+    req.add("X-List", "added")
+    req.set("X-List", "replaced")
+    req.remove("X-List")
+    guard let values = req.getAll("x-LiSt") else { return 500 }
+    guard let missing = req.getAll("X-Missing") else { return 500 }
+    guard missing.count == 0 && missing.get(0).or("missing") == "missing" else { return 500 }
+    guard values.count != 0 else { return response(200, body: "empty") }
+    guard values.count == 3 && values.get(0).or("missing") == "first,second" &&
+        values.get(1).or("missing") == "" && values.get(2).or("missing") == "third" &&
+        values.get(3).or("missing") == "missing" else { return 500 }
+    return response(200, body: "ordered")
+}
 route "/" {
     guard let path = req.normalizedPath else { return 400 }
     guard let target = req.normalizedTarget else { return 400 }
@@ -286,6 +299,28 @@ route "/" {
                     finally:
                         probe.close()
                 assert result == (200, expected_name), ('metadata', result)
+                # Physical occurrences stay ordered, including empty values and
+                # commas, and request mutations do not change original reads.
+                fields = [('X-List', 'first,second'), ('x-list', ''), ('X-LIST', 'third')]
+                if args.h2:
+                    result = h2_request(port, '/get-all', fields, tls_context=context)
+                    empty_result = h2_request(port, '/get-all', [], tls_context=context)
+                else:
+                    probe = connection(port)
+                    try:
+                        probe.putrequest('GET', '/get-all')
+                        for name, value in fields:
+                            probe.putheader(name, value)
+                        probe.endheaders()
+                        reply = probe.getresponse()
+                        result = (reply.status, reply.read())
+                        probe.request('GET', '/get-all')
+                        reply = probe.getresponse()
+                        empty_result = (reply.status, reply.read())
+                    finally:
+                        probe.close()
+                assert result == (200, b'ordered'), ('getAll occurrences', result)
+                assert empty_result == (200, b'empty'), ('getAll absent', empty_result)
                 normalized = [('/api/../admin?q=%2f', b'/admin?q=%2f|'),
                               ('/api/%75sers', b'/api/users|'), ('/api//users', b'/api/users|')]
                 for path, expected in normalized:

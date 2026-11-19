@@ -44,6 +44,7 @@ enum class MirValueKind : u8 {
     IfElse,
     StructInit,
     Field,
+    ReqHeaderAll,
     ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,

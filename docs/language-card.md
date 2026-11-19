@@ -306,7 +306,14 @@ req.uniqueHeader("X-API-Key") // str?; missing or duplicate fields yield nil
 req.set("X-User-ID", "123")  // ✅ replace/dedupe; statement-only; string values may be dynamic
 req.add("X-Tag", "a")        // ✅ preserve existing fields and append; string values may be dynamic
 req.remove("Authorization")  // ✅ delete every matching field before forwarding
-req.getAll("Accept")         // ⏳ [str]
+req.getAll("Accept")         // Collected<str>?
+// Literal nonempty HTTP token name; original values in wire order, case-insensitive.
+// Absence is an empty collection; malformed requests or budget failure yield nil.
+// Values are copied, including empty values; commas are not split.
+// HTTP/2 uses the synthesized request view: :authority becomes Host, Cookie
+// fields are joined, and Content-Length can be synthesized for the body bridge.
+// Other repeated fields retain their order.
+// Routes containing explicit wait do not support req.getAll yet.
 
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
@@ -331,6 +338,11 @@ resp.body = json(data)            // body
 resp.status                       // StatusCode, read/write
 return resp
 ```
+
+Unwrap the result of `req.getAll` before reading `.count` or using `.get(index)`.
+Indexing starts at zero and returns `nil` outside the collection. The request
+view used by `getAll` is limited to 64 header fields. The collection copies its
+values into the existing request arena and shares its allocation budget.
 
 Ordinary local HTTP/1 responses mirror the version of a complete strictly
 parsed request (`HTTP/1.0` or `HTTP/1.1`). Responses to requests without a

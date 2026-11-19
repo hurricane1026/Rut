@@ -601,8 +601,16 @@ req.bodyRaw = newBody   // replace body before forward (recomputes Content-Lengt
 // Cookies
 req.cookie("session_id") // string?
 
-// Multi-value headers
-req.getAll("Accept")    // [string] — all values for a header
+// Multi-value headers: getAll requires a nonempty literal HTTP token name.
+// It matches case-insensitively, does not split commas, and returns an empty
+// collection for absence or nil on invalid input / parsing / arena budget failure.
+// Values are invocation-owned; queued header mutations do not alter this view.
+// HTTP/2 uses the synthesized request view: :authority becomes Host, Cookie
+// fields are joined, and the body bridge may synthesize Content-Length. Other
+// repeated fields retain their order.
+// Routes containing explicit wait do not support getAll yet: collection
+// bindings cannot currently be safely resumed.
+req.getAll("Accept")    // Collected<str>? — original field values in wire order
 req.add("X-Tag", "a")   // append (doesn't replace existing)
 
 // Request-level context — typed struct, shared across middleware and handler
