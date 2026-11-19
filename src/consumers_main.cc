@@ -627,7 +627,7 @@ bool rotate_key_change(
     return output.ok;
 }
 
-bool prune_cutoff(const char* text, i64& cutoff) {
+bool parse_positive_unix_seconds(const char* text, i64& cutoff) {
     if (!text || text[0] < '1' || text[0] > '9') return false;
     u64 value = 0;
     constexpr u64 kMax = ~u64{0} >> 1;
@@ -667,7 +667,8 @@ int prune_credentials_command(const char* source,
                               const char* cutoff_text,
                               const char* destination) {
     i64 cutoff = 0;
-    if (!prune_cutoff(cutoff_text, cutoff)) return failure("invalid credential pruning cutoff\n");
+    if (!parse_positive_unix_seconds(cutoff_text, cutoff))
+        return failure("invalid credential pruning cutoff\n");
     Buffer input;
     SensitiveDocument base;
     if (!read_private(source, input)) return failure("cannot read private registry file\n");
@@ -682,6 +683,84 @@ int prune_credentials_command(const char* source,
         return failure("invalid pruned Consumer registry snapshot\n");
     const char* error = publish(destination, {result.data, output.len});
     return error ? failure(error) : 0;
+}
+
+// Deployment-time checks consume only already-validated registry metadata.
+struct PolicySnapshot {
+    json::Document& registry;
+    json::Document& policy;
+    i64 now;
+    u32 consumers;
+    u32 credentials;
+};
+
+struct PolicyRule {
+    Str name;
+    bool toggle;
+    bool (*check)(PolicySnapshot&, u32);
+};
+
+bool policy_hashed_keys(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        const u32 method = field(doc, record, lit_str("method"));
+        if ((field_equals(doc, method, lit_str("bearer")) ||
+             field_equals(doc, method, lit_str("header"))) &&
+            field(doc, record, lit_str("secretSha256")) == json::kNone)
+            return false;
+    }
+    return true;
+}
+
+constexpr PolicyRule kPolicyRules[] = {
+    {lit_str("requireHashedKeys"), true, policy_hashed_keys},
+};
+
+int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
+    i64 now = 0;
+    if (!parse_positive_unix_seconds(seconds, now))
+        return failure("invalid policy evaluation time\n");
+    Buffer input;
+    SensitiveDocument registry;
+    if (!read_private(input_path, input) || !consumer_registry_valid(registry, input.view()))
+        return failure("invalid private Consumer registry snapshot\n");
+    Buffer policy_bytes;
+    SensitiveDocument policy;
+    if (!read_private(policy_path, policy_bytes) || !policy.parse(policy_bytes.view()) ||
+        policy.nodes[0].kind != json::Kind::Object || policy.nodes[0].child == json::kNone)
+        return failure("invalid private Consumer deployment policy\n");
+    PolicySnapshot snapshot{registry,
+                            policy,
+                            now,
+                            field(registry, 0, lit_str("consumers")),
+                            field(registry, 0, lit_str("credentials"))};
+    u32 seen = 0;
+    for (u32 node = policy.nodes[0].child; node != json::kNone; node = policy.nodes[node].next) {
+        u32 index = 0;
+        for (; index < sizeof(kPolicyRules) / sizeof(kPolicyRules[0]); ++index) {
+            if (field_equals(policy, policy.nodes[node].key, kPolicyRules[index].name)) break;
+        }
+        if (index == sizeof(kPolicyRules) / sizeof(kPolicyRules[0]) || (seen & (1U << index)))
+            return failure("unknown or duplicate Consumer deployment policy rule\n");
+        seen |= 1U << index;
+        const auto& rule = kPolicyRules[index];
+        if (rule.toggle && policy.nodes[node].kind == json::Kind::Boolean &&
+            policy.raw(node).eq(lit_str("false")))
+            continue;
+        if ((!rule.toggle || policy.nodes[node].kind == json::Kind::Boolean) &&
+            rule.check(snapshot, node))
+            continue;
+        // Report the fixed schema name only. Never include input values or paths.
+        char message[128];
+        json::Writer report{message, sizeof(message)};
+        report.text(lit_str("Consumer deployment policy rejected rule: "));
+        report.text(rule.name);
+        report.put('\n');
+        if (report.ok) (void)write_all(STDERR_FILENO, {message, report.len});
+        return 2;
+    }
+    return 0;
 }
 
 bool provision_profile(json::Document& base, json::Document& profile) {
@@ -801,6 +880,7 @@ int provision_key_verifier_command(const char* source,
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
+    "       rut-consumers check-policy INPUT POLICY NOW_UNIX_SECONDS\n"
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
@@ -837,6 +917,8 @@ constexpr char kUsage[] =
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && strcmp(argv[1], "check-policy") == 0)
+        return check_policy_command(argv[2], argv[3], argv[4]);
     if (argc == 2 && strcmp(argv[1], "--help") == 0)
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)

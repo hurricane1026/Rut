@@ -11121,6 +11121,11 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+Offline `rut-consumers check-policy` evaluates a bounded private policy object
+against a validated private registry snapshot. An explicit Unix-second argument
+makes preflight decisions reproducible. Checks consume metadata and emit only
+fixed rule names on failure.
+
 Offline `rut-consumers diff BEFORE AFTER` validates both private snapshots and
 buffers a bounded redacted change report before stdout. Stable decoded IDs match
 records; metadata compares decoded values and group sets while preserving optional

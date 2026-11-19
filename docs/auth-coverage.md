@@ -857,6 +857,13 @@ and narrowed groups, disabled owners/keys, and future/expired windows on both
 backends. See [the provisioning contract](consumer-registry.md#registering-consumers-and-provisioning-constrained-keys).
 Online administration and deployment remain open in #1072.
 
+### Consumer deployment policy checks
+
+The private, offline `rut-consumers check-policy` gate validates candidate
+snapshots against opt-in deployment rules at an explicit Unix-second sample.
+The checks do not publish snapshots or carry request-time state.
+See [deployment policy checks](consumer-registry.md#deployment-policy-checks).
+
 ## Configured OAuth client Basic construction
 
 `oauthClientBasicAuthorization` and `oauth_client.basicAuthorization` construct
