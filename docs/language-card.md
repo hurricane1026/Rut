@@ -2607,7 +2607,9 @@ configuration, never token/HTTP-request data. The address is a literal IPv4;
 there is no blocking DNS, redirect following or token-driven fetch. Optional
 `dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A/CNAME DNS; optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
-validation. Neither profile accepts request-selected destinations. See
+validation. In DNS mode `dnsCacheSeconds` (1–3600) enables per-shard reuse up
+to the earlier of the configured cap and the shortest validated record TTL.
+Neither profile accepts request-selected destinations. See
 [JWKS DNS/discovery](jwks-discovery.md) for schema, ownership and failure limits.
 The CA file and TLS server name are mandatory and certificate verification cannot
 be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is

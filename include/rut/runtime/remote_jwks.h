@@ -11,6 +11,7 @@ struct RemoteJwks {
     HttpsEndpoint endpoint{};
     char dns_address[16]{};
     u16 dns_port = 53;
+    u32 dns_cache_seconds = 0;
     char allowed_addresses[kMaxDnsAddresses][16]{};
     u32 allowed_count = 0;
     char discovery_path[1024]{};
@@ -27,6 +28,7 @@ struct RemoteJwks {
 struct JwksDnsAddresses {
     char values[RemoteJwks::kMaxDnsAddresses][16]{};
     u32 count = 0;
+    u32 ttl_seconds = 0;
 };
 
 // Owned validator bound to the accepted key representation and selected IPv4.
@@ -52,6 +54,7 @@ public:
                const JwksValidator* validator = nullptr,
                u64 validator_deadline = 0);
     void advance(u64 monotonic_ms);
+    void finish_attempt();
     void cancel();
     State state() const { return state_; }
     bool not_modified() const { return state_ == State::Done && keys_.status() == 304; }
@@ -73,12 +76,16 @@ private:
     u64 started_ = 0;
     u32 timeout_ = 0;
     JwksDnsAddresses addresses_{};
+    JwksDnsAddresses cached_addresses_{};
+    u64 dns_cached_at_ = 0;
+    u64 dns_cache_deadline_ = 0;
     u32 address_index_ = 0;
     bool discovering_ = false;
     bool initialized_ = false;
     bool begin_http(u64 now);
     bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
+    void clear_dns_cache();
     bool fail();
 };
 // Saturating completion-based maintenance deadline, shared by both JWT algorithms.

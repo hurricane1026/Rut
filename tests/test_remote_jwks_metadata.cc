@@ -513,6 +513,35 @@ TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     CHECK_EQ(jwks_refresh_deadline(~u64{0}, 3600), ~u64{0});
 }
 
+TEST(remote_jwks_metadata, dns_cache_configuration_and_minimum_chain_ttl) {
+    const char* base =
+        "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\","
+        "\"ca\":\"ca.pem\",\"path\":\"/keys\",\"refreshSeconds\":1,"
+        "\"maxAgeSeconds\":3,\"timeoutSeconds\":1";
+    char bytes[1024];
+    json::Document document;
+    RemoteJwks configuration;
+    int size = snprintf(bytes, sizeof(bytes), "{%s,\"dnsCacheSeconds\":4}", base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+    CHECK_FALSE(configuration.load(document, 0));
+    size = snprintf(bytes,
+                    sizeof(bytes),
+                    "{%s,\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\"],"
+                    "\"dnsCacheSeconds\":4}",
+                    base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+    REQUIRE(configuration.load(document, 0));
+    CHECK_EQ(configuration.dns_cache_seconds, 4u);
+    DnsPacket response;
+    response.cname(nullptr, "keys.example", 12);
+    response.a("keys.example", 1, 30);
+    response.a("keys.example", 1, 5);
+    JwksDnsAddresses addresses;
+    REQUIRE(accepts(response, configuration, addresses));
+    CHECK_EQ(addresses.count, 1u);
+    CHECK_EQ(addresses.ttl_seconds, 5u);
+}
+
 TEST(remote_jwks_metadata, conditional_requests_boolean_and_reset) {
     const char* base =
         "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\","

@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--discovery-dns", action="store_true")
     parser.add_argument("--access-profile", action="store_true")
     parser.add_argument("--conditional", action="store_true")
+    parser.add_argument("--dns-cache", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -198,6 +199,9 @@ def main():
                                        allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
+        if args.dns_cache:
+            assert args.discovery_dns
+            policy["remoteJwks"]["dnsCacheSeconds"] = 4
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
         if args.access_profile:
             policy["requiredType"] = "at+jwt"
@@ -325,7 +329,26 @@ def main():
                     time.sleep(0.01)
                 raise AssertionError(f"JWKS request did not reach {target}; seen {state['locals']}")
 
-            if args.conditional:
+            if args.dns_cache:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    initial_dns = state["dnsRequests"]
+                    initial_keys = state["requests"]
+                    state["dns"] = "timeout"
+                assert initial_dns == 1
+                wait_for_origin_request(initial_keys)
+                with lock:
+                    assert state["dnsRequests"] == initial_dns
+                wait_for_dns_request(initial_dns, limit=8)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                with lock:
+                    before_recovery = state["requests"]
+                    state["dns"] = "move"
+                wait_for_origin_address(before_recovery, "127.0.0.2")
+                wait_status(fixture["a"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
+            elif args.conditional:
                 def observed(predicate, start=0, count=1, limit=12):
                     deadline = time.monotonic() + limit
                     while time.monotonic() < deadline:

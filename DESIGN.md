@@ -11212,6 +11212,9 @@ must match an explicit finite allowlist. TLS name/CA, issuer, endpoint URI and
 kid/algorithm inventory remain configuration-owned. The validated terminal
 addresses are tried in answer order after definitive TCP establishment failures.
 Each address runs its own discovery and key exchange within the shared deadline.
+Optional `dnsCacheSeconds` caps reuse of the fully validated address set by its
+shortest record TTL and the configured limit. The set is owned by the shard
+policy and is discarded on cancellation, clock reset, or TCP candidate exhaustion.
 DNS/discovery/key stages share one deadline and retry cadence; failures do not
 renew key age. No libc DNS wait, redirects, request-selected endpoints, new
 library or additional handler ABI is introduced. See [the bounded profile](docs/jwks-discovery.md).

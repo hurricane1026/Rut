@@ -10,7 +10,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
   "refreshSeconds": 30, "retrySeconds": 5, "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "conditionalRequests": true,
-  "dnsAddress": "192.0.2.53", "dnsPort": 53,
+  "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
   "discoveryIssuer": "https://issuer.example"
@@ -38,8 +38,8 @@ while maintenance continues its bounded retry cadence. The attempt's total
 and allowed destinations are IPv4 literals; at most eight destination addresses
 are accepted. `dnsPort` is optional (default 53), otherwise 1–65535. The original
 `address` remains a mandatory valid configuration field but is **never a fallback**
-when DNS is enabled. Each refresh attempt resolves the configured TLS server name
-again, through one connected nonblocking UDP socket to the configured resolver.
+when DNS is enabled. By default each attempt resolves the configured TLS server
+name again through one connected nonblocking UDP socket to the configured resolver.
 No blocking libc resolver, system search list, request-selected name or new DNS
 library is used.
 
@@ -57,8 +57,16 @@ only point backwards to a previously decoded valid label boundary, with bounded
 pointer traversal. Forks, duplicate CNAMEs, cycles, an owner with both A and CNAME,
 missing terminal A records, unrelated answers, malformed or trailing RDATA/bytes,
 AAAA, truncation, DNS errors and authority/additional sections fail the attempt.
-The configured resolver must provide this bounded UDP A/CNAME profile. The
-gateway uses the response only for the current refresh attempt.
+The configured resolver must provide this bounded UDP A/CNAME profile.
+
+Optional `dnsCacheSeconds` (integer 1–3600) requires DNS mode. It enables one
+owned address set per policy and shard. A validated reply may be reused until
+the earlier of its shortest record TTL and this local cap, measured from DNS
+completion on the monotonic clock. Cache hits still run authenticated discovery
+and key fetch within their own attempt timeout. These requests never extend
+DNS expiry. Cancel, clock failure or reversal, and exhaustion of the cached
+address set on a TCP connect failure discard it. A reply rejected by the
+resolver policy never enters the cache.
 
 Within an attempt the gateway tries distinct terminal A addresses in their
 original answer order. It moves to the next address only when TCP establishment
@@ -66,7 +74,7 @@ reports a connection refusal or another definitive network error. TLS, HTTP,
 metadata and key validation failures end the attempt. The next address uses
 the same total deadline and starts at discovery when discovery is configured.
 The remaining addresses are discarded when the deadline expires, including when
-an earlier address stalls. Each attempt uses one DNS query.
+an earlier address stalls. Each attempt uses at most one DNS query.
 
 TLS SNI/certificate hostname and CA remain fixed to the configured original
 server name even when a CNAME target or an allowed address changes. DNS is not

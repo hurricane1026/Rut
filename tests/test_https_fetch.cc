@@ -1430,6 +1430,53 @@ TEST(https_fetch, jwks_discovery_rejects_mismatched_origin_and_uninitialized_fet
     CHECK_EQ(partial.state(), JwksFetch::State::Idle);
 }
 
+TEST(https_fetch, jwks_dns_cache_owns_answers_until_cap_and_cancel) {
+    signal(SIGPIPE, SIG_IGN);
+    DnsOrigin dns;
+    REQUIRE(dns.init());
+    TlsOrigin origin;
+    origin.responses[0] = lit_str(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        "11\r\n\r\n{\"keys\":[]}");
+    origin.count = 1;
+    REQUIRE(origin.init());
+    RemoteJwks configuration;
+    configuration.endpoint = origin.endpoint();
+    strcpy(configuration.dns_address, "127.0.0.1");
+    strcpy(configuration.allowed_addresses[0], "127.0.0.1");
+    configuration.allowed_count = 1;
+    configuration.dns_port = dns.port;
+    configuration.dns_cache_seconds = 2;
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    const u64 kNow = jwt_monotonic_ms();
+    const auto complete = [&](u64 time) {
+        for (u32 i = 0; i < 1500 && fetch.state() == JwksFetch::State::Busy; ++i) {
+            fetch.advance(time);
+            usleep(1000);
+        }
+        return fetch.state() == JwksFetch::State::Done;
+    };
+    REQUIRE(fetch.start(kNow, 3000));
+    REQUIRE(dns.reply(1, 0));
+    REQUIRE(complete(kNow));
+    fetch.finish_attempt();
+    REQUIRE(fetch.start(kNow + 1999, 3000));
+    CHECK_FALSE(dns.reply(1, 0));
+    REQUIRE(complete(kNow + 1999));
+    fetch.finish_attempt();
+    REQUIRE(fetch.start(kNow + 2000, 3000));
+    REQUIRE(dns.reply(1, 0));
+    REQUIRE(complete(kNow + 2000));
+    fetch.cancel();
+    REQUIRE(fetch.start(kNow + 2001, 3000));
+    REQUIRE(dns.reply(1, 0));
+    REQUIRE(complete(kNow + 2001));
+    fetch.finish_attempt();
+    REQUIRE(fetch.start(kNow + 2000, 3000));
+    REQUIRE(dns.reply(1, 0));
+}
+
 TEST(https_fetch, conditional_jwks_bodyless_profile_is_opt_in) {
     const Str not_modified = lit_str(
         "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n"

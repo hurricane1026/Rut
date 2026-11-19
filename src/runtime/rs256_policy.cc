@@ -335,7 +335,7 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
                     policy.conditional_requests ? &remote->validator : nullptr,
                     jwks_refresh_deadline(remote->last_success, policy.max_age_seconds))) {
                 remote->next_attempt = jwks_refresh_deadline(monotonic_ms, policy.retry_seconds);
-                remote->fetch.cancel();
+                remote->fetch.finish_attempt();
                 continue;
             }
         }
@@ -372,7 +372,7 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
         remote->next_attempt = jwks_refresh_deadline(
             monotonic_ms, succeeded ? policy.refresh_seconds : policy.retry_seconds);
         // Release the borrowed body only after key import/activation completes.
-        remote->fetch.cancel();
+        remote->fetch.finish_attempt();
     }
 }
 

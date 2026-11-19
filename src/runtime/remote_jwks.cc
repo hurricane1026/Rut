@@ -145,6 +145,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_port = static_cast<u16>(value);
             fields |= 4096;
+        } else if (kKey.eq(lit_str("dnsCacheSeconds"))) {
+            if (value > 3600) return false;
+            next.dns_cache_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("refreshSeconds"))) {
             if (value > 3600) return false;
             next.refresh_seconds = static_cast<u32>(value);
@@ -168,7 +171,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
         return false;
-    if (fields & (256 | 512 | 4096)) {
+    if ((fields & (256 | 512 | 4096)) || next.dns_cache_seconds) {
         in_addr resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
             inet_pton(AF_INET, next.dns_address, &resolver) != 1)
@@ -351,6 +354,7 @@ bool jwks_dns_answer(Str packet,
     };
     Record records[kMaxAnswers]{};
     u32 offset = query.len;
+    u32 min_ttl = ~u32{0};
     for (u32 i = 0; i < answers; ++i) {
         auto& record = records[i];
         if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
@@ -361,6 +365,7 @@ bool jwks_dns_answer(Str packet,
             (static_cast<u32>(read16(bytes + offset + 4)) << 16) | read16(bytes + offset + 6);
         const u32 size = read16(bytes + offset + 8);
         if (read16(bytes + offset + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
+        if (ttl < min_ttl) min_ttl = ttl;
         offset += 10;
         if (size > packet.len - offset) return false;
         const u32 end = offset + size;
@@ -406,6 +411,7 @@ bool jwks_dns_answer(Str packet,
             if (alias != answers) return false;
             for (u32 i = 0; i < answers; ++i)
                 if (!records[i].used) return false;
+            selected.ttl_seconds = min_ttl;
             addresses = selected;
             return true;
         }
@@ -429,7 +435,7 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
     initialized_ = true;
     return true;
 }
-void JwksFetch::cancel() {
+void JwksFetch::finish_attempt() {
     if (dns_fd_ >= 0) ::close(dns_fd_);
     dns_fd_ = -1;
     keys_.cancel();
@@ -442,8 +448,17 @@ void JwksFetch::cancel() {
     validator_deadline_ = 0;
     state_ = State::Cancelled;
 }
+void JwksFetch::clear_dns_cache() {
+    cached_addresses_ = {};
+    dns_cached_at_ = 0;
+    dns_cache_deadline_ = 0;
+}
+void JwksFetch::cancel() {
+    finish_attempt();
+    clear_dns_cache();
+}
 bool JwksFetch::fail() {
-    cancel();
+    finish_attempt();
     state_ = State::Failed;
     return false;
 }
@@ -471,8 +486,11 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         sent_validator_ = kTag.len != 0;
     }
     // A synchronous connect error uses the same next-address path as SO_ERROR.
-    return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
-           can_try_next_address(fetch) || fail();
+    if (fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
+        can_try_next_address(fetch))
+        return true;
+    if (fetch.connect_failed()) clear_dns_cache();
+    return fail();
 }
 bool JwksFetch::start(u64 now,
                       u32 timeout_ms,
@@ -480,7 +498,7 @@ bool JwksFetch::start(u64 now,
                       u64 validator_deadline) {
     if (!initialized_ || state_ == State::Busy || !now || !timeout_ms) return false;
     const JwksValidator kSaved = validator ? *validator : JwksValidator{};
-    cancel();
+    finish_attempt();
     if (configuration_.conditional_requests && validator) {
         request_validator_ = kSaved;
         validator_deadline_ = validator_deadline;
@@ -489,6 +507,11 @@ bool JwksFetch::start(u64 now,
     timeout_ = timeout_ms;
     state_ = State::Busy;
     if (!configuration_.dns_address[0]) return begin_http(now);
+    if (cached_addresses_.count && now >= dns_cached_at_ && now < dns_cache_deadline_) {
+        addresses_ = cached_addresses_;
+        return begin_http(now);
+    }
+    clear_dns_cache();
     __builtin_memset(query_, 0, sizeof(query_));
     if (RAND_bytes(query_, 2) != 1) return fail();
     query_[2] = 1;
@@ -523,7 +546,12 @@ bool JwksFetch::start(u64 now,
 }
 void JwksFetch::advance(u64 now) {
     if (state_ != State::Busy) return;
-    if (!now || now < started_ || now - started_ >= timeout_) {
+    if (!now || now < started_ || now < dns_cached_at_) {
+        clear_dns_cache();
+        (void)fail();
+        return;
+    }
+    if (now - started_ >= timeout_) {
         (void)fail();
         return;
     }
@@ -540,6 +568,14 @@ void JwksFetch::advance(u64 now) {
         }
         ::close(dns_fd_);
         dns_fd_ = -1;
+        if (configuration_.dns_cache_seconds) {
+            const u32 kTtl = addresses_.ttl_seconds < configuration_.dns_cache_seconds
+                                 ? addresses_.ttl_seconds
+                                 : configuration_.dns_cache_seconds;
+            cached_addresses_ = addresses_;
+            dns_cached_at_ = now;
+            dns_cache_deadline_ = jwks_refresh_deadline(now, kTtl);
+        }
         (void)begin_http(now);
         return;
     }
@@ -551,6 +587,7 @@ void JwksFetch::advance(u64 now) {
             ++address_index_;
             (void)begin_http(now);
         } else {
+            if (fetch.connect_failed()) clear_dns_cache();
             (void)fail();
         }
         return;
