@@ -29,4 +29,20 @@ route GET "/both" {
     return 204
 }
 
+// KEYCLOAK_AUTHORIZED_PARTY pins the OAuth client that obtained the token.
+route GET "/party" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAuthorizedParty(access, env("KEYCLOAK_AUTHORIZED_PARTY"))
+    return 204
+}
+
+route GET "/either" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireRealmOrClientRole(access, env("KEYCLOAK_REALM_ROLE"),
+        env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"))
+    return 204
+}
+
 route "/" { return 404 }

@@ -25,4 +25,19 @@ route GET "/all" {
     return 204
 }
 
+route GET "/any" {
+    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = casdoor.requireAnyGroup(document, env("CASDOOR_ORG"),
+        env("CASDOOR_GROUP"), env("CASDOOR_SECOND_GROUP"))
+    return 204
+}
+
+// CASDOOR_FORBIDDEN_GROUP vetoes an otherwise permitted group in the same org.
+route GET "/restricted" {
+    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = casdoor.requireGroupWithout(document, env("CASDOOR_ORG"),
+        env("CASDOOR_GROUP"), env("CASDOOR_FORBIDDEN_GROUP"))
+    return 204
+}
+
 route "/" { return 404 }

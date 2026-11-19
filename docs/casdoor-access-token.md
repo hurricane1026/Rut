@@ -73,6 +73,17 @@ names from another source. Both return the unchanged verified document on
 success. Their 403 is authorization denial, while authentication remains the
 verifier's 401.
 
+`requireAnyGroup(document, org, first, second)` accepts either configured
+membership after checking the access-token type and owner. The example exposes
+it at `/any`.
+
+`requireGroupWithout(document, org, allowed, forbidden)` requires a positive
+membership and rejects the configured forbidden group even when the allowed
+group is present. Both comparisons use the same signed array and exact
+organization-qualified names. The example exposes it at `/restricted` and
+takes the forbidden selector from `CASDOOR_FORBIDDEN_GROUP`. Configuring the
+same allowed and forbidden group returns 503.
+
 The native integration tests sign independent RS256 fixtures from the public
 RFC 7515 test key, then load the example through `rut` and remove its source and
 middleware files before requests. They exercise both backends at O0/O2 and

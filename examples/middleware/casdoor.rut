@@ -36,3 +36,20 @@ func requireAllGroups(_ document: Json, _ org: str, _ first: str, _ second: str)
     guard first_matches && second_matches else { respond 403 }
     access
 }
+
+func requireAnyGroup(_ document: Json, _ org: str, _ first: str, _ second: str) -> Json {
+    guard validSelector(org) && validSelector(first) && validSelector(second) else { respond 503 }
+    let access = requireAccessToken(document, org)
+    guard jwtHasGroup(access, org + "/" + first) || jwtHasGroup(access, org + "/" + second) else { respond 403 }
+    access
+}
+
+// A positive match also validates the complete signed group array.
+func requireGroupWithout(_ document: Json, _ org: str, _ allowed: str, _ forbidden: str) -> Json {
+    guard validSelector(org) && validSelector(allowed) && validSelector(forbidden) &&
+        allowed != forbidden else { respond 503 }
+    let access = requireAccessToken(document, org)
+    guard jwtHasGroup(access, org + "/" + allowed) &&
+        !jwtHasGroup(access, org + "/" + forbidden) else { respond 403 }
+    access
+}
