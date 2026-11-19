@@ -1577,9 +1577,20 @@ reuse. Each shard tracks consecutive probe outcomes per target. The optional
 default independently to 1. Each completed probe resets the opposite streak.
 An active verdict changes when its threshold is reached. Business connections
 do not progress these streaks, and config replacement clears them. All-ejected
-fail-open behavior remains the selection contract. HTTPS and gRPC health
-protocols remain absent. Native artifact version 21 records the threshold
-fields in the upstream configuration. See [scope and tests](docs/kong-active-health.md).
+fail-open remains the default selection contract. HTTPS and gRPC health
+protocols remain absent. See [scope and tests](docs/kong-active-health.md).
+
+An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
+threshold requires the sum of healthy enabled weights, multiplied by 100, to
+meet or exceed the total enabled weight multiplied by the percentage. Active
+and passive ejections both count. Retry exclusions affect target selection
+while leaving the capacity calculation unchanged. New forwarding and direct
+connects return 503 when capacity is insufficient. A retry that cannot select
+another target follows the previous failure path. Retired configurations can
+drain established requests. A current target with an enabled threshold ignores
+late connect results from a retired configuration. The default of 0 preserves
+fail-open selection and the existing handling of passive results.
+Native artifact version 22 records the minimum healthy weight percentage.
 
 The compiler contract is:
 
@@ -1618,8 +1629,8 @@ Selection state follows the same ownership boundary:
   State remains shard-owned and configuration lifetimes follow existing RCU.
 
 Both algorithms skip actively or passively ejected endpoints when at least one
-healthy endpoint exists. When all endpoints are ejected, they consider the full
-set, preserving the runtime's existing fail-open behavior. Empty backend sets
+healthy endpoint exists. With the default capacity threshold, they consider all
+enabled endpoints when none are healthy. Empty backend sets
 are rejected by configuration admission. Least-request ties rotate using that
 forward site's cursor. One attempt is counted from upstream dispatch through
 completion or failure, including connect time; a failed attempt releases its

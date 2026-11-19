@@ -568,6 +568,16 @@ old results, including reuse of a configuration address. Existing all-ejected
 fail-open selection remains unchanged. HTTPS and HTTP/2/gRPC probes are absent.
 See [active-health scope and verification](kong-active-health.md).
 
+An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
+healthy share of its configured weight. The field accepts integers from 0
+through 100. The default, 0, keeps fail-open selection. A positive value counts
+only enabled targets and uses both active and passive health. A request's retry
+history leaves the percentage unchanged, but selection skips targets already
+tried. When the healthy share falls below the threshold, new forwarding and
+explicit `wait(upstream(api).connect())` requests receive 503. A retry that
+cannot select another target retains its earlier failure result. Health verdicts
+start fresh on each shard after a configuration reload.
+
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

@@ -552,6 +552,9 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
         if (ref.count > RouteConfig::kMaxHeadersPerSet) return false;
     }
 
+    for (u32 i = 0; i < mod.upstream_count; ++i)
+        if (mod.upstreams[i].minimum_healthy_weight_percent > 100) return false;
+
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
     // into the declaration order (0 = first `upstream` decl, 1 = second,
     // …). `RouteConfig::upstreams` is also declaration-order (add_upstream
@@ -594,6 +597,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && up.hc_enabled)) return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -645,6 +649,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && up.hc_enabled)) return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

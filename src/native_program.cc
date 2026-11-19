@@ -559,6 +559,8 @@ bool load_native_program(const char* source,
         const auto& target = c.upstreams[i];
         if (target.addr_count == 0 || target.addr_count > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream backend count");
+        if (target.minimum_healthy_weight_percent > 100)
+            return fail("invalid native upstream healthy weight percent");
         if (target.hc_enabled && !target.hc_thresholds.valid())
             return fail("invalid native upstream health thresholds");
     }

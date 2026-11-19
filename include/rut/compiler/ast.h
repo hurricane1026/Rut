@@ -385,6 +385,7 @@ struct AstUpstreamDecl {
     static constexpr u32 kMaxBackends = 8;
     u32 backend_count = 0;  // 0 → single-address form via host_lit/port_lit
     Str backend_lits[kMaxBackends]{};
+    u8 minimum_healthy_weight_percent = 0;
     u32 weight_count = 0;
     u16 backend_weights[kMaxBackends]{};
 

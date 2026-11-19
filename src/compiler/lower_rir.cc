@@ -4324,6 +4324,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
         out.module.upstreams[i].hc_thresholds = mir.upstreams[i].hc_thresholds;
+        out.module.upstreams[i].minimum_healthy_weight_percent =
+            mir.upstreams[i].minimum_healthy_weight_percent;
         out.module.upstreams[i].weight_count = mir.upstreams[i].weight_count;
         for (u32 b = 0; b < mir.upstreams[i].weight_count; ++b)
             out.module.upstreams[i].backend_weights[b] = mir.upstreams[i].backend_weights[b];

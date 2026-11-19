@@ -3828,6 +3828,7 @@ TEST(native_program, active_health_thresholds_survive_native_activation) {
     REQUIRE(source.append(R"rut(
 upstream api {
     backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
+    minimum_healthy_weight_percent: 50
     health_check: { path: "/healthz", interval: 2s, failure_threshold: 3, success_threshold: 2 }
 }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
@@ -3840,6 +3841,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     const auto& config = owner.p->config;
     REQUIRE_EQ(config.upstream_count, 1u);
     const auto& target = config.upstreams[0];
+    CHECK_EQ(target.minimum_healthy_weight_percent, 50u);
     CHECK(target.hc_enabled);
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK_EQ(target.hc_thresholds.failures, 3u);
