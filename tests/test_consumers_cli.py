@@ -105,6 +105,13 @@ def test_deployment_policy(tool, root):
     check({active: 0}, records=[], ok=True)
     for invalid in (65, True, '1'):
         check({active: invalid}, rule=active)
+    each_active = 'requireActiveCredentialForEnabledConsumers'
+    check({each_active: True}, ok=True)
+    enabled_owner = dict(disabled, enabled=True)
+    check({each_active: True}, consumers=[alice, enabled_owner], rule=each_active)
+    check({each_active: True}, consumers=[alice, enabled_owner],
+          records=[key, dict(parked, consumerId='disabled', enabled=True, groups=[])], ok=True)
+    check({each_active: True}, now=200, rule=each_active)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
