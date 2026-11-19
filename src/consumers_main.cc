@@ -843,6 +843,16 @@ bool policy_each_consumer_active(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+bool policy_consumer_groups(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        const u32 groups = field(doc, consumer, lit_str("groups"));
+        if (policy_enabled(doc, consumer) && doc.nodes[groups].child == json::kNone) return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
@@ -851,6 +861,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},
     {lit_str("minimumActiveCredentials"), false, policy_minimum_active},
     {lit_str("requireActiveCredentialForEnabledConsumers"), true, policy_each_consumer_active},
+    {lit_str("requireGroupsForEnabledConsumers"), true, policy_consumer_groups},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
