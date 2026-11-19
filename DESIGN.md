@@ -8559,8 +8559,8 @@ Latency histogram uses log-scale buckets:
 ### 13.6 Access Log
 
 Access logging is a process-start sink, separate from application logging.
-The legacy CLI flusher remains unchanged. A main-source `accessLog` declaration
-selects the reliable per-record SourceLive publisher:
+A main-source `accessLog` declaration selects the reliable per-record SourceLive
+publisher:
 
 ```rut
 accessLog { path: "/var/log/rut/host.log", format: downstreamHost, publication: live }
@@ -8587,6 +8587,15 @@ The reliable SourceLive path uses one SPSC ring per shard and a process-owned
 writer thread. Publication remains bounded and allocates no memory on request
 completion. The legacy CLI flusher and its existing text format remain a
 separate compatibility mode.
+
+With legacy `--access-log PATH`, `--access-log-path-only` opts into recording the
+encoded path through the first literal `?`, excluding the delimiter and query.
+The producer validates the original target and its provenance before deriving
+that path. It copies only the path into the owned strict H1 or admitted H2 gRPC
+snapshot. The existing 128-byte complete-target bound and over-limit marker
+apply to the resulting path. Default and SourceLive profiles retain their
+existing behavior. Ordinary H2 target availability also stays unchanged.
+Neither forwarding nor request authentication uses this log snapshot.
 
 ### 13.7 Internal Endpoints
 
@@ -11234,8 +11243,9 @@ request bytes remain available to the handler. One example rebuilds a
 fixed-endpoint HTTPS form POST from sanitized fields and authenticated identity.
 The query forwarding example joins the original path-only view to the remaining
 query fields and uses the existing owned `set_path` effect. It records request
-lengths through the source `downstreamRequestBytes` log profile. Form-body
-rewriting and legacy target log redaction are outside this profile. See
+lengths through the source `downstreamRequestBytes` log profile. Deployments
+using legacy access logs can opt into `--access-log-path-only`. Form-body
+rewriting remains separate. See
 [the contract](docs/consumer-registry.md#explicit-query-and-form-credentials).
 
 `JwksFetch` publishes initialized state only after both HTTPS contexts initialize.

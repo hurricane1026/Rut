@@ -1744,7 +1744,7 @@ struct ConnectionBase {
     // Called exactly once at request start when the owning loop has access
     // logging enabled. checked_raw_request_target() performs every provenance
     // and range gate before any target byte is copied here.
-    void capture_access_log_target_snapshot() {
+    void capture_access_log_target_snapshot(bool path_only = false) {
         clear_access_log_target_snapshot();
         const u32 episode = req_metadata_episode;
         const RawRequestTargetWitnessResult witness = checked_raw_request_target();
@@ -1752,14 +1752,17 @@ struct ConnectionBase {
             if (witness.target.len == 0 ||
                 witness.target.len > kAccessLogObservedStrictH1TargetMax) {
                 access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
-            } else if (witness.target.len > kAccessLogCompleteTargetMax) {
-                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
-                access_log_target_snapshot.target_state = AccessLogTargetState::OverLimit;
             } else {
-                for (u32 i = 0; i < witness.target.len; i++)
-                    access_log_target_snapshot.path[i] = witness.target.ptr[i];
-                access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
-                access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+                const Str kTarget =
+                    path_only ? access_log_target_path_prefix(witness.target) : witness.target;
+                access_log_target_snapshot.target_length = static_cast<u16>(kTarget.len);
+                if (kTarget.len > kAccessLogCompleteTargetMax) {
+                    access_log_target_snapshot.target_state = AccessLogTargetState::OverLimit;
+                } else {
+                    for (u32 i = 0; i < kTarget.len; i++)
+                        access_log_target_snapshot.path[i] = kTarget.ptr[i];
+                    access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+                }
             }
         } else if (witness.state == RawRequestTargetWitnessState::Neutral) {
             access_log_target_snapshot.target_state = AccessLogTargetState::Unavailable;

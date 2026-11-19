@@ -198,6 +198,14 @@ TEST(access_log_entry, exact_public_layout_and_constants) {
     CHECK_EQ(sizeof(AccessLogRing), 98432u);
 }
 
+TEST(access_log_ring, init_restores_default_target_mode) {
+    AccessLogRing ring{};
+    ring.init(true);
+    CHECK(ring.path_only);
+    ring.init();
+    CHECK_FALSE(ring.path_only);
+}
+
 TEST(access_log_downstream_host, pinned_schema_and_owned_capture_states) {
     CHECK_EQ(kAccessLogDownstreamHostMax, 128u);
     CHECK_EQ(kAccessLogDownstreamHostRecordSchema, 1u);

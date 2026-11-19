@@ -407,7 +407,8 @@ static bool write_with_poll(
 
 // --- AccessLogFlusher ---
 
-void AccessLogRing::init() {
+void AccessLogRing::init(bool capture_path_only) {
+    path_only = capture_path_only;
     write_pos = 0;
     read_pos = 0;
 }

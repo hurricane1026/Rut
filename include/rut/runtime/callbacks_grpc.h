@@ -141,16 +141,22 @@ inline u32 h2_websocket_error(u8* out, u32 cap, u32 sid, u8 failure, bool starte
     return http2_write_headers(out, cap, sid, &kHeader, 1, true);
 }
 
-inline void grpc_log_target(AccessLogEntry& entry, Str path) {
+inline void grpc_log_target(AccessLogEntry& entry, Str path, bool path_only = false) {
+    bool valid = path.ptr && path.len && path.ptr[0] == '/' &&
+                 path.len <= kAccessLogObservedStrictH1TargetMax;
+    for (u32 j = 0; valid && j < path.len; ++j) {
+        const u8 kByte = static_cast<u8>(path.ptr[j]);
+        valid = kByte > 32 && kByte != 127;
+    }
+    if (!valid) {
+        entry.target_state = AccessLogTargetState::Invalid;
+        entry.target_length = path_only ? 0u : static_cast<u16>(path.len);
+        return;
+    }
+    if (path_only) path = access_log_target_path_prefix(path);
     entry.target_length = static_cast<u16>(path.len);
     entry.target_state = path.len > kAccessLogCompleteTargetMax ? AccessLogTargetState::OverLimit
                                                                 : AccessLogTargetState::Complete;
-    if (!path.len || path.ptr[0] != '/' || path.len > kAccessLogObservedStrictH1TargetMax)
-        entry.target_state = AccessLogTargetState::Invalid;
-    for (u32 j = 0; j < path.len; j++) {
-        const u8 kByte = static_cast<u8>(path.ptr[j]);
-        if (kByte <= 32 || kByte == 127) entry.target_state = AccessLogTargetState::Invalid;
-    }
     if (entry.target_state == AccessLogTargetState::Complete)
         __builtin_memcpy(entry.path, path.ptr, path.len);
 }
@@ -1338,7 +1344,7 @@ bool grpc_start_impl(Loop* loop,
     for (u32 i = 0; i < nh; i++) {
         if (!hs[i].name.eq({":path", 5})) continue;
         const Str kPath = hs[i].value;
-        grpc_log_target(entry, kPath);
+        grpc_log_target(entry, kPath, loop->access_log && loop->access_log->path_only);
         break;
     }
     for (u32 i = 0; i + 1 < sizeof(entry.upstream) && i < sizeof(target.name); i++) {

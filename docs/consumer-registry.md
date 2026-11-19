@@ -171,13 +171,17 @@ method and body intact.
 
 The example selects the `downstreamRequestBytes` access-log format, which
 records lengths without targets. `downstreamHost` also omits the target.
-The legacy `--access-log` format can record the original request target.
-Avoid that format, custom raw-target logging and unredacted captures on
-routes that authenticate query credentials. This profile covers configured
-query fields. For form credentials use the explicitly rebuilt callout above.
+For a legacy CLI sink, run `--access-log PATH --access-log-path-only` to omit
+the entire query before recording the original encoded path. This process-wide
+option also covers requests denied by authentication or group policy. It
+affects only the log. Forwarding still needs the explicit target replacement
+above. Keep query credentials out of custom raw-target logging and captures.
+For form credentials use the explicitly rebuilt callout above.
 
 Native H1/H2 fixtures read the exact upstream request and inspect the
 target-free access log on epoll and io_uring at O0 and O2.
+The legacy CLI fixture verifies plain and compressed path-only logs on both
+backends.
 
 ## Lifecycle and publication
 

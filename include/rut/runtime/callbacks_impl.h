@@ -2827,7 +2827,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_response_accounting();
     capture_request_metadata(conn);
     if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
-        conn.capture_access_log_target_snapshot();
+        conn.capture_access_log_target_snapshot(loop->access_log && loop->access_log->path_only);
     if (loop->live_access_log != nullptr && loop->live_access_log->captures_downstream_host()) {
         capture_access_log_downstream_host_snapshot(conn.access_log_downstream_host_snapshot,
                                                     conn.req_metadata_episode,

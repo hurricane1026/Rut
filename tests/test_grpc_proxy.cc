@@ -938,7 +938,8 @@ struct Client {
                 bool end,
                 const char* timeout = nullptr,
                 bool jit_forward = false,
-                bool jit_timer_forward = false) {
+                bool jit_timer_forward = false,
+                const char* path_override = nullptr) {
         rpcs[index].size = bytes;
         rpcs[index].end = end;
         static thread_local char content_length[16];
@@ -946,9 +947,10 @@ struct Client {
                                  nv(":scheme", "http"),
                                  nv(":authority", "grpc.test"),
                                  nv(":path",
-                                    jit_timer_forward ? "/jitwait.Echo/Call"
-                                    : jit_forward     ? "/jit.Echo/Call"
-                                                      : "/test.Echo/Call"),
+                                    path_override       ? path_override
+                                    : jit_timer_forward ? "/jitwait.Echo/Call"
+                                    : jit_forward       ? "/jit.Echo/Call"
+                                                        : "/test.Echo/Call"),
                                  nv("content-type", "application/grpc+proto"),
                                  nv("te", "trailers"),
                                  nv("grpc-timeout", timeout ? timeout : "1H")};
@@ -4855,6 +4857,98 @@ TEST(grpc_proxy, log_target_snapshot_and_bounds) {
     CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
     grpc_log_target(entry, {});
     CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+}
+
+TEST(grpc_proxy, path_only_log_validates_the_complete_target_before_redaction) {
+    AccessLogEntry entry{};
+    const Str target = lit_str("/service%3F/Method?private=not-logged");
+    grpc_log_target(entry, target, true);
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Complete);
+    CHECK((Str{entry.path, entry.target_length}.eq(lit_str("/service%3F/Method"))));
+    CHECK(memchr(entry.path, '?', sizeof(entry.path)) == nullptr);
+
+    entry = {};
+    const std::string long_query = "/service/Method?private=" + std::string(256, 'q');
+    grpc_log_target(entry, {long_query.data(), static_cast<u32>(long_query.size())}, true);
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Complete);
+    CHECK((Str{entry.path, entry.target_length}.eq(lit_str("/service/Method"))));
+
+    entry = {};
+    std::string long_path(129u, 'p');
+    long_path[0] = '/';
+    long_path += "?private=fixture";
+    grpc_log_target(entry, {long_path.data(), static_cast<u32>(long_path.size())}, true);
+    CHECK_EQ(entry.target_state, AccessLogTargetState::OverLimit);
+    CHECK_EQ(entry.target_length, 129u);
+    CHECK_EQ(entry.path[0], '\0');
+
+    entry = {};
+    grpc_log_target(entry, lit_str("/service/Method?invalid=\n"), true);
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+    CHECK_EQ(entry.target_length, 0u);
+    CHECK_EQ(entry.path[0], '\0');
+    grpc_log_target(entry, {nullptr, 7}, true);
+    CHECK_EQ(entry.target_state, AccessLogTargetState::Invalid);
+    CHECK_EQ(entry.target_length, 0u);
+}
+
+template <typename Loop>
+static void grpc_path_only_log_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log(true).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
+    cfg.upstreams[0].http2 = true;
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1).has_value());
+    {
+        Client client;
+        const bool connected = client.init(get_port(lfd));
+        CHECK(connected);
+        if (connected) {
+            CHECK_EQ(
+                client.request(
+                    0, 32, true, nullptr, false, false, "/test.Echo/Call?private=fixture-secret"),
+                1);
+            CHECK(client.until(0, true));
+            CHECK(client.rpcs[0].ok);
+        }
+    }
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    CHECK_EQ(server->requests.load(), 1u);
+    AccessLogEntry entry{};
+    if (shard->log_ring->pop(entry)) {
+        CHECK_EQ(entry.target_state, AccessLogTargetState::Complete);
+        CHECK((Str{entry.path, entry.target_length}.eq(lit_str("/test.Echo/Call"))));
+        CHECK(memchr(entry.path, '?', sizeof(entry.path)) == nullptr);
+        CHECK_EQ(entry.grpc_status_plus_one, 1u);
+    } else {
+        CHECK(false);
+    }
+    CHECK_EQ(shard->log_ring->available(), 0u);
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, path_only_legacy_log_epoll) {
+    grpc_path_only_log_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, path_only_legacy_log_iouring) {
+    grpc_path_only_log_case<IoUringEventLoop>(_tc);
 }
 
 TEST(grpc_proxy, log_overflow_does_not_duplicate_or_lose_rpc_accounting) {

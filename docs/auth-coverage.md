@@ -14,7 +14,7 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion, separate key/verifier provisioning and constrained rotation preserving owner/groups/windows in validated private outputs, and an opt-in sanitized forwarding target for query credentials | Online administrative registry APIs, online scheduling/revocation, transparent form-body mutation and legacy target log redaction; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
+| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion, separate key/verifier provisioning and constrained rotation preserving owner/groups/windows in validated private outputs, an opt-in sanitized forwarding target for query credentials, and opt-in legacy access logs without queries | Online administrative registry APIs, online scheduling/revocation and transparent form-body mutation; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
@@ -1637,8 +1637,8 @@ JIT tests also cover the 1024/1025-byte bound. See
   preserves expired windows, and uses private key-first/snapshot-second publication.
   Diff validates both private inputs before output, omits key fields and reports
   only metadata plus key-material/representation booleans. It creates no files.
-  Neither command publishes configuration. Online management APIs, transparent
-  form-body mutation and legacy target log redaction remain open under #1072.
+  Neither command publishes configuration. Online management APIs and
+  transparent form-body mutation remain open under #1072.
 - [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
   Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
   and gateway-restart retention. The opt-in local-AOF profile adds a confirmed
@@ -1661,8 +1661,10 @@ The returned `remaining` content removes the selected credential. The executable
 fixed-HTTPS form adapter rebuilds an outbound request. The query forwarding
 example passes an explicitly sanitized target to the existing owned forward
 effect. Both examples verify upstream redaction on native H1/H2 and both Linux
-backends. The original request remains available to the handler. Legacy target
-logs and transparent form-body mutation remain outside this profile.
+backends. The original request remains available to the handler. The
+`--access-log-path-only` legacy CLI option omits queries before target capture
+on strict H1 and admitted H2 gRPC, including denied strict H1 requests.
+Transparent form-body mutation remains outside this profile.
 See [the precise input/redaction bounds](consumer-registry.md#explicit-query-and-form-credentials).
 `consumerAuthenticateMtls(configuration)` maps the existing verified TLS peer
 fingerprint to a Consumer record in the bounded registry. `mtls` records require

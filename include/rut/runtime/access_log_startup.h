@@ -19,6 +19,8 @@ enum class AccessLogStartupResolutionError : u8 {
     ConflictingCliCompression,
     ConflictingCliLevel,
     ConflictingEnvironmentCompression,
+    CliPathOnlyRequiresLegacyLog,
+    ConflictingCliPathOnly,
 };
 
 struct AccessLogStartupInputs {
@@ -30,6 +32,7 @@ struct AccessLogStartupInputs {
     bool cli_level_present = false;
     i32 cli_level = 0;
     bool environment_compression_present = false;
+    bool cli_path_only = false;
 };
 
 struct AccessLogStartupResolution {
@@ -38,6 +41,7 @@ struct AccessLogStartupResolution {
     // controls. The caller must retain argv for the process lifetime.
     const char* legacy_path = nullptr;
     bool legacy_compression = false;
+    bool legacy_path_only = false;
     i32 legacy_level = 0;
     // SourceLive is an owned copy and never borrows parser, loader, or input
     // storage. It is not a publisher; #366 must consume it later.

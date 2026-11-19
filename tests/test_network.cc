@@ -30754,6 +30754,63 @@ TEST(access_log_snapshot, bounded_capture_is_owned_and_access_disabled_does_not_
              AccessLogTargetState::LegacyNullTerminated);
 }
 
+TEST(access_log_snapshot, path_only_preserves_encoded_path_and_applies_bound_after_split) {
+    auto connection = std::make_unique<Connection>();
+    auto storage = std::make_unique<u8[]>(SlicePool::kSliceSize);
+    Connection& conn = *connection;
+    const std::string path = "/users//raw%3F";
+    const std::string suffixes[] = {"", "?", "?a=b?other", "?" + std::string(1024, 'q')};
+    for (const auto& suffix : suffixes) {
+        const std::string target = path + suffix;
+        REQUIRE(
+            load_access_log_snapshot_request(conn, storage.get(), SlicePool::kSliceSize, target));
+        conn.capture_access_log_target_snapshot(true);
+        const auto& snapshot = conn.access_log_target_snapshot;
+        CHECK_EQ(snapshot.target_state, AccessLogTargetState::Complete);
+        CHECK_EQ(std::string(snapshot.path, snapshot.target_length), path);
+        CHECK(conn.checked_raw_request_target().target.eq(
+            {target.data(), static_cast<u32>(target.size())}));
+    }
+    for (const u32 length : {127u, 128u, 129u}) {
+        std::string long_path(length, 'p');
+        long_path[0] = '/';
+        REQUIRE(load_access_log_snapshot_request(
+            conn, storage.get(), SlicePool::kSliceSize, long_path + "?private=fixture"));
+        conn.capture_access_log_target_snapshot(true);
+        const auto& snapshot = conn.access_log_target_snapshot;
+        CHECK_EQ(snapshot.target_length, length);
+        if (length <= kAccessLogCompleteTargetMax) {
+            CHECK_EQ(snapshot.target_state, AccessLogTargetState::Complete);
+            CHECK_EQ(std::string(snapshot.path, snapshot.target_length), long_path);
+        } else {
+            CHECK_EQ(snapshot.target_state, AccessLogTargetState::OverLimit);
+            CHECK_EQ(snapshot.path[0], '\0');
+        }
+    }
+
+    ++conn.req_raw_target_episode;
+    conn.capture_access_log_target_snapshot(true);
+    CHECK_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::Invalid);
+    CHECK_EQ(conn.access_log_target_snapshot.target_length, 0u);
+    conn.clear_raw_request_target_witness();
+    conn.capture_access_log_target_snapshot(true);
+    CHECK_EQ(conn.access_log_target_snapshot.target_state, AccessLogTargetState::Unavailable);
+
+    const char* unsupported[] = {
+        "http://example.invalid/path?private=fixture", "example.invalid:80", "*"};
+    for (const char* target : unsupported) {
+        CHECK_FALSE(
+            load_access_log_snapshot_request(conn, storage.get(), SlicePool::kSliceSize, target));
+        conn.capture_access_log_target_snapshot();
+        const auto expected = conn.access_log_target_snapshot.target_state;
+        CHECK(expected == AccessLogTargetState::Invalid ||
+              expected == AccessLogTargetState::Unavailable);
+        conn.capture_access_log_target_snapshot(true);
+        CHECK_EQ(conn.access_log_target_snapshot.target_state, expected);
+        CHECK_EQ(conn.access_log_target_snapshot.target_length, 0u);
+    }
+}
+
 TEST(access_log_snapshot, completion_publication_is_explicit_episode_owned_and_one_shot) {
     SmallLoop loop;
     loop.setup();
