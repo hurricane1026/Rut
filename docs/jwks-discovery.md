@@ -8,7 +8,8 @@ remain supported. New fields are all trusted compile/load-time configuration:
 {
   "address": "192.0.2.10", "port": 443, "serverName": "issuer.example",
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
-  "refreshSeconds": 30, "retrySeconds": 5, "maxAgeSeconds": 120, "timeoutSeconds": 10,
+  "refreshSeconds": 30, "retrySeconds": 5, "maxRetryAfterSeconds": 30,
+  "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "conditionalRequests": true,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
@@ -33,6 +34,16 @@ Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
 renew last-success time; requests fail closed after the original maximum age
 while maintenance continues its bounded retry cadence. The attempt's total
 `timeoutSeconds` deadline still begins at attempt start and spans all stages.
+
+Optional `maxRetryAfterSeconds` (integer 1–3600) permits the authenticated key
+endpoint to delay retries after HTTP 429 or 503. A fully framed response can
+supply one canonical decimal delay in seconds within the unsigned 32-bit range.
+The gateway caps that delay at `maxRetryAfterSeconds` and waits the greater of
+the resulting hint and its local retry interval, measured from completion.
+Absent, duplicate, malformed, overflowing and HTTP-date values use the local
+interval. Discovery and successful key responses ignore this header. These
+throttle responses are failures and do not update the keys, validators or
+last-success time.
 
 `dnsAddress` and a nonempty `allowedAddresses` list must appear together. Resolver
 and allowed destinations are IPv4 literals; at most eight destination addresses

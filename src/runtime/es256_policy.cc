@@ -362,8 +362,10 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
                 }
             }
         }
-        remote->next_attempt = jwks_refresh_deadline(
-            monotonic_ms, succeeded ? policy.refresh_seconds : policy.retry_seconds);
+        const u32 kHint = remote->fetch.retry_after_seconds();
+        const u32 kRetry = kHint > policy.retry_seconds ? kHint : policy.retry_seconds;
+        remote->next_attempt =
+            jwks_refresh_deadline(monotonic_ms, succeeded ? policy.refresh_seconds : kRetry);
         // Release the borrowed body only after key import/activation completes.
         remote->fetch.finish_attempt();
     }

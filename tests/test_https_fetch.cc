@@ -1483,7 +1483,7 @@ TEST(https_fetch, conditional_jwks_bodyless_profile_is_opt_in) {
         "Content-Length: 100000\r\n\r\n");
     BoundedJsonResponse normal, authorization, conditional;
     authorization.reset(true);
-    conditional.reset_conditional_jwks();
+    conditional.reset_jwks(true);
     CHECK(normal.append(not_modified) == BoundedJsonResponse::Result::Error);
     CHECK(authorization.append(not_modified) == BoundedJsonResponse::Result::Error);
     CHECK(conditional.append(not_modified) == BoundedJsonResponse::Result::Complete);
@@ -1496,10 +1496,10 @@ TEST(https_fetch, conditional_jwks_bodyless_profile_is_opt_in) {
         lit_str("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
         lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n")};
     for (Str message : invalid) {
-        conditional.reset_conditional_jwks();
+        conditional.reset_jwks(true);
         CHECK(conditional.append(message) == BoundedJsonResponse::Result::Error);
     }
-    conditional.reset_conditional_jwks();
+    conditional.reset_jwks(true);
     CHECK(conditional.append(lit_str("HTTP/1.1 304 Not Modified\r\n\r\n")) ==
           BoundedJsonResponse::Result::Complete);
     conditional.reset();

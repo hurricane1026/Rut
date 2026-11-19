@@ -2622,6 +2622,9 @@ Successful refreshes (including valid empty sets) wait `refreshSeconds` from
 completion; all failed attempts wait `retrySeconds` from failure completion.
 Slow failures therefore wait the full delay after timeout. Retry never extends
 maximum key age and can exceed it; there is no jitter or exponential backoff.
+Optional `maxRetryAfterSeconds` (1–3600) allows one bounded decimal
+`Retry-After` on authenticated key HTTP 429 and 503 responses. This can delay
+the next maintenance attempt without renewing the cache.
 Address, server name, CA path and request path are owned, bounded strings with no
 embedded
 NUL; paths start with `/` and cannot contain whitespace, controls, fragments or

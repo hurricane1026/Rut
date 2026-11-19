@@ -56,6 +56,7 @@ void BoundedJsonResponse::reset(bool authorization) {
     authorization_ = authorization;
     callout_ = false;
     conditional_jwks_ = false;
+    retry_after_jwks_ = false;
     status_ = 0;
     wire_len_ = body_len_ = offset_ = expected_ = 0;
     headers_ = chunked_ = sized_ = false;
@@ -66,9 +67,10 @@ void BoundedJsonResponse::reset_callout() {
     reset(true);
     callout_ = true;
 }
-void BoundedJsonResponse::reset_conditional_jwks() {
+void BoundedJsonResponse::reset_jwks(bool conditional, bool retry_after) {
     reset();
-    conditional_jwks_ = true;
+    conditional_jwks_ = conditional;
+    retry_after_jwks_ = retry_after;
 }
 
 bool strong_etag_valid(Str value) {
@@ -99,9 +101,11 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         if (kStatus == ParseStatus::Error) return Result::Error;
         if (kStatus == ParseStatus::Incomplete)
             return wire_len_ >= 8192 ? Result::Error : Result::More;
-        if (parser.header_end > 8192 ||
-            (!authorization_ && response.status_code != 200 &&
-             !(conditional_jwks_ && response.status_code == 304)) ||
+        const bool kNotModified = conditional_jwks_ && response.status_code == 304;
+        const bool kThrottled =
+            retry_after_jwks_ && (response.status_code == 429 || response.status_code == 503);
+        const bool kNeedsJson = !authorization_ && !kNotModified && !kThrottled;
+        if (parser.header_end > 8192 || (kNeedsJson && response.status_code != 200) ||
             (callout_ && (response.status_code < 200 || response.status_code > 599)) ||
             (authorization_ && !callout_ && response.status_code != 200 &&
              response.status_code != 401 && response.status_code != 403) ||
@@ -130,15 +134,12 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                        (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
                     --end;
                 const Str kType{header.value.ptr, end};
-                if (!authorization_ && !(conditional_jwks_ && response.status_code == 304) &&
-                    !equal_ci(kType, lit_str("application/json")) &&
+                if (kNeedsJson && !equal_ci(kType, lit_str("application/json")) &&
                     !equal_ci(kType, lit_str("application/jwk-set+json")))
                     return Result::Error;
             }
         }
-        if ((!authorization_ && !(conditional_jwks_ && response.status_code == 304) &&
-             type_count != 1) ||
-            (transfer_count && response.has_content_length))
+        if ((kNeedsJson && type_count != 1) || (transfer_count && response.has_content_length))
             return Result::Error;
         status_ = response.status_code;
         headers_ = true;
@@ -244,10 +245,11 @@ void HttpsFetch::cancel() {
     response_.reset();
     state_ = State::Cancelled;
 }
-bool HttpsFetch::init(const HttpsEndpoint& endpoint) {
+bool HttpsFetch::init(const HttpsEndpoint& endpoint, bool retry_after_jwks) {
     if (context_.ssl_ctx || !endpoint.valid()) return false;
     if (!init_tls_client_context(context_, endpoint.tls)) return false;
     endpoint_ = endpoint;
+    retry_after_jwks_ = retry_after_jwks;
     if (!prepare_jwks_request({})) {
         destroy_tls_client_context(context_);
         return false;
@@ -311,7 +313,8 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     close();
     response_.reset(authorization_);
     if (callout_) response_.reset_callout();
-    if (conditional_jwks_) response_.reset_conditional_jwks();
+    if (conditional_jwks_ || retry_after_jwks_)
+        response_.reset_jwks(conditional_jwks_, retry_after_jwks_);
     started_ = monotonic_ms;
     timeout_ms_ = timeout_ms;
     sent_ = 0;

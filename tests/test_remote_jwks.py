@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--access-profile", action="store_true")
     parser.add_argument("--conditional", action="store_true")
     parser.add_argument("--dns-cache", action="store_true")
+    parser.add_argument("--retry-after", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -42,6 +43,7 @@ def main():
              "discovery": "valid", "dns": "valid",
              "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
              "conditionalRequests": [], "discoveries": [], "discoveryDelay": 0}
+    state["retryAfter"] = () if args.retry_after else ("30",)
     cold_release = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -76,6 +78,7 @@ def main():
                 state["locals"].append(self.connection.getsockname()[0])
                 status, body, hold = state["status"], state["body"], state["hold"]
                 delay = state["delay"]
+                retry_after = state["retryAfter"]
                 state["attempts"].append((time.monotonic(), status, delay))
                 tags = []
                 if args.conditional:
@@ -112,6 +115,8 @@ def main():
                     self.send_header("Content-Type", "application/jwk-set+json")
                 for tag in tags:
                     self.send_header("ETag", tag)
+                for value in retry_after:
+                    self.send_header("Retry-After", value)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -191,6 +196,8 @@ def main():
         retry_profile = not args.discovery_dns and not args.access_profile and not args.conditional
         if retry_profile:
             policy["remoteJwks"].update(retrySeconds=2, timeoutSeconds=2)
+        if args.retry_after:
+            policy["remoteJwks"].update(retrySeconds=1, maxRetryAfterSeconds=3)
         if args.discovery_dns:
             # Reserve the allowlisted first address without listening on it.
             refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -329,7 +336,32 @@ def main():
                     time.sleep(0.01)
                 raise AssertionError(f"JWKS request did not reach {target}; seen {state['locals']}")
 
-            if args.dns_cache:
+            if args.retry_after:
+                def delay_for(status, headers, expected, limit):
+                    with lock:
+                        begin = len(state["attempts"])
+                        state.update(status=status, retryAfter=headers)
+                    deadline = time.monotonic() + limit
+                    while time.monotonic() < deadline:
+                        with lock:
+                            times = [at for at, code, _ in state["attempts"][begin:]
+                                     if code == status]
+                        if len(times) >= 2:
+                            assert times[1] - times[0] >= expected - .15, times
+                            return
+                        time.sleep(.02)
+                    raise AssertionError(f"did not observe two HTTP {status} attempts")
+
+                wait_status(fixture["a"], 200)
+                delay_for(503, ("30",), 3, 5.5)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                delay_for(429, ("30", "30"), 1, 5.5)
+                delay_for(503, ("0",), 1, 3)
+                delay_for(429, ("2",), 2, 4.5)
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+            elif args.dns_cache:
                 wait_status(fixture["a"], 200)
                 with lock:
                     initial_dns = state["dnsRequests"]

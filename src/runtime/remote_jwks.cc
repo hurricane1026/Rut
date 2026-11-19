@@ -155,6 +155,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         } else if (kKey.eq(lit_str("retrySeconds"))) {
             if (value > 3600) return false;
             next.retry_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("maxRetryAfterSeconds"))) {
+            if (value > 3600) return false;
+            next.max_retry_after_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("maxAgeSeconds"))) {
             if (value > 86400) return false;
             next.max_age_seconds = static_cast<u32>(value);
@@ -224,6 +227,29 @@ bool jwks_response_etag(const ParsedResponse& response, Str& entity_tag) {
         entity_tag = kHeader.value;
     }
     return true;
+}
+u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
+    if (!cap_seconds || (response.status_code != 429 && response.status_code != 503)) return 0;
+    bool seen = false;
+    u32 delay = 0;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const auto& kHeader = response.headers[i];
+        if (!http_header_name_eq_ci(kHeader.name.ptr, kHeader.name.len, "Retry-After", 11))
+            continue;
+        const Str kValue = kHeader.value;
+        if (seen || !kValue.ptr || !kValue.len || kValue.len > 10 ||
+            (kValue.len > 1 && kValue.ptr[0] == '0'))
+            return 0;
+        seen = true;
+        for (u32 j = 0; j < kValue.len; ++j) {
+            const char kDigit = kValue.ptr[j];
+            if (kDigit < '0' || kDigit > '9') return 0;
+            const u32 kNumber = static_cast<u32>(kDigit - '0');
+            if (delay > (~u32{0} - kNumber) / 10) return 0;
+            delay = delay * 10 + kNumber;
+        }
+    }
+    return delay < cap_seconds ? delay : cap_seconds;
 }
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
     return now && last_success && now >= last_success &&
@@ -425,7 +451,9 @@ JwksFetch::~JwksFetch() {
     cancel();
 }
 bool JwksFetch::init(const RemoteJwks& configuration) {
-    if (initialized_ || state_ == State::Busy || !keys_.init(configuration.endpoint)) return false;
+    if (initialized_ || state_ == State::Busy ||
+        !keys_.init(configuration.endpoint, configuration.max_retry_after_seconds != 0))
+        return false;
     if (configuration.discovery_path[0]) {
         HttpsEndpoint endpoint = configuration.endpoint;
         __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
@@ -446,6 +474,7 @@ void JwksFetch::finish_attempt() {
     response_validator_.clear();
     sent_validator_ = false;
     validator_deadline_ = 0;
+    retry_after_seconds_ = 0;
     state_ = State::Cancelled;
 }
 void JwksFetch::clear_dns_cache() {
@@ -602,6 +631,16 @@ void JwksFetch::advance(u64 now) {
         discovering_ = false;
         (void)start_http(keys_, now);
     } else {
+        if (keys_.status() == 429 || keys_.status() == 503) {
+            ParsedResponse response{};
+            const u32 kDelay =
+                keys_.headers(response)
+                    ? jwks_response_retry_after(response, configuration_.max_retry_after_seconds)
+                    : 0;
+            (void)fail();
+            retry_after_seconds_ = kDelay;
+            return;
+        }
         if (configuration_.conditional_requests) {
             ParsedResponse response{};
             Str tag{};
