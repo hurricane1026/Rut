@@ -1399,18 +1399,20 @@ TEST_F(EpochLoopF, monotonic_under_load) {
 // === Config pointer updates after multiple reloads ===
 
 TEST(shard_control, config_ptr_updates_after_reload) {
-    // Wire SmallLoop with config_ptr → local RouteConfig*. Set initial config.
+    // Wire SmallLoop with config_ptr → active RouteConfig. Set initial config.
     // Send config update with new config. Call poll_command. Verify
     // *config_ptr now points to new config. Send ANOTHER update. Verify
     // updated again.
     SmallLoop loop;
     loop.setup();
 
-    RouteConfig cfg1{};
+    MappedArray<RouteConfig> configs;
+    REQUIRE(configs.init(3).has_value());
+    RouteConfig& cfg1 = configs[0];
     cfg1.route_count = 10;
-    RouteConfig cfg2{};
+    RouteConfig& cfg2 = configs[1];
     cfg2.route_count = 20;
-    RouteConfig cfg3{};
+    RouteConfig& cfg3 = configs[2];
     cfg3.route_count = 30;
 
     const RouteConfig* active = &cfg1;

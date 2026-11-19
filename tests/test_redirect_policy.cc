@@ -1,3 +1,4 @@
+#include "route_config_fixture.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -410,7 +411,9 @@ TEST(redirect_policy, exact_field_count_and_aggregate_boundaries_are_bounded) {
     rir::Module mod{};
     mod.redirect_policy_count = 4;
     for (u32 i = 0; i < 4; i++) mod.redirect_policies[i] = exact[i];
-    RouteConfig cfg{};
+    test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config != nullptr);
+    RouteConfig& cfg = *cfg_owner.config;
     REQUIRE(populate_route_config(cfg, mod));
     CHECK_EQ(cfg.redirect_policy_count, 4u);
     CHECK_EQ(cfg.redirect_policy_bytes_used, kRedirectPolicyBytes);
@@ -421,14 +424,18 @@ TEST(redirect_policy, exact_field_count_and_aggregate_boundaries_are_bounded) {
     rir::Module overflow_mod{};
     overflow_mod.redirect_policy_count = 4;
     for (u32 i = 0; i < 4; i++) overflow_mod.redirect_policies[i] = exact[i];
-    RouteConfig overflow_cfg{};
+    test::RouteConfigFixture overflow_cfg_owner;
+    REQUIRE(overflow_cfg_owner.config != nullptr);
+    RouteConfig& overflow_cfg = *overflow_cfg_owner.config;
     CHECK_FALSE(populate_route_config(overflow_cfg, overflow_mod));
     CHECK_EQ(overflow_cfg.redirect_policy_count, 0u);
     CHECK_EQ(overflow_cfg.redirect_policy_bytes_used, 0u);
     CHECK_FALSE(redirect_policy_table_valid(nullptr, kMaxRedirectPolicies + 1));
 
     char count_body[] = "";
-    RouteConfig count_cfg{};
+    test::RouteConfigFixture count_cfg_owner;
+    REQUIRE(count_cfg_owner.config != nullptr);
+    RouteConfig& count_cfg = *count_cfg_owner.config;
     for (u32 i = 0; i < kMaxRedirectPolicies; i++) {
         auto count_spec = policy({count_body, 0});
         count_spec.status_code = static_cast<u16>(300 + i);
@@ -490,7 +497,9 @@ TEST(redirect_policy, duplicate_contract_and_owned_copy_are_explicit) {
 }
 
 TEST(redirect_policy, direct_add_and_runtime_validation_are_bounds_safe_and_atomic) {
-    RouteConfig cfg{};
+    test::RouteConfigFixture cfg_owner;
+    REQUIRE(cfg_owner.config != nullptr);
+    RouteConfig& cfg = *cfg_owner.config;
     REQUIRE_EQ(cfg.add_redirect_policy(policy()), 1u);
     REQUIRE(cfg.redirect_policy_id_is_valid(1));
 
@@ -506,7 +515,9 @@ TEST(redirect_policy, direct_add_and_runtime_validation_are_bounds_safe_and_atom
     CHECK_EQ(cfg.add_redirect_policy(policy()), 0u);
     CHECK(redirect_inventory_matches(cfg, forged_pointer_snapshot));
 
-    RouteConfig forged_count{};
+    test::RouteConfigFixture forged_count_owner;
+    REQUIRE(forged_count_owner.config != nullptr);
+    RouteConfig& forged_count = *forged_count_owner.config;
     forged_count.redirect_policy_count = kMaxRedirectPolicies + 1;
     forged_count.redirect_policies[0].reason = {reinterpret_cast<const char*>(1), 1};
     forged_count.redirect_policy_bytes[0] = 'C';
@@ -515,7 +526,9 @@ TEST(redirect_policy, direct_add_and_runtime_validation_are_bounds_safe_and_atom
     CHECK_EQ(forged_count.add_redirect_policy(policy()), 0u);
     CHECK(redirect_inventory_matches(forged_count, forged_count_snapshot));
 
-    RouteConfig forged_watermark{};
+    test::RouteConfigFixture forged_watermark_owner;
+    REQUIRE(forged_watermark_owner.config != nullptr);
+    RouteConfig& forged_watermark = *forged_watermark_owner.config;
     forged_watermark.redirect_policy_count = 1;
     forged_watermark.redirect_policy_bytes_used = kRedirectPolicyBytes + 1;
     forged_watermark.redirect_policies[0].reason = {reinterpret_cast<const char*>(1), 1};

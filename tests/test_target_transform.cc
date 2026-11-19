@@ -1,3 +1,4 @@
+#include "route_config_fixture.h"
 #include "rut/common/forward_target.h"
 #include "rut/compiler/rir.h"
 #include "rut/runtime/compile_to_config.h"
@@ -124,7 +125,9 @@ TEST(target_transform, query_bearing_populate_owns_and_duplicate_add_reuses_stor
     mod.target_transform_count = 1;
     mod.target_transforms[0] = transform({strip, 5}, {replace, 12});
 
-    RouteConfig populated{};
+    test::RouteConfigFixture populated_owner;
+    REQUIRE(populated_owner.config != nullptr);
+    RouteConfig& populated = *populated_owner.config;
     REQUIRE(populate_route_config(populated, mod));
     REQUIRE_EQ(populated.target_transform_count, 1u);
     REQUIRE_EQ(populated.target_transform_bytes_used, 17u);
@@ -135,7 +138,9 @@ TEST(target_transform, query_bearing_populate_owns_and_duplicate_add_reuses_stor
     CHECK(populated.target_transforms[0].strip_prefix.eq({"/api/", 5}));
     CHECK(populated.target_transforms[0].replace_prefix.eq({"/v1/?fixed=1", 12}));
 
-    RouteConfig deduplicated{};
+    test::RouteConfigFixture deduplicated_owner;
+    REQUIRE(deduplicated_owner.config != nullptr);
+    RouteConfig& deduplicated = *deduplicated_owner.config;
     REQUIRE_EQ(deduplicated.add_target_transform(transform({"/api/", 5}, {"/v1/?fixed=1", 12})),
                1u);
     const u32 bytes = deduplicated.target_transform_bytes_used;
@@ -145,7 +150,9 @@ TEST(target_transform, query_bearing_populate_owns_and_duplicate_add_reuses_stor
     CHECK_EQ(deduplicated.target_transform_bytes_used, bytes);
 
     char empty_query_replace[] = "/v1/?";
-    RouteConfig empty_query{};
+    test::RouteConfigFixture empty_query_owner;
+    REQUIRE(empty_query_owner.config != nullptr);
+    RouteConfig& empty_query = *empty_query_owner.config;
     REQUIRE_EQ(empty_query.add_target_transform(transform({"/api/", 5}, {empty_query_replace, 5})),
                1u);
     empty_query_replace[4] = 'x';

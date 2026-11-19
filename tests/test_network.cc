@@ -12,6 +12,7 @@
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/iouring_event_loop.h"
 #endif
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/route_table.h"
@@ -7760,13 +7761,21 @@ TEST(http2, h2_forward_copies_synth_before_json_arena_release) {
 }
 
 TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_status_or_work) {
+    // Each scenario gets a fresh mock loop without reserving its buffers on the stack.
+    struct LoopStorage {
+        SmallLoop loop;
+        LoopStorage() {}
+    };
+
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(config.add_policy_bundle(0, 0, 0, 5), 1u);
     static constexpr u8 kSynth[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
     {
-        SmallLoop loop;
+        MappedArray<LoopStorage> loop_storage;
+        REQUIRE(loop_storage.init(1).has_value());
+        SmallLoop& loop = loop_storage[0].loop;
         loop.setup();
         auto* conn = loop.alloc_conn();
         REQUIRE(conn != nullptr);
@@ -7801,7 +7810,9 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
     // Verified deferred metadata remains outside H2: the selector is never
     // invoked and the stream gets the same sticky zero-byte close.
     {
-        SmallLoop loop;
+        MappedArray<LoopStorage> loop_storage;
+        REQUIRE(loop_storage.init(1).has_value());
+        SmallLoop& loop = loop_storage[0].loop;
         loop.setup();
         auto* conn = loop.alloc_conn();
         REQUIRE(conn != nullptr);
@@ -7843,7 +7854,9 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
         REQUIRE(forged->add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE_EQ(forged->add_policy_bundle(0, 0, 0, 5), 1u);
         forged->policy_bundles[0].response_read_timeout_seconds = 64;
-        SmallLoop loop;
+        MappedArray<LoopStorage> loop_storage;
+        REQUIRE(loop_storage.init(1).has_value());
+        SmallLoop& loop = loop_storage[0].loop;
         loop.setup();
         auto* conn = loop.alloc_conn();
         REQUIRE(conn != nullptr);
