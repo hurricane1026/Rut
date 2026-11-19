@@ -1573,9 +1573,14 @@ callbacks do not refresh the absolute upstream deadline or change client metrics
 Each sweep is bounded to 32 issues and reserves 64 client slots plus backend
 submission headroom (16 SQ entries on io_uring). Drain suppresses new probes.
 Pointer plus configuration identity rejects old verdicts after reload/address
-reuse. All-ejected fail-open behavior remains the legacy selection contract.
-HTTPS and gRPC health protocols remain absent. Native artifact version 20 also
-records the added Connection probe identity. See [scope and tests](docs/kong-active-health.md).
+reuse. Each shard tracks consecutive probe outcomes per target. The optional
+`failure_threshold` and `success_threshold` fields range from 1 to 255 and
+default independently to 1. Each completed probe resets the opposite streak.
+An active verdict changes when its threshold is reached. Business connections
+do not progress these streaks, and config replacement clears them. All-ejected
+fail-open behavior remains the selection contract. HTTPS and gRPC health
+protocols remain absent. Native artifact version 21 records the threshold
+fields in the upstream configuration. See [scope and tests](docs/kong-active-health.md).
 
 The compiler contract is:
 

@@ -21958,6 +21958,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_path = item.upstream.hc_path_lit;
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_expected_status = item.upstream.hc_expected_status;
+        up.hc_thresholds = item.upstream.hc_thresholds;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

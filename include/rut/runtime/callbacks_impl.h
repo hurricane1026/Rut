@@ -58,7 +58,9 @@ inline constexpr u64 kBackendEjectCooldownUs = 5'000'000;  // 5s
 struct BackendHealth {
     u16 fails;           // consecutive connect failures
     u64 eject_until_us;  // passively ejected while now < this (0 = healthy)
-    bool active_down;    // active-probe failure: down until a probe SUCCEEDS (no timed expiry)
+    bool active_down;    // active verdict has no timed expiry
+    u8 active_failures;
+    u8 active_successes;
 };
 
 // thread_local health table. Returns a mutable ref, or nullptr if indices are
@@ -74,10 +76,8 @@ inline BackendHealth* backend_health(u16 upstream_id, u32 backend_idx) {
 inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
     const BackendHealth* h = backend_health(upstream_id, backend_idx);
     if (h == nullptr) return false;
-    // `active_down` (an active-probe failure) has no timed expiry — only a
-    // successful probe clears it, so it suppresses the backend independent of the
-    // passive 5s cooldown (which would otherwise resume routing to a dead backend
-    // between probes when the health-check interval exceeds the cooldown).
+    // Active ejection has no timed expiry. A success streak clears it independently
+    // of the passive cooldown, even when the health-check interval is longer.
     return h->active_down || now_us < h->eject_until_us;
 }
 
@@ -96,26 +96,27 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
 }
 
-// Record the outcome of an ACTIVE health probe to (upstream_id, backend_idx).
-// Unlike passive ejection — a fixed 5s cooldown — an active failure keeps the
-// backend out of rotation until a probe SUCCEEDS: `active_down` is the authority
-// and has no timed expiry. This closes the gap where, with health_check.interval
-// > kBackendEjectCooldownUs, the passive cooldown would lapse between probes and
-// select_backend would resume routing to a still-dead backend. On success the
-// backend is fully healthy again: clear active_down AND the passive fail/eject
-// record. (`fails` is still bumped on failure for observability; active_down is
-// what select_backend honors.)
-inline void record_active_probe_result(u16 upstream_id, u32 backend_idx, bool healthy, u64 now_us) {
-    (void)now_us;  // active suppression is success-gated, not time-gated
+// Active verdicts use consecutive probe outcomes and stay in force until the
+// opposite threshold is reached. Business connects update only passive state.
+inline void record_active_probe_result(u16 upstream_id,
+                                       u32 backend_idx,
+                                       bool healthy,
+                                       u64 now_us,
+                                       ActiveHealthThresholds thresholds = {}) {
+    (void)now_us;  // Active verdicts have no timed expiry.
     BackendHealth* h = backend_health(upstream_id, backend_idx);
     if (h == nullptr) return;
     if (healthy) {
-        h->active_down = false;
+        h->active_failures = 0;
+        if (h->active_successes < thresholds.successes) h->active_successes++;
+        if (h->active_successes >= thresholds.successes) h->active_down = false;
         h->fails = 0;
         h->eject_until_us = 0;
         return;
     }
-    h->active_down = true;
+    h->active_successes = 0;
+    if (h->active_failures < thresholds.failures) h->active_failures++;
+    if (h->active_failures >= thresholds.failures) h->active_down = true;
     if (h->fails < 0xffff) h->fails++;
 }
 
@@ -146,9 +147,8 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
 // no config pin and active_down has no timed expiry — so after a reload a verdict
 // recorded under the OLD config would wrongly suppress (or pass) a DIFFERENT
 // endpoint that now occupies the same numeric slot, and if the new config
-// disables health checks there is no future probe to clear it. Reset all three
-// fields (active_down + the passive fails/eject, since indices may now mean a
-// different backend). O(kMaxUpstreams * kMaxBackends); runs only on reload.
+// disables health checks there is no future probe to clear it. Reset verdicts,
+// streaks, and passive state. O(kMaxUpstreams * kMaxBackends); runs only on reload.
 //
 // probe_in_flight is deliberately NOT reset. A probe launched under the old config
 // may still be in flight via a live Connection that owns its slot's flag; every
@@ -327,17 +327,25 @@ void free_probe_conn(Loop* loop, Connection& conn) {
     loop->free_health_probe(conn);
 }
 
-// Record an active-probe outcome, but only if the config that LAUNCHED the probe
-// is still current. A hot reload (*config_ptr swap) mid-probe can repoint the
-// numeric upstream_idx at a different upstream/backend; a stale result recorded
-// against that index would wrongly suppress or clear the new backend. After a
-// swap the result is meaningless, so drop it.
+// Resolve a probe's configuration only while its launching snapshot is current.
+// The same numeric upstream and backend indices can refer to a different
+// target after reload.
+template <typename Loop>
+inline const UpstreamTarget* current_probe_target(Loop* loop, const Connection& conn) {
+    const RouteConfig* cur = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (cur == nullptr || cur != conn.request_config ||
+        cur->http_cache_identity != conn.health_probe_config_identity ||
+        conn.upstream_idx >= cur->upstream_count)
+        return nullptr;
+    const UpstreamTarget& target = cur->upstreams[conn.upstream_idx];
+    return conn.upstream_backend_idx < target.addr_count ? &target : nullptr;
+}
+
 template <typename Loop>
 inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
-    const RouteConfig* cur = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (cur != nullptr && cur == conn.request_config &&
-        cur->http_cache_identity == conn.health_probe_config_identity)
-        record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us);
+    if (const auto* target = current_probe_target(loop, conn))
+        record_active_probe_result(
+            conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us, target->hc_thresholds);
 }
 
 template <typename Loop>
@@ -529,20 +537,12 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // upstream_idx at a different upstream. Guard BEFORE the expected-status
     // comparison — after a swap the response is meaningless, so free without
     // recording (the stale result must not touch the new backend at this index).
-    const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (config == nullptr || config != conn.request_config ||
-        config->http_cache_identity != conn.health_probe_config_identity) {
-        free_probe_conn(loop, conn);
-        return;
+    if (const auto* target = current_probe_target(loop, conn)) {
+        const bool kHealthy =
+            kStatus == ParseStatus::Complete && resp.status_code == target->hc_expected_status;
+        record_active_probe_result(
+            conn.upstream_idx, conn.upstream_backend_idx, kHealthy, kNowUs, target->hc_thresholds);
     }
-    // Complete + expected status → healthy; anything else (Error, Incomplete with
-    // no more data, unexpected status) → failure.
-    bool healthy = false;
-    if (kStatus == ParseStatus::Complete && config != nullptr &&
-        conn.upstream_idx < config->upstream_count) {
-        healthy = (resp.status_code == config->upstreams[conn.upstream_idx].hc_expected_status);
-    }
-    record_active_probe_result(conn.upstream_idx, conn.upstream_backend_idx, healthy, kNowUs);
     free_probe_conn(loop, conn);
 }
 

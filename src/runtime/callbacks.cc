@@ -1247,11 +1247,7 @@ void reset_backend_health() {
     for (u16 u = 0; u < RouteConfig::kMaxUpstreams; u++)
         for (u32 b = 0; b < UpstreamTarget::kMaxBackends; b++) {
             BackendHealth* h = backend_health(u, b);
-            if (h != nullptr) {
-                h->fails = 0;
-                h->eject_until_us = 0;
-                h->active_down = false;
-            }
+            if (h != nullptr) *h = {};
         }
 }
 

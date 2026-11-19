@@ -59,7 +59,10 @@ def main():
         source = f'''
 upstream api {{
     backends: [{entries}]
-    health_check: {{ path: "/healthz", interval: 1s, status: 200 }}
+    health_check: {{
+        path: "/healthz", interval: 1s, status: 200,
+        failure_threshold: 2, success_threshold: 3
+    }}
 }}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
 '''
@@ -115,12 +118,16 @@ route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
                 wait_for(lambda: probes['A'] > before, 'unhealthy endpoint was not probed')
                 wait_for(lambda: all(request() == (200, b'B') for _ in range(4)),
                          'unhealthy endpoint was not ejected')
+                with lock:
+                    assert probes['A'] - before >= 2, (protocol, probes)
                 assert all(request() == (200, b'B') for _ in range(20)), protocol
                 with lock:
                     healthy['A'] = True
                     before = probes['A']
                 wait_for(lambda: probes['A'] > before, 'disabled-by-health target was not reprobed')
                 wait_for(lambda: request() == (200, b'A'), 'recovered target was not re-enabled')
+                with lock:
+                    assert probes['A'] - before >= 3, (protocol, probes)
                 recovered = Counter(request() for _ in range(20))
                 assert recovered == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, recovered)
             with lock:

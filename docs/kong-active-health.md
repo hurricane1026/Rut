@@ -12,9 +12,11 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 ```
 
 - Linux epoll 和 io_uring 都会按周期发送真实 HTTP/1.1 GET，比较完整响应头中的状态码。
-  探测失败会摘除目标，后续成功探测恢复目标；普通请求连接成功不能清除主动摘除。
+  连续失败达到阈值时摘除目标，连续成功达到阈值时恢复；相反结果重置连续计数。
+  普通请求连接成功不能清除主动摘除。
 - 仅支持当前明文 HTTP/1 上游；HTTPS、HTTP/2/gRPC 健康协议不在本次范围。
-  单个预期状态、统一探测周期与一次成功/失败阈值沿用既有语义。
+  使用单个预期状态和统一探测周期。`failure_threshold` 与 `success_threshold`
+  分别指定摘除和恢复所需的连续探测次数，取值 1–255，省略时各为 1。
 - 每个 shard、每个目标最多一个在途探针。权重 0 的目标不接收探测或业务流量。
   每次 sweep 最多发出 32 个探针，并为业务连接保留 64 个空闲槽；预算不足时延后。
 - io_uring 在 sweep 发起探针时另预留 16 个 SQ 提交位置；探针使用连接自己的地址和请求/响应切片。
@@ -26,8 +28,8 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
   即使新配置复用了相同地址也不能污染其健康状态；内核不借用旧配置中的 sockaddr。
 
 Rut 原有的“所有启用目标都已摘除时 fail-open”保持不变；不宣称该行为与 Kong 的
-不可用阈值、全不可用响应完全相同。本次不实现 Kong 的 HTTP 状态数组、可配置计数阈值、
-独立健康/不健康周期、主动 HTTPS、Admin API 或节点间共享健康判定。
+不可用阈值、全不可用响应完全相同。HTTP 状态数组、独立健康/不健康周期、主动 HTTPS、Admin API
+和节点间共享健康判定仍超出该能力的范围。
 
 验证入口：
 
@@ -45,4 +47,4 @@ ctest --test-dir build -R '^test_(health_probes|active_health_)' --output-on-fai
 14 个真实网关/分流/路由/ELF CTest 项全部通过，另有 1,674 个网络、1,312 个前端、
 104 个 gRPC 与 88 个 Native artifact 回归通过。未运行 macOS kqueue 或真实 Kong 对照测试。
 
-Connection 的私有 Native ABI 新增探针配置身份，artifact 版本升为 20；旧产物需重新编译。
+Native artifact 版本 21 记录探测阈值，并保留版本 20 引入的探针配置身份。旧产物需重新编译。
