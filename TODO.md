@@ -852,9 +852,10 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Offline Consumer administration with full-record upserts, removal, disabled
   credentials/Consumers, group replacement, redacted inspection/preflight and
   validated atomic no-replace private snapshots (`rut-consumers`).
-- [ ] Remaining #1072 interfaces: online administrative management and transparent
-  request-target/body mutation; offline snapshot administration/publication and
-  explicit rebuilt messages are the current interfaces, not a CLI watcher/IAM platform.
+- [x] Opt-in Consumer query credential hiding for proxy routes using verified
+  remaining fields and the owned forwarding target effect.
+- [ ] Remaining #1072 interfaces include online administrative management,
+  transparent form-body mutation and redaction in legacy request-target logs.
 - [ ] Replicated persistence/failover verification for the replay authority beyond
   the tested single-instance intact-AOF recovery profile;
   broad DNS profiles/automatic kid onboarding remain separately scoped.

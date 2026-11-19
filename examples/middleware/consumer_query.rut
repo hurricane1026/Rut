@@ -1,0 +1,7 @@
+// identity comes from successful consumerAuthenticateQuery on the same request.
+// pathOnly is that request's original path without its query.
+func forwardingTarget(_ pathOnly: str, _ identity: Json) -> str {
+    guard let fieldValue = json.get(identity, "/remaining") else { nil }
+    guard let fields = json.string(fieldValue) else { nil }
+    if fields == "" { pathOnly } else { pathOnly + "?" + fields }
+}

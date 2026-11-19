@@ -3699,7 +3699,11 @@ decoded duplicate names/malformed fields, and return identity plus sanitized
 `remaining` fields. The ASCII profile is bounded to 4096 input bytes, 64 fields,
 64-byte field names and 512 decoded credential bytes. Form callers require a
 singleton expected Content-Type. They do not mutate the original request or add
-implicit fallback; use an explicitly rebuilt upstream request, as in
+implicit fallback. A query route can pass the verified identity and
+`req.pathOnly` to `consumer_query.forwardingTarget` from
+`examples/middleware/consumer_query.rut` and supply the result to
+`forward(..., set_path: target)`. A form route can send the remaining fields in
+an explicitly rebuilt request. See
 [the source/redaction contract](consumer-registry.md#explicit-query-and-form-credentials).
 
 ### Keycloak access-token role helpers

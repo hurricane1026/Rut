@@ -11212,9 +11212,13 @@ A bounded parser validates the whole ASCII URL-encoded field list, decodes names
 once for duplicate detection, authenticates exactly one selected source, then
 projects identity plus the untouched non-credential encoded fields. It never
 returns the key. Empty/ambiguous/over-capacity input fails closed. Original
-request bytes remain unchanged; the example rebuilds a fixed-endpoint HTTPS form
-POST and selects only sanitized fields and authenticated identity. No transparent
-forward/body rewrite is implied. See [the contract](docs/consumer-registry.md).
+request bytes remain available to the handler. One example rebuilds a
+fixed-endpoint HTTPS form POST from sanitized fields and authenticated identity.
+The query forwarding example joins the original path-only view to the remaining
+query fields and uses the existing owned `set_path` effect. It records request
+lengths through the source `downstreamRequestBytes` log profile. Form-body
+rewriting and legacy target log redaction are outside this profile. See
+[the contract](docs/consumer-registry.md#explicit-query-and-form-credentials).
 
 `JwksFetch` publishes initialized state only after both HTTPS contexts initialize.
 Failed partial initialization cannot start a keys-only refresh, and a second init
