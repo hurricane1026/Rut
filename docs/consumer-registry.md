@@ -522,12 +522,18 @@ request-target/body mutation and online administrative HTTP APIs remain separate
 
 ### Targeted lifecycle commands
 
-All commands take a validated private input snapshot.
+All commands take a validated private input snapshot. Mutation commands publish
+a new private snapshot under the same no-replace rules as `apply`.
 
 | Command after `rut-consumers` | Effect |
 | --- | --- |
 | `inspect-consumer INPUT CONSUMER_ID` | Print the selected Consumer's metadata as one JSON object. |
 | `inspect-credential INPUT CREDENTIAL_ID` | Print the selected credential's metadata as one JSON object. Raw secrets and SHA-256 verifiers are omitted. |
+| `remove-consumer INPUT CONSUMER_ID OUTPUT` | Remove a Consumer that owns no credentials, including disabled credentials. |
+
+Removal frees
+IDs for reuse and becomes effective when the replacement is deployed. The input
+snapshot and older files still contain their previous credential records.
 
 ## Product scope
 
