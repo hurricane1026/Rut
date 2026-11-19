@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--retry-backoff", action="store_true")
     parser.add_argument("--stage-timeout", action="store_true")
     parser.add_argument("--conditional-discovery", action="store_true")
+    parser.add_argument("--discovery-cache", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -240,6 +241,9 @@ def main():
                                        allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
+        if args.discovery_cache:
+            assert args.discovery_dns
+            policy["remoteJwks"].update(maxAgeSeconds=8, discoveryCacheSeconds=5)
         if args.conditional_discovery:
             assert args.discovery_dns
             policy["remoteJwks"].update(conditionalDiscovery=True, timeoutSeconds=5)
@@ -383,7 +387,38 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.conditional_discovery:
+            if args.discovery_cache:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    assert len(state["discoveries"]) == 1
+                    state["body"] = json.dumps(fixture["second"]["jwks"]).encode()
+                wait_status(fixture["b"], 200)
+                with lock:
+                    assert len(state["discoveries"]) == 1
+                    state["dns"] = "move"
+                    before_move = state["requests"]
+                wait_for_origin_address(before_move, "127.0.0.2")
+                with lock:
+                    assert len(state["discoveries"]) == 2
+                    state["discovery"] = "issuer"
+                    before_skip = state["requests"]
+                wait_for_origin_request(before_skip)
+                with lock:
+                    assert len(state["discoveries"]) == 2
+                # Skipping discovery does not slide its expiry. Once a fresh
+                # response is required, rejected metadata prevents any key GET.
+                wait_status(fixture["b"], 401, limit=16)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["b"])])[0] == 401
+                with lock:
+                    assert len(state["discoveries"]) > 2
+                    last_keys = state["requests"]
+                    retries = state["dnsRequests"]
+                wait_for_dns_request(retries + 1)
+                with lock:
+                    assert state["requests"] == last_keys
+                    state["discovery"] = "valid"
+                wait_status(fixture["b"], 200)
+            elif args.conditional_discovery:
                 def metadata_seen(predicate, start=0, limit=10):
                     deadline = time.monotonic() + limit
                     while time.monotonic() < deadline:

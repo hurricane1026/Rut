@@ -716,6 +716,31 @@ TEST(remote_jwks_metadata, conditional_discovery_is_separate_and_requires_metada
     CHECK(config.conditional_requests);
 }
 
+TEST(remote_jwks_metadata, discovery_cache_requires_discovery_and_a_bounded_age) {
+    const char* base =
+        R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+        R"("path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":5)";
+    const char* discovery =
+        R"(,"discoveryPath":"/metadata","discoveryIssuer":"https://issuer.example")";
+    RemoteJwks config;
+    const auto load = [&](const char* stage, const char* fields) {
+        char bytes[512];
+        const int length = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, stage, fields);
+        json::Document document;
+        return length > 0 && static_cast<u32>(length) < sizeof(bytes) &&
+               document.parse({bytes, static_cast<u32>(length)}) && config.load(document, 0);
+    };
+    REQUIRE(load(discovery, ""));
+    CHECK_EQ(config.discovery_cache_seconds, 0u);
+    CHECK_FALSE(load("", R"(,"discoveryCacheSeconds":2)"));
+    CHECK_FALSE(load(discovery, R"(,"discoveryCacheSeconds":4)"));
+    CHECK_FALSE(load(discovery, R"(,"discoveryCacheSeconds":3601)"));
+    CHECK_FALSE(load(discovery, R"(,"discoveryCacheSeconds":0)"));
+    REQUIRE(load(discovery, R"(,"discoveryCacheSeconds":3,"conditionalDiscovery":true)"));
+    CHECK_EQ(config.discovery_cache_seconds, 3u);
+    CHECK(config.conditional_discovery);
+}
+
 TEST(remote_jwks_metadata, owned_strong_etag_address_binding_and_hard_expiry) {
     CHECK(strong_etag_valid(lit_str("\"\"")));
     CHECK(strong_etag_valid(lit_str("\"opaque,tag\\value\"")));

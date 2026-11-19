@@ -10276,7 +10276,11 @@ Optional Boolean `conditionalDiscovery` lets a separate same-initial-address
 strong ETag revalidate previously accepted discovery metadata before
 `maxAgeSeconds`. The discovery path and TLS identity remain configuration-owned.
 A successful discovery 200 or matching 304 may commit its own validator before
-keys are fetched, and cannot renew key age. See [the exact contract](docs/jwks-discovery.md#conditional-key-refresh).
+keys are fetched, and cannot renew key age. Optional `discoveryCacheSeconds`
+skips discovery while the last proven metadata is fresh for the same initial
+address. It never skips key acquisition. Discovery proofs are single-entry,
+shard-owned and discarded on cancellation, clock reset or configuration
+retirement. See [the exact contract](docs/jwks-discovery.md#conditional-key-refresh).
 
 Both event-loop implementations poll this same task; the specialized epoll/kqueue
 loops use the same maintenance hook. Config replacement cancels the retiring shard's

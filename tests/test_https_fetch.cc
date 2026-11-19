@@ -1279,6 +1279,57 @@ void complete_jwks(JwksFetch& fetch, DnsOrigin* resolver = nullptr, u8 first = 1
     }
 }
 }  // namespace
+TEST(https_fetch, jwks_stage_deadlines_preserve_total_timeout_and_cancel) {
+    DnsOrigin dns;
+    PoolOrigin stalled_tls;
+    REQUIRE(dns.init());
+    REQUIRE(stalled_tls.init());
+    RemoteJwks configuration;
+    configuration.endpoint = TlsOrigin{}.endpoint();
+    configuration.endpoint.port = stalled_tls.port;
+    strcpy(configuration.discovery_path, "/discovery");
+    strcpy(configuration.discovery_issuer, "https://localhost");
+    strcpy(configuration.dns_address, "127.0.0.1");
+    strcpy(configuration.allowed_addresses[0], "127.0.0.1");
+    configuration.allowed_count = 1;
+    configuration.dns_port = dns.port;
+    configuration.dns_timeout_seconds = 1;
+    configuration.discovery_timeout_seconds = 1;
+
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    REQUIRE(fetch.start(1000, 6000));
+    fetch.advance(1999);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Busy);
+    fetch.advance(2000);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+    CHECK(stalled_tls.no_connect());
+    REQUIRE(dns.reply(1, 0));  // Drain the expired query.
+
+    REQUIRE(fetch.start(3000, 6000));
+    REQUIRE(dns.reply(1, 0));
+    fetch.advance(3500);
+    fetch.advance(4499);
+    REQUIRE_EQ(fetch.state(), JwksFetch::State::Busy);
+    fetch.advance(4500);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+
+    REQUIRE(fetch.start(5000, 800));
+    REQUIRE(dns.reply(1, 0));
+    fetch.advance(5600);
+    fetch.advance(5799);
+    REQUIRE_EQ(fetch.state(), JwksFetch::State::Busy);
+    fetch.advance(5800);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Failed);
+
+    REQUIRE(fetch.start(6000, 6000));
+    REQUIRE(dns.reply(1, 0));
+    fetch.advance(6500);
+    fetch.cancel();
+    fetch.advance(7500);
+    CHECK_EQ(fetch.state(), JwksFetch::State::Cancelled);
+}
+
 TEST(https_fetch, jwks_dns_discovery_lifecycle_and_recovery) {
     signal(SIGPIPE, SIG_IGN);
     DnsOrigin dns;
@@ -1475,6 +1526,70 @@ TEST(https_fetch, jwks_dns_cache_owns_answers_until_cap_and_cancel) {
     fetch.finish_attempt();
     REQUIRE(fetch.start(kNow + 2000, 3000));
     REQUIRE(dns.reply(1, 0));
+}
+
+TEST(https_fetch, jwks_discovery_cache_and_etag_are_independent_and_cancelled) {
+    signal(SIGPIPE, SIG_IGN);
+    TlsOrigin origin;
+    char discovery[1024];
+    REQUIRE(origin.init());
+    char body[512];
+    const int body_length = snprintf(body,
+                                     sizeof(body),
+                                     "{\"issuer\":\"https://localhost\",\"jwks_uri\":\"https://"
+                                     "localhost:%u/keys?profile=rs256\"}",
+                                     origin.port);
+    REQUIRE(body_length > 0 && static_cast<u32>(body_length) < sizeof(body));
+    const int length = snprintf(discovery,
+                                sizeof(discovery),
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                "ETag: \"metadata\"\r\nContent-Length: %d\r\n\r\n%s",
+                                body_length,
+                                body);
+    REQUIRE(length > 0 && static_cast<u32>(length) < sizeof(discovery));
+    const Str metadata{discovery, static_cast<u32>(length)};
+    const Str keys = lit_str(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n"
+        "\r\n{\"keys\":[]}");
+    const Str revalidated = lit_str("HTTP/1.1 304 Not Modified\r\nETag: \"metadata\"\r\n\r\n");
+    origin.responses[0] = metadata;
+    origin.responses[1] = keys;
+    origin.responses[2] = keys;
+    origin.responses[3] = revalidated;
+    origin.responses[4] = keys;
+    origin.responses[5] = keys;
+    origin.responses[6] = metadata;
+    origin.responses[7] = keys;
+    origin.count = 8;
+
+    RemoteJwks configuration;
+    configuration.endpoint = origin.endpoint();
+    strcpy(configuration.discovery_path, "/discovery");
+    strcpy(configuration.discovery_issuer, "https://localhost");
+    configuration.max_age_seconds = 5;
+    configuration.discovery_cache_seconds = 2;
+    configuration.conditional_discovery = true;
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    const auto complete = [&](u64 now) {
+        if (!fetch.start(now, 3000)) return false;
+        for (u32 i = 0; i < 1500 && fetch.state() == JwksFetch::State::Busy; ++i) {
+            fetch.advance(now);
+            usleep(1000);
+        }
+        return fetch.state() == JwksFetch::State::Done && fetch.body().eq(lit_str("{\"keys\":[]}"));
+    };
+    REQUIRE(complete(1000));
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 2u);
+    REQUIRE(complete(2999));
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 3u);
+    REQUIRE(complete(3000));
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 5u);
+    REQUIRE(complete(4999));
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 6u);
+    fetch.cancel();
+    REQUIRE(complete(4999));  // Still fresh without cancellation.
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 8u);
 }
 
 TEST(https_fetch, conditional_jwks_bodyless_profile_is_opt_in) {

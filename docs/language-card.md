@@ -2676,7 +2676,9 @@ keeps the verifier bank/empty state, and renews age on success. Cold/expired cac
 need full 200 responses. Discovery remains unconditional unless
 `conditionalDiscovery` enables a separate, same-address strong ETag and hard
 metadata age under `maxAgeSeconds`. Discovery revalidation still fetches keys
-and never renews key age. See
+and never renews key age. Optional `discoveryCacheSeconds` (1–3600 and at
+most `maxAgeSeconds`) skips only fresh same-initial-address discovery. Key GETs
+continue and cache hits never extend metadata age. See
 [the conditional contract](jwks-discovery.md#conditional-key-refresh).
 Cache-Control-derived lifetimes, HTTP/2 origin fetches and compressed responses
 remain outside this profile.

@@ -156,6 +156,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         } else if (kKey.eq(lit_str("discoveryTimeoutSeconds"))) {
             if (value > 60) return false;
             next.discovery_timeout_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("discoveryCacheSeconds"))) {
+            if (value > 3600) return false;
+            next.discovery_cache_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("dnsCacheSeconds"))) {
             if (value > 3600) return false;
             next.dns_cache_seconds = static_cast<u32>(value);
@@ -198,7 +201,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             inet_pton(AF_INET, next.dns_address, &resolver) != 1)
             return false;
     }
-    if ((fields & (1024 | 2048)) || next.discovery_timeout_seconds || next.conditional_discovery) {
+    if (next.discovery_cache_seconds > next.max_age_seconds) return false;
+    if ((fields & (1024 | 2048)) || next.discovery_timeout_seconds || next.conditional_discovery ||
+        next.discovery_cache_seconds) {
         if (!(fields & 1024) || !(fields & 2048) || !discovery_issuer_valid(next.discovery_issuer))
             return false;
         HttpsEndpoint discovery = next.endpoint;
@@ -521,6 +526,7 @@ void JwksFetch::cancel() {
     finish_attempt();
     clear_dns_cache();
     discovery_validator_.clear();
+    discovery_address_[0] = 0;
     discovery_accepted_at_ = 0;
 }
 bool JwksFetch::fail() {
@@ -535,6 +541,10 @@ bool JwksFetch::begin_http(u64 now) {
         if (!keys_.set_address(kAddress) || (discovering_ && !discovery_.set_address(kAddress)))
             return fail();
     }
+    if (discovering_ && address_index_ == 0 &&
+        jwks_cache_fresh(now, discovery_accepted_at_, configuration_.discovery_cache_seconds) &&
+        ctext(discovery_address_).eq(selected_address()))
+        discovering_ = false;
     auto& fetch = discovering_ ? discovery_ : keys_;
     return start_http(fetch, now);
 }
@@ -644,13 +654,19 @@ bool JwksFetch::accept_discovery(u64 now) {
             (tag.len && !next.bind(tag, selected_address())))
             return false;
         discovery_validator_ = next;
-        discovery_accepted_at_ = now;
     }
+    if (configuration_.discovery_cache_seconds) {
+        const Str kAddress = selected_address();
+        __builtin_memcpy(discovery_address_, kAddress.ptr, kAddress.len);
+        discovery_address_[kAddress.len] = 0;
+    }
+    if (configuration_.conditional_discovery || configuration_.discovery_cache_seconds)
+        discovery_accepted_at_ = now;
     return true;
 }
 void JwksFetch::advance(u64 now) {
     if (state_ != State::Busy) return;
-    if (!now || now < started_ || now < dns_cached_at_) {
+    if (!now || now < started_ || now < dns_cached_at_ || now < discovery_accepted_at_) {
         cancel();
         state_ = State::Failed;
         return;

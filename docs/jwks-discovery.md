@@ -10,7 +10,9 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
   "refreshSeconds": 30, "retrySeconds": 5, "maxRetrySeconds": 60, "maxRetryAfterSeconds": 30,
   "maxAgeSeconds": 120, "timeoutSeconds": 10,
-  "conditionalRequests": true,
+  "dnsTimeoutSeconds": 2, "discoveryTimeoutSeconds": 3,
+  "conditionalRequests": true, "conditionalDiscovery": true,
+  "discoveryCacheSeconds": 30,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
@@ -42,8 +44,10 @@ stages to a positive integer number of seconds no greater than
 `timeoutSeconds`. Each requires its corresponding DNS or discovery profile
 and is measured from stage entry. The earlier of the stage limit and total
 deadline wins. Stage timeout ends the attempt through the normal failure and
-retry path, without trying another address or issuing another DNS query.
-Omitting either setting gives that stage the full remaining attempt budget.
+retry path, without trying another address or issuing another DNS query. If a
+definitive TCP connection error triggers failover, the next discovery GET has
+its own stage limit under the same total attempt deadline. Omitting either
+setting gives that stage the full remaining attempt budget.
 
 Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
 renew last-success time; requests fail closed after the original maximum age
@@ -188,6 +192,23 @@ never becomes a key tag, and accepting metadata does not renew key age.
 Clock failure or reversal, cancellation and configuration retirement discard
 the stored discovery validator.
 
+### Fresh discovery reuse
+
+Optional `discoveryCacheSeconds` (integer 1–3600 and at most
+`maxAgeSeconds`) requires discovery and defaults to disabled. It remembers the
+last accepted metadata and exact selected IPv4 address. While younger than this
+limit, a later attempt with the same initial address may skip the discovery GET
+and proceed directly to the key GET. The entry remains bound to the configured
+issuer, discovery endpoint and TLS trust. Changed addresses and failover require
+full discovery before a key GET.
+
+Cache reuse never slides the metadata timestamp. An accepted 200, or an
+accepted 304 with `conditionalDiscovery` enabled, can refresh it. Metadata can
+be accepted independently of a later key failure. Once discovery is needed
+again, a failed response ends the attempt without reviving expired metadata or
+renewing key age. Only successful key refresh can renew keys. Cancellation,
+clock reset and configuration retirement discard the remembered metadata.
+
 One shard-owned `JwksFetch` coordinates DNS, discovery and the key GET under one
 timeout. At most one stage is in flight per policy/shard. No token, unknown kid,
 or concurrent verification creates another request. Successful key import still
@@ -208,6 +229,9 @@ Fixed-endpoint fixtures also measure immediate and slow-timeout failure retry
 spacing, with HTTP/1.1 and HTTP/2 maximum-age denial and recovery. Conditional
 fixtures cover repeated 304, rotation/empty sets, strict validator failures, hard
 expiry at emission/completion, and unconditional changed-IP/failover requests.
+Separate native profiles cover discovery conditional requests, strict expiry and
+same-address reuse without suppressing key rotation. They also verify DNS and
+metadata stage timeouts preserve the normal retry path.
 Real native-loaded RS256 and ES256 gateways run after source removal on both
 Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.

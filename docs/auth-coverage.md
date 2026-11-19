@@ -891,8 +891,11 @@ age only before hard expiry. Cold/expired caches require full 200. Duplicate,
 weak, malformed or mismatching validators fail closed. Validators commit with
 accepted keys and never change issuer, TLS or kid trust. Native conditional
 RS256/ES256 tests cover both Linux backends, HTTP/1.1/HTTP/2 verification, delayed
-expiry and unconditional address-change/failover. This remains a bounded
-foundation. #1077 is open.
+expiry and unconditional address-change/failover. Discovery can independently
+revalidate authenticated metadata using a strong ETag, reuse it within a shorter
+same-address lifetime, or bound DNS and discovery stage timeouts beneath the
+shared attempt deadline. These options preserve key acquisition and hard key
+age. #1077 remains open for remaining acceptance work.
 
 The reusable bounded HTTPS state machine and existing HTTP/chunk parsers accept
 200 JSON bodies with strict framing, byte limits and authenticated transport.

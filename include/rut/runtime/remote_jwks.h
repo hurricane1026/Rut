@@ -18,6 +18,7 @@ struct RemoteJwks {
     char discovery_path[1024]{};
     char discovery_issuer[1024]{};
     u32 discovery_timeout_seconds = 0;
+    u32 discovery_cache_seconds = 0;
     u32 refresh_seconds = 0;
     u32 retry_seconds = 0;
     u32 max_retry_seconds = 0;
@@ -83,6 +84,7 @@ private:
     JwksValidator request_validator_{};
     JwksValidator response_validator_{};
     JwksValidator discovery_validator_{};
+    char discovery_address_[16]{};
     u64 discovery_accepted_at_ = 0;
     bool sent_discovery_validator_ = false;
     bool sent_validator_ = false;
