@@ -118,6 +118,12 @@ def test_deployment_policy(tool, root):
           records=[dict(key, groups=[])], rule=group_required)
     check({group_required: False}, consumers=[dict(alice, groups=[]), disabled],
           records=[dict(key, groups=[])], ok=True)
+    explicit = 'requireExplicitCredentialGroups'
+    check({explicit: True}, ok=True)
+    inheriting = {k: v for k, v in key.items() if k != 'groups'}
+    check({explicit: True}, records=[inheriting], rule=explicit)
+    check({explicit: True}, records=[dict(inheriting, enabled=False)], ok=True)
+    check({explicit: True}, records=[dict(key, groups=[])], ok=True)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
