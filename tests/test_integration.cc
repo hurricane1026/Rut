@@ -24006,14 +24006,14 @@ TEST(route, upstream_backends_list_compiles) {
     rir.destroy();
 }
 
-// `health_check: { path, interval, status }` threads through every IR layer
-// into UpstreamTarget (config data only; no runtime probing in this slice).
+// Active probe policy survives lowering and activation.
 TEST(route, upstream_health_check_compiles) {
     using namespace rut;
     const char* src =
         "upstream api {\n"
         "  backends: [\"127.0.0.1:8081\"]\n"
-        "  health_check: { path: \"/healthz\", interval: 5s, status: 200 }\n"
+        "  health_check: { path: \"/healthz\", interval: 5s, status: 200, "
+        "failure_threshold: 3, success_threshold: 255 }\n"
         "}\n"
         "route GET \"/api\" { return forward(api, load_balance: .roundRobin) }\n";
     auto lexed = lex(Str{src, static_cast<u32>(__builtin_strlen(src))});
@@ -24034,6 +24034,8 @@ TEST(route, upstream_health_check_compiles) {
     CHECK(rir.module.upstreams[0].hc_enabled);
     CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 5000u);
     CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    CHECK_EQ(rir.module.upstreams[0].hc_thresholds.failures, 3u);
+    CHECK_EQ(rir.module.upstreams[0].hc_thresholds.successes, 255u);
     REQUIRE_EQ(rir.module.upstreams[0].hc_path.len, 8u);
     CHECK((rir.module.upstreams[0].hc_path.eq({"/healthz", 8})));
     // populate_route_config copies the config into UpstreamTarget.
@@ -24045,6 +24047,10 @@ TEST(route, upstream_health_check_compiles) {
     CHECK((Str{cfg.upstreams[0].hc_path, cfg.upstreams[0].hc_path_len}.eq({"/healthz", 8})));
     CHECK_EQ(cfg.upstreams[0].hc_interval_ms, 5000u);
     CHECK_EQ(cfg.upstreams[0].hc_expected_status, 200u);
+    CHECK_EQ(cfg.upstreams[0].hc_thresholds.failures, 3u);
+    CHECK_EQ(cfg.upstreams[0].hc_thresholds.successes, 255u);
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/healthz", 8, 1000, 200, {0, 1}));
+    CHECK_EQ(cfg.upstreams[0].hc_thresholds.failures, 3u);
     rir.destroy();
 }
 
@@ -24074,6 +24080,8 @@ TEST(route, upstream_health_check_status_defaults_to_200) {
     CHECK(rir.module.upstreams[0].hc_enabled);
     CHECK_EQ(rir.module.upstreams[0].hc_interval_ms, 10000u);
     CHECK_EQ(rir.module.upstreams[0].hc_expected_status, 200u);
+    CHECK_EQ(rir.module.upstreams[0].hc_thresholds.failures, 1u);
+    CHECK_EQ(rir.module.upstreams[0].hc_thresholds.successes, 1u);
     rir.destroy();
 }
 

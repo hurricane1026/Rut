@@ -165,6 +165,56 @@ void health_and_recovery(rut::test::TestCase* _tc) {
 }
 
 template <typename Loop>
+void health_thresholds(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    REQUIRE(rig.owner.config->set_upstream_health_check(0, "/healthz", 8, 1000, 200, {2, 3}));
+    const auto respond = [&](bool success) {
+        Socket peer;
+        char request[512]{};
+        return start_health_probe(rig.loop, 0, 0) &&
+               rig.receive_request(peer, request, sizeof(request)) &&
+               rig.respond(peer,
+                           success ? "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                                   : "HTTP/1.1 500 Failed\r\nContent-Length: 0\r\n\r\n");
+    };
+    struct Outcome {
+        bool success;
+        bool ejected;
+    };
+    const Outcome outcomes[] = {{false, false},
+                                {true, false},
+                                {false, false},
+                                {false, true},
+                                {true, true},
+                                {true, true},
+                                {false, true},
+                                {true, true},
+                                {true, true},
+                                {true, false}};
+    for (const auto& outcome : outcomes) {
+        REQUIRE(respond(outcome.success));
+        record_backend_result(0, 0, true, 0);
+        CHECK_EQ(backend_ejected(0, 0, ~u64{0}), outcome.ejected);
+    }
+
+    // The previous configuration's partial streak cannot eject a replacement.
+    REQUIRE(respond(false));
+    rig.owner.config->http_cache_identity = http_cache_config_identity();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    Socket stalled;
+    char request[512]{};
+    REQUIRE(rig.receive_request(stalled, request, sizeof(request)));
+    for (u32 i = 0; i < 3; ++i) rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_FALSE(backend_ejected(0, 0, ~u64{0}));
+    REQUIRE(respond(false));
+    CHECK(backend_ejected(0, 0, ~u64{0}));
+    CHECK_EQ(rig.loop->active_count(), 0u);
+}
+
+template <typename Loop>
 void timeout_and_reclaim(rut::test::TestCase* _tc) {
     ProbeRig<Loop> rig;
     REQUIRE(rig.init());
@@ -264,6 +314,12 @@ TEST(health_probe, epoll_health_and_recovery) {
 }
 TEST(health_probe, iouring_health_and_recovery) {
     health_and_recovery<IoUringEventLoop>(_tc);
+}
+TEST(health_probe, epoll_health_thresholds) {
+    health_thresholds<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_health_thresholds) {
+    health_thresholds<IoUringEventLoop>(_tc);
 }
 TEST(health_probe, epoll_timeout_and_reclaim) {
     timeout_and_reclaim<EpollEventLoop>(_tc);

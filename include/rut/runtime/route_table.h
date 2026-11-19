@@ -12,6 +12,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_health.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
@@ -94,6 +95,7 @@ struct UpstreamTarget {
     u32 hc_path_len = 0;
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
+    ActiveHealthThresholds hc_thresholds{};
 
     void set_name(const char* n) {
         name_len = 0;
@@ -1875,21 +1877,25 @@ public:
         return true;
     }
 
-    // Attach active health-check config to an upstream (by id). Data only — no
-    // probing is performed yet. `path` (length `path_len`, not required to be
+    // Attach active health-check config to an upstream (by id).
+    // `path` (length `path_len`, not required to be
     // NUL-terminated) is the probe path; `interval_ms` the probe period;
     // `status` the status code that marks a backend healthy. Returns false on a
     // bad upstream id, an over-long path, a non-origin-form path (empty, missing
     // the leading '/', or containing bytes that would break the request line),
     // or an impossible expected HTTP status.
-    bool set_upstream_health_check(
-        u32 uid, const char* path, u32 path_len, u32 interval_ms, u16 status) {
+    bool set_upstream_health_check(u32 uid,
+                                   const char* path,
+                                   u32 path_len,
+                                   u32 interval_ms,
+                                   u16 status,
+                                   ActiveHealthThresholds thresholds = {}) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
         if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (interval_ms == 0) return false;
-        if (status < 100 || status > 599) return false;
+        if (status < 100 || status > 599 || !thresholds.valid()) return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
         // be an origin-form target that cannot inject spaces/control bytes into
         // the request line. The DSL path is also checked at parse time; this is
@@ -1904,6 +1910,7 @@ public:
         up.hc_path_len = path_len;
         up.hc_interval_ms = interval_ms;
         up.hc_expected_status = status;
+        up.hc_thresholds = thresholds;
         up.hc_enabled = true;
         return true;
     }

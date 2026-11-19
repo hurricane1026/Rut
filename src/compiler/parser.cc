@@ -3884,10 +3884,8 @@ struct Parser {
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
                 } else if (field_name.eq({"health_check", 12})) {
-                    // `health_check: { path: "...", interval: <dur>, status: N }`
-                    // — active-health config (data only this slice). path and
-                    // interval are required; status defaults to 200. Mirrors the
-                    // dict-field error style above (dup/unknown/missing).
+                    // Active health requires a path and interval. Status defaults to
+                    // 200, and each consecutive-outcome threshold defaults to one.
                     if (item.upstream.hc_enabled)
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
@@ -3896,6 +3894,8 @@ struct Parser {
                     bool seen_path = false;
                     bool seen_interval = false;
                     bool seen_status = false;
+                    bool seen_failure_threshold = false;
+                    bool seen_success_threshold = false;
                     while (true) {
                         auto hc_field = expect(TokenType::Ident);
                         if (!hc_field) return core::make_unexpected(hc_field.error());
@@ -3982,6 +3982,33 @@ struct Parser {
                                                       lit.value()->text);
                             item.upstream.hc_expected_status = static_cast<u16>(sv);
                             seen_status = true;
+                        } else if (hc_key.eq({"failure_threshold", 17}) ||
+                                   hc_key.eq({"success_threshold", 17})) {
+                            const bool kFailure = hc_key.eq({"failure_threshold", 17});
+                            bool& seen = kFailure ? seen_failure_threshold : seen_success_threshold;
+                            if (seen)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto lit = expect(TokenType::IntLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            u32 value = 0;
+                            for (u32 i = 0; i < lit.value()->text.len; i++) {
+                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[i] - '0');
+                                if (value > (ActiveHealthThresholds::kMax - digit) / 10u)
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*lit.value()),
+                                                          lit.value()->text);
+                                value = value * 10 + digit;
+                            }
+                            if (value == 0)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*lit.value()),
+                                                      lit.value()->text);
+                            auto& thresholds = item.upstream.hc_thresholds;
+                            (kFailure ? thresholds.failures : thresholds.successes) =
+                                static_cast<u8>(value);
+                            seen = true;
                         } else {
                             return frontend_error(FrontendError::UnexpectedToken,
                                                   span_from(*hc_field.value()),

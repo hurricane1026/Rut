@@ -10520,6 +10520,32 @@ TEST(frontend, parse_upstream_health_check_rejects_out_of_range_status) {
     }
 }
 
+TEST(frontend, parse_upstream_health_check_rejects_invalid_thresholds) {
+    struct Case {
+        const char* fields;
+        FrontendError error;
+    };
+    const Case cases[] = {
+        {"failure_threshold: 0", FrontendError::InvalidInteger},
+        {"success_threshold: 256", FrontendError::InvalidInteger},
+        {"failure_threshold: 18446744073709551617", FrontendError::InvalidInteger},
+        {"success_threshold: 2, success_threshold: 3", FrontendError::UnexpectedToken},
+    };
+    for (const auto& test : cases) {
+        char src[256];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"/h\", "
+                 "interval: 1s, %s } }\nroute GET \"/u\" { return 200 }\n",
+                 test.fields);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, test.error);
+    }
+}
+
 TEST(frontend, parse_upstream_health_check_rejects_non_origin_path) {
     // The probe writes the path verbatim into `GET <path> HTTP/1.1`, so a path
     // without a leading '/' (e.g. "healthz") would emit a malformed request line

@@ -11,6 +11,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_health.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
 #include "rut/common/ws_control_flow.h"
@@ -67,6 +68,7 @@ struct HirUpstream {
     Str hc_path{};
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
+    ActiveHealthThresholds hc_thresholds{};
 };
 
 struct HirListener {
