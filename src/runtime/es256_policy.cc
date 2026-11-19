@@ -315,11 +315,18 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
             remote->fetch.cancel();
             remote->last_success = 0;
             remote->next_attempt = 0;
+            remote->validator.clear();
             continue;
         }
+        if (!jwks_cache_fresh(monotonic_ms, remote->last_success, policy.max_age_seconds))
+            remote->validator.clear();
         if (remote->fetch.state() != HttpsFetch::State::Busy) {
             if (monotonic_ms < remote->next_attempt) continue;
-            if (!remote->fetch.start(monotonic_ms, policy.timeout_seconds * 1000)) {
+            if (!remote->fetch.start(
+                    monotonic_ms,
+                    policy.timeout_seconds * 1000,
+                    policy.conditional_requests ? &remote->validator : nullptr,
+                    jwks_refresh_deadline(remote->last_success, policy.max_age_seconds))) {
                 remote->next_attempt = jwks_refresh_deadline(monotonic_ms, policy.retry_seconds);
                 remote->fetch.cancel();
                 continue;
@@ -328,7 +335,15 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
         remote->fetch.advance(monotonic_ms);
         if (remote->fetch.state() == HttpsFetch::State::Busy) continue;
         bool succeeded = false;
-        if (remote->fetch.state() == HttpsFetch::State::Done) {
+        if (remote->fetch.state() == HttpsFetch::State::Done && remote->fetch.not_modified()) {
+            if (remote->validator.tag[0] &&
+                jwks_cache_fresh(monotonic_ms, remote->last_success, policy.max_age_seconds)) {
+                remote->last_success = monotonic_ms;
+                succeeded = true;
+            } else {
+                remote->validator.clear();
+            }
+        } else if (remote->fetch.state() == HttpsFetch::State::Done) {
             Es256KeySet keys;
             const auto kPrepared = policies[i].prepare_refresh(remote->fetch.body(), keys);
             if (kPrepared != Es256Policy::Refresh::Invalid) {
@@ -342,6 +357,7 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
                     remote->use_alternate = !remote->use_alternate;
                     remote->empty = kPrepared == Es256Policy::Refresh::Empty;
                     remote->last_success = monotonic_ms;
+                    remote->validator = remote->fetch.validator();
                     succeeded = true;
                 }
             }
@@ -355,8 +371,12 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
 
 void Es256Policies::cancel(u32 shard) {
     if (!rows || shard >= kMaxShards) return;
-    for (u32 i = 0; i < count; ++i)
-        if (rows[shard].remote[i]) rows[shard].remote[i]->fetch.cancel();
+    for (u32 i = 0; i < count; ++i) {
+        if (rows[shard].remote[i]) {
+            rows[shard].remote[i]->fetch.cancel();
+            rows[shard].remote[i]->validator.clear();
+        }
+    }
 }
 
 bool Es256Policies::fetch_busy(u32 shard) const {

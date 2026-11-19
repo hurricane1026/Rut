@@ -72,6 +72,7 @@ public:
 private:
     struct RemoteRow {
         JwksFetch fetch;
+        JwksValidator validator;
         Es256VerifierSet alternate;
         u64 last_success = 0;
         u64 next_attempt = 0;

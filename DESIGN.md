@@ -10245,14 +10245,25 @@ handling cancels work and clears freshness; retry never renews last-success or
 maximum key age. Attempt timeouts still span DNS, metadata and key-fetch stages
 from their start; there is no jitter, exponential backoff or request-driven fetch.
 
+Optional Boolean `remoteJwks.conditionalRequests` enables bounded authenticated
+ETag revalidation for both algorithms. Strong quoted ASCII tags (at most 128
+bytes) commit atomically with accepted 200 key/empty-set activation and bind to
+its selected address. Same-address initial-candidate GETs may send the owned tag
+only before hard expiry. Changed addresses and failover are unconditional. A
+bodyless 304 must repeat the exact sent tag and complete while the cache remains
+fresh. It preserves verifier banks/empty state and renews successful age/cadence.
+Cold/expired caches need a full 200. Malformed validators or ineligible 304s fail
+without renewing age. Missing ETag on accepted 200 clears prior state. Discovery
+and other HTTPS profiles remain unchanged. See [the exact contract](docs/jwks-discovery.md#conditional-key-refresh).
+
 Both event-loop implementations poll this same task; the specialized epoll/kqueue
 loops use the same maintenance hook. Config replacement cancels the retiring shard's
 fetch while preserving its RCU-owned keys for existing readers until expiration;
 shutdown/destruction close resources. No blocking DNS/network operation, request-
 time key parsing, coroutine, virtual dispatch, external HTTP client library or
-cross-shard mutable cache is introduced. DNS/discovery, new-kid auto-admission,
-HTTP/2, conditional cache revalidation and distributed refresh coordination remain
-outside this bounded profile.
+cross-shard mutable cache is introduced. New-kid auto-admission,
+HTTP/2 origin fetching and distributed refresh coordination remain outside this
+bounded profile.
 
 ### Native password-storage foundation
 

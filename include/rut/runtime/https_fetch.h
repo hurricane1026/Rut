@@ -26,6 +26,7 @@ public:
     static constexpr u32 kMaxWire = 16384;
     void reset(bool authorization = false);
     void reset_callout();
+    void reset_conditional_jwks();
     u16 status() const { return status_; }
     Str unique_header(Str name) const;
     bool headers(ParsedResponse& response) const;
@@ -43,6 +44,7 @@ private:
     u32 expected_ = 0;
     bool authorization_ = false;
     bool callout_ = false;
+    bool conditional_jwks_ = false;
     u16 status_ = 0;
     bool headers_ = false;
     bool chunked_ = false;
@@ -71,6 +73,7 @@ public:
     Str unique_header(Str name) const { return response_.unique_header(name); }
     bool start(u64 monotonic_ms, u32 timeout_ms);
     bool set_address(Str address);
+    bool set_jwks_condition(Str entity_tag);
     void advance(u64 monotonic_ms);
     void cancel();
     State state() const { return state_; }
@@ -85,6 +88,7 @@ private:
     i32 fd_ = -1;
     bool authorization_ = false;
     bool callout_ = false;
+    bool conditional_jwks_ = false;
     bool connect_failed_ = false;
     char request_[6144]{};
     u32 request_len_ = 0;
@@ -97,12 +101,16 @@ private:
     void close();
     bool fail();
     bool fail_connect(int error);
+    bool prepare_jwks_request(Str entity_tag);
     static bool connected(HttpsFetch& self);
     static bool start_tls(HttpsFetch& self);
     static bool handshake(HttpsFetch& self);
     static bool write(HttpsFetch& self);
     static bool read(HttpsFetch& self);
 };
+
+// Strong quoted ASCII entity-tag; bounded for owned JWKS validator storage.
+bool strong_etag_valid(Str value);
 
 // Zero on invalid/failed clock. Callers fail closed on zero or time reversal.
 u64 jwt_monotonic_ms();

@@ -55,6 +55,7 @@ bool HttpsEndpoint::valid() const {
 void BoundedJsonResponse::reset(bool authorization) {
     authorization_ = authorization;
     callout_ = false;
+    conditional_jwks_ = false;
     status_ = 0;
     wire_len_ = body_len_ = offset_ = expected_ = 0;
     headers_ = chunked_ = sized_ = false;
@@ -64,6 +65,21 @@ void BoundedJsonResponse::reset(bool authorization) {
 void BoundedJsonResponse::reset_callout() {
     reset(true);
     callout_ = true;
+}
+void BoundedJsonResponse::reset_conditional_jwks() {
+    reset();
+    conditional_jwks_ = true;
+}
+
+bool strong_etag_valid(Str value) {
+    if (!value.ptr || value.len < 2 || value.len > 128 || value.ptr[0] != '"' ||
+        value.ptr[value.len - 1] != '"')
+        return false;
+    for (u32 i = 1; i + 1 < value.len; ++i) {
+        const auto kByte = static_cast<u8>(value.ptr[i]);
+        if (kByte != 0x21 && (kByte < 0x23 || kByte > 0x7e)) return false;
+    }
+    return true;
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
@@ -83,12 +99,15 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         if (kStatus == ParseStatus::Error) return Result::Error;
         if (kStatus == ParseStatus::Incomplete)
             return wire_len_ >= 8192 ? Result::Error : Result::More;
-        if (parser.header_end > 8192 || (!authorization_ && response.status_code != 200) ||
+        if (parser.header_end > 8192 ||
+            (!authorization_ && response.status_code != 200 &&
+             !(conditional_jwks_ && response.status_code == 304)) ||
             (callout_ && (response.status_code < 200 || response.status_code > 599)) ||
             (authorization_ && !callout_ && response.status_code != 200 &&
              response.status_code != 401 && response.status_code != 403) ||
             response.headers_truncated || response.content_length_count > 1 ||
-            (response.content_length > kMaxBody && !(callout_ && response.status_code == 304)))
+            (response.content_length > kMaxBody &&
+             !((callout_ || conditional_jwks_) && response.status_code == 304)))
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
         for (u32 i = 0; i < response.header_count; ++i) {
@@ -111,19 +130,23 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                        (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
                     --end;
                 const Str kType{header.value.ptr, end};
-                if (!authorization_ && !equal_ci(kType, lit_str("application/json")) &&
+                if (!authorization_ && !(conditional_jwks_ && response.status_code == 304) &&
+                    !equal_ci(kType, lit_str("application/json")) &&
                     !equal_ci(kType, lit_str("application/jwk-set+json")))
                     return Result::Error;
             }
         }
-        if ((!authorization_ && type_count != 1) || (transfer_count && response.has_content_length))
+        if ((!authorization_ && !(conditional_jwks_ && response.status_code == 304) &&
+             type_count != 1) ||
+            (transfer_count && response.has_content_length))
             return Result::Error;
         status_ = response.status_code;
         headers_ = true;
         chunked_ = transfer_count != 0;
         sized_ = response.has_content_length;
         expected_ = response.content_length;
-        if (callout_ && (status_ == 204 || status_ == 205 || status_ == 304)) {
+        if ((callout_ && (status_ == 204 || status_ == 205 || status_ == 304)) ||
+            (conditional_jwks_ && status_ == 304)) {
             if (chunked_ || (status_ != 304 && expected_ != 0)) return Result::Error;
             sized_ = true;
             expected_ = 0;
@@ -225,21 +248,37 @@ bool HttpsFetch::init(const HttpsEndpoint& endpoint) {
     if (context_.ssl_ctx || !endpoint.valid()) return false;
     if (!init_tls_client_context(context_, endpoint.tls)) return false;
     endpoint_ = endpoint;
+    if (!prepare_jwks_request({})) {
+        destroy_tls_client_context(context_);
+        return false;
+    }
+    return true;
+}
+bool HttpsFetch::prepare_jwks_request(Str entity_tag) {
     const int kSize = snprintf(
         request_,
         sizeof(request_),
         "GET %s HTTP/1.1\r\nHost: %s:%u\r\nAccept: application/jwk-set+json, application/json\r\n"
-        "Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        endpoint.path,
-        endpoint.tls.server_name,
-        endpoint.port);
-    if (kSize <= 0 || static_cast<u32>(kSize) >= sizeof(request_)) {
-        destroy_tls_client_context(context_);
-        return false;
-    }
+        "Accept-Encoding: identity\r\nConnection: close\r\n%s%.*s%s\r\n",
+        endpoint_.path,
+        endpoint_.tls.server_name,
+        endpoint_.port,
+        entity_tag.len ? "If-None-Match: " : "",
+        static_cast<int>(entity_tag.len),
+        entity_tag.ptr ? entity_tag.ptr : "",
+        entity_tag.len ? "\r\n" : "");
+    if (kSize <= 0 || static_cast<u32>(kSize) >= sizeof(request_)) return false;
     request_len_ = static_cast<u32>(kSize);
     return true;
 }
+bool HttpsFetch::set_jwks_condition(Str entity_tag) {
+    if (!context_.ssl_ctx || state_ == State::Busy || authorization_ ||
+        (entity_tag.len && !strong_etag_valid(entity_tag)) || !prepare_jwks_request(entity_tag))
+        return false;
+    conditional_jwks_ = true;
+    return true;
+}
+
 bool HttpsFetch::init_authorization(const HttpsEndpoint& endpoint, Str request) {
     if (!request.ptr || !request.len || request.len > sizeof(request_) || !init(endpoint))
         return false;
@@ -272,6 +311,7 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     close();
     response_.reset(authorization_);
     if (callout_) response_.reset_callout();
+    if (conditional_jwks_) response_.reset_conditional_jwks();
     started_ = monotonic_ms;
     timeout_ms_ = timeout_ms;
     sent_ = 0;
