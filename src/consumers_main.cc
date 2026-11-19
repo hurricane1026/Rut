@@ -735,6 +735,7 @@ enum class RegistryAction : u8 {
     InheritCredentialGroups,
     SetCredentialWindow,
     ClearCredentialWindow,
+    MoveCredential,
 };
 
 struct RegistryCommand {
@@ -753,6 +754,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"inherit-credential-groups", 5, RegistryAction::InheritCredentialGroups},
     {"set-credential-window", 7, RegistryAction::SetCredentialWindow},
     {"clear-credential-window", 5, RegistryAction::ClearCredentialWindow},
+    {"move-credential", 6, RegistryAction::MoveCredential},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -780,17 +782,23 @@ bool update_credential(
     json::Document& doc, u32 record, RegistryAction action, char** args, json::Writer& output) {
     const bool kGroups = action == RegistryAction::SetCredentialGroups ||
                          action == RegistryAction::InheritCredentialGroups;
-    const u32 kGroupsField = field(doc, record, lit_str("groups"));
     const bool kWindow = action == RegistryAction::SetCredentialWindow ||
                          action == RegistryAction::ClearCredentialWindow;
+    const u32 kGroupsField = field(doc, record, lit_str("groups"));
+    const u32 kOwnerField = field(doc, record, lit_str("consumerId"));
     const u32 kStartField = field(doc, record, lit_str("notBefore"));
     const u32 kEndField = field(doc, record, lit_str("expiresAt"));
+    const bool kMove = action == RegistryAction::MoveCredential;
+    if (kMove && (kGroupsField == json::kNone ||
+                  !doc.raw(field(doc, record, lit_str("enabled"))).eq(lit_str("false"))))
+        return false;
 
     output.put('{');
     bool first = true;
     for (u32 child = doc.nodes[record].child; child != json::kNone; child = doc.nodes[child].next) {
         if ((kGroups && child == kGroupsField) ||
-            (kWindow && (child == kStartField || child == kEndField)))
+            (kWindow && (child == kStartField || child == kEndField)) ||
+            (kMove && child == kOwnerField))
             continue;
         if (!first) output.put(',');
         first = false;
@@ -809,6 +817,10 @@ bool update_credential(
         if (!append_window_bound(output, lit_str("notBefore"), args[4]) ||
             !append_window_bound(output, lit_str("expiresAt"), args[5]))
             return false;
+    } else if (kMove) {
+        const Str owner{args[4], bounded_argument(args[4], 65)};
+        output.text(lit_str(",\"consumerId\":"));
+        if (!provision_id_valid(owner) || !json::quote(owner, output)) return false;
     }
     output.put('}');
     return output.ok;
@@ -954,6 +966,7 @@ constexpr char kUsage[] =
     "       rut-consumers inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT\n"
     "       rut-consumers clear-credential-window INPUT CREDENTIAL_ID OUTPUT\n"
+    "       rut-consumers move-credential INPUT CREDENTIAL_ID NEW_CONSUMER_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"

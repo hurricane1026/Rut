@@ -536,8 +536,11 @@ a new private snapshot under the same no-replace rules as `apply`.
 | `inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT` | Remove the credential-level restriction so it inherits its owner's groups. |
 | `set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT` | Replace both validity bounds. Values are nonnegative Unix seconds, and `-` omits a bound. Positive starts are inclusive and positive expiries are exclusive. Zero retains the registry format's unbounded semantics. |
 | `clear-credential-window INPUT CREDENTIAL_ID OUTPUT` | Remove both validity bounds. |
+| `move-credential INPUT CREDENTIAL_ID NEW_CONSUMER_ID OUTPUT` | Reassign an explicitly disabled credential with an explicit group restriction. Every restricted group must exist on the destination Consumer. The credential stays disabled. |
 
-Removal frees
+A move preserves the credential's key material, method, time bounds and explicit
+group restriction. If the key material was issued to the old owner, provision
+replacement key material before enabling access for the new owner. Removal frees
 IDs for reuse and becomes effective when the replacement is deployed. The input
 snapshot and older files still contain their previous credential records.
 

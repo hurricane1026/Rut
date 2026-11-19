@@ -3694,6 +3694,10 @@ The offline `rut-consumers` executable validates, previews redacted replacements
 inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic
 running-gateway publication. See [offline administration](consumer-registry.md#offline-administration).
 
+[Targeted lifecycle commands](consumer-registry.md#targeted-lifecycle-commands)
+support redacted record lookup, removal, and credential group, validity window
+and disabled-owner updates. Operations use the same private snapshot format.
+
 `consumerAuthenticateMtls(configuration) -> Json?` is the only registry entry
 point for `method: "mtls"`. That record's `secret` field is a public canonical
 64-character lowercase hexadecimal SHA-256 certificate fingerprint pin. The

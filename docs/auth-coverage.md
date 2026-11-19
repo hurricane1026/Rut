@@ -474,6 +474,17 @@ configuration, spoofed identity/group headers, deny-before-allow composition,
 unknown verified Consumers and optional-auth guests. See
 [the runnable example](../examples/consumer-group-deny-auth.rut).
 
+## Targeted offline Consumer lifecycle
+
+`rut-consumers` can inspect an individual Consumer or credential with metadata-only
+output, remove credentials and empty Consumers, or explicitly remove a Consumer
+with all of its credentials. Credential updates support explicit group subsets,
+owner-group inheritance, start/expiry windows, and reassignment while disabled
+with the same explicit group restriction. Each mutation validates a complete
+snapshot and writes it to a new private file for explicit deployment.
+See [the commands and deployment contract](consumer-registry.md#targeted-lifecycle-commands)
+for #1072.
+
 ## Static HS JWT secret rotation
 
 `auth.rotatingJwtDocumentHs256` / `Hs384` / `Hs512` verify against an explicit

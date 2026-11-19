@@ -11176,6 +11176,15 @@ replacement, then uses existing key-first/snapshot-second private no-replace
 publication. No language or runtime semantics change. Online deployment and
 broader lifecycle acceptance remain open in #1072. See [the provisioning profile](docs/consumer-registry.md#registering-consumers-and-provisioning-constrained-keys).
 
+Targeted `rut-consumers` commands select one decoded stable ID in a validated
+snapshot. Record inspection omits key material. Mutation builds a replacement
+with the existing JSON writer, validates the complete result with the runtime
+registry validator, and uses the existing no-replace private publication path.
+Removing an owner requires either an empty credential set or the explicit
+owner-and-credentials command. Reassigning a credential requires that credential
+to be explicitly disabled with a group subset also valid for the destination
+owner. Reassignment preserves its disabled state and credential policy.
+
 `rut-consumers prune-credentials` removes explicitly disabled credentials and
 finite expiries at or before an operator-supplied canonical positive signed-64-bit
 Unix-second cutoff. It does not read the clock. All Consumers and full retained
