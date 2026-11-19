@@ -142,8 +142,7 @@ the conditional GET after DNS/discovery and when accepting the 304. Expiry durin
 an in-flight request rejects its 304. The next attempt requires a full 200 and
 cannot revive old keys through revalidation. Failure never renews age. Clock
 failure/reset and configuration retirement discard validators. Attempt cleanup
-clears its own copied state. Discovery requests never send `If-None-Match` and
-remain 200-only. All stages retain the original attempt timeout and retry cadence.
+clears its own copied state. Discovery has a separate opt-in validator. All stages retain the original attempt timeout and retry cadence.
 No request traffic, token or unknown kid creates extra work.
 
 ## Discovery contract
@@ -168,6 +167,26 @@ TTL interpretation and alias ownership are informed by
 [section 10.1](https://www.rfc-editor.org/rfc/rfc2181#section-10.1). This profile
 deliberately rejects zero and high-bit-set TTLs instead of accepting zero or
 normalizing a high-bit-set value to zero as described by the RFC.
+
+## Conditional discovery
+
+Optional Boolean `conditionalDiscovery` defaults to false and requires configured
+discovery when true. Discovery normally uses unconditional GETs and expects 200.
+With the option enabled, an authenticated 200 that passes exact issuer and
+endpoint checks can commit its own strong ETag under the same 128-byte syntax as
+key ETags. Missing ETag clears the discovery validator. Duplicate, weak or
+malformed ETags fail the discovery attempt.
+
+The exact selected IPv4 address and the immutable configured discovery endpoint
+bind the owned validator to that representation. The initial candidate can send
+this tag while the metadata remains younger than `maxAgeSeconds`. Address changes
+and TCP failover candidates always fetch full metadata. A 304 must be bodyless,
+match the exact sent strong ETag and finish before the metadata hard age expires.
+Accepting it renews metadata age only. Every successful discovery still proceeds
+to a separate key GET within the original attempt deadline. The discovery tag
+never becomes a key tag, and accepting metadata does not renew key age.
+Clock failure or reversal, cancellation and configuration retirement discard
+the stored discovery validator.
 
 One shard-owned `JwksFetch` coordinates DNS, discovery and the key GET under one
 timeout. At most one stage is in flight per policy/shard. No token, unknown kid,

@@ -2673,7 +2673,10 @@ malformed ETag rejects the enabled-profile attempt. Conditional GETs require the
 same initial IPv4 candidate and a still-fresh cache. Changed-IP/failover GETs are
 unconditional. A 304 requires the exact sent tag and fresh cache at completion,
 keeps the verifier bank/empty state, and renews age on success. Cold/expired caches
-need full 200 responses, and discovery is always unconditional/200-only. See
+need full 200 responses. Discovery remains unconditional unless
+`conditionalDiscovery` enables a separate, same-address strong ETag and hard
+metadata age under `maxAgeSeconds`. Discovery revalidation still fetches keys
+and never renews key age. See
 [the conditional contract](jwks-discovery.md#conditional-key-refresh).
 Cache-Control-derived lifetimes, HTTP/2 origin fetches and compressed responses
 remain outside this profile.
