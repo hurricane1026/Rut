@@ -27,6 +27,9 @@ def main():
     parser.add_argument("--discovery-dns", action="store_true")
     parser.add_argument("--access-profile", action="store_true")
     parser.add_argument("--conditional", action="store_true")
+    parser.add_argument("--dns-cache", action="store_true")
+    parser.add_argument("--retry-after", action="store_true")
+    parser.add_argument("--retry-backoff", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -41,6 +44,7 @@ def main():
              "discovery": "valid", "dns": "valid",
              "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
              "conditionalRequests": [], "discoveries": [], "discoveryDelay": 0}
+    state["retryAfter"] = () if args.retry_after else ("30",)
     cold_release = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -75,6 +79,7 @@ def main():
                 state["locals"].append(self.connection.getsockname()[0])
                 status, body, hold = state["status"], state["body"], state["hold"]
                 delay = state["delay"]
+                retry_after = state["retryAfter"]
                 state["attempts"].append((time.monotonic(), status, delay))
                 tags = []
                 if args.conditional:
@@ -111,6 +116,9 @@ def main():
                     self.send_header("Content-Type", "application/jwk-set+json")
                 for tag in tags:
                     self.send_header("ETag", tag)
+                if status in (429, 503):
+                    for value in retry_after:
+                        self.send_header("Retry-After", value)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -190,6 +198,10 @@ def main():
         retry_profile = not args.discovery_dns and not args.access_profile and not args.conditional
         if retry_profile:
             policy["remoteJwks"].update(retrySeconds=2, timeoutSeconds=2)
+        if args.retry_after:
+            policy["remoteJwks"].update(retrySeconds=1, maxRetryAfterSeconds=3)
+        if args.retry_backoff:
+            policy["remoteJwks"].update(retrySeconds=1, maxRetrySeconds=3)
         if args.discovery_dns:
             # Reserve the allowlisted first address without listening on it.
             refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -198,6 +210,9 @@ def main():
                                        allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
+        if args.dns_cache:
+            assert args.discovery_dns
+            policy["remoteJwks"]["dnsCacheSeconds"] = 4
         literal = json.dumps(json.dumps(policy, separators=(",", ":")))
         if args.access_profile:
             policy["requiredType"] = "at+jwt"
@@ -325,7 +340,82 @@ def main():
                     time.sleep(0.01)
                 raise AssertionError(f"JWKS request did not reach {target}; seen {state['locals']}")
 
-            if args.conditional:
+            def assert_retry_interval(got, expected):
+                # Idle maintenance runs on a one-second tick. A refresh can
+                # finish just after the tick and miss the first eligible tick.
+                assert expected - .15 <= got <= expected + 1.5, (got, expected)
+
+            if args.retry_backoff:
+                def failures(expected, limit):
+                    with lock:
+                        begin = len(state["attempts"])
+                        state["status"] = 503
+                    deadline = time.monotonic() + limit
+                    while time.monotonic() < deadline:
+                        with lock:
+                            times = [at for at, code, _ in state["attempts"][begin:] if code == 503]
+                        if len(times) > len(expected):
+                            intervals = [right - left for left, right in zip(times, times[1:])]
+                            for got, want in zip(intervals, expected):
+                                assert_retry_interval(got, want)
+                            return
+                        time.sleep(.02)
+                    raise AssertionError(f"backoff retries {times} did not match {expected}")
+
+                wait_status(fixture["a"], 200)
+                failures((1, 2, 3, 3), 19)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+                failures((1,), 6)
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+            elif args.retry_after:
+                def delay_for(status, headers, expected, limit):
+                    with lock:
+                        begin = len(state["attempts"])
+                        state.update(status=status, retryAfter=headers)
+                    deadline = time.monotonic() + limit
+                    while time.monotonic() < deadline:
+                        with lock:
+                            times = [at for at, code, _ in state["attempts"][begin:]
+                                     if code == status]
+                        if len(times) >= 2:
+                            assert_retry_interval(times[1] - times[0], expected)
+                            return
+                        time.sleep(.02)
+                    raise AssertionError(f"did not observe two HTTP {status} attempts: {times}")
+
+                wait_status(fixture["a"], 200)
+                delay_for(503, ("30",), 3, 9)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                delay_for(429, ("30", "30"), 1, 8)
+                delay_for(503, ("0",), 1, 7)
+                delay_for(429, ("2",), 2, 8)
+                publish(json.dumps(fixture["first"]["jwks"]).encode())
+                wait_status(fixture["a"], 200)
+            elif args.dns_cache:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    initial_dns = state["dnsRequests"]
+                    initial_keys = state["requests"]
+                    state["dns"] = "timeout"
+                assert initial_dns == 1
+                wait_for_origin_request(initial_keys)
+                with lock:
+                    assert state["dnsRequests"] == initial_dns
+                wait_for_dns_request(initial_dns, limit=8)
+                wait_status(fixture["a"], 401)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+                with lock:
+                    before_recovery = state["requests"]
+                    state["dns"] = "move"
+                wait_for_origin_address(before_recovery, "127.0.0.2")
+                wait_status(fixture["a"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
+            elif args.conditional:
                 def observed(predicate, start=0, count=1, limit=12):
                     deadline = time.monotonic() + limit
                     while time.monotonic() < deadline:

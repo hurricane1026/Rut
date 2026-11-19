@@ -2606,8 +2606,8 @@ succeed before any claims are returned; revocation failure is the usual nil/401.
 
 The compile-time `Crypto.jwtRs256(token, policy)` and
 `Crypto.jwtEs256(token, policy)` policies can include an optional `remoteJwks`
-object with these eight required members (and optional `retrySeconds`,
-`conditionalRequests` and trusted DNS/discovery fields described below):
+object with these eight required members plus the optional retry,
+conditional and trusted DNS/discovery settings described below:
 
 ```json
 {"address":"192.0.2.10","port":443,"serverName":"issuer.example",
@@ -2623,7 +2623,9 @@ configuration, never token/HTTP-request data. The address is a literal IPv4;
 there is no blocking DNS, redirect following or token-driven fetch. Optional
 `dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A/CNAME DNS; optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
-validation. Neither profile accepts request-selected destinations. See
+validation. In DNS mode `dnsCacheSeconds` (1–3600) enables per-shard reuse up
+to the earlier of the configured cap and the shortest validated record TTL.
+Neither profile accepts request-selected destinations. See
 [JWKS DNS/discovery](jwks-discovery.md) for schema, ownership and failure limits.
 The CA file and TLS server name are mandatory and certificate verification cannot
 be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
@@ -2633,9 +2635,13 @@ implicit and cleartext endpoints are unavailable.
 strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Optional
 `retrySeconds` is an integer from 1–3600 and defaults to `refreshSeconds`.
 Successful refreshes (including valid empty sets) wait `refreshSeconds` from
-completion; all failed attempts wait `retrySeconds` from failure completion.
-Slow failures therefore wait the full delay after timeout. Retry never extends
-maximum key age and can exceed it; there is no jitter or exponential backoff.
+completion. Failures default to waiting `retrySeconds` from completion.
+Optional `maxRetrySeconds` (at least `retrySeconds`, up to 3600) doubles the
+local delay on consecutive failures until the cap. Success resets it.
+Retry never extends maximum key age.
+Optional `maxRetryAfterSeconds` (1–3600) allows one bounded decimal
+`Retry-After` on authenticated key HTTP 429 and 503 responses. This can delay
+the next maintenance attempt without renewing the cache.
 Address, server name, CA path and request path are owned, bounded strings with no
 embedded
 NUL; paths start with `/` and cannot contain whitespace, controls, fragments or

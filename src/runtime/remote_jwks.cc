@@ -145,6 +145,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_port = static_cast<u16>(value);
             fields |= 4096;
+        } else if (kKey.eq(lit_str("dnsCacheSeconds"))) {
+            if (value > 3600) return false;
+            next.dns_cache_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("refreshSeconds"))) {
             if (value > 3600) return false;
             next.refresh_seconds = static_cast<u32>(value);
@@ -152,6 +155,12 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         } else if (kKey.eq(lit_str("retrySeconds"))) {
             if (value > 3600) return false;
             next.retry_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("maxRetrySeconds"))) {
+            if (value > 3600) return false;
+            next.max_retry_seconds = static_cast<u32>(value);
+        } else if (kKey.eq(lit_str("maxRetryAfterSeconds"))) {
+            if (value > 3600) return false;
+            next.max_retry_after_seconds = static_cast<u32>(value);
         } else if (kKey.eq(lit_str("maxAgeSeconds"))) {
             if (value > 86400) return false;
             next.max_age_seconds = static_cast<u32>(value);
@@ -164,11 +173,12 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             return false;
     }
     if (!next.retry_seconds) next.retry_seconds = next.refresh_seconds;
+    if (next.max_retry_seconds && next.max_retry_seconds < next.retry_seconds) return false;
     next.endpoint.tls.enabled = true;
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
         return false;
-    if (fields & (256 | 512 | 4096)) {
+    if ((fields & (256 | 512 | 4096)) || next.dns_cache_seconds) {
         in_addr resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
             inet_pton(AF_INET, next.dns_address, &resolver) != 1)
@@ -185,9 +195,25 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     return true;
 }
 
+bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
+    const bool kValid = now_ms && now_ms >= previous_ms;
+    previous_ms = now_ms;
+    return kValid;
+}
+
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
     const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
     return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
+}
+
+u32 JwksRetry::failure(const RemoteJwks& policy, u32 server_hint) {
+    const u32 kCap = policy.max_retry_seconds;
+    if (!kCap || !local_seconds_) {
+        local_seconds_ = policy.retry_seconds;
+    } else {
+        local_seconds_ = local_seconds_ > kCap / 2 ? kCap : local_seconds_ * 2;
+    }
+    return server_hint > local_seconds_ ? server_hint : local_seconds_;
 }
 
 void JwksValidator::clear() {
@@ -221,6 +247,29 @@ bool jwks_response_etag(const ParsedResponse& response, Str& entity_tag) {
         entity_tag = kHeader.value;
     }
     return true;
+}
+u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
+    if (!cap_seconds || (response.status_code != 429 && response.status_code != 503)) return 0;
+    bool seen = false;
+    u32 delay = 0;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const auto& kHeader = response.headers[i];
+        if (!http_header_name_eq_ci(kHeader.name.ptr, kHeader.name.len, "Retry-After", 11))
+            continue;
+        const Str kValue = kHeader.value;
+        if (seen || !kValue.ptr || !kValue.len || kValue.len > 10 ||
+            (kValue.len > 1 && kValue.ptr[0] == '0'))
+            return 0;
+        seen = true;
+        for (u32 j = 0; j < kValue.len; ++j) {
+            const char kDigit = kValue.ptr[j];
+            if (kDigit < '0' || kDigit > '9') return 0;
+            const u32 kNumber = static_cast<u32>(kDigit - '0');
+            if (delay > (~u32{0} - kNumber) / 10) return 0;
+            delay = delay * 10 + kNumber;
+        }
+    }
+    return delay < cap_seconds ? delay : cap_seconds;
 }
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
     return now && last_success && now >= last_success &&
@@ -351,6 +400,7 @@ bool jwks_dns_answer(Str packet,
     };
     Record records[kMaxAnswers]{};
     u32 offset = query.len;
+    u32 min_ttl = ~u32{0};
     for (u32 i = 0; i < answers; ++i) {
         auto& record = records[i];
         if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
@@ -361,6 +411,7 @@ bool jwks_dns_answer(Str packet,
             (static_cast<u32>(read16(bytes + offset + 4)) << 16) | read16(bytes + offset + 6);
         const u32 size = read16(bytes + offset + 8);
         if (read16(bytes + offset + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
+        if (ttl < min_ttl) min_ttl = ttl;
         offset += 10;
         if (size > packet.len - offset) return false;
         const u32 end = offset + size;
@@ -406,6 +457,7 @@ bool jwks_dns_answer(Str packet,
             if (alias != answers) return false;
             for (u32 i = 0; i < answers; ++i)
                 if (!records[i].used) return false;
+            selected.ttl_seconds = min_ttl;
             addresses = selected;
             return true;
         }
@@ -419,7 +471,9 @@ JwksFetch::~JwksFetch() {
     cancel();
 }
 bool JwksFetch::init(const RemoteJwks& configuration) {
-    if (initialized_ || state_ == State::Busy || !keys_.init(configuration.endpoint)) return false;
+    if (initialized_ || state_ == State::Busy ||
+        !keys_.init(configuration.endpoint, configuration.max_retry_after_seconds != 0))
+        return false;
     if (configuration.discovery_path[0]) {
         HttpsEndpoint endpoint = configuration.endpoint;
         __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
@@ -429,7 +483,7 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
     initialized_ = true;
     return true;
 }
-void JwksFetch::cancel() {
+void JwksFetch::finish_attempt() {
     if (dns_fd_ >= 0) ::close(dns_fd_);
     dns_fd_ = -1;
     keys_.cancel();
@@ -440,10 +494,20 @@ void JwksFetch::cancel() {
     response_validator_.clear();
     sent_validator_ = false;
     validator_deadline_ = 0;
+    retry_after_seconds_ = 0;
     state_ = State::Cancelled;
 }
+void JwksFetch::clear_dns_cache() {
+    cached_addresses_ = {};
+    dns_cached_at_ = 0;
+    dns_cache_deadline_ = 0;
+}
+void JwksFetch::cancel() {
+    finish_attempt();
+    clear_dns_cache();
+}
 bool JwksFetch::fail() {
-    cancel();
+    finish_attempt();
     state_ = State::Failed;
     return false;
 }
@@ -471,8 +535,11 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         sent_validator_ = kTag.len != 0;
     }
     // A synchronous connect error uses the same next-address path as SO_ERROR.
-    return fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
-           can_try_next_address(fetch) || fail();
+    if (fetch.start(now, timeout_ - static_cast<u32>(now - started_)) ||
+        can_try_next_address(fetch))
+        return true;
+    if (fetch.connect_failed()) clear_dns_cache();
+    return fail();
 }
 bool JwksFetch::start(u64 now,
                       u32 timeout_ms,
@@ -480,7 +547,7 @@ bool JwksFetch::start(u64 now,
                       u64 validator_deadline) {
     if (!initialized_ || state_ == State::Busy || !now || !timeout_ms) return false;
     const JwksValidator kSaved = validator ? *validator : JwksValidator{};
-    cancel();
+    finish_attempt();
     if (configuration_.conditional_requests && validator) {
         request_validator_ = kSaved;
         validator_deadline_ = validator_deadline;
@@ -489,6 +556,11 @@ bool JwksFetch::start(u64 now,
     timeout_ = timeout_ms;
     state_ = State::Busy;
     if (!configuration_.dns_address[0]) return begin_http(now);
+    if (cached_addresses_.count && now >= dns_cached_at_ && now < dns_cache_deadline_) {
+        addresses_ = cached_addresses_;
+        return begin_http(now);
+    }
+    clear_dns_cache();
     __builtin_memset(query_, 0, sizeof(query_));
     if (RAND_bytes(query_, 2) != 1) return fail();
     query_[2] = 1;
@@ -523,7 +595,12 @@ bool JwksFetch::start(u64 now,
 }
 void JwksFetch::advance(u64 now) {
     if (state_ != State::Busy) return;
-    if (!now || now < started_ || now - started_ >= timeout_) {
+    if (!now || now < started_ || now < dns_cached_at_) {
+        clear_dns_cache();
+        (void)fail();
+        return;
+    }
+    if (now - started_ >= timeout_) {
         (void)fail();
         return;
     }
@@ -540,6 +617,14 @@ void JwksFetch::advance(u64 now) {
         }
         ::close(dns_fd_);
         dns_fd_ = -1;
+        if (configuration_.dns_cache_seconds) {
+            const u32 kTtl = addresses_.ttl_seconds < configuration_.dns_cache_seconds
+                                 ? addresses_.ttl_seconds
+                                 : configuration_.dns_cache_seconds;
+            cached_addresses_ = addresses_;
+            dns_cached_at_ = now;
+            dns_cache_deadline_ = jwks_refresh_deadline(now, kTtl);
+        }
         (void)begin_http(now);
         return;
     }
@@ -551,6 +636,7 @@ void JwksFetch::advance(u64 now) {
             ++address_index_;
             (void)begin_http(now);
         } else {
+            if (fetch.connect_failed()) clear_dns_cache();
             (void)fail();
         }
         return;
@@ -565,6 +651,16 @@ void JwksFetch::advance(u64 now) {
         discovering_ = false;
         (void)start_http(keys_, now);
     } else {
+        if (keys_.status() == 429 || keys_.status() == 503) {
+            ParsedResponse response{};
+            const u32 kDelay =
+                keys_.headers(response)
+                    ? jwks_response_retry_after(response, configuration_.max_retry_after_seconds)
+                    : 0;
+            (void)fail();
+            retry_after_seconds_ = kDelay;
+            return;
+        }
         if (configuration_.conditional_requests) {
             ParsedResponse response{};
             Str tag{};

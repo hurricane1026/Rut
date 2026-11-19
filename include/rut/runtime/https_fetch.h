@@ -26,7 +26,7 @@ public:
     static constexpr u32 kMaxWire = 16384;
     void reset(bool authorization = false);
     void reset_callout();
-    void reset_conditional_jwks();
+    void reset_jwks(bool conditional, bool retry_after = false);
     u16 status() const { return status_; }
     Str unique_header(Str name) const;
     bool headers(ParsedResponse& response) const;
@@ -45,6 +45,7 @@ private:
     bool authorization_ = false;
     bool callout_ = false;
     bool conditional_jwks_ = false;
+    bool retry_after_jwks_ = false;
     u16 status_ = 0;
     bool headers_ = false;
     bool chunked_ = false;
@@ -64,7 +65,7 @@ public:
     HttpsFetch(const HttpsFetch&) = delete;
     HttpsFetch& operator=(const HttpsFetch&) = delete;
     ~HttpsFetch();
-    bool init(const HttpsEndpoint& endpoint);
+    bool init(const HttpsEndpoint& endpoint, bool retry_after_jwks = false);
     // Authorization profile: caller supplies a complete bounded HTTP request.
     bool init_authorization(const HttpsEndpoint& endpoint, Str request);
     bool init_callout(const HttpsEndpoint& endpoint, Str request);
@@ -89,6 +90,7 @@ private:
     bool authorization_ = false;
     bool callout_ = false;
     bool conditional_jwks_ = false;
+    bool retry_after_jwks_ = false;
     bool connect_failed_ = false;
     char request_[6144]{};
     u32 request_len_ = 0;

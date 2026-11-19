@@ -502,6 +502,17 @@ TEST(remote_jwks_metadata, retry_configuration_defaults_order_bounds_and_reset) 
     }
 }
 
+TEST(remote_jwks_metadata, maintenance_observes_idle_clock_reversal) {
+    u64 previous = 0;
+    REQUIRE(jwks_observe_time(previous, 1000));      // Last successful key refresh.
+    REQUIRE(jwks_observe_time(previous, 2000));      // A later failed refresh.
+    REQUIRE(jwks_observe_time(previous, 2300));      // Idle before the retry deadline.
+    CHECK_FALSE(jwks_observe_time(previous, 1900));  // Still newer than the successful refresh.
+    CHECK(jwks_observe_time(previous, 1900));
+    CHECK_FALSE(jwks_observe_time(previous, 0));
+    CHECK(jwks_observe_time(previous, 100));
+}
+
 TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     // A slow attempt completes after its previous refresh interval. Its retry
     // still waits a full configured interval from this later completion time.
@@ -511,6 +522,108 @@ TEST(remote_jwks_metadata, completion_deadline_intervals_and_overflow) {
     CHECK_EQ(jwks_refresh_deadline(~u64{0} - 1000, 1), ~u64{0});
     CHECK_EQ(jwks_refresh_deadline(~u64{0} - 999, 1), ~u64{0});
     CHECK_EQ(jwks_refresh_deadline(~u64{0}, 3600), ~u64{0});
+}
+
+TEST(remote_jwks_metadata, local_retry_backoff_caps_resets_and_keeps_hints_separate) {
+    RemoteJwks policy;
+    policy.retry_seconds = 3;
+    JwksRetry delay;
+    CHECK_EQ(delay.failure(policy), 3u);
+    CHECK_EQ(delay.failure(policy), 3u);
+    policy.max_retry_seconds = 14;
+    delay.reset();
+    CHECK_EQ(delay.failure(policy), 3u);
+    CHECK_EQ(delay.failure(policy, 20), 20u);
+    CHECK_EQ(delay.failure(policy), 12u);
+    CHECK_EQ(delay.failure(policy), 14u);
+    CHECK_EQ(delay.failure(policy), 14u);
+    delay.reset();
+    CHECK_EQ(delay.failure(policy), 3u);
+
+    const Str invalid =
+        lit_str(R"({"address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+                R"("path":"/keys","refreshSeconds":7,"maxAgeSeconds":9,"timeoutSeconds":1,)"
+                R"("maxRetrySeconds":6})");
+    const Str valid = lit_str(
+        R"({"maxRetrySeconds":6,"address":"192.0.2.1","port":443,"serverName":"issuer.example",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":7,"maxAgeSeconds":9,"timeoutSeconds":1,)"
+        R"("retrySeconds":4})");
+    json::Document document;
+    REQUIRE(document.parse(invalid));
+    CHECK_FALSE(policy.load(document, 0));
+    REQUIRE(document.parse(valid));
+    REQUIRE(policy.load(document, 0));
+    CHECK_EQ(policy.max_retry_seconds, 6u);
+    CHECK_EQ(policy.retry_seconds, 4u);
+}
+
+TEST(remote_jwks_metadata, retry_after_requires_one_bounded_decimal_on_throttle_status) {
+    const auto parse = [](Str headers, u32 cap) {
+        BoundedJsonResponse wire;
+        wire.reset_jwks(false, true);
+        if (wire.append(headers) != BoundedJsonResponse::Result::Complete) return ~u32{0};
+        ParsedResponse response{};
+        if (!wire.headers(response)) return ~u32{0};
+        return jwks_response_retry_after(response, cap);
+    };
+    CHECK_EQ(parse(lit_str("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n"
+                           "rEtRy-AfTeR: 4294967295\r\n\r\n"),
+                   8),
+             8u);
+    CHECK_EQ(parse(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n"
+                           "Retry-After: 4294967296\r\n\r\n"),
+                   8),
+             0u);
+    CHECK_EQ(parse(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n"
+                           "Retry-After: 4\r\nRetry-After: 5\r\n\r\n"),
+                   8),
+             0u);
+    CHECK_EQ(parse(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n"
+                           "Retry-After: 04\r\n\r\n"),
+                   8),
+             0u);
+    CHECK_EQ(parse(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n"
+                           "Retry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"),
+                   8),
+             0u);
+    CHECK_EQ(
+        parse(lit_str("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/json\r\n"
+                      "Retry-After: 5\r\n\r\n"),
+              8),
+        0u);
+    BoundedJsonResponse disabled;
+    CHECK_EQ(disabled.append(lit_str("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n"
+                                     "Retry-After: 5\r\n\r\n")),
+             BoundedJsonResponse::Result::Error);
+}
+
+TEST(remote_jwks_metadata, dns_cache_configuration_and_minimum_chain_ttl) {
+    const char* base =
+        "\"address\":\"192.0.2.1\",\"port\":443,\"serverName\":\"issuer.example\","
+        "\"ca\":\"ca.pem\",\"path\":\"/keys\",\"refreshSeconds\":1,"
+        "\"maxAgeSeconds\":3,\"timeoutSeconds\":1";
+    char bytes[1024];
+    json::Document document;
+    RemoteJwks configuration;
+    int size = snprintf(bytes, sizeof(bytes), "{%s,\"dnsCacheSeconds\":4}", base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+    CHECK_FALSE(configuration.load(document, 0));
+    size = snprintf(bytes,
+                    sizeof(bytes),
+                    "{%s,\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\"],"
+                    "\"dnsCacheSeconds\":4}",
+                    base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+    REQUIRE(configuration.load(document, 0));
+    CHECK_EQ(configuration.dns_cache_seconds, 4u);
+    DnsPacket response;
+    response.cname(nullptr, "keys.example", 12);
+    response.a("keys.example", 1, 30);
+    response.a("keys.example", 1, 5);
+    JwksDnsAddresses addresses;
+    REQUIRE(accepts(response, configuration, addresses));
+    CHECK_EQ(addresses.count, 1u);
+    CHECK_EQ(addresses.ttl_seconds, 5u);
 }
 
 TEST(remote_jwks_metadata, conditional_requests_boolean_and_reset) {
@@ -605,7 +718,7 @@ TEST(remote_jwks_metadata, conditional_response_etag_is_unique_and_strong) {
                                     "Content-Length: 2\r\n%s\r\n{}",
                                     extra);
         BoundedJsonResponse response;
-        response.reset_conditional_jwks();
+        response.reset_jwks(true);
         CHECK(response.append({bytes, static_cast<u32>(length)}) ==
               BoundedJsonResponse::Result::Complete);
         ParsedResponse headers{};
@@ -614,7 +727,7 @@ TEST(remote_jwks_metadata, conditional_response_etag_is_unique_and_strong) {
         CHECK(!jwks_response_etag(headers, tag));
     }
     BoundedJsonResponse response;
-    response.reset_conditional_jwks();
+    response.reset_jwks(true);
     CHECK(response.append(lit_str("HTTP/1.1 304 Not Modified\r\neTaG: \"v1\"\r\n\r\n")) ==
           BoundedJsonResponse::Result::Complete);
     ParsedResponse headers{};
@@ -622,7 +735,7 @@ TEST(remote_jwks_metadata, conditional_response_etag_is_unique_and_strong) {
     Str tag{};
     CHECK(jwks_response_etag(headers, tag));
     CHECK(tag.eq(lit_str("\"v1\"")));
-    response.reset_conditional_jwks();
+    response.reset_jwks(true);
     CHECK(response.append(lit_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                                   "Content-Length: 2\r\n\r\n{}")) ==
           BoundedJsonResponse::Result::Complete);

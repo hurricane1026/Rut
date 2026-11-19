@@ -8,9 +8,10 @@ remain supported. New fields are all trusted compile/load-time configuration:
 {
   "address": "192.0.2.10", "port": 443, "serverName": "issuer.example",
   "ca": "/etc/rut/issuer-ca.pem", "path": "/keys",
-  "refreshSeconds": 30, "retrySeconds": 5, "maxAgeSeconds": 120, "timeoutSeconds": 10,
+  "refreshSeconds": 30, "retrySeconds": 5, "maxRetrySeconds": 60, "maxRetryAfterSeconds": 30,
+  "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "conditionalRequests": true,
-  "dnsAddress": "192.0.2.53", "dnsPort": 53,
+  "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
   "discoveryIssuer": "https://issuer.example"
@@ -22,24 +23,41 @@ uses `refreshSeconds`, regardless of field order. Omission preserves the interva
 value; failed attempts now measure it from completion, so slow failures no longer
 retry immediately when their prior start-based interval has elapsed.
 Successful refreshes, including valid empty key sets, schedule the next attempt
-from completion plus `refreshSeconds`. Setup, DNS, metadata, HTTPS, parsing and verifier-import failures
-schedule from their completion plus `retrySeconds`. A slow failure still waits
-the full retry interval after its timeout. Both algorithms use the same rule;
-there is no jitter, exponential backoff or token-triggered retry. Deadlines
-saturate instead of wrapping on integer overflow. An invalid maintenance clock
-cancels the attempt and clears cache freshness before a later cold attempt.
+from completion plus `refreshSeconds`. By default, setup, DNS, metadata, HTTPS,
+parsing and verifier-import failures schedule from completion plus
+`retrySeconds`. A slow failure still waits the full retry interval after its
+timeout. Both algorithms use the same rule. Deadlines saturate on overflow.
+An invalid maintenance clock cancels the attempt and clears cache freshness
+before a later cold attempt.
+
+Optional `maxRetrySeconds` (integer `retrySeconds`–3600) enables capped
+exponential retry backoff. The first failure waits `retrySeconds` and each
+consecutive failure doubles the local interval up to the cap. A successful
+key refresh, accepted 304, or a maintenance reset clears the progression.
+Server hints can extend the scheduled delay without changing the next local
+backoff step. Request traffic never triggers a refresh.
 
 Retry delay does not extend `maxAgeSeconds` and may exceed it. Failures never
 renew last-success time; requests fail closed after the original maximum age
 while maintenance continues its bounded retry cadence. The attempt's total
 `timeoutSeconds` deadline still begins at attempt start and spans all stages.
 
+Optional `maxRetryAfterSeconds` (integer 1–3600) permits the authenticated key
+endpoint to delay retries after HTTP 429 or 503. A fully framed response can
+supply one canonical decimal delay in seconds within the unsigned 32-bit range.
+The gateway caps that delay at `maxRetryAfterSeconds` and waits the greater of
+the resulting hint and its local retry interval, measured from completion.
+Absent, duplicate, malformed, overflowing and HTTP-date values use the local
+interval. Discovery and successful key responses ignore this header. These
+throttle responses are failures and do not update the keys, validators or
+last-success time.
+
 `dnsAddress` and a nonempty `allowedAddresses` list must appear together. Resolver
 and allowed destinations are IPv4 literals; at most eight destination addresses
 are accepted. `dnsPort` is optional (default 53), otherwise 1–65535. The original
 `address` remains a mandatory valid configuration field but is **never a fallback**
-when DNS is enabled. Each refresh attempt resolves the configured TLS server name
-again, through one connected nonblocking UDP socket to the configured resolver.
+when DNS is enabled. By default each attempt resolves the configured TLS server
+name again through one connected nonblocking UDP socket to the configured resolver.
 No blocking libc resolver, system search list, request-selected name or new DNS
 library is used.
 
@@ -57,8 +75,16 @@ only point backwards to a previously decoded valid label boundary, with bounded
 pointer traversal. Forks, duplicate CNAMEs, cycles, an owner with both A and CNAME,
 missing terminal A records, unrelated answers, malformed or trailing RDATA/bytes,
 AAAA, truncation, DNS errors and authority/additional sections fail the attempt.
-The configured resolver must provide this bounded UDP A/CNAME profile. The
-gateway uses the response only for the current refresh attempt.
+The configured resolver must provide this bounded UDP A/CNAME profile.
+
+Optional `dnsCacheSeconds` (integer 1–3600) requires DNS mode. It enables one
+owned address set per policy and shard. A validated reply may be reused until
+the earlier of its shortest record TTL and this local cap, measured from DNS
+completion on the monotonic clock. Cache hits still run authenticated discovery
+and key fetch within their own attempt timeout. These requests never extend
+DNS expiry. Cancel, clock failure or reversal, and exhaustion of the cached
+address set on a TCP connect failure discard it. A reply rejected by the
+resolver policy never enters the cache.
 
 Within an attempt the gateway tries distinct terminal A addresses in their
 original answer order. It moves to the next address only when TCP establishment
@@ -66,7 +92,7 @@ reports a connection refusal or another definitive network error. TLS, HTTP,
 metadata and key validation failures end the attempt. The next address uses
 the same total deadline and starts at discovery when discovery is configured.
 The remaining addresses are discarded when the deadline expires, including when
-an earlier address stalls. Each attempt uses one DNS query.
+an earlier address stalls. Each attempt uses at most one DNS query.
 
 TLS SNI/certificate hostname and CA remain fixed to the configured original
 server name even when a CNAME target or an allowed address changes. DNS is not

@@ -318,10 +318,11 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
         if (!remote) continue;
         if (monotonic_ms == ~u64{0}) monotonic_ms = jwt_monotonic_ms();
         const auto& policy = policies_[i].remote();
-        if (!monotonic_ms || (remote->last_success && monotonic_ms < remote->last_success)) {
+        if (!jwks_observe_time(remote->last_maintenance, monotonic_ms)) {
             remote->fetch.cancel();
             remote->last_success = 0;
             remote->next_attempt = 0;
+            remote->retry.reset();
             remote->validator.clear();
             continue;
         }
@@ -334,8 +335,9 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
                     policy.timeout_seconds * 1000,
                     policy.conditional_requests ? &remote->validator : nullptr,
                     jwks_refresh_deadline(remote->last_success, policy.max_age_seconds))) {
-                remote->next_attempt = jwks_refresh_deadline(monotonic_ms, policy.retry_seconds);
-                remote->fetch.cancel();
+                remote->next_attempt =
+                    jwks_refresh_deadline(monotonic_ms, remote->retry.failure(policy));
+                remote->fetch.finish_attempt();
                 continue;
             }
         }
@@ -369,10 +371,14 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
                 }
             }
         }
-        remote->next_attempt = jwks_refresh_deadline(
-            monotonic_ms, succeeded ? policy.refresh_seconds : policy.retry_seconds);
+        u32 delay = policy.refresh_seconds;
+        if (succeeded)
+            remote->retry.reset();
+        else
+            delay = remote->retry.failure(policy, remote->fetch.retry_after_seconds());
+        remote->next_attempt = jwks_refresh_deadline(monotonic_ms, delay);
         // Release the borrowed body only after key import/activation completes.
-        remote->fetch.cancel();
+        remote->fetch.finish_attempt();
     }
 }
 
@@ -381,6 +387,7 @@ void Rs256Policies::cancel(u32 shard) {
     for (u32 i = 0; i < count_; ++i) {
         if (rows_[shard].remote[i]) {
             rows_[shard].remote[i]->fetch.cancel();
+            rows_[shard].remote[i]->retry.reset();
             rows_[shard].remote[i]->validator.clear();
         }
     }
