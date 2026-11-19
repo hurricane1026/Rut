@@ -111,7 +111,10 @@ def test_targeted_registry_commands(tool, root):
     end = 9223372036854775807
     start_removed = {k: v for k, v in parked.items() if k != 'notBefore'}
     windowed = dict(snapshot, credentials=[raw, dict(start_removed, expiresAt=end), inherited])
-    mutate('set-credential-window', [parked['id'], '-', str(end)], windowed)
+    windowed_path = mutate('set-credential-window', [parked['id'], '-', str(end)], windowed)
+    unwindowed = {k: v for k, v in parked.items() if k not in ('notBefore', 'expiresAt')}
+    mutate('clear-credential-window', [parked['id']],
+           dict(snapshot, credentials=[raw, unwindowed, inherited]), windowed_path)
     assert source.read_bytes() == original
 
 

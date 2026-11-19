@@ -535,6 +535,7 @@ a new private snapshot under the same no-replace rules as `apply`.
 | `set-credential-groups INPUT CREDENTIAL_ID JSON_ARRAY OUTPUT` | Replace the credential's group restriction with a subset of its owner's groups. Use `'[]'` to restrict the credential to no groups. |
 | `inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT` | Remove the credential-level restriction so it inherits its owner's groups. |
 | `set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT` | Replace both validity bounds. Values are nonnegative Unix seconds, and `-` omits a bound. Positive starts are inclusive and positive expiries are exclusive. Zero retains the registry format's unbounded semantics. |
+| `clear-credential-window INPUT CREDENTIAL_ID OUTPUT` | Remove both validity bounds. |
 
 Removal frees
 IDs for reuse and becomes effective when the replacement is deployed. The input
