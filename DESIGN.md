@@ -11142,6 +11142,16 @@ remain disabled. New IDs must be globally unused, including disabled records,
 and retaining history requires a free credential slot. The input and running
 gateways are unchanged; deployment remains explicit and #1072 remains open.
 
+`rut-consumers provision-key-verifier` accepts an exact private provisioning
+profile for new Consumer registration with a first key, or constrained key
+creation under an existing owner. Optional new Consumer records are creation-only.
+Credential metadata allows explicit groups and time bounds with their existing
+runtime meanings, including disabled staging and omitted-field inheritance.
+The tool generates the same CSPRNG key and SHA-256 verifier, validates the complete
+replacement, then uses existing key-first/snapshot-second private no-replace
+publication. No language or runtime semantics change. Online deployment and
+broader lifecycle acceptance remain open in #1072. See [the provisioning profile](docs/consumer-registry.md#registering-consumers-and-provisioning-constrained-keys).
+
 `rut-consumers prune-credentials` removes explicitly disabled credentials and
 finite expiries at or before an operator-supplied canonical positive signed-64-bit
 Unix-second cutoff. It does not read the clock. All Consumers and full retained

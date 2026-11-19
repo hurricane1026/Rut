@@ -97,6 +97,53 @@ def administer(args, root, name, config, previous=None):
     return json.loads(target.read_text())
 
 
+def provision_profiles(args, root):
+    base = root / 'provision-empty.json'
+    result = subprocess.run([args.admin, 'init', str(base)], capture_output=True, timeout=10)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    owner = dict(id='profile-owner', enabled=True, groups=['staff', 'readers', 'writers'])
+    keys = {}
+    policies = [('reader', dict(groups=['readers'], notBefore=1, expiresAt=9223372036854775807)),
+                ('empty', dict(groups=[])), ('inherited', {}),
+                ('future', dict(notBefore=9223372036854775807)),
+                ('expired', dict(expiresAt=1)), ('disabled', dict(enabled=False)),
+                ('header', dict(method='header', groups=[])),
+                ('paused', dict(consumerId='profile-paused'))]
+    for index, (name, fields) in enumerate(policies):
+        record = dict(id='profile-' + name, consumerId=owner['id'], method='bearer', enabled=True)
+        record.update(fields)
+        profile = dict(credential=record)
+        if index == 0:
+            profile['consumer'] = owner
+        if name == 'paused':
+            profile['consumer'] = dict(id='profile-paused', enabled=False, groups=[])
+        profile_path = root / f'{name}-profile.json'
+        profile_path.write_text(json.dumps(profile))
+        profile_path.chmod(0o600)
+        output, key = root / f'{name}-provisioned.json', root / f'{name}-private-key'
+        before = base.read_bytes(), profile_path.read_bytes()
+        result = subprocess.run([args.admin, 'provision-key-verifier', str(base), str(profile_path),
+                                 str(output), str(key)], capture_output=True, timeout=10)
+        assert result.returncode == 0 and not result.stdout and not result.stderr, result
+        assert (base.read_bytes(), profile_path.read_bytes()) == before
+        keys[name] = key.read_text()
+        base = output
+    configuration = json.loads(base.read_bytes())
+    with gateway(args, configuration, root / 'provisioned-gateway',
+                 sensitive=tuple(keys.values())) as port:
+        for name, path, expected in (
+            ('reader', '/private', 200), ('reader', '/read', 200),
+            ('reader', '/staff', 403), ('reader', '/write', 403),
+            ('empty', '/private', 200), ('empty', '/read', 403),
+            ('inherited', '/staff', 204), ('inherited', '/write', 200),
+            ('future', '/private', 401), ('expired', '/private', 401),
+            ('disabled', '/private', 401), ('paused', '/private', 401), ('header', '/key', 204)):
+            field = 'X-API-Key' if name == 'header' else 'Authorization'
+            presented = keys[name] if name == 'header' else 'Bearer ' + keys[name]
+            assert request(port, path, f'{field}: {presented}\r\n')[0] == expected
+            assert h2_request(port, path, [(field.lower(), presented)])[0] == expected
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--server',required=True)
@@ -117,6 +164,7 @@ def main():
         initial=administer(args,root,'initial-snapshot',initial)
         generated = {}
         if args.admin:
+            provision_profiles(args, root)
             base = root / 'initial-snapshot.json'
             for credential_id, method in [('generated-bearer-v1', 'bearer'),
                                           ('generated-bearer-v2', 'bearer'),

@@ -823,6 +823,150 @@ def test_snapshot_diff(tool, root):
             assert record['secret'].encode() not in result.stderr
 
 
+def test_provision_key_verifier(tool, root):
+    work = root / 'provision-profile'
+    work.mkdir(mode=0o700)
+    empty = dict(version=1, consumers=[], credentials=[])
+    source = private(work / 'source.json', empty)
+    consumer = dict(id='new"owner', enabled=True, groups=['readers', 'writers'])
+    credential = dict(id='first-key', consumerId=consumer['id'], method='bearer', enabled=True,
+                      groups=['readers'], notBefore=1, expiresAt=9223372036854775807)
+    counter = 0
+
+    def provision(profile, expected=None, source_path=source, destinations=None, env=None):
+        nonlocal counter
+        counter += 1
+        profile_path = private(work / f'profile-{counter}.json', profile)
+        snapshot, key = destinations or (work / f'output-{counter}.json', work / f'key-{counter}')
+        before, profile_before = source_path.read_bytes(), profile_path.read_bytes()
+        result = subprocess.run([tool, 'provision-key-verifier', str(source_path), str(profile_path),
+                                 str(snapshot), str(key)], capture_output=True, timeout=10, env=env)
+        assert source_path.read_bytes() == before and profile_path.read_bytes() == profile_before
+        assert not result.stdout and b'secret-material' not in result.stderr
+        if expected is None:
+            assert result.returncode == 2, result
+            assert not snapshot.exists() and not key.exists()
+            return result
+        assert result.returncode == 0 and not result.stderr, result
+        material = key.read_bytes()
+        assert len(material) == 64 and re.fullmatch(rb'[0-9a-f]{64}', material)
+        assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in (snapshot, key))
+        assert material not in snapshot.read_bytes()
+        value = json.loads(snapshot.read_bytes())
+        record = value['credentials'][-1]
+        assert record.pop('secretSha256') == hashlib.sha256(material).hexdigest()
+        assert 'secret' not in record and record == expected['credentials'][-1]
+        assert value == expected
+        assert run(tool, 'validate', snapshot).returncode == 0
+        inspection = run(tool, 'inspect', snapshot)
+        assert inspection.returncode == 0 and material not in inspection.stdout + inspection.stderr
+        return snapshot, key
+
+    provision(dict(consumer=consumer, credential=credential),
+              dict(version=1, consumers=[consumer], credentials=[credential]))
+    existing = dict(version=1, consumers=[consumer, dict(id='paused', enabled=False, groups=[])],
+                    credentials=[dict(id='retired', consumerId=consumer['id'], method='header',
+                                      enabled=False, secret='old-private-key')])
+    existing_source = private(work / 'existing.json', existing)
+    for method in ('bearer', 'header'):
+        for policy in ({}, dict(groups=[]), dict(groups=['writers'], notBefore=0, expiresAt=0),
+                       dict(groups=['readers'], notBefore=10, expiresAt=11),
+                       dict(notBefore=9223372036854775807), dict(expiresAt=1)):
+            record = dict(id='existing-key', consumerId=consumer['id'], method=method, enabled=True, **policy)
+            provision(dict(credential=record),
+                      dict(existing, credentials=existing['credentials'] + [record]), existing_source)
+    paused = dict(id='paused-key', consumerId='paused', method='header', enabled=False, groups=[])
+    provision(dict(credential=paused),
+              dict(existing, credentials=existing['credentials'] + [paused]), existing_source)
+    staged_consumer = dict(consumer, enabled=False)
+    staged_record = dict(credential, enabled=False)
+    provision(dict(consumer=staged_consumer, credential=staged_record),
+              dict(version=1, consumers=[staged_consumer], credentials=[staged_record]))
+
+    invalid = [dict(), dict(consumer=consumer), [], dict(consumer=None, credential=credential),
+               dict(consumer=consumer, credential=credential, unknown=True),
+               dict(consumer=dict(consumer, unknown=True), credential=credential),
+               dict(consumer=dict(consumer, id='different'), credential=credential),
+               dict(consumer=consumer, credential=dict(credential, consumerId='different'))]
+    for field, value in (('secret', 'secret-material'), ('secretSha256', 'a' * 64),
+                         ('unknown', True), ('method', 'basic'), ('method', 'mtls'),
+                         ('method', 'other'), ('enabled', 1), ('id', ''), ('id', 'a' * 65),
+                         ('consumerId', 'missing'), ('groups', ['absent']),
+                         ('groups', ['readers', 'readers']), ('groups', 'readers'),
+                         ('notBefore', -1), ('expiresAt', '10'), ('expiresAt', 1)):
+        invalid.append(dict(consumer=consumer, credential=dict(credential, **{field: value})))
+    for field in ('id', 'consumerId', 'method', 'enabled'):
+        incomplete = dict(credential)
+        incomplete.pop(field)
+        invalid.append(dict(consumer=consumer, credential=incomplete))
+    for profile in invalid:
+        provision(profile)
+    for key in ('credential', 'consumer'):
+        original = json.dumps(dict(consumer=consumer, credential=credential))
+        raw = (original[:-1] + ',' + json.dumps(key) + ':' + json.dumps(
+            credential if key == 'credential' else consumer) + '}').encode()
+        provision(raw)
+    duplicate = json.dumps(dict(consumer=consumer, credential=credential)).replace(
+        '"first-key"', '"first-key", "id": "second-key"')
+    provision(duplicate.encode())
+    provision(dict(consumer=consumer, credential=credential), source_path=existing_source)
+    provision(dict(credential=dict(credential, id='retired')), source_path=existing_source)
+    malformed = private(work / 'malformed-source.json', dict(existing, unknown=True))
+    provision(dict(credential=credential), source_path=malformed)
+    provision(b'x' * 8193)
+
+    # Both schema cardinality limits are checked against the complete replacement.
+    full_consumers = [dict(id=f'c{i}', enabled=True, groups=[]) for i in range(32)]
+    full = private(work / 'full-consumers.json', dict(version=1, consumers=full_consumers, credentials=[]))
+    provision(dict(consumer=consumer, credential=credential), source_path=full)
+    many = [dict(id=f'k{i}', consumerId=consumer['id'], method='header', enabled=False,
+                 secret=f'key-{i}') for i in range(64)]
+    full = private(work / 'full-credentials.json', dict(version=1, consumers=[consumer], credentials=many))
+    assert run(tool, 'validate', full).returncode == 0
+    provision(dict(credential=credential), source_path=full)
+    available = private(work / 'one-slot.json', dict(version=1, consumers=[consumer], credentials=many[:-1]))
+    provision(dict(credential=credential),
+              dict(version=1, consumers=[consumer], credentials=many[:-1] + [credential]), available)
+
+    profile_path = private(work / 'private-profile.json', dict(consumer=consumer, credential=credential))
+    snapshot, key = work / 'guard-output.json', work / 'guard-key'
+    command = [tool, 'provision-key-verifier', source, profile_path, snapshot, key]
+    profile_path.chmod(0o644)
+    assert run(*command).returncode == 2 and not snapshot.exists() and not key.exists()
+    profile_path.chmod(0o600)
+    symlink = work / 'profile-link'
+    symlink.symlink_to(profile_path)
+    assert run(tool, 'provision-key-verifier', source, symlink, snapshot, key).returncode == 2
+    for first, second in ((source, key), (snapshot, profile_path), (snapshot, snapshot)):
+        assert run(tool, 'provision-key-verifier', source, profile_path, first, second).returncode == 2
+    assert not snapshot.exists() and not key.exists()
+    other = work / 'other'
+    other.mkdir(mode=0o700)
+    assert run(tool, 'provision-key-verifier', source, profile_path, snapshot, other / 'key').returncode == 2
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: run(*command), range(2)))
+    assert sorted(result.returncode for result in results) == [0, 2]
+    assert all(not result.stdout for result in results)
+    winner = json.loads(snapshot.read_bytes())
+    assert winner['credentials'][0]['secretSha256'] == hashlib.sha256(key.read_bytes()).hexdigest()
+
+    shim = root / 'linkat-fault.so'
+    marker = root / 'preload-capability.marker'
+    if shim.exists() and marker.exists():
+        for fail_at in (1, 2):
+            failed_snapshot, failed_key = work / f'fault-{fail_at}.json', work / f'fault-{fail_at}.key'
+            env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_LINKAT_FAIL_AT=str(fail_at))
+            result = subprocess.run([tool, 'provision-key-verifier', str(source), str(profile_path),
+                                     str(failed_snapshot), str(failed_key)], capture_output=True,
+                                    timeout=10, env=env)
+            assert result.returncode == 2 and not result.stdout and not failed_snapshot.exists()
+            assert failed_key.exists() == (fail_at == 2)
+            if failed_key.exists():
+                assert failed_key.read_bytes() not in result.stderr
+    for args in ([], ['a'], ['a', 'b'], ['a', 'b', 'c'], ['a', 'b', 'c', 'd', 'e']):
+        assert run(tool, 'provision-key-verifier', *args).returncode == 2
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -838,6 +982,7 @@ def main(tool):
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
         test_generated_key_verifier(tool, root)
+        test_provision_key_verifier(tool, root)
         test_rotated_key_verifier(tool, root)
         test_credential_groups_preserve_and_reject_parent_removal(tool, root)
         test_snapshot_diff(tool, root)

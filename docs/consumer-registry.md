@@ -332,6 +332,53 @@ command arguments.
 build/src/rut-consumers generate-key-verifier consumer-config/v1.json alice alice-key-v2 bearer consumer-config/v2.json consumer-config/alice-key-v2.txt
 ```
 
+### Registering Consumers and provisioning constrained keys
+
+`provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT` reads a private
+JSON profile and generates a new bearer/header key. This provides two workflows:
+register a Consumer with its first key, or add a key with explicit groups and time
+bounds to an existing Consumer. The exact profile shape is:
+
+```json
+{
+  "consumer": {"id": "alice", "enabled": true, "groups": ["staff", "readers"]},
+  "credential": {"id": "alice-read-v1", "consumerId": "alice", "method": "bearer",
+                 "enabled": true, "groups": ["readers"],
+                 "notBefore": 1800000000, "expiresAt": 1800003600}
+}
+```
+
+`consumer` is optional. When present, it is one complete new Consumer record,
+its ID must be unused even on disabled records, and it must match the credential's
+`consumerId`. Existing Consumers are never updated by this command. When omitted,
+the credential must reference an existing Consumer.
+
+`credential` requires `id`, `consumerId`, `method` and boolean `enabled`. Its only
+optional fields are `groups`, `notBefore` and `expiresAt`. Only `bearer` and
+`header` methods are accepted. The credential ID must be unused across enabled and
+disabled records. Raw secrets, verifier fields, unknown names and duplicate names
+are rejected. Explicit groups must be a subset of the owning Consumer's groups.
+Omitted groups retain inheritance, while `[]` grants no groups. Time bounds retain
+the exact supplied values and optional-field presence. No clock is read and no
+expiry is renewed. Disabled Consumers and credentials may be staged explicitly.
+
+The source, profile and complete replacement use the existing bounded private-file
+and runtime-schema checks. Input files remain unchanged. Outputs reuse the
+0600, no-replace key-first/snapshot-second publication contract above, including
+its partial-publication and uncertain-durability errors. The generated key is
+written only to the separate key output, with only its SHA-256 verifier added to
+the snapshot. Existing raw secrets in the source remain sensitive. Success is
+silent, and failures contain no profile or key material.
+
+```sh
+# For an existing Consumer, omit the consumer member from the private profile.
+build/src/rut-consumers provision-key-verifier consumer-config/empty.json consumer-config/alice-profile.json consumer-config/alice.json consumer-config/alice-read-v1.key
+```
+
+Deployment remains explicit. This command does not publish to running gateways,
+distribute keys, preserve a durable revocation history or provide online
+administration. Those lifecycle requirements remain open in #1072.
+
 `rotate-key-verifier INPUT OLD_CREDENTIAL_ID NEW_CREDENTIAL_ID SNAPSHOT_OUTPUT
 KEY_OUTPUT` replaces an existing enabled bearer/header credential with a freshly
 generated key and SHA-256 verifier. The old credential may contain raw `secret`
