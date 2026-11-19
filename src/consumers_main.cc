@@ -741,9 +741,32 @@ bool policy_allowed_methods(PolicySnapshot& snapshot, u32 value) {
     return true;
 }
 
+bool policy_enabled(json::Document& doc, u32 record) {
+    return doc.raw(field(doc, record, lit_str("enabled"))).eq(lit_str("true"));
+}
+
+i64 policy_time(json::Document& doc, u32 record, Str field_name) {
+    const u32 node = field(doc, record, field_name);
+    i64 seconds = 0;
+    // The runtime schema validator already checked any supplied value.
+    if (node != json::kNone) json::integer(doc.raw(node), seconds);
+    return seconds;
+}
+
+bool policy_expiry(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) && !policy_time(doc, record, lit_str("expiresAt")))
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
+    {lit_str("requireExpiryForEnabledCredentials"), true, policy_expiry},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {

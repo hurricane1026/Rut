@@ -76,6 +76,12 @@ def test_deployment_policy(tool, root):
     check({'allowedMethods': ['basic']}, ok=True, records=[basic])
     check({'allowedMethods': ['mtls']}, ok=True, records=[mtls])
     check({'allowedMethods': ['header']}, records=[basic], rule='allowedMethods')
+    expiry = {'requireExpiryForEnabledCredentials': True}
+    check(expiry, ok=True)
+    check(expiry, records=[dict(key, expiresAt=0)], rule=next(iter(expiry)))
+    check(expiry, ok=True, records=[dict(key, expiresAt=0, enabled=False)])
+    check(expiry, records=[dict(key, expiresAt=0, consumerId='disabled', groups=[])],
+          rule=next(iter(expiry)))
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
