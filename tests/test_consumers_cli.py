@@ -96,6 +96,15 @@ def test_deployment_policy(tool, root):
     check({remaining: 1}, records=[dict(key, expiresAt=0)], rule=remaining)
     check({remaining: 1}, records=[dict(key, expiresAt=0, enabled=False)], ok=True)
     check({remaining: 9223372036854775807}, now=9223372036854775807, rule=remaining)
+    active = 'minimumActiveCredentials'
+    check({active: 1}, now=100, ok=True)
+    check({active: 1}, now=99, rule=active)
+    check({active: 1}, now=200, rule=active)
+    check({active: 1}, records=[dict(key, consumerId='disabled', groups=[])], rule=active)
+    check({active: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({active: 0}, records=[], ok=True)
+    for invalid in (65, True, '1'):
+        check({active: invalid}, rule=active)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
