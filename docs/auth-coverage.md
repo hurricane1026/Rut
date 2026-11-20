@@ -897,7 +897,7 @@ remote-mode requests before the first successful fetch. Only configured approved
 kids can be imported. A valid empty intersection immediately removes cached keys.
 There is no token-triggered fetch or redirect following. Optional bounded A/CNAME
 DNS and exact issuer/JWKS URI discovery validation now share the same cold refresh
-lifecycle; see [the trust contract](jwks-discovery.md).
+lifecycle; duplicate DNS allowlist entries fail configuration load; see [the trust contract](jwks-discovery.md).
 Optional integer `retrySeconds` (1–3600, defaulting to `refreshSeconds`) separates
 failure delay from successful refresh cadence for both algorithms. All failures
 wait from completion, including slow timeouts and import failures; successful

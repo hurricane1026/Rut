@@ -156,6 +156,9 @@ TEST(remote_jwks_metadata, dns_configuration_pairs_bounds_and_failure_reset) {
         ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[7]",
         ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"invalid\"]",
         ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\\u0000\"]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\",\"192.0.2.1\"]",
+        ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\",\"192.0.2.2\",\"192.0."
+        "2.\\u0031\"]",
         ",\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\",\"192.0.2.2\",\"192.0."
         "2.3\",\"192.0.2.4\",\"192.0.2.5\",\"192.0.2.6\",\"192.0.2.7\",\"192.0.2.8\",\"192.0.2."
         "9\"]",
@@ -186,6 +189,16 @@ TEST(remote_jwks_metadata, dns_configuration_pairs_bounds_and_failure_reset) {
     REQUIRE(configuration.load(document, 0));
     CHECK_EQ(configuration.dns_port, 5353u);
     CHECK_EQ(configuration.allowed_count, 1u);
+    const int max_length =
+        snprintf(bytes,
+                 sizeof(bytes),
+                 "{%s,\"dnsAddress\":\"192.0.2.53\",\"allowedAddresses\":[\"192.0.2.1\","
+                 "\"192.0.2.2\",\"192.0.2.3\",\"192.0.2.4\",\"192.0.2.5\",\"192.0.2.6\","
+                 "\"192.0.2.7\",\"192.0.2.8\"]}",
+                 base);
+    REQUIRE(document.parse({bytes, static_cast<u32>(max_length)}));
+    REQUIRE(configuration.load(document, 0));
+    CHECK_EQ(configuration.allowed_count, 8u);
     CHECK(!configuration.load(document, document.count));
     CHECK_EQ(configuration.allowed_count, 0u);
 }
