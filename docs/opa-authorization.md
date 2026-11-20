@@ -95,3 +95,13 @@ This slice does not embed Rego, administer OPA policies, implement distributed
 identity/session state, or automatically map arbitrary decision fields. Endpoint
 authentication, if needed, is supplied explicitly using existing JSON request
 header editing; downstream credentials are never forwarded automatically.
+
+### Optional structured decision tenant binding
+
+After a trusted OPA call, `opa.tenantStatus(decision, expectedTenant)`
+accepts the structured allow decision from `opa.requireDecision(reply)` and checks an exact, case-sensitive `result.tenant`
+string equal to the nonempty tenant from route configuration. Undefined or denied
+rules and tenant mismatches return 403; an empty configured tenant, missing or
+non-string tenant on an allow, malformed response, or unavailable OPA returns 503.
+Check its status before forwarding; do not derive the expected tenant from an
+untrusted request. `requireDecision` remains available for other decision schemas.

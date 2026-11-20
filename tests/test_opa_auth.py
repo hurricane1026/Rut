@@ -111,6 +111,22 @@ route POST "/decision" {
     guard let body = json(allowed) else { return 503 }
     return response(200, body: body)
 }
+route POST "/tenant" {
+    guard let reply = json.parse(req.body) else { return 400 }
+    let decision = opa.requireDecision(reply)
+    let status = opa.tenantStatus(decision, "t1")
+    guard status != 503 else { return 503 }
+    guard status == 200 else { return 403 }
+    guard let body = json(decision) else { return 503 }
+    return response(200, body: body)
+}
+route POST "/tenant-empty" {
+    guard let reply = json.parse(req.body) else { return 400 }
+    let decision = opa.requireDecision(reply)
+    let status = opa.tenantStatus(decision, "")
+    guard status != 503 else { return 503 }
+    return 200
+}
 route POST "/build" {
     guard let input = json.parse(req.body) else { return 400 }
     guard let request = opa.request(input) else { return 503 }
@@ -126,6 +142,20 @@ route GET "/mapped/:id" {
     let allowed = opa.requireDecision(reply)
     guard let body = json(allowed) else { return 503 }
     return response(200, body: body)
+}
+route GET "/tenant-forward/:id" {
+    let resource = req.param("id").or("")
+    guard let input = json.value({subject: "verified", resource: resource}) else { return 503 }
+    guard let request = opa.request(input) else { return 503 }
+    let pending = httpCall(env("OPA_DECISION"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let decision = opa.requireDecision(reply)
+    let status = opa.tenantStatus(decision, "tenant-allow")
+    match status {
+        200 => { return forward(backend, load_balance: .roundRobin) }
+        403 => { return 403 }
+        _ => { return 503 }
+    }
 }
 route GET "/timeout" {
     guard let input = json.parse("{\\"resource\\":\\"slow\\"}") else { return 503 }
@@ -208,6 +238,19 @@ route GET "/untrusted" {
                             if status == 200:
                                 parsed = json.loads(data)
                                 assert parsed == (json.loads(raw) if route == '/boolean' else json.loads(raw)['result'])
+                    for raw, expected in [
+                        ('{"result":{"allow":true,"tenant":"t1"}}', 200),
+                        ('{"result":{"allow":true,"tenant":"T1"}}', 403),
+                        ('{"result":{"allow":true,"tenant":""}}', 403),
+                        ('{"result":{"allow":true}}', 503),
+                        ('{"result":{"allow":true,"tenant":null}}', 503),
+                        ('{"result":{"allow":true,"tenant":1}}', 503),
+                        ('{"result":{"allow":false}}', 403),
+                        ('{}', 403), ('{"result":{"allow":"true"}}', 503),
+                        ('{"result":{"allow":true,"tenant":"t1","ten\\u0061nt":"t2"}}', 503)]:
+                        status, _, data = request('/tenant', envelope(raw))
+                        assert status == expected, (raw, status, data)
+                    assert request('/tenant-empty', envelope('{"result":{"allow":true,"tenant":"t1"}}'))[0] == 503
                     for reply in ({}, {'ok': False, 'status': 200, 'body': '{"result":true}'},
                                   {'ok': 'true', 'status': 200, 'body': '{"result":true}'},
                                   {'ok': True, 'status': '200', 'body': '{"result":true}'},
@@ -234,6 +277,8 @@ route GET "/untrusted" {
                     assert (status, data) == (200, b'/reports/allow'), (status, data)
                     assert 'Set-Cookie' not in headers and 'X-Consumer-ID' not in headers
                     assert len(records) == before + 1 and len(forwarded) == 1
+                    assert records[before][0] == '/v1/data/rut/allow'
+                    assert records[before][2]['input'] == dict(subject='report-reader', action='read', resource='allow')
                     assert forwarded[-1][1]['X-Consumer-ID'] == 'report-reader'
                     assert 'Authorization' not in forwarded[-1][1]
                     for mode, expected in (('deny', 403), ('undefined', 403), ('wrong-type', 503),
@@ -248,6 +293,12 @@ route GET "/untrusted" {
                     before = len(records)
                     assert request('/untrusted')[0] == 503
                     assert len(records) == before  # Wrong TLS identity sends no HTTP request.
+                    count = len(forwarded)
+                    assert request('/tenant-forward/deny')[0] == 403
+                    assert request('/tenant-forward/other')[0] == 403
+                    assert len(forwarded) == count
+                    assert request('/tenant-forward/allow')[0] == 200
+                    assert len(forwarded) == count + 1
                     assert request('/mapped/deny')[0] == 403
                     with ThreadPoolExecutor(max_workers=4) as workers:
                         results = list(workers.map(lambda i: request('/mapped/' + str(i)), range(4)))
@@ -292,8 +343,6 @@ route GET "/untrusted" {
                         assert headers['Content-Type'] == 'application/json'
                         assert all(key.lower() not in ('authorization', 'cookie', 'x-consumer-id') for key in headers)
                         assert set(message) == {'input'}
-                        if message['input']['resource'] == 'allow':
-                            assert message['input']['subject'] == 'report-reader'
                     print(f'PASS: {args.backend} OPA Boolean/structured decisions, strict errors, TLS, authenticated proxy and isolation')
                 finally:
                     if process.poll() is None:

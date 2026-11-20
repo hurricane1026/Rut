@@ -44,3 +44,10 @@ func requireDecision(_ reply: Json) -> Json {
     guard allow else { respond 403 }
     result
 }
+
+// Apply only to the allow decision returned by requireDecision.
+func tenantStatus(_ decision: Json, _ tenant: str) -> i32 {
+    guard tenant != "" else { 503 }
+    guard let actual = json.string(json.get(decision, "/tenant").or(decision)) else { 503 }
+    if actual == tenant { 200 } else { 403 }
+}
