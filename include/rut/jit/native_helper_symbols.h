@@ -37,6 +37,7 @@
     X(rut_helper_resp_commit_headers)                 \
     X(rut_helper_resp_header)                         \
     X(rut_helper_req_cookie)                          \
+    X(rut_helper_req_unique_cookie)                   \
     X(rut_helper_req_query)                           \
     X(rut_helper_req_query_string)                    \
     X(rut_helper_req_param)                           \
