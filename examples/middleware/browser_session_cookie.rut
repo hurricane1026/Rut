@@ -1,0 +1,9 @@
+// Clearing a host-bound session cookie must use the same name and Path as
+// issuance. This fixed profile cannot accept an untrusted cookie name or path.
+// It only clears the browser cookie; revoke server-side session state first.
+func cleared() -> Response {
+    let result = response(204)
+    result.add("Set-Cookie", "__Host-rut_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict")
+    result.set("Cache-Control", "no-store")
+    result
+}
