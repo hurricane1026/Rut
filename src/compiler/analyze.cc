@@ -16215,6 +16215,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::ReqParam:
                 case HirExprKind::ReqQuery:
                 case HirExprKind::ReqCookie:
+                case HirExprKind::ReqUniqueCookie:
                 case HirExprKind::ReqPath:
                 case HirExprKind::ReqPathOnly:
                 case HirExprKind::ReqQueryString:

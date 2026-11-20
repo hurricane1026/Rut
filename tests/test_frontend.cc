@@ -48484,8 +48484,10 @@ TEST(frontend, consistent_hash_arguments_and_key_types) {
         auto ast = parse_file_heap(tokens.value());
         if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
     }
-    for (const char* key :
-         {"req.path", "req.remoteAddr", "req.header(\"X-Key\").or(\"fallback\")"}) {
+    for (const char* key : {"req.path",
+                            "req.remoteAddr",
+                            "req.header(\"X-Key\").or(\"fallback\")",
+                            "req.uniqueCookie(\"sid\").or(\"fallback\")"}) {
         const std::string source =
             std::string(
                 "upstream api at \"127.0.0.1:9001\"\nroute GET \"/\" { return forward(api, "
