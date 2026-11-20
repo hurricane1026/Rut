@@ -131,6 +131,20 @@ def test_deployment_policy(tool, root):
     check({capacity: 0}, records=[], ok=True)
     check({capacity: 0}, records=[dict(parked, consumerId='disabled', groups=[])], rule=capacity)
     check({capacity: 65}, rule=capacity)
+    per_owner = 'minimumActiveCredentialsPerEnabledConsumer'
+    check({per_owner: 0}, records=[], ok=True)
+    check({per_owner: 1}, now=100, ok=True)
+    check({per_owner: 1}, now=99, rule=per_owner)
+    check({per_owner: 1}, now=200, rule=per_owner)
+    check({per_owner: 2}, rule=per_owner)
+    check({per_owner: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({per_owner: 1}, consumers=[alice, enabled_owner], rule=per_owner)
+    check({per_owner: 1}, consumers=[disabled], records=[], ok=True)
+    check({'minimumActiveCredentials': 2, per_owner: 1},
+          consumers=[alice, enabled_owner], records=[key, dict(parked, enabled=True)],
+          rule=per_owner)
+    for invalid in (-1, -0.0, 1.5, True, '1', 65, 9223372036854775808):
+        check({per_owner: invalid}, rule=per_owner)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
            'minimumActiveCredentials': 1, capacity: 2}, ok=True)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],

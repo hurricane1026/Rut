@@ -843,6 +843,19 @@ bool policy_each_consumer_active(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+bool policy_minimum_per_enabled_consumer(PolicySnapshot& snapshot, u32 value) {
+    i64 minimum = 0;
+    if (!policy_quantity(snapshot.policy, value, 0, minimum) || minimum > 64) return false;
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (policy_enabled(doc, consumer) &&
+            policy_count_credentials(snapshot, consumer, true) < static_cast<u32>(minimum))
+            return false;
+    }
+    return true;
+}
+
 bool policy_consumer_groups(PolicySnapshot& snapshot, u32) {
     auto& doc = snapshot.registry;
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
@@ -886,6 +899,9 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireGroupsForEnabledConsumers"), true, policy_consumer_groups},
     {lit_str("requireExplicitCredentialGroups"), true, policy_credential_groups},
     {lit_str("maxCredentialsPerConsumer"), false, policy_max_credentials},
+    {lit_str("minimumActiveCredentialsPerEnabledConsumer"),
+     false,
+     policy_minimum_per_enabled_consumer},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
