@@ -124,6 +124,12 @@ rut::i32 rut_helper_req_header_count(const rut::u8* req_data,
 
 // Collect original field values in wire order into the invocation arena.
 // Returns null on invalid input, parse failure, or allocation/budget failure.
+void* rut_helper_req_query_all(void* conn,
+                               void* arena,
+                               const rut::u8* req_data,
+                               rut::u32 req_len,
+                               const char* name,
+                               rut::u32 name_len);
 void* rut_helper_req_header_all(void* conn,
                                 void* arena,
                                 const rut::u8* req_data,

@@ -33082,3 +33082,46 @@ TEST(jit, request_header_all_helper_owns_original_values) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, request_query_all_helper_preserves_raw_order_and_owns_values) {
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char request[] =
+        "GET /?tags=a%2Fb&tags=&tags&Tags=no&tags=x+y HTTP/1.1\r\nHost: example\r\n\r\n";
+    auto* data = reinterpret_cast<const u8*>(request);
+    auto* values = static_cast<CollectedValues*>(
+        rut_helper_req_query_all(nullptr, &arena, data, sizeof(request) - 1, "tags", 4));
+    REQUIRE(values);
+    REQUIRE_EQ(values->count, 4u);
+    CHECK(static_cast<const Str*>(values->get(0, sizeof(Str)))->eq({"a%2Fb", 5}));
+    CHECK(static_cast<const Str*>(values->get(1, sizeof(Str)))->eq({"", 0}));
+    CHECK(static_cast<const Str*>(values->get(2, sizeof(Str)))->eq({"", 0}));
+    CHECK(static_cast<const Str*>(values->get(3, sizeof(Str)))->eq({"x+y", 3}));
+    auto* absent = static_cast<CollectedValues*>(
+        rut_helper_req_query_all(nullptr, &arena, data, sizeof(request) - 1, "missing", 7));
+    REQUIRE(absent);
+    CHECK_EQ(absent->count, 0u);
+    request[12] = 'z';
+    CHECK(static_cast<const Str*>(values->get(0, sizeof(Str)))->eq({"a%2Fb", 5}));
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, nullptr, 0, "x", 1));
+    CHECK(!rut_helper_req_query_all(nullptr, nullptr, data, sizeof(request) - 1, "x", 1));
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, data, sizeof(request) - 1, "", 0));
+    char many[1024];
+    u32 length = 0;
+    const char prefix[] = "GET /?";
+    __builtin_memcpy(many, prefix, sizeof(prefix) - 1);
+    length = sizeof(prefix) - 1;
+    for (u32 i = 0; i < 65; ++i) {
+        __builtin_memcpy(many + length, i ? "&x=1" : "x=1", i ? 4 : 3);
+        length += i ? 4 : 3;
+    }
+    const char suffix[] = " HTTP/1.1\r\nHost: example\r\n\r\n";
+    __builtin_memcpy(many + length, suffix, sizeof(suffix) - 1);
+    length += sizeof(suffix) - 1;
+    CHECK(!rut_helper_req_query_all(
+        nullptr, &arena, reinterpret_cast<const u8*>(many), length, "x", 1));
+    arena.destroy();
+    pool.destroy();
+}

@@ -933,6 +933,61 @@ void rut_helper_req_cookie(const u8* req_data,
     }
 }
 
+// Scan the raw request target once per pass; both query accessors share its
+// delimiter and fragment handling.
+struct QueryScan {
+    const char* data;
+    u32 len;
+    u32 pos;
+};
+
+static bool query_scan_init(const u8* data, u32 len, QueryScan* scan) {
+    if (!data) return false;
+    const ParseCache& pc = parse_cached(data, len);
+    if (!pc.ok) return false;
+    const Str path = pc.req.path;
+    u32 pos = 0;
+    while (pos < path.len && path.ptr[pos] != '?' && path.ptr[pos] != '#') ++pos;
+    if (pos == path.len || path.ptr[pos] != '?') {
+        *scan = {path.ptr, 0, 0};
+        return true;
+    }
+    ++pos;
+    const char* query = path.ptr + pos;
+    u32 length = path.len - pos;
+    for (u32 i = 0; i < length; ++i)
+        if (query[i] == '#') {
+            length = i;
+            break;
+        }
+    *scan = {query, length, 0};
+    return true;
+}
+
+static bool query_scan_next(QueryScan* scan, const char* name, u32 name_len, Str* value) {
+    const char* query = scan->data;
+    const u32 length = scan->len;
+    while (scan->pos < length) {
+        while (scan->pos < length && query[scan->pos] == '&') ++scan->pos;
+        const u32 start = scan->pos;
+        while (scan->pos < length && query[scan->pos] != '&' && query[scan->pos] != '=')
+            ++scan->pos;
+        const u32 end = scan->pos;
+        u32 value_start = end;
+        u32 value_end = end;
+        if (scan->pos < length && query[scan->pos] == '=') {
+            value_start = ++scan->pos;
+            while (scan->pos < length && query[scan->pos] != '&') ++scan->pos;
+            value_end = scan->pos;
+        }
+        if (end - start == name_len && memcmp(query + start, name, name_len) == 0) {
+            *value = {query + value_start, value_end - value_start};
+            return true;
+        }
+    }
+    return false;
+}
+
 void rut_helper_req_query(const u8* req_data,
                           u32 req_len,
                           const char* name,
@@ -943,52 +998,35 @@ void rut_helper_req_query(const u8* req_data,
     *out_has_value = 0;
     *out_ptr = nullptr;
     *out_len = 0;
-    if (!name || name_len == 0) return;
+    if (!name || !name_len) return;
+    QueryScan scan{};
+    Str value{};
+    if (!query_scan_init(req_data, req_len, &scan) ||
+        !query_scan_next(&scan, name, name_len, &value))
+        return;
+    *out_has_value = 1;
+    *out_ptr = value.ptr;
+    *out_len = value.len;
+}
 
-    const ParseCache& pc = parse_cached(req_data, req_len);
-    if (!pc.ok) return;
-    const ParsedRequest& req = pc.req;
-    if (req.path.len == 0) return;
-
-    const char* path = req.path.ptr;
-    u32 path_len = req.path.len;
-    u32 path_pos = 0;
-    while (path_pos < path_len && path[path_pos] != '?' && path[path_pos] != '#') {
-        path_pos++;
-    }
-    if (path_pos >= path_len || path[path_pos] != '?') return;
-    if (path_pos + 1 >= path_len) return;
-
-    const char* query = path + path_pos + 1;
-    u32 query_len = path_len - path_pos - 1;
-    for (u32 i = 0; i < query_len; i++) {
-        if (query[i] == '#') {
-            query_len = i;
-            break;
-        }
-    }
-    u32 pos = 0;
-    while (pos < query_len) {
-        while (pos < query_len && query[pos] == '&') pos++;
-        const u32 key_start = pos;
-        while (pos < query_len && query[pos] != '&' && query[pos] != '=') pos++;
-        const u32 key_end = pos;
-        u32 val_start = key_end;
-        u32 val_end = key_end;
-        if (pos < query_len && query[pos] == '=') {
-            pos++;
-            val_start = pos;
-            while (pos < query_len && query[pos] != '&') pos++;
-            val_end = pos;
-        }
-        const u32 key_len = key_end - key_start;
-        if (key_len == name_len && memcmp(query + key_start, name, name_len) == 0) {
-            *out_has_value = 1;
-            *out_ptr = query + val_start;
-            *out_len = val_end - val_start;
-            return;
-        }
-    }
+void* rut_helper_req_query_all(
+    void* conn, void* arena, const u8* req_data, u32 req_len, const char* name, u32 name_len) {
+    if (!name || !name_len) return nullptr;
+    QueryScan scan{};
+    if (!query_scan_init(req_data, req_len, &scan)) return nullptr;
+    QueryScan count_scan = scan;
+    Str value{};
+    u32 count = 0;
+    while (query_scan_next(&count_scan, name, name_len, &value))
+        if (++count > CollectedValues::kMaxItems) return nullptr;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    const u32 offset = 0;
+    auto* values = CollectedValues::create(storage, sizeof(Str), count ? count : 1, &offset, 1);
+    if (!values) return nullptr;
+    while (query_scan_next(&scan, name, name_len, &value))
+        if (!values->append(&value, sizeof(Str))) return nullptr;
+    return values;
 }
 
 void rut_helper_req_query_string(

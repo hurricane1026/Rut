@@ -591,7 +591,7 @@ req.params.postId       // string (from :postId)
 // Query string
 req.queryString         // string? — raw query string: "page=1&limit=20"
 req.query("page")       // string? — first value of the parameter
-req.queryAll("tags")    // [string] — all values (?tags=a&tags=b), like getAll for headers
+req.queryAll("tags")    // Collected<str>? — raw values in order, at most 64
 
 // Body
 req.body(User)          // parse body as User struct, error-capable
@@ -608,7 +608,7 @@ req.cookie("session_id") // string?
 // HTTP/2 uses the synthesized request view: :authority becomes Host, Cookie
 // fields are joined, and the body bridge may synthesize Content-Length. Other
 // repeated fields retain their order.
-// Routes containing explicit wait do not support getAll yet: collection
+// Routes containing explicit wait do not support getAll or queryAll yet: collection
 // bindings cannot currently be safely resumed.
 req.getAll("Accept")    // Collected<str>? — original field values in wire order
 req.add("X-Tag", "a")   // append (doesn't replace existing)
@@ -4585,7 +4585,7 @@ upstream { retry: ... }       // retry policy (on specific status codes, with ba
 
 // --- Request ---
 req.query("key")              // string? — first value of a query parameter
-req.queryAll("key")           // [string] — all values of a query parameter
+req.queryAll("key")           // Collected<str>? — all raw values, at most 64
 req.queryString               // raw query string
 req.cookie("name")            // cookie access
 

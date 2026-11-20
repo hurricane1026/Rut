@@ -178,6 +178,8 @@ constexpr Str kTimeWaitDetail = lit_str(
     "sampled after the wait");
 constexpr Str kUuidWaitDetail = lit_str(
     "uuid() in routes containing wait is not supported yet; locals re-materialize on resume");
+constexpr Str kQueryAllWaitDetail =
+    lit_str("req.queryAll() requires a route without explicit wait");
 constexpr Str kHeaderAllWaitDetail = lit_str("req.getAll() requires a route without explicit wait");
 constexpr Str kMinMaxDetail = lit_str(
     "max/min expect two plain integer values of the same width (i32 or i64; "
@@ -5187,9 +5189,10 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (receiver_override == nullptr &&
         magic_req_receiver(*expr.lhs, mod, locals, local_count, binding) &&
-        (expr.name.eq({"getAll", 6}) || expr.name.eq({"header", 6}) ||
-         expr.name.eq({"uniqueHeader", 12}) || expr.name.eq({"headerCount", 11}) ||
-         expr.name.eq({"param", 5}) || expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}))) {
+        (expr.name.eq({"getAll", 6}) || expr.name.eq({"queryAll", 8}) ||
+         expr.name.eq({"header", 6}) || expr.name.eq({"uniqueHeader", 12}) ||
+         expr.name.eq({"headerCount", 11}) || expr.name.eq({"param", 5}) ||
+         expr.name.eq({"cookie", 6}) || expr.name.eq({"query", 5}))) {
         if (expr.args.len != 1 || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::StrLit) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -5207,18 +5210,20 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             out.kind = HirExprKind::ReqQuery;
             out.may_nil = true;
         } else {
-            if (expr.name.eq({"getAll", 6}) || expr.name.eq({"uniqueHeader", 12}) ||
-                expr.name.eq({"headerCount", 11})) {
+            if (expr.name.eq({"getAll", 6}) || expr.name.eq({"queryAll", 8}) ||
+                expr.name.eq({"uniqueHeader", 12}) || expr.name.eq({"headerCount", 11})) {
                 if (out.str_value.len == 0)
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
-                for (u32 i = 0; i < out.str_value.len; ++i)
+                for (u32 i = 0; i < out.str_value.len && !expr.name.eq({"queryAll", 8}); ++i)
                     if (!is_http_tchar(static_cast<u8>(out.str_value.ptr[i])))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, expr.span, expr.name);
-                if (expr.name.eq({"getAll", 6})) {
+                if (expr.name.eq({"getAll", 6}) || expr.name.eq({"queryAll", 8})) {
                     if (route && route->time_ops_blocked)
-                        return frontend_error(
-                            FrontendError::UnsupportedSyntax, expr.span, kHeaderAllWaitDetail);
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              expr.span,
+                                              expr.name.eq({"queryAll", 8}) ? kQueryAllWaitDetail
+                                                                            : kHeaderAllWaitDetail);
                     auto element = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                          HirTypeKind::Str,
                                                          0xffffffffu,
@@ -5242,7 +5247,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                                        expr.span,
                                                        element.value());
                     if (!shape) return core::make_unexpected(shape.error());
-                    out.kind = HirExprKind::ReqHeaderAll;
+                    out.kind = expr.name.eq({"queryAll", 8}) ? HirExprKind::ReqQueryAll
+                                                             : HirExprKind::ReqHeaderAll;
                     out.type = HirTypeKind::Collected;
                     out.shape_index = shape.value();
                     out.may_nil = true;
@@ -21223,6 +21229,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
     switch (e.kind) {
         case HirExprKind::HashDigest:
         case HirExprKind::Uuid:
+        case HirExprKind::ReqQueryAll:
         case HirExprKind::ReqHeaderAll:
         case HirExprKind::ReqHeaderCount:
         case HirExprKind::ReqUniqueHeader:
@@ -26466,6 +26473,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         "storage must survive resume without rematerialization");
                 if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
+                if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
@@ -27064,6 +27072,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         if (route.waits.len > 0) {
             auto blocked_detail = [](const HirExpr& e) -> Str {
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
+                if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
                 return {};
