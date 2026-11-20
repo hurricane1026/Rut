@@ -1765,3 +1765,14 @@ than ceiling `expires_in`. Apply it only to a document from a verified HTTPS
 token response, along with the usual token and scope validation before forwarding.
 The bound is an inclusive number of seconds, limited to positive i32 values.
 Existing grant helpers remain unchanged; no token caching or clock is involved.
+
+### Optional exact token-exchange scopes
+
+Pass the result of `oauth_client.exchangeDocument(reply)` to
+`oauth_exchange_exact.require(document, trustedScopes)`, then apply
+`oauth_client.tokenAuthorizationDocument` before forwarding. The first helper
+requires a completed AS response issuing the OAuth access-token type; the exact
+scope check validates both lists and requires each to contain the other. Order
+and repeated scopes do not matter. Extra, missing, malformed or case-mismatched
+scopes fail closed. This opt-in check does not change the existing wider-grant
+policy. The endpoint must still be a fixed, verified HTTPS AS.
