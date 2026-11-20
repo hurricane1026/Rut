@@ -20,6 +20,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/response_body_chain.h"
+#include "rut/runtime/response_read_timer.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_deflate.h"
 #include "rut/runtime/ws_extensions.h"
@@ -125,15 +126,6 @@ enum class ResponseReadDeadlineSendKind : u8 {
     Header,
     Body,
     Combined,
-};
-
-// Kernel ownership for the generic precise response-read timer. CancelPending
-// retains the immutable identity until both the timeout target and the cancel
-// SQE completions have been harvested, in either order.
-enum class ResponseReadTimerPhase : u8 {
-    None,
-    Armed,
-    CancelPending,
 };
 
 // Immutable request/response contract selected before the JIT handler runs.
@@ -1079,22 +1071,13 @@ struct ConnectionBase {
     // independently; their keys remain unchanged until the second CQE arrives.
     bool consume_response_read_timer_completion(u32 tagged_generation) {
         if (!response_read_timer_owner_is_valid()) return false;
-        const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
-        const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
-        if (generation == 0 || generation != response_read_timer_owner_generation) return false;
-        if (response_read_timer_phase == ResponseReadTimerPhase::Armed) {
-            if (cancel || !response_read_timer_target_owned || response_read_timer_cancel_owned)
-                return false;
-            response_read_timer_target_owned = false;
-        } else if (response_read_timer_phase == ResponseReadTimerPhase::CancelPending) {
-            bool& owned =
-                cancel ? response_read_timer_cancel_owned : response_read_timer_target_owned;
-            if (!owned) return false;
-            owned = false;
-        } else {
-            return false;
-        }
-        if (!response_read_timer_target_owned && !response_read_timer_cancel_owned) {
+        const auto result = consume_response_read_timer_owner(response_read_timer_phase,
+                                                              response_read_timer_owner_generation,
+                                                              tagged_generation,
+                                                              response_read_timer_target_owned,
+                                                              response_read_timer_cancel_owned);
+        if (result == TimerCompletion::Rejected) return false;
+        if (result == TimerCompletion::Drained) {
             const bool cleared = clear_response_read_timer_owner();
             if (cleared && response_read_deadline_state == ResponseReadDeadlineState::None)
                 response_read_timer_last_progress_ns = 0;

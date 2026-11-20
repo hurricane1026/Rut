@@ -41392,10 +41392,26 @@ TEST(state_invariant, response_read_timer_cancel_owners_drain_in_either_order) {
         CHECK_EQ(conn.response_read_timer_cancel_owned, !cancel_first);
         REQUIRE(conn.response_read_timer_owner_is_valid());
 
+        // A late completion from another generation cannot release the remaining owner.
+        CHECK_FALSE(conn.consume_response_read_timer_completion(second + 1u));
+        CHECK_FALSE(conn.clear_response_read_timer_owner());
+        CHECK_EQ(conn.response_read_timer_timespec.tv_sec, 1);
         CHECK_FALSE(conn.consume_response_read_timer_completion(first));
         REQUIRE(conn.consume_response_read_timer_completion(second));
         CHECK(conn.response_read_timer_owner_is_neutral());
         CHECK_EQ(conn.response_read_timer_generation, generation);
+        REQUIRE(conn.next_response_read_timer_generation());
+        conn.response_read_timer_timespec = {2, 0};
+        conn.response_read_timer_deadline_generation = 32;
+        conn.response_read_timer_upstream_episode = 38;
+        conn.response_read_timer_phase = ResponseReadTimerPhase::Armed;
+        conn.response_read_timer_target_owned = true;
+        CHECK_FALSE(conn.consume_response_read_timer_completion(first));
+        CHECK_FALSE(conn.consume_response_read_timer_completion(second));
+        CHECK(conn.response_read_timer_target_owned);
+        CHECK_EQ(conn.response_read_timer_timespec.tv_sec, 2);
+        REQUIRE(conn.consume_response_read_timer_completion(generation + 1));
+        CHECK(conn.response_read_timer_owner_is_neutral());
     }
 }
 

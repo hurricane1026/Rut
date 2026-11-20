@@ -62,6 +62,19 @@ def main():
         mutate(root / "include", overlay, "rut/runtime/io_event.h",
                "    Count,\n};", "    Count,\n    UnclassifiedEvent = 254,\n};")
         check(compiler, root, overlay, "UnclassifiedEvent", source=runtime)
+        (overlay / "rut/runtime/io_event.h").unlink()
+
+        runtime = "src/runtime/response_read_timer.cc"
+        header = "rut/runtime/response_read_timer.h"
+        check(compiler, root, overlay, source=runtime)
+        for before, after in [
+            ("generation == 0 || generation != owner_generation", "generation == 0"),
+            ("cancel ? cancel_owned : target_owned", "cancel ? target_owned : cancel_owned"),
+            ("target_owned || cancel_owned ?", "target_owned && cancel_owned ?"),
+        ]:
+            mutate(root / "include", overlay, header, before, after)
+            check(compiler, root, overlay, "Response-read timer completion violates ownership contract",
+                  source=runtime)
 
 
 if __name__ == "__main__":
