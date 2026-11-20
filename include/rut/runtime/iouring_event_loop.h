@@ -19,6 +19,7 @@
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/response_read_deadline.h"
+#include "rut/runtime/send_progress.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
@@ -3726,6 +3727,8 @@ public:
     // Raw client send — bytes go to the wire as-is (plaintext, or already-
     // encrypted ciphertext from the TLS layer).
     bool submit_send_raw(Connection& c, const u8* buf, u32 len) {
+        // The direct-write paths below can put bytes on the wire before submitting an SQE.
+        if (!send_result_fits(len)) return false;
         const auto phase = c.response_read_deadline_post_commit_phase;
         const bool deadline_send = phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
                                    phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
@@ -3898,9 +3901,9 @@ public:
             // Proxy-stream tails use the cursor fields but retain their own
             // accounting. A single-shot send owns its continuation until the
             // final ciphertext target drains, including after encryption ends.
-            if (c.tls_proxy_stream || buf == nullptr || len == 0 ||
-                len > static_cast<u32>(INT32_MAX) || c.fd < 0 ||
-                !c.tls_single_shot_send_owner_is_neutral() || c.tls_send_src != nullptr) {
+            if (c.tls_proxy_stream || buf == nullptr || len == 0 || !send_result_fits(len) ||
+                c.fd < 0 || !c.tls_single_shot_send_owner_is_neutral() ||
+                c.tls_send_src != nullptr) {
                 close_conn(c);
                 return false;
             }

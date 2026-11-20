@@ -8,6 +8,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
+#include "rut/runtime/send_progress.h"
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -774,7 +775,7 @@ bool IoUringBackend::add_send(i32 fd,
                               u32 generation,
                               bool more_follows,
                               BufferedSendVector* vector) {
-    if (conn_id >= connection_capacity || connection_capacity == 0) return false;
+    if (conn_id >= connection_capacity || !send_result_fits(len)) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;  // no SQE even after a flush: don't record send_state for it
     if (vector && !vector->matches(buf, len)) return false;
@@ -812,7 +813,7 @@ bool IoUringBackend::add_send_file(i32 fd,
                                    bool allow_sync_completion) {
     if (wrote_all) *wrote_all = false;
     if (conn_id >= connection_capacity || connection_capacity == 0 || fd < 0 || file_fd < 0 ||
-        len == 0 || len > static_cast<u32>(INT32_MAX))
+        len == 0 || !send_result_fits(len))
         return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;  // the completion must stay accountable
@@ -908,7 +909,7 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
                                                  BufferedSendVector* vector,
                                                  u32 extra_flags) {
     if (vector && !vector->matches(buf, len)) return false;
-    if (conn_id >= connection_capacity || connection_capacity == 0 || written > len ||
+    if (conn_id >= connection_capacity || !send_result_fits(len) || written > len ||
         (written == len && !nop_inject_result))
         return false;
     io_uring_sqe* sqe = get_sqe();
@@ -948,7 +949,9 @@ bool IoUringBackend::flush_pending_nonblocking() {
 
 bool IoUringBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
-    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
+        !send_result_fits(len))
+        return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
@@ -2116,7 +2119,7 @@ u32 IoUringBackend::wait(
             }
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
-                if (nw > ss.remaining || ss.offset > UINT32_MAX - nw) {
+                if (!advance_send_bytes(ss.offset, ss.remaining, nw)) {
                     // A completion may never claim bytes outside the submitted
                     // range.  Clear the state and emit one terminal failure;
                     // wrapping remaining would otherwise manufacture a complete
@@ -2137,8 +2140,6 @@ u32 IoUringBackend::wait(
                     continue;
                 }
                 if (ss.vector) ss.vector->advance(nw);
-                ss.offset += nw;
-                ss.remaining -= nw;
                 if (ss.remaining > 0) {
                     // Partial — re-submit remaining bytes
                     io_uring_sqe* sqe = get_sqe_flushing();

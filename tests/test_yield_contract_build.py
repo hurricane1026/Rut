@@ -69,6 +69,17 @@ def main():
         overlay = Path(directory)
         compiler = sys.argv[1]
         check_timer_transport(compiler, root, overlay)
+        source = "src/runtime/send_progress.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("completed > remaining", "completed >= remaining"),
+            ("total <= INT32_MAX", "total <= UINT32_MAX"),
+            ("remaining -= completed;", "remaining = 0;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/send_progress.h", before, after)
+            check(compiler, root, overlay, "Partial send violates byte accounting contract",
+                  source=source)
+            probe.unlink()
         check(compiler, root, overlay)
         check_downstream_send(compiler, root, overlay)
         source = "src/runtime/io_event.cc"

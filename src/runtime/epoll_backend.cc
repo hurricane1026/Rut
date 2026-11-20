@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/send_progress.h"
 #include "rut/runtime/tls.h"
 
 #include <errno.h>
@@ -649,7 +650,9 @@ void EpollBackend::pause_upstream_recv(u32 conn_id,
 
 bool EpollBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
-    if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity || !send_result_fits(len) ||
+        !valid_upstream_episode(upstream_episode))
+        return false;
 
     auto& state = upstream_send_state[conn_id];
     if (state.remaining || state.src || state.fd >= 0) return false;
@@ -777,7 +780,7 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
 }
 
 bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool more_follows) {
-    if (conn_id >= connection_capacity) return false;
+    if (conn_id >= connection_capacity || !send_result_fits(len)) return false;
 
     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
     auto& state = send_state[conn_id];
@@ -843,7 +846,8 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool mo
 }
 
 bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
-    if (connection_capacity == 0 || c.id >= connection_capacity) return false;
+    if (connection_capacity == 0 || c.id >= connection_capacity || !send_result_fits(len))
+        return false;
 
     if (!c.tls_active || !c.tls) return add_send(c.fd, c.id, buf, len);
 

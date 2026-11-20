@@ -1,6 +1,7 @@
 #include "rut/runtime/kqueue_backend.h"
 
 #include "rut/platform/socket.h"
+#include "rut/runtime/send_progress.h"
 #include "rut/runtime/tls.h"
 
 #include <errno.h>
@@ -347,7 +348,8 @@ bool KqueueBackend::finish_send(u32 id, SendState& state, SSL* ssl, IoEvent& eve
 }
 
 bool KqueueBackend::start_send(i32 fd, u32 id, const u8* buf, u32 len, bool upstream, u32 episode) {
-    if (id >= kMaxFdMap || (upstream && !valid_owner(id, episode)) || (len != 0 && !buf))
+    if (id >= kMaxFdMap || !send_result_fits(len) || (upstream && !valid_owner(id, episode)) ||
+        (len != 0 && !buf))
         return false;
     auto& state = upstream ? upstream_send_state[id] : send_state[id];
     if (state.remaining || state.src || state.fd >= 0) return false;
@@ -387,7 +389,8 @@ bool KqueueBackend::add_recv_tls(Connection& conn) {
 
 bool KqueueBackend::add_send_tls(Connection& conn, const u8* buf, u32 len) {
     const u32 id = conn.id;
-    if (id >= kMaxFdMap || send_state[id].remaining || send_state[id].src || send_state[id].fd >= 0)
+    if (id >= kMaxFdMap || !send_result_fits(len) || send_state[id].remaining ||
+        send_state[id].src || send_state[id].fd >= 0)
         return false;
     if (pending_count == kPendingCap && len == 0) return false;
     const int previous_fd = downstream_fd_map[id];
