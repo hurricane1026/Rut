@@ -744,6 +744,10 @@ suffixes after an otherwise valid signature. Multiple valid-format signatures
 support sender key rotation. Callers may independently try another trusted key
 within their configured rotation window.
 
+A [durable rotation example](../examples/webhook-durable-rotation-replay-auth.rut)
+combines current/previous keys with confirmed local AOF claims under one stable
+signer namespace; the claim survives Redis and gateway restarts.
+
 `auth.rotatingStandardWebhook` accepts current and previous decoded keys and
 their configured credential IDs. Both slots are checked; the current slot wins
 when both match. Empty keys disable slots, and removing the previous key revokes

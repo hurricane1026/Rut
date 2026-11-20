@@ -239,7 +239,9 @@ def gateway(args, source, store, directory):
     if args.tls:
         endpoint.update(tls=True,caFile=str(Path(args.testdata)/'localhost_cert.pem'),serverName='localhost')
     import json
-    env=dict(os.environ,STANDARD_WEBHOOK_RAW_KEY=KEY,REPLAY_NAMESPACE=getattr(args, 'namespace', 'replay:billing'),SIGNED_REQUEST_KEY=KEY,
+    env=dict(os.environ,STANDARD_WEBHOOK_RAW_KEY=getattr(args, 'current_key', KEY),
+             STANDARD_WEBHOOK_PREVIOUS_RAW_KEY=getattr(args, 'previous_key', ''),
+             REPLAY_NAMESPACE=getattr(args, 'namespace', 'replay:billing'),SIGNED_REQUEST_KEY=KEY,
              REDIS_ENDPOINT=json.dumps(endpoint),REDIS_USERNAME='gateway',
              REDIS_PASSWORD='service-password',REDIS_DATABASE='1')
     log=root/'gateway.log'
