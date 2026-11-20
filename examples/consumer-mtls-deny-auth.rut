@@ -1,0 +1,8 @@
+import "middleware/mtls_deny.rut"
+
+route GET "/private" {
+    let checked = mtls_deny.require(env("MTLS_DENY_FIRST"), env("MTLS_DENY_SECOND"))
+    guard let identity = consumerAuthenticateMtls(env("MTLS_REGISTRY")) else { return 401 }
+    guard let consumerId = json.string(json.get(identity, "/consumerId").or(identity)) else { return 503 }
+    return response(200, body: consumerId)
+}
