@@ -17,8 +17,8 @@ struct PassiveHealthPolicy {
 inline bool active_health_host_valid(Str authority) {
     if (!authority.ptr || authority.len == 0 || authority.len > 260) return false;
     for (u32 i = 0; i < authority.len; ++i) {
-        const char c = authority.ptr[i];
-        if (c == ',' || c == '*') return false;
+        const unsigned char c = static_cast<unsigned char>(authority.ptr[i]);
+        if (c == 0 || c < 0x20 || c == 0x7f || c == ',' || c == '*') return false;
     }
     char normalized[254];
     u16 length = 0;

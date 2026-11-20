@@ -48740,4 +48740,9 @@ TEST(frontend, upstream_health_probe_host_authority) {
     for (u32 i = 0; i < 261; ++i) long_host[i] = 'a';
     long_host[261] = '\0';
     CHECK_FALSE(active_health_host_valid({long_host, 261}));
+
+    const char invalid_authorities[][3] = {
+        {'a', '\0', 'b'}, {'a', '\x01', 'b'}, {'a', '\x7f', 'b'}};
+    for (const auto& invalid : invalid_authorities)
+        CHECK_FALSE(active_health_host_valid({invalid, 3}));
 }
