@@ -1,0 +1,7 @@
+// Opt-in maximum lifetime in seconds; trusted configuration must be positive.
+func documentWithMaxLifetime(_ document: Json, _ maxLifetime: i32) -> Json {
+    guard maxLifetime > 0 else { respond 503 }
+    let lifetime = json.int(json.get(document, "/expires_in").or(document)).or(0)
+    guard lifetime > 0 && lifetime <= i64(maxLifetime) else { respond 503 }
+    document
+}
