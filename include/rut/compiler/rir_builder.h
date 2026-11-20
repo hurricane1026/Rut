@@ -671,13 +671,15 @@ struct Builder {
     }
 
     Result<ValueId> emit_req_routing_property(bool string, i32 selector, SourceLoc loc = {}) {
-        if (selector < 0 || selector > 2) return err(RirError::InvalidState);
+        if (selector < 0 || selector > (string ? 2 : 3)) return err(RirError::InvalidState);
         const Type* ty;
         if (string) {
             auto* inner = TRY(make_type(TypeKind::Str));
             ty = TRY(make_type(TypeKind::Optional, inner));
         } else {
-            ty = TRY(make_type(selector == 2 ? TypeKind::Bool : TypeKind::I32));
+            ty = TRY(make_type(selector == 3   ? TypeKind::Str
+                               : selector == 2 ? TypeKind::Bool
+                                               : TypeKind::I32));
         }
         auto result =
             TRY(emit(string ? Opcode::ReqRoutingString : Opcode::ReqConnectionScalar, ty, loc));

@@ -33300,3 +33300,47 @@ TEST(jit, request_unique_query_helper_raw_occurrences) {
     check("dup", 3, false, {});
     check("absent", 6, false, {});
 }
+
+TEST(jit, request_scheme_uses_completed_transport) {
+    const char* src = R"rut(
+route GET "/" {
+    guard req.scheme != "https" else { return 201 }
+    guard req.scheme == "http" else { return 500 }
+    return 202
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const char req[] = "GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-Proto: https\r\n\r\n";
+    Connection conn;
+    conn.reset();
+    auto run = [&] {
+        return HandlerResult::unpack(
+                   handler(
+                       &conn, nullptr, reinterpret_cast<const u8*>(req), sizeof(req) - 1, nullptr))
+            .status_code;
+    };
+    CHECK_EQ(run(), 202u);
+    conn.tls_active = true;
+    CHECK_EQ(run(), 202u);
+    conn.tls_handshake_complete = true;
+    CHECK_EQ(run(), 201u);
+    engine.shutdown();
+    rir.destroy();
+}

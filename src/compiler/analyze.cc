@@ -11733,6 +11733,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                                             : 2;
                 return out;
             }
+            if (expr.name.eq(lit_str("scheme"))) {
+                out.kind = HirExprKind::ReqConnectionScalar;
+                out.int_value = 3;
+                out.type = HirTypeKind::Str;
+                return out;
+            }
             if (expr.name.eq(lit_str("remotePort")) || expr.name.eq(lit_str("localPort")) ||
                 expr.name.eq(lit_str("isTls"))) {
                 out.kind = HirExprKind::ReqConnectionScalar;

@@ -1699,9 +1699,27 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_connection_scalar");
             if (fn == nullptr)
                 fn = LLVMAddFunction(c.llvm_mod, "rut_helper_req_connection_scalar", type);
-            LLVMValueRef args[] = {c.param_conn, LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0)};
+            LLVMValueRef args[] = {
+                c.param_conn,
+                LLVMConstInt(c.i32_ty, inst.imm.i32_val == 3 ? 2 : inst.imm.i32_val, 0)};
             LLVMValueRef value = LLVMBuildCall2(c.builder, type, fn, args, 2, "connection.scalar");
-            if (inst.imm.i32_val == 2)
+            if (inst.imm.i32_val == 3) {
+                auto secure = LLVMBuildICmp(
+                    c.builder, LLVMIntNE, value, LLVMConstInt(c.i32_ty, 0, 0), "scheme.secure");
+                auto ptr = LLVMBuildSelect(c.builder,
+                                           secure,
+                                           c.make_global_str(lit_str("https"), "scheme.https"),
+                                           c.make_global_str(lit_str("http"), "scheme.http"),
+                                           "scheme.ptr");
+                auto len = LLVMBuildSelect(c.builder,
+                                           secure,
+                                           LLVMConstInt(c.i32_ty, 5, 0),
+                                           LLVMConstInt(c.i32_ty, 4, 0),
+                                           "scheme.len");
+                auto result = LLVMGetUndef(c.str_ty);
+                result = LLVMBuildInsertValue(c.builder, result, ptr, 0, "scheme.value.ptr");
+                value = LLVMBuildInsertValue(c.builder, result, len, 1, "scheme.value.len");
+            } else if (inst.imm.i32_val == 2)
                 value = LLVMBuildICmp(
                     c.builder, LLVMIntNE, value, LLVMConstInt(c.i32_ty, 0, 0), "connection.tls");
             c.set_value(inst.result, value);
@@ -4235,14 +4253,16 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 if (inst.op == rir::Opcode::ReqRoutingString ||
                     inst.op == rir::Opcode::ReqConnectionScalar) {
                     if (inst.operand_count != 0 || inst.extra_operands || inst.imm.i32_val < 0 ||
-                        inst.imm.i32_val > 2 || inst.result == rir::kNoValue ||
-                        inst.result.id >= fn.value_count || fn.values == nullptr)
+                        inst.imm.i32_val > (inst.op == rir::Opcode::ReqRoutingString ? 2 : 3) ||
+                        inst.result == rir::kNoValue || inst.result.id >= fn.value_count ||
+                        fn.values == nullptr)
                         return {nullptr, nullptr, false};
                     if (inst.op == rir::Opcode::ReqConnectionScalar) {
                         const auto* type = fn.values[inst.result.id].type;
                         if (type == nullptr ||
-                            type->kind != (inst.imm.i32_val == 2 ? rir::TypeKind::Bool
-                                                                 : rir::TypeKind::I32) ||
+                            type->kind != (inst.imm.i32_val == 3   ? rir::TypeKind::Str
+                                           : inst.imm.i32_val == 2 ? rir::TypeKind::Bool
+                                                                   : rir::TypeKind::I32) ||
                             type->inner || type->struct_def)
                             return {nullptr, nullptr, false};
                     }

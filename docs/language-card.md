@@ -3919,7 +3919,9 @@ with `set_path:`. This is an explicit route policy, not global canonicalization.
 
 `req.remotePort: i32` and `req.localPort: i32` come from the accepted socket and
 bound listener. `req.isTls: bool` reports a completed TLS transport; it ignores
-Forwarded, X-Forwarded-Proto and H2 :scheme. `req.sni: str?` is the handshake's
+Forwarded, X-Forwarded-Proto and H2 :scheme. `req.scheme: str` is `"https"`
+for a completed TLS transport and `"http"` for cleartext; it uses the same
+connection state and ignores those client-provided fields. `req.sni: str?` is the handshake's
 connection-owned server name (at most 253 bytes), absent on cleartext or absent
 SNI. SNI is client-selected routing metadata, not an authenticated identity.
 

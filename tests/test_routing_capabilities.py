@@ -187,6 +187,7 @@ route GET "/metadata" {
     guard req.localPort == local && req.remotePort > 0 else { return 422 }
     let secure = req.header("X-Secure").or("") == "yes"
     guard req.isTls == secure else { return 403 }
+    guard (secure && req.scheme == "https") || (!secure && req.scheme == "http") else { return 403 }
     let name = req.sni.or("none")
     return response(200, body: name)
 }
@@ -303,7 +304,9 @@ route "/" {
                             probe.close()
                     assert result[0] == code and (expected is None or result[1] == expected), ('capture', path, result)
                 metadata_headers = {'X-Local-Port': str(port), 'X-Secure': 'yes' if args.tls else 'no',
-                                    'X-Forwarded-Proto': 'http' if args.tls else 'https', 'SNI': 'spoof.example'}
+                                    'X-Forwarded-Proto': 'http' if args.tls else 'https',
+                                    'Forwarded': 'proto=http' if args.tls else 'proto=https',
+                                    'SNI': 'spoof.example'}
                 expected_name = b'localhost' if args.tls else b'none'
                 if args.h2:
                     result = h2_request(port, '/metadata', list(metadata_headers.items()), tls_context=context)

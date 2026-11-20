@@ -588,6 +588,10 @@ req.remove("Authorization")  // remove all matching fields before upstream forwa
 req.params.id           // string (from :id)
 req.params.postId       // string (from :postId)
 
+// Effective transport scheme is "https" on completed TLS, otherwise "http".
+// Forwarded, X-Forwarded-Proto and HTTP/2 :scheme do not alter it.
+req.scheme              // str
+
 // Query string
 req.queryString         // string? — raw query string: "page=1&limit=20"
 req.query("page")       // string? — first value of the parameter

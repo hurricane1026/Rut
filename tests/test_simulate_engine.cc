@@ -512,6 +512,7 @@ TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported
     const char* src =
         "route GET \"/local\" { guard req.localPort == 8443 else { return 400 } return 201 }\n"
         "route GET \"/tls\" { if req.isTls { return 201 } else { return 202 } }\n"
+        "route GET \"/scheme\" { if req.scheme == \"https\" { return 201 } else { return 202 } }\n"
         "route GET \"/sni\" { guard let name = req.sni else { return 400 } return 201 }\n"
         "route GET \"/cert\" { guard let cert = req.tlsClientCertSha256 else { return 400 } return "
         "201 }\n"
@@ -523,10 +524,10 @@ TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported
 
     Engine engine;
     REQUIRE(engine.init(rir.module, nullptr, 0));
-    REQUIRE_EQ(engine.route_count, 6u);
-    for (u32 i = 0; i < 4; i++) CHECK(engine.routes[i].needs_uncaptured_transport_metadata);
-    CHECK_FALSE(engine.routes[4].needs_uncaptured_transport_metadata);
+    REQUIRE_EQ(engine.route_count, 7u);
+    for (u32 i = 0; i < 5; i++) CHECK(engine.routes[i].needs_uncaptured_transport_metadata);
     CHECK_FALSE(engine.routes[5].needs_uncaptured_transport_metadata);
+    CHECK_FALSE(engine.routes[6].needs_uncaptured_transport_metadata);
 
     const auto check_unsupported = [&](const char* path) {
         char request[96];
@@ -543,6 +544,7 @@ TEST(simulate_engine, routes_using_uncaptured_transport_metadata_are_unsupported
     };
     check_unsupported("/local");
     check_unsupported("/tls");
+    check_unsupported("/scheme");
     check_unsupported("/sni");
     check_unsupported("/cert");
 

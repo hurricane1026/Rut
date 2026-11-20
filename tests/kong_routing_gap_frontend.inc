@@ -164,6 +164,7 @@ TEST(kong_routing_gap, connection_metadata_accessors_reach_verified_rir) {
         "route GET \"/\" { let port = req.remotePort return 200 }",
         "route GET \"/\" { let port = req.localPort return 200 }",
         "route GET \"/\" { let secure = req.isTls return 200 }",
+        "route GET \"/\" { let scheme = req.scheme return 200 }",
     };
     for (const char* source : sources) CHECK(kong_gap_stage(_tc, source) == KongGapStage::Verified);
 }
