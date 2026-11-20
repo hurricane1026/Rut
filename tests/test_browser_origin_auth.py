@@ -38,10 +38,14 @@ def main():
         root = Path(directory)
         (root / "middleware").mkdir()
         shutil.copyfile(source.parent / "middleware/browser_origin.rut", root / "middleware/browser_origin.rut")
-        for config in ("https://admin.example.com", "", "*", "null", "https://admin.example.com/path",
-                       "https://admin.example.com, https://evil.example",
-                       "https://admin..example.com", "https://admin.example.com:70000",
-                       "https://-admin.example.com", "https://admin-.example.com"):
+        configs = [(value, "https://console.example.com") for value in
+                   ("https://admin.example.com", "", "*", "null", "https://admin.example.com/path",
+                    "https://admin.example.com, https://evil.example",
+                    "https://admin..example.com", "https://admin.example.com:70000",
+                    "https://-admin.example.com", "https://admin-.example.com")]
+        configs += [("https://admin.example.com", value) for value in
+                    ("", "*", "null", "https://console.example.com/path", "https://admin.example.com")]
+        for config, second in configs:
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
@@ -50,7 +54,7 @@ def main():
             with (root / "server.log").open("w+") as log:
                 proc = subprocess.Popen([args.server, str(program), "--backend", args.backend,
                                          "--opt", args.opt, "--shards", "1", "--drain", "0"],
-                                        env=dict(os.environ, BROWSER_ORIGIN=config), stdout=log, stderr=subprocess.STDOUT)
+                                        env=dict(os.environ, BROWSER_ORIGIN=config, BROWSER_SECOND_ORIGIN=second), stdout=log, stderr=subprocess.STDOUT)
                 try:
                     deadline = time.monotonic() + 15
                     while True:
@@ -76,6 +80,11 @@ def main():
                         if config and config not in ("*", "null"):
                             actual = exchange(port, path, f"Origin: {config}\r\n")
                             assert actual == (204 if config == "https://admin.example.com" else 503), (config, path, actual)
+                    for fields, expected in cases + [("Origin: https://console.example.com\r\n", 204),
+                                                     ("Origin: https://console.example.com.evil.example\r\n", 403),
+                                                     ("Origin: https://admin.example.com\r\nOrigin: https://console.example.com\r\n", 403)]:
+                        actual = exchange(port, "/shared/write", fields)
+                        assert actual == (expected if config == "https://admin.example.com" and second == "https://console.example.com" else 503), (config, second, fields, actual)
                 finally:
                     proc.terminate()
                     proc.wait(timeout=10)
