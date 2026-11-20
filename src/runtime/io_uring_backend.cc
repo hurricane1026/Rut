@@ -1,6 +1,7 @@
 #include "rut/runtime/io_uring_backend.h"
 
 #include "core/expected.h"
+#include "io_uring_send_target.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
@@ -2007,14 +2008,10 @@ u32 IoUringBackend::wait(
         // A downstream token authenticates the SendState whose byte counters
         // the proactor is about to mutate. Stale/cancel tokens and multishot
         // records reach the default emitter unchanged for dispatch to handle.
-        bool downstream_send_proactor = false;
-        if (type == IoEventType::Send && conn_id < connection_capacity) {
-            const u32 current_generation = send_state[conn_id].generation;
-            downstream_send_proactor = aux == current_generation &&
-                                       (aux & kNonUpstreamSendCancelBit) == 0 &&
-                                       (cqe->flags & IORING_CQE_F_MORE) == 0;
-        }
-        if ((type == IoEventType::Send && downstream_send_proactor) ||
+        const bool downstream_send_proactor =
+            type == IoEventType::Send && conn_id < connection_capacity &&
+            matches_downstream_send_target(send_state[conn_id].generation, aux, cqe->flags);
+        if (downstream_send_proactor ||
             (type == IoEventType::UpstreamSend && aux == 0 && conn_id < connection_capacity)) {
             auto& ss = (type == IoEventType::UpstreamSend) ? upstream_send_state[conn_id]
                                                            : send_state[conn_id];
