@@ -731,6 +731,7 @@ enum class RegistryAction : u8 {
     RemoveConsumer,
     RemoveConsumerWithCredentials,
     RemoveCredential,
+    SetCredentialGroups,
 };
 
 struct RegistryCommand {
@@ -745,6 +746,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"remove-consumer", 5, RegistryAction::RemoveConsumer},
     {"remove-consumer-with-credentials", 5, RegistryAction::RemoveConsumerWithCredentials},
     {"remove-credential", 5, RegistryAction::RemoveCredential},
+    {"set-credential-groups", 6, RegistryAction::SetCredentialGroups},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -753,6 +755,33 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
         if (field_equals(doc, field(doc, record, lit_str("id")), id)) return record;
     }
     return json::kNone;
+}
+
+bool update_credential(
+    json::Document& doc, u32 record, RegistryAction action, char** args, json::Writer& output) {
+    const bool kGroups = action == RegistryAction::SetCredentialGroups;
+    const u32 kGroupsField = field(doc, record, lit_str("groups"));
+
+    output.put('{');
+    bool first = true;
+    for (u32 child = doc.nodes[record].child; child != json::kNone; child = doc.nodes[child].next) {
+        if ((kGroups && child == kGroupsField)) continue;
+        if (!first) output.put(',');
+        first = false;
+        if (!doc.write(doc.nodes[child].key, output)) return false;
+        output.put(':');
+        if (!doc.write(child, output)) return false;
+    }
+    if (action == RegistryAction::SetCredentialGroups) {
+        const Str input{args[4], bounded_argument(args[4], json::kMaxBytes + 1)};
+        SensitiveDocument groups;
+        if (!input.len || !groups.parse(input) || groups.nodes[0].kind != json::Kind::Array)
+            return false;
+        output.text(lit_str(",\"groups\":"));
+        if (!groups.write(0, output)) return false;
+    }
+    output.put('}');
+    return output.ok;
 }
 
 int registry_command(RegistryAction action, int argc, char** args) {
@@ -795,7 +824,10 @@ int registry_command(RegistryAction action, int argc, char** args) {
             continue;
         if (!first) output.put(',');
         first = false;
-        if (!doc.write(record, output)) return failure("cannot encode credential record\n");
+        const bool written = record == kTarget
+                                 ? update_credential(doc, record, action, args, output)
+                                 : doc.write(record, output);
+        if (!written) return failure("cannot update credential record\n");
     }
     output.text(lit_str("]}"));
     SensitiveDocument checked;
@@ -888,6 +920,7 @@ constexpr char kUsage[] =
     "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
+    "       rut-consumers set-credential-groups INPUT CREDENTIAL_ID JSON_ARRAY OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"

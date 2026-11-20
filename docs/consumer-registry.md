@@ -532,6 +532,7 @@ a new private snapshot under the same no-replace rules as `apply`.
 | `remove-consumer INPUT CONSUMER_ID OUTPUT` | Remove a Consumer that owns no credentials, including disabled credentials. |
 | `remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT` | Remove the Consumer and all its credentials in one replacement snapshot. |
 | `remove-credential INPUT CREDENTIAL_ID OUTPUT` | Remove one credential by stable ID. |
+| `set-credential-groups INPUT CREDENTIAL_ID JSON_ARRAY OUTPUT` | Replace the credential's group restriction with a subset of its owner's groups. Use `'[]'` to restrict the credential to no groups. |
 
 Removal frees
 IDs for reuse and becomes effective when the replacement is deployed. The input
