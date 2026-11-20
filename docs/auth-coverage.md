@@ -1758,7 +1758,9 @@ The free inbound mTLS profile supports `--tls-client-crl` with the existing
 client CA and server certificate/key flags. One bounded complete direct-issuer
 PEM CRL is loaded at startup; current lastUpdate/nextUpdate are mandatory and
 new handshakes enforce issuer/signature/serial/time checks before publishing
-client identity. Session resumption remains disabled. Local fixtures cover both
+client identity. Optional `--tls-client-crl-verify-issuer` checks a unique direct
+CA issuer and the CRL signature before startup. Session resumption remains disabled.
+Local fixtures cover both
 backends, TLS1.2/1.3, HTTP1/2, malformed input, revocation and snapshot/keep-alive
 boundaries. See [the exact contract](mtls-client-crl.md). Online refresh, OCSP,
 intermediate revocation and cancellation of established connections remain open.

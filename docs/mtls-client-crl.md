@@ -37,13 +37,24 @@ never add a trusted CA certificate. A CA certificate in place of, or appended to
 the CRL is rejected. Operator-owned CA and CRL paths remain trust configuration,
 not client-controlled URLs or HTTP fields.
 
+### Optional issuer preflight
+
+Add `--tls-client-crl-verify-issuer` to require startup validation of the CRL
+signature. It requires `--tls-client-crl` and exactly one certificate in the
+configured CA bundle whose subject matches the CRL issuer. That certificate must
+be a CA, permit CRL signing when key usage is present, and verify the CRL
+signature. Missing, ambiguous, unsuitable or invalid issuers prevent startup.
+This opt-in profile requires the direct CRL issuer in the CA bundle, even when
+an intermediate could otherwise be supplied by the client during a handshake.
+It does not enable online replacement or compare CRL freshness across restarts.
+
 ## Handshake and authorization
 
 The existing pinned static OpenSSL verifier applies
 [`X509_V_FLAG_CRL_CHECK`](https://docs.openssl.org/3.5/man3/X509_VERIFY_PARAM_set_flags/#verification-flags)
 to the client leaf. A revoked serial, unsuitable issuer, invalid CRL signature,
 unsupported critical extension, missing suitable CRL or expired CRL fails the TLS
-handshake before HTTP authorization. A structurally valid CRL with an unknown
+handshake before HTTP authorization. Without issuer preflight, a structurally valid CRL with an unknown
 issuer or invalid signature may load at startup; its cryptographic suitability
 is checked against the actual peer chain during each full handshake, and cannot
 produce a verified client identity. No soft-fail or CA-only fallback applies.

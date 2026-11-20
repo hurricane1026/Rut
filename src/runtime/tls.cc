@@ -38,7 +38,7 @@ namespace {
 // Cold startup only: one complete direct-issuer PEM CRL, at most 64 KiB.
 // Import CRLs explicitly so this file can never add a trusted CA certificate.
 // The store owns its reference; no BIO/file/input views outlive this function.
-bool load_client_crl(SSL_CTX* ctx, const char* path) {
+bool load_client_crl(SSL_CTX* ctx, const char* path, bool verify_issuer) {
     if (!path || path[0] == '\0') return false;
     X509_STORE* store = SSL_CTX_get_cert_store(ctx);
     if (!store) return false;
@@ -93,6 +93,28 @@ bool load_client_crl(SSL_CTX* ctx, const char* path) {
         ok = last && next && X509_cmp_current_time(last) < 0 && X509_cmp_current_time(next) > 0 &&
              X509_CRL_get_ext_by_NID(crl, NID_delta_crl, -1) < 0 &&
              X509_CRL_get_ext_by_NID(crl, NID_issuing_distribution_point, -1) < 0;
+    }
+    if (ok && verify_issuer) {
+        X509* issuer = nullptr;
+        int matches = 0;
+        const X509_NAME* name = X509_CRL_get_issuer(crl);
+        for (int i = 0; i < sk_X509_OBJECT_num(objects); ++i) {
+            X509_OBJECT* object = sk_X509_OBJECT_value(objects, i);
+            if (X509_OBJECT_get_type(object) != X509_LU_X509) continue;
+            X509* certificate = X509_OBJECT_get0_X509(object);
+            if (X509_NAME_cmp(X509_get_subject_name(certificate), name) != 0) continue;
+            issuer = certificate;
+            ++matches;
+        }
+        if (matches != 1 || X509_check_ca(issuer) <= 0) {
+            ok = false;
+        } else {
+            const uint32_t usage = X509_get_key_usage(issuer);
+            EVP_PKEY* key = X509_get_pubkey(issuer);
+            ok = (usage == UINT32_MAX || (usage & KU_CRL_SIGN) != 0) && key &&
+                 X509_CRL_verify(crl, key) == 1;
+            EVP_PKEY_free(key);
+        }
     }
     if (ok) {
         ok = X509_STORE_add_crl(store, crl) == 1 &&
@@ -268,8 +290,9 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
                                                                    const char* key_path,
                                                                    bool offer_h2,
                                                                    const char* client_ca_path,
-                                                                   const char* client_crl_path) {
-    if (client_crl_path && !client_ca_path)
+                                                                   const char* client_crl_path,
+                                                                   bool verify_crl_issuer) {
+    if ((client_crl_path && !client_ca_path) || (verify_crl_issuer && !client_crl_path))
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
@@ -316,7 +339,7 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
     if (kRequireClientCertificate) {
         if (client_ca_path[0] == '\0' ||
             SSL_CTX_load_verify_locations(ssl_ctx, client_ca_path, nullptr) != 1 ||
-            (client_crl_path && !load_client_crl(ssl_ctx, client_crl_path))) {
+            (client_crl_path && !load_client_crl(ssl_ctx, client_crl_path, verify_crl_issuer))) {
             SSL_CTX_free(ssl_ctx);
             BIO_meth_free(bridge_bio_method);
             BIO_meth_free(socket_bio_method);

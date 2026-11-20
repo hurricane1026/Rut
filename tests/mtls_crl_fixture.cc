@@ -172,6 +172,33 @@ int verify_contexts(const char* testdata, const char* fixtures) {
         rut::destroy_tls_server_context(ctx);
         if (!kOk) return 1;
     }
+    struct StrictCase {
+        const char* name;
+        bool creates;
+    };
+    const StrictCase kStrictCases[] = {{"clear.pem", true},
+                                       {"revoked.pem", true},
+                                       {"bad-signature.pem", false},
+                                       {"wrong-issuer.pem", false},
+                                       {"expired.pem", false}};
+    for (const auto& item : kStrictCases) {
+        if (snprintf(path, sizeof(path), "%s/%s", fixtures, item.name) >=
+            static_cast<int>(sizeof(path)))
+            return 1;
+        auto created =
+            rut::create_tls_server_context(certificate, key, false, certificate, path, true);
+        if (created.has_value() != item.creates) {
+            if (created) rut::destroy_tls_server_context(created.value());
+            return 1;
+        }
+        if (created) rut::destroy_tls_server_context(created.value());
+    }
+    auto missing_crl =
+        rut::create_tls_server_context(certificate, key, false, certificate, nullptr, true);
+    if (missing_crl) {
+        rut::destroy_tls_server_context(missing_crl.value());
+        return 1;
+    }
     auto unpaired = rut::create_tls_server_context(certificate, key, false, nullptr, path);
     if (unpaired) {
         rut::destroy_tls_server_context(unpaired.value());
@@ -217,6 +244,18 @@ int main(int argc, char** argv) {
              crl(issuer, key, argv[2], "no-next.pem", true, -60, 3600, false) &&
              crl(issuer, key, argv[2], "delta.pem", true, -60, 3600, true, false, true) &&
              crl(issuer, key, argv[2], "indirect.pem", true, -60, 3600, true, false, false, true);
+        X509* duplicate = X509_dup(issuer);
+        ok = ok && duplicate && ASN1_INTEGER_set(X509_get_serialNumber(duplicate), 999) == 1 &&
+             X509_set_pubkey(duplicate, other) == 1 &&
+             X509_sign(duplicate, other, EVP_sha256()) > 0;
+        if (snprintf(path, sizeof(path), "%s/ambiguous-ca.pem", argv[2]) >=
+            static_cast<int>(sizeof(path)))
+            ok = false;
+        FILE* bundle = ok ? fopen(path, "w") : nullptr;
+        ok = ok && bundle && PEM_write_X509(bundle, issuer) == 1 &&
+             PEM_write_X509(bundle, duplicate) == 1;
+        if (bundle) fclose(bundle);
+        X509_free(duplicate);
         EVP_PKEY_free(other);
     }
     EVP_PKEY_free(key);

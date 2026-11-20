@@ -9497,7 +9497,9 @@ restarting the listener. Optional `--tls-client-crl PATH` adds one bounded,
 startup-static direct-issuer full leaf CRL with mandatory current time bounds.
 Only CRLs are imported, CA-bundle CRLs cannot compete with the explicit CRL,
 and new handshakes fail closed on revocation, unsuitable issuer/signature or
-expiry. Existing connections retain their handshake identity. Online refresh,
+expiry. Optional `--tls-client-crl-verify-issuer` requires a unique direct CA
+in the configured bundle and validates the CRL signature before startup.
+Existing connections retain their handshake identity. Online refresh,
 OCSP, intermediate revocation, dynamic mapping and immediate established-session
 revocation remain separate; see `docs/mtls-client-crl.md`. See
 [`mtls-pinned-auth.rut`](examples/mtls-pinned-auth.rut). OpenSSL verification
