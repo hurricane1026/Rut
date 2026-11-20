@@ -618,6 +618,13 @@ health capacity, and existing policy exclusions still apply. This does not alter
 HTTP/2 or gRPC upstream forwarding or explicit `connect()`. Pooled-connection
 replay retains its existing rules; if its fresh reconnect fails, subsequent
 backend selection uses this budget.
+An upstream may configure `passive_health: { failure_threshold: 3, eject_for: 5s }`.
+Both fields are required; the threshold is 1–255 and the duration is positive
+and less than 4,294,967,295 milliseconds. Without the block the existing three
+failures and five seconds apply. Existing connection outcome paths determine
+failures; HTTP response status codes do not. Configured passive and active probe
+verdicts are independent. Configuration reload resets health and rejects late
+results from retired configurations when the current upstream opts in.
 
 ## Native gRPC forwarding
 

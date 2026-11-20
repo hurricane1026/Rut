@@ -555,7 +555,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
     for (u32 i = 0; i < mod.upstream_count; ++i)
         if (mod.upstreams[i].minimum_healthy_weight_percent > 100 ||
             mod.upstreams[i].connect_attempts == 0 ||
-            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends)
+            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends ||
+            !mod.upstreams[i].passive_health.valid())
             return false;
 
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
@@ -604,6 +605,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
             if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
                 return false;
+            cfg.upstreams[i].passive_health = up.passive_health;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -660,6 +662,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
             if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
                 return false;
+            cfg.upstreams[i].passive_health = up.passive_health;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

@@ -21,6 +21,8 @@ inline void grpc_release_backend_active(GrpcExchange& x) {
     }
 }
 inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us);
+inline void record_backend_result(u16, u32, bool, u64, PassiveHealthPolicy);
+inline PassiveHealthPolicy passive_health_policy(const RouteConfig*, u16);
 
 template <typename Loop>
 void grpc_refresh_timer(Loop*, Connection&);
@@ -420,7 +422,8 @@ inline void grpc_record_connect_result(Loop* loop,
                                        u64 now_us) {
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
-    grpc_record_connect_result(conn, success, now_us);
+    record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, success, now_us,
+                          passive_health_policy(conn.request_config, conn.upstream_idx));
 }
 template <typename Loop>
 inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {

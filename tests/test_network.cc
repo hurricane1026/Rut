@@ -91046,3 +91046,31 @@ TEST(weighted_load_balance, reload_result_admission_uses_current_capacity_policy
     CHECK(admit_passive_health_result(&loop, nullptr, 0));
     CHECK_FALSE(current_health_generation(&loop, &old_cfg));
 }
+
+TEST(weighted_load_balance, configured_passive_health_threshold_and_reload) {
+    *backend_health(0, 0) = {};
+    PassiveHealthPolicy policy{2000, 2, true};
+    record_backend_result(0, 0, false, 100, policy);
+    CHECK_FALSE(backend_ejected(0, 0, 100));
+    record_active_probe_result(0, 0, false, 100, {}, true);
+    CHECK_EQ(backend_health(0, 0)->fails, 1u);
+    record_backend_result(0, 0, false, 200, policy);
+    CHECK_EQ(backend_health(0, 0)->eject_until_us, 2000200u);
+    record_active_probe_result(0, 0, true, 300, {}, true);
+    CHECK(backend_ejected(0, 0, 300));
+    CHECK_FALSE(backend_ejected(0, 0, 2000200));
+    record_backend_result(0, 0, true, 2000300, policy);
+    CHECK_EQ(backend_health(0, 0)->fails, 0u);
+    RouteConfig old_cfg, new_cfg;
+    REQUIRE(old_cfg.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(new_cfg.add_upstream("api", 0x7f000001, 9002));
+    const RouteConfig* current = &new_cfg;
+    struct Loop {
+        const RouteConfig** config_ptr;
+    } loop{&current};
+    CHECK(admit_passive_health_result(&loop, &old_cfg, 0));
+    new_cfg.upstreams[0].passive_health = policy;
+    CHECK_FALSE(admit_passive_health_result(&loop, &old_cfg, 0));
+    CHECK(admit_passive_health_result(&loop, &new_cfg, 0));
+    *backend_health(0, 0) = {};
+}

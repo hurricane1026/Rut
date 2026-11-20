@@ -3703,6 +3703,7 @@ struct Parser {
             item.upstream.addr_span = span_from(*lbrace.value());
             bool seen_minimum_healthy_weight_percent = false;
             bool seen_connect_attempts = false;
+            bool seen_passive_health = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -3937,6 +3938,51 @@ struct Parser {
                     }
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
+                } else if (field_name.eq({"passive_health", 14})) {
+                    if (seen_passive_health)
+                        return frontend_error(FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_passive_health = true;
+                    auto left = expect(TokenType::LBrace);
+                    if (!left) return core::make_unexpected(left.error());
+                    bool seen_failure = false, seen_eject = false;
+                    while (cur().type != TokenType::RBrace) {
+                        auto key = expect(TokenType::Ident);
+                        if (!key) return core::make_unexpected(key.error());
+                        auto colon = expect(TokenType::Colon);
+                        if (!colon) return core::make_unexpected(colon.error());
+                        if (key.value()->text.eq({"failure_threshold", 17})) {
+                            if (seen_failure) return frontend_error(FrontendError::UnexpectedToken, span_from(*key.value()), key.value()->text);
+                            seen_failure = true;
+                            auto lit = expect(TokenType::IntLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            u32 value = 0;
+                            for (u32 n = 0; n < lit.value()->text.len; ++n) {
+                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
+                                if (value > (255u - digit) / 10u)
+                                    return frontend_error(FrontendError::InvalidInteger, span_from(*lit.value()), lit.value()->text);
+                                value = value * 10u + digit;
+                            }
+                            if (!value) return frontend_error(FrontendError::InvalidInteger, span_from(*lit.value()), lit.value()->text);
+                            item.upstream.passive_health.failures = static_cast<u8>(value);
+                        } else if (key.value()->text.eq({"eject_for", 9})) {
+                            if (seen_eject) return frontend_error(FrontendError::UnexpectedToken, span_from(*key.value()), key.value()->text);
+                            seen_eject = true;
+                            auto dur = expect(TokenType::DurLit);
+                            if (!dur) return core::make_unexpected(dur.error());
+                            const u32 ms = dur_lit_to_ms(dur.value()->text);
+                            if (!ms || ms == 0xffffffffu)
+                                return frontend_error(FrontendError::InvalidInteger, span_from(*dur.value()), dur.value()->text);
+                            item.upstream.passive_health.eject_ms = ms;
+                        } else {
+                            return frontend_error(FrontendError::UnexpectedToken, span_from(*key.value()), key.value()->text);
+                        }
+                        (void)take(TokenType::Comma);
+                    }
+                    auto right = expect(TokenType::RBrace);
+                    if (!right) return core::make_unexpected(right.error());
+                    if (!seen_failure || !seen_eject)
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(*field.value()), field_name);
+                    item.upstream.passive_health.configured = true;
                 } else if (field_name.eq({"health_check", 12})) {
                     // Active health requires a path and interval. Status defaults to
                     // 200, and each consecutive-outcome threshold defaults to one.
@@ -4121,7 +4167,7 @@ struct Parser {
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
                         seen_minimum_healthy_weight_percent || seen_connect_attempts ||
-                        item.upstream.has_max_inflight)) {
+                        seen_passive_health || item.upstream.has_max_inflight)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

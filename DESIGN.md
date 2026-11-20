@@ -1629,6 +1629,16 @@ replay retains its existing rules; if its fresh reconnect fails, subsequent
 backend selection uses this budget.
 Native artifact version 24 records the upstream connect-attempt budget.
 
+Native artifact version 25 records the upstream passive health policy.
+
+An upstream may configure `passive_health: { failure_threshold: 3, eject_for: 5s }`.
+Both fields are required; the threshold is 1–255 and the duration is positive
+and less than 4,294,967,295 milliseconds. Without the block the existing three
+failures and five seconds apply. Existing connection outcome paths determine
+failures; HTTP response status codes do not. Configured passive and active probe
+verdicts are independent. Configuration reload resets health and rejects late
+results from retired configurations when the current upstream opts in.
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

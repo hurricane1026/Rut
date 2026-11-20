@@ -48657,3 +48657,36 @@ TEST(frontend, unique_cookie_requires_literal_token_name) {
         CHECK(!analyze_file_heap(ast.value()));
     }
 }
+
+TEST(frontend, passive_health_policy_bounds_and_prebound) {
+    auto tokens =
+        lex(lit("upstream api { passive_health: { failure_threshold: 255, eject_for: 2s } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK(cfg.upstreams[0].passive_health.configured);
+    CHECK_EQ(cfg.upstreams[0].passive_health.failures, 255u);
+    CHECK_EQ(cfg.upstreams[0].passive_health.eject_ms, 2000u);
+    rir.module.upstreams[0].passive_health.eject_ms = 0;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.destroy();
+    for (Str source :
+         {lit("upstream a { passive_health: { failure_threshold: 0, eject_for: 1s } }"),
+          lit("upstream a { passive_health: { failure_threshold: 256, eject_for: 1s } }"),
+          lit("upstream a { passive_health: { failure_threshold: 1, eject_for: 0s } }"),
+          lit("upstream a { passive_health: { failure_threshold: 1, eject_for: 9999999999h } }"),
+          lit("upstream a { passive_health: { failure_threshold: 1 } }")}) {
+        auto invalid = lex(source);
+        REQUIRE(invalid);
+        CHECK_FALSE(parse_file_heap(invalid.value()));
+    }
+}
