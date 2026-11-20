@@ -692,6 +692,15 @@ failures; HTTP response status codes do not. Configured passive and active probe
 verdicts are independent. Configuration reload resets health and rejects late
 results from retired configurations when the current upstream opts in.
 
+An upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For
+ordinary HTTP/1 requests with a fully buffered upload, no pipelined successor,
+no WebSocket upgrade and no explicit response/failure policy, the wheel starts
+when the upstream request send completes. It covers plaintext and verified HTTPS
+origins; incomplete header fragments and interim 1xx responses do not extend it.
+After final headers the ordinary upstream idle timer resumes. Timeout returns the
+existing 504 and closes the upstream. Other profiles and the default retain their
+existing timing. The wheel has one-second resolution.
+
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

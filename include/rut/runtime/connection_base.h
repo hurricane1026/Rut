@@ -420,6 +420,7 @@ struct ConnectionBase {
     u8 access_log_upstream_attempts_plus_one;  // zero unavailable; otherwise request count + 1
     u8 upstream_backend_idx;                   // which backend endpoint the current connect targets
     u8 upstream_attempted_backends;            // endpoints already tried by this request
+    bool response_header_timeout_armed;
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
@@ -2184,6 +2185,7 @@ struct ConnectionBase {
         connect_timeout_episode = 0;
         upstream_backend_idx = 0;
         upstream_attempted_backends = 0;
+        response_header_timeout_armed = false;
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;

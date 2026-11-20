@@ -18560,7 +18560,9 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     REQUIRE(c->upstream_fd >= 0);
     loop.backend.clear_ops();
 
+    c->response_header_timeout_armed = true;
     CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_FALSE(c->response_header_timeout_armed);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);  // fresh connect submitted
     CHECK(!c->upstream_reused);                             // one-shot
     if (c->upstream_fd >= 0) close(c->upstream_fd);

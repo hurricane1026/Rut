@@ -1007,7 +1007,8 @@ public:
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.h1_tls_transport && !conn.throttle_paused &&
-                            conn.connect_timeout_episode == 0 && !conn.is_health_probe &&
+                            conn.connect_timeout_episode == 0 &&
+                            !conn.response_header_timeout_armed && !conn.is_health_probe &&
                             !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,

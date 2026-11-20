@@ -8966,8 +8966,9 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
-                            conn.connect_timeout_episode == 0 && !conn.ws_shutdown_deadline_armed &&
+                        if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
+                            !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
+                            !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&
