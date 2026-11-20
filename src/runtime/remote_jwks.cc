@@ -85,6 +85,8 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
                 address[value.len] = 0;
                 if (strlen(address) != value.len || inet_pton(AF_INET, address, &parsed) != 1)
                     return false;
+                for (u32 i = 0; i + 1 < next.allowed_count; ++i)
+                    if (strcmp(address, next.allowed_addresses[i]) == 0) return false;
             }
             fields |= 256;
             continue;

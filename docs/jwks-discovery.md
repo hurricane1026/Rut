@@ -66,7 +66,7 @@ last-success time.
 
 `dnsAddress` and a nonempty `allowedAddresses` list must appear together. Resolver
 and allowed destinations are IPv4 literals; at most eight destination addresses
-are accepted. `dnsPort` is optional (default 53), otherwise 1–65535. The original
+are accepted, and duplicate entries are rejected. `dnsPort` is optional (default 53), otherwise 1–65535. The original
 `address` remains a mandatory valid configuration field but is **never a fallback**
 when DNS is enabled. By default each attempt resolves the configured TLS server
 name again through one connected nonblocking UDP socket to the configured resolver.

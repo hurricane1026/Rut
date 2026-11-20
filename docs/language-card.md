@@ -2648,7 +2648,8 @@ mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a literal IPv4;
 there is no blocking DNS, redirect following or token-driven fetch. Optional
-`dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A/CNAME DNS; optional
+`dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded A/CNAME DNS; the IPv4
+allowlist rejects duplicate entries. Optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
 validation. In DNS mode `dnsCacheSeconds` (1–3600) enables per-shard reuse up
 to the earlier of the configured cap and the shortest validated record TTL.
