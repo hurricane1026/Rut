@@ -15962,6 +15962,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                               lit_str("dynamic response bodies require a direct route terminator"));
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
+        if (stmt.response_status_local.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("computed response status requires a direct route terminator"));
         if (stmt.returns_response_local)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
@@ -18290,6 +18295,32 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         auto term = analyze_response_local_term(stmt, route->locals.data, route->locals.len);
         if (!term) return core::make_unexpected(term.error());
         route->control.direct_term = term.value();
+        return {};
+    }
+    if (stmt.response_status_local.len != 0) {
+        const HirLocal* status = nullptr;
+        for (u32 i = route->locals.len; i > 0; --i) {
+            if (route->locals[i - 1].name.eq(stmt.response_status_local)) {
+                status = &route->locals[i - 1];
+                break;
+            }
+        }
+        if (!status || status->type != HirTypeKind::I32 || status->may_nil || status->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("response status must name an unwrapped i32 local"));
+        if (route->waits.len != 0 || route->for_loops.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("computed response status cannot cross wait/for boundaries"));
+        HirTerminator term{};
+        term.kind = HirTerminatorKind::ReturnStatus;
+        term.source_kind = HirTerminatorSourceKind::LocalRef;
+        term.local_ref_index = status->ref_index;
+        term.checked_response_status = true;
+        term.span = stmt.span;
+        route->control.direct_term = term;
         return {};
     }
     AstStatement terminal = stmt;

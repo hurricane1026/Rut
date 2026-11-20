@@ -3783,7 +3783,26 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             // (source syntax is `return <local>`, no response()
             // builder form on this path). Body plumbing on that path
             // can follow when response(localVar) becomes valid.
-            const auto code_id = locals[term.local_ref_index];
+            auto code_id = locals[term.local_ref_index];
+            if (term.checked_response_status) {
+                const rir::SourceLoc loc{term.span.line, term.span.col};
+                auto min = b.emit_const_i32(200, loc);
+                auto max = b.emit_const_i32(599, loc);
+                auto fallback = b.emit_const_i32(500, loc);
+                if (!min || !max || !fallback)
+                    return frontend_error(FrontendError::OutOfMemory, term.span);
+                auto low = b.emit_cmp(rir::Opcode::CmpGe, code_id, min.value(), loc);
+                auto high = b.emit_cmp(rir::Opcode::CmpLe, code_id, max.value(), loc);
+                if (!low || !high)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                auto upper_checked = b.emit_select(high.value(), code_id, fallback.value(), loc);
+                if (!upper_checked)
+                    return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                auto checked =
+                    b.emit_select(low.value(), upper_checked.value(), fallback.value(), loc);
+                if (!checked) return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+                code_id = checked.value();
+            }
             if (!b.emit_ret_status(code_id, {term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};

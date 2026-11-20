@@ -3877,3 +3877,28 @@ route GET "/" {
         invoke(owner.p->config.routes[0], "GET / HTTP/1.1\r\nHost: example\r\n\r\n");
     CHECK_EQ(result.status_code, 429u);
 }
+
+TEST(native_program, computed_response_status_validates_before_packing) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+route GET "/" {
+    let code = parseInt(req.query("code").or("")).or(0)
+    return response(code)
+}
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    for (const auto& item : {std::pair<const char*, u16>{"200", 200},
+                             {"599", 599},
+                             {"199", 500},
+                             {"600", 500},
+                             {"-1", 500},
+                             {"65736", 500},
+                             {"2147483647", 500}}) {
+        const std::string request =
+            std::string("GET /?code=") + item.first + " HTTP/1.1\r\nHost: example\r\n\r\n";
+        CHECK_EQ(invoke(owner.p->config.routes[0], request).status_code, item.second);
+    }
+}
