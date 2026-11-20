@@ -211,7 +211,7 @@ enum class Opcode : u8 {
     ReqQuery,                // %r = req.query "name"         → Optional(str)
     ReqQueryString,          // %r = req.queryString          → Optional(str)
     ReqRoutingString,        // selector: normalizedPath/normalizedTarget/SNI -> Optional(str)
-    ReqConnectionScalar,     // selector: remotePort/localPort/isTls -> i32/i32/bool
+    ReqConnectionScalar,     // selector: remotePort/localPort/isTls/scheme -> i32/i32/bool/str
     ReqTlsClientCertSha256,  // %r = req.tlsClientCertSha256 → Optional(str)
     ReqMethod,               // %r = req.method               → Method
     ReqPath,                 // %r = req.path                 → str

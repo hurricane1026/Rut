@@ -1892,7 +1892,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
     }
     if (value.kind == MirValueKind::ReqRoutingString ||
         value.kind == MirValueKind::ReqConnectionScalar) {
-        if (value.int_value < 0 || value.int_value > 2)
+        if (value.int_value < 0 ||
+            value.int_value > (value.kind == MirValueKind::ReqRoutingString ? 2 : 3))
             return frontend_error(FrontendError::UnsupportedSyntax, span);
         auto v = b.emit_req_routing_property(value.kind == MirValueKind::ReqRoutingString,
                                              static_cast<i32>(value.int_value),

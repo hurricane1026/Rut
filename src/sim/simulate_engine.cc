@@ -176,7 +176,7 @@ static bool rir_function_needs_uncaptured_transport_metadata(const rir::Function
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
             if (inst.op == rir::Opcode::ReqConnectionScalar &&
-                (inst.imm.i32_val == 1 || inst.imm.i32_val == 2))
+                (inst.imm.i32_val == 1 || inst.imm.i32_val == 2 || inst.imm.i32_val == 3))
                 return true;
             if (inst.op == rir::Opcode::ReqRoutingString && inst.imm.i32_val == 2) return true;
             if (inst.op == rir::Opcode::ReqTlsClientCertSha256) return true;

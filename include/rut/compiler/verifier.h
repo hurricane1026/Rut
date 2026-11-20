@@ -201,14 +201,15 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
     }
     if (inst.op == Opcode::ReqRoutingString || inst.op == Opcode::ReqConnectionScalar) {
         if (inst.operand_count != 0 || inst.extra_operands || inst.imm.i32_val < 0 ||
-            inst.imm.i32_val > 2 || inst.result == kNoValue || !fn.values ||
-            inst.result.id >= fn.value_count)
+            inst.imm.i32_val > (inst.op == Opcode::ReqRoutingString ? 2 : 3) ||
+            inst.result == kNoValue || !fn.values || inst.result.id >= fn.value_count)
             return false;
         const Type* type = fn.values[inst.result.id].type;
         if (!type || type->struct_def) return false;
         if (inst.op == Opcode::ReqConnectionScalar)
-            return !type->inner &&
-                   type->kind == (inst.imm.i32_val == 2 ? TypeKind::Bool : TypeKind::I32);
+            return !type->inner && type->kind == (inst.imm.i32_val == 3   ? TypeKind::Str
+                                                  : inst.imm.i32_val == 2 ? TypeKind::Bool
+                                                                          : TypeKind::I32);
         return type->kind == TypeKind::Optional && type->inner &&
                type->inner->kind == TypeKind::Str && !type->inner->inner &&
                !type->inner->struct_def;
