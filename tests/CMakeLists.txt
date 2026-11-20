@@ -4283,7 +4283,7 @@ if(RUT_ENABLE_JIT)
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-durable-rotation-replay-auth.rut
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --rotation)
                 set_tests_properties(test_auth_durable_rotation_replay_${auth_free_backend}_tls PROPERTIES
-                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                    LABELS "integration;auth;docker" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
                 foreach(durable_replay_tls plain tls)
                     set(durable_replay_tls_args)
                     if(durable_replay_tls STREQUAL "tls")
