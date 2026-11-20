@@ -734,6 +734,7 @@ enum class RegistryAction : u8 {
     SetCredentialGroups,
     InheritCredentialGroups,
     SetCredentialWindow,
+    ClearCredentialWindow,
 };
 
 struct RegistryCommand {
@@ -751,6 +752,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"set-credential-groups", 6, RegistryAction::SetCredentialGroups},
     {"inherit-credential-groups", 5, RegistryAction::InheritCredentialGroups},
     {"set-credential-window", 7, RegistryAction::SetCredentialWindow},
+    {"clear-credential-window", 5, RegistryAction::ClearCredentialWindow},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -779,7 +781,8 @@ bool update_credential(
     const bool kGroups = action == RegistryAction::SetCredentialGroups ||
                          action == RegistryAction::InheritCredentialGroups;
     const u32 kGroupsField = field(doc, record, lit_str("groups"));
-    const bool kWindow = action == RegistryAction::SetCredentialWindow;
+    const bool kWindow = action == RegistryAction::SetCredentialWindow ||
+                         action == RegistryAction::ClearCredentialWindow;
     const u32 kStartField = field(doc, record, lit_str("notBefore"));
     const u32 kEndField = field(doc, record, lit_str("expiresAt"));
 
@@ -950,6 +953,7 @@ constexpr char kUsage[] =
     "       rut-consumers set-credential-groups INPUT CREDENTIAL_ID JSON_ARRAY OUTPUT\n"
     "       rut-consumers inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT\n"
+    "       rut-consumers clear-credential-window INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
