@@ -553,6 +553,7 @@ activate a snapshot. Use the same snapshot for deployment that passed the check.
 | `minimumRemainingValiditySeconds` | Require an enabled credential record to have a finite expiry at least this many positive seconds after the supplied time. Applies also to future activations and records staged under disabled Consumers. |
 | `minimumActiveCredentials` | Require at least this many active credentials across enabled Consumers, as evaluated at the supplied time. Accepts integers from 0 to 64. |
 | `minimumActiveCredentialsPerEnabledConsumer` | Require this many active credentials for each enabled Consumer at the supplied time. Disabled Consumers are excluded; zero imposes no minimum. Accepts integers from 0 to 64. |
+| `minActiveMethodsPerEnabledConsumer` | Require this many distinct active credential methods for each enabled Consumer at the supplied time. Disabled Consumers are excluded. Accepts integers from 1 to 4. |
 | `requireActiveCredentialForEnabledConsumers` | Require every enabled Consumer to own at least one active credential at the supplied time. Disabled Consumers are exempt. |
 | `requireGroupsForEnabledConsumers` | Require every enabled Consumer to declare at least one group. This is a deployment check of its metadata, independent of any credential-specific restriction. |
 | `requireExplicitCredentialGroups` | Require enabled credentials to declare their own group array. An explicit empty subset is allowed and does not inherit owner groups. |

@@ -145,6 +145,17 @@ def test_deployment_policy(tool, root):
           rule=per_owner)
     for invalid in (-1, -0.0, 1.5, True, '1', 65, 9223372036854775808):
         check({per_owner: invalid}, rule=per_owner)
+    methods = 'minActiveMethodsPerEnabledConsumer'
+    check({methods: 1}, now=100, ok=True)
+    check({methods: 1}, now=99, rule=methods)
+    check({methods: 1}, now=200, rule=methods)
+    check({methods: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({methods: 2}, records=[key, dict(key, id='second', secretSha256='a' * 64)], rule=methods)
+    check({methods: 2}, records=[key, parked], rule=methods)
+    check({methods: 1}, consumers=[alice, enabled_owner], rule=methods)
+    check({methods: 4}, consumers=[disabled], records=[], ok=True)
+    for invalid in (0, -1, 1.5, True, '1', 5, 9223372036854775808):
+        check({methods: invalid}, rule=methods)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
            'minimumActiveCredentials': 1, capacity: 2}, ok=True)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
