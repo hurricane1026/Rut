@@ -92,3 +92,17 @@ func authorizationForScopes(_ reply: Json, _ requiredScopes: str) -> str {
     guard jwtHasAllScopes(document, requiredScopes) else { respond 503 }
     tokenAuthorizationDocument(document)
 }
+
+// Repeated tokens are accepted as set members, as in jwtHasAllScopes.
+func exactScopesMatch(_ document: Json, _ requiredScopes: str) -> bool {
+    guard let granted = json.string(json.get(document, "/scope").or(document)) else { false }
+    guard let configured = json.value({scope: requiredScopes}) else { false }
+    jwtHasAllScopes(document, requiredScopes) && jwtHasAllScopes(configured, granted)
+}
+
+// Require equal scope sets from the authenticated token endpoint.
+func authorizationForExactScopes(_ reply: Json, _ requiredScopes: str) -> str {
+    guard let document = introspection.replyDocument(reply) else { respond 503 }
+    guard exactScopesMatch(document, requiredScopes) else { respond 503 }
+    tokenAuthorizationDocument(document)
+}
