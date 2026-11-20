@@ -40,6 +40,7 @@
 #include <fstream>
 #include <memory>
 
+#include <arpa/inet.h>
 #include <llvm-c/Core.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -2228,7 +2229,8 @@ TEST(jit, frontend_req_standard_header_alias_any_fallback) {
 TEST(jit, ip_parse_compares_runtime_value_to_remote_address) {
     const char* source = R"rut(
 route GET "/" {
-    guard let value = IP.parse(req.query("ip").or("")) else { return 400 }
+    let parsed = IP.parse(req.query("ip").or(""))
+    guard let value = parsed else { return 400 }
     guard value == req.remoteAddr else { return 403 }
     return 204
 }
@@ -2253,7 +2255,7 @@ route GET "/" {
     REQUIRE(handler != nullptr);
     Connection conn;
     conn.reset();
-    conn.peer_addr = 0x0100000au;  // 10.0.0.1 in network-order s_addr form
+    conn.peer_addr = htonl(0x0a000001u);  // 10.0.0.1 in network-order s_addr form
     struct Case {
         const char* request;
         u16 status;
@@ -2285,7 +2287,7 @@ TEST(helpers, strict_ipv4_parse) {
     };
     const Case cases[] = {{"0.0.0.0", true, 0},
                           {"255.255.255.255", true, 0xffffffffu},
-                          {"10.0.0.1", true, 0x0a000001u},
+                          {"10.0.0.1", true, htonl(0x0a000001u)},
                           {"", false, 0},
                           {"1.2.3", false, 0},
                           {"1.2.3.4.5", false, 0},

@@ -600,7 +600,7 @@ req.bodyRaw = newBody   // replace body before forward (recomputes Content-Lengt
 
 // `IP.parse(text)` returns IP? for strict dotted IPv4: four decimal octets
 // in 0...255, no whitespace or multi-digit leading zeros; otherwise nil.
-// The value uses the same representation as req.remoteAddr.
+// The value uses the same network-order representation as req.remoteAddr.
 
 // Cookies
 req.cookie("session_id")       // string? — first matching pair
