@@ -3952,6 +3952,73 @@ TEST(jit, frontend_req_http_version_string_reflects_request_line) {
     rir.destroy();
 }
 
+TEST(jit, frontend_unique_cookie) {
+    const char* src = R"rut(
+route GET "/" {
+    guard let sid = req.uniqueCookie("sid") else { return 401 }
+    guard sid != "" else { return 204 }
+    guard sid == "ok" else { return 403 }
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    struct Case {
+        const char* request;
+        u16 status;
+    };
+    const Case cases[] = {
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: sid=ok\r\n\r\n", 200},
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: sid=\r\n\r\n", 204},
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: Sid=no; sid=ok\r\n\r\n", 200},
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: sid=ok; sid=no\r\n\r\n", 401},
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: sid=ok\r\nCookie: sid=ok\r\n\r\n", 401},
+        {"GET / HTTP/1.1\r\nHost: h\r\nCookie: sid; other=x\r\n\r\n", 401},
+        {"GET / HTTP/1.1\r\nHost: h\r\n\r\n", 401},
+    };
+    for (const auto& test : cases) {
+        const auto result = HandlerResult::unpack(handler(nullptr,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(test.request),
+                                                          static_cast<u32>(strlen(test.request)),
+                                                          nullptr));
+        CHECK(result.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(result.status_code, test.status);
+    }
+    const hpack::Header h2_headers[] = {{{":method", 7}, {"GET", 3}},
+                                        {{":path", 5}, {"/", 1}},
+                                        {{"cookie", 6}, {"sid=ok", 6}},
+                                        {{"cookie", 6}, {"sid=ok", 6}}};
+    u8 synth[512]{};
+    const u32 synth_len = h2_synth_h1_request(h2_headers, 4, synth, sizeof(synth));
+    REQUIRE(synth_len > 0);
+    auto h2_result = HandlerResult::unpack(handler(nullptr, nullptr, synth, synth_len, nullptr));
+    CHECK_EQ(h2_result.status_code, 401);
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+    rut_helper_req_cookie(synth, synth_len, "sid", 3, &has, &ptr, &len);
+    CHECK_EQ(has, 1u);
+    CHECK((Str{ptr, len}.eq(lit_str("ok"))));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_req_cookie_any_fallback) {
     const char* src =
         "route GET \"/session\" { let sid = any(req.cookie(\"sid\"), \"\") if sid == \"ok\" { "

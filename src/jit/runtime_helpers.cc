@@ -883,13 +883,14 @@ void rut_helper_resp_header(void* conn,
     }
 }
 
-void rut_helper_req_cookie(const u8* req_data,
-                           u32 req_len,
-                           const char* name,
-                           u32 name_len,
-                           u8* out_has_value,
-                           const char** out_ptr,
-                           u32* out_len) {
+static void req_cookie_impl(bool unique,
+                            const u8* req_data,
+                            u32 req_len,
+                            const char* name,
+                            u32 name_len,
+                            u8* out_has_value,
+                            const char** out_ptr,
+                            u32* out_len) {
     *out_has_value = 0;
     *out_ptr = nullptr;
     *out_len = 0;
@@ -924,10 +925,16 @@ void rut_helper_req_cookie(const u8* req_data,
                 value_end--;
             const u32 key_len = key_end - key_start;
             if (key_len == name_len && memcmp(p + key_start, name, name_len) == 0) {
+                if (*out_has_value) {
+                    *out_has_value = 0;
+                    *out_ptr = nullptr;
+                    *out_len = 0;
+                    return;
+                }
                 *out_has_value = 1;
                 *out_ptr = p + value_start;
                 *out_len = value_end - value_start;
-                return;
+                if (!unique) return;
             }
         }
     }
@@ -986,6 +993,26 @@ static bool query_scan_next(QueryScan* scan, const char* name, u32 name_len, Str
         }
     }
     return false;
+}
+
+void rut_helper_req_cookie(const u8* req_data,
+                           u32 req_len,
+                           const char* name,
+                           u32 name_len,
+                           u8* out_has_value,
+                           const char** out_ptr,
+                           u32* out_len) {
+    req_cookie_impl(false, req_data, req_len, name, name_len, out_has_value, out_ptr, out_len);
+}
+
+void rut_helper_req_unique_cookie(const u8* req_data,
+                                  u32 req_len,
+                                  const char* name,
+                                  u32 name_len,
+                                  u8* out_has_value,
+                                  const char** out_ptr,
+                                  u32* out_len) {
+    req_cookie_impl(true, req_data, req_len, name, name_len, out_has_value, out_ptr, out_len);
 }
 
 void rut_helper_req_query(const u8* req_data,

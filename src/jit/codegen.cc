@@ -110,6 +110,7 @@ struct Ctx {
     LLVMValueRef fn_req_header;
     LLVMValueRef fn_req_header_count;
     LLVMValueRef fn_req_cookie;
+    LLVMValueRef fn_req_unique_cookie;
     LLVMValueRef fn_req_query;
     LLVMValueRef fn_req_query_string;
     LLVMValueRef fn_req_param;
@@ -520,6 +521,15 @@ struct Ctx {
             fn_req_cookie = LLVMAddFunction(llvm_mod, "rut_helper_req_cookie", ft);
         }
         return fn_req_cookie;
+    }
+
+    LLVMValueRef get_req_unique_cookie() {
+        if (!fn_req_unique_cookie) {
+            LLVMTypeRef params[] = {ptr_ty, i32_ty, ptr_ty, i32_ty, ptr_ty, ptr_ty, ptr_ty};
+            fn_req_unique_cookie = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_unique_cookie", LLVMFunctionType(void_ty, params, 7, 0));
+        }
+        return fn_req_unique_cookie;
     }
 
     // void rut_helper_req_query(ptr, i32, ptr, i32, ptr, ptr, ptr)
@@ -1609,7 +1619,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, strval);
             break;
         }
-        case rir::Opcode::ReqCookie: {
+        case rir::Opcode::ReqCookie:
+        case rir::Opcode::ReqUniqueCookie: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "cookie.name");
             LLVMValueRef name_len = LLVMConstInt(c.i32_ty, name.len, 0);
@@ -1618,12 +1629,10 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "cookie.len");
             LLVMValueRef args[] = {
                 c.param_req_data, c.param_req_len, name_ptr, name_len, out_has, out_ptr, out_len};
-            LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_cookie()),
-                           c.get_req_cookie(),
-                           args,
-                           7,
-                           "");
+            LLVMValueRef helper = inst.op == rir::Opcode::ReqUniqueCookie
+                                      ? c.get_req_unique_cookie()
+                                      : c.get_req_cookie();
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 7, "");
             LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "cookie.h");
             LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "cookie.p");
             LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "cookie.l");
@@ -3772,6 +3781,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
                 case rir::Opcode::ReqHttpVersion:
                 case rir::Opcode::ReqContentLength:
                 case rir::Opcode::ReqCookie:
+                case rir::Opcode::ReqUniqueCookie:
                     return true;
                 default:
                     break;
@@ -4374,6 +4384,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
     c.fn_req_header = nullptr;
     c.fn_req_header_count = nullptr;
     c.fn_req_cookie = nullptr;
+    c.fn_req_unique_cookie = nullptr;
     c.fn_req_query = nullptr;
     c.fn_req_query_string = nullptr;
     c.fn_req_param = nullptr;

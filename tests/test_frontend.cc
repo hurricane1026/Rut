@@ -48640,3 +48640,20 @@ TEST(frontend, upstream_max_inflight_bounds_and_prebound) {
         rir.destroy();
     }
 }
+
+TEST(frontend, unique_cookie_requires_literal_token_name) {
+    const char* args[] = {"\"\"", "\"bad name\"", "\"a=b\"", "name", "42"};
+    for (const char* arg : args) {
+        char src[256];
+        snprintf(
+            src,
+            sizeof(src),
+            "route GET \"/\" { let name = \"sid\" let value = req.uniqueCookie(%s) return 200 }\n",
+            arg);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
