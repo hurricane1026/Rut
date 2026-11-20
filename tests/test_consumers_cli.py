@@ -115,6 +115,25 @@ def test_targeted_registry_commands(tool, root):
     unwindowed = {k: v for k, v in parked.items() if k not in ('notBefore', 'expiresAt')}
     mutate('clear-credential-window', [parked['id']],
            dict(snapshot, credentials=[raw, unwindowed, inherited]), windowed_path)
+
+    mutate('move-credential', [raw['id'], bob['id']], None)
+    mutate('move-credential', [inherited['id'], bob['id']], None)
+    mutate('move-credential', [parked['id'], 'missing'], None)
+    mutate('move-credential', [parked['id'], vacant['id']], None)
+    moved = dict(snapshot, credentials=[raw, dict(parked, consumerId=bob['id']), inherited])
+    mutate('move-credential', [parked['id'], bob['id']], moved)
+
+    # Competing writers to a new snapshot can publish only one complete result.
+    shared = root / 'targeted-race.json'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda cmd: run(tool, cmd, source, parked['id'], shared),
+            ['remove-credential', 'clear-credential-window']))
+    assert sorted(result.returncode for result in results) == [0, 2]
+    for result in results:
+        check_output(result)
+        assert not result.stdout
+    assert run(tool, 'validate', shared).returncode == 0
     assert source.read_bytes() == original
 
 
