@@ -5213,7 +5213,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
          expr.name.eq({"header", 6}) || expr.name.eq({"uniqueHeader", 12}) ||
          expr.name.eq({"headerCount", 11}) || expr.name.eq({"param", 5}) ||
          expr.name.eq({"cookie", 6}) || expr.name.eq({"uniqueCookie", 12}) ||
-         expr.name.eq({"query", 5}))) {
+         expr.name.eq({"query", 5}) || expr.name.eq({"uniqueQuery", 11}))) {
         if (expr.args.len != 1 || expr.args[0] == nullptr ||
             expr.args[0]->kind != AstExprKind::StrLit) {
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
@@ -5234,6 +5234,11 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 if (!is_http_tchar(static_cast<u8>(out.str_value.ptr[i])))
                     return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             out.kind = HirExprKind::ReqUniqueCookie;
+            out.may_nil = true;
+        } else if (expr.name.eq({"uniqueQuery", 11})) {
+            if (out.str_value.len == 0)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
+            out.kind = HirExprKind::ReqUniqueQuery;
             out.may_nil = true;
         } else if (expr.name.eq({"query", 5})) {
             out.kind = HirExprKind::ReqQuery;
@@ -21266,6 +21271,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::ReqParam:
         case HirExprKind::ReqCookie:
         case HirExprKind::ReqUniqueCookie:
+        case HirExprKind::ReqUniqueQuery:
         case HirExprKind::ReqQuery:
         case HirExprKind::ReqQueryString:
         case HirExprKind::RegexCapture:

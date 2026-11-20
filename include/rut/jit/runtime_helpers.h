@@ -197,6 +197,15 @@ void rut_helper_req_query(const rut::u8* req_data,
                           const char** out_ptr,
                           rut::u32* out_len);
 
+// Returns the raw value only when the raw name occurs exactly once.
+void rut_helper_req_unique_query(const rut::u8* req_data,
+                                 rut::u32 req_len,
+                                 const char* name,
+                                 rut::u32 name_len,
+                                 rut::u8* out_has_value,
+                                 const char** out_ptr,
+                                 rut::u32* out_len);
+
 // Extract the raw query string from request target, excluding '?' and '#fragment'.
 // Returns Optional(Str): *out_has_value = 1 if a query component exists.
 // If found, *out_ptr / *out_len point into req_data.

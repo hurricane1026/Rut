@@ -159,6 +159,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqParam:
             buf.put_cstr("req.param");
             break;
+        case Opcode::ReqUniqueQuery:
+            buf.put_cstr("req.unique_query");
+            break;
         case Opcode::ReqQuery:
             buf.put_cstr("req.query");
             break;
@@ -775,6 +778,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqHeader:
         case Opcode::ReqParam:
         case Opcode::ReqQuery:
+        case Opcode::ReqUniqueQuery:
         case Opcode::ReqCookie:
         case Opcode::ReqUniqueCookie:
             buf.put(' ');

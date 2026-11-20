@@ -33276,3 +33276,27 @@ TEST(jit, request_query_all_helper_preserves_raw_order_and_owns_values) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, request_unique_query_helper_raw_occurrences) {
+    const char request[] =
+        "GET /?tag=a%2Fb&Tag=x&empty=&bare&dup=1&dup=2&%74ag=z HTTP/1.1\r\nHost: example\r\n\r\n";
+    const auto* data = reinterpret_cast<const u8*>(request);
+    auto check = [&](const char* name, u32 name_len, bool expected, Str value) {
+        u8 has = 9;
+        const char* ptr = nullptr;
+        u32 len = 0;
+        rut_helper_req_unique_query(data, sizeof(request) - 1, name, name_len, &has, &ptr, &len);
+        CHECK_EQ(has, expected ? 1u : 0u);
+        if (expected) {
+            const Str actual{ptr, len};
+            CHECK(actual.eq(value));
+        }
+    };
+    check("tag", 3, true, {"a%2Fb", 5});
+    check("Tag", 3, true, {"x", 1});
+    check("%74ag", 5, true, {"z", 1});
+    check("empty", 5, true, {"", 0});
+    check("bare", 4, true, {"", 0});
+    check("dup", 3, false, {});
+    check("absent", 6, false, {});
+}

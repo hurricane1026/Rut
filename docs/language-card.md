@@ -326,6 +326,7 @@ req.getAll("Accept")         // Collected<str>?
 req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
 req.queryAll("tags")         // Collected<str>? (all raw values, in order)
+req.uniqueQuery("tags")       // str? (exactly one raw occurrence)
 req.cookie("session")        // str? (first match)
 req.uniqueCookie("session")  // str? (exactly one matching pair)
 req.body(User)               // typed parse, error-capable → guard let
@@ -352,6 +353,8 @@ resp.body = json(data)            // body
 resp.status                       // StatusCode, read/write
 return resp
 ```
+
+`req.uniqueQuery` requires a nonempty literal name and returns nil for zero or multiple raw, case-sensitive name matches. It preserves bare and empty values and performs no percent decoding.
 
 Unwrap the result of `req.getAll` or `req.queryAll` before reading `.count` or using `.get(index)`. `queryAll` requires a nonempty literal name, matches raw names case-sensitively, and preserves empty and bare values without decoding. It returns an empty collection for no matches, or nil for invalid input, allocation failure, or more than 64 matches.
 Indexing starts at zero and returns `nil` outside the collection. The request

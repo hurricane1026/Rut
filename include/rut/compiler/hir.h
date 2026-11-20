@@ -185,6 +185,7 @@ enum class HirExprKind : u8 {
     ReqParam,
     ReqCookie,
     ReqUniqueCookie,
+    ReqUniqueQuery,
     ReqQuery,
     ReqQueryString,
     ReqTlsClientCertSha256,

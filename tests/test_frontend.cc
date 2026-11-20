@@ -48764,3 +48764,32 @@ TEST(frontend, upstream_health_probe_host_authority) {
     for (const auto& invalid : invalid_authorities)
         CHECK_FALSE(active_health_host_valid({invalid, 3}));
 }
+
+TEST(frontend, unique_query_requires_literal_and_lowers) {
+    for (const char* source :
+         {R"rut(route GET "/" { let v = req.uniqueQuery("") return 204 })rut",
+          R"rut(route GET "/" { let n = "tag" let v = req.uniqueQuery(n) return 204 })rut"}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    auto tokens = lex(lit(R"rut(route GET "/" {
+        guard let v = req.uniqueQuery("tag") else { return 400 }
+        guard v == "x" else { return 400 }
+        return 204
+    })rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqUniqueQuery));
+    rir.destroy();
+}
