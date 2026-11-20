@@ -798,6 +798,61 @@ int provision_key_verifier_command(const char* source,
     return 0;
 }
 
+int metadata_command(const char* command,
+                     const char* source,
+                     const char* id_text,
+                     const char* value_text,
+                     const char* destination) {
+    const bool kGroups = strcmp(command, "set-consumer-groups") == 0;
+    const bool kCredential = strcmp(command, "set-credential-enabled") == 0;
+    const Str kId{id_text, bounded_argument(id_text, 65)};
+    if (!provision_id_valid(kId)) return failure("invalid registry record ID\n");
+    Buffer input;
+    SensitiveDocument base;
+    if (!read_private(source, input)) return failure("cannot read private registry file\n");
+    if (!consumer_registry_valid(base, input.view()))
+        return failure("invalid Consumer registry snapshot\n");
+    const u32 kRecords =
+        field(base, 0, kCredential ? lit_str("credentials") : lit_str("consumers"));
+    if (kRecords >= base.count || kRecords >= json::kMaxNodes ||
+        base.nodes[kRecords].kind != json::Kind::Array)
+        return failure("invalid Consumer registry snapshot\n");
+    u32 record = json::kNone;
+    for (u32 n = base.nodes[kRecords].child; n != json::kNone; n = base.nodes[n].next) {
+        if (n >= base.count || n >= json::kMaxNodes)
+            return failure("invalid Consumer registry snapshot\n");
+        if (field_equals(base, field(base, n, lit_str("id")), kId)) record = n;
+    }
+    if (record == json::kNone) return failure("registry record ID does not exist\n");
+    Buffer groups;
+    SensitiveDocument parsed_groups;
+    Str replacement;
+    if (kGroups) {
+        if (!read_private(value_text, groups)) return failure("cannot read private groups file\n");
+        if (!parsed_groups.parse(groups.view()) || !parsed_groups.count ||
+            parsed_groups.nodes[0].kind != json::Kind::Array)
+            return failure("invalid Consumer groups array\n");
+        replacement = groups.view();
+    } else if (strcmp(value_text, "true") == 0) {
+        replacement = lit_str("true");
+    } else if (strcmp(value_text, "false") == 0) {
+        replacement = lit_str("false");
+    } else {
+        return failure("enabled state must be true or false\n");
+    }
+    Buffer result;
+    json::Writer output{result.data, json::kMaxBytes};
+    const u32 kMember = field(base, record, kGroups ? lit_str("groups") : lit_str("enabled"));
+    if (kMember >= base.count || kMember >= json::kMaxNodes ||
+        !base.write(0, output, kMember, replacement))
+        return failure("updated registry exceeds supported capacity\n");
+    SensitiveDocument checked;
+    if (!consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* const kError = publish(destination, {result.data, output.len});
+    return kError ? failure(kError) : 0;
+}
+
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
@@ -812,6 +867,9 @@ constexpr char kUsage[] =
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers prune-credentials INPUT CUTOFF_UNIX_SECONDS OUTPUT\n"
     "       rut-consumers provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT\n"
+    "       rut-consumers set-consumer-enabled INPUT CONSUMER_ID true|false OUTPUT\n"
+    "       rut-consumers set-credential-enabled INPUT CREDENTIAL_ID true|false OUTPUT\n"
+    "       rut-consumers set-consumer-groups INPUT CONSUMER_ID GROUPS_FILE OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
@@ -843,6 +901,10 @@ int main(int argc, char** argv) {
         return prune_credentials_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)
         return provision_key_verifier_command(argv[2], argv[3], argv[4], argv[5]);
+    if (argc == 6 && (strcmp(argv[1], "set-consumer-enabled") == 0 ||
+                      strcmp(argv[1], "set-credential-enabled") == 0 ||
+                      strcmp(argv[1], "set-consumer-groups") == 0))
+        return metadata_command(argv[1], argv[2], argv[3], argv[4], argv[5]);
     const bool kInit = argc == 3 && strcmp(argv[1], "init") == 0;
     const bool kValidate = argc == 3 && strcmp(argv[1], "validate") == 0;
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;

@@ -844,6 +844,17 @@ for syntax and rollout semantics.
 
 
 
+## Targeted Consumer lifecycle updates
+
+Offline state changes for existing Consumers and credentials preserve other fields,
+including key representation and time bounds. Private group-array updates retain
+explicit credential subsets and reject invalid memberships. CLI regressions cover
+all four methods, raw/verifier records, strict arguments, private files, races and
+publication failures. Native H1/H2 fixtures on both backends exercise owner and
+credential disable/reactivation, inherited versus explicit group changes, expired
+reactivation denial, and independently loaded snapshot isolation. See [the contract](consumer-registry.md#targeted-state-and-group-updates).
+Online administration and deployment remain open in #1072.
+
 ## Consumer registration and constrained key provisioning
 
 Offline `rut-consumers provision-key-verifier` supports new Consumer registration

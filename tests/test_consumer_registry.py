@@ -144,6 +144,67 @@ def provision_profiles(args, root):
             assert h2_request(port, path, [(field.lower(), presented)])[0] == expected
 
 
+def targeted_lifecycle(args, root):
+    original = dict(version=1, consumers=[consumer('state-owner', groups=['staff', 'readers'])],
+        credentials=[
+            credential('state-inherit', 'state-owner', 'bearer', 'state-inherit-key'),
+            credential('state-reader', 'state-owner', 'bearer', 'state-reader-key', groups=['readers']),
+            credential('state-empty', 'state-owner', 'bearer', 'state-empty-key', groups=[]),
+            credential('state-header', 'state-owner', 'header', 'state-header-key'),
+            credential('state-basic', 'state-owner', 'basic', 'state-user:state-password'),
+            dict(credential('state-expired', 'state-owner', 'bearer', 'state-expired-key', False), expiresAt=1)])
+    source = root / 'state-source.json'
+    source.write_text(json.dumps(original))
+    source.chmod(0o600)
+    sensitive = tuple(record['secret'] for record in original['credentials'])
+    counter = 0
+    def change(command, identity, value, base=source):
+        nonlocal counter
+        counter += 1
+        output = root / f'state-output-{counter}.json'
+        before = base.read_bytes()
+        result = subprocess.run([args.admin, command, str(base), identity, str(value), str(output)],
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0 and not result.stdout and not result.stderr, result
+        assert base.read_bytes() == before
+        return output
+    def check(port, path, value, status, header='Authorization'):
+        assert request(port, path, f'{header}: {value}\r\n')[0] == status
+        assert h2_request(port, path, [(header.lower(), value)])[0] == status
+    with gateway(args, original, root / 'state-original', sensitive=sensitive) as pinned:
+        check(pinned, '/staff', 'Bearer state-inherit-key', 204)
+        disabled = change('set-consumer-enabled', 'state-owner', 'false')
+        with gateway(args, json.loads(disabled.read_bytes()), root / 'state-disabled', sensitive=sensitive) as port:
+            for key in ('state-inherit-key', 'state-reader-key', 'state-empty-key'):
+                check(port, '/private', 'Bearer ' + key, 401)
+            check(port, '/key', 'state-header-key', 401, 'X-API-Key')
+        check(pinned, '/private', 'Bearer state-inherit-key', 200)
+        enabled = change('set-consumer-enabled', 'state-owner', 'true', disabled)
+        retired = change('set-credential-enabled', 'state-inherit', 'false', enabled)
+        with gateway(args, json.loads(retired.read_bytes()), root / 'state-retired', sensitive=sensitive) as port:
+            check(port, '/private', 'Bearer state-inherit-key', 401)
+            check(port, '/read', 'Bearer state-reader-key', 200)
+        restored = change('set-credential-enabled', 'state-inherit', 'true', retired)
+        restored = change('set-credential-enabled', 'state-expired', 'true', restored)
+        groups = root / 'state-groups.json'
+        groups.write_text(json.dumps(['staff', 'readers', 'writers']))
+        groups.chmod(0o600)
+        regrouped = change('set-consumer-groups', 'state-owner', groups, restored)
+        with gateway(args, json.loads(regrouped.read_bytes()), root / 'state-regrouped', sensitive=sensitive) as port:
+            check(port, '/write', 'Bearer state-inherit-key', 200)
+            check(port, '/write', 'Bearer state-reader-key', 403)
+            check(port, '/write', 'Bearer state-empty-key', 403)
+            check(port, '/private', 'Bearer state-expired-key', 401)
+        check(pinned, '/write', 'Bearer state-inherit-key', 403)
+        groups.write_text(json.dumps(['readers']))
+        narrowed = change('set-consumer-groups', 'state-owner', groups, regrouped)
+        with gateway(args, json.loads(narrowed.read_bytes()), root / 'state-narrowed', sensitive=sensitive) as port:
+            check(port, '/staff', 'Bearer state-inherit-key', 403)
+            check(port, '/read', 'Bearer state-inherit-key', 200)
+            check(port, '/read', 'Bearer state-reader-key', 200)
+        check(pinned, '/staff', 'Bearer state-inherit-key', 204)
+
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--server',required=True)
@@ -164,6 +225,7 @@ def main():
         initial=administer(args,root,'initial-snapshot',initial)
         generated = {}
         if args.admin:
+            targeted_lifecycle(args, root)
             provision_profiles(args, root)
             base = root / 'initial-snapshot.json'
             for credential_id, method in [('generated-bearer-v1', 'bearer'),

@@ -967,6 +967,154 @@ def test_provision_key_verifier(tool, root):
         assert run(tool, 'provision-key-verifier', *args).returncode == 2
 
 
+def test_targeted_metadata(tool, root):
+    work = root / 'targeted-metadata'
+    work.mkdir(mode=0o700)
+    consumers = [dict(id='alice"id', enabled=True, groups=['staff', 'readers']),
+                 dict(id='paused', enabled=False, groups=[])]
+    credentials = []
+    for index, method in enumerate(('bearer', 'header', 'basic', 'mtls', 'bearer', 'header')):
+        record = dict(id=f'credential-{index}', consumerId='alice"id', method=method,
+                      enabled=index != 4)
+        material = ('user:private-password' if method == 'basic' else
+                    'a' * 64 if method == 'mtls' else f'private-key-{index}')
+        if index >= 4:
+            record['secretSha256'] = hashlib.sha256(material.encode()).hexdigest()
+        else:
+            record['secret'] = material
+        if index % 2 == 0:
+            record.update(groups=['readers'], notBefore=1, expiresAt=9223372036854775807)
+        credentials.append(record)
+    initial = dict(version=1, consumers=consumers, credentials=credentials)
+    source = private(work / 'source.json', initial)
+    groups = private(work / 'groups.json', ['readers', 'staff', 'writers'])
+    counter = 0
+    def update(command, identity, value, expected=None, input_path=source, output_path=None, env=None):
+        nonlocal counter
+        counter += 1
+        output = output_path or work / f'updated-{counter}.json'
+        before = input_path.read_bytes()
+        result = subprocess.run([tool, command, str(input_path), identity, str(value), str(output)],
+                                capture_output=True, timeout=10, env=env)
+        assert not result.stdout and input_path.read_bytes() == before
+        for record in credentials:
+            assert record.get('secret', record.get('secretSha256')).encode() not in result.stderr
+        if expected is None:
+            assert result.returncode == 2 and not output.exists(), result
+        else:
+            assert result.returncode == 0 and not result.stderr, result
+            assert json.loads(output.read_bytes()) == expected
+            assert stat.S_IMODE(output.stat().st_mode) == 0o600
+            assert run(tool, 'validate', output).returncode == 0
+        return output
+
+    assert run(tool, 'validate', source).returncode == 0
+    for enabled in (False, True):
+        expected = json.loads(json.dumps(initial))
+        expected['consumers'][0]['enabled'] = enabled
+        changed = update('set-consumer-enabled', consumers[0]['id'], str(enabled).lower(), expected)
+        restored = update('set-consumer-enabled', consumers[0]['id'], 'true', initial, changed)
+        assert json.loads(restored.read_bytes()) == initial
+    for index, record in enumerate(credentials):
+        for enabled in (False, True):
+            expected = json.loads(json.dumps(initial))
+            expected['credentials'][index]['enabled'] = enabled
+            update('set-credential-enabled', record['id'], str(enabled).lower(), expected)
+    paused = json.loads(json.dumps(initial))
+    paused['consumers'][1]['enabled'] = True
+    update('set-consumer-enabled', 'paused', 'true', paused)
+    changed_groups = dict(initial, consumers=[dict(consumers[0], groups=['readers', 'staff', 'writers']), consumers[1]])
+    update('set-consumer-groups', consumers[0]['id'], groups, changed_groups)
+    assert json.loads(groups.read_bytes()) == ['readers', 'staff', 'writers']
+    # Removing a group referenced even by a disabled credential is an invalid transaction.
+    only_staff = private(work / 'only-staff.json', ['staff'])
+    update('set-consumer-groups', consumers[0]['id'], only_staff)
+    narrowed = json.loads(json.dumps(initial))
+    for record in narrowed['credentials']:
+        if 'groups' in record:
+            record['groups'] = []
+    narrowed_source = private(work / 'narrowed.json', narrowed)
+    empty = private(work / 'empty.json', [])
+    expected = dict(narrowed, consumers=[dict(consumers[0], groups=[]), consumers[1]])
+    update('set-consumer-groups', consumers[0]['id'], empty, expected, narrowed_source)
+    for value in (['duplicate', 'duplicate'], [''], ['a' * 129], ['a b'], [True], {}, None,
+                  [f'g{i}' for i in range(17)], b'["readers"] trailing', b'['):
+        invalid = private(work / 'invalid-groups.json', value)
+        update('set-consumer-groups', consumers[0]['id'], invalid)
+    for command, identity, value in (
+        ('set-consumer-enabled', 'missing', 'true'),
+        ('set-credential-enabled', 'missing', 'false'),
+        ('set-consumer-groups', 'missing', groups),
+        ('set-consumer-enabled', '', 'false'),
+        ('set-credential-enabled', 'x' * 65, 'true')):
+        update(command, identity, value)
+    for command, identity in (('set-consumer-enabled', consumers[0]['id']),
+                              ('set-credential-enabled', credentials[0]['id'])):
+        for value in ('True', 'FALSE', '1', '0', ' true', 'true ', '', 'null'):
+            update(command, identity, value)
+    invalid_source = private(work / 'invalid-source.json', dict(initial, unknown=True))
+    for command, identity, value in (
+        ('set-consumer-enabled', consumers[0]['id'], 'false'),
+        ('set-credential-enabled', credentials[0]['id'], 'false'),
+        ('set-consumer-groups', consumers[0]['id'], groups)):
+        update(command, identity, value, input_path=invalid_source)
+        source.chmod(0o644)
+        update(command, identity, value)
+        source.chmod(0o600)
+        link = work / 'source-link'
+        if not link.exists():
+            link.symlink_to(source)
+        update(command, identity, value, input_path=link)
+    only_disabled_reference = json.loads(json.dumps(narrowed))
+    only_disabled_reference['credentials'][4]['groups'] = ['readers']
+    disabled_reference = private(work / 'disabled-reference.json', only_disabled_reference)
+    update('set-consumer-groups', consumers[0]['id'], only_staff, input_path=disabled_reference)
+    large = dict(version=1, consumers=[dict(id='large', enabled=True, groups=[])],
+                 credentials=[dict(id='large-a', consumerId='large', method='bearer', enabled=True,
+                                   secret='a' * 4096),
+                              dict(id='large-b', consumerId='large', method='header', enabled=True,
+                                   secret='b' * 2900)])
+    large_source = private(work / 'large-source.json', large)
+    assert run(tool, 'validate', large_source).returncode == 0
+    large_groups = private(work / 'large-groups.json', [f'g{i:02}' + 'x' * 125 for i in range(16)])
+    update('set-consumer-groups', 'large', large_groups, input_path=large_source)
+    # Private input, no-replace output, and directory ownership/mode use shared guards.
+    groups.chmod(0o644)
+    update('set-consumer-groups', consumers[0]['id'], groups)
+    groups.chmod(0o600)
+    linked_groups = work / 'groups-link'
+    linked_groups.symlink_to(groups)
+    update('set-consumer-groups', consumers[0]['id'], linked_groups)
+    assert run(tool, 'set-consumer-enabled', source, consumers[0]['id'], 'false', source).returncode == 2
+    existing = private(work / 'existing.json', b'private-sentinel')
+    assert run(tool, 'set-consumer-groups', source, consumers[0]['id'], groups, existing).returncode == 2
+    assert existing.read_bytes() == b'private-sentinel'
+    unsafe = work / 'unsafe'
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o777)
+    update('set-consumer-enabled', consumers[0]['id'], 'false', output_path=unsafe / 'output')
+    unsafe.chmod(0o700)
+    raced = work / 'race.json'
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: run(tool, 'set-consumer-enabled', source,
+                                                   consumers[0]['id'], 'false', raced), range(2)))
+    assert sorted(result.returncode for result in results) == [0, 2]
+    assert all(not result.stdout for result in results)
+    assert json.loads(raced.read_bytes())['consumers'][0]['enabled'] is False
+    shim, marker = root / 'linkat-fault.so', root / 'preload-capability.marker'
+    if shim.exists() and marker.exists():
+        env = dict(os.environ, LD_PRELOAD=str(shim), RUT_TEST_LINKAT_FAIL_AT='1')
+        for command, identity, value in (
+            ('set-consumer-enabled', consumers[0]['id'], 'false'),
+            ('set-credential-enabled', credentials[0]['id'], 'false'),
+            ('set-consumer-groups', consumers[0]['id'], groups)):
+            update(command, identity, value, env=env)
+    for command in ('set-consumer-enabled', 'set-credential-enabled', 'set-consumer-groups'):
+        for args in ([], ['a'], ['a', 'b'], ['a', 'b', 'c'], ['a', 'b', 'c', 'd', 'e']):
+            assert run(tool, command, *args).returncode == 2
+    assert not list(work.glob('.rut-consumers-*'))
+
+
 def main(tool):
     assert run(tool, '--help').returncode == 0
     for args in [[], ['init'], ['apply'], ['inspect'], ['validate'], ['plan'],
@@ -983,6 +1131,7 @@ def main(tool):
         test_hash_keys(tool, root)
         test_generated_key_verifier(tool, root)
         test_provision_key_verifier(tool, root)
+        test_targeted_metadata(tool, root)
         test_rotated_key_verifier(tool, root)
         test_credential_groups_preserve_and_reject_parent_removal(tool, root)
         test_snapshot_diff(tool, root)

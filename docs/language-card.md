@@ -3653,6 +3653,15 @@ exact owner, method, optional groups and time bounds, including expired windows,
 and does not enable a disabled Consumer. The new ID must be unused even among
 disabled records; retaining the old record requires a free credential slot.
 Rotation is offline and deployment remains explicit (#1072 remains open).
+Targeted offline `set-consumer-enabled INPUT ID true|false OUTPUT`,
+`set-credential-enabled INPUT ID true|false OUTPUT` and
+`set-consumer-groups INPUT ID GROUPS_FILE OUTPUT` update existing records while
+preserving other metadata and key material. Private group arrays replace owner
+membership. Inherited groups follow the new set, explicit credential groups stay
+unchanged, and invalid subsets reject the complete replacement. Reactivation
+never renews windows or bypasses owner state. No command deploys to gateways.
+See [targeted updates](consumer-registry.md#targeted-state-and-group-updates).
+
 `provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT` accepts a private
 exact JSON profile. It can register a new Consumer with its first generated key,
 or add a key under an existing owner with explicit credential groups/time bounds.
