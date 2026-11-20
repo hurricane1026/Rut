@@ -2253,7 +2253,7 @@ route GET "/" {
     REQUIRE(handler != nullptr);
     Connection conn;
     conn.reset();
-    conn.peer_addr = 0x0a000001u;
+    conn.peer_addr = 0x0100000au;  // 10.0.0.1 in network-order s_addr form
     struct Case {
         const char* request;
         u16 status;

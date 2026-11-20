@@ -2,9 +2,12 @@
 
 #include "rut/common/types.h"
 
+#include <arpa/inet.h>
+
 namespace rut {
 
-// Strict dotted IPv4 in the same host-order representation as req.remoteAddr.
+// Strict dotted IPv4 in the same network-order s_addr representation as
+// req.remoteAddr.
 inline bool parse_ipv4_canonical(Str text, u32& output) {
     output = 0;
     if (!text.ptr || text.len < 7 || text.len > 15) return false;
@@ -21,11 +24,13 @@ inline bool parse_ipv4_canonical(Str text, u32& output) {
         if (pos == start) return false;
         value = (value << 8) | part;
         if (octet < 3) {
-            if (pos == text.len || text.ptr[pos++] != '.') return false;
+            if (pos == text.len) return false;
+            const char separator = text.ptr[pos++];
+            if (separator != '.') return false;
         }
     }
     if (pos != text.len) return false;
-    output = value;
+    output = htonl(value);
     return true;
 }
 

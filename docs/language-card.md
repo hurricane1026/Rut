@@ -240,6 +240,8 @@ IP.parse("192.0.2.1")     // IP? — strict dotted IPv4
 `IP.parse(value)` accepts an unwrapped `str` and returns `IP?`. It accepts four
 decimal octets from 0 through 255, with no whitespace or leading zero in a
 multi-digit octet; invalid input returns nil. IPv6 is not supported.
+The resulting value uses the same network-order representation as
+`req.remoteAddr`.
 
 `parseInt(value)` returns `i32?`; `parseInt64(value)` returns `i64?`.
 Both accept an unwrapped `str` or `Bytes`, without imports, allocation or text
