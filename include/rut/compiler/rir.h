@@ -202,6 +202,7 @@ enum class Opcode : u8 {
 
     // ── Request access ──
     ReqHeaderAll,
+    ReqQueryAll,
     ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,               // %r = req.header "Name"        → Optional(str)

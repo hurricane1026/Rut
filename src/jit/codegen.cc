@@ -1348,11 +1348,15 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::ReqQueryAll:
         case rir::Opcode::ReqHeaderAll: {
             LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
             const auto type = LLVMFunctionType(c.ptr_ty, parameters, 6, 0);
-            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_header_all");
-            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_req_header_all", type);
+            const char* helper_name = inst.op == rir::Opcode::ReqQueryAll
+                                          ? "rut_helper_req_query_all"
+                                          : "rut_helper_req_header_all";
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, helper_name);
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, helper_name, type);
             LLVMValueRef arguments[] = {c.param_conn,
                                         c.param_arena,
                                         c.param_req_data,
@@ -3749,6 +3753,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
         for (u32 ii = 0; ii < blk.inst_count; ii++) {
             if (rir::is_password_prefix(blk.insts[ii])) return true;
             switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqQueryAll:
                 case rir::Opcode::ReqHeaderAll:
                 case rir::Opcode::ReqHeaderCount:
                 case rir::Opcode::ReqUniqueHeader:

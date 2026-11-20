@@ -190,6 +190,14 @@ route GET "/metadata" {
     let name = req.sni.or("none")
     return response(200, body: name)
 }
+route GET "/query-all" {
+    guard let values = req.queryAll("tags") else { return 500 }
+    guard let missing = req.queryAll("missing") else { return 500 }
+    guard missing.count == 0 && values.count == 4 &&
+        values.get(0).or("missing") == "a%2Fb" && values.get(1).or("missing") == "" &&
+        values.get(2).or("missing") == "" && values.get(3).or("missing") == "x+y" else { return 400 }
+    return response(200, body: "ordered")
+}
 route GET "/get-all" {
     req.add("X-List", "added")
     req.set("X-List", "replaced")
@@ -321,6 +329,17 @@ route "/" {
                         probe.close()
                 assert result == (200, b'ordered'), ('getAll occurrences', result)
                 assert empty_result == (200, b'empty'), ('getAll absent', empty_result)
+                if args.h2:
+                    result = h2_request(port, '/query-all?tags=a%2Fb&tags=&tags&Tags=no&tags=x+y', [], tls_context=context)
+                else:
+                    probe = connection(port)
+                    try:
+                        probe.request('GET', '/query-all?tags=a%2Fb&tags=&tags&Tags=no&tags=x+y')
+                        reply = probe.getresponse()
+                        result = (reply.status, reply.read())
+                    finally:
+                        probe.close()
+                assert result == (200, b'ordered'), ('queryAll occurrences', result)
                 normalized = [('/api/../admin?q=%2f', b'/admin?q=%2f|'),
                               ('/api/%75sers', b'/api/users|'), ('/api//users', b'/api/users|')]
                 for path, expected in normalized:

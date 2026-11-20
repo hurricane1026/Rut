@@ -313,12 +313,12 @@ req.getAll("Accept")         // Collected<str>?
 // HTTP/2 uses the synthesized request view: :authority becomes Host, Cookie
 // fields are joined, and Content-Length can be synthesized for the body bridge.
 // Other repeated fields retain their order.
-// Routes containing explicit wait do not support req.getAll yet.
+// Routes containing explicit wait do not support req.getAll or req.queryAll yet.
 
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
-req.queryAll("tags")         // ⏳ [str]
+req.queryAll("tags")         // Collected<str>? (all raw values, in order)
 req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
 req.body                     // raw body as str
@@ -339,7 +339,7 @@ resp.status                       // StatusCode, read/write
 return resp
 ```
 
-Unwrap the result of `req.getAll` before reading `.count` or using `.get(index)`.
+Unwrap the result of `req.getAll` or `req.queryAll` before reading `.count` or using `.get(index)`. `queryAll` requires a nonempty literal name, matches raw names case-sensitively, and preserves empty and bare values without decoding. It returns an empty collection for no matches, or nil for invalid input, allocation failure, or more than 64 matches.
 Indexing starts at zero and returns `nil` outside the collection. The request
 view used by `getAll` is limited to 64 header fields. The collection copies its
 values into the existing request arena and shares its allocation budget.
