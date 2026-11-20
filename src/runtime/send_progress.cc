@@ -19,10 +19,10 @@ consteval bool send_progress_matches(u32 offset, u32 remaining, u32 completed) {
 
 consteval bool send_progress_contract() {
     constexpr u32 kCases[] = {0, 1, 2, 3, INT32_MAX - 1u, INT32_MAX, INT32_MAX + 1u, UINT32_MAX};
-    for (u32 offset : kCases)
-        for (u32 remaining : kCases)
-            for (u32 completed : kCases)
-                if (!send_progress_matches(offset, remaining, completed)) return false;
+    for (const u32 kOffset : kCases)
+        for (const u32 kRemaining : kCases)
+            for (const u32 kCompleted : kCases)
+                if (!send_progress_matches(kOffset, kRemaining, kCompleted)) return false;
     return true;
 }
 
