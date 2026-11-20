@@ -109,7 +109,7 @@ def gateway(args, groups, snapshot_variant=False, invalid_routes=False, boundary
         source.write_text(program)
         middleware = root / 'middleware'
         middleware.mkdir()
-        for name in ('auth.rut', 'rbac.rut'):
+        for name in ('auth.rut', 'rbac.rut', 'rbac_owner.rut'):
             (middleware / name).write_bytes((Path(args.source).parent / 'middleware' / name).read_bytes())
         log = root / 'gateway.log'
         with log.open('w') as output:
@@ -134,6 +134,7 @@ def gateway(args, groups, snapshot_variant=False, invalid_routes=False, boundary
             source.unlink()
             (middleware / 'auth.rut').unlink()
             (middleware / 'rbac.rut').unlink()
+            (middleware / 'rbac_owner.rut').unlink()
             yield port
         finally:
             if process.poll() is None:
