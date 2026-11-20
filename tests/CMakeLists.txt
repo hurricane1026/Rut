@@ -4287,6 +4287,18 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_jwt_scope_lists_${scope_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(cookie_backend epoll io_uring)
+                foreach(cookie_opt 0 2)
+                    add_test(NAME test_browser_session_clear_${cookie_backend}_opt${cookie_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_browser_session_clear.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/browser-session-clear.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR}
+                            --backend ${cookie_backend} --opt ${cookie_opt})
+                    set_tests_properties(test_browser_session_clear_${cookie_backend}_opt${cookie_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(fetch_backend epoll io_uring)
                 foreach(fetch_opt 0 2)
                     add_test(NAME test_browser_fetch_metadata_auth_${fetch_backend}_opt${fetch_opt}
