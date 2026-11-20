@@ -4015,6 +4015,8 @@ struct Parser {
                     bool seen_interval = false;
                     bool seen_timeout = false;
                     bool seen_status = false;
+                    bool seen_status_min = false;
+                    bool seen_status_max = false;
                     bool seen_failure_threshold = false;
                     bool seen_success_threshold = false;
                     while (true) {
@@ -4098,8 +4100,12 @@ struct Parser {
                                             "seconds from 1s to 63s"));
                             item.upstream.hc_timeout_seconds = ms / 1000;
                             seen_timeout = true;
-                        } else if (hc_key.eq({"status", 6})) {
-                            if (seen_status)
+                        } else if (hc_key.eq({"status", 6}) || hc_key.eq({"status_min", 10}) ||
+                                   hc_key.eq({"status_max", 10})) {
+                            bool& seen = hc_key.eq({"status", 6})        ? seen_status
+                                         : hc_key.eq({"status_min", 10}) ? seen_status_min
+                                                                         : seen_status_max;
+                            if (seen)
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*hc_field.value()),
                                                       hc_key);
@@ -4130,8 +4136,13 @@ struct Parser {
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
-                            item.upstream.hc_expected_status = static_cast<u16>(sv);
-                            seen_status = true;
+                            if (hc_key.eq({"status", 6}))
+                                item.upstream.hc_expected_status = static_cast<u16>(sv);
+                            else if (hc_key.eq({"status_min", 10}))
+                                item.upstream.hc_status_min = static_cast<u16>(sv);
+                            else
+                                item.upstream.hc_status_max = static_cast<u16>(sv);
+                            seen = true;
                         } else if (hc_key.eq({"failure_threshold", 17}) ||
                                    hc_key.eq({"success_threshold", 17})) {
                             const bool kFailure = hc_key.eq({"failure_threshold", 17});
@@ -4176,6 +4187,12 @@ struct Parser {
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(*field.value()), detail);
                     }
+                    if (seen_status_min != seen_status_max || (seen_status && seen_status_min) ||
+                        !active_health_status_range_valid(item.upstream.hc_status_min,
+                                                          item.upstream.hc_status_max))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*field.value()),
+                                              lit_str("health_check status range is invalid"));
                     item.upstream.hc_enabled = true;
                 } else {
                     return frontend_error(

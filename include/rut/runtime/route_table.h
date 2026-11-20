@@ -102,6 +102,8 @@ struct UpstreamTarget {
     u32 hc_interval_ms = 0;
     u32 hc_timeout_seconds = 0;  // 0 uses the upstream timeout.
     u16 hc_expected_status = 200;
+    u16 hc_status_min = 0;
+    u16 hc_status_max = 0;
     ActiveHealthThresholds hc_thresholds{};
 
     void set_name(const char* n) {
@@ -1898,6 +1900,8 @@ public:
                                    u16 status,
                                    ActiveHealthThresholds thresholds = {},
                                    u32 timeout_seconds = 0,
+                                   u16 status_min = 0,
+                                   u16 status_max = 0,
                                    Str host = {}) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
@@ -1905,7 +1909,9 @@ public:
         if (host.len && !active_health_host_valid(host)) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (interval_ms == 0 || timeout_seconds >= TimerWheel::kSlots) return false;
-        if (status < 100 || status > 599 || !thresholds.valid()) return false;
+        if (status < 100 || status > 599 || !thresholds.valid() ||
+            !active_health_status_range_valid(status_min, status_max))
+            return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
         // be an origin-form target that cannot inject spaces/control bytes into
         // the request line. The DSL path is also checked at parse time; this is
@@ -1924,6 +1930,8 @@ public:
         up.hc_interval_ms = interval_ms;
         up.hc_timeout_seconds = timeout_seconds;
         up.hc_expected_status = status;
+        up.hc_status_min = status_min;
+        up.hc_status_max = status_max;
         up.hc_thresholds = thresholds;
         up.hc_enabled = true;
         return true;

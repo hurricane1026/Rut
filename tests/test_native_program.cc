@@ -3832,7 +3832,7 @@ upstream api {
     connect_attempts: 8
     max_inflight: 17
     passive_health: { failure_threshold: 7, eject_for: 12s }
-    health_check: { path: "/healthz", interval: 2s, timeout: 3s, host: "probe.example:8080", failure_threshold: 3, success_threshold: 2 }
+    health_check: { path: "/healthz", interval: 2s, timeout: 3s, status_min: 201, status_max: 299, host: "probe.example:8080", failure_threshold: 3, success_threshold: 2 }
 }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
@@ -3854,6 +3854,8 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK_EQ(target.hc_timeout_seconds, 3u);
     CHECK((Str{target.hc_host, target.hc_host_len}.eq(lit_str("probe.example:8080"))));
+    CHECK_EQ(target.hc_status_min, 201u);
+    CHECK_EQ(target.hc_status_max, 299u);
     CHECK_EQ(target.hc_thresholds.failures, 3u);
     CHECK_EQ(target.hc_thresholds.successes, 2u);
 }

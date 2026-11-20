@@ -22,6 +22,7 @@ def main():
     args = parser.parse_args()
     lock = threading.Lock()
     healthy = {'A': True, 'B': True, 'disabled': True}
+    strict_failure = {'code': 200}
     probes = Counter()
     hosts = {}
     data_requests = Counter()
@@ -35,7 +36,10 @@ def main():
                         if self.path in ('/healthz', '/strict-healthz'):
                             probes[self.path, label] += 1
                             hosts[self.path, label] = self.headers.get('Host')
-                            code = 200 if healthy[label] else 500
+                            if self.path == '/strict-healthz':
+                                code = (201 if label == 'A' else 202) if healthy[label] else strict_failure['code']
+                            else:
+                                code = 200 if healthy[label] else 500
                         else:
                             data_requests[label] += 1
                             code = 200  # Health endpoint controls eligibility independently.
@@ -69,7 +73,7 @@ upstream api {{
 upstream strict {{
     backends: [{entries}]
     minimum_healthy_weight_percent: 51
-    health_check: {{ path: "/strict-healthz", interval: 1s, status: 200, host: "Probe.Example:8080",
+    health_check: {{ path: "/strict-healthz", interval: 1s, status_min: 201, status_max: 202, host: "Probe.Example:8080",
                     failure_threshold: 2, success_threshold: 3 }}
 }}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
@@ -138,6 +142,7 @@ route GET "/strict-connect" {{
                 assert initial == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, initial)
                 assert h1('/strict-connect')[0] == 204
                 with lock:
+                    strict_failure['code'] = 200 if protocol == 'H1' else 203
                     healthy['A'] = False
                     before = probes[normal_a]
                     strict_before = probes[strict_a]

@@ -1648,6 +1648,12 @@ failures; HTTP response status codes do not. Configured passive and active probe
 verdicts are independent. Configuration reload resets health and rejects late
 results from retired configurations when the current upstream opts in.
 
+Active health checks may instead specify both `status_min` and `status_max`;
+the inclusive range accepts complete responses with status 100–599. The pair
+is mutually exclusive with exact `status`, and omission keeps exact 200. Native
+artifact version 27 records the range and rejects older artifacts for
+recompilation.
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

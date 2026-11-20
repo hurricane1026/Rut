@@ -48793,3 +48793,65 @@ TEST(frontend, unique_query_requires_literal_and_lowers) {
     CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqUniqueQuery));
     rir.destroy();
 }
+
+TEST(frontend, upstream_health_status_range_validation_and_lowering) {
+    for (const char* fields : {"status_min: 100, status_max: 599",
+                               "status_min: 204, status_max: 204",
+                               "status_max: 299, status_min: 200"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { "
+                 "path: \"/health\", interval: 1s, %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(cfg.upstreams[0].hc_status_min, ast->items[0].upstream.hc_status_min);
+        CHECK_EQ(cfg.upstreams[0].hc_status_max, ast->items[0].upstream.hc_status_max);
+        rir.destroy();
+    }
+    for (const char* fields : {"status_min: 200",
+                               "status_max: 299",
+                               "status_min: 300, status_max: 299",
+                               "status_min: 99, status_max: 200",
+                               "status_min: 200, status_max: 600",
+                               "status_min: 200, status_max: 299, status: 200",
+                               "status: 200, status_min: 200, status_max: 299",
+                               "status_min: 200, status_min: 201, status_max: 299",
+                               "status_min: 4294967496, status_max: 299"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/health\", interval: 1s, %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+}
+
+TEST(frontend, upstream_health_status_range_runtime_validation) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, 0, 200, 299));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, 0, 99, 299));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, 0, 200, 600));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, 0, 300, 299));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, 0, 0, 299));
+    CHECK_EQ(cfg.upstreams[0].hc_status_min, 200u);
+    CHECK_EQ(cfg.upstreams[0].hc_status_max, 299u);
+    REQUIRE(cfg.set_upstream_health_check(0, "/", 1, 1000, 204));
+    CHECK_EQ(cfg.upstreams[0].hc_status_min, 0u);
+    CHECK_EQ(cfg.upstreams[0].hc_status_max, 0u);
+    CHECK_EQ(cfg.upstreams[0].hc_expected_status, 204u);
+}

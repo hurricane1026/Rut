@@ -22038,6 +22038,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_timeout_seconds = item.upstream.hc_timeout_seconds;
         up.hc_expected_status = item.upstream.hc_expected_status;
+        up.hc_status_min = item.upstream.hc_status_min;
+        up.hc_status_max = item.upstream.hc_status_max;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
         up.connect_attempts = item.upstream.connect_attempts;
