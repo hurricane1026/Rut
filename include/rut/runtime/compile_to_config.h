@@ -555,7 +555,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
     for (u32 i = 0; i < mod.upstream_count; ++i)
         if (mod.upstreams[i].minimum_healthy_weight_percent > 100 ||
             mod.upstreams[i].connect_attempts == 0 ||
-            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends) return false;
+            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends)
+            return false;
 
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
     // into the declaration order (0 = first `upstream` decl, 1 = second,
