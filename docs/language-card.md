@@ -2169,6 +2169,10 @@ deduplicate verified IDs durably across shards and nodes before side effects.
 returns a configured `Identity` after verification; empty key configuration or
 empty identity metadata returns 503, while malformed input, an oversized key,
 or invalid signatures return 401.
+The [durable rotation example](../examples/webhook-durable-rotation-replay-auth.rut)
+combines static current/previous keys with confirmed local AOF replay claims and
+a stable signer namespace.
+
 `auth.rotatingStandardWebhook(id, timestamp, signature, body, config)` with an
 `auth.WebhookRotation` configuration checks both configured key
 slots and reports the matching configured credential ID; current wins a tie.

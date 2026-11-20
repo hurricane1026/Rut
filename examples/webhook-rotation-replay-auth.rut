@@ -1,0 +1,26 @@
+import "clients/redis-client.rut"
+import "middleware/auth.rut"
+import "middleware/replay.rut"
+
+listen :8080
+
+// Both slots belong to the same logical signer. Keep this namespace stable
+// across rotation, and do not include the matched credential ID in the key.
+route POST "/webhook" {
+    let id = req.uniqueHeader("webhook-id").or("")
+    let identity = auth.rotatingStandardWebhook(id,
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""), req.body,
+        auth.WebhookRotation(currentKey: env("STANDARD_WEBHOOK_RAW_KEY"),
+            previousKey: env("STANDARD_WEBHOOK_PREVIOUS_RAW_KEY"),
+            consumerId: "billing-provider", currentId: "current", previousId: "previous"))
+    guard let key = replay.key(env("REPLAY_NAMESPACE"), id) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisReplayClaim(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let admitted = replay.requireClaimed(status)
+    // An uncertain claim never admits side effects or triggers an automatic retry.
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+route "/" { return 404 }
