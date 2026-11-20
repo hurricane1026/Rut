@@ -82,7 +82,7 @@ route GET "/test-overlong-selector" {{
         source.write_text(program)
         middleware = root / 'middleware'
         middleware.mkdir()
-        for name in ('auth.rut', 'rbac.rut'):
+        for name in ('auth.rut', 'rbac.rut', 'consumer_factor.rut'):
             (middleware / name).write_bytes((Path(args.source).parent / 'middleware' / name).read_bytes())
         log = root / 'gateway.log'
         with log.open('w') as output:
@@ -107,6 +107,7 @@ route GET "/test-overlong-selector" {{
             source.unlink()
             (middleware / 'auth.rut').unlink()
             (middleware / 'rbac.rut').unlink()
+            (middleware / 'consumer_factor.rut').unlink()
             yield port
         finally:
             if process.poll() is None:

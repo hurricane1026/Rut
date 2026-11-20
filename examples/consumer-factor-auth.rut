@@ -1,0 +1,27 @@
+import "middleware/consumer_factor.rut"
+
+listen :8080
+
+// Both the factor and the RBAC rule are trusted route configuration.
+route GET "/read" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let factor = consumer_factor.require(identity, "reader-key", "bearer")
+    guard jwtHasGroup(factor, "readers") else { return 403 }
+    guard let subject = json.string(json.get(factor, "/consumerId").or(factor)) else { return 503 }
+    return response(200, body: subject)
+}
+route GET "/wrong-method" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let factor = consumer_factor.require(identity, "reader-key", "header")
+    return 200
+}
+route GET "/bad-policy" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let factor = consumer_factor.require(identity, "", "bearer")
+    return 200
+}
+route GET "/bad-method" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    let factor = consumer_factor.require(identity, "reader-key", "unknown")
+    return 200
+}
