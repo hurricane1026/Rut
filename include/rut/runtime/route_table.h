@@ -26,6 +26,7 @@
 #include "rut/runtime/route_select.h"  // path_has_param_segment
 #include "rut/runtime/route_trie.h"
 #include "rut/runtime/rs256_policy.h"
+#include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn (terminate-mode routes)
 #include <new>  // Existing std::nothrow allocations during configuration staging.
@@ -95,6 +96,7 @@ struct UpstreamTarget {
     char hc_path[64];
     u32 hc_path_len = 0;
     u32 hc_interval_ms = 0;
+    u32 hc_timeout_seconds = 0;  // 0 uses the upstream timeout.
     u16 hc_expected_status = 200;
     ActiveHealthThresholds hc_thresholds{};
 
@@ -1890,12 +1892,13 @@ public:
                                    u32 path_len,
                                    u32 interval_ms,
                                    u16 status,
-                                   ActiveHealthThresholds thresholds = {}) {
+                                   ActiveHealthThresholds thresholds = {},
+                                   u32 timeout_seconds = 0) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
         if (path == nullptr) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
-        if (interval_ms == 0) return false;
+        if (interval_ms == 0 || timeout_seconds >= TimerWheel::kSlots) return false;
         if (status < 100 || status > 599 || !thresholds.valid()) return false;
         // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
         // be an origin-form target that cannot inject spaces/control bytes into
@@ -1910,6 +1913,7 @@ public:
         up.hc_path[path_len] = '\0';
         up.hc_path_len = path_len;
         up.hc_interval_ms = interval_ms;
+        up.hc_timeout_seconds = timeout_seconds;
         up.hc_expected_status = status;
         up.hc_thresholds = thresholds;
         up.hc_enabled = true;

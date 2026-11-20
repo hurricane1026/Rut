@@ -10477,6 +10477,39 @@ TEST(frontend, parse_upstream_dict_form) {
     }
 }
 
+TEST(frontend, parse_upstream_health_check_timeout) {
+    struct Case {
+        const char* value;
+        u32 seconds;
+    };
+    for (const Case test : {Case{"1s", 1},
+                            Case{"1000ms", 1},
+                            Case{"1m", 60},
+                            Case{"63s", 63},
+                            Case{"0s", 0},
+                            Case{"750ms", 0},
+                            Case{"1500ms", 0},
+                            Case{"64s", 0},
+                            Case{"1h", 0},
+                            Case{"999999999999999999999s", 0}}) {
+        char src[256];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"/h\", "
+                 "interval: 1s, timeout: %s } }\nroute GET \"/u\" { return 200 }\n",
+                 test.value);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        if (test.seconds == 0) {
+            CHECK(!ast);
+        } else {
+            REQUIRE(ast);
+            CHECK_EQ(ast->items[0].upstream.hc_timeout_seconds, test.seconds);
+        }
+    }
+}
+
 TEST(frontend, parse_upstream_health_check_valid_status) {
     // A health_check.status inside the HTTP response range (100..599) parses and
     // is stored. 200 and the boundary 599 both pass.

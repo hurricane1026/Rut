@@ -1576,7 +1576,11 @@ backends. io_uring uses one-shot receives into probe-owned slices, immutable
 address bytes in the otherwise-unused send slice, and the existing exact-episode
 retirement ledger for close/cancel retry. The per-target in-flight guard is
 released with slot reclamation, after every target/cancel completion. Probe
-callbacks do not refresh the absolute upstream deadline or change client metrics.
+callbacks do not refresh the probe timer or change client metrics. The optional
+`health_check.timeout` accepts whole-second durations from 1s to 63s; omission
+uses the upstream timeout. One timer covers connect, send and response. The
+one-second wheel may fire roughly one tick after the configured duration,
+depending on its phase.
 Each sweep is bounded to 32 issues and reserves 64 client slots plus backend
 submission headroom (16 SQ entries on io_uring). Drain suppresses new probes.
 Pointer plus configuration identity rejects old verdicts after reload/address
@@ -1598,7 +1602,8 @@ another target follows the previous failure path. Retired configurations can
 drain established requests. A current target with an enabled threshold ignores
 late connect results from a retired configuration. The default of 0 preserves
 fail-open selection and the existing handling of passive results.
-Native artifact version 22 records the minimum healthy weight percentage.
+Native artifact version 23 records the active health timeout as well as the
+minimum healthy weight percentage.
 
 The compiler contract is:
 

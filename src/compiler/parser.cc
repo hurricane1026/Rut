@@ -7,6 +7,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/timer_wheel.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -3910,6 +3911,7 @@ struct Parser {
                     if (!hc_lbrace) return core::make_unexpected(hc_lbrace.error());
                     bool seen_path = false;
                     bool seen_interval = false;
+                    bool seen_timeout = false;
                     bool seen_status = false;
                     bool seen_failure_threshold = false;
                     bool seen_success_threshold = false;
@@ -3965,6 +3967,22 @@ struct Parser {
                                                       dur.value()->text);
                             item.upstream.hc_interval_ms = kIntervalMs;
                             seen_interval = true;
+                        } else if (hc_key.eq({"timeout", 7})) {
+                            if (seen_timeout)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto dur = expect(TokenType::DurLit);
+                            if (!dur) return core::make_unexpected(dur.error());
+                            const u32 ms = dur_lit_to_ms(dur.value()->text);
+                            if (ms == 0 || ms % 1000 != 0 || ms / 1000 >= TimerWheel::kSlots)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    span_from(*dur.value()),
+                                    lit_str("health_check timeout must be a whole number of "
+                                            "seconds from 1s to 63s"));
+                            item.upstream.hc_timeout_seconds = ms / 1000;
+                            seen_timeout = true;
                         } else if (hc_key.eq({"status", 6})) {
                             if (seen_status)
                                 return frontend_error(FrontendError::UnexpectedToken,

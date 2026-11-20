@@ -629,6 +629,7 @@ struct Module {
         bool hc_enabled = false;
         Str hc_path;
         u32 hc_interval_ms = 0;
+        u32 hc_timeout_seconds = 0;  // 0 uses the upstream timeout.
         u16 hc_expected_status = 200;
         ActiveHealthThresholds hc_thresholds{};
     };
