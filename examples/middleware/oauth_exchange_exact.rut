@@ -1,0 +1,8 @@
+// Apply only to oauth_client.exchangeDocument's verified exchange grant, and
+// perform the normal bearer token validation before forwarding.
+func require(_ grant: Json, _ requiredScopes: str) -> Json {
+    let actual = json.string(json.get(grant, "/scope").or(grant)).or("")
+    guard let policy = json.value({scope: requiredScopes}) else { respond 503 }
+    guard jwtHasAllScopes(grant, requiredScopes) && jwtHasAllScopes(policy, actual) else { respond 503 }
+    grant
+}

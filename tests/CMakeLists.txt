@@ -4926,6 +4926,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
         set_tests_properties(test_oauth_grant_policy_${backend} PROPERTIES
             LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME test_oauth_exchange_exact_policy_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_oauth_exchange_exact_policy.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
+        set_tests_properties(test_oauth_exchange_exact_policy_${backend} PROPERTIES
+            LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_oauth_client_basic_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_oauth_client_basic.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})
