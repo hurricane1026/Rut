@@ -3854,6 +3854,22 @@ struct Parser {
                         return frontend_error(
                             FrontendError::InvalidInteger, span_from(*lit.value()), field_name);
                     item.upstream.connect_attempts = static_cast<u8>(attempts);
+                } else if (field_name.eq({"max_inflight", 12})) {
+                    if (item.upstream.has_max_inflight)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    item.upstream.has_max_inflight = true;
+                    auto lit = expect(TokenType::IntLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    u32 value = 0;
+                    for (u32 n = 0; n < lit.value()->text.len; ++n) {
+                        const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
+                        if (value > (0xffffffffu - digit) / 10u)
+                            return frontend_error(
+                                FrontendError::InvalidInteger, span_from(*lit.value()), field_name);
+                        value = value * 10u + digit;
+                    }
+                    item.upstream.max_inflight = value;
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
                     if (seen_minimum_healthy_weight_percent)
                         return frontend_error(
@@ -4104,7 +4120,8 @@ struct Parser {
                                           item.upstream.addr_span);
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
-                        seen_minimum_healthy_weight_percent || seen_connect_attempts)) {
+                        seen_minimum_healthy_weight_percent || seen_connect_attempts ||
+                        item.upstream.has_max_inflight)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config
