@@ -127,7 +127,13 @@ inline void record_passive_health_result(u16 uid,
     }
     if (!threshold) return;
     if (*counter < threshold) ++*counter;
-    if (*counter >= threshold) h->passive_down = true;
+    if (*counter >= threshold) {
+        // A newly latched passive verdict starts active recovery from scratch.
+        // Successes observed before this transition must not satisfy the active
+        // recovery streak for the newly ejected endpoint.
+        if (!h->passive_down) h->active_successes = 0;
+        h->passive_down = true;
+    }
 }
 
 inline const PassiveHealthPolicy* passive_health_policy(const RouteConfig* config, u16 uid) {
@@ -9642,8 +9648,9 @@ void h2_proxy_finish(Loop* loop,
         h2_proxy_fail(loop, conn, 502);
         return;
     }
-    record_passive_response_status(
-        loop, conn.h2 ? conn.h2->async_cfg : conn.request_config, conn, resp.status_code);
+    // Cache hits enter this common serializer without an origin response event;
+    // only the real-origin parser above records passive health. Keep cache
+    // invalidation bookkeeping here for unsafe cache-fill requests.
     http_cache_observe_status(conn, resp.status_code);
     if (!is_head) http_cache_complete(conn, conn.upstream_recv_buf.data(), hdr_end + body_len);
     constexpr u32 kMaxForwardHeaders = kMaxHeaders + Connection::kMaxRespHeaderMutations;

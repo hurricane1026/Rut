@@ -6617,6 +6617,7 @@ public:
                 static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
             if (response_read_timer_remaining_ms(
                     c.response_read_timer_last_progress_ns, timeout_ns, now_ns) == 0) {
+                record_passive_timeout(this, c);
                 c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
                 // Keep the authenticated active-batch owner in scope while
                 // selecting the generic expiry disposition.  Deferring this
@@ -6854,6 +6855,7 @@ public:
                 const u64 last = c.response_read_timer_last_progress_ns;
                 const bool due = response_read_timer_remaining_ms(last, timeout_ns, now_ns) == 0;
                 if (due) {
+                    record_passive_timeout(this, c);
                     c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
                     response_read_deadline_expiry_pending = true;
                 } else if (!rearm_precise_response_read_timer(c, now_ns)) {
@@ -8369,6 +8371,11 @@ public:
                         // See epoll_event_loop.h: timer fires for keepalive,
                         // wait(ms), or wait-any timeout completion.
                         if (c->response_read_deadline_state == ResponseReadDeadlineState::Armed) {
+                            // The wheel owns this explicit response-read expiry on
+                            // io_uring. Record the pre-response timeout before the
+                            // deferred teardown path; the observer's current-config,
+                            // live-origin, and per-episode guards make it once-only.
+                            record_passive_timeout(this, *c);
                             c->response_read_deadline_state =
                                 ResponseReadDeadlineState::ExpiryPending;
                             response_read_deadline_expiry_pending = true;

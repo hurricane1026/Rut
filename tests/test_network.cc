@@ -11355,6 +11355,49 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     CHECK_FALSE(conn->epoch_held);
 }
 
+TEST(http2, cache_hit_finish_does_not_report_origin_passive_health) {
+    struct BackendHealthReset {
+        BackendHealthReset() { reset_backend_health(); }
+        ~BackendHealthReset() { reset_backend_health(); }
+    } health_reset;
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    h2.async_stream = 1;
+    conn->h2 = &h2;
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = 0;
+    conn->upstream_episode = 1;
+    static u8 upstream[256];
+    conn->upstream_recv_buf.bind(upstream, sizeof(upstream));
+    ParsedResponse parsed{};
+    parsed.reset();
+    parsed.status_code = 503;
+    parsed.version = HttpVersion::Http11;
+    auto config = RouteConfig{};
+    REQUIRE(config.add_upstream("api", 0x7f000001, 9001));
+    auto& policy = config.upstreams[0].passive_health;
+    policy.enabled = true;
+    policy.http_failures = 1;
+    policy.successes = 1;
+    policy.healthy_statuses[0] = 1;
+    policy.unhealthy_statuses[(503 - 200) / 64] = u64{1} << ((503 - 200) % 64);
+    const RouteConfig* current = &config;
+    loop.config_ptr = &current;
+    h2.async_cfg = &config;
+    h2_proxy_finish(&loop, *conn, parsed, 0, 0, false);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 0u);
+}
+
 TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     SmallLoop loop;
     loop.setup();
@@ -88509,11 +88552,17 @@ TEST(response_read_deadline_fixed_upload_head_batch,
         auto& config = *config_owner;
         PrebuiltD2Fixture fixture{};
         REQUIRE(stage_unreachable_fixed_upload_head_wait(loop, config, route_method, &fixture));
+        config.upstreams[0].passive_health.enabled = true;
+        config.upstreams[0].passive_health.timeouts = 2;
+        config.upstreams[0].passive_health.successes = 1;
+        config.upstreams[0].passive_health.healthy_statuses[0] = 1;
+        REQUIRE(loop->arm_health_on_config_change());
         REQUIRE(complete_unreachable_fixed_upload_head_and_arm(loop, fixture));
         Connection& conn = *fixture.conn;
         BackendHealth* health = backend_health(0, 0);
         REQUIRE(health != nullptr);
         const BackendHealth health_before = *health;
+        const u32 episode = conn.upstream_episode;
         CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
         CHECK(conn.upstream_recv_armed);
         loop->timer.remove(&conn);
@@ -88532,6 +88581,12 @@ TEST(response_read_deadline_fixed_upload_head_batch,
         CHECK_EQ(health->fails, health_before.fails);
         CHECK_EQ(health->eject_until_us, health_before.eject_until_us);
         CHECK_EQ(health->active_down, health_before.active_down);
+        CHECK_EQ(health->passive_timeouts, 1u);
+        CHECK_EQ(conn.passive_timeout_episode, episode);
+        // A duplicate timer dispatch after the owner was consumed must not
+        // publish another timeout for the same upstream episode.
+        loop->dispatch_batch(&timeout, 1);
+        CHECK_EQ(health->passive_timeouts, 1u);
         complete_prebuilt_d2_header(loop, conn);
         drain_prebuilt_d2_retirement(loop, conn, kUpstreamOpRecv, false);
         REQUIRE(conn.http1_boundary_ready);
@@ -91168,8 +91223,10 @@ TEST(passive_health, independent_counters_latch_and_active_recovery) {
     record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
     record_passive_health_result(0, 0, policy, PassiveHealthOutcome::TcpFailure);
     CHECK_FALSE(backend_ejected(0, 0, 100));
+    health->active_successes = 1;
     record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
     CHECK(backend_ejected(0, 0, ~u64{0}));  // no cooldown recovery
+    CHECK_EQ(health->active_successes, 0u);
     CHECK_EQ(health->passive_http_failures, 2u);
     CHECK_EQ(health->passive_tcp_failures, 1u);
     CHECK_EQ(select_backend(0, 2, 100), 1u);
