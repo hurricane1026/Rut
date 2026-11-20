@@ -42,7 +42,7 @@ remote-JWKS freshness and failure behavior remain with the RS256 policy; this
 adapter introduces no fetch or positive decision cache.
 
 `KEYCLOAK_CLIENT`, `KEYCLOAK_REALM_ROLE`, `KEYCLOAK_CLIENT_ROLE` and
-`KEYCLOAK_AUTHORIZED_PARTY` are explicit
+`KEYCLOAK_AUTHORIZED_PARTY` and `KEYCLOAK_SUBJECT` are explicit
 trusted configuration snapshots. Requests cannot select them through headers,
 query parameters, body fields, `azp` or another claim. Bearer clients should use
 HTTPS. The example defines authorization responses, not an application backend.
@@ -55,6 +55,7 @@ HTTPS. The example defines authorization responses, not an application backend.
 | `GET /client` | Configured role in `resource_access[configured client].roles` |
 | `GET /both` | Both memberships in the same verified token |
 | `GET /either` | At least one membership in its configured namespace |
+| `GET /subject` | The signed stable `sub` matches the configured subject and the realm role matches |
 | `GET /party` | The signed `azp` matches the configured authorized party |
 
 A realm role does not become a client role, and another client's role cannot
@@ -118,3 +119,10 @@ containers, signature/algorithm/kid rejection, credential duplication and policy
 replacement. Replacement tests load successive gateway snapshots; they do not
 claim to exercise in-process RCU publication or a live IdP outage. Existing
 RS256/JWKS tests own key activation, refresh, TLS and remote-service failures.
+
+`requireSubject(document, expected)` pins the signed stable `sub` exactly and
+returns the unchanged document. Call it only after signature, issuer, audience
+and time verification and the Bearer access-token gate. The trusted expected
+subject must be nonempty and at most 128 UTF-8 bytes; invalid configuration
+returns 503. Missing, non-string or unequal subjects return a Bearer-challenged
+401. Usernames and request metadata do not supply a substitute.
