@@ -5,6 +5,7 @@
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -561,6 +562,8 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream backend count");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
+        if (target.hc_enabled && target.hc_timeout_seconds >= TimerWheel::kSlots)
+            return fail("invalid native upstream health timeout");
         if (target.hc_enabled && !target.hc_thresholds.valid())
             return fail("invalid native upstream health thresholds");
     }

@@ -1518,6 +1518,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_enabled = module.upstreams[i].hc_enabled;
         up.hc_path = module.upstreams[i].hc_path;
         up.hc_interval_ms = module.upstreams[i].hc_interval_ms;
+        up.hc_timeout_seconds = module.upstreams[i].hc_timeout_seconds;
         up.hc_expected_status = module.upstreams[i].hc_expected_status;
         up.hc_thresholds = module.upstreams[i].hc_thresholds;
         up.minimum_healthy_weight_percent = module.upstreams[i].minimum_healthy_weight_percent;

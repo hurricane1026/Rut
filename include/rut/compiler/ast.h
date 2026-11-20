@@ -399,6 +399,7 @@ struct AstUpstreamDecl {
     bool hc_enabled = false;
     Str hc_path_lit{};             // raw `path:` string literal
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
+    u32 hc_timeout_seconds = 0;    // 0 uses the upstream timeout.
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
     ActiveHealthThresholds hc_thresholds{};
 };

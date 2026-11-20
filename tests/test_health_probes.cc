@@ -218,13 +218,19 @@ template <typename Loop>
 void timeout_and_reclaim(rut::test::TestCase* _tc) {
     ProbeRig<Loop> rig;
     REQUIRE(rig.init());
+    rig.loop->upstream_timeout = 10;
+    REQUIRE(rig.owner.config->set_upstream_health_check(0, "/healthz", 8, 1000, 200, {}, 2));
     REQUIRE(start_health_probe(rig.loop, 0, 0));
     Socket peer;
     char request[512]{};
     REQUIRE(rig.receive_request(peer, request, sizeof(request)));
     Connection* probe = rig.probe();
     REQUIRE(probe);
-    for (u32 i = 0; i < 3; ++i) rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    for (u32 i = 0; i < 2; ++i) {
+        rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+        CHECK(probe_in_flight(0, 0));
+    }
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
     CHECK(backend_ejected(0, 0, ~u64{0}));
     if constexpr (requires { rig.loop->pending_free_count; }) {
         CHECK(probe_in_flight(0, 0));

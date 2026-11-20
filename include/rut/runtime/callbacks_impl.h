@@ -496,14 +496,14 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // connect but never responds (or a connect that stays pending) would otherwise
     // keep this Connection alive forever with upstream I/O armed and
     // probe_in_flight set — permanently suppressing all future probes for the
-    // backend and leaking the slot. Arm it on the 1s timer wheel with the same
-    // bound a real proxied upstream response gets (upstream_timeout, default 30s,
-    // already < TimerWheel::kSlots): the Timeout tick reaps a stalled probe as a
-    // health FAILURE and frees it (clearing probe_in_flight so the next sweep
-    // re-probes). Every fast completion path frees via free_probe_conn ->
+    // backend and leaking the slot. Arm it on the 1s timer wheel with the
+    // configured timeout, falling back to upstream_timeout. The timeout tick
+    // records a health failure and reclaims the stalled probe so the next sweep
+    // can probe again. Every fast completion path frees via free_probe_conn ->
     // free_health_probe -> free_conn, which removes the wheel entry, so a completed
     // probe can never leave a stale entry to fire later against a reused slot.
-    loop->timer.add(&conn, loop->upstream_timeout);
+    loop->timer.add(&conn,
+                    target.hc_timeout_seconds ? target.hc_timeout_seconds : loop->upstream_timeout);
     return true;
 }
 

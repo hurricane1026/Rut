@@ -560,7 +560,7 @@ behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md
 upstream api {
     backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
     health_check: {
-        path: "/healthz", interval: 1s, status: 200,
+        path: "/healthz", interval: 1s, status: 200, timeout: 3s,
         failure_threshold: 3, success_threshold: 2
     }
 }
@@ -569,6 +569,11 @@ upstream api {
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
 A complete response with the expected status counts as success. Connect/read
 errors, malformed responses, unexpected status and timeouts count as failures.
+The optional `timeout` accepts whole-second durations from 1s through 63s
+(including equivalent literals such as `1000ms`). Omission uses the existing
+upstream timeout. One timer bounds connect, send and response together; activity
+does not refresh it. The one-second timer wheel can fire up to roughly one tick
+after the configured duration, depending on the tick phase.
 `failure_threshold` ejects after that many consecutive failures, and
 `success_threshold` restores after that many consecutive successes. Each
 threshold accepts 1–255 and defaults to 1. An opposite result resets the streak,
