@@ -11485,3 +11485,10 @@ without the fork overriding their allocator.
 
 No-match/unparticipating groups are nil; participating empty groups are present.
 Resource errors return 500 before fallback/negation can consume an absent value.
+
+### OPA structured tenant binding
+
+The optional `opa.tenantStatus` follows the existing trusted structured
+OPA decision contract with an exact configured tenant comparison before forwarding.
+Denied decisions and mismatches return 403; malformed or unavailable decisions and
+invalid configuration return 503. See [the contract](docs/opa-authorization.md#optional-structured-decision-tenant-binding).
