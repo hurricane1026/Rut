@@ -399,6 +399,8 @@ struct AstUpstreamDecl {
     u32 max_request_body_bytes = 0;
 
     u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
+
+    u8 response_header_timeout_seconds = 0;
     u32 weight_count = 0;
     u16 backend_weights[kMaxBackends]{};
 

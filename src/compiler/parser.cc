@@ -3717,6 +3717,8 @@ struct Parser {
             bool seen_priorities = false;
 
             bool seen_connect_timeout = false;
+
+            bool seen_response_header_timeout = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -3916,6 +3918,20 @@ struct Parser {
                     }
                     item.upstream.has_max_request_body_bytes = true;
                     item.upstream.max_request_body_bytes = limit;
+
+                } else if (field_name.eq({"response_header_timeout", 23})) {
+                    if (seen_response_header_timeout)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_response_header_timeout = true;
+                    auto value = expect(TokenType::DurLit);
+                    if (!value) return core::make_unexpected(value.error());
+                    u8 seconds = 0;
+                    if (!dur_lit_to_exact_response_read_seconds(value.value()->text, &seconds))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*value.value()),
+                                              value.value()->text);
+                    item.upstream.response_header_timeout_seconds = seconds;
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
                     if (seen_minimum_healthy_weight_percent)
                         return frontend_error(
@@ -4299,7 +4315,8 @@ struct Parser {
                        (seen_protocol || item.upstream.hc_enabled ||
                         seen_minimum_healthy_weight_percent || seen_connect_attempts ||
                         seen_passive_health || seen_priorities || item.upstream.has_max_inflight ||
-                        item.upstream.has_max_request_body_bytes || seen_connect_timeout)) {
+                        item.upstream.has_max_request_body_bytes || seen_connect_timeout ||
+                        seen_response_header_timeout)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

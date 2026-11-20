@@ -49022,3 +49022,41 @@ TEST(frontend, upstream_connect_timeout_bounds_and_prebound) {
     REQUIRE(duplicate);
     CHECK_FALSE(parse_file_heap(duplicate.value()));
 }
+
+TEST(frontend, upstream_response_header_timeout_bounds_and_prebound) {
+    for (const char* value : {"1s", "1000ms", "63s", "1m"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { response_header_timeout: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(cfg.upstreams[0].response_header_timeout_seconds,
+                 value[0] == '6'   ? 63u
+                 : value[1] == 'm' ? 60u
+                                   : 1u);
+        rir.module.upstreams[0].response_header_timeout_seconds = 64;
+        CHECK_FALSE(populate_route_config(cfg, rir.module));
+        rir.destroy();
+    }
+    for (const char* value : {"0s", "500ms", "1500ms", "64s", "999999999999999999999s"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { response_header_timeout: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto duplicate =
+        lex(lit("upstream api { response_header_timeout: 1s, response_header_timeout: 2s }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+}
