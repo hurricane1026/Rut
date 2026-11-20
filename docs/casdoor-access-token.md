@@ -106,6 +106,12 @@ array must be fully valid; malformed arrays deny. Invalid configuration returns
 503, failed access-token or owner checks return challenged 401, and a failed
 group policy returns 403. The verified document is returned unchanged.
 
+`requireAllGroupsWithout(document, org, first, second, forbidden)` requires both
+exact qualified groups and rejects the forbidden group in the same complete,
+valid groups claim. All selectors must be valid and the three group names must
+be distinct, or the policy returns 503. Invalid access-token claims return 401;
+missing, malformed or nonmatching groups return 403.
+
 ## Pinned provider integration
 
 The Docker integration fixture starts the official Casdoor v4.27.1 image pinned

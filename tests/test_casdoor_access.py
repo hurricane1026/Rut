@@ -20,7 +20,7 @@ AUDIENCE = 'casdoor-api'
 
 @contextmanager
 def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended',
-            subject='alice', principal=False, policy=None, union=False):
+            subject='alice', principal=False, policy=None, union=False, intersection=False):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -44,6 +44,12 @@ def gateway(args, directory, org='tenant', group='staff', second='billing:read',
             'route GET "/union" {\n' + \
             '    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
             '    let allowed = casdoor.requireGroupUnionWithout(document, env("CASDOOR_ORG"), env("CASDOOR_GROUP"), env("CASDOOR_SECOND_GROUP"), env("CASDOOR_FORBIDDEN_GROUP"))\n' + \
+            '    return 204\n}\n'
+    if intersection:
+        program = program[:program.index('route GET "/access"')] + \
+            'route GET "/intersection" {\n' + \
+            '    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
+            '    let allowed = casdoor.requireAllGroupsWithout(document, env("CASDOOR_ORG"), env("CASDOOR_GROUP"), env("CASDOOR_SECOND_GROUP"), env("CASDOOR_FORBIDDEN_GROUP"))\n' + \
             '    return 204\n}\n'
     source.write_text(program.replace('listen :8080', f'listen :{port}'))
     if policy is None:
@@ -239,6 +245,25 @@ def main():
                                           ('staff', 'billing:read', 'bad/group')):
             with gateway(args, root, group=group, second=second, forbidden=forbidden, union=True) as port:
                 assert request(port, '/union', signed(accepted), 'h2') == 503
+                checks += 1
+        with gateway(args, root, intersection=True) as port:
+            for version in ('HTTP/1.1', 'h2'):
+                for claims, status in ((accepted, 204),
+                    (dict(base, groups=['tenant/staff']), 403),
+                    (dict(base, groups=['tenant/billing:read']), 403),
+                    (dict(base, groups=['tenant/staff', 'tenant/billing:read', 'tenant/suspended']), 403),
+                    (dict(base, groups=['tenant/suspended', 'tenant/billing:read', 'tenant/staff']), 403),
+                    (dict(base, groups=['tenant/staff', 'tenant/billing:read', 'other/suspended']), 204),
+                    (dict(base, groups=['tenant/staff', 'tenant/billing:read', 7]), 403),
+                    (dict(accepted, owner='other'), 401), (dict(accepted, tokenType='refresh-token'), 401)):
+                    assert request(port, '/intersection', signed(claims), version) == status
+                    checks += 1
+        for group, second, forbidden in (('staff', 'staff', 'suspended'),
+                                          ('staff', 'billing:read', 'staff'),
+                                          ('staff', 'billing:read', 'billing:read'),
+                                          ('staff', 'billing:read', 'bad/group')):
+            with gateway(args, root, group=group, second=second, forbidden=forbidden, intersection=True) as port:
+                assert request(port, '/intersection', signed(accepted), 'h2') == 503
                 checks += 1
         for subject in ('', 'x' * 129):
             with gateway(args, root, subject=subject, principal=True) as port:
