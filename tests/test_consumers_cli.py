@@ -112,6 +112,12 @@ def test_deployment_policy(tool, root):
     check({each_active: True}, consumers=[alice, enabled_owner],
           records=[key, dict(parked, consumerId='disabled', enabled=True, groups=[])], ok=True)
     check({each_active: True}, now=200, rule=each_active)
+    group_required = 'requireGroupsForEnabledConsumers'
+    check({group_required: True}, ok=True)
+    check({group_required: True}, consumers=[dict(alice, groups=[]), disabled],
+          records=[dict(key, groups=[])], rule=group_required)
+    check({group_required: False}, consumers=[dict(alice, groups=[]), disabled],
+          records=[dict(key, groups=[])], ok=True)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
