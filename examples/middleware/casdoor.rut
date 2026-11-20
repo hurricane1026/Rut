@@ -72,3 +72,22 @@ func requireGroupUnionWithout(_ document: Json, _ org: str, _ first: str,
         !jwtHasGroup(access, org + "/" + forbidden) else { respond 403 }
     access
 }
+
+// The forbidden qualified name must be complete before a negative match.
+func hasAllGroupsWithout(_ access: Json, _ org: str, _ first: str,
+                         _ second: str, _ forbidden: str) -> bool {
+    let excluded = org + "/" + forbidden
+    guard Bytes(excluded).count == Bytes(org).count + 1 + Bytes(forbidden).count else { false }
+    guard let projected = json.value({groups: json.get(access, "/groups").or(access)}) else { false }
+    jwtHasGroup(projected, org + "/" + first) && jwtHasGroup(projected, org + "/" + second) &&
+        !jwtHasGroup(projected, excluded)
+}
+
+func requireAllGroupsWithout(_ document: Json, _ org: str, _ first: str,
+                             _ second: str, _ forbidden: str) -> Json {
+    guard validSelector(org) && validSelector(first) && validSelector(second) &&
+        validSelector(forbidden) && first != second && first != forbidden && second != forbidden else { respond 503 }
+    let access = requireAccessToken(document, org)
+    guard hasAllGroupsWithout(access, org, first, second, forbidden) else { respond 403 }
+    access
+}
