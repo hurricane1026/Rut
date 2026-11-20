@@ -91,6 +91,11 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             fields |= 256;
             continue;
         }
+        if (kKey.eq(lit_str("requireNonEmptyKeys"))) {
+            if (document.nodes[entry].kind != json::Kind::Boolean) return false;
+            next.require_non_empty_keys = document.raw(entry).eq(lit_str("true"));
+            continue;
+        }
         if (kKey.eq(lit_str("conditionalRequests"))) {
             if (document.nodes[entry].kind != json::Kind::Boolean) return false;
             next.conditional_requests = document.raw(entry).eq(lit_str("true"));

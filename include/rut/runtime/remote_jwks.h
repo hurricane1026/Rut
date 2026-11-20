@@ -23,6 +23,7 @@ struct RemoteJwks {
     u32 retry_seconds = 0;
     u32 max_retry_seconds = 0;
     u32 max_retry_after_seconds = 0;
+    bool require_non_empty_keys = false;
     bool conditional_requests = false;
     bool conditional_discovery = false;
     u32 max_age_seconds = 0;
