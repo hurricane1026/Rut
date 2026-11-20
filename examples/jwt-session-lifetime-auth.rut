@@ -1,0 +1,27 @@
+import "clients/redis-client.rut"
+import "middleware/jwt_session.rut"
+
+listen :8080
+
+func sessionPermitStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => if data == b"active" { 1 } else { 0 }
+        .missing => 0
+        _ => -1
+    }
+}
+
+// Fixed positive seconds: maximum age 300 and maximum signed lifetime 600.
+// Set both literals to positive trusted policy values before deployment.
+// The limits are checked after signature/claims validation and before Redis I/O.
+route GET "/private" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard jwtClaimsValidWithLifetime(document, env("JWT_ISSUER"), env("JWT_AUDIENCE"), i64(300), i64(600)) else { return response(401, headers: {"WWW-Authenticate": "Bearer error=\"invalid_token\""}) }
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let active = jwt_session.requireActiveStatus(sessionPermitStatus(result))
+    return 204
+}
