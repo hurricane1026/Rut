@@ -210,6 +210,7 @@ add_library(rut_runtime STATIC
     runtime/traffic_capture.cc
     runtime/route_art.cc
     runtime/route_select.cc
+    runtime/route_table.cc
     runtime/route_trie.cc
     ${SIMD_SOURCE}
 )
@@ -294,8 +295,10 @@ add_library(rut_verifier STATIC
     compiler/concurrency_verifier.cc
     compiler/wait_verifier.cc
     compiler/handler_verifier.cc
+    compiler/verifier.cc
 )
 target_include_directories(rut_verifier PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(rut_verifier PRIVATE rut_runtime)
 
 # Compiler library
 add_library(rut_compiler STATIC
