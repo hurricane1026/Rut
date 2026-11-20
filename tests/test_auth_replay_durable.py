@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 
-from test_auth_replay import exchange, gateway
+from test_auth_replay import KEY, exchange, gateway
 from test_redis_commands import REDIS_IMAGE, packet, read_value
 
 
@@ -116,6 +116,7 @@ def main():
     parser.add_argument('--testdata', required=True)
     parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
     parser.add_argument('--tls', action='store_true')
+    parser.add_argument('--rotation', action='store_true')
     parser.add_argument('--opt', type=int, choices=(0, 2), default=2)
     args = parser.parse_args()
     store = DurableStore(args)
@@ -125,6 +126,30 @@ def main():
         assert store.command(b'CONFIG', b'GET', b'maxmemory-policy') == [b'maxmemory-policy', b'noeviction']
         with tempfile.TemporaryDirectory(prefix='rut-auth-durable-') as directory:
             root = Path(directory)
+            if args.rotation:
+                assert args.tls
+                next_key = 'standard-webhook-next-fixture-9876543210'
+                args.current_key = KEY
+                args.previous_key = ''
+                with gateway(args, Path(args.source).resolve(), store, root) as port:
+                    assert exchange(port, 'rotation-persisted', key=KEY) == 204
+                    ttl = store.command(b'PTTL', key('rotation-persisted'))
+                store.kill()
+                store.start()
+                assert store.command(b'GET', key('rotation-persisted')) == b'claimed'
+                assert 0 < store.command(b'PTTL', key('rotation-persisted')) < ttl
+                args.current_key, args.previous_key = next_key, KEY
+                with gateway(args, Path(args.source).resolve(), store, root) as port:
+                    assert exchange(port, 'rotation-persisted', key=next_key, h2=True) == 409
+                    assert exchange(port, 'overlap-old', key=KEY) == 204
+                    assert exchange(port, 'overlap-new', key=next_key) == 204
+                args.previous_key = ''
+                with gateway(args, Path(args.source).resolve(), store, root) as port:
+                    assert exchange(port, 'old-retired', key=KEY) == 401
+                    assert exchange(port, 'overlap-old', key=next_key) == 409
+                    assert exchange(port, 'after-retirement', key=next_key) == 204
+                print('PASS: TLS Redis durable replay across signing-key rotation and restarts')
+                return
             with gateway(args, Path(args.source).resolve(), store, root) as port:
                 assert exchange(port, 'persisted') == 204
                 assert exchange(port, 'persisted', h2=True) == 409
