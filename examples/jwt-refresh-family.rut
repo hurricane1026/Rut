@@ -1,0 +1,113 @@
+// One configured subject/family, with separately signed refresh credentials.
+// A trusted owner must enroll the initial token digest before exposing this route.
+import "clients/redis-client.rut"
+import "middleware/jwt_session.rut"
+
+// Fixed script; callers authenticate the credential and bind its family first.
+func redisRefreshFamilyScript() -> Bytes {
+    Bytes("local function d(v) return v and #v==64 and not string.find(v,'[^0-9a-f]') end if #KEYS~=1 or #ARGV~=2 or #KEYS[1]==0 or #KEYS[1]>256 or not d(ARGV[1]) or not d(ARGV[2]) or ARGV[1]==ARGV[2] then return -1 end local v=redis.call('GET',KEYS[1]) if not v then return 0 end if redis.call('PTTL',KEYS[1])<0 then return -1 end if v=='revoked' then return 0 end if #v~=67 or string.sub(v,1,3)~='v1:' or not d(string.sub(v,4)) then return -1 end if v=='v1:'..ARGV[1] then redis.call('SET',KEYS[1],'v1:'..ARGV[2],'KEEPTTL') return 1 end redis.call('SET',KEYS[1],'revoked','KEEPTTL') return 2")
+}
+
+func redisRefreshFamilyRequestFinish(_ count: Bytes, _ family: Bytes, _ old: Bytes, _ replacement: Bytes) {
+    guard let keyed = concatBytes(count, family, 8192) else { nil }
+    guard let previous = concatBytes(keyed, old, 8192) else { nil }
+    guard let mutation = concatBytes(previous, replacement, 8192) else { nil }
+    concatBytes(mutation, b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192)
+}
+func redisRefreshFamilyRequest(_ key: Bytes, _ presented: Bytes, _ next: Bytes) {
+    guard let source = resp2BulkArgument(redisRefreshFamilyScript(), 8192) else { nil }
+    guard let family = resp2BulkArgument(key, 8192) else { nil }
+    guard let old = resp2BulkArgument(presented, 8192) else { nil }
+    guard let replacement = resp2BulkArgument(next, 8192) else { nil }
+    guard let start = concatBytes(b"*6\r\n$4\r\nEVAL\r\n", source, 8192) else { nil }
+    guard let count = concatBytes(start, b"$1\r\n1\r\n", 8192) else { nil }
+    redisRefreshFamilyRequestFinish(count, family, old, replacement)
+}
+// Map only exact canonical integer acknowledgements. Unexpected replies poison
+// the lease and all initialization or cleanup failures remain uncertain.
+func redisRefreshFamilyReply(_ reply: Resp2Token) -> RedisSessionResult {
+    if reply.kind == 3 && reply.data == Bytes("1") { RedisSessionResult.ok } else {
+        if reply.kind == 3 && reply.data == Bytes("0") { RedisSessionResult.missing } else {
+            if reply.kind == 3 && reply.data == Bytes("2") { RedisSessionResult.value(Bytes("revoked")) } else {
+                if reply.kind == 2 { RedisSessionResult.serverError(reply.data) } else { RedisSessionResult.replyFailure }
+            }
+        }
+    }
+}
+
+func redisRefreshFamilyConfirmedReply(_ frame: Bytes) -> RedisSessionResult {
+    guard let reply = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
+    guard let barrier = frame.slice(reply.next, frame.count) else { RedisSessionResult.replyFailure }
+    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    redisRefreshFamilyReply(reply)
+}
+
+func redisRefreshFamilyExecute(_ connection: TcpConnection, _ request: Bytes) -> RedisSessionResult {
+    guard request.count > 0 else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    let reading = redisReplayDurableRead(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    redisRefreshFamilyConfirmedReply(frame)
+}
+// 1 rotated, 2 revoked on reuse, 0 absent/revoked, -1 uncertain/error.
+// Publish a fresh credential only for 1, after this helper returns.
+func redisRefreshFailureValue() -> i32 { -1 }
+func redisRefreshFailure(_ connection: TcpConnection) -> i32 {
+    let closed = connection.close()
+    redisRefreshFailureValue()
+}
+func redisRefreshFamilyFinish(_ connection: TcpConnection, _ result: RedisSessionResult) -> i32 {
+    let finished = redisSessionFinish(connection, result)
+    match finished {
+        .ok => 1
+        .missing => 0
+        .value(data) => if data == Bytes("revoked") { 2 } else { -1 }
+        _ => -1
+    }
+}
+
+func redisRefreshFamily(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                        _ database: i32, _ key: Bytes, _ presented: Bytes, _ next: Bytes) -> i32 {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { -1 }
+    let result = redisRefreshFamilyExecute(connection, redisRefreshFamilyRequest(key, presented, next).or(Bytes("")))
+    if redisSessionAlreadyClosed(result) {
+        redisRefreshFailure(connection)
+    } else { redisRefreshFamilyFinish(connection, result) }
+}
+
+struct RefreshPlan { family: Bytes currentDigest: Bytes nextDigest: Bytes token: str }
+func refreshIssue(_ token: str, _ subject: str, _ tokenId: str) -> RefreshPlan {
+    guard let family = jwt_session.key(env("REFRESH_SUBJECT"), env("REFRESH_NAMESPACE")) else { nil }
+    guard let current = sha256(token) else { nil }
+    guard let issued = jwt_session.issueHs256(subject, env("REFRESH_ISSUER"), env("REFRESH_AUDIENCE"), tokenId, env("REFRESH_SECRET"), env("REFRESH_NAMESPACE"), "refresh") else { nil }
+    guard let digest = sha256(issued.token) else { nil }
+    RefreshPlan(family: family, currentDigest: Bytes(current), nextDigest: Bytes(digest), token: issued.token)
+}
+func refreshAuthenticated(_ token: str) -> bool {
+    let secret = env("REFRESH_SECRET")
+    guard req.isTls && Bytes(secret).count >= 32 && Bytes(secret).count <= 4096 &&
+        env("REFRESH_SUBJECT") != "" && env("REFRESH_ISSUER") != "" &&
+        env("REFRESH_AUDIENCE") != "" else { respond 503 }
+    guard let document = jwtDecode(token, secret, "HS256") else { respond 401 }
+    let subject = json.string(json.get(document, "/sub").or(document)).or("")
+    guard jwtClaimsValid(document, env("REFRESH_ISSUER"), env("REFRESH_AUDIENCE")) &&
+        subject == env("REFRESH_SUBJECT") && jwtHasScope(document, "refresh") else { respond 401 }
+    true
+}
+route POST "/refresh" {
+    let pendingId = uuid()
+    guard let tokenId = pendingId else { return 503 }
+    let token = bearerToken(req.authorization.or("")).or("")
+    let authenticated = refreshAuthenticated(token)
+    guard let plan = refreshIssue(token, env("REFRESH_SUBJECT"), tokenId) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisRefreshFamily(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), plan.family, plan.currentDigest, plan.nextDigest)
+    guard status != -1 else { return 503 }
+    guard status == 1 else { return 401 }
+    let issuedToken = plan.token
+    return response(200, body: issuedToken, headers: {"Content-Type": "application/jwt", "Cache-Control": "no-store", "Pragma": "no-cache"})
+}
+route "/" { return 404 }
