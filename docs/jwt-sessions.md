@@ -296,6 +296,9 @@ tombstone expiry, ACL denial, capacity, read-only role and disabled AOF. Both
 backends, O0/O2 wire tests and verified TLS service tests are registered. These
 single-instance tests do not establish replication/failover consistency.
 
+See the [separate refresh-family profile](refresh-family.md) for atomic
+refresh credential rotation and reuse revocation with a fixed family expiry.
+
 ## Validation scope
 
 The JIT test uses the example's real typed mapper to cover every
