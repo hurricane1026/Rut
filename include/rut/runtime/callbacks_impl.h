@@ -11,6 +11,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/http_cache_connection.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -283,6 +284,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         best = i;
     }
     if (eligible == 0) return count;  // No fallback can reactivate weight zero.
+    if (spec.policy == LoadBalancePolicy::ConsistentHash)
+        return select_consistent_hash(spec, target.addrs, weights, count, eligible);
     auto& previous = state.weighted_eligible[spec.site - 1];
     auto& current = state.weighted_current[spec.site - 1];
     if (previous != eligible) {

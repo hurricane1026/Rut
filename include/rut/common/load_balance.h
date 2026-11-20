@@ -5,15 +5,26 @@
 namespace rut {
 // None is internal absence for non-forward operations and native compatibility.
 // The language never supplies a default.
-enum class LoadBalancePolicy : u8 { None, RoundRobin, LeastRequests, Invalid = 255 };
+enum class LoadBalancePolicy : u8 {
+    None,
+    RoundRobin,
+    LeastRequests,
+    ConsistentHash,
+    Invalid = 255
+};
 inline constexpr u32 kMaxForwardSites = 512;
 inline bool load_balance_policy_valid(LoadBalancePolicy policy) {
     return policy == LoadBalancePolicy::None || policy == LoadBalancePolicy::RoundRobin ||
-           policy == LoadBalancePolicy::LeastRequests;
+           policy == LoadBalancePolicy::LeastRequests ||
+           policy == LoadBalancePolicy::ConsistentHash;
 }
 struct ForwardLoadBalance {
     u16 site;  // 1-based compiled operation identity; zero for native compatibility
     LoadBalancePolicy policy;
+    // Request-owned digest, copied with H2 pending/async metadata. Never borrows key bytes.
+    u8 hash_digest[32];
+    bool hash_grpc;
+    u16 hash_status;  // 0 absent, 1 valid, 400 invalid key, 503 digest/config error
 };
 inline bool forward_load_balance_valid(ForwardLoadBalance spec) {
     return spec.policy == LoadBalancePolicy::None

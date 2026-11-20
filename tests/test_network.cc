@@ -91046,3 +91046,101 @@ TEST(weighted_load_balance, reload_result_admission_uses_current_capacity_policy
     CHECK(admit_passive_health_result(&loop, nullptr, 0));
     CHECK_FALSE(current_health_generation(&loop, &old_cfg));
 }
+
+TEST(consistent_hash, health_retry_shard_and_configuration_isolation) {
+    rut::test::RouteConfigFixture old_owner;
+    rut::test::RouteConfigFixture new_owner;
+    REQUIRE(old_owner.config);
+    REQUIRE(new_owner.config);
+    auto& old = *old_owner.config;
+    auto& current = *new_owner.config;
+    for (auto* cfg : {&old, &current}) {
+        REQUIRE(cfg->add_upstream("api", 0x7f000001, 9001));
+        REQUIRE(cfg->add_upstream_backend(0, 0x7f000001, 9002));
+    }
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    ForwardLoadBalance spec{1, LoadBalancePolicy::ConsistentHash};
+    spec.hash_status = 1;
+    REQUIRE(consistent_hash_digest(
+        lit_str("tenant"), 1, lit_str("0123456789abcdef0123456789abcdef"), spec.hash_digest));
+    const u32 original = select_forward_backend(&old, 0, spec, 0, 2, 0, 0);
+    REQUIRE(original < 2);
+    for (u32 shard = 0; shard < kMaxShards; ++shard)
+        CHECK_EQ(select_forward_backend(&old, shard, spec, 0, 2, 0, 0), original);
+    const u8 excluded = static_cast<u8>(1u << original);
+    CHECK_EQ(select_forward_backend(&old, 0, spec, 0, 2, 0, excluded), 1 - original);
+    CHECK_EQ(select_forward_backend(&old, 0, spec, 0, 2, 0, 3), 2u);
+    backend_health(0, original)->active_down = true;
+    CHECK_EQ(select_forward_backend(&old, 0, spec, 0, 2, 0, 0), 1 - original);
+    backend_health(0, 1 - original)->active_down = true;
+    // Existing default fail-open remains deterministic; strict capacity fails closed.
+    CHECK_EQ(select_forward_backend(&old, 0, spec, 0, 2, 0, 0), original);
+    current.upstreams[0].minimum_healthy_weight_percent = 50;
+    CHECK_EQ(select_forward_backend(&current, 0, spec, 0, 2, 0, 0), 2u);
+    *backend_health(0, 0) = {};
+    *backend_health(0, 1) = {};
+    current.upstreams[0].weights[original] = 0;
+    CHECK_EQ(select_forward_backend(&current, 0, spec, 0, 2, 0, 0), 1 - original);
+    // Requests pinning the old snapshot still use its original weights.
+    CHECK_EQ(select_forward_backend(&old, 0, spec, 0, 2, 0, 0), original);
+}
+
+TEST(consistent_hash, grpc_invalid_key_is_trailers_only_with_protocol_status) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn);
+    for (bool parked : {false, true})
+        for (u16 status : {400, 503}) {
+            Http2Conn h2{};
+            h2.init();
+            conn->h2 = &h2;
+            conn->forward_load_balance = {1, LoadBalancePolicy::ConsistentHash};
+            conn->forward_load_balance.hash_status = status;
+            conn->forward_load_balance.hash_grpc = true;
+            JitDispatchOutcome outcome{};
+            outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+            outcome.status_code = status;
+            u8 wire[2048]{};
+            H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false, false};
+            if (parked) {
+                REQUIRE(h2_park_local_outcome(dispatch, 1, outcome, nullptr, false, 0));
+                // Another stream must not change this pending gRPC error's classification.
+                conn->forward_load_balance = {};
+                h2_finish_body(dispatch, 1);
+            } else {
+                h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+            }
+            Http2FrameHeader frame{};
+            REQUIRE_EQ(parse_frame_header(wire, dispatch.resp_len, &frame), ParseStatus::Complete);
+            CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+            CHECK((frame.flags & (http2_flag::kEndHeaders | http2_flag::kEndStream)) ==
+                  (http2_flag::kEndHeaders | http2_flag::kEndStream));
+            CHECK_EQ(dispatch.resp_len, frame.length + kFrameHeaderSize);
+            hpack::DynamicTable decoder;
+            decoder.init(kDefaultHeaderTableSize);
+            hpack::Header headers[8];
+            u8 scratch[256]{};
+            u32 count = 0;
+            REQUIRE(hpack::decode_header_block(decoder,
+                                               wire + kFrameHeaderSize,
+                                               frame.length,
+                                               scratch,
+                                               sizeof(scratch),
+                                               headers,
+                                               8,
+                                               &count));
+            bool http_ok = false, grpc_ok = false, type_ok = false;
+            for (u32 i = 0; i < count; ++i) {
+                if (headers[i].name.eq(lit_str(":status")))
+                    http_ok = headers[i].value.eq(lit_str("200"));
+                if (headers[i].name.eq(lit_str("content-type")))
+                    type_ok = headers[i].value.eq(lit_str("application/grpc"));
+                if (headers[i].name.eq(lit_str("grpc-status")))
+                    grpc_ok = headers[i].value.eq(status == 400 ? lit_str("3") : lit_str("14"));
+            }
+            CHECK(http_ok && grpc_ok && type_ok);
+        }
+    conn->h2 = nullptr;
+}

@@ -10,6 +10,7 @@
 #include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/jit/yield_contract.h"
+#include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/route_method.h"
 
 namespace rut {
@@ -212,7 +213,7 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
                !type->inner->struct_def;
     }
     if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate &&
-        inst.op != Opcode::ReqSetPath)
+        inst.op != Opcode::ReqSetPath && inst.op != Opcode::ReqSetHash)
         return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
     const auto kExact = [&](ValueId id, TypeKind kind) {
@@ -220,6 +221,20 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
         const Type* type = fn.values[id.id].type;
         return type && type->kind == kind && !type->inner && !type->struct_def;
     };
+    if (inst.op == Opcode::ReqSetHash) {
+        if (inst.result != kNoValue || inst.operand_count != 2 ||
+            (!kExact(inst.operand(0), TypeKind::Str) && !kExact(inst.operand(0), TypeKind::IP)) ||
+            !kExact(inst.operand(1), TypeKind::Str))
+            return false;
+        const auto& v = fn.values[inst.operand(1).id];
+        if (v.def_block.id >= fn.block_count || !fn.blocks) return false;
+        const auto& block = fn.blocks[v.def_block.id];
+        if (!block.insts || v.def_inst >= block.inst_count) return false;
+        const auto& seed = block.insts[v.def_inst];
+        u8 decoded[16];
+        return seed.op == Opcode::ConstStr && seed.result == inst.operand(1) &&
+               consistent_hash_seed(seed.imm.str_val, decoded);
+    }
     if (inst.op == Opcode::ReqSetPath) {
         if (inst.result != kNoValue || inst.operand_count != 1 ||
             !kExact(inst.operand(0), TypeKind::Str) ||

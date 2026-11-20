@@ -45801,7 +45801,7 @@ route GET "/other" { return forward(api, load_balance: .roundRobin) }
         CHECK_EQ(static_cast<u32>(term->imm.i32_val) & 255, i == 1 ? 2u : 1u);
     }
     auto* term = find_first_op(out.module.functions[0], rir::Opcode::RetForward);
-    term->imm.i32_val = (1 << 8) | 3;
+    term->imm.i32_val = (1 << 8) | 4;
     CHECK_FALSE(rir::verify_module(out.module).ok);
     out.destroy();
 }
@@ -48457,5 +48457,52 @@ TEST(frontend, request_header_all_rejects_explicit_wait_in_either_order_and_help
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir);
         CHECK(hir.error().detail.eq(lit("req.getAll() requires a route without explicit wait")));
+    }
+}
+
+TEST(frontend, consistent_hash_arguments_and_key_types) {
+    for (const char* args :
+         {"load_balance: .consistentHash",
+          "load_balance: .consistentHash, hash_key: req.path",
+          "load_balance: .roundRobin, hash_key: req.path, hash_seed: "
+          "\"0123456789abcdef0123456789abcdef\"",
+          "load_balance: .consistentHash, hash_key: 42, hash_seed: "
+          "\"0123456789abcdef0123456789abcdef\"",
+          "load_balance: .consistentHash, hash_key: req.header(\"X-Key\"), hash_seed: "
+          "\"0123456789abcdef0123456789abcdef\"",
+          "load_balance: .consistentHash, hash_key: req.path, hash_seed: "
+          "\"00000000000000000000000000000000\"",
+          "load_balance: .consistentHash, hash_key: req.path, hash_seed: req.path",
+          "load_balance: .consistentHash, hash_key: \"\", hash_seed: "
+          "\"0123456789abcdef0123456789abcdef\""}) {
+        const std::string source =
+            std::string(
+                "upstream api at \"127.0.0.1:9001\"\nroute GET \"/\" { return forward(api, ") +
+            args + ") }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    for (const char* key :
+         {"req.path", "req.remoteAddr", "req.header(\"X-Key\").or(\"fallback\")"}) {
+        const std::string source =
+            std::string(
+                "upstream api at \"127.0.0.1:9001\"\nroute GET \"/\" { return forward(api, "
+                "load_balance: .consistentHash, hash_key: ") +
+            key + ", hash_seed: \"0123456789abcdef0123456789abcdef\") }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule out{};
+        REQUIRE(lower_to_rir(mir.value(), out));
+        CHECK(rir::verify_module(out.module).ok);
+        CHECK(find_first_op(out.module.functions[0], rir::Opcode::ReqSetHash) != nullptr);
+        out.destroy();
     }
 }

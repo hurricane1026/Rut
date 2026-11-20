@@ -644,6 +644,35 @@ VerifyResult verify_module_impl(const Module& mod,
                     if ((encoded >> 8) > kMaxForwardSites || !forward_load_balance_valid(lb))
                         return verify_fail(
                             summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                    if ((encoded & 255) == static_cast<u32>(LoadBalancePolicy::ConsistentHash)) {
+                        i32 ch_upstream = -1;
+                        u32 hashes = 0;
+                        for (u32 before = 0; before < ii; ++before)
+                            if (block.insts[before].op == Opcode::ReqSetHash) ++hashes;
+                        if (hashes != 1 || inst.operand_count == 0 ||
+                            !const_i32(inst.operand(0), &ch_upstream) || ch_upstream < 0 ||
+                            static_cast<u32>(ch_upstream) >= mod.upstream_count)
+                            return verify_fail(
+                                summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                        const auto& up = mod.upstreams[ch_upstream];
+                        if (!up.has_address || !up.port || up.extra_count > 7)
+                            return verify_fail(
+                                summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                        for (u32 i = 0; i < up.extra_count; ++i) {
+                            if (!up.extra_ports[i] ||
+                                (up.extra_ips[i] == up.ip && up.extra_ports[i] == up.port))
+                                return verify_fail(
+                                    summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
+                            for (u32 j = 0; j < i; ++j)
+                                if (up.extra_ips[i] == up.extra_ips[j] &&
+                                    up.extra_ports[i] == up.extra_ports[j])
+                                    return verify_fail(summary,
+                                                       VerifyIssueCode::InvalidForwardPreflight,
+                                                       fi,
+                                                       bi,
+                                                       ii);
+                        }
+                    }
                 }
                 if (inst.op != Opcode::RetForwardBundle) continue;
                 if (inst.operand_count != 3)

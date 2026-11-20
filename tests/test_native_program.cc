@@ -3847,3 +3847,32 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.hc_thresholds.failures, 3u);
     CHECK_EQ(target.hc_thresholds.successes, 2u);
 }
+
+TEST(native_program, consistent_hash_seed_and_key_survive_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api at "127.0.0.1:9001"
+route GET "/" { return forward(api, load_balance: .consistentHash,
+    hash_key: req.header("X-Key").or(""),
+    hash_seed: "0123456789abcdef0123456789abcdef") }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    ConnectionBase conn{};
+    jit::HandlerCtx ctx{};
+    const char request[] = "GET / HTTP/1.1\r\nHost: localhost\r\nX-Key: tenant-42\r\n\r\n";
+    auto result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        &conn, &ctx, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.action, jit::HandlerAction::Forward);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::ConsistentHash);
+    CHECK_EQ(conn.forward_load_balance.hash_status, 1u);
+    CHECK_EQ(conn.forward_load_balance.hash_digest[0], 0xe9u);
+    ctx = {};
+    const char empty[] = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    result = jit::HandlerResult::unpack(owner.p->config.routes[0].fn(
+        &conn, &ctx, reinterpret_cast<const u8*>(empty), sizeof(empty) - 1, nullptr));
+    CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 400u);
+}

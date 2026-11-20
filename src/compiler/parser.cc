@@ -2263,16 +2263,31 @@ struct Parser {
                         if (stmt.forward_load_balance.policy != LoadBalancePolicy::None)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
-                        auto value = expect_policy_case(lit_str(".roundRobin .leastRequests"));
+                        auto value = expect_policy_case(
+                            lit_str(".roundRobin .leastRequests .consistentHash"));
                         if (!value) return core::make_unexpected(value.error());
                         if (value.value()->text.eq({"roundRobin", 10}))
                             stmt.forward_load_balance.policy = LoadBalancePolicy::RoundRobin;
                         else if (value.value()->text.eq({"leastRequests", 13}))
                             stmt.forward_load_balance.policy = LoadBalancePolicy::LeastRequests;
+                        else if (value.value()->text.eq({"consistentHash", 14}))
+                            stmt.forward_load_balance.policy = LoadBalancePolicy::ConsistentHash;
                         else
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*value.value()),
                                                   value.value()->text);
+                    } else if (kw_text.eq({"hash_key", 8}) || kw_text.eq({"hash_seed", 9})) {
+                        auto*& slot = kw_text.eq({"hash_key", 8}) ? stmt.forward_hash_key
+                                                                  : stmt.forward_hash_seed;
+                        if (slot)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*kw.value()),
+                                                  lit_str("duplicate hash argument"));
+                        auto expr = parse_expr();
+                        if (!expr) return core::make_unexpected(expr.error());
+                        auto owned = alloc_expr(expr.value());
+                        if (!owned) return core::make_unexpected(owned.error());
+                        slot = owned.value();
                     } else if (kw_text.eq({"response_read_timeout", 21})) {
                         if (stmt.has_forward_response_read_timeout)
                             return frontend_error(
@@ -3023,10 +3038,17 @@ struct Parser {
                             FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
                 }
                 if (stmt.forward_load_balance.policy == LoadBalancePolicy::None)
-                    return frontend_error(
-                        FrontendError::UnsupportedSyntax,
-                        span_from(start),
-                        lit_str("forward requires load_balance: .roundRobin or .leastRequests"));
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(start),
+                                          lit_str("forward requires load_balance: .roundRobin, "
+                                                  ".leastRequests or .consistentHash"));
+                if ((stmt.forward_load_balance.policy == LoadBalancePolicy::ConsistentHash)
+                        ? (!stmt.forward_hash_key || !stmt.forward_hash_seed)
+                        : (stmt.forward_hash_key || stmt.forward_hash_seed))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(start),
+                                          lit_str("consistentHash requires hash_key and hash_seed; "
+                                                  "other policies forbid them"));
                 if (stmt.has_forward_timeout_failure_policy &&
                     (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy))
                     return frontend_error(

@@ -337,6 +337,8 @@ struct MirTerminator {
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
     ForwardLoadBalance forward_load_balance{};
+    MirValue* forward_hash_value = nullptr;
+    Str forward_hash_seed{};
     u16 forward_timeout_failure_policy_id = 0;
     u8 forward_response_read_timeout_seconds = 0;
     ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;
@@ -540,6 +542,7 @@ private:
         for (u32 i = 0; i < locals.len; i++) rebase_value(locals[i].init, other);
         for (u32 i = 0; i < blocks.len; i++) {
             rebase_value_ptr(other, blocks[i].term.forward_path_value);
+            rebase_value_ptr(other, blocks[i].term.forward_hash_value);
             rebase_value(blocks[i].term.cond, other);
             rebase_value(blocks[i].term.lhs, other);
             rebase_value(blocks[i].term.rhs, other);

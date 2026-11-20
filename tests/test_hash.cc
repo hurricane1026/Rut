@@ -1,4 +1,5 @@
 #include "../src/runtime/password_internal.h"
+#include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/password.h"
 #include "rut/runtime/password_request.h"
@@ -779,6 +780,78 @@ TEST(password_worker, completion_fd_restart_and_cancel_cleanup) {
         CHECK(fcntl(fd, F_GETFD) == -1);
         CHECK(errno == EBADF);
     }
+}
+
+TEST(hash, consistent_hash_vectors_and_validation) {
+    constexpr Str seed = lit_str("0123456789abcdef0123456789abcdef");
+    u8 digest[32];
+    REQUIRE(consistent_hash_digest(lit_str("tenant-42"), 1, seed, digest));
+    // Generated independently with Python hashlib/hmac (see wire test oracle).
+    const u8 expected[32] = {0xe9, 0x79, 0x1c, 0x2c, 0x5d, 0x8d, 0x6d, 0xed, 0x88, 0x8e, 0x7f,
+                             0x8f, 0xf9, 0x47, 0x9c, 0xc8, 0x7a, 0x5e, 0x30, 0xef, 0xba, 0xd5,
+                             0x51, 0x97, 0x52, 0x9c, 0x87, 0xb2, 0xfd, 0x30, 0x7b, 0x5d};
+    CHECK(__builtin_memcmp(digest, expected, 32) == 0);
+    CHECK_EQ(consistent_hash_cost(0), 274877906944ull);
+    CHECK_EQ(consistent_hash_cost(1), 274877906944ull);
+    CHECK_EQ(consistent_hash_cost(2), 270582939648ull);
+    CHECK_EQ(consistent_hash_cost(3), 268070544839ull);
+    CHECK_EQ(consistent_hash_cost(u64{1} << 63), 4294967296ull);
+    CHECK_EQ(consistent_hash_cost(~u64{0}), 1ull);
+    u8 bytes[16];
+    CHECK_FALSE(consistent_hash_seed(lit_str("00000000000000000000000000000000"), bytes));
+    CHECK_FALSE(consistent_hash_seed(lit_str("0123456789ABCDEF0123456789abcdef"), bytes));
+    CHECK_FALSE(consistent_hash_digest({}, 1, seed, digest));
+    char oversized[4097]{};
+    CHECK_FALSE(consistent_hash_digest({oversized, 4097}, 1, seed, digest));
+    REQUIRE(consistent_hash_digest({"a\0b", 3}, 1, seed, digest));
+    u8 other[32];
+    REQUIRE(consistent_hash_digest({"a\0c", 3}, 1, seed, other));
+    CHECK(__builtin_memcmp(digest, other, 32) != 0);
+}
+
+TEST(hash, consistent_hash_distribution_remapping_and_eligibility) {
+    sockaddr_in addresses[8]{};
+    u16 weights[8] = {1, 3, 1, 1, 1, 1, 1, 1};
+    for (u32 i = 0; i < 8; ++i) {
+        addresses[i].sin_family = AF_INET;
+        addresses[i].sin_addr.s_addr = htonl(0x7f000001);
+        addresses[i].sin_port = htons(static_cast<u16>(9000 + i));
+    }
+    u32 hits[2]{};
+    ForwardLoadBalance spec{};
+    spec.hash_status = 1;
+    constexpr Str seed = lit_str("0123456789abcdef0123456789abcdef");
+    for (u32 k = 0; k < 100000; ++k) {
+        const u8 key[] = {static_cast<u8>(k >> 24),
+                          static_cast<u8>(k >> 16),
+                          static_cast<u8>(k >> 8),
+                          static_cast<u8>(k)};
+        REQUIRE(consistent_hash_digest(
+            {reinterpret_cast<const char*>(key), 4}, 1, seed, spec.hash_digest));
+        const u32 old = select_consistent_hash(spec, addresses, weights, 2, 3);
+        REQUIRE(old < 2);
+        ++hits[old];
+        const u32 added = select_consistent_hash(spec, addresses, weights, 3, 7);
+        CHECK(added == old || added == 2);
+        const u32 removed = select_consistent_hash(spec, addresses, weights, 3, 3);
+        CHECK_EQ(removed, old);
+        const u16 increased[] = {2, 3};
+        const u32 changed = select_consistent_hash(spec, addresses, increased, 2, 3);
+        CHECK(changed == old || changed == 0);
+        const sockaddr_in reverse[] = {addresses[1], addresses[0]};
+        const u16 reversed[] = {3, 1};
+        CHECK_EQ(select_consistent_hash(spec, reverse, reversed, 2, 3), 1 - old);
+        CHECK_EQ(select_consistent_hash(spec, addresses, weights, 8, 128), 7u);
+    }
+    CHECK(hits[0] > 24000 && hits[0] < 26000);
+    CHECK(hits[1] > 74000 && hits[1] < 76000);
+    CHECK_EQ(select_consistent_hash(spec, addresses, weights, 8, 0), 8u);
+    weights[0] = 0;
+    CHECK_EQ(select_consistent_hash(spec, addresses, weights, 2, 1), 2u);
+    addresses[1] = addresses[0];
+    CHECK_EQ(select_consistent_hash(spec, addresses, weights, 2, 3), 2u);
+    spec.hash_status = 0;
+    CHECK_EQ(select_consistent_hash(spec, addresses, weights, 2, 3), 2u);
 }
 
 int main(int argc, char** argv) {

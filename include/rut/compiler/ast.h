@@ -325,6 +325,8 @@ struct AstStatement {
     u16 forward_failure_policy_id = 0;
     bool has_forward_failure_policy = false;
     ForwardLoadBalance forward_load_balance{};
+    AstExpr* forward_hash_key = nullptr;
+    AstExpr* forward_hash_seed = nullptr;
     u16 forward_timeout_failure_policy_id = 0;
     bool has_forward_timeout_failure_policy = false;
     u8 forward_response_read_timeout_seconds = 0;

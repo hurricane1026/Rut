@@ -5340,3 +5340,67 @@ TEST(load_balance, failed_http_attempt_releases_before_downstream_drain) {
     REQUIRE(detach_upstream_close_only(&loop, conn));
     CHECK_EQ(active, 0u);
 }
+
+TEST(load_balance, consistent_hash_grpc_rpc_affinity_ignores_active_counts_and_releases) {
+    struct PendingConnectLoop : EpollEventLoop {
+        bool submit_connect(Connection&, const void*, u32) { return true; }
+    } loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(cfg->add_upstream("grpc", 0x7f000001, 9001).has_value());
+    REQUIRE(cfg->upstreams[0].add_addr(0x7f000001, 9002));
+    cfg->upstreams[0].http2 = true;
+    cfg->upstreams[0].weights[0] = 3;
+    GrpcBackendHealthReset health_reset;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    down->request_config = cfg.get();
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    ForwardLoadBalance hash{1, LoadBalancePolicy::ConsistentHash};
+    hash.hash_status = 1;
+    REQUIRE(consistent_hash_digest(
+        lit_str("tenant"), 1, lit_str("0123456789abcdef0123456789abcdef"), hash.hash_digest));
+    const u32 selected = select_forward_backend(cfg.get(), 0, hash, 0, 2, 0, 0);
+    REQUIRE(selected < 2);
+    for (u16 i = 0; i < 4; ++i) {
+        const u32 sid = 2u * i + 1u;
+        REQUIRE(down->h2->open_stream(sid) != nullptr);
+        down->forward_load_balance = hash;
+        down->forward_load_balance.site = i + 1;
+        REQUIRE(grpc_start_impl(&loop, *down, sid, cfg.get(), 0, hs, 5, req, false));
+        auto* rpc = grpc_find(*down->h2, sid);
+        REQUIRE(rpc != nullptr);
+        REQUIRE(rpc->upstream != nullptr);
+        CHECK_EQ(rpc->upstream->upstream_backend_idx, selected);
+    }
+    CHECK_EQ(cfg->backend_selection[0].active[0][selected], 4u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1 - selected], 0u);
+    auto* first = grpc_find(*down->h2, 1);
+    REQUIRE(first != nullptr);
+    grpc_release_slot(&loop, *first);
+    CHECK_EQ(cfg->backend_selection[0].active[0][selected], 3u);
+    // Weight zero also rejects a new gRPC exchange, without touching live RPCs.
+    cfg->upstreams[0].weights[0] = 0;
+    cfg->upstreams[0].weights[1] = 0;
+    REQUIRE(down->h2->open_stream(9) != nullptr);
+    down->forward_load_balance = hash;
+    CHECK_FALSE(grpc_start_impl(&loop, *down, 9, cfg.get(), 0, hs, 5, req, false));
+    CHECK(grpc_find(*down->h2, 9) == nullptr);
+    CHECK_EQ(cfg->backend_selection[0].active[0][selected], 3u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1 - selected], 0u);
+    loop.force_close_all();
+    CHECK_EQ(cfg->backend_selection[0].active[0][0], 0u);
+    CHECK_EQ(cfg->backend_selection[0].active[0][1], 0u);
+    loop.shutdown();
+}
