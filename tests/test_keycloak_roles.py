@@ -53,7 +53,7 @@ def signed(claims, header=None):
 
 
 @contextmanager
-def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice'):
+def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -64,12 +64,20 @@ def gateway(args, directory, client='orders', realm='member', role='read', party
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
     source = root / 'auth.rut'
-    source.write_text(original.read_text().replace('listen :8080', f'listen :{port}'))
+    program = original.read_text()
+    if restricted:
+        program = program[:program.index('route GET "/realm"')] + \
+            'route GET "/restricted" {\n' + \
+            '    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
+            '    let access = keycloak.requireBearerAccessToken(document)\n' + \
+            '    let allowed = keycloak.requireRealmRoleWithout(access, env("KEYCLOAK_REALM_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
+            '    return 204\n}\n'
+    source.write_text(program.replace('listen :8080', f'listen :{port}'))
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
                   jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), KEYCLOAK_CLIENT=client,
                KEYCLOAK_REALM_ROLE=realm, KEYCLOAK_CLIENT_ROLE=role,
-               KEYCLOAK_AUTHORIZED_PARTY=party, KEYCLOAK_SUBJECT=subject)
+               KEYCLOAK_AUTHORIZED_PARTY=party, KEYCLOAK_SUBJECT=subject, KEYCLOAK_FORBIDDEN_ROLE=forbidden)
     log = root / 'gateway.log'
     with log.open('w') as output:
         process = subprocess.Popen([args.server, str(source), '--backend', args.backend,
@@ -223,6 +231,23 @@ def main():
             assert request(port, '/party', signed(dict(valid, azp='storefront')), 'h2') == 503
             assert request(port, '/either', signed(valid), 'HTTP/1.1') == 503
             checks += 2
+        with gateway(args, root, restricted=True) as port:
+            for version in ('HTTP/1.0', 'HTTP/1.1', 'h2'):
+                for claims, status in ((valid, 204),
+                                       (dict(valid, realm_access=dict(roles=['member', 'suspended'])), 403),
+                                       (dict(valid, realm_access=dict(roles=['suspended', 'member'])), 403),
+                                       (dict(valid, realm_access=dict(roles=['member', 'suspended-extra'])), 204),
+                                       (dict(valid, realm_access=dict(roles=['member', 7])), 403),
+                                       (dict(valid, realm_access=dict(roles=['other'])), 403),
+                                       (dict(valid, iss='other'), 401),
+                                       (dict(valid, aud='other'), 401),
+                                       (dict(valid, typ='Refresh'), 401)):
+                    assert request(port, '/restricted', signed(claims), version) == status, (claims, version)
+                    checks += 1
+        for forbidden in ('', 'x' * 129, 'member'):
+            with gateway(args, root, forbidden=forbidden, restricted=True) as port:
+                assert request(port, '/restricted', signed(valid), 'h2') == 503
+                checks += 1
         for subject in ('', 'x' * 129):
             with gateway(args, root, subject=subject) as port:
                 assert request(port, '/subject', signed(valid), 'h2') == 503
