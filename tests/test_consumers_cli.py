@@ -156,6 +156,19 @@ def test_deployment_policy(tool, root):
     check({methods: 4}, consumers=[disabled], records=[], ok=True)
     for invalid in (0, -1, 1.5, True, '1', 5, 9223372036854775808):
         check({methods: invalid}, rule=methods)
+    reachable = 'requiredReachableGroupPerEnabledConsumer'
+    check({reachable: 'operators'}, now=100, ok=True)
+    check({reachable: 'operators'}, now=99, rule=reachable)
+    check({reachable: 'operators'}, now=200, rule=reachable)
+    check({reachable: 'operators'}, records=[dict(key, groups=[])], rule=reachable)
+    check({reachable: 'operators'}, records=[inheriting], ok=True)
+    check({reachable: 'operators'}, records=[dict(key, enabled=False)], rule=reachable)
+    check({reachable: 'operators'}, consumers=[alice, enabled_owner], rule=reachable)
+    check({reachable: 'operators'}, consumers=[disabled], records=[], ok=True)
+    check({reachable: 'x' * 128}, consumers=[dict(alice, groups=['x' * 128])],
+          records=[dict(inheriting)], ok=True)
+    for invalid in ('', 'x' * 129, 'bad group', True, ['operators']):
+        check({reachable: invalid}, rule=reachable)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
            'minimumActiveCredentials': 1, capacity: 2}, ok=True)
     check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
