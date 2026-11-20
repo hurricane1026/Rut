@@ -5597,3 +5597,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "integration;network;admission" TIMEOUT 75 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(bodyless_backend epoll io_uring)
+        add_test(NAME test_upstream_order_bodyless_${bodyless_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_upstream_order_bodyless.py
+                --server $<TARGET_FILE:rut> --backend ${bodyless_backend})
+        set_tests_properties(test_upstream_order_bodyless_${bodyless_backend} PROPERTIES
+            LABELS "integration;network;response-policy" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

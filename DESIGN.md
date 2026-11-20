@@ -2578,8 +2578,9 @@ response-side counterpart: a fixed, closed byte-for-byte serialization of the
 upstream response instead of the transparent zero-copy default. Admission is
 bounded to a cleartext HTTP/1.1, origin-form, bodyless non-HEAD request and
 one final upstream HTTP/1.1 response framed by exactly one `Content-Length`
-(chunking, trailers, close-delimited framing, and 1xx/204/304/no-body
-responses all fail closed), with two explicit, narrowly bounded exceptions:
+(chunking, trailers, close-delimited framing, and 1xx/no-body responses
+fail closed except for 204 and 304 in the upstream-order profile described
+below), with two further narrowly bounded exceptions:
 a HEAD request is admitted only when both `response_policy` and any paired
 `failure_policy` select `head_mode: .suppressBody` (headers only, upstream's
 declared `Content-Length` kept but no body emitted; see
@@ -2617,8 +2618,8 @@ the downstream connection is closing, and always substitutes the canonical
 reason phrase for the status code -- including when the upstream sent an
 empty reason phrase, since it is never forwarded. `hide_headers` cannot
 suppress `Content-Length`: it is the sole framing field this profile admits
-(exactly one, required by the preconditions above), so a hide-list entry
-naming it is not honored, mirroring how the fixed-order profile never routes
+(exactly one for ordinary responses; forbidden for 204 and optional as 304
+representation metadata), so a hide-list entry naming it is not honored, mirroring how the fixed-order profile never routes
 `Content-Length` through its own hide check either. A response carrying
 `Transfer-Encoding` is rejected outright regardless of its value (not merely
 stripped): Envoy treats any Transfer-Encoding value other than exactly
@@ -2626,6 +2627,13 @@ stripped): Envoy treats any Transfer-Encoding value other than exactly
 (`ConnectionImpl::onHeadersCompleteImpl`, `source/common/http/http1/codec_impl.cc`),
 and forwarding the coded bytes as an ordinary fixed-length body would
 silently corrupt them.
+
+Bodyless 204 and 304 responses use this upstream-order layout. A 204 must
+have no Content-Length or Transfer-Encoding; a 304 may carry one valid
+Content-Length as representation metadata but no Transfer-Encoding. Neither
+forwards body bytes. The origin connection is retired before publishing these
+headers, while the downstream connection may remain persistent. Status 205
+remains unsupported in this profile.
 
 `header_order: .upstream`'s five governing fields (`header_order`,
 `header_names`, `connection_header`, `status_reason`, `date`) are required
