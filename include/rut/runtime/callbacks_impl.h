@@ -4510,6 +4510,7 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::EventYield: {
+            const auto contract = jit::yield_contract(outcome.yield_kind, outcome.timer_ms);
             conn.pending_handler_fn = fn;
             conn.handler_state = outcome.next_state;
             conn.pending_yield_kind = outcome.yield_kind;
@@ -4554,7 +4555,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
             }
-            if (outcome.yield_kind == jit::YieldKind::Send) {
+            if (contract.primary == jit::YieldArm::DownstreamSend) {
                 if (conn.send_buf.len() == 0) {
                     // Zero bytes complete without a syscall, but wait remains
                     // an event-loop boundary rather than recursive execution.
@@ -4591,7 +4592,7 @@ void handle_jit_outcome(Loop* loop,
                     loop->backend.pause_recv(conn.id);
                 }
                 return;
-            } else if (outcome.yield_kind == jit::YieldKind::UpstreamConnect &&
+            } else if (contract.primary == jit::YieldArm::UpstreamConnect &&
                        outcome.timer_ms != 0) {
                 const RouteConfig* config = conn.request_config;
                 const u32 upstream_id = outcome.timer_ms - 1;
@@ -4646,7 +4647,7 @@ void handle_jit_outcome(Loop* loop,
                     send_bad_gateway();
                     return;
                 }
-            } else if (outcome.yield_kind == jit::YieldKind::UpstreamSend) {
+            } else if (contract.primary == jit::YieldArm::UpstreamSend) {
                 if (upstream_target_matches()) {
                     if (!loop->submit_send_upstream(
                             conn, conn.recv_buf.data(), conn.recv_buf.len())) {
@@ -4657,7 +4658,7 @@ void handle_jit_outcome(Loop* loop,
                     send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
                 }
-            } else if (outcome.yield_kind == jit::YieldKind::UpstreamRecv) {
+            } else if (contract.primary == jit::YieldArm::UpstreamRecv) {
                 if (upstream_target_matches()) {
                     if (!loop->submit_recv_upstream(conn)) {
                         send_bad_gateway();
@@ -4668,8 +4669,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
             }
-            const bool waits_downstream_recv = outcome.yield_kind == jit::YieldKind::Any ||
-                                               outcome.yield_kind == jit::YieldKind::Recv;
+            const bool waits_downstream_recv = contract.primary == jit::YieldArm::DownstreamRecv;
             if (!waits_downstream_recv) {
                 if constexpr (requires(Loop* lp, u32 conn_id) {
                                   lp->backend.pause_recv(conn_id);
@@ -4677,7 +4677,7 @@ void handle_jit_outcome(Loop* loop,
                     loop->backend.pause_recv(conn.id);
                 }
             }
-            if (outcome.yield_kind == jit::YieldKind::Any && outcome.timer_ms != 0 &&
+            if (contract.secondary == jit::YieldArm::Timer &&
                 !loop->schedule_yield_timer(conn, outcome.timer_ms)) {
                 loop->timer.refresh(&conn, loop->keepalive_timeout);
                 send_internal_error();
@@ -4690,14 +4690,10 @@ void handle_jit_outcome(Loop* loop,
                     conn.yield_armed = false;
                 }
             };
-            if ((outcome.yield_kind == jit::YieldKind::Any ||
-                 outcome.yield_kind == jit::YieldKind::Recv) &&
-                conn.recv_pause_cancel_pending) {
+            if (waits_downstream_recv && conn.recv_pause_cancel_pending) {
                 conn.recv_pause_rearm_pending = true;
             }
-            if ((outcome.yield_kind == jit::YieldKind::Any ||
-                 outcome.yield_kind == jit::YieldKind::Recv) &&
-                conn.fd >= 0 && !conn.recv_armed) {
+            if (waits_downstream_recv && conn.fd >= 0 && !conn.recv_armed) {
                 if (!loop->submit_recv(conn)) {
                     if (conn.yield_armed) {
                         disarm_yield_timer();
@@ -4718,10 +4714,7 @@ void handle_jit_outcome(Loop* loop,
             // case). Gated to the io_uring loop via the pause_recv(conn)
             // member; epoll deliberately masks EPOLLIN for these waits above.
             if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
-                const bool kWaitsUpstream = outcome.yield_kind == jit::YieldKind::UpstreamConnect ||
-                                            outcome.yield_kind == jit::YieldKind::UpstreamRecv ||
-                                            outcome.yield_kind == jit::YieldKind::UpstreamSend;
-                if (kWaitsUpstream && conn.fd >= 0 && !conn.recv_paused_for_send) {
+                if (contract.requires_target() && conn.fd >= 0 && !conn.recv_paused_for_send) {
                     // Best-effort: under SQ pressure the upstream op or
                     // keepalive still bounds the wait, so a missed FIN detector
                     // must not fail the in-flight upstream request.

@@ -6,6 +6,35 @@
 namespace rut::rir {
 namespace {
 
+// Cross-check the packed ABI contract against the RIR wait-arm encoding,
+// including reserved bytes and both payload classes (zero/nonzero).
+static_assert(
+    [] {
+        for (u32 byte = 0; byte < 256; ++byte) {
+            for (u32 payload = 0; payload <= 1; ++payload) {
+                const auto kind = static_cast<u8>(byte);
+                const auto contract =
+                    jit::yield_contract(static_cast<jit::YieldKind>(kind), payload);
+                const auto primary = verify_runtime_pending_op_arm_mask(contract.primary);
+                const auto secondary = verify_runtime_pending_op_arm_mask(contract.secondary);
+                if ((contract.primary == jit::YieldArm::None) != (primary == 0) ||
+                    (contract.secondary == jit::YieldArm::None) != (secondary == 0))
+                    return false;
+                if (contract.secondary != jit::YieldArm::None &&
+                    (contract.secondary != jit::YieldArm::Timer || primary == 0))
+                    return false;
+                if ((contract.primary == jit::YieldArm::None) !=
+                    (verify_callback_for_arm(contract.primary) == VerifyRuntimeCallbackSlot::None))
+                    return false;
+                if ((primary & secondary) != 0 ||
+                    (primary | secondary) != verify_yield_default_arm_mask(kind, payload))
+                    return false;
+            }
+        }
+        return true;
+    }(),
+    "Yield contract disagrees with RIR wait arms");
+
 VerifyIssueCode issue_code(verify::Issue issue) {
     switch (issue) {
         case verify::Issue::Livelock:

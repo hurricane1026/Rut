@@ -1324,6 +1324,15 @@ TEST(RirVerifier, HandlerAutomatonSummarizesTimedAnyAsTimerAndRecv) {
     CHECK_EQ(runtime_check.runtime_state_count, 2u);
     CHECK_EQ(runtime_check.runtime_transition_count, 5u);
 
+    // Swapping the callbacks preserves both masks but sends each completion
+    // to the wrong owner.
+    auto& runtime = automaton.nodes[entry.id].runtime;
+    runtime.callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
+    runtime.secondary_callback_slot = VerifyRuntimeCallbackSlot::DownstreamRecv;
+    runtime_check = verify_handler_runtime_states(automaton);
+    CHECK_FALSE(runtime_check.ok);
+    CHECK(runtime_check.issue.code == VerifyHandlerCheckIssueCode::CallbackSlotMismatch);
+
     ctx.destroy();
 }
 

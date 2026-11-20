@@ -9,6 +9,7 @@
 #include "rut/compiler/rir.h"
 #include "rut/compiler/rir_printer.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/jit/yield_contract.h"
 #include "rut/runtime/route_method.h"
 
 namespace rut {
@@ -315,21 +316,7 @@ inline VerifyResult verify_fail(VerifySummary summary,
 }
 
 inline bool verify_valid_yield_kind(u8 kind) {
-    switch (static_cast<jit::YieldKind>(kind)) {
-        case jit::YieldKind::Timer:
-        case jit::YieldKind::Any:
-        case jit::YieldKind::Recv:
-        case jit::YieldKind::Send:
-        case jit::YieldKind::UpstreamConnect:
-        case jit::YieldKind::UpstreamRecv:
-        case jit::YieldKind::UpstreamSend:
-            return true;
-        case jit::YieldKind::HttpGet:
-        case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
-            return false;
-    }
-    return false;
+    return jit::yield_contract(static_cast<jit::YieldKind>(kind), 0).primary != jit::YieldArm::None;
 }
 
 enum class VerifyYieldRuntimeClass : u8 {
@@ -338,15 +325,7 @@ enum class VerifyYieldRuntimeClass : u8 {
     Unsupported,
 };
 
-enum class VerifyRuntimePendingOp : u8 {
-    None,
-    Timer,
-    DownstreamRecv,
-    DownstreamSend,
-    UpstreamConnect,
-    UpstreamRecv,
-    UpstreamSend,
-};
+using VerifyRuntimePendingOp = jit::YieldArm;
 
 enum class VerifyRuntimeCallbackSlot : u8 {
     None,
@@ -384,103 +363,55 @@ struct VerifyRuntimeProtocolCheck {
     u8 fail_closed_transition_count = 0;
 };
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+constexpr VerifyRuntimeCallbackSlot verify_callback_for_arm(jit::YieldArm op) {
+    using enum VerifyRuntimeCallbackSlot;
+    switch (op) {
+        case jit::YieldArm::None:
+            return None;
+        case jit::YieldArm::Timer:
+            return HandlerTimer;
+        case jit::YieldArm::DownstreamRecv:
+            return DownstreamRecv;
+        case jit::YieldArm::DownstreamSend:
+            return DownstreamSend;
+        case jit::YieldArm::UpstreamRecv:
+            return UpstreamRecv;
+        case jit::YieldArm::UpstreamConnect:
+        case jit::YieldArm::UpstreamSend:
+            return UpstreamSend;
+    }
+    return None;
+}
+#pragma GCC diagnostic pop
+
 struct VerifyRuntimeProtocolModel {
-    static VerifyRuntimeProtocolCheck check_yield(u8 kind, u32 payload) {
+    static constexpr VerifyRuntimeProtocolCheck check_yield(u8 kind, u32 payload) {
         VerifyRuntimeProtocolCheck check{};
-        switch (static_cast<jit::YieldKind>(kind)) {
-            case jit::YieldKind::Timer:
-                check.ok = true;
-                check.pending_op = VerifyRuntimePendingOp::Timer;
-                check.callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
-                check.submit_transition = true;
-                check.completion_transition = true;
-                check.fail_closed_transition = true;
-                check.submit_transition_count = 1;
-                check.completion_transition_count = 1;
-                check.fail_closed_transition_count = 1;
-                return check;
-            case jit::YieldKind::Any:
-            case jit::YieldKind::Recv:
-            case jit::YieldKind::Send:
-                check.ok = true;
-                check.pending_op = VerifyRuntimePendingOp::DownstreamRecv;
-                check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamRecv;
-                check.submit_transition = true;
-                check.completion_transition = true;
-                check.fail_closed_transition = true;
-                check.submit_transition_count = 1;
-                check.completion_transition_count = 1;
-                check.fail_closed_transition_count = 1;
-                if (static_cast<jit::YieldKind>(kind) == jit::YieldKind::Any && payload != 0) {
-                    check.secondary_pending_op = VerifyRuntimePendingOp::Timer;
-                    check.secondary_callback_slot = VerifyRuntimeCallbackSlot::HandlerTimer;
-                    check.submit_transition_count = 2;
-                    check.completion_transition_count = 2;
-                    check.fail_closed_transition_count = 2;
-                }
-                if (static_cast<jit::YieldKind>(kind) == jit::YieldKind::Send) {
-                    check.pending_op = VerifyRuntimePendingOp::DownstreamSend;
-                    check.callback_slot = VerifyRuntimeCallbackSlot::DownstreamSend;
-                    return check;
-                }
-                return check;
-            case jit::YieldKind::UpstreamConnect:
-                check.pending_op = VerifyRuntimePendingOp::UpstreamConnect;
-                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamSend;
-                if (payload == 0) {
-                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
-                    return check;
-                }
-                check.ok = true;
-                check.submit_transition = true;
-                check.completion_transition = true;
-                check.fail_closed_transition = true;
-                check.submit_transition_count = 1;
-                check.completion_transition_count = 1;
-                check.fail_closed_transition_count = 1;
-                return check;
-            case jit::YieldKind::UpstreamRecv:
-                check.pending_op = VerifyRuntimePendingOp::UpstreamRecv;
-                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamRecv;
-                if (payload == 0) {
-                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
-                    return check;
-                }
-                check.ok = true;
-                check.submit_transition = true;
-                check.completion_transition = true;
-                check.fail_closed_transition = true;
-                check.submit_transition_count = 1;
-                check.completion_transition_count = 1;
-                check.fail_closed_transition_count = 1;
-                return check;
-            case jit::YieldKind::UpstreamSend:
-                check.pending_op = VerifyRuntimePendingOp::UpstreamSend;
-                check.callback_slot = VerifyRuntimeCallbackSlot::UpstreamSend;
-                if (payload == 0) {
-                    check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
-                    return check;
-                }
-                check.ok = true;
-                check.submit_transition = true;
-                check.completion_transition = true;
-                check.fail_closed_transition = true;
-                check.submit_transition_count = 1;
-                check.completion_transition_count = 1;
-                check.fail_closed_transition_count = 1;
-                return check;
-            case jit::YieldKind::HttpGet:
-            case jit::YieldKind::HttpPost:
-            case jit::YieldKind::Forward:
-                check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
-                return check;
+        const auto contract = jit::yield_contract(static_cast<jit::YieldKind>(kind), payload);
+        check.pending_op = contract.primary;
+        check.callback_slot = verify_callback_for_arm(contract.primary);
+        if (contract.primary == jit::YieldArm::None) {
+            check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
+            return check;
         }
-        check.reason = VerifyRuntimeProtocolReason::UnsupportedEventYield;
+        if (contract.requires_target() && payload == 0) {
+            check.reason = VerifyRuntimeProtocolReason::MissingUpstreamTarget;
+            return check;
+        }
+        check.ok = true;
+        check.secondary_pending_op = contract.secondary;
+        check.secondary_callback_slot = verify_callback_for_arm(contract.secondary);
+        check.submit_transition = check.completion_transition = check.fail_closed_transition = true;
+        const u8 arms = contract.secondary == jit::YieldArm::None ? 1 : 2;
+        check.submit_transition_count = check.completion_transition_count =
+            check.fail_closed_transition_count = arms;
         return check;
     }
 };
 
-inline u8 verify_yield_default_arm_mask(u8 kind, u32 payload) {
+constexpr u8 verify_yield_default_arm_mask(u8 kind, u32 payload) {
     switch (static_cast<jit::YieldKind>(kind)) {
         case jit::YieldKind::Timer:
             return 1u << 0;
@@ -504,7 +435,7 @@ inline u8 verify_yield_default_arm_mask(u8 kind, u32 payload) {
     return 0;
 }
 
-inline u8 verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp op) {
+constexpr u8 verify_runtime_pending_op_arm_mask(VerifyRuntimePendingOp op) {
     switch (op) {
         case VerifyRuntimePendingOp::None:
             return 0;
@@ -626,22 +557,10 @@ struct VerifyHandlerCheckResult {
 };
 
 inline VerifyYieldRuntimeClass verify_yield_runtime_class(u8 kind) {
-    switch (static_cast<jit::YieldKind>(kind)) {
-        case jit::YieldKind::Timer:
-            return VerifyYieldRuntimeClass::Timer;
-        case jit::YieldKind::Any:
-        case jit::YieldKind::Recv:
-        case jit::YieldKind::Send:
-        case jit::YieldKind::UpstreamConnect:
-        case jit::YieldKind::UpstreamRecv:
-        case jit::YieldKind::UpstreamSend:
-            return VerifyYieldRuntimeClass::Event;
-        case jit::YieldKind::HttpGet:
-        case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
-            return VerifyYieldRuntimeClass::Unsupported;
-    }
-    return VerifyYieldRuntimeClass::Unsupported;
+    const auto arm = jit::yield_contract(static_cast<jit::YieldKind>(kind), 0).primary;
+    if (arm == jit::YieldArm::None) return VerifyYieldRuntimeClass::Unsupported;
+    return arm == jit::YieldArm::Timer ? VerifyYieldRuntimeClass::Timer
+                                       : VerifyYieldRuntimeClass::Event;
 }
 
 inline bool verify_valid_yield_runtime_protocol(u8 kind, u32 payload) {
@@ -920,7 +839,10 @@ inline VerifyHandlerCheckResult verify_handler_runtime_states(
         const u8 pending_arm_mask =
             static_cast<u8>(verify_runtime_pending_op_arm_mask(node.runtime.pending_op) |
                             verify_runtime_pending_op_arm_mask(node.runtime.secondary_pending_op));
-        if (callback_mask == 0 || pending_arm_mask == 0) {
+        if (callback_mask == 0 || pending_arm_mask == 0 ||
+            node.runtime.callback_slot != verify_callback_for_arm(node.runtime.pending_op) ||
+            node.runtime.secondary_callback_slot !=
+                verify_callback_for_arm(node.runtime.secondary_pending_op)) {
             result.ok = false;
             result.issue.code = VerifyHandlerCheckIssueCode::CallbackSlotMismatch;
             result.issue.node_index = ni;

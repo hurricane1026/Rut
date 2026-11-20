@@ -1,3 +1,5 @@
+#include "rut/compiler/ast.h"
+#include "rut/compiler/verifier.h"
 #include "test_helpers.h"
 #include <memory>
 
@@ -72,6 +74,37 @@ struct Owners {
     }
 };
 }  // namespace
+
+TEST(wait_scheduler, receive_wait_trace_matches_rir_arms) {
+    for (auto kind : {jit::YieldKind::Recv, jit::YieldKind::Any}) {
+        for (u32 payload : {0u, 25u}) {
+            SmallLoop loop;
+            loop.setup();
+            loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+            auto* conn = loop.find_fd(42);
+            REQUIRE(conn != nullptr);
+
+            JitDispatchOutcome out{};
+            out.kind = JitDispatchOutcome::Kind::EventYield;
+            out.next_state = 1;
+            out.yield_kind = kind;
+            out.timer_ms = payload;
+            loop.backend.clear_ops();
+            real_response_calls = 0;
+            handle_jit_outcome(&loop, *conn, out, &terminal_status, true);
+            const u8 arms = rir::verify_yield_default_arm_mask(static_cast<u8>(kind), payload);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Recv), (arms & kWaitEventArmRecv) ? 1u : 0u);
+            CHECK_EQ(loop.last_yield_ms, (arms & kWaitEventArmTimer) ? payload : 0u);
+
+            loop.dispatch(make_ev(conn->id, IoEventType::Send, 1));
+            CHECK_EQ(real_response_calls, 0u);
+            loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, 12));
+            CHECK_EQ(real_response_calls, 1u);
+            CHECK_EQ(conn->pending_handler_fn, nullptr);
+            CHECK_EQ(conn->resp_status, 204);
+        }
+    }
+}
 
 TEST(wait_scheduler, batch_limit_and_fifo_at_64_65_and_129_owners) {
     for (u32 count : {64u, 65u, 129u}) {

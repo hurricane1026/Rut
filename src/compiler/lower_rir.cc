@@ -45,6 +45,8 @@ static bool complete_content_length_request_policy_is_admitted_for_term(u8 route
                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
 static u8 yield_kind_abi(WaitEventKind kind) {
     switch (kind) {
         case WaitEventKind::Timer:
@@ -64,6 +66,8 @@ static u8 yield_kind_abi(WaitEventKind kind) {
     }
     return static_cast<u8>(jit::YieldKind::Timer);
 }
+
+#pragma GCC diagnostic pop
 
 static constexpr u32 wait_kind_slot(u32 wait_index) {
     return wait_index * 2;
