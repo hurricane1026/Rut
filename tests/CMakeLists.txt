@@ -4357,6 +4357,16 @@ if(RUT_ENABLE_JIT)
                         LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            foreach(cutoff_backend epoll io_uring)
+                foreach(cutoff_opt 0 2)
+                    add_test(NAME test_jwt_session_cutoff_${cutoff_backend}_O${cutoff_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_session_cutoff.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-cutoff-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${cutoff_backend} --opt ${cutoff_opt})
+                    set_tests_properties(test_jwt_session_cutoff_${cutoff_backend}_O${cutoff_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(session_durable_backend epoll io_uring)
                 foreach(session_durable_opt 0 2)
                     add_test(NAME test_jwt_session_durable_${session_durable_backend}_opt${session_durable_opt}
