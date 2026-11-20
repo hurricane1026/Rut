@@ -319,6 +319,9 @@ verification. The live durable-session test checks that a surviving old permit
 is ignored while a new session can be issued, used and revoked in the new
 namespace.
 
+See the [separate refresh-family profile](refresh-family.md) for atomic
+refresh credential rotation and reuse revocation with a fixed family expiry.
+
 ## Validation scope
 
 The JIT test uses the example's real typed mapper to cover every
