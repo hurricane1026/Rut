@@ -207,6 +207,7 @@ enum class Opcode : u8 {
     ReqUniqueHeader,
     ReqHeader,               // %r = req.header "Name"        → Optional(str)
     ReqParam,                // %r = req.param "id"           → str
+    ReqUniqueQuery,
     ReqQuery,                // %r = req.query "name"         → Optional(str)
     ReqQueryString,          // %r = req.queryString          → Optional(str)
     ReqRoutingString,        // selector: normalizedPath/normalizedTarget/SNI -> Optional(str)

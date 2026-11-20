@@ -592,6 +592,7 @@ req.params.postId       // string (from :postId)
 req.queryString         // string? — raw query string: "page=1&limit=20"
 req.query("page")       // string? — first value of the parameter
 req.queryAll("tags")    // Collected<str>? — raw values in order, at most 64
+req.uniqueQuery("tags") // str? (only when exactly one raw, case-sensitive name occurs; no decoding)
 
 // Body
 req.body(User)          // parse body as User struct, error-capable

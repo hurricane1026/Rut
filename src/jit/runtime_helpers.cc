@@ -1037,6 +1037,28 @@ void rut_helper_req_query(const u8* req_data,
     *out_len = value.len;
 }
 
+void rut_helper_req_unique_query(const u8* req_data,
+                                 u32 req_len,
+                                 const char* name,
+                                 u32 name_len,
+                                 u8* out_has_value,
+                                 const char** out_ptr,
+                                 u32* out_len) {
+    *out_has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    if (!name || !name_len) return;
+    QueryScan scan{};
+    Str value{}, duplicate{};
+    if (!query_scan_init(req_data, req_len, &scan) ||
+        !query_scan_next(&scan, name, name_len, &value) ||
+        query_scan_next(&scan, name, name_len, &duplicate))
+        return;
+    *out_has_value = 1;
+    *out_ptr = value.ptr;
+    *out_len = value.len;
+}
+
 void* rut_helper_req_query_all(
     void* conn, void* arena, const u8* req_data, u32 req_len, const char* name, u32 name_len) {
     if (!name || !name_len) return nullptr;

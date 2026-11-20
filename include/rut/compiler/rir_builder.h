@@ -656,6 +656,14 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_req_unique_query(Str name, SourceLoc loc = {}) {
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::ReqUniqueQuery, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
     Result<ValueId> emit_req_query_string(SourceLoc loc = {}) {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));

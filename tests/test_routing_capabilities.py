@@ -190,6 +190,15 @@ route GET "/metadata" {
     let name = req.sni.or("none")
     return response(200, body: name)
 }
+route GET "/unique-query" {
+    guard req.uniqueQuery("tag").or("missing") == "a%2Fb" else { return 400 }
+    guard req.uniqueQuery("empty").or("missing") == "" else { return 401 }
+    guard req.uniqueQuery("bare").or("missing") == "" else { return 402 }
+    guard req.uniqueQuery("dup").or("missing") == "missing" else { return 403 }
+    guard req.uniqueQuery("absent").or("missing") == "missing" else { return 404 }
+    guard req.uniqueQuery("Tag").or("missing") == "x" else { return 405 }
+    return 204
+}
 route GET "/query-all" {
     guard let values = req.queryAll("tags") else { return 500 }
     guard let missing = req.queryAll("missing") else { return 500 }
@@ -340,6 +349,18 @@ route "/" {
                     finally:
                         probe.close()
                 assert result == (200, b'ordered'), ('queryAll occurrences', result)
+                target = '/unique-query?tag=a%2Fb&Tag=x&empty=&bare&dup=1&dup=2&%74ag=z'
+                if args.h2:
+                    result = h2_request(port, target, [], tls_context=context)
+                else:
+                    probe = connection(port)
+                    try:
+                        probe.request('GET', target)
+                        reply = probe.getresponse()
+                        result = (reply.status, reply.read())
+                    finally:
+                        probe.close()
+                assert result == (204, b''), ('uniqueQuery', result)
                 normalized = [('/api/../admin?q=%2f', b'/admin?q=%2f|'),
                               ('/api/%75sers', b'/api/users|'), ('/api//users', b'/api/users|')]
                 for path, expected in normalized:

@@ -1643,6 +1643,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, opt);
             break;
         }
+        case rir::Opcode::ReqUniqueQuery:
         case rir::Opcode::ReqQuery: {
             Str name = inst.imm.str_val;
             LLVMValueRef name_ptr = c.make_global_str(name, "query.name");
@@ -1652,12 +1653,15 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "query.len");
             LLVMValueRef args[] = {
                 c.param_req_data, c.param_req_len, name_ptr, name_len, out_has, out_ptr, out_len};
-            LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_query()),
-                           c.get_req_query(),
-                           args,
-                           7,
-                           "");
+            LLVMValueRef query_fn = c.get_req_query();
+            if (inst.op == rir::Opcode::ReqUniqueQuery) {
+                query_fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_unique_query");
+                if (!query_fn)
+                    query_fn = LLVMAddFunction(c.llvm_mod,
+                                               "rut_helper_req_unique_query",
+                                               LLVMGlobalGetValueType(c.get_req_query()));
+            }
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(query_fn), query_fn, args, 7, "");
             LLVMValueRef h = LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "query.h");
             LLVMValueRef p = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "query.p");
             LLVMValueRef l = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "query.l");
@@ -3786,6 +3790,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
                 case rir::Opcode::ReqHeaderCount:
                 case rir::Opcode::ReqUniqueHeader:
                 case rir::Opcode::ReqHeader:
+                case rir::Opcode::ReqUniqueQuery:
                 case rir::Opcode::ReqQuery:
                 case rir::Opcode::ReqQueryString:
                 case rir::Opcode::ReqMethod:
