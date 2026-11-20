@@ -1,0 +1,15 @@
+import Crypto
+
+// Trusted lowercase certificate SHA-256 pins; an empty slot is disabled.
+// Call before Consumer approval, using only the verified TLS connection.
+func require(_ first: str, _ second: str) -> bool {
+    guard (first != "" || second != "") &&
+        (first == "" || Crypto.sha256HexValid(first)) &&
+        (second == "" || Crypto.sha256HexValid(second)) &&
+        (first == "" || second == "" || first != second) else { respond 503 }
+    guard let presented = req.tlsClientCertSha256 else { respond 403 }
+    let firstMatches = Crypto.equal(presented, first)
+    let secondMatches = Crypto.equal(presented, second)
+    guard !firstMatches && !secondMatches else { respond 403 }
+    true
+}
