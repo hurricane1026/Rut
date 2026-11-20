@@ -729,6 +729,7 @@ enum class RegistryAction : u8 {
     InspectConsumer,
     InspectCredential,
     RemoveConsumer,
+    RemoveConsumerWithCredentials,
 };
 
 struct RegistryCommand {
@@ -741,6 +742,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"inspect-consumer", 4, RegistryAction::InspectConsumer},
     {"inspect-credential", 4, RegistryAction::InspectCredential},
     {"remove-consumer", 5, RegistryAction::RemoveConsumer},
+    {"remove-consumer-with-credentials", 5, RegistryAction::RemoveConsumerWithCredentials},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -760,7 +762,8 @@ int registry_command(RegistryAction action, int argc, char** args) {
     const u32 kConsumers = field(doc, 0, lit_str("consumers"));
     const u32 kCredentials = field(doc, 0, lit_str("credentials"));
     const bool kInspectConsumer = action == RegistryAction::InspectConsumer;
-    const bool kRemoveConsumer = action == RegistryAction::RemoveConsumer;
+    const bool kCascade = action == RegistryAction::RemoveConsumerWithCredentials;
+    const bool kRemoveConsumer = action == RegistryAction::RemoveConsumer || kCascade;
     const bool kConsumer = kInspectConsumer || kRemoveConsumer;
     const u32 kTarget = provision_id_valid(id)
                             ? record_by_id(doc, kConsumer ? kConsumers : kCredentials, id)
@@ -785,6 +788,7 @@ int registry_command(RegistryAction action, int argc, char** args) {
     bool first = true;
     for (u32 record = doc.nodes[kCredentials].child; record != json::kNone;
          record = doc.nodes[record].next) {
+        if (kCascade && field_equals(doc, field(doc, record, lit_str("consumerId")), id)) continue;
         if (!first) output.put(',');
         first = false;
         if (!doc.write(record, output)) return failure("cannot encode credential record\n");
@@ -878,6 +882,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
     "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
+    "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
