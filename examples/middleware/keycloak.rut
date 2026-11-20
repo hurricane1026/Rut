@@ -116,3 +116,9 @@ func requireClientRoleWithout(_ document: Json, _ client: str, _ allowed: str, _
     guard clientRolesMatch(document, client, allowed, forbidden, true) else { respond 403 }
     document
 }
+
+func requireAllClientRoles(_ document: Json, _ client: str, _ first: str, _ second: str) -> Json {
+    guard clientValid(client) && roleValid(first) && roleValid(second) && first != second else { respond 503 }
+    guard clientRolesMatch(document, client, first, second, false) else { respond 403 }
+    document
+}
