@@ -1756,3 +1756,12 @@ client identity. Session resumption remains disabled. Local fixtures cover both
 backends, TLS1.2/1.3, HTTP1/2, malformed input, revocation and snapshot/keep-alive
 boundaries. See [the exact contract](mtls-client-crl.md). Online refresh, OCSP,
 intermediate revocation and cancellation of established connections remain open.
+
+### Optional upstream grant lifetime ceiling
+
+`oauth_grant_lifetime.documentWithMaxLifetime(document, seconds)` rejects a
+nonpositive configured ceiling and missing, malformed, nonpositive or greater
+than ceiling `expires_in`. Apply it only to a document from a verified HTTPS
+token response, along with the usual token and scope validation before forwarding.
+The bound is an inclusive number of seconds, limited to positive i32 values.
+Existing grant helpers remain unchanged; no token caching or clock is involved.
