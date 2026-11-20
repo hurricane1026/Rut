@@ -1147,12 +1147,11 @@ const char* status_reason(u16 code);
 // (source/common/http/codes.cc, Envoy v1.39.1), independent of the much
 // narrower `status_reason` table above used by the legacy local-response
 // formatters. Covers every status the `header_order: .upstream` admission
-// in `build_upstream_order_response_headers` accepts (200..599 minus the
-// no-body exclusions 204/205/304): every code Envoy names gets its exact
-// phrase, and any admitted-but-unnamed code (e.g. 299) gets "Unknown" --
-// mirroring `CodeUtility::toString`'s own fallthrough for an unmatched
-// `Code` value -- rather than being rejected. Only fails (returns false)
-// when `out` is null; every `u16` code otherwise gets a phrase.
+// in `build_upstream_order_response_headers` accepts (200..599 except 205): every code Envoy names
+// gets its exact phrase, and any admitted-but-unnamed code (e.g. 299) gets "Unknown" -- mirroring
+// `CodeUtility::toString`'s own fallthrough for an unmatched `Code` value -- rather than being
+// rejected. Only fails (returns false) when `out` is null; every `u16` code otherwise gets a
+// phrase.
 bool canonical_status_reason(u16 code, Str* out);
 void format_static_response(Connection& conn,
                             u16 code,
@@ -14512,9 +14511,14 @@ inline bool build_upstream_order_response_headers(
     if (purpose != Http1PrebuiltResponsePurpose::None || !admitted_response_policy_valid(policy) ||
         policy.header_order != ResponsePolicyHeaderOrder::Upstream ||
         resp.version != HttpVersion::Http11 || resp.status_code < 200 || resp.status_code > 599 ||
-        resp.status_code == 204 || resp.status_code == 205 || resp.status_code == 304 ||
-        resp.headers_truncated || resp.content_length_count != 1 || !resp.has_content_length ||
-        resp.chunked)
+        resp.status_code == 205 || resp.headers_truncated || resp.chunked)
+        return false;
+    const bool no_content = resp.status_code == 204;
+    const bool not_modified = resp.status_code == 304;
+    if (no_content     ? resp.content_length_count != 0 || resp.has_content_length
+        : not_modified ? resp.content_length_count > 1 ||
+                             (resp.content_length_count == 1 && !resp.has_content_length)
+                       : resp.content_length_count != 1 || !resp.has_content_length)
         return false;
     // Unlike `build_strict_response_headers` below, this profile never emits
     // `resp.reason` (the canonical table below replaces it), so an upstream
@@ -14608,8 +14612,9 @@ inline bool build_upstream_order_response_headers(
     for (u32 i = 0; i < resp.header_count; i++) {
         const Header& h = resp.headers[i];
         const Str name = h.name;
-        // Content-Length is the sole framing field this profile admits (see
-        // the precondition above: exactly one, and it must be present). It
+        // Content-Length is the sole framing field this profile admits. It
+        // is required for ordinary responses, forbidden on 204, and optional
+        // representation metadata on 304. It
         // must never disappear from the downstream response while the body
         // is still streamed byte for byte, so a `hide_headers` entry naming
         // it is not honored here — mirroring how the fixed-order
@@ -16024,6 +16029,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.response_policy_id != 0) {
+        const bool no_body_status = resp.status_code == 204 || resp.status_code == 304;
         // This profile is deliberately narrower than transparent forwarding:
         // only an origin-form HTTP/1.1 request may select it, and the final
         // response must be a strict self-framed HTTP/1.1 response. SuppressBody
@@ -16039,7 +16045,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
             !conn.request_config || !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
-             conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
+             conn.upstream_recv_buf.len() - resp_parser.header_end >
+                 (no_body_status ? 0u : resp.content_length)) ||
             !build_strict_response_headers(conn,
                                            *conn.request_config,
                                            resp,
@@ -16058,8 +16065,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             reject_strict_response(loop, conn);
             return;
         }
-        conn.resp_body_mode = BodyMode::ContentLength;
-        conn.resp_body_remaining = resp.content_length;
+        conn.resp_body_mode = no_body_status ? BodyMode::None : BodyMode::ContentLength;
+        conn.resp_body_remaining = no_body_status ? 0 : resp.content_length;
         // Mirror the transparent path's upstream-pooling gate (~12087 below):
         // conn.req_keep_alive alone only says the *request* told the origin it
         // may keep the connection open. The parsed response is the origin's
@@ -16069,14 +16076,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // request asked for. Ignoring that here let a keep-alive client's next
         // request take a closing/dead socket from the idle pool.
         conn.upstream_keep_alive =
-            conn.response_policy_suppress_body
+            (conn.response_policy_suppress_body || no_body_status)
                 ? false
                 : (conn.req_keep_alive && resp.keep_alive && !resp.connection_close);
         const u32 header_len = resp_parser.header_end;
         conn.upstream_send_len = header_len;
         conn.resp_body_sent = conn.response_header_buf.len();
         conn.proxy_resp_started = true;
-        if (conn.response_policy_suppress_body) {
+        if (conn.response_policy_suppress_body || no_body_status) {
+            // A 304 length is representation metadata, not a body. A 204
+            // has no framing fields. Retire the origin before publishing so
+            // late bytes cannot be attributed to this or a later request.
             // The representation length remains in the synthesized headers,
             // but HEAD sends no representation bytes. Close and detach the
             // upstream before publishing those headers; a delayed body or

@@ -2619,8 +2619,10 @@ TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_dom
         // dummy reason phrase, so a pass here can only be explained by the
         // canonical replacement -- not by accidentally forwarding the
         // upstream's own reason.
-        const std::string raw = "HTTP/1.1 " + std::string(digits, 3) +
-                                " placeholder-reason-phrase\r\nContent-Length: 2\r\n\r\nhi";
+        std::string raw = "HTTP/1.1 " + std::string(digits, 3) + " placeholder-reason-phrase\r\n";
+        if (code != 204) raw += "Content-Length: 2\r\n";
+        raw += "\r\n";
+        if (code != 204 && code != 304) raw += "hi";
         HttpResponseParser parser;
         ParsedResponse response;
         parser.reset();
@@ -2635,11 +2637,11 @@ TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_dom
         return true;
     };
 
-    // Every status 200..599 except the no-body exclusions (204/205/304) must
+    // Every status 200..599 except 205 must
     // be admitted, and the status line must carry Envoy's exact canonical
     // phrase for that code -- "Unknown" for one Envoy itself does not name.
     for (u32 code = 200; code <= 599; code++) {
-        if (code == 204 || code == 205 || code == 304) continue;
+        if (code == 205) continue;
         std::string line;
         const bool admitted = status_line_for(static_cast<u16>(code), &line);
         CHECK(admitted);
@@ -2649,13 +2651,9 @@ TEST(response_policy, upstream_header_order_canonical_reason_covers_admitted_dom
         CHECK(line.find(expected_status_line) == 0);
     }
 
-    // The three no-body exclusions remain rejected by the admission check
-    // itself (a separate concern from canonical-reason coverage), not by
-    // `canonical_status_reason` -- confirm they still fail closed here.
-    for (u16 code : {204, 205, 304}) {
-        std::string line;
-        CHECK_FALSE(status_line_for(code, &line));
-    }
+    // This policy still rejects 205 before canonical-reason formatting.
+    std::string line;
+    CHECK_FALSE(status_line_for(205, &line));
 
     // Direct spot checks named in the review thread, plus one Envoy leaves
     // unnamed (299 has no assigned meaning; Envoy's own table omits it).
@@ -91141,4 +91139,52 @@ TEST(weighted_load_balance, configured_passive_health_threshold_and_reload) {
     CHECK_FALSE(admit_passive_health_result(&loop, &old_cfg, 0));
     CHECK(admit_passive_health_result(&loop, &new_cfg, 0));
     *backend_health(0, 0) = {};
+}
+
+TEST(response_policy, upstream_order_bodyless_status_framing) {
+    char server[] = "envoy";
+    ForwardResponsePolicySpec policy{};
+    policy.version = ResponsePolicyVersion::Http11;
+    policy.framing = ResponsePolicyFraming::ContentLength;
+    policy.connection = ResponsePolicyConnection::Request;
+    policy.header_order = ResponsePolicyHeaderOrder::Upstream;
+    policy.header_names = ResponsePolicyHeaderNames::Lowercase;
+    policy.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    policy.status_reason = ResponsePolicyStatusReason::Canonical;
+    policy.date = ResponsePolicyDate::PreserveOrCurrent;
+    policy.server = {server, 5};
+    RouteConfig config{};
+    REQUIRE_EQ(config.add_response_policy(policy), 1u);
+    u8 storage[SlicePool::kSliceSize]{};
+    Connection conn{};
+    conn.reset();
+    conn.response_header_slice = storage;
+    conn.response_header_buf.bind(storage, sizeof(storage));
+    conn.response_policy_id = 1;
+    conn.keep_alive = true;
+    conn.req_client_keep_alive = true;
+    struct Case {
+        const char* bytes;
+        bool accepted;
+    };
+    for (const Case c : {
+             Case{"HTTP/1.1 204 No Content\r\nDate: Mon, 01 Jan 2024 00:00:00 GMT\r\n\r\n", true},
+             Case{"HTTP/1.1 304 Not Modified\r\nDate: Mon, 01 Jan 2024 00:00:00 GMT\r\n\r\n", true},
+             Case{"HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n", true},
+             Case{"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false},
+             Case{"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n", false},
+             Case{"HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n\r\n", false},
+         }) {
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(c.bytes), strlen(c.bytes), &response),
+                   ParseStatus::Complete);
+        CHECK_EQ(build_strict_response_headers(conn, config, response), c.accepted);
+        if (c.accepted && response.status_code == 304 && response.has_content_length)
+            CHECK(buf_has(conn.response_header_buf.data(),
+                          conn.response_header_buf.len(),
+                          "content-length: 123\r\n"));
+    }
 }

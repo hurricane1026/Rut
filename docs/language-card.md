@@ -1102,6 +1102,9 @@ return forward(users, load_balance: .roundRobin,
 // Connection: close. The strict response-domain limits above remain unchanged.
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.
+// The upstream-order profile also accepts bodyless 204 and 304 responses.
+// 204 forbids Content-Length; 304 may carry one representation length.
+// Transfer-Encoding is rejected, and neither response forwards body bytes.
 // header_order: .upstream is a separate closed combination (Envoy-compatible
 // H1): preserves upstream header order and lowercases every forwarded name,
 // keeps an upstream `date` in place (or appends one when absent), replaces
