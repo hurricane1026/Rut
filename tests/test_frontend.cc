@@ -48404,3 +48404,58 @@ TEST(frontend, minimum_healthy_weight_percent_bounds_and_prebound) {
         CHECK_FALSE(parse_file_heap(tokens.value()));
     }
 }
+
+TEST(frontend, request_header_all_lowers_to_bounded_collection) {
+    const char* source = R"rut(
+route GET "/" {
+    guard let values = req.getAll("X-Tag") else { return 500 }
+    guard values.count == 2 && values.get(0).or("") == "a" else { return 400 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqHeaderAll));
+    rir.destroy();
+}
+
+TEST(frontend, request_header_all_rejects_explicit_wait_in_either_order_and_helpers) {
+    const char* sources[] = {
+        R"rut(route GET "/" {
+            wait(1ms)
+            guard let tags = req.getAll("X-Tag") else { return 500 }
+            guard tags.count == 2 else { return 400 }
+            return 204
+        })rut",
+        R"rut(route GET "/" {
+            guard let tags = req.getAll("X-Tag") else { return 500 }
+            wait(1ms)
+            guard tags.count == 2 else { return 400 }
+            return 204
+        })rut",
+        R"rut(func tags() -> Collected<str> { req.getAll("X-Tag") }
+        route GET "/" {
+            guard let values = tags() else { return 500 }
+            wait(1ms)
+            return 204
+        })rut",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(hir.error().detail.eq(lit("req.getAll() requires a route without explicit wait")));
+    }
+}

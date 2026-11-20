@@ -480,6 +480,18 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_req_header_all(Str name, SourceLoc loc = {}) {
+        if (!name.ptr || name.len == 0) return err(RirError::InvalidState);
+        for (u32 i = 0; i < name.len; ++i)
+            if (!is_http_tchar(static_cast<u8>(name.ptr[i]))) return err(RirError::InvalidState);
+        auto* element = TRY(make_type(TypeKind::Str));
+        auto* array = TRY(make_type(TypeKind::Array, element));
+        auto* ty = TRY(make_type(TypeKind::Optional, array));
+        auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
     Result<ValueId> emit_req_header_count(Str name, SourceLoc loc = {}) {
         if (!name.ptr || name.len == 0) return err(RirError::InvalidState);
         for (u32 i = 0; i < name.len; ++i)

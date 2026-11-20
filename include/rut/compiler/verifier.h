@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/http_header_validation.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/concurrency_verifier.h"
@@ -987,7 +988,8 @@ inline bool verify_phi_types_equal(const Type* first, const Type* second, u32 de
 }
 
 inline bool valid_collected_instruction(const Function& fn, const Instruction& inst) {
-    const bool allocation = inst.op == Opcode::ArrayNew;
+    const bool header_all = inst.op == Opcode::ReqHeaderAll;
+    const bool allocation = inst.op == Opcode::ArrayNew || header_all;
     const bool push = inst.op == Opcode::ArrayPush;
     const bool count = inst.op == Opcode::ArrayLen;
     const bool get = inst.op == Opcode::ArrayGet;
@@ -1006,6 +1008,14 @@ inline bool valid_collected_instruction(const Function& fn, const Instruction& i
     if (!array || array->kind != TypeKind::Array || array->struct_def ||
         !collected_element_type(array->inner))
         return false;
+    if (header_all) {
+        if (result->kind != TypeKind::Optional || array->inner->kind != TypeKind::Str ||
+            !inst.imm.str_val.ptr || !inst.imm.str_val.len)
+            return false;
+        for (u32 i = 0; i < inst.imm.str_val.len; ++i)
+            if (!is_http_tchar(static_cast<u8>(inst.imm.str_val.ptr[i]))) return false;
+        return true;
+    }
     if (allocation)
         return result->kind == TypeKind::Optional && inst.imm.i32_val >= 1 &&
                inst.imm.i32_val <= 64;

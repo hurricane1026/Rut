@@ -406,6 +406,33 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
     return count;
 }
 
+void* rut_helper_req_header_all(
+    void* conn, void* arena, const u8* req_data, u32 req_len, const char* name, u32 name_len) {
+    if (!req_data || !name || !name_len) return nullptr;
+    for (u32 i = 0; i < name_len; ++i)
+        if (!is_http_tchar(static_cast<u8>(name[i]))) return nullptr;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return nullptr;
+    u32 count = 0;
+    for (u32 i = 0; i < pc.req.header_count; ++i) {
+        const auto& h = pc.req.headers[i];
+        if (http_header_name_eq_ci(h.name.ptr, h.name.len, name, name_len)) ++count;
+    }
+    if (count > CollectedValues::kMaxItems) return nullptr;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    const u32 offset = 0;
+    auto* values = CollectedValues::create(storage, sizeof(Str), count ? count : 1, &offset, 1);
+    if (!values) return nullptr;
+    for (u32 i = 0; i < pc.req.header_count; ++i) {
+        const auto& h = pc.req.headers[i];
+        if (http_header_name_eq_ci(h.name.ptr, h.name.len, name, name_len) &&
+            !values->append(&h.value, sizeof(Str)))
+            return nullptr;
+    }
+    return values;
+}
+
 extern "C" void* rut_helper_http_call_frame(
     void* connection, void* context, u64 size, const u8* request, u32 length) {
     if (!connection || !context || !request || !length || length > 8192 ||

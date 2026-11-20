@@ -22,6 +22,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/callbacks_h2.h"
+#include "rut/runtime/collected_values.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/crypto_c.h"
@@ -33048,4 +33049,36 @@ TEST(jit, oauth_client_basic_authorization_owned_results_and_rir_shapes) {
     engine.shutdown();
     pool.destroy();
     tc.destroy();
+}
+
+TEST(jit, request_header_all_helper_owns_original_values) {
+    SlicePool pool;
+    REQUIRE(pool.init(4));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char request[] =
+        "GET / HTTP/1.1\r\nHost: example\r\nX-Tag: a,b\r\nx-tag:\r\nX-TAG: last\r\n\r\n";
+    const auto* data = reinterpret_cast<const u8*>(request);
+    auto* values = static_cast<CollectedValues*>(
+        rut_helper_req_header_all(nullptr, &arena, data, sizeof(request) - 1, "x-TAG", 5));
+    REQUIRE(values);
+    REQUIRE_EQ(values->count, 3u);
+    const auto* first = static_cast<const Str*>(values->get(0, sizeof(Str)));
+    const auto* second = static_cast<const Str*>(values->get(1, sizeof(Str)));
+    const auto* third = static_cast<const Str*>(values->get(2, sizeof(Str)));
+    REQUIRE(first && second && third);
+    CHECK(first->eq({"a,b", 3}));
+    CHECK(second->eq({"", 0}));
+    CHECK(third->eq({"last", 4}));
+    auto* absent = static_cast<CollectedValues*>(
+        rut_helper_req_header_all(nullptr, &arena, data, sizeof(request) - 1, "Missing", 7));
+    REQUIRE(absent);
+    CHECK_EQ(absent->count, 0u);
+    request[40] = 'z';
+    CHECK(first->eq({"a,b", 3}));
+    CHECK(!rut_helper_req_header_all(nullptr, &arena, data, sizeof(request) - 1, "Bad Name", 8));
+    CHECK(!rut_helper_req_header_all(nullptr, &arena, nullptr, 0, "x", 1));
+    CHECK(!rut_helper_req_header_all(nullptr, nullptr, data, sizeof(request) - 1, "x", 1));
+    arena.destroy();
+    pool.destroy();
 }

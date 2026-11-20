@@ -1348,6 +1348,28 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::ReqHeaderAll: {
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            const auto type = LLVMFunctionType(c.ptr_ty, parameters, 6, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_req_header_all");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_req_header_all", type);
+            LLVMValueRef arguments[] = {c.param_conn,
+                                        c.param_arena,
+                                        c.param_req_data,
+                                        c.param_req_len,
+                                        c.make_global_str(inst.imm.str_val, "hdr.all.name"),
+                                        LLVMConstInt(c.i32_ty, inst.imm.str_val.len, 0)};
+            const auto pointer =
+                LLVMBuildCall2(c.builder, type, helper, arguments, 6, "header.all");
+            const auto has = LLVMBuildICmp(
+                c.builder, LLVMIntNE, pointer, LLVMConstNull(c.ptr_ty), "header.all.has");
+            auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, has, c.i8_ty, ""), 0, "");
+            result = LLVMBuildInsertValue(c.builder, result, pointer, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::ReqHeaderCount: {
             LLVMValueRef name = c.make_global_str(inst.imm.str_val, "hdr.count.name");
             LLVMValueRef args[] = {c.param_req_data,
@@ -3727,6 +3749,7 @@ static bool rir_function_uses_parse(const rir::Function& fn) {
         for (u32 ii = 0; ii < blk.inst_count; ii++) {
             if (rir::is_password_prefix(blk.insts[ii])) return true;
             switch (blk.insts[ii].op) {
+                case rir::Opcode::ReqHeaderAll:
                 case rir::Opcode::ReqHeaderCount:
                 case rir::Opcode::ReqUniqueHeader:
                 case rir::Opcode::ReqHeader:
@@ -4137,7 +4160,7 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                 // Neither HTTP inputs nor HTTP mutation/response effects belong
                 // to an application-message invocation, including hidden helper
                 // accesses. Context slots are compiler storage, not HTTP values.
-                if (ws_body_mode && inst.op >= rir::Opcode::ReqHeaderCount &&
+                if (ws_body_mode && inst.op >= rir::Opcode::ReqHeaderAll &&
                     inst.op <= rir::Opcode::ReqSetTargetTransform &&
                     inst.op != rir::Opcode::WsMessageField &&
                     inst.op != rir::Opcode::CtxLoadSlotI32)
