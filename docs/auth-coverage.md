@@ -846,7 +846,7 @@ for syntax and rollout semantics.
 
 ## Targeted Consumer lifecycle updates
 
-Offline state changes for existing Consumers and credentials preserve other fields,
+Offline state and exact validity-window changes for existing Consumers and credentials preserve other fields,
 including key representation and time bounds. Private group-array updates retain
 explicit credential subsets and reject invalid memberships. CLI regressions cover
 all four methods, raw/verifier records, strict arguments, private files, races and

@@ -451,8 +451,18 @@ def main():
         timed_key = 'window-key'
         if args.admin:
             timed_source = root / 'timed-rotation-input.json'
-            timed_source.write_text(json.dumps(timed))
+            untimed = json.loads(json.dumps(timed))
+            del untimed['credentials'][0]['notBefore']
+            del untimed['credentials'][0]['expiresAt']
+            timed_source.write_text(json.dumps(untimed))
             timed_source.chmod(0o600)
+            windowed = root / 'targeted-window.json'
+            result = subprocess.run([args.admin, 'set-credential-window', str(timed_source),
+                                     'window', str(activation), str(expiry), str(windowed)],
+                                    capture_output=True, timeout=10)
+            assert result.returncode == 0 and not result.stdout and not result.stderr, result
+            assert json.loads(windowed.read_bytes()) == timed
+            timed_source = windowed
             timed_output, timed_key_output = root / 'timed-rotation.json', root / 'timed-rotation.key'
             result = subprocess.run([args.admin, 'rotate-key-verifier', str(timed_source),
                                      'window', 'window-rotated', str(timed_output), str(timed_key_output)],

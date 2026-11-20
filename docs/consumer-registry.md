@@ -591,3 +591,16 @@ activate a snapshot. Use the same snapshot for deployment that passed the check.
 | Policy field | Effect |
 | --- | --- |
 | `requireHashedKeys` | Require a SHA-256 verifier for every bearer or header key, including disabled records. |
+
+### Targeted credential validity windows
+
+`rut-consumers set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT`
+updates the two Unix-second bounds of one existing credential without exposing or
+re-entering its secret. Each bound is a canonical nonnegative decimal integer
+up to `9223372036854775807`; zero means unbounded. If both are nonzero, the
+activation time must precede expiry. Activation is inclusive and expiry is
+exclusive. The command preserves the owner, enabled state, method, groups and
+raw or hashed verifier, and works for disabled credentials too. It validates the
+complete candidate and publishes a new private, no-replace snapshot through the
+same offline path as the other lifecycle commands. It reads no clock and does
+not change any running gateway; deployment still requires a separate adoption.
