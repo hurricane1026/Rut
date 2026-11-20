@@ -133,17 +133,10 @@ void IoUringBackend::decode_user_data(
     u64 data, u32& conn_id, IoEventType& type, u32& aux, u32& upstream_episode) {
     type = static_cast<IoEventType>(data & 0xFFu);
     if (io_event_uses_upstream_episode(type)) {
-        conn_id = static_cast<u32>((data >> 8) & kIoUserDataMaxConnId);
-        aux = static_cast<u8>(data >> 56);
-        upstream_episode = static_cast<u32>((data >> 32) & kIoUserDataMaxUpstreamEpisode);
-        UpstreamEventToken token;
-        if (decode_upstream_event_token(data, &token)) {
-            return;
-        }
-        // Preserve the upstream type/connection identity, but make malformed
-        // tokens unambiguously stale. In particular, do not let episode zero
-        // fall through to the legacy decoder and invoke a current callback.
-        upstream_episode = kInvalidUpstreamEventEpisode;
+        const auto token = decode_upstream_completion_token(data);
+        conn_id = token.conn_id;
+        aux = token.aux;
+        upstream_episode = token.episode;
         return;
     }
     decode_user_data(data, conn_id, type, aux);
