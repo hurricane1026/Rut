@@ -14026,6 +14026,40 @@ TEST(iouring_send, study_direct_vector_keeps_total_bytes_and_flags_after_prefix)
     }
 }
 
+TEST(iouring_send, vector_resubmits_the_exact_suffix_at_the_span_boundary) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    auto& backend = guard.loop->backend;
+    static const u8 first[] = {1, 2, 3, 4};
+    static const u8 second[] = {5, 6, 7};
+    BufferedSendVector vector;
+    vector.bind(first, sizeof(first), second, sizeof(second));
+    REQUIRE(backend.add_send(9, 0, first, 7, 5, false, &vector));
+    u32 sent = 0;
+    for (u32 chunk : {2u, 2u, 1u, 2u}) {
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(5, static_cast<i32>(chunk)));
+        sent += chunk;
+        IoEvent event{};
+        const u32 before = guard.sq_tail;
+        REQUIRE_EQ(backend.wait(&event, 1, guard.loop->conns, 1), sent == 7 ? 1u : 0u);
+        if (sent == 7) {
+            CHECK_EQ(event.result, 7);
+            CHECK_EQ(vector.message.msg_iovlen, 0u);
+            CHECK_EQ(guard.sq_tail, before);
+            continue;
+        }
+        REQUIRE_EQ(guard.sq_tail, before + 1u);
+        const auto& retry = guard.sq_entries[before & guard.sq_mask];
+        REQUIRE_EQ(retry.opcode, IORING_OP_SENDMSG);
+        REQUIRE_EQ(retry.addr, reinterpret_cast<u64>(&vector.message));
+        REQUIRE_EQ(vector.message.msg_iovlen, sent < 4 ? 2u : 1u);
+        CHECK_EQ(vector.message.msg_iov[0].iov_base, sent < 4 ? first + sent : second + (sent - 4));
+        CHECK_EQ(vector.message.msg_iov[0].iov_len, sent < 4 ? 4 - sent : 7 - sent);
+    }
+}
+
 TEST(iouring_send, more_follows_sets_msg_more_across_partial_resubmission) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());

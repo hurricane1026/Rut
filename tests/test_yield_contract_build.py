@@ -41,6 +41,21 @@ def main():
                        "enum class YieldKind : u8 {\n    UndeclaredContractProbe = 255,")
         check(compiler, root, overlay, "UndeclaredContractProbe")
         probe.unlink()
+        source = "src/runtime/buffered_send_vector.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("source + (kSize - part.iov_len)", "source + kStep"),
+            ("++message.msg_iov;", "/* leave the previous span selected */"),
+            ("\n            n -= kStep;", "\n            n = 0;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
+                           before, after)
+            check(compiler, root, overlay, "Buffered send cursor violates suffix contract", source=source)
+            probe.unlink()
+        probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
+                       "second_source == parts[1].iov_base && ", "")
+        check(compiler, root, overlay, "Buffered send spans disagree with pinned sources", source=source)
+        probe.unlink()
         probe = mutate(root / "include", overlay, "rut/jit/yield_contract.h",
                        "return {DownstreamSend, None};", "return {DownstreamRecv, None};")
         check(compiler, root, overlay, "Yield contract disagrees with RIR wait arms")
