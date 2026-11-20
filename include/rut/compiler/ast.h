@@ -389,6 +389,7 @@ struct AstUpstreamDecl {
     u8 connect_attempts = 3;
     bool has_max_inflight = false;
     u32 max_inflight = 0;
+    PassiveHealthPolicy passive_health{};
     u32 weight_count = 0;
     u16 backend_weights[kMaxBackends]{};
 

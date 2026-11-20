@@ -8,8 +8,8 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-// Version 24 records the connect-attempt budget in UpstreamTarget.
-constexpr u32 kVersion = 24;
+// Version 25 records the passive health policy in UpstreamTarget.
+constexpr u32 kVersion = 25;
 struct StreamHeader {
     u64 magic;
     u32 version;

@@ -87,6 +87,7 @@ struct UpstreamTarget {
     u32 max_inflight = 0;
     u8 minimum_healthy_weight_percent = 0;
     u8 connect_attempts = 3;
+    PassiveHealthPolicy passive_health{};
 
     // Active HTTP health-check config. hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe

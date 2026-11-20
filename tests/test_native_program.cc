@@ -3831,6 +3831,7 @@ upstream api {
     minimum_healthy_weight_percent: 50
     connect_attempts: 8
     max_inflight: 17
+    passive_health: { failure_threshold: 7, eject_for: 12s }
     health_check: { path: "/healthz", interval: 2s, timeout: 3s, failure_threshold: 3, success_threshold: 2 }
 }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
@@ -3846,6 +3847,9 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.minimum_healthy_weight_percent, 50u);
     CHECK_EQ(target.connect_attempts, 8u);
     CHECK_EQ(target.max_inflight, 17u);
+    CHECK_EQ(target.passive_health.failures, 7u);
+    CHECK_EQ(target.passive_health.eject_ms, 12000u);
+    CHECK(target.passive_health.configured);
     CHECK(target.hc_enabled);
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK_EQ(target.hc_timeout_seconds, 3u);

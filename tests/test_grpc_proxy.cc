@@ -3739,6 +3739,8 @@ TEST(grpc_proxy, stale_handshake_result_does_not_touch_reloaded_backend) {
     rut::test::RouteConfigFixture old_config_owner;
     REQUIRE(old_config_owner.config);
     RouteConfig& old_config = *old_config_owner.config;
+    REQUIRE(old_config.add_upstream("grpc", 0x7f000001, 1).has_value());
+    old_config.upstreams[0].passive_health = {1000, 1, true};
     rut::test::RouteConfigFixture current_config_owner;
     REQUIRE(current_config_owner.config);
     RouteConfig& current_config = *current_config_owner.config;
@@ -3757,8 +3759,10 @@ TEST(grpc_proxy, stale_handshake_result_does_not_touch_reloaded_backend) {
     grpc_record_handshake_result(&loop, conn, false, monotonic_us());
     CHECK_EQ(health->fails, 0u);
     active = &old_config;
-    grpc_record_handshake_result(&loop, conn, false, monotonic_us());
+    const u64 now = monotonic_us();
+    grpc_record_handshake_result(&loop, conn, false, now);
     CHECK_EQ(health->fails, 1u);
+    CHECK(health->eject_until_us >= now + 1000000u);
 }
 
 TEST(grpc_proxy, stale_connect_failure_does_not_touch_reloaded_backend) {
