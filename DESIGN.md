@@ -11499,3 +11499,10 @@ The opt-in `introspection.requireActiveBearer` composes active-token validation
 with mandatory Bearer token-type metadata, retaining the existing case-insensitive
 comparison and 401 invalid-token response. The original optional-type policy is
 unchanged. See [the contract](docs/oauth-introspection.md#optional-mandatory-bearer-token-type).
+
+### Exact upstream OAuth scope grants
+
+The opt-in `oauth_client.authorizationForExactScopes` compares the configured
+and returned scope sets in both directions before using the token. Reordering
+and repeated members are accepted; extra or missing members fail closed. The
+existing at-least policy remains unchanged. See [the contract](docs/upstream-oauth.md#optional-exact-grant-scope-ceiling).

@@ -182,6 +182,7 @@ def main():
             source += scoped
             all_scopes = (examples / 'upstream-oauth-all-scopes.rut').read_text()
             source += all_scopes[all_scopes.index('route GET'):]
+            source += all_scopes[all_scopes.index('route GET'):].replace('/all-scope-reports', '/exact-scope-reports').replace('authorizationForScopes', 'authorizationForExactScopes')
             invalid_scopes = ('', ' reports:read', 'reports:read ', 'reports:read  write',
                               'reports:read\twrite', 'reports:read\nwrite', 'reports:read"',
                               'reports:read\\', 'réad', 'reports:read\x00', 'x' * 1025)
@@ -271,6 +272,15 @@ def main():
                         before = len(calls)
                         assert request('/all-scope-reports')[::2] == (200, b'upstream-ok')
                         assert len(calls) == before + 1 and calls[-1][2] == scoped_body
+                    for selected in ('valid', 'reordered-scopes', 'repeated-scopes'):
+                        mode = selected
+                        assert request('/exact-scope-reports')[0] == 200, selected
+                    for selected in ('wider-scopes', 'narrow-scope', 'two-scopes', 'case-scope',
+                                     'prefix-scope', 'bad-scope', 'typed-scope', 'no-scope'):
+                        mode = selected
+                        before = len(forwarded)
+                        assert request('/exact-scope-reports')[0] == 503, selected
+                        assert len(forwarded) == before
                     for selected in ('narrow-scope', 'two-scopes', 'case-scope', 'prefix-scope', 'bad-scope'):
                         mode = selected
                         before = len(forwarded)

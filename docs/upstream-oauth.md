@@ -244,3 +244,13 @@ The native-loaded two-shard HTTP fixture exercises the example after source/modu
 removal on epoll and io_uring, including reordered/wider/partial grants, HTTP/2,
 credential separation and concurrent requests. Existing one-permission and
 resource-indicator routes remain in the same regression matrix.
+
+### Optional exact grant scope ceiling
+
+`oauth_client.authorizationForExactScopes(reply, configuredScopes)` validates the
+trusted token endpoint response and requires its scope set to equal the nonempty
+configured set. Reordering and repeated scope tokens are accepted as set members;
+missing, malformed, narrower, or wider grants return 503 before forwarding. Both
+lists use the existing bounded scope grammar and comparisons are case-sensitive.
+This opt-in policy leaves `authorizationForScopes` unchanged, which accepts wider
+grants. The configured list must come from trusted route configuration.
