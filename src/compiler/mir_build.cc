@@ -839,7 +839,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     }
     if (expr.kind == HirExprKind::ReqQuery || expr.kind == HirExprKind::ReqUniqueQuery) {
         v.kind = expr.kind == HirExprKind::ReqUniqueQuery ? MirValueKind::ReqUniqueQuery
-                                                         : MirValueKind::ReqQuery;
+                                                          : MirValueKind::ReqQuery;
         v.type = MirTypeKind::Str;
         v.may_nil = true;
         v.str_value = expr.str_value;
