@@ -100,7 +100,10 @@ def test_targeted_registry_commands(tool, root):
     for groups in ('["outside"]', '["staff","staff"]', '[1]', 'null', '[],"expiresAt":1'):
         mutate('set-credential-groups', [parked['id'], groups], None)
     restricted = dict(snapshot, credentials=[raw, dict(parked, groups=[]), inherited])
-    mutate('set-credential-groups', [parked['id'], '[]'], restricted)
+    restricted_path = mutate('set-credential-groups', [parked['id'], '[]'], restricted)
+    del_group = {k: v for k, v in parked.items() if k != 'groups'}
+    mutate('inherit-credential-groups', [parked['id']],
+           dict(snapshot, credentials=[raw, del_group, inherited]), restricted_path)
     assert source.read_bytes() == original
 
 

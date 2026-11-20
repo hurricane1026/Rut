@@ -732,6 +732,7 @@ enum class RegistryAction : u8 {
     RemoveConsumerWithCredentials,
     RemoveCredential,
     SetCredentialGroups,
+    InheritCredentialGroups,
 };
 
 struct RegistryCommand {
@@ -747,6 +748,7 @@ constexpr RegistryCommand kRegistryCommands[] = {
     {"remove-consumer-with-credentials", 5, RegistryAction::RemoveConsumerWithCredentials},
     {"remove-credential", 5, RegistryAction::RemoveCredential},
     {"set-credential-groups", 6, RegistryAction::SetCredentialGroups},
+    {"inherit-credential-groups", 5, RegistryAction::InheritCredentialGroups},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -759,7 +761,8 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
 
 bool update_credential(
     json::Document& doc, u32 record, RegistryAction action, char** args, json::Writer& output) {
-    const bool kGroups = action == RegistryAction::SetCredentialGroups;
+    const bool kGroups = action == RegistryAction::SetCredentialGroups ||
+                         action == RegistryAction::InheritCredentialGroups;
     const u32 kGroupsField = field(doc, record, lit_str("groups"));
 
     output.put('{');
@@ -921,6 +924,7 @@ constexpr char kUsage[] =
     "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers set-credential-groups INPUT CREDENTIAL_ID JSON_ARRAY OUTPUT\n"
+    "       rut-consumers inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
