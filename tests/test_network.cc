@@ -42509,7 +42509,7 @@ TEST(iouring_response_read_timer, post_disarm_custody_cqes_never_close_live_owne
 
 TEST(iouring_response_read_timer,
      post_disarm_malformed_custody_cqes_do_not_touch_live_or_successor_owner) {
-    for (const u32 malformed_kind : {0u, 1u, 2u}) {
+    for (const u32 malformed_kind : {0u, 1u, 2u, 3u}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         IoUringEventLoop* loop = guard.loop;
@@ -42525,6 +42525,7 @@ TEST(iouring_response_read_timer,
         IoEvent malformed = inert_response_read_timer_event(conn->id, generation);
         if (malformed_kind == 0) malformed.non_upstream_generation = generation + 1u;
         if (malformed_kind == 1) malformed.aux = 1;
+        if (malformed_kind == 3) malformed.copy_end = 1;
         if (malformed_kind == 2) {
             IoEvent cancel =
                 inert_response_read_timer_event(conn->id, generation | kResponseReadTimerCancelBit);
@@ -42539,6 +42540,8 @@ TEST(iouring_response_read_timer,
         loop->dispatch_batch(&malformed, 1);
         CHECK(conn->fd >= 0);
         CHECK_EQ(conn->response_read_timer_phase, ResponseReadTimerPhase::CancelPending);
+        CHECK(conn->response_read_timer_target_owned);
+        CHECK(conn->response_read_timer_cancel_owned);
         IoEvent target = inert_response_read_timer_event(conn->id, generation);
         target.result = -ECANCELED;
         IoEvent cancel =
