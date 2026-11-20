@@ -625,7 +625,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                                  source_live_ring_count)
                 : source_live_session.start(static_cast<SourceAccessLogFd&&>(*source_live_fd),
                                             source_live_bindings,
-                                            source_live_ring_count);
+                                            source_live_ring_count,
+                                            source_live_format);
         if (!started) {
             report_source_live_start_error(started.error());
             (void)release_source_live_rings();

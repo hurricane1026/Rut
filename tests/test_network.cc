@@ -82791,6 +82791,32 @@ TEST(state_invariant, backend_retry_connect_submit_failure_closes_retry_fd) {
     close(retry_fds[1]);
 }
 
+TEST(state_invariant, backend_retry_no_eligible_backend_does_not_record_attempt) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(upstream.value()), 0x7F000001, 9001));
+    cfg.upstreams[upstream.value()].weights[1] = 0;
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_backend_idx = 0;
+    c->upstream_attempted_backends = 1u;
+    c->upstream_attempts = 1;
+    c->access_log_upstream_attempts_plus_one = 2;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE(c->upstream_fd >= 0);
+
+    CHECK_FALSE(try_connect_next_backend<SmallLoop>(&loop, *c));
+    CHECK_EQ(c->upstream_attempts, 2u);
+    CHECK_EQ(c->access_log_upstream_attempts_plus_one, 2u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.close_conn(*c);
+}
+
 TEST(state_invariant, backend_retry_least_requests_skips_failed_endpoint) {
     RouteConfig cfg;
     auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);

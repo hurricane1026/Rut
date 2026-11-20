@@ -68,8 +68,12 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
 }
 
 core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::start(
-    SourceAccessLogFd&& output, const SourceLiveAccessLogRingBinding* bindings, u32 ring_count) {
-    return start_impl(static_cast<SourceAccessLogFd&&>(output), bindings, ring_count, false);
+    SourceAccessLogFd&& output,
+    const SourceLiveAccessLogRingBinding* bindings,
+    u32 ring_count,
+    AccessLogFormatProfile format) {
+    return start_impl(
+        static_cast<SourceAccessLogFd&&>(output), bindings, ring_count, false, nullptr, format);
 }
 
 core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::start_host(
@@ -96,7 +100,8 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
     const SourceLiveAccessLogRingBinding* bindings,
     u32 ring_count,
     bool allow_unleased,
-    SourceLiveAccessLogHostRing* const* host_rings) {
+    SourceLiveAccessLogHostRing* const* host_rings,
+    AccessLogFormatProfile format) {
     if (state_.load(std::memory_order_acquire) != State::New)
         return core::make_unexpected(SourceLiveAccessLogStartError{
             SourceLiveAccessLogStartErrorKind::InvalidLifecycle, kSourceLiveAccessLogNoRing, 0});
@@ -146,6 +151,11 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
                 SourceLiveAccessLogStartErrorKind::InvalidRingState, static_cast<u8>(i), 0});
     }
 
+    if (format != AccessLogFormatProfile::DownstreamRequestBytesLine &&
+        format != AccessLogFormatProfile::UpstreamAttempts)
+        return core::make_unexpected(SourceLiveAccessLogStartError{
+            SourceLiveAccessLogStartErrorKind::InvalidLifecycle, kSourceLiveAccessLogNoRing, 0});
+    format_ = format;
     ring_count_ = ring_count;
     for (u32 i = 0; i < ring_count_; i++) {
         rings_[i] = bindings[i].ring;
@@ -351,7 +361,7 @@ bool SourceLiveAccessLogSession::service_round() {
         const u64 position = peek.position;
         const AccessLogEntry entry = *peek.entry;
         char host_line[kAccessLogDownstreamHostLineCapacity];
-        char request_bytes_line[kAccessLogDownstreamRequestBytesLineCapacity];
+        char request_bytes_line[16];
         u32 line_length = 0u;
         const char* line = nullptr;
         if (host_rings_[ring_index] != nullptr) {
@@ -368,8 +378,11 @@ bool SourceLiveAccessLogSession::service_round() {
                 entry, host_record, host_line, sizeof(host_line));
             line = host_line;
         } else {
-            line_length = format_access_log_downstream_request_bytes_line(
-                entry, request_bytes_line, sizeof(request_bytes_line));
+            line_length = format_ == AccessLogFormatProfile::UpstreamAttempts
+                              ? format_access_log_upstream_attempts_line(
+                                    entry, request_bytes_line, sizeof(request_bytes_line))
+                              : format_access_log_downstream_request_bytes_line(
+                                    entry, request_bytes_line, sizeof(request_bytes_line));
             line = request_bytes_line;
         }
         // Drop the only borrowed slot pointer before any commit can make the
@@ -393,6 +406,8 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
                                               u32 line_length) {
     const u32 line_capacity = host_rings_[ring_index] != nullptr
                                   ? kAccessLogDownstreamHostLineCapacity
+                              : format_ == AccessLogFormatProfile::UpstreamAttempts
+                                  ? 16u
                                   : kAccessLogDownstreamRequestBytesLineCapacity;
     if (line == nullptr || line_length == 0u || line_length > line_capacity) {
         publish_writer_fatal(

@@ -2649,6 +2649,8 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.timestamp_us = realtime_us();
         entry.duration_us = kDurationUs;
         entry.status = status;
+        if (kOwnsRequestCompletion && conn.h2 == nullptr)
+            entry.upstream_attempts_plus_one = conn.access_log_upstream_attempts_plus_one;
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size;
@@ -2964,6 +2966,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.forward_load_balance = {};
     conn.upstream_attempted_backends = 0;
     conn.req_start_us = monotonic_us();
+    conn.access_log_upstream_attempts_plus_one = 1;
     conn.json_arena.destroy();
     conn.jit_response_body = {};
     conn.jit_response_body_valid = false;
@@ -3469,6 +3472,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             send_terminal_response(loop, conn);
             return;
         }
+        conn.access_log_upstream_attempts_plus_one = 2;
         conn.upstream_backend_idx = static_cast<u8>(kBackend);
         conn.upstream_attempted_backends = static_cast<u8>(1u << kBackend);
         hold_backend_active(conn);
@@ -5681,6 +5685,7 @@ void handle_jit_outcome(Loop* loop,
             }
             conn.upstream_idx = static_cast<u16>(outcome.upstream_id);
             conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
+            conn.access_log_upstream_attempts_plus_one = 2;
             conn.upstream_start_us = monotonic_us();
             conn.upstream_backend_idx = static_cast<u8>(kBackend);
             hold_backend_active(conn);
@@ -5948,6 +5953,9 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
         (void)detach_upstream_close(loop, conn);
         return false;
     }
+    if (conn.access_log_upstream_attempts_plus_one > 0 &&
+        conn.access_log_upstream_attempts_plus_one < 255)
+        ++conn.access_log_upstream_attempts_plus_one;
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
     hold_backend_active(conn);

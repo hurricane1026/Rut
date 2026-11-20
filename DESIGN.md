@@ -8655,6 +8655,14 @@ attempt history. H2 stream publication and upstream endpoint/status history
 remain outside this bounded capability. Source declarations are accepted only
 in the main file and use `publication: live`.
 
+The opt-in `upstreamAttempts` profile uses the same reliable publisher and
+writes `<status> <attempts-or-dash>\n`. Ordinary HTTP/1 records the selected
+forwarding attempt count: zero for local responses, one for initial forwarding
+including pooled reuse, and one more per failover selection. Recovery from a dead
+pooled connection to the same endpoint does not increment the counter. The dash
+means unavailable, including published gRPC records. Existing H2 stream producer
+coverage remains unchanged. The line includes no request target or credentials.
+
 The reliable SourceLive path uses one SPSC ring per shard and a process-owned
 writer thread. Publication remains bounded and allocates no memory on request
 completion. The legacy CLI flusher and its existing text format remain a

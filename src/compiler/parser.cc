@@ -4346,6 +4346,8 @@ struct Parser {
             format_profile = AccessLogFormatProfile::DownstreamRequestBytesLine;
         } else if (format.value()->text.eq({"downstreamHost", 14})) {
             format_profile = AccessLogFormatProfile::DownstreamHost;
+        } else if (format.value()->text.eq({"upstreamAttempts", 16})) {
+            format_profile = AccessLogFormatProfile::UpstreamAttempts;
         } else {
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*format.value()), format.value()->text);

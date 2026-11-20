@@ -112,7 +112,10 @@ public:
     // example by Shard). The raw overload above is retained for standalone
     // caller-owned sessions and cannot be attached to a leased Shard ring.
     core::Expected<void, SourceLiveAccessLogStartError> start(
-        SourceAccessLogFd&& output, const SourceLiveAccessLogRingBinding* bindings, u32 ring_count);
+        SourceAccessLogFd&& output,
+        const SourceLiveAccessLogRingBinding* bindings,
+        u32 ring_count,
+        AccessLogFormatProfile format = AccessLogFormatProfile::DownstreamRequestBytesLine);
     core::Expected<void, SourceLiveAccessLogStartError> start_host(
         SourceAccessLogFd&& output,
         const SourceLiveAccessLogHostRingBinding* bindings,
@@ -170,7 +173,8 @@ private:
         const SourceLiveAccessLogRingBinding* bindings,
         u32 ring_count,
         bool allow_unleased,
-        SourceLiveAccessLogHostRing* const* host_rings = nullptr);
+        SourceLiveAccessLogHostRing* const* host_rings = nullptr,
+        AccessLogFormatProfile format = AccessLogFormatProfile::DownstreamRequestBytesLine);
     void release_ring_borrows();
     void close_owned();
 
@@ -188,6 +192,7 @@ private:
     LiveAccessLogRing* rings_[kMaxRings]{};
     SourceLiveAccessLogHostRing* host_rings_[kMaxRings]{};
     SourceLiveAccessLogLeaseSlot* leases_[kMaxRings]{};
+    AccessLogFormatProfile format_ = AccessLogFormatProfile::DownstreamRequestBytesLine;
     u32 ring_count_ = 0u;
     u32 next_ring_ = 0u;
 };

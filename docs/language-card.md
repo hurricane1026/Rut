@@ -290,6 +290,14 @@ create a second line. States are `complete`, `empty`, `absent`, `duplicate`,
 or claim upstream-attempt history. H2 stream publication is not part of this
 profile. The existing `downstreamRequestBytes` output remains byte-identical.
 
+The opt-in `format: upstreamAttempts` writes `<status> <attempts-or-dash>\n`
+for published completions. For ordinary HTTP/1, the count is selected forwarding
+attempts: local handling records 0, initial forwarding (including pooled reuse)
+records 1, and endpoint failover increments it. Reconnecting a dead pooled
+connection to the same endpoint does not increment it. A dash means unavailable,
+including published gRPC records; H2 stream logging is otherwise limited by the
+existing producer coverage. The line contains no target, header or credential.
+
 When using the legacy CLI sink `--access-log PATH`, add
 `--access-log-path-only` to omit queries from logged targets. The mode records
 the original encoded path without the first literal `?` or anything after it.

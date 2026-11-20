@@ -90,8 +90,9 @@ struct AccessLogEntry {
     char upstream[24];  // upstream name, null-terminated
     u16 target_length;
     AccessLogTargetState target_state;
-    u8 grpc_status_plus_one;  // zero for HTTP; 1..17 encode canonical gRPC status 0..16
-    u8 _pad[4];
+    u8 grpc_status_plus_one;        // zero for HTTP; 1..17 encode canonical gRPC status 0..16
+    u8 upstream_attempts_plus_one;  // zero unavailable; otherwise observed count + 1
+    u8 _pad[3];
 };
 
 static_assert(offsetof(AccessLogEntry, timestamp_us) == 0);
@@ -175,6 +176,8 @@ static_assert(offsetof(AccessLogRing, entries) == 72);
 // shard\n". Formatting is transactional: a null or undersized output returns zero without
 // modifying caller storage. kAccessLogTextLineCapacity bounds every valid entry line.
 u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size);
+
+u32 format_access_log_upstream_attempts_line(const AccessLogEntry& entry, char* buf, u32 buf_size);
 
 // Format only the downstream request byte count as unsigned decimal followed by '\n'.
 // Returns bytes written without a trailing NUL. Formatting is transactional: a null or
