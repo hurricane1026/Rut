@@ -98,3 +98,15 @@ configuration returns 503. Missing, non-string or mismatching subjects, owners
 or token types return a Bearer-challenged 401. Call it after the configured
 signature, issuer, audience and time verifier. Names and request metadata do not
 substitute for the signed subject. The native fixture exercises this policy using trusted `CASDOOR_SUBJECT` configuration.
+## Pinned provider integration
+
+The Docker integration fixture starts the official Casdoor v4.27.1 image pinned
+by digest, seeds an isolated SQLite database and obtains a DefaultJWT access
+token through its password grant. It checks the provider's issuer, audience,
+organization, groups and access-token type, configures the verifier from the
+provider's JWKS, and exercises HTTP/1.1 and HTTP/2 on both backends. It also
+checks provider-issued ID and refresh tokens, invalid signatures, wrong
+audience or organization, and denied group policies. The refresh token has no
+`kid` in this provider version, so the configured verifier rejects it before
+the token-type policy. The fixture uses local test credentials and certificates;
+it is not a full provider conformance or production deployment test.
