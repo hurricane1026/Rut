@@ -124,6 +124,17 @@ def test_deployment_policy(tool, root):
     check({explicit: True}, records=[inheriting], rule=explicit)
     check({explicit: True}, records=[dict(inheriting, enabled=False)], ok=True)
     check({explicit: True}, records=[dict(key, groups=[])], ok=True)
+    capacity = 'maxCredentialsPerConsumer'
+    check({capacity: 2}, ok=True)
+    check({capacity: 1}, rule=capacity)
+    check({capacity: 1}, records=[key, dict(parked, consumerId='disabled', groups=[])], ok=True)
+    check({capacity: 0}, records=[], ok=True)
+    check({capacity: 0}, records=[dict(parked, consumerId='disabled', groups=[])], rule=capacity)
+    check({capacity: 65}, rule=capacity)
+    check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
+           'minimumActiveCredentials': 1, capacity: 2}, ok=True)
+    check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
+           'minimumActiveCredentials': 1, capacity: 1}, rule=capacity)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
