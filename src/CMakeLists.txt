@@ -184,6 +184,7 @@ add_library(rut_runtime STATIC
     runtime/jwt_es256.cc
     runtime/jwt_claims.cc
     runtime/arena.cc
+    runtime/jit_dispatch.cc
     runtime/callbacks.cc
     runtime/shard.cc
     ${RUT_IO_SOURCES}
