@@ -10267,7 +10267,11 @@ attempt, including setup and key-import failures, schedules from completion plus
 the retry interval. Deadlines saturate on overflow. Existing invalid-clock
 handling cancels work and clears freshness; retry never renews last-success or
 maximum key age. Attempt timeouts still span DNS, metadata and key-fetch stages
-from their start; there is no jitter, exponential backoff or request-driven fetch.
+from their start. Optional `dnsTimeoutSeconds` and `discoveryTimeoutSeconds`
+can shorten those stages without changing the outer deadline or permitting
+failover on timeout. Optional `maxRetrySeconds` caps exponential backoff and
+`maxRetryAfterSeconds` can honor bounded authenticated key-server throttle hints.
+There is no jitter or request-driven fetch.
 
 Optional Boolean `remoteJwks.conditionalRequests` enables bounded authenticated
 ETag revalidation for both algorithms. Strong quoted ASCII tags (at most 128
@@ -10277,8 +10281,16 @@ only before hard expiry. Changed addresses and failover are unconditional. A
 bodyless 304 must repeat the exact sent tag and complete while the cache remains
 fresh. It preserves verifier banks/empty state and renews successful age/cadence.
 Cold/expired caches need a full 200. Malformed validators or ineligible 304s fail
-without renewing age. Missing ETag on accepted 200 clears prior state. Discovery
-and other HTTPS profiles remain unchanged. See [the exact contract](docs/jwks-discovery.md#conditional-key-refresh).
+without renewing age. Missing ETag on accepted 200 clears prior state.
+Optional Boolean `conditionalDiscovery` lets a separate same-initial-address
+strong ETag revalidate previously accepted discovery metadata before
+`maxAgeSeconds`. The discovery path and TLS identity remain configuration-owned.
+A successful discovery 200 or matching 304 may commit its own validator before
+keys are fetched, and cannot renew key age. Optional `discoveryCacheSeconds`
+skips discovery while the last proven metadata is fresh for the same initial
+address. It never skips key acquisition. Discovery proofs are single-entry,
+shard-owned and discarded on cancellation, clock reset or configuration
+retirement. See [the exact contract](docs/jwks-discovery.md#conditional-key-refresh).
 
 Both event-loop implementations poll this same task; the specialized epoll/kqueue
 loops use the same maintenance hook. Config replacement cancels the retiring shard's

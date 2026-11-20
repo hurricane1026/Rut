@@ -30,6 +30,9 @@ def main():
     parser.add_argument("--dns-cache", action="store_true")
     parser.add_argument("--retry-after", action="store_true")
     parser.add_argument("--retry-backoff", action="store_true")
+    parser.add_argument("--stage-timeout", action="store_true")
+    parser.add_argument("--conditional-discovery", action="store_true")
+    parser.add_argument("--discovery-cache", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -39,11 +42,14 @@ def main():
     lock = threading.Lock()
     release_response = threading.Event()
     state = {"body": json.dumps(fixture["first"]["jwks"]).encode(), "status": 200,
-             "requests": 0, "locals": [], "dnsRequests": 0, "attempts": [], "delay": 0,
+             "requests": 0, "locals": [], "dnsRequests": 0, "dnsTimes": [], "attempts": [], "delay": 0,
              "hold": "cold" if args.access_profile else False,
              "discovery": "valid", "dns": "valid",
              "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
              "conditionalRequests": [], "discoveries": [], "discoveryDelay": 0}
+    state.update(metadataTag='"metadata-v1"', metadataRequests=[])
+    if args.conditional_discovery:
+        state["discovery"] = "force304"
     state["retryAfter"] = () if args.retry_after else ("30",)
     cold_release = threading.Event()
 
@@ -55,7 +61,25 @@ def main():
                 with lock:
                     mode = state["discovery"]
                     discovery_delay = state["discoveryDelay"]
-                    state["discoveries"].append((self.headers.get("If-None-Match"), discovery_delay))
+                    incoming = self.headers.get("If-None-Match")
+                    state["discoveries"].append((incoming, discovery_delay))
+                    tags = []
+                    status = 302 if mode == "redirect" else 200
+                    if args.conditional_discovery:
+                        tag = state["metadataTag"]
+                        if tag is not None:
+                            tags = [tag]
+                        if mode in ("force304", "mismatch304", "duplicate304") or (
+                                mode == "valid" and tag is not None and incoming == tag):
+                            status = 304
+                        if mode == "mismatch304":
+                            tags = ['"wrong"']
+                        if mode == "duplicate304":
+                            tags = [tag, tag]
+                        state["metadataRequests"].append((incoming, status, mode, discovery_delay,
+                                                          self.connection.getsockname()[0]))
+                    if args.stage_timeout:
+                        state.setdefault("discoveryTimes", []).append(time.monotonic())
                 if discovery_delay:
                     time.sleep(discovery_delay)
                 metadata = dict(issuer=fixture["first"]["issuer"],
@@ -63,8 +87,13 @@ def main():
                 if mode == "issuer": metadata["issuer"] = "https://evil.example"
                 if mode == "uri": metadata["jwks_uri"] = "https://127.0.0.2/keys"
                 body = json.dumps(metadata).encode()
-                self.send_response(302 if mode == "redirect" else 200)
-                self.send_header("Content-Type", "application/json")
+                self.send_response(status)
+                if status == 304:
+                    body = b""
+                else:
+                    self.send_header("Content-Type", "application/json")
+                for tag in tags:
+                    self.send_header("ETag", tag)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -152,6 +181,8 @@ def main():
             with lock:
                 mode = state["dns"]
                 state["dnsRequests"] += 1
+                if args.stage_timeout:
+                    state["dnsTimes"].append(time.monotonic())
             if mode == "timeout": continue
             target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
             address = socket.inet_aton(target)
@@ -210,6 +241,17 @@ def main():
                                        allowedAddresses=["127.0.0.1", "127.0.0.2", "127.0.0.4"],
                                        discoveryPath="/.well-known/openid-configuration",
                                        discoveryIssuer=policy["issuer"])
+        if args.discovery_cache:
+            assert args.discovery_dns
+            policy["remoteJwks"].update(maxAgeSeconds=8, discoveryCacheSeconds=5)
+        if args.conditional_discovery:
+            assert args.discovery_dns
+            policy["remoteJwks"].update(conditionalDiscovery=True, timeoutSeconds=5)
+        if args.stage_timeout:
+            assert args.discovery_dns
+            policy["remoteJwks"].update(timeoutSeconds=6, dnsTimeoutSeconds=1,
+                                        discoveryTimeoutSeconds=1)
+            state["dns"] = "timeout"
         if args.dns_cache:
             assert args.discovery_dns
             policy["remoteJwks"]["dnsCacheSeconds"] = 4
@@ -345,7 +387,122 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.retry_backoff:
+            if args.discovery_cache:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    assert len(state["discoveries"]) == 1
+                    state["body"] = json.dumps(fixture["second"]["jwks"]).encode()
+                wait_status(fixture["b"], 200)
+                with lock:
+                    assert len(state["discoveries"]) == 1
+                    state["dns"] = "move"
+                    before_move = state["requests"]
+                wait_for_origin_address(before_move, "127.0.0.2")
+                with lock:
+                    assert len(state["discoveries"]) == 2
+                    state["discovery"] = "issuer"
+                    before_skip = state["requests"]
+                wait_for_origin_request(before_skip)
+                with lock:
+                    assert len(state["discoveries"]) == 2
+                # Skipping discovery does not slide its expiry. Once a fresh
+                # response is required, rejected metadata prevents any key GET.
+                wait_status(fixture["b"], 401, limit=16)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["b"])])[0] == 401
+                with lock:
+                    assert len(state["discoveries"]) > 2
+                    last_keys = state["requests"]
+                    retries = state["dnsRequests"]
+                wait_for_dns_request(retries + 1)
+                with lock:
+                    assert state["requests"] == last_keys
+                    state["discovery"] = "valid"
+                wait_status(fixture["b"], 200)
+            elif args.conditional_discovery:
+                def metadata_seen(predicate, start=0, limit=10):
+                    deadline = time.monotonic() + limit
+                    while time.monotonic() < deadline:
+                        with lock:
+                            values = state["metadataRequests"][start:]
+                            match = next((entry for entry in values if predicate(entry)), None)
+                        if match is not None:
+                            return match
+                        time.sleep(.02)
+                    raise AssertionError(f"missing metadata observation: {values}")
+
+                def metadata_change(**changes):
+                    with lock:
+                        state.update(changes)
+                        return len(state["metadataRequests"])
+
+                metadata_seen(lambda entry: entry[1] == 304 and entry[0] is None)
+                wait_status(fixture["a"], 401)
+                with lock:
+                    assert not state["requests"]
+                start = metadata_change(discovery="valid")
+                wait_status(fixture["a"], 200)
+                metadata_seen(lambda entry: entry[0] == '"metadata-v1"' and entry[1] == 304, start)
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 401
+
+                for mode in ("mismatch304", "duplicate304"):
+                    start = metadata_change(discovery=mode)
+                    metadata_seen(lambda entry: entry[2] == mode, start)
+                    with lock:
+                        prior = state["requests"]
+                    wait_status(fixture["b"], 401)
+                    with lock:
+                        assert state["requests"] == prior
+                    start = metadata_change(discovery="valid")
+                    cold = metadata_seen(lambda entry: entry[2] == "valid", start)
+                    assert cold[:2] == (None, 200), cold
+                    wait_status(fixture["b"], 200)
+                    metadata_seen(lambda entry: entry[1] == 304, start)
+
+                start = metadata_change(discoveryDelay=3.2)
+                metadata_seen(lambda entry: entry[1] == 304 and entry[3] == 3.2, start)
+                with lock:
+                    prior = state["requests"]
+                start = metadata_change(discoveryDelay=0)
+                wait_status(fixture["b"], 401)
+                cold = metadata_seen(lambda entry: entry[3] == 0, start)
+                assert cold[:2] == (None, 200), cold
+                wait_status(fixture["b"], 200)
+                with lock:
+                    assert state["requests"] == prior + 1
+
+                start = metadata_change(dns="move")
+                changed = metadata_seen(lambda entry: entry[4] == "127.0.0.2", start)
+                assert changed[:2] == (None, 200), changed
+                metadata_seen(lambda entry: entry[1] == 304 and entry[4] == "127.0.0.2", start)
+                start = metadata_change(dns="cname-failover")
+                failover = metadata_seen(lambda entry: entry[4] == "127.0.0.2", start)
+                assert failover[:2] == (None, 200), failover
+            elif args.stage_timeout:
+                # Each capped stage aborts and waits for the normal retry tick.
+                # The six-second overall timeout alone cannot meet either bound.
+                wait_for_dns_request(1)
+                with lock:
+                    dns_times = state["dnsTimes"]
+                    assert 1.8 <= dns_times[1] - dns_times[0] < 5, dns_times
+                    assert not state["discoveries"] and not state["requests"]
+                    state.update(dns="valid", discoveryDelay=3)
+                deadline = time.monotonic() + 11
+                while time.monotonic() < deadline:
+                    with lock:
+                        discoveries = state.get("discoveryTimes", ())
+                        if len(discoveries) >= 2:
+                            assert 1.8 <= discoveries[1] - discoveries[0] < 5, discoveries
+                            assert not state["requests"]
+                            state.update(discoveryDelay=0)
+                            break
+                    time.sleep(.02)
+                else:
+                    raise AssertionError("metadata timeout did not retry")
+                wait_status(fixture["a"], 200)
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["a"])])[0] == 200
+            elif args.retry_backoff:
                 def failures(expected, limit):
                     with lock:
                         begin = len(state["attempts"])

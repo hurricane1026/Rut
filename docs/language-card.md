@@ -2647,7 +2647,10 @@ be disabled. Only HTTP/1.1 is offered over TLS; absent ALPN is allowed. HTTPS is
 implicit and cleartext endpoints are unavailable.
 
 `port` is 1–65535; `refreshSeconds` is 1–3600; `maxAgeSeconds` is 1–86400 and
-strictly greater than the refresh interval; `timeoutSeconds` is 1–60. Optional
+strictly greater than the refresh interval; `timeoutSeconds` is 1–60.
+Optional `dnsTimeoutSeconds` and `discoveryTimeoutSeconds` require their
+respective stages and cap stage time at 1–`timeoutSeconds` seconds while
+preserving the original total deadline. Optional
 `retrySeconds` is an integer from 1–3600 and defaults to `refreshSeconds`.
 Successful refreshes (including valid empty sets) wait `refreshSeconds` from
 completion. Failures default to waiting `retrySeconds` from completion.
@@ -2685,7 +2688,12 @@ malformed ETag rejects the enabled-profile attempt. Conditional GETs require the
 same initial IPv4 candidate and a still-fresh cache. Changed-IP/failover GETs are
 unconditional. A 304 requires the exact sent tag and fresh cache at completion,
 keeps the verifier bank/empty state, and renews age on success. Cold/expired caches
-need full 200 responses, and discovery is always unconditional/200-only. See
+need full 200 responses. Discovery remains unconditional unless
+`conditionalDiscovery` enables a separate, same-address strong ETag and hard
+metadata age under `maxAgeSeconds`. Discovery revalidation still fetches keys
+and never renews key age. Optional `discoveryCacheSeconds` (1–3600 and at
+most `maxAgeSeconds`) skips only fresh same-initial-address discovery. Key GETs
+continue and cache hits never extend metadata age. See
 [the conditional contract](jwks-discovery.md#conditional-key-refresh).
 Cache-Control-derived lifetimes, HTTP/2 origin fetches and compressed responses
 remain outside this profile.

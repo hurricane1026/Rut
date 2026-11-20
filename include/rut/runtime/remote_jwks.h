@@ -12,15 +12,19 @@ struct RemoteJwks {
     char dns_address[16]{};
     u16 dns_port = 53;
     u32 dns_cache_seconds = 0;
+    u32 dns_timeout_seconds = 0;
     char allowed_addresses[kMaxDnsAddresses][16]{};
     u32 allowed_count = 0;
     char discovery_path[1024]{};
     char discovery_issuer[1024]{};
+    u32 discovery_timeout_seconds = 0;
+    u32 discovery_cache_seconds = 0;
     u32 refresh_seconds = 0;
     u32 retry_seconds = 0;
     u32 max_retry_seconds = 0;
     u32 max_retry_after_seconds = 0;
     bool conditional_requests = false;
+    bool conditional_discovery = false;
     u32 max_age_seconds = 0;
     u32 timeout_seconds = 0;
     bool enabled() const { return refresh_seconds != 0; }
@@ -79,6 +83,10 @@ private:
     RemoteJwks configuration_{};
     JwksValidator request_validator_{};
     JwksValidator response_validator_{};
+    JwksValidator discovery_validator_{};
+    char discovery_address_[16]{};
+    u64 discovery_accepted_at_ = 0;
+    bool sent_discovery_validator_ = false;
     bool sent_validator_ = false;
     u64 validator_deadline_ = 0;
     u32 retry_after_seconds_ = 0;
@@ -100,6 +108,8 @@ private:
     bool begin_http(u64 now);
     bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
+    Str selected_address() const;
+    bool accept_discovery(u64 now);
     void clear_dns_cache();
     bool fail();
 };
