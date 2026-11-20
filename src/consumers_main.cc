@@ -856,6 +856,27 @@ bool policy_minimum_per_enabled_consumer(PolicySnapshot& snapshot, u32 value) {
     return true;
 }
 
+bool policy_minimum_methods_per_enabled_consumer(PolicySnapshot& snapshot, u32 value) {
+    i64 minimum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, minimum) || minimum > 4) return false;
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (!policy_enabled(doc, consumer)) continue;
+        const u32 id = field(doc, consumer, lit_str("id"));
+        u32 methods = 0;
+        for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+             record = doc.nodes[record].next) {
+            if (policy_owner_matches(doc, record, id) && policy_active(snapshot, record))
+                methods |= policy_method_bit(doc, field(doc, record, lit_str("method")));
+        }
+        u32 count = 0;
+        for (; methods; methods >>= 1) count += methods & 1U;
+        if (count < static_cast<u32>(minimum)) return false;
+    }
+    return true;
+}
+
 bool policy_consumer_groups(PolicySnapshot& snapshot, u32) {
     auto& doc = snapshot.registry;
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
@@ -902,6 +923,9 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("minimumActiveCredentialsPerEnabledConsumer"),
      false,
      policy_minimum_per_enabled_consumer},
+    {lit_str("minActiveMethodsPerEnabledConsumer"),
+     false,
+     policy_minimum_methods_per_enabled_consumer},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
