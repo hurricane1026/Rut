@@ -412,6 +412,7 @@ struct AstUpstreamDecl {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    bool hc_require_initial_success = false;
     Str hc_host_lit{};
     Str hc_path_lit{};             // raw `path:` string literal
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms

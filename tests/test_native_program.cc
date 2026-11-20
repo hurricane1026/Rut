@@ -3837,7 +3837,7 @@ upstream api {
     max_request_body_bytes: 17
     connect_timeout: 3s
     response_header_timeout: 7s
-    health_check: { path: "/healthz", interval: 2s, timeout: 3s, status_min: 201, status_max: 299, host: "probe.example:8080", failure_threshold: 3, success_threshold: 2 }
+    health_check: { path: "/healthz", interval: 2s, timeout: 3s, status_min: 201, status_max: 299, host: "probe.example:8080", failure_threshold: 3, success_threshold: 2, require_initial_success: true }
 }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
@@ -3862,6 +3862,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 
     CHECK_EQ(target.response_header_timeout_seconds, 7u);
     CHECK(target.hc_enabled);
+    CHECK_EQ(target.hc_require_initial_success, 1u);
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK_EQ(target.hc_timeout_seconds, 3u);
     CHECK((Str{target.hc_host, target.hc_host_len}.eq(lit_str("probe.example:8080"))));

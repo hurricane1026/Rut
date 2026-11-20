@@ -609,6 +609,15 @@ inclusive range of complete response statuses. Both bounds are required,
 each must be 100–599, and the minimum cannot exceed the maximum. This pair
 cannot be combined with `status`; without either, the exact default is 200.
 
+Set `require_initial_success: true` in `health_check` to exclude each backend
+until it has passed the configured consecutive `success_threshold` probes on
+that shard and configuration generation. Passive connection success does not
+satisfy this requirement. Pending endpoints never enter fail-open selection;
+if none are eligible, forwarding and explicit connect return 503. Once ready,
+normal active/passive ejection and fail-open behavior apply. Reload resets the
+latch. The option defaults to false and retains the existing plaintext-only
+probe support.
+
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
 A complete response with the expected status counts as success. Connect/read
 errors, malformed responses, unexpected status and timeouts count as failures.

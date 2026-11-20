@@ -1518,6 +1518,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.tls = module.upstreams[i].tls;
         up.http2 = module.upstreams[i].http2;
         up.hc_enabled = module.upstreams[i].hc_enabled;
+        up.hc_require_initial_success = module.upstreams[i].hc_require_initial_success;
         up.hc_host = module.upstreams[i].hc_host;
         up.hc_path = module.upstreams[i].hc_path;
         up.hc_interval_ms = module.upstreams[i].hc_interval_ms;

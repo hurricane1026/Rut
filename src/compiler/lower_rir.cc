@@ -4344,6 +4344,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].tls = mir.upstreams[i].tls;
         out.module.upstreams[i].http2 = mir.upstreams[i].http2;
         out.module.upstreams[i].hc_enabled = mir.upstreams[i].hc_enabled;
+        out.module.upstreams[i].hc_require_initial_success =
+            mir.upstreams[i].hc_require_initial_success;
         const Str src_hc_host = mir.upstreams[i].hc_host;
         char* hc_host_buf = nullptr;
         if (src_hc_host.len > 0) {

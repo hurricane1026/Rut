@@ -101,6 +101,7 @@ struct UpstreamTarget {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    u8 hc_require_initial_success = 0;
     char hc_host[261]{};
     u32 hc_host_len = 0;
     char hc_path[64];
@@ -1908,7 +1909,8 @@ public:
                                    u32 timeout_seconds = 0,
                                    u16 status_min = 0,
                                    u16 status_max = 0,
-                                   Str host = {}) {
+                                   Str host = {},
+                                   bool require_initial_success = false) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
         if (path == nullptr) return false;
@@ -1939,6 +1941,7 @@ public:
         up.hc_status_min = status_min;
         up.hc_status_max = status_max;
         up.hc_thresholds = thresholds;
+        up.hc_require_initial_success = require_initial_success ? 1 : 0;
         up.hc_enabled = true;
         return true;
     }

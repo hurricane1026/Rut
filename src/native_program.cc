@@ -570,6 +570,9 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream response header timeout");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
+        if (target.hc_require_initial_success > 1 ||
+            (target.hc_require_initial_success && !target.hc_enabled))
+            return fail("invalid native upstream initial readiness");
         if (target.hc_host_len >= sizeof(target.hc_host) ||
             (target.hc_host_len && !active_health_host_valid({target.hc_host, target.hc_host_len})))
             return fail("invalid native upstream health host");
