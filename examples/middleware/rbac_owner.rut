@@ -1,0 +1,8 @@
+// Only after authentication, tenant binding and role authorization; owner is
+// trusted resource metadata, not a caller-controlled header or body.
+func requireOwner(_ identity: Json, _ ownerConsumerId: str) -> Json {
+    guard Bytes(ownerConsumerId).count >= 1 && Bytes(ownerConsumerId).count <= 64 && ownerConsumerId.matches(re"^[\x21-\x7e]+$") else { respond 503 }
+    let consumerId = json.string(json.get(identity, "/consumerId").or(identity)).or("")
+    guard consumerId == ownerConsumerId else { respond 403 }
+    identity
+}

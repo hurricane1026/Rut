@@ -1,0 +1,15 @@
+import "middleware/rbac_owner.rut"
+
+listen :8080
+
+// Tenant bindings, role and resource owner are trusted configuration.
+route GET "/tenant/acme/invoices/alice" {
+    guard let identity = consumerAuthenticate(req.authorization.or(""), env("AUTH_REGISTRY"), "bearer") else { return 401 }
+    guard let field = json.get(identity, "/consumerId") else { return 403 }
+    guard let id = json.string(field) else { return 403 }
+    guard id == "alice" || id == "bob" else { return 403 }
+    guard jwtHasGroup(identity, "invoice-reader") else { return 403 }
+    let owned = rbac_owner.requireOwner(identity, "alice")
+    guard let subject = json.string(json.get(owned, "/consumerId").or(owned)) else { return 503 }
+    return response(200, body: subject)
+}
