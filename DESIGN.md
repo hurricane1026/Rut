@@ -599,7 +599,13 @@ req.bodyRaw             // raw body as string, error-capable
 req.bodyRaw = newBody   // replace body before forward (recomputes Content-Length)
 
 // Cookies
-req.cookie("session_id") // string?
+req.cookie("session_id")       // string? — first matching pair
+req.uniqueCookie("session_id") // string? — exactly one matching pair
+
+// uniqueCookie requires a nonempty literal HTTP token name. It scans the original
+// parsed Cookie fields using cookie() pair rules, matches names case-sensitively,
+// and returns nil for zero or multiple matches; one empty value is present.
+// HTTP/2 uses the same synthesized view, where Cookie fields are joined.
 
 // Multi-value headers: getAll requires a nonempty literal HTTP token name.
 // It matches case-insensitively, does not split commas, and returns an empty

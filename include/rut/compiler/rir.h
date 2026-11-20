@@ -232,6 +232,7 @@ enum class Opcode : u8 {
     ReqRemoteAddr,           // %r = req.remote_addr          → IP
     ReqContentLength,        // %r = req.content_length       → ByteSize
     ReqCookie,               // %r = req.cookie "name"        → Optional(str)
+    ReqUniqueCookie,         // %r = req.uniqueCookie "name"  → Optional(str)
 
     // ── Request mutation ──
     ReqSetHeader,           // req.set_header "Name", %val

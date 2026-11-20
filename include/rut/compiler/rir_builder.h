@@ -640,10 +640,10 @@ struct Builder {
         return TRY(emit(Opcode::ReqContentLength, ty, loc)).vid;
     }
 
-    Result<ValueId> emit_req_cookie(Str name, SourceLoc loc = {}) {
+    Result<ValueId> emit_req_cookie(Str name, SourceLoc loc = {}, bool unique = false) {
         auto* inner = TRY(make_type(TypeKind::Str));
         auto* ty = TRY(make_type(TypeKind::Optional, inner));
-        auto [inst, vid] = TRY(emit(Opcode::ReqCookie, ty, loc));
+        auto [inst, vid] = TRY(emit(unique ? Opcode::ReqUniqueCookie : Opcode::ReqCookie, ty, loc));
         inst->imm.str_val = name;
         return vid;
     }
