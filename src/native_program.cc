@@ -565,6 +565,9 @@ bool load_native_program(const char* source,
         if (!target.passive_health.valid()) return fail("invalid native upstream passive health");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
+        if (target.hc_host_len >= sizeof(target.hc_host) ||
+            (target.hc_host_len && !active_health_host_valid({target.hc_host, target.hc_host_len})))
+            return fail("invalid native upstream health host");
         if (target.hc_enabled && target.hc_timeout_seconds >= TimerWheel::kSlots)
             return fail("invalid native upstream health timeout");
         if (target.hc_enabled && !target.hc_thresholds.valid())

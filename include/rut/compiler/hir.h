@@ -70,6 +70,7 @@ struct HirUpstream {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    Str hc_host{};
     Str hc_path{};
     u32 hc_interval_ms = 0;
     u32 hc_timeout_seconds = 0;  // 0 uses the upstream timeout.

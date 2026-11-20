@@ -573,6 +573,11 @@ upstream api {
 }
 ```
 
+An optional `host: "api.example:8080"` inside `health_check` selects the literal
+HTTP Host authority sent on plaintext probes. It accepts a nonempty, valid
+authority up to 260 bytes; omission uses the probed IPv4 address and port. It
+does not enable TLS or alter forwarding requests.
+
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
 A complete response with the expected status counts as success. Connect/read
 errors, malformed responses, unexpected status and timeouts count as failures.
