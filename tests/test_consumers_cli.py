@@ -104,6 +104,14 @@ def test_targeted_registry_commands(tool, root):
     del_group = {k: v for k, v in parked.items() if k != 'groups'}
     mutate('inherit-credential-groups', [parked['id']],
            dict(snapshot, credentials=[raw, del_group, inherited]), restricted_path)
+
+    for bounds in (('10', '10'), ('101', '100'), ('-1', '100'), ('+1', '100'),
+                   ('1', '9223372036854775808'), ('', '100')):
+        mutate('set-credential-window', [parked['id'], *bounds], None)
+    end = 9223372036854775807
+    start_removed = {k: v for k, v in parked.items() if k != 'notBefore'}
+    windowed = dict(snapshot, credentials=[raw, dict(start_removed, expiresAt=end), inherited])
+    mutate('set-credential-window', [parked['id'], '-', str(end)], windowed)
     assert source.read_bytes() == original
 
 
