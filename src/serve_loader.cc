@@ -165,7 +165,8 @@ bool copy_access_log_sink(const HirModule& hir, Str source, AccessLogSinkSpec& o
         source.ptr[decl.path_token_span.start] != '"' ||
         source.ptr[decl.path_token_span.end - 1u] != '"' ||
         (decl.format != AccessLogFormatProfile::DownstreamRequestBytesLine &&
-         decl.format != AccessLogFormatProfile::DownstreamHost) ||
+         decl.format != AccessLogFormatProfile::DownstreamHost &&
+         decl.format != AccessLogFormatProfile::UpstreamAttempts) ||
         decl.publication != AccessLogPublicationProfile::LiveEachRecord ||
         !access_log_sink_path_valid(decl.path))
         return false;

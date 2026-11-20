@@ -9881,3 +9881,19 @@ TEST(serve_loader, websocket_cache_effects_keep_identity_and_clock_across_messag
     program.destroy();
 }
 #endif
+
+TEST(serve_loader, source_access_log_upstream_attempts_profile) {
+    const std::string dir = "/tmp/rut_serve_loader_access_log_upstream_attempts";
+    std::filesystem::remove_all(dir);
+    const std::string path = write_file(dir,
+                                        "app.rut",
+                                        "accessLog { path: \"/var/log/rut/attempts.log\", format: "
+                                        "upstreamAttempts, publication: live }\n"
+                                        "route GET \"/\" { return 200 }\n");
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE(program.access_log.present);
+    CHECK(program.access_log.format == AccessLogFormatProfile::UpstreamAttempts);
+    CHECK(access_log_sink_spec_valid(program.access_log));
+}

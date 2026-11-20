@@ -261,6 +261,20 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     return w;
 }
 
+u32 format_access_log_upstream_attempts_line(const AccessLogEntry& entry, char* buf, u32 buf_size) {
+    char line[16];
+    u32 length = write_u64_dec(line, entry.status);
+    line[length++] = ' ';
+    if (entry.upstream_attempts_plus_one)
+        length += write_u64_dec(line + length, entry.upstream_attempts_plus_one - 1u);
+    else
+        line[length++] = '-';
+    line[length++] = '\n';
+    if (!buf || buf_size < length) return 0;
+    for (u32 i = 0; i < length; ++i) buf[i] = line[i];
+    return length;
+}
+
 u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
                                                     char* buf,
                                                     u32 buf_size) {

@@ -730,3 +730,27 @@ TEST(access_log_live_writer, invalid_and_double_lifecycle_fail_without_fd_leaks)
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(access_log_live_writer, upstream_attempts_profile_writes_status_and_availability) {
+    LiveAccessLogRing ring;
+    ring.init();
+    Pipe output;
+    REQUIRE(output.open_nonblocking());
+    SourceLiveAccessLogLeaseSlot lease{nullptr};
+    SourceLiveAccessLogRingBinding bindings[] = {{&ring, &lease}};
+    SourceLiveAccessLogSession session;
+    REQUIRE(session.start(
+        output.take_writer(), bindings, 1u, AccessLogFormatProfile::UpstreamAttempts));
+    AccessLogEntry entry{};
+    entry.status = 200;
+    entry.upstream_attempts_plus_one = 1;
+    CHECK(ring.try_publish(entry).status == LiveAccessLogPublishStatus::Published);
+    entry.status = 502;
+    entry.upstream_attempts_plus_one = 3;
+    CHECK(ring.try_publish(entry).status == LiveAccessLogPublishStatus::Published);
+    entry.status = 503;
+    entry.upstream_attempts_plus_one = 0;
+    CHECK(ring.try_publish(entry).status == LiveAccessLogPublishStatus::Published);
+    CHECK(session.finish().status == SourceLiveAccessLogFinishStatus::Success);
+    CHECK_EQ(read_to_eagain_or_eof(output.read_fd), "200 0\n502 2\n503 -\n");
+}

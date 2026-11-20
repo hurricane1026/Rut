@@ -4766,6 +4766,11 @@ set_tests_properties(test_cli_backend PROPERTIES LABELS "cli" RUN_SERIAL TRUE TI
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    add_test(NAME test_cli_access_log_attempts
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_access_log_attempts.py
+                $<TARGET_FILE:rut>)
+    set_tests_properties(test_cli_access_log_attempts PROPERTIES
+        LABELS "cli;access-log" RUN_SERIAL TRUE TIMEOUT 75)
     add_test(NAME test_cli_access_log_host
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_access_log_host.py
                 $<TARGET_FILE:rut>)

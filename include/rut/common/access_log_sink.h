@@ -11,6 +11,7 @@ enum class AccessLogFormatProfile : u8 {
     None = 0,
     DownstreamRequestBytesLine = 1,
     DownstreamHost = 2,
+    UpstreamAttempts = 3,
 };
 
 enum class AccessLogPublicationProfile : u8 {
@@ -74,7 +75,8 @@ inline bool access_log_sink_spec_valid(const AccessLogSinkSpec& spec) {
         return true;
     }
     if ((spec.format != AccessLogFormatProfile::DownstreamRequestBytesLine &&
-         spec.format != AccessLogFormatProfile::DownstreamHost) ||
+         spec.format != AccessLogFormatProfile::DownstreamHost &&
+         spec.format != AccessLogFormatProfile::UpstreamAttempts) ||
         spec.publication != AccessLogPublicationProfile::LiveEachRecord ||
         spec.path_len > kAccessLogSinkPathMax || spec.path[spec.path_len] != '\0')
         return false;
