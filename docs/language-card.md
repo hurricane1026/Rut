@@ -583,6 +583,15 @@ behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md
 See the [consistent-hash implementation design](consistent-hash-design.md) for
 weighted HRW encoding, remapping guarantees and acceptance boundaries.
 
+HTTP/1 forwarding and HTTP/2 streams targeting HTTP/1 origins can fail over after
+a TCP connect failure, before sending any application request bytes. The budget
+is at most three distinct endpoints, using the original load-balancing policy
+and hash digest, target weights and health restrictions. This includes POST
+requests that have not reached the origin, within the existing buffered
+forwarding profiles for HTTP/2 bodies. HTTP statuses, response resets,
+timeouts and native HTTP/2/gRPC origin requests do not gain retries. See
+[upstream connect failover](upstream-connect-failover.md).
+
 ## Active HTTP upstream health checks
 
 ```swift
