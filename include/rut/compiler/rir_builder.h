@@ -763,6 +763,17 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_set_hash(ValueId key, ValueId seed, SourceLoc loc = {}) {
+        if ((!val_has_type(key, TypeKind::Str) && !val_has_type(key, TypeKind::IP)) ||
+            !val_has_type(seed, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqSetHash, nullptr, loc));
+        r.inst->operands[0] = key;
+        r.inst->operands[1] = seed;
+        r.inst->operand_count = 2;
+        return {};
+    }
+
     VoidResult emit_req_set_path(ValueId path, SourceLoc loc = {}, bool owned = false) {
         if (!val_has_type(path, TypeKind::Str)) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));

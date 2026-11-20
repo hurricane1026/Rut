@@ -17,9 +17,11 @@
 #include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/format_integer.h"
+#include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_call.h"
 #include "rut/runtime/http_parser.h"
@@ -686,19 +688,60 @@ void rut_helper_req_set_owned_path(void* conn, const char* path, u32 len) {
     c.req_path_override = {copy, len};
 }
 
-void rut_helper_req_set_load_balance(void* conn, u32 encoded) {
-    if (!conn) return;  // ABI-only callers may inspect a result without dispatching.
-    auto* c = static_cast<ConnectionBase*>(conn);
-    if (encoded == 0) {
-        c->forward_load_balance = {};
-        return;
+void rut_helper_req_set_hash(void* conn,
+                             const char* key,
+                             u32 len,
+                             const char* seed,
+                             u32 seed_len,
+                             u32 ip,
+                             u32 type,
+                             const u8* req_data,
+                             u32 req_len) {
+    if (!conn) return;
+    auto& spec = static_cast<ConnectionBase*>(conn)->forward_load_balance;
+    __builtin_memset(spec.hash_digest, 0, sizeof(spec.hash_digest));
+    spec.hash_status = 503;
+    spec.hash_grpc = false;
+    if (type == 2) {
+        key = reinterpret_cast<const char*>(&ip);
+        len = 4;
     }
-    c->forward_load_balance = {static_cast<u16>(encoded >> 8),
-                               static_cast<LoadBalancePolicy>(encoded & 255)};
-    if ((encoded >> 8) > kMaxForwardSites || (encoded >> 8) == 0 ||
-        !load_balance_policy_valid(c->forward_load_balance.policy) ||
-        c->forward_load_balance.policy == LoadBalancePolicy::None)
-        c->forward_load_balance = {0, LoadBalancePolicy::Invalid};
+    u8 decoded[16];
+    if (consistent_hash_seed({seed, seed_len}, decoded)) {
+        if (!key || len == 0 || len > 4096)
+            spec.hash_status = 400;
+        else if (consistent_hash_digest(
+                     {key, len}, static_cast<u8>(type), {seed, seed_len}, spec.hash_digest))
+            spec.hash_status = 1;
+    }
+    // Transparent upgrades are not part of the initial consistent-hash contract.
+    if (static_cast<ConnectionBase*>(conn)->req_wants_upgrade) spec.hash_status = 503;
+    if (req_data && (spec.hash_status != 1 ||
+                     (req_len >= 8 && __builtin_memcmp(req_data, "CONNECT ", 8) == 0))) {
+        ParsedRequest request{};
+        HttpParser parser;
+        if (parser.parse(req_data, req_len, &request) == ParseStatus::Complete) {
+            if (request.method == HttpMethod::CONNECT) spec.hash_status = 503;
+            if (spec.hash_status != 1) spec.hash_grpc = grpc_request(request);
+        }
+    }
+}
+
+u32 rut_helper_req_set_load_balance(void* conn, u32 encoded) {
+    if (!conn)
+        return (encoded & 255) == static_cast<u32>(LoadBalancePolicy::ConsistentHash) ? 503 : 0;
+    auto& spec = static_cast<ConnectionBase*>(conn)->forward_load_balance;
+    const auto policy = static_cast<LoadBalancePolicy>(encoded & 255);
+    if (policy != LoadBalancePolicy::ConsistentHash) spec = {};
+    spec.site = static_cast<u16>(encoded >> 8);
+    spec.policy = policy;
+    if ((encoded >> 8) > kMaxForwardSites || !forward_load_balance_valid(spec)) {
+        spec = {0, LoadBalancePolicy::Invalid};
+        return 503;
+    }
+    if (policy == LoadBalancePolicy::ConsistentHash && spec.hash_status != 1)
+        return spec.hash_status == 400 ? 400 : 503;
+    return 0;
 }
 
 void rut_helper_req_set_target_transform(void* conn, u32 transform_id) {

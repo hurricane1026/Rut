@@ -377,12 +377,23 @@ struct Ctx {
         return helper;
     }
 
+    LLVMValueRef fn_req_set_hash = nullptr;
+    LLVMValueRef get_req_set_hash() {
+        if (!fn_req_set_hash) {
+            LLVMTypeRef params[] = {
+                ptr_ty, ptr_ty, i32_ty, ptr_ty, i32_ty, i32_ty, i32_ty, ptr_ty, i32_ty};
+            fn_req_set_hash = LLVMAddFunction(
+                llvm_mod, "rut_helper_req_set_hash", LLVMFunctionType(void_ty, params, 9, 0));
+        }
+        return fn_req_set_hash;
+    }
+
     // void rut_helper_req_set_load_balance(ptr conn, i32 id)
     LLVMValueRef fn_req_set_load_balance = nullptr;
     LLVMValueRef get_req_set_load_balance() {
         if (!fn_req_set_load_balance) {
             LLVMTypeRef params[] = {ptr_ty, i32_ty};
-            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 2, 0);
+            LLVMTypeRef ft = LLVMFunctionType(i32_ty, params, 2, 0);
             fn_req_set_load_balance =
                 LLVMAddFunction(llvm_mod, "rut_helper_req_set_load_balance", ft);
         }
@@ -1403,6 +1414,29 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             opt = LLVMBuildInsertValue(c.builder, opt, p, 1, "opt.ptr");
             opt = LLVMBuildInsertValue(c.builder, opt, l, 2, "opt.len");
             c.set_value(inst.result, opt);
+            break;
+        }
+        case rir::Opcode::ReqSetHash: {
+            LLVMValueRef key = c.get_value(inst.operands[0]);
+            LLVMValueRef seed = c.get_value(inst.operands[1]);
+            const bool ip = c.cur_fn->values[inst.operands[0].id].type->kind == rir::TypeKind::IP;
+            LLVMValueRef args[] = {
+                c.param_conn,
+                ip ? LLVMConstNull(c.ptr_ty) : LLVMBuildExtractValue(c.builder, key, 0, "hash.key"),
+                ip ? LLVMConstInt(c.i32_ty, 4, 0)
+                   : LLVMBuildExtractValue(c.builder, key, 1, "hash.len"),
+                LLVMBuildExtractValue(c.builder, seed, 0, "hash.seed"),
+                LLVMBuildExtractValue(c.builder, seed, 1, "hash.seed.len"),
+                ip ? key : LLVMConstInt(c.i32_ty, 0, 0),
+                LLVMConstInt(c.i32_ty, ip ? 2 : 1, 0),
+                c.param_req_data,
+                c.param_req_len};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_hash()),
+                           c.get_req_set_hash(),
+                           args,
+                           9,
+                           "");
             break;
         }
         case rir::Opcode::ReqSetPath: {
@@ -3573,12 +3607,32 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             // the existing request/response policy ABI and preflight proof shape.
             LLVMValueRef lb_args[] = {
                 c.param_conn, LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), 0)};
-            LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_req_set_load_balance()),
-                           c.get_req_set_load_balance(),
-                           lb_args,
-                           2,
-                           "");
+            LLVMValueRef hash_status =
+                LLVMBuildCall2(c.builder,
+                               LLVMGlobalGetValueType(c.get_req_set_load_balance()),
+                               c.get_req_set_load_balance(),
+                               lb_args,
+                               2,
+                               "hash.status");
+            const auto hash_ok = LLVMAppendBasicBlockInContext(
+                c.llvm_ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder)), "hash.ok");
+            const auto hash_error = LLVMAppendBasicBlockInContext(
+                c.llvm_ctx, LLVMGetBasicBlockParent(LLVMGetInsertBlock(c.builder)), "hash.error");
+            LLVMBuildCondBr(
+                c.builder,
+                LLVMBuildICmp(
+                    c.builder, LLVMIntEQ, hash_status, LLVMConstInt(c.i32_ty, 0, 0), "hash.valid"),
+                hash_ok,
+                hash_error);
+            LLVMPositionBuilderAtEnd(c.builder, hash_error);
+            LLVMValueRef error_result =
+                LLVMBuildShl(c.builder,
+                             LLVMBuildZExt(c.builder, hash_status, c.i64_ty, "hash.error.ext"),
+                             LLVMConstInt(c.i64_ty, 8, 0),
+                             "hash.error.result");
+            c.emit_parse_unprime();
+            LLVMBuildRet(c.builder, error_result);
+            LLVMPositionBuilderAtEnd(c.builder, hash_ok);
             // Pack: action=Forward, upstream_id from operand. For the explicit
             // request-policy slice, operand 1 carries the compact policy id in
             // the otherwise-unused status slot.

@@ -1,9 +1,9 @@
 # Consistent Hashing for Upstream Selection
 
-Status: **proposal, not implemented**. This document specifies future implementation
-and acceptance criteria; it does not introduce currently supported syntax.
-Baseline: `388fc48ba`; scenarios K017/K018. Only `.roundRobin` and `.leastRequests`
-are currently accepted. See the [language card](language-card.md#explicit-load-balancing-at-each-forward-call).
+Status: **implemented with the validation boundaries recorded below**. This
+specification includes deployment acceptance criteria beyond the local test suite.
+Design baseline: `388fc48ba`; scenarios K017/K018. The compiler accepts
+`.roundRobin`, `.leastRequests` and `.consistentHash`. See the [language card](language-card.md#explicit-load-balancing-at-each-forward-call).
 
 ## 1. Goals and scope
 
@@ -286,7 +286,11 @@ version. At implementation time, verify that version's hash_on, weights and
 health parameters. Claim coverage only for versions actually tested. Compare
 stability, enable/disable behavior, remapping properties and distribution;
 do not describe differing endpoint sequences as identical mappings.
-This document adds no differential tests and reports no live Kong execution.
+The optional `--kong` mode of `tests/test_consistent_hash.py` runs that pinned
+image. It checks header affinity, weighted distribution, zero-weight disablement
+and reordering. Adding a target also records migrations between old targets:
+Kong Ketama and Rut HRW have different placement and remapping behavior. See the
+[validation record](consistent-hash-validation.md) for observed results.
 
 ## 7. Implementation stages and acceptance gates
 
@@ -299,7 +303,8 @@ This document adds no differential tests and reports no live Kong execution.
 
 Merging A/B does not complete a usable feature. Mark the K018 subset complete
 only after all C/D gates pass. Implementation PRs must update DESIGN, the
-language card, examples and scenario index. This design PR only links the proposal.
+language card, examples and scenario index. Remaining deployment gates are recorded
+explicitly in the validation record; this implementation does not claim all gates complete.
 
 Required tests:
 
@@ -352,3 +357,49 @@ settings, hash_on string enum, automatic Cookies, dynamic target IDs or state
 store. Before extending to DNS, IPv6 or a management plane, define stable target
 identities and distributed configuration consistency. Resolver-result array
 indexes must never serve as target identities.
+
+
+## Implementation notes
+
+The implementation uses the existing compiled string-constant ownership for
+seeds rather than introducing a separate policy table. Each forwarding operation
+emits one `ReqSetHash` before request rewrites and the terminal forwarding result;
+the verifier checks the constant seed, key types, distinct static endpoints and
+that the terminal has exactly one hash operation in its block. This preserves
+native artifact ownership after source removal without adding another loader
+format. Native ABI is 23 (22 was the previous version).
+
+`ForwardLoadBalance` holds the 32-byte digest, a validation status and the gRPC
+error-mapping flag. It remains trivially constructible for the HTTP/2 slab pool.
+Its size is 38 bytes; on x86-64 `Connection` grows from 6232 to 6264 bytes.
+Existing H2 pending/async copies carry the complete metadata by value. Selection
+uses the original pinned configuration and recalculates only endpoint scores on
+retry. Normal requests do not parse HTTP again merely to hash the key.
+
+The shipped expression subset covers literals, bound locals, scalar request
+reads, optional unwrapping/fallback and string concatenation. Other expression
+kinds reject until their purity is established. Transparent WebSocket upgrades
+and CONNECT reject with 503; this change does not add a hash policy to the
+`websocket(...)` builder or explicit connection waits.
+
+The independent Python oracle in `tests/test_consistent_hash.py` checks live
+HTTP/1 and HTTP/2 routing against the specified digest and integer algorithm,
+including reordered endpoints, multiple shards, IP keys, zero weights and invalid
+keys. `test_hash` checks golden vectors and 100,000-key weighted distribution and
+remapping properties. Dedicated frontend, JIT and native tests cover validation,
+timer suspension, digest ownership and execution after source removal. These
+checks establish the Rut algorithm; they do not imply byte-for-byte Ketama
+placement compatibility with Kong or completion of every deployment/performance
+gate listed above. Performance experiments remain outside default CI.
+
+
+### Validated scope and remaining gates
+
+See [the validation record](consistent-hash-validation.md) for commands and counts.
+The ordinary HTTP/2-to-HTTP/1 proxy retains its existing single async-slot limit;
+this change does not add concurrent ordinary proxy streams to one connection.
+The same-connection stream-isolation fixture closes each upstream response.
+An io_uring upstream-drain 502 also reproduces with `.roundRobin` when that fixture
+keeps the origin connection alive; it is not treated as a passing hash test.
+Concurrent gRPC RPC affinity/accounting is covered separately. Cross-architecture
+execution and production performance/cancellation stress gates remain open.

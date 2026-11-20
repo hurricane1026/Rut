@@ -243,6 +243,7 @@ enum class Opcode : u8 {
     RespAddHeader,          // resp.add_header "Name", %val
     RespRemoveHeader,       // resp.remove_header "Name"
     RespCommitHeaders,      // publish pending Response-builder mutations
+    ReqSetHash,             // req.set_hash %key, %constant_seed
     ReqSetPath,             // req.set_path %path
     ReqSetTargetTransform,  // req.set_target_transform <1-based transform id>
     CtxStoreSlotI32,        // if i < ctx.slot_count: ctx.slot[i] = %val

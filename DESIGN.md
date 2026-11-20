@@ -1548,8 +1548,8 @@ route POST "/jobs" {
 ```
 
 `load_balance` is an ordinary named argument, not a new keyword. Its value has
-a closed policy type; the initial policy vocabulary is `.roundRobin` and
-`.leastRequests`. The compiler requires this argument at every `forward` call; legacy
+a closed policy type; its vocabulary is `.roundRobin`, `.leastRequests` and
+`.consistentHash`. The compiler requires this argument at every `forward` call; legacy
 `forward(api)` is rejected, including for single-backend upstreams.
 
 `upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1] }`
@@ -1570,6 +1570,19 @@ to each pinned configuration; no request-path allocation or cross-shard mutation
 is introduced. New RCU configurations begin at zero. Native artifact version
 19 records the new layout and rejects earlier artifacts for recompilation.
 
+
+Consistent hashing uses weighted rendezvous hashing with deterministic integer
+Q32.32 exponential-race costs, HMAC-SHA256 key digests and SHA256 endpoint scores.
+It reuses the existing eligibility mask, excluding zero-weight, unavailable,
+saturated and already attempted targets. Endpoint identity consists only of the
+network-order IPv4 address and port. A request-owned digest is copied with H2
+pending/async forwarding state; retries retain the digest and the pinned RCU
+configuration. No new per-shard cursor, ring, allocation or external library is
+required. `hash_key` and `hash_seed` are required named arguments only for this
+policy. Seeds are immutable compiled constants; native ABI 23 carries the new
+operation and forwarding metadata. See
+[the complete design](docs/consistent-hash-design.md) and
+[language contract](docs/language-card.md) for key validation and protocol limits.
 
 Active HTTP probes use the existing upstream `health_check` object on both Linux
 backends. io_uring uses one-shot receives into probe-owned slices, immutable

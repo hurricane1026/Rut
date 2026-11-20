@@ -33082,3 +33082,69 @@ TEST(jit, request_header_all_helper_owns_original_values) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, consistent_hash_digest_survives_yield_and_rejects_empty_keys) {
+    const char* source = R"(
+upstream api at "127.0.0.1:9001"
+route GET "/rr" { return forward(api, load_balance: .consistentHash, hash_key: req.header("X-Key").or(""), hash_seed: "0123456789abcdef0123456789abcdef") }
+route GET "/least" { wait(1ms) return forward(api, load_balance: .consistentHash, hash_key: req.header("X-Key").or(""), hash_seed: "0123456789abcdef0123456789abcdef") }
+)";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule out{};
+    REQUIRE(lower_to_rir(mir.value(), out));
+    auto cg = codegen(out.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto rr = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    auto least = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(rr != nullptr);
+    REQUIRE(least != nullptr);
+    ConnectionBase conn;
+    conn.reset();
+    HandlerCtx ctx{};
+    constexpr char request[] = "GET /rr HTTP/1.1\r\nHost: localhost\r\nX-Key: tenant-42\r\n\r\n";
+    const auto* data = reinterpret_cast<const u8*>(request);
+    auto result = HandlerResult::unpack(rr(&conn, &ctx, data, sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.action, HandlerAction::Forward);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::ConsistentHash);
+    REQUIRE_EQ(conn.forward_load_balance.hash_status, 1u);
+    u8 digest[32];
+    memcpy(digest, conn.forward_load_balance.hash_digest, 32);
+    const u16 first_site = conn.forward_load_balance.site;
+    conn.forward_load_balance = {};
+    result = HandlerResult::unpack(least(&conn, &ctx, data, sizeof(request) - 1, nullptr));
+    REQUIRE_EQ(result.action, HandlerAction::Yield);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::None);
+    ctx.state = result.next_state;
+    ctx.resume_event_kind = static_cast<u32>(YieldKind::Timer);
+    result = HandlerResult::unpack(least(&conn, &ctx, data, sizeof(request) - 1, nullptr));
+    CHECK_EQ(result.action, HandlerAction::Forward);
+    CHECK_EQ(conn.forward_load_balance.policy, LoadBalancePolicy::ConsistentHash);
+    CHECK(conn.forward_load_balance.site != first_site);
+    CHECK(memcmp(digest, conn.forward_load_balance.hash_digest, 32) == 0);
+    ctx = {};
+    constexpr char empty[] = "GET /rr HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    result = HandlerResult::unpack(
+        rr(&conn, &ctx, reinterpret_cast<const u8*>(empty), sizeof(empty) - 1, nullptr));
+    CHECK_EQ(result.action, HandlerAction::ReturnStatus);
+    CHECK_EQ(result.status_code, 400u);
+    ctx = {};
+    constexpr char grpc[] =
+        "POST /rr HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc\r\nContent-Length: "
+        "0\r\n\r\n";
+    result = HandlerResult::unpack(
+        rr(&conn, &ctx, reinterpret_cast<const u8*>(grpc), sizeof(grpc) - 1, nullptr));
+    CHECK_EQ(result.status_code, 400u);
+    CHECK(conn.forward_load_balance.hash_grpc);
+    engine.shutdown();
+    out.destroy();
+}

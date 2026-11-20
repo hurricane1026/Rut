@@ -498,8 +498,8 @@ effects only. Full buffered body/status middleware remains ⏳.
 
 ## Explicit load balancing at each forward call
 
-Every `forward` requires an explicit `load_balance` named argument. The only
-accepted values are `.roundRobin` and `.leastRequests`. Legacy `forward(api)`
+Every `forward` requires an explicit `load_balance` named argument. The accepted
+values are `.roundRobin`, `.leastRequests` and `.consistentHash`. Legacy `forward(api)`
 is a compile error, including for single-backend upstreams.
 
 ```swift
@@ -520,6 +520,32 @@ and host-bound upstreams. `upstream` contains backend/connection configuration;
 it does not contain or supply a selection policy. The `at "ip:port"` upstream
 form can remain: its callers must supply the argument. There is no default,
 inheritance, string spelling, numeric spelling, or policy alias.
+
+Consistent hashing uses weighted rendezvous selection over distinct static IPv4
+endpoints. Both `hash_key` and `hash_seed` are required only for `.consistentHash`:
+
+```swift
+route GET "/sticky" {
+    guard let tenant = req.header("X-Tenant-ID") else { return 400 }
+    return forward(api, load_balance: .consistentHash,
+                   hash_key: tenant,
+                   hash_seed: env("UPSTREAM_HASH_SEED"))
+}
+```
+
+The key is a non-optional `str` or `IP`, evaluated once from bounded pure
+expressions or already bound locals. Strings use exact bytes, including NUL;
+empty or larger-than-4096-byte keys reject with HTTP 400 before upstream I/O.
+Native gRPC uses HTTP 200 with trailers-only `grpc-status: 3` instead.
+The seed must be a nonzero compile/load-time constant of 32 lowercase hex
+characters. Set the same seed across instances for the same mapping; changing
+it remaps keys. Backend declaration order, shard count and connection reuse do
+not change selection. Weight zero, health, capacity and retry exclusions apply;
+no eligible target returns 503. Explicit `wait(upstream(...).connect())` retains
+its existing selection policy. WebSocket upgrades are rejected with 503 for this
+policy; `websocket(...)` does not accept these arguments. Native ABI 23 requires
+recompiling older artifacts. See [the implementation design](consistent-hash-design.md)
+for the deterministic algorithm and compatibility boundaries.
 
 Weighted backends use a Swift dictionary literal:
 `backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]`.
@@ -554,9 +580,8 @@ Retries release the failed attempt before selecting again. Both algorithms
 skip ejected backends when healthy ones exist and retain the existing fail-open
 behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md §3.4.1](../DESIGN.md#341-listening-tls-and-upstream).
 
-Consistent hashing is not implemented. See the
-[consistent-hash implementation design](consistent-hash-design.md) for the proposed
-interface, weighted HRW algorithm and acceptance plan; this is not supported syntax.
+See the [consistent-hash implementation design](consistent-hash-design.md) for
+weighted HRW encoding, remapping guarantees and acceptance boundaries.
 
 ## Active HTTP upstream health checks
 

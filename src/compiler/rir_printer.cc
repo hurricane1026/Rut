@@ -258,6 +258,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::RespCommitHeaders:
             buf.put_cstr("resp.commit_headers");
             break;
+        case Opcode::ReqSetHash:
+            buf.put_cstr("req.set_hash");
+            break;
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
@@ -840,6 +843,12 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::RespRemoveHeader:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::ReqSetHash:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            buf.put_cstr(", ");
+            print_value_ref(buf, inst.operands[1]);
             break;
         case Opcode::ReqSetPath:
         case Opcode::SextI64:

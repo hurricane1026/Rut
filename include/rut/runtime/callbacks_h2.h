@@ -708,6 +708,7 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
     h2.pending_buffer_body = false;
     h2.pending_local_outcome = true;
     h2.pending_local_status = o.status_code;
+    h2.pending_load_balance = d.conn->forward_load_balance;
     h2.pending_local_body_idx = o.response_body_idx;
     h2.pending_local_headers_idx = o.response_headers_idx;
     h2.pending_local_is_head = is_head;
@@ -932,6 +933,15 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             if (enabled) h2_release_completed_jit_json(*conn);
         }
     } json_release{d.conn, true};
+    const auto& hash = d.conn->forward_load_balance;
+    if (hash.policy == LoadBalancePolicy::ConsistentHash && hash.hash_status != 1 &&
+        hash.hash_grpc) {
+        const hpack::Header headers[] = {
+            {{"content-type", 12}, {"application/grpc", 16}},
+            {{"grpc-status", 11}, hash.hash_status == 400 ? Str{"3", 1} : Str{"14", 2}}};
+        h2_emit_response(d, stream_id, 200, headers, 2, nullptr, 0);
+        return;
+    }
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.response_body_idx == 0xffffu) {
@@ -1479,6 +1489,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         const u16 body_idx = h2->pending_local_body_idx;
         const u16 headers_idx = h2->pending_local_headers_idx;
         const bool is_head = h2->pending_local_is_head;
+        const ForwardLoadBalance load_balance = h2->pending_load_balance;
         const RouteConfig* cfg = h2->pending_local_cfg;
         const bool mutation_overflow = h2->pending_local_mutation_overflow;
         const u8 mutation_count = h2->pending_local_mutation_count;
@@ -1488,6 +1499,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         // The parked outcome may own a dynamic JSON body; keep its arena alive
         // until h2_emit_outcome has staged the bytes.
         h2_reset_request_mutations(*d.conn, false);
+        d.conn->forward_load_balance = load_balance;
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
             dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),

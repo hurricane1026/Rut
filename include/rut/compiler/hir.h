@@ -956,6 +956,8 @@ struct HirTerminator {
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
     ForwardLoadBalance forward_load_balance{};
+    u32 forward_hash_expr_index = 0xffffffffu;
+    Str forward_hash_seed{};
     u16 forward_timeout_failure_policy_id = 0;
     u8 forward_response_read_timeout_seconds = 0;
     ForwardResponseBufferingMode forward_response_buffering = ForwardResponseBufferingMode::None;

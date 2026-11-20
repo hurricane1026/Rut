@@ -12,6 +12,7 @@
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/node_pool.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
@@ -16153,6 +16154,91 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
     if (!upstream_index) return core::make_unexpected(upstream_index.error());
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.forward_load_balance = stmt.forward_load_balance;
+    if (stmt.forward_load_balance.policy == LoadBalancePolicy::ConsistentHash) {
+        if (!route || !stmt.forward_hash_key || !stmt.forward_hash_seed)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("hash arguments require a request scope"));
+        const auto& up = mod.upstreams[upstream_index.value()];
+        if (!up.has_address)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("consistentHash requires static IPv4 endpoints"));
+        for (u32 i = 0; i < up.extra_count; ++i) {
+            if (up.extra_ips[i] == up.ip && up.extra_ports[i] == up.port)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("consistentHash requires distinct endpoints"));
+            for (u32 j = 0; j < i; ++j)
+                if (up.extra_ips[i] == up.extra_ips[j] && up.extra_ports[i] == up.extra_ports[j])
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          stmt.span,
+                                          lit_str("consistentHash requires distinct endpoints"));
+        }
+        auto key = analyze_expr(*stmt.forward_hash_key, route, mod, locals, local_count, binding);
+        auto seed = analyze_expr(*stmt.forward_hash_seed, route, mod, locals, local_count, binding);
+        if (!key) return core::make_unexpected(key.error());
+        if (!seed) return core::make_unexpected(seed.error());
+        u8 seed_bytes[16];
+        if (seed->kind != HirExprKind::StrLit || seed->may_nil || seed->may_error ||
+            !consistent_hash_seed(seed->str_value, seed_bytes))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("hash_seed requires a nonzero constant of 32 lowercase hex characters"));
+        if ((key->type != HirTypeKind::Str && key->type != HirTypeKind::IP) || key->may_nil ||
+            key->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("hash_key requires an unwrapped str or IP"));
+        const auto pure = [&](auto&& self, const HirExpr& e, u32 depth) -> bool {
+            if (depth > 128) return false;
+            switch (e.kind) {
+                case HirExprKind::StrLit:
+                case HirExprKind::IntLit:
+                case HirExprKind::BoolLit:
+                case HirExprKind::BoundValue:
+                case HirExprKind::LocalRef:
+                case HirExprKind::ReqRemoteAddr:
+                case HirExprKind::ReqHeader:
+                case HirExprKind::ReqUniqueHeader:
+                case HirExprKind::ReqParam:
+                case HirExprKind::ReqQuery:
+                case HirExprKind::ReqCookie:
+                case HirExprKind::ReqPath:
+                case HirExprKind::ReqPathOnly:
+                case HirExprKind::ReqQueryString:
+                case HirExprKind::ReqRoutingString:
+                case HirExprKind::ReqTlsClientCertSha256:
+                case HirExprKind::Field:
+                case HirExprKind::Or:
+                case HirExprKind::ValueOf:
+                case HirExprKind::NoError:
+                case HirExprKind::LetIn:
+                case HirExprKind::StringConcat:
+                    break;
+                default:
+                    return false;
+            }
+            // Bound values have already been evaluated by their lexical owner.
+            if (e.kind == HirExprKind::BoundValue || e.kind == HirExprKind::LocalRef) return true;
+            if (e.lhs && !self(self, *e.lhs, depth + 1)) return false;
+            if (e.rhs && !self(self, *e.rhs, depth + 1)) return false;
+            for (u32 i = 0; i < e.args.len; ++i)
+                if (e.args[i] && !self(self, *e.args[i], depth + 1)) return false;
+            return true;
+        };
+        if (!pure(pure, key.value(), 0) || (key->kind == HirExprKind::StrLit &&
+                                            (key->str_value.len == 0 || key->str_value.len > 4096)))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("hash_key requires a bounded pure expression"));
+        term.forward_hash_expr_index = route->exprs.len;
+        if (!route->exprs.push(key.value()))
+            return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        term.forward_hash_seed = seed->str_value;
+    }
+
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) {
         term.forward_set_path = stmt.forward_set_path;
@@ -26291,6 +26377,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        term.redirect_policy_id == 0 && !term.has_forward_path() &&
+                       term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_response_read_timeout_seconds != 0 &&
@@ -26310,6 +26397,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        !term.commit_response_mutations && !term.has_forward_path() &&
+                       term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
                        term.forward_response_policy_id == 0 &&
                        term.forward_failure_policy_id == 0 &&
@@ -26330,9 +26418,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 structural_common && timeout_term_count == 1 &&
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
-                !direct.has_forward_path() && direct.forward_set_headers.len == 0 &&
-                !direct.has_forward_target_transform && !direct.commit_response_mutations &&
-                timeout_request_policy_is_admitted(direct) &&
+                !direct.has_forward_path() &&
+                direct.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
+                direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
+                !direct.commit_response_mutations && timeout_request_policy_is_admitted(direct) &&
                 (!complete_buffering ||
                  (complete_content_length_route_method_is_admitted(route.method) &&
                   (complete_content_length_request_policy_is_admitted(
@@ -26369,6 +26458,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        term.redirect_policy_id == 0 && !term.has_forward_path() &&
+                       term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
                        term.forward_request_policy_id == static_cast<u16>(policy) &&

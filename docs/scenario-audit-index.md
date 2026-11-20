@@ -27,7 +27,7 @@
 - **K015** API 多版本共存：通过 Route/Service 等资源组织。
 - **K016** URL 前缀剥离、Host/URI 重写：路由配置与转换插件。
 - **K017** 多实例与加权负载均衡：Kong Upstream/Target；APISIX Upstream。静态权重与禁用目标子集见 [上游权重](kong-upstream-weights.md)；动态 API、DNS/SRV 权重及一致性哈希尚未验收。
-- **K018** Hash client or request attributes to preserve backend affinity: verify the algorithm and session semantics. Not implemented in Rut; the [consistent-hash design](consistent-hash-design.md) is a proposal.
+- **K018** Hash client or request attributes to preserve backend affinity: verify the algorithm and session semantics. Implemented with explicit `.consistentHash`, typed request keys and weighted rendezvous hashing; see the [algorithm and compatibility limits](consistent-hash-design.md). Kong Ketama placement equivalence is not claimed.
 - **K019** 主动健康检查、被动失败检测、故障摘除与恢复：两者支持对应机制。Rut 两后端主动 HTTP 探测子集见 [主动健康检查](kong-active-health.md)；完整 Kong 阈值、HTTPS 和控制面仍未验收。
 - **K020** 上游连接/读写超时与重试：验证重试条件、次数及非幂等请求边界。
 - **K021** DNS 服务发现：两者支持。
