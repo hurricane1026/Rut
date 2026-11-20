@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/jit/yield_contract.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/password_gateway.h"
 
@@ -100,24 +101,28 @@ inline u32 timer_seconds_from_ms(u32 ms) {
 }
 
 inline bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
-    switch (kind) {
-        case jit::YieldKind::Any:
-            return type == IoEventType::Recv || type == IoEventType::Timeout ||
-                   type == IoEventType::HandlerTimer;
-        case jit::YieldKind::Recv:
-            return type == IoEventType::Recv;
-        case jit::YieldKind::Send:
-            return type == IoEventType::Send;
-        case jit::YieldKind::UpstreamConnect:
-            return type == IoEventType::UpstreamConnect;
-        case jit::YieldKind::UpstreamRecv:
-            return type == IoEventType::UpstreamRecv;
-        case jit::YieldKind::UpstreamSend:
-            return type == IoEventType::UpstreamSend;
-        case jit::YieldKind::HttpGet:
-        case jit::YieldKind::HttpPost:
-        case jit::YieldKind::Forward:
-        case jit::YieldKind::Timer:
+    // Event eligibility is payload-independent here. Timer delivery also checks
+    // the armed timer in the loop; a timer-only wait uses its own resume path.
+    const auto contract = jit::yield_contract(kind, 1);
+    switch (type) {
+        case IoEventType::Recv:
+            return contract.primary == jit::YieldArm::DownstreamRecv;
+        case IoEventType::Send:
+            return contract.primary == jit::YieldArm::DownstreamSend;
+        case IoEventType::UpstreamConnect:
+            return contract.primary == jit::YieldArm::UpstreamConnect;
+        case IoEventType::UpstreamRecv:
+            return contract.primary == jit::YieldArm::UpstreamRecv;
+        case IoEventType::UpstreamSend:
+            return contract.primary == jit::YieldArm::UpstreamSend;
+        case IoEventType::Timeout:
+        case IoEventType::HandlerTimer:
+            return contract.secondary == jit::YieldArm::Timer;
+        case IoEventType::Accept:
+        case IoEventType::RelayRead:
+        case IoEventType::RelayWrite:
+        case IoEventType::ResponseReadTimer:
+        case IoEventType::Count:
             return false;
     }
     return false;
@@ -212,25 +217,11 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
         case jit::HandlerAction::Yield:
             out.next_state = r.next_state;
             out.yield_kind = r.yield_kind;
-            switch (r.yield_kind) {
-                case jit::YieldKind::Timer:
-                    out.kind = JitDispatchOutcome::Kind::TimerYield;
-                    out.timer_ms = r.yield_payload_u32();
-                    return out;
-                case jit::YieldKind::Any:
-                case jit::YieldKind::Recv:
-                case jit::YieldKind::Send:
-                case jit::YieldKind::UpstreamConnect:
-                case jit::YieldKind::UpstreamRecv:
-                case jit::YieldKind::UpstreamSend:
-                    out.kind = JitDispatchOutcome::Kind::EventYield;
-                    out.timer_ms = r.yield_payload_u32();
-                    return out;
-                case jit::YieldKind::HttpGet:
-                case jit::YieldKind::HttpPost:
-                case jit::YieldKind::Forward:
-                    return out;
-            }
+            const auto arm = jit::yield_contract(r.yield_kind, r.yield_payload_u32()).primary;
+            if (arm == jit::YieldArm::None) return out;
+            out.kind = arm == jit::YieldArm::Timer ? JitDispatchOutcome::Kind::TimerYield
+                                                   : JitDispatchOutcome::Kind::EventYield;
+            out.timer_ms = r.yield_payload_u32();
             return out;
     }
     return out;  // unreachable; leaves Kind::Error

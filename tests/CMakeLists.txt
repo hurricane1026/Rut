@@ -545,6 +545,10 @@ set_tests_properties(test_redirect_policy PROPERTIES LABELS "unit")
 find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(YIELD_CONTRACT_BUILD_TEST ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_yield_contract_build.py ${CMAKE_CXX_COMPILER})
+add_test(NAME test_yield_contract_build COMMAND ${YIELD_CONTRACT_BUILD_TEST})
+set_tests_properties(test_yield_contract_build PROPERTIES LABELS "unit;model" TIMEOUT 60)
 
 add_test(NAME test_consumers_cli
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumers_cli.py
@@ -4627,6 +4631,7 @@ if(APPLE)
     include(macos.cmake)
 elseif(RUT_ENABLE_JIT)
     add_custom_target(check
+        COMMAND ${YIELD_CONTRACT_BUILD_TEST}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
@@ -4722,6 +4727,7 @@ else()
         set(CHECK_GRPC_DEPENDS test_grpc_proxy)
     endif()
     add_custom_target(check
+        COMMAND ${YIELD_CONTRACT_BUILD_TEST}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_wait_scheduler_model.py --check-only
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py
