@@ -17,7 +17,7 @@ from test_jwt_sessions import ISSUE_KEY, KEY, NAMESPACE, Peer, exchange, permit_
 
 
 @contextmanager
-def gateway(args, store, directory):
+def gateway(args, store, directory, namespace=NAMESPACE):
     source = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -33,7 +33,7 @@ def gateway(args, store, directory):
         endpoint.update(tls=True, caFile=str(Path(args.testdata) / 'localhost_cert.pem'),
                         serverName='localhost')
     env = dict(os.environ, JWT_SECRET=KEY, JWT_PREVIOUS_SECRET='', JWT_ISSUER='issuer',
-               JWT_AUDIENCE='gateway', JWT_SESSION_NAMESPACE=NAMESPACE,
+               JWT_AUDIENCE='gateway', JWT_SESSION_NAMESPACE=namespace,
                REDIS_ENDPOINT=json.dumps(endpoint), REDIS_USERNAME='gateway',
                REDIS_PASSWORD='service-password', REDIS_DATABASE='1',
                SESSION_ISSUE_KEY=ISSUE_KEY, SESSION_SUBJECT='alice', SESSION_SCOPES='orders:read')
@@ -192,6 +192,33 @@ def live(args, root):
 
 
 
+def cutover(args, root):
+    store = SessionStore(args)
+    try:
+        stale = token(nonce='prior-authority')
+        old_key = permit_key(stale)
+        new_namespace = NAMESPACE + ':recovery-1'
+        selector = ('~' + new_namespace + ':*').encode()
+        assert store.command(b'SET', old_key, b'active', b'EX', b'240') == b'OK'
+        # Only the new namespace is available to the restarted gateway.
+        assert store.command(b'ACL', b'SETUSER', b'gateway', b'resetkeys', selector) == b'OK'
+        with gateway(args, store, root, namespace=new_namespace) as port:
+            assert exchange(port, 'HTTP/1.1', stale)[0] == 401
+            status, body, _, cache = exchange(
+                port, 'HTTP/1.1', ISSUE_KEY, method='POST', path='/sessions')
+            assert status == 200 and cache == ['no-store']
+            issued = body.decode('ascii')
+            issued_key = permit_key(issued, new_namespace)
+            assert store.command(b'GET', issued_key) == b'active'
+            assert exchange(port, 'HTTP/1.1', issued)[0] == 200
+            revoke(port, issued)
+            assert store.command(b'GET', issued_key) == b'revoked'
+            assert exchange(port, 'HTTP/1.1', issued)[0] == 401
+        assert store.command(b'GET', old_key) == b'active'
+    finally:
+        store.close()
+
+
 def cleanup_recovery(args, root):
     store = SessionStore(args, disable_reset=True)
     try:
@@ -223,6 +250,7 @@ def main():
         (live if args.live else wire)(args, Path(directory))
         if args.live:
             cleanup_recovery(args, Path(directory))
+            cutover(args, Path(directory))
     print('PASS: durable exact-token logout, fail-closed replies and recovery' if args.live else
           'PASS: durable exact-token logout, wire faults and acknowledgement ordering')
 
