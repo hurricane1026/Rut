@@ -2131,6 +2131,29 @@ void send_terminal_response(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
+// The source cap is scoped to ordinary H1-to-H1 upstream work. It uses the
+// validated client framing identity, including when a handler buffered a body.
+template <typename Loop>
+bool reject_upstream_request_body_limit(Loop* loop,
+                                        Connection& conn,
+                                        const UpstreamTarget& target) {
+    if (!target.max_request_body_bytes || target.http2) return false;
+    const u16 status = conn.req_client_has_transfer_encoding ? 411
+                       : conn.req_client_has_content_length &&
+                               conn.req_content_length > target.max_request_body_bytes
+                           ? 413
+                           : 0;
+    if (!status) return false;
+    conn.pending_handler_fn = nullptr;
+    conn.resp_status = status;
+    conn.keep_alive = false;
+    format_static_response(
+        conn, status, false, http1_request_is_head(conn), ordinary_local_response_version(conn));
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    send_terminal_response(loop, conn);
+    return true;
+}
+
 // A response has been completely sent on a connection that does not persist.
 // Backends whose close() cannot end the stream immediately send the FIN now so
 // the server, not the client, closes first (and holds TIME_WAIT), as nginx does.
@@ -3416,6 +3439,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
 #endif
 
     if (route && route->action == RouteAction::Proxy) {
+        if (route->upstream_id < config->upstream_count &&
+            reject_upstream_request_body_limit(loop, conn, config->upstreams[route->upstream_id]))
+            return;
 #if RUT_ENABLE_WEBSOCKET
         if (!ws_prepare_handshake_before_forward(loop, conn)) return;
 #endif
@@ -4655,6 +4681,7 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 const auto& target = config->upstreams[upstream_id];
+                if (reject_upstream_request_body_limit(loop, conn, target)) return;
                 const u64 kStartUs = monotonic_us();
                 const bool kCanConnect = !target.http2 &&
                                          !(target.tls.enabled && conn.req_wants_upgrade) &&
@@ -4817,6 +4844,10 @@ void handle_jit_outcome(Loop* loop,
             const u16 original_outcome_timeout_failure_policy_id =
                 outcome.timeout_failure_policy_id;
             const RouteConfig* config = conn.request_config;
+            if (config && outcome.upstream_id < config->upstream_count &&
+                reject_upstream_request_body_limit(
+                    loop, conn, config->upstreams[outcome.upstream_id]))
+                return;
             u16 forward_response_policy_id = outcome.response_policy_id;
             u16 forward_failure_policy_id = outcome.failure_policy_id;
             u16 forward_timeout_failure_policy_id = outcome.timeout_failure_policy_id;

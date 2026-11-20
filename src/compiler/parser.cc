@@ -3882,6 +3882,24 @@ struct Parser {
                         value = value * 10u + digit;
                     }
                     item.upstream.max_inflight = value;
+
+                } else if (field_name.eq({"max_request_body_bytes", 22})) {
+                    if (item.upstream.has_max_request_body_bytes)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto value = expect(TokenType::IntLit);
+                    if (!value) return core::make_unexpected(value.error());
+                    u32 limit = 0;
+                    for (u32 n = 0; n < value.value()->text.len; ++n) {
+                        const u32 digit = static_cast<u32>(value.value()->text.ptr[n] - '0');
+                        if (limit > (0xffffffffu - digit) / 10u)
+                            return frontend_error(FrontendError::InvalidInteger,
+                                                  span_from(*value.value()),
+                                                  field_name);
+                        limit = limit * 10u + digit;
+                    }
+                    item.upstream.has_max_request_body_bytes = true;
+                    item.upstream.max_request_body_bytes = limit;
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
                     if (seen_minimum_healthy_weight_percent)
                         return frontend_error(
@@ -4264,7 +4282,8 @@ struct Parser {
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
                         seen_minimum_healthy_weight_percent || seen_connect_attempts ||
-                        seen_passive_health || seen_priorities || item.upstream.has_max_inflight)) {
+                        seen_passive_health || seen_priorities || item.upstream.has_max_inflight ||
+                        item.upstream.has_max_request_body_bytes)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

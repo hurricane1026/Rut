@@ -612,6 +612,9 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                 return false;
             for (u32 b = 0; b < cfg.upstreams[i].addr_count; ++b)
                 cfg.upstreams[i].priorities[b] = up.priority_count ? up.backend_priorities[b] : 0;
+
+            if (up.has_max_request_body_bytes)
+                cfg.upstreams[i].max_request_body_bytes = up.max_request_body_bytes;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -678,6 +681,9 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                 return false;
             for (u32 b = 0; b < cfg.upstreams[i].addr_count; ++b)
                 cfg.upstreams[i].priorities[b] = up.priority_count ? up.backend_priorities[b] : 0;
+
+            if (up.has_max_request_body_bytes)
+                cfg.upstreams[i].max_request_body_bytes = up.max_request_body_bytes;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

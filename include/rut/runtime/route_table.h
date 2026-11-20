@@ -86,6 +86,7 @@ struct UpstreamTarget {
     // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
+    u32 max_request_body_bytes = 0;  // 0 disables the H1 forwarding admission cap
     u8 minimum_healthy_weight_percent = 0;
     u8 connect_attempts = 3;
     PassiveHealthPolicy passive_health{};

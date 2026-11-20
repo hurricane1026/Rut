@@ -48933,3 +48933,55 @@ TEST(frontend, computed_response_status_requires_unwrapped_i32_local) {
         if (parsed) CHECK_FALSE(analyze_file_heap(parsed.value()));
     }
 }
+
+TEST(frontend, upstream_request_body_limit_source_and_prebound) {
+    for (const char* value : {"0", "1", "4294967295"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { max_request_body_bytes: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(ast->items[0].upstream.has_address);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+        cfg.upstreams[0].max_request_body_bytes = 123;
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(cfg.upstreams[0].max_request_body_bytes,
+                 ast->items[0].upstream.max_request_body_bytes);
+        rir.destroy();
+    }
+    for (const char* value : {"-1", "4294967296", "true", "99999999999999999999"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { max_request_body_bytes: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto default_tokens = lex(lit("upstream api"));
+    REQUIRE(default_tokens);
+    auto default_ast = parse_file_heap(default_tokens.value());
+    REQUIRE(default_ast);
+    auto default_hir = analyze_file_heap(default_ast.value());
+    REQUIRE(default_hir);
+    auto default_mir = build_mir_heap(default_hir.value());
+    REQUIRE(default_mir);
+    FrontendRirModule default_rir{};
+    REQUIRE(lower_to_rir(default_mir.value(), default_rir));
+    RouteConfig prebound;
+    REQUIRE(prebound.add_upstream("api", 0x7f000001, 9001));
+    prebound.upstreams[0].max_request_body_bytes = 123;
+    REQUIRE(populate_route_config(prebound, default_rir.module));
+    CHECK_EQ(prebound.upstreams[0].max_request_body_bytes, 123u);
+    default_rir.destroy();
+    auto duplicate =
+        lex(lit("upstream api { max_request_body_bytes: 0, max_request_body_bytes: 1 }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+}

@@ -4378,6 +4378,10 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].priority_count = mir.upstreams[i].priority_count;
         for (u32 b = 0; b < mir.upstreams[i].priority_count; ++b)
             out.module.upstreams[i].backend_priorities[b] = mir.upstreams[i].backend_priorities[b];
+
+        out.module.upstreams[i].has_max_request_body_bytes =
+            mir.upstreams[i].has_max_request_body_bytes;
+        out.module.upstreams[i].max_request_body_bytes = mir.upstreams[i].max_request_body_bytes;
         out.module.upstreams[i].weight_count = mir.upstreams[i].weight_count;
         for (u32 b = 0; b < mir.upstreams[i].weight_count; ++b)
             out.module.upstreams[i].backend_weights[b] = mir.upstreams[i].backend_weights[b];

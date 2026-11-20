@@ -1623,6 +1623,16 @@ selects from the lowest enabled unexcluded tier. Direct connect uses the same
 tier rule. Capacity checks count enabled weights across all tiers, independent
 of retry exclusions. Native artifact version 28 records these priorities.
 
+The optional upstream field `max_request_body_bytes` bounds ordinary HTTP/1
+to HTTP/1 forwarding by the original validated Content-Length. Values from 1 to
+4294967295 enable the bound; 0 disables it. A request above the bound receives
+413, and a request using Transfer-Encoding receives 411, before connecting or
+sending to that upstream; rejection closes the downstream connection. Missing
+body framing means zero bytes. The gate covers static/JIT forwards and explicit
+upstream connect waits. Omission preserves a host pre-bound value. HTTP/2 and
+native gRPC forwarding are outside this slice. Native artifact version 29
+records the field and requires older artifacts to be recompiled.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active

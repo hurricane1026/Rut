@@ -64,6 +64,9 @@ struct HirUpstream {
 
     u32 priority_count = 0;
     u8 backend_priorities[8]{};
+
+    bool has_max_request_body_bytes = false;
+    u32 max_request_body_bytes = 0;
     u32 weight_count = 0;
     u16 backend_weights[8]{};
     // Active health-check config copied from the DSL (data only; no probing in
