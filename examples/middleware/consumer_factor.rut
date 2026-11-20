@@ -1,0 +1,11 @@
+// Restrict a successfully authenticated Consumer identity to an exact factor.
+// Only pass the Json returned by consumerAuthenticate* on this request.
+func require(_ identity: Json, _ credentialId: str, _ method: str) -> Json {
+    guard Bytes(credentialId).count >= 1 && Bytes(credentialId).count <= 64 &&
+        credentialId.matches(re"^[\x21-\x7e]+$") &&
+        (method == "bearer" || method == "basic" || method == "header" || method == "mtls") else { respond 503 }
+    let actualCredential = json.string(json.get(identity, "/credentialId").or(identity)).or("")
+    let actualMethod = json.string(json.get(identity, "/method").or(identity)).or("")
+    guard actualCredential == credentialId && actualMethod == method else { respond 403 }
+    identity
+}
