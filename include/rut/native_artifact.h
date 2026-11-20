@@ -8,8 +8,8 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-// Version 31 records upstream response-header timeouts.
-constexpr u32 kVersion = 31;
+// Version 32 records initial probe readiness.
+constexpr u32 kVersion = 32;
 struct StreamHeader {
     u64 magic;
     u32 version;

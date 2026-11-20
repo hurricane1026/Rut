@@ -588,6 +588,7 @@ struct MirUpstream {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    bool hc_require_initial_success = false;
     Str hc_host{};
     Str hc_path{};
     u32 hc_interval_ms = 0;

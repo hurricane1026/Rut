@@ -22089,6 +22089,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.tls = item.upstream.tls;
         up.http2 = item.upstream.http2;
         up.hc_enabled = item.upstream.hc_enabled;
+        up.hc_require_initial_success = item.upstream.hc_require_initial_success;
         up.hc_host = item.upstream.hc_host_lit;
         up.hc_path = item.upstream.hc_path_lit;
         up.hc_interval_ms = item.upstream.hc_interval_ms;

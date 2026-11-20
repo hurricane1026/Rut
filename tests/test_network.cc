@@ -91190,3 +91190,51 @@ TEST(response_policy, upstream_order_bodyless_status_framing) {
                           "content-length: 123\r\n"));
     }
 }
+
+TEST(upstream_health, initial_success_latch_blocks_pending_across_selectors) {
+    reset_backend_health();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 8001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 8002));
+    auto& target = cfg.upstreams[0];
+    target.hc_enabled = true;
+    target.hc_require_initial_success = 1;
+    const ForwardLoadBalance rr{1, LoadBalancePolicy::RoundRobin};
+    const ForwardLoadBalance least{2, LoadBalancePolicy::LeastRequests};
+    const ForwardLoadBalance native{};
+    for (auto spec : {rr, least, native})
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 100), 2u);
+    CHECK_EQ(select_backend(0, 2, 100, target.weights, false, 0, target.priorities, &target), 2u);
+    record_backend_result(0, 0, true, 100);
+    CHECK_FALSE(backend_initially_ready(target, 0, 0));
+    ActiveHealthThresholds thresholds{};
+    thresholds.successes = 2;
+    record_active_probe_result(0, 0, true, 100, thresholds);
+    CHECK_FALSE(backend_initially_ready(target, 0, 0));
+    record_active_probe_result(0, 0, true, 101, thresholds);
+    CHECK(backend_initially_ready(target, 0, 0));
+    for (auto spec : {rr, least, native})
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 102), 0u);
+    // An unready higher-priority target must not block a ready lower tier.
+    target.priorities[0] = 1;
+    target.priorities[1] = 0;
+    for (auto spec : {rr, least, native})
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 102), 0u);
+    CHECK_EQ(select_backend(0, 2, 102, target.weights, false, 0, target.priorities, &target), 0u);
+
+    target.minimum_healthy_weight_percent = 51;
+    CHECK_FALSE(upstream_capacity_available(target, 0, 102));
+    target.minimum_healthy_weight_percent = 50;
+    CHECK(upstream_capacity_available(target, 0, 102));
+    target.minimum_healthy_weight_percent = 0;
+    record_active_probe_result(0, 0, false, 103, thresholds);
+    CHECK(backend_initially_ready(target, 0, 0));
+    // Fail-open may choose an ejected but previously verified endpoint, never a pending one.
+    for (auto spec : {rr, least, native})
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 2, 104), 0u);
+    reset_backend_health();
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, 0, 2, 105), 2u);
+    target.hc_require_initial_success = 0;
+    CHECK_LT(select_forward_backend(&cfg, 0, rr, 0, 2, 105), 2u);
+    reset_backend_health();
+}

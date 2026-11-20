@@ -4110,13 +4110,27 @@ struct Parser {
                     bool seen_status_max = false;
                     bool seen_failure_threshold = false;
                     bool seen_success_threshold = false;
+                    bool seen_initial_success = false;
                     while (true) {
                         auto hc_field = expect(TokenType::Ident);
                         if (!hc_field) return core::make_unexpected(hc_field.error());
                         const Str hc_key = hc_field.value()->text;
                         auto hc_colon = expect(TokenType::Colon);
                         if (!hc_colon) return core::make_unexpected(hc_colon.error());
-                        if (hc_key.eq({"host", 4})) {
+                        if (hc_key.eq({"require_initial_success", 23})) {
+                            if (seen_initial_success)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            if (take(TokenType::KwTrue))
+                                item.upstream.hc_require_initial_success = true;
+                            else if (take(TokenType::KwFalse))
+                                item.upstream.hc_require_initial_success = false;
+                            else
+                                return frontend_error(
+                                    FrontendError::UnexpectedToken, span_from(cur()), hc_key);
+                            seen_initial_success = true;
+                        } else if (hc_key.eq({"host", 4})) {
                             if (hc_seen_host)
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*hc_field.value()),

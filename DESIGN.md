@@ -1643,6 +1643,18 @@ TLS upstreams, HTTP/2 downstream or upstream forwarding, explicit wait-connect,
 and strict response-read or timeout-policy owners retain existing timing. Native artifact version 30 records
 this timeout.
 
+An active `health_check` may set `require_initial_success: true` (default
+false). Each shard starts every enabled backend pending in a new configuration
+generation. Only a consecutive probe-success streak reaching
+`success_threshold` latches readiness; business connects never do. Pending
+backends are excluded from forward selection, native selection, explicit
+connects, retry and fail-open fallback. With no eligible backend the request
+receives 503. They remain in the configured healthy-weight denominator but do
+not enter its numerator. After readiness, normal ejection and fallback semantics
+apply. The existing generation reset and probe identity guard discard stale
+verdicts. This does not add TLS or HTTP/2 probes. Native artifact version 32
+records the configuration field.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active

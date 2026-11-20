@@ -555,6 +555,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
 
     for (u32 i = 0; i < mod.upstream_count; ++i)
         if (mod.upstreams[i].minimum_healthy_weight_percent > 100 ||
+            (mod.upstreams[i].hc_require_initial_success && !mod.upstreams[i].hc_enabled) ||
             mod.upstreams[i].connect_attempts == 0 ||
             mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends ||
             !mod.upstreams[i].passive_health.valid() ||
@@ -639,7 +640,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_timeout_seconds,
                                                    up.hc_status_min,
                                                    up.hc_status_max,
-                                                   up.hc_host))
+                                                   up.hc_host,
+                                                   up.hc_require_initial_success))
                     return false;
             }
         }
@@ -711,7 +713,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_timeout_seconds,
                                                    up.hc_status_min,
                                                    up.hc_status_max,
-                                                   up.hc_host))
+                                                   up.hc_host,
+                                                   up.hc_require_initial_success))
                     return false;
             }
         }

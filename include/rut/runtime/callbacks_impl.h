@@ -61,6 +61,7 @@ struct BackendHealth {
     bool active_down;    // active verdict has no timed expiry
     u8 active_failures;
     u8 active_successes;
+    bool active_initial_success;
 };
 
 // thread_local health table. Returns a mutable ref, or nullptr if indices are
@@ -126,7 +127,8 @@ inline bool admit_passive_health_result(Loop* loop, const RouteConfig* pinned, u
         // A configured capacity floor uses only the current target's health.
         if (current && pinned && current != pinned && uid < current->upstream_count &&
             (current->upstreams[uid].minimum_healthy_weight_percent != 0 ||
-             current->upstreams[uid].passive_health.configured))
+             current->upstreams[uid].passive_health.configured ||
+             current->upstreams[uid].hc_require_initial_success))
             return false;
     }
     return true;
@@ -146,7 +148,10 @@ inline void record_active_probe_result(u16 upstream_id,
     if (healthy) {
         h->active_failures = 0;
         if (h->active_successes < thresholds.successes) h->active_successes++;
-        if (h->active_successes >= thresholds.successes) h->active_down = false;
+        if (h->active_successes >= thresholds.successes) {
+            h->active_down = false;
+            h->active_initial_success = true;
+        }
         if (!separate_passive) {
             h->fails = 0;
             h->eject_until_us = 0;
@@ -200,6 +205,12 @@ inline void set_probe_in_flight(u16 upstream_id, u32 backend_idx, bool v) {
 // sweep_health_probes — instantiated in main.cc and the test TUs — and a single
 // strong symbol avoids multiple-definition across TUs that include this header.
 
+inline bool backend_initially_ready(const UpstreamTarget& target, u16 uid, u32 index) {
+    if (!target.hc_require_initial_success) return true;
+    const BackendHealth* health = backend_health(uid, index);
+    return health && health->active_initial_success;
+}
+
 // Round-robin over enabled backends, preferring healthy endpoints. If all
 // enabled backends are ejected, fail open to the first enabled endpoint in
 // rotation. Returning backend_count means no endpoint is enabled.
@@ -209,13 +220,16 @@ inline u32 select_backend(u16 upstream_id,
                           const u16* weights,
                           bool strict = false,
                           u8 excluded = 0,
-                          const u8* priorities = nullptr) {
+                          const u8* priorities = nullptr,
+                          const UpstreamTarget* readiness_target = nullptr) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
     if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
     bool any_healthy = false;
     u32 tier = 256;
     for (u32 i = 0; i < backend_count; ++i) {
-        if ((weights && weights[i] == 0) || (excluded & (1u << i))) continue;
+        if ((weights && weights[i] == 0) || (excluded & (1u << i)) ||
+            (readiness_target && !backend_initially_ready(*readiness_target, upstream_id, i)))
+            continue;
         const bool healthy = !backend_ejected(upstream_id, i, now_us);
         const u32 priority = priorities ? priorities[i] : 0;
         if (healthy && !any_healthy) {
@@ -229,6 +243,7 @@ inline u32 select_backend(u16 upstream_id,
         const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
         if ((weights && weights[idx] == 0) || (excluded & (1u << idx)) ||
             (priorities ? priorities[idx] : 0) != tier ||
+            (readiness_target && !backend_initially_ready(*readiness_target, upstream_id, idx)) ||
             (any_healthy && backend_ejected(upstream_id, idx, now_us)))
             continue;
         rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
@@ -251,7 +266,8 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
     u64 healthy = 0;
     for (u32 i = 0; i < target.addr_count; ++i) {
         configured += target.weights[i];
-        if (!backend_ejected(uid, i, now)) healthy += target.weights[i];
+        if (backend_initially_ready(target, uid, i) && !backend_ejected(uid, i, now))
+            healthy += target.weights[i];
     }
     return configured != 0 && healthy * 100 >= configured * target.minimum_healthy_weight_percent;
 }
@@ -259,7 +275,7 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
 inline u32 select_strict_backend(const UpstreamTarget& target, u16 uid, u64 now, u8 excluded) {
     if (!upstream_capacity_available(target, uid, now)) return target.addr_count;
     return select_backend(
-        uid, target.addr_count, now, target.weights, true, excluded, target.priorities);
+        uid, target.addr_count, now, target.weights, true, excluded, target.priorities, &target);
 }
 
 // Selection uses only the owning shard's sidecar in the pinned configuration.
@@ -284,7 +300,7 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
             if (cfg->upstreams[uid].weights[i] != 1) return count;
         if (strict) return select_strict_backend(target, uid, now, excluded_backends);
         return select_backend(
-            uid, count, now, target.weights, false, excluded_backends, target.priorities);
+            uid, count, now, target.weights, false, excluded_backends, target.priorities, &target);
     }
     if (strict && !upstream_capacity_available(target, uid, now)) return count;
     auto& state = cfg->backend_selection[shard];
@@ -292,12 +308,14 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     const auto& weights = cfg->upstreams[uid].weights;
     bool any_healthy = false;
     for (u32 i = 0; i < count; ++i) {
-        if (weights[i] != 0 && (excluded_backends & (1u << i)) == 0)
+        if (weights[i] != 0 && (excluded_backends & (1u << i)) == 0 &&
+            backend_initially_ready(target, uid, i))
             any_healthy |= !backend_ejected(uid, i, now);
     }
     u32 tier = 256;
     for (u32 i = 0; i < count; ++i) {
         if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0 ||
+            !backend_initially_ready(target, uid, i) ||
             ((strict || any_healthy) && backend_ejected(uid, i, now)))
             continue;
         if (target.priorities[i] < tier) tier = target.priorities[i];
@@ -306,7 +324,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     u32 best = count;
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
-        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0 || target.priorities[i] != tier)
+        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0 ||
+            !backend_initially_ready(target, uid, i) || target.priorities[i] != tier)
             continue;
         if ((strict || any_healthy) && backend_ejected(uid, i, now)) continue;
         // Compare exact active/weight ratios without division or narrowing.
@@ -2604,13 +2623,16 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (conn.request_config && conn.upstream_idx < conn.request_config->upstream_count) {
         const auto& target = conn.request_config->upstreams[conn.upstream_idx];
         const u64 now = monotonic_us();
-        if (target.minimum_healthy_weight_percent != 0 &&
+        if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success) &&
             !current_health_generation(loop, conn.request_config))
             return false;
-        if (target.minimum_healthy_weight_percent != 0 &&
+        if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success) &&
             (conn.upstream_backend_idx >= target.addr_count ||
-             !upstream_capacity_available(target, conn.upstream_idx, now) ||
-             target.weights[conn.upstream_backend_idx] == 0 ||
+             !backend_initially_ready(target, conn.upstream_idx, conn.upstream_backend_idx) ||
+             target.weights[conn.upstream_backend_idx] == 0))
+            return false;
+        if (target.minimum_healthy_weight_percent != 0 &&
+            (!upstream_capacity_available(target, conn.upstream_idx, now) ||
              backend_ejected(conn.upstream_idx, conn.upstream_backend_idx, now)))
             return false;
     }
@@ -3520,12 +3542,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
-        const u32 kBackend = select_forward_backend(conn.request_config,
-                                                    conn.shard_id,
-                                                    conn.forward_load_balance,
-                                                    route->upstream_id,
-                                                    target.addr_count,
-                                                    conn.upstream_start_us);
+        const u32 kBackend = target.hc_require_initial_success &&
+                                     !current_health_generation(loop, conn.request_config)
+                                 ? target.addr_count
+                                 : select_forward_backend(conn.request_config,
+                                                          conn.shard_id,
+                                                          conn.forward_load_balance,
+                                                          route->upstream_id,
+                                                          target.addr_count,
+                                                          conn.upstream_start_us);
         if (kBackend >= target.addr_count) {
             release_upstream_slot(loop, conn);
             conn.pending_handler_fn = nullptr;
@@ -4712,7 +4737,9 @@ void handle_jit_outcome(Loop* loop,
                                          !(target.tls.enabled && conn.req_wants_upgrade) &&
                                          target.addr_count <= UpstreamTarget::kMaxBackends;
                 const u32 kBackend =
-                    !kCanConnect ? target.addr_count
+                    !kCanConnect || (target.hc_require_initial_success &&
+                                     !current_health_generation(loop, config))
+                        ? target.addr_count
                     : target.minimum_healthy_weight_percent != 0
                         ? select_strict_backend(target, static_cast<u16>(upstream_id), kStartUs, 0)
                         : select_backend(static_cast<u16>(upstream_id),
@@ -4721,7 +4748,8 @@ void handle_jit_outcome(Loop* loop,
                                          target.weights,
                                          false,
                                          0,
-                                         target.priorities);
+                                         target.priorities,
+                                         &target);
                 if (kBackend >= target.addr_count) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
@@ -5503,12 +5531,15 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
             }
-            const u32 kBackend = select_forward_backend(config,
-                                                        conn.shard_id,
-                                                        conn.forward_load_balance,
-                                                        static_cast<u16>(outcome.upstream_id),
-                                                        target.addr_count,
-                                                        monotonic_us());
+            const u32 kBackend =
+                target.hc_require_initial_success && !current_health_generation(loop, config)
+                    ? target.addr_count
+                    : select_forward_backend(config,
+                                             conn.shard_id,
+                                             conn.forward_load_balance,
+                                             static_cast<u16>(outcome.upstream_id),
+                                             target.addr_count,
+                                             monotonic_us());
             if (kBackend >= target.addr_count) {
                 release_upstream_slot(loop, conn);
                 conn.pending_handler_fn = nullptr;
@@ -6004,7 +6035,8 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     const RouteConfig* config = conn.request_config;
     if (!config || conn.upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[conn.upstream_idx];
-    if (target.minimum_healthy_weight_percent != 0 && !current_health_generation(loop, config))
+    if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success) &&
+        !current_health_generation(loop, config))
         return false;
     const u32 kBudget =
         target.addr_count < target.connect_attempts ? target.addr_count : target.connect_attempts;
@@ -10161,12 +10193,14 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend = select_forward_backend(cfg,
-                                                conn.shard_id,
-                                                h2->async_load_balance,
-                                                upstream_id,
-                                                target.addr_count,
-                                                conn.upstream_start_us);
+    const u32 kBackend = target.hc_require_initial_success && !current_health_generation(loop, cfg)
+                             ? target.addr_count
+                             : select_forward_backend(cfg,
+                                                      conn.shard_id,
+                                                      h2->async_load_balance,
+                                                      upstream_id,
+                                                      target.addr_count,
+                                                      conn.upstream_start_us);
     if (kBackend >= target.addr_count) {
         h2_proxy_fail(loop, conn, 503);
         return;

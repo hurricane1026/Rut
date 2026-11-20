@@ -49060,3 +49060,39 @@ TEST(frontend, upstream_response_header_timeout_bounds_and_prebound) {
     REQUIRE(duplicate);
     CHECK_FALSE(parse_file_heap(duplicate.value()));
 }
+
+TEST(frontend, upstream_health_require_initial_success_source) {
+    for (const char* flag : {"true", "false"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { path: \"/\", "
+                 "interval: 1s, require_initial_success: %s } }",
+                 flag);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(cfg.upstreams[0].hc_require_initial_success, flag[0] == 't' ? 1u : 0u);
+        rir.destroy();
+    }
+    for (const char* value : {"1", "\"true\"", "true, require_initial_success: false"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/\", interval: 1s, "
+                 "require_initial_success: %s } }",
+                 value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+}
