@@ -1776,3 +1776,14 @@ scope check validates both lists and requires each to contain the other. Order
 and repeated scopes do not matter. Extra, missing, malformed or case-mismatched
 scopes fail closed. This opt-in check does not change the existing wider-grant
 policy. The endpoint must still be a fixed, verified HTTPS AS.
+
+### Optional token response no-store profile
+
+`oauth_grant_cache.requireNoStore(reply)` accepts only a completed httpCall
+response with exactly one `Cache-Control` field whose value is exactly the
+lowercase string `no-store`. Missing, duplicate, differently cased, combined
+or otherwise decorated values fail closed. This deliberately strict profile
+is not a general Cache-Control parser; conforming responses with other directives
+are rejected. Apply it to the fixed verified HTTPS AS response before consuming
+the token, in addition to the normal status, token and scope checks. Existing
+helpers remain unchanged.

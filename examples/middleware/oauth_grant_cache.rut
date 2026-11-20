@@ -1,0 +1,7 @@
+// Strict opt-in profile: exactly one Cache-Control field, exactly "no-store".
+// Apply to a reply from the fixed verified HTTPS token endpoint before use.
+func requireNoStore(_ reply: Json) -> Json {
+    let first = json.string(json.get(reply, "/headers/cache-control/0").or(reply)).or("")
+    guard first == "no-store" && json.get(reply, "/headers/cache-control/1") == nil else { respond 503 }
+    reply
+}
