@@ -4399,6 +4399,14 @@ if(RUT_ENABLE_JIT)
                     set_tests_properties(test_jwt_sessions_${jwt_session_backend}_opt${jwt_session_opt} PROPERTIES
                         LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
                 endforeach()
+                add_test(NAME test_jwt_session_lifetime_${jwt_session_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_session_lifetime.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-session-lifetime-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR}
+                        --backend ${jwt_session_backend} --opt 2)
+                set_tests_properties(test_jwt_session_lifetime_${jwt_session_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 add_test(NAME test_jwt_sessions_${jwt_session_backend}_tls
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_sessions.py
                         --server $<TARGET_FILE:rut>
