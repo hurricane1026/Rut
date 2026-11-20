@@ -19,7 +19,7 @@ AUDIENCE = 'casdoor-api'
 
 
 @contextmanager
-def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended'):
+def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended', subject='alice', principal=False):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -30,11 +30,20 @@ def gateway(args, directory, org='tenant', group='staff', second='billing:read',
         probe.bind(('127.0.0.1', 0))
         port = probe.getsockname()[1]
     source = root / 'gateway.rut'
-    source.write_text(original.read_text().replace('listen :8080', f'listen :{port}'))
+    program = original.read_text()
+    if principal:
+        program = program[:program.index('route GET "/access"')] + \
+            'route GET "/principal" {\n' + \
+            '    let document = verifyRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
+            '    let principal = casdoor.requirePrincipal(document, env("CASDOOR_ORG"), env("CASDOOR_SUBJECT"))\n' + \
+            '    guard json.string(json.get(principal, "/owner").or(principal)).or("") == env("CASDOOR_ORG") else { return 403 }\n' + \
+            '    return 204\n}\n'
+    source.write_text(program.replace('listen :8080', f'listen :{port}'))
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
                   jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), CASDOOR_ORG=org,
-               CASDOOR_GROUP=group, CASDOOR_SECOND_GROUP=second, CASDOOR_FORBIDDEN_GROUP=forbidden)
+               CASDOOR_GROUP=group, CASDOOR_SECOND_GROUP=second, CASDOOR_FORBIDDEN_GROUP=forbidden,
+               CASDOOR_SUBJECT=subject)
     log = root / 'gateway.log'
     with log.open('w') as output:
         process = subprocess.Popen([args.server, str(source), '--backend', args.backend,
@@ -189,6 +198,25 @@ def main():
             assert request(port, '/any', signed(accepted), 'HTTP/1.1') == 503
             assert request(port, '/restricted', signed(accepted), 'h2') == 503
             checks += 2
+        with gateway(args, root, principal=True) as port:
+            for version in ('HTTP/1.0', 'HTTP/1.1', 'h2'):
+                for claims, status in ((accepted, 204), (dict(accepted, sub='Alice'), 401),
+                                   (dict(accepted, sub='alice-extra'), 401),
+                                   (dict(accepted, sub='bob', name='alice'), 401),
+                                   (dict(accepted, owner='other'), 401),
+                                   (dict(accepted, tokenType='refresh-token'), 401),
+                                   (dict(accepted, aud='other'), 401),
+                                   (dict(accepted, groups=[]), 204)):
+                    assert request(port, '/principal', signed(claims), version) == status, (claims, version, status)
+                    checks += 1
+        for subject in ('', 'x' * 129):
+            with gateway(args, root, subject=subject, principal=True) as port:
+                assert request(port, '/principal', signed(accepted), 'h2') == 503
+                assert request(port, '/principal', 'malformed', 'HTTP/1.1') == 401
+                checks += 2
+        with gateway(args, root, subject='s' * 128, principal=True) as port:
+            assert request(port, '/principal', signed(dict(accepted, sub='s' * 128)), 'h2') == 204
+            checks += 1
         # Organization selection is trusted configuration, not a request value.
         with gateway(args, root, 'tenant-other') as port:
             assert request(port, '/group', signed(accepted), 'h2') == 401
