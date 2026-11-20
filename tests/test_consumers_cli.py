@@ -92,6 +92,10 @@ def test_targeted_registry_commands(tool, root):
     mutate('remove-consumer', [vacant['id']], dict(snapshot, consumers=[alice, bob]))
     mutate('remove-consumer-with-credentials', [alice['id']],
            dict(snapshot, consumers=[bob, vacant], credentials=[]))
+    mutate('remove-credential', ['missing'], None)
+    removed = dict(snapshot, credentials=[raw, inherited])
+    mutate('remove-credential', [parked['id']], removed)
+    mutate('remove-credential', [raw['id']], None)
     assert source.read_bytes() == original
 
 
