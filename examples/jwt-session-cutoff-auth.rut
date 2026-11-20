@@ -1,0 +1,28 @@
+import "clients/redis-client.rut"
+import "middleware/jwt_session.rut"
+
+listen :8080
+
+func permitStatus(_ result: RedisSessionResult) -> i32 {
+    match result { .value(data) => if data == b"active" { 1 } else { 0 } .missing => 0 _ => -1 }
+}
+
+// This static policy invalidates prior sessions for one fixed subject. It does
+// not delete Redis permits and is not a durable, dynamically updated revocation.
+// Change the trusted threshold when deploying the policy; never take it from a request.
+route GET "/private" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    let subject = json.string(json.get(document, "/sub").or(document)).or("")
+    let issued = json.int(json.get(document, "/iat").or(document)).or(0)
+    guard subject == "alice" && issued >= 1700000000 else {
+        return response(401, headers: {"WWW-Authenticate": "Bearer error=\"invalid_token\""})
+    }
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let status = permitStatus(result)
+    let active = jwt_session.requireActiveStatus(status)
+    return response(200, body: subject)
+}
