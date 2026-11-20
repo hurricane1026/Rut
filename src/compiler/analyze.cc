@@ -22003,6 +22003,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_expected_status = item.upstream.hc_expected_status;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
+        up.connect_attempts = item.upstream.connect_attempts;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

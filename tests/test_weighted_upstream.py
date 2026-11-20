@@ -58,11 +58,15 @@ def main():
 upstream api {{ backends: [{addresses}] }}
 upstream off {{ backends: [{disabled}] }}
 upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
+upstream one {{ connect_attempts: 1, backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
+upstream two {{ connect_attempts: 2, backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
 upstream connect_api {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 0, "127.0.0.1:{ports[1]}": 1] }}
 route GET "/rr" {{ return forward(api, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(api, load_balance: .leastRequests) }}
 route GET "/off" {{ return forward(off, load_balance: .roundRobin) }}
 route GET "/retry" {{ return forward(retry, load_balance: .roundRobin) }}
+route GET "/one" {{ return forward(one, load_balance: .roundRobin) }}
+route GET "/two" {{ return forward(two, load_balance: .roundRobin) }}
 route GET "/connect" {{
     let ev = wait(upstream(connect_api).connect())
     if ev.ok {{ return 204 }} else {{ return 502 }}
@@ -119,6 +123,8 @@ route GET "/connect-off" {{
                 for _ in range(5):
                     code, body = request('/retry')
                     assert (code, body) == (200, b'B'), (protocol, 'retry', code, body)
+            assert h1('/one')[0] == 502
+            assert h1('/two') == (200, b'B')
             for path, status in (('/connect', 204), ('/connect-off', 503)):
                 for _ in range(2):
                     code, body = h1(path)

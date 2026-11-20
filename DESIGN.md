@@ -1605,6 +1605,16 @@ fail-open selection and the existing handling of passive results.
 Native artifact version 23 records the active health timeout as well as the
 minimum healthy weight percentage.
 
+An upstream may set `connect_attempts: N` to allow 1 through 8 fresh TCP
+connection attempts for ordinary HTTP/1 forwarding, including the first attempt.
+The default is 3; attempts are also limited by available distinct backends.
+Only failed connects before sending a request are retried. Backend eligibility,
+health capacity, and existing policy exclusions still apply. This does not alter
+HTTP/2 or gRPC upstream forwarding or explicit `connect()`. Pooled-connection
+replay retains its existing rules; if its fresh reconnect fails, subsequent
+backend selection uses this budget.
+Native artifact version 24 records the upstream connect-attempt budget.
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

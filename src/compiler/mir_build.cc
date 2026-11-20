@@ -1522,6 +1522,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_expected_status = module.upstreams[i].hc_expected_status;
         up.hc_thresholds = module.upstreams[i].hc_thresholds;
         up.minimum_healthy_weight_percent = module.upstreams[i].minimum_healthy_weight_percent;
+        up.connect_attempts = module.upstreams[i].connect_attempts;
         up.weight_count = module.upstreams[i].weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = module.upstreams[i].backend_weights[b];

@@ -57,6 +57,7 @@ struct HirUpstream {
     u32 extra_ips[kMaxExtraBackends] = {};
     u16 extra_ports[kMaxExtraBackends] = {};
     u8 minimum_healthy_weight_percent = 0;
+    u8 connect_attempts = 3;
     u32 weight_count = 0;
     u16 backend_weights[8]{};
     // Active health-check config copied from the DSL (data only; no probing in
