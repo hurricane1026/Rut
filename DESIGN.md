@@ -1633,6 +1633,16 @@ upstream connect waits. Omission preserves a host pre-bound value. HTTP/2 and
 native gRPC forwarding are outside this slice. Native artifact version 29
 records the field and requires older artifacts to be recompiled.
 
+An upstream may configure `connect_timeout` as a whole-second duration
+from 1s through 63s. An episode-tagged timer wheel entry owns each fresh TCP
+connect attempt; unrelated I/O cannot refresh it. Completion transfers timing
+back to the existing upstream timer. The wheel can fire
+roughly one tick late. Expiry uses existing timeout failure and retirement paths
+without replay. The first slice supports ordinary HTTP/1 downstream forwarding;
+TLS upstreams, HTTP/2 downstream or upstream forwarding, explicit wait-connect,
+and strict response-read or timeout-policy owners retain existing timing. Native artifact version 30 records
+this timeout.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active

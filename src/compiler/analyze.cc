@@ -22109,6 +22109,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
         up.has_max_request_body_bytes = item.upstream.has_max_request_body_bytes;
         up.max_request_body_bytes = item.upstream.max_request_body_bytes;
+
+        up.connect_timeout_seconds = item.upstream.connect_timeout_seconds;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

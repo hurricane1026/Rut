@@ -1538,6 +1538,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
         up.has_max_request_body_bytes = module.upstreams[i].has_max_request_body_bytes;
         up.max_request_body_bytes = module.upstreams[i].max_request_body_bytes;
+
+        up.connect_timeout_seconds = module.upstreams[i].connect_timeout_seconds;
         up.weight_count = module.upstreams[i].weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = module.upstreams[i].backend_weights[b];

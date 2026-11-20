@@ -655,6 +655,17 @@ For a host pre-bound upstream, omission preserves its existing setting. Explicit
 upstream connect waits honor the same gate. HTTP/2 and native gRPC forwarding are
 outside this cap.
 
+An upstream can set `connect_timeout: 3s` for each fresh TCP connect
+attempt. It accepts whole-second durations from 1s to 63s, including equivalent
+`ms` literals. Omission retains the global upstream timeout. The one-second
+wheel may fire about one tick after the specified duration; activity does not
+refresh the connect timer. On connect completion, the existing upstream timer
+resumes on TCP connect completion. A timeout follows existing timeout handling and
+does not replay the request. This option applies to ordinary forwarding from an HTTP/1 downstream to a
+plaintext HTTP/1 upstream. TLS upstreams, HTTP/2 downstream or upstream forwarding and explicit
+`wait(upstream(...).connect())` and strict response-read or timeout-policy
+owners retain their existing timeout behavior.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts
