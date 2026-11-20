@@ -4338,6 +4338,14 @@ if(RUT_ENABLE_JIT)
                     set_tests_properties(test_consumer_owner_rbac_${auth_free_backend}_O${owner_rbac_opt} PROPERTIES
                         LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 endforeach()
+                foreach(webhook_rotation_opt 0 2)
+                    add_test(NAME test_webhook_rotation_replay_${auth_free_backend}_O${webhook_rotation_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_webhook_rotation_replay.py
+                            --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-rotation-replay-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --opt ${webhook_rotation_opt})
+                    set_tests_properties(test_webhook_rotation_replay_${auth_free_backend}_O${webhook_rotation_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
                 add_test(NAME test_signed_replay_${auth_free_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signed-request-replay-auth.rut
