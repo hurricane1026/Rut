@@ -2925,6 +2925,7 @@ public:
             return false;
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
+        c.reset_passive_health_observations();
         c.upstream_fd = fd;
         return true;
     }

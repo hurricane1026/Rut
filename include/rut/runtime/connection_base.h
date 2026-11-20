@@ -907,6 +907,10 @@ struct ConnectionBase {
     // reset()/slot reuse; the transport slices will advance it before each
     // upstream episode so stale completions cannot match a later episode.
     u32 upstream_episode = 1;
+    // One final header verdict/timeout per upstream attempt. Reset on connect
+    // submission and pool borrow: pooling may retain the I/O episode token.
+    u32 passive_response_episode = 0;
+    u32 passive_timeout_episode = 0;
 
     // Fail-closed terminal state for an exhausted io_uring episode token. Like
     // upstream_episode, this deliberately survives reset(): a quarantined slot
@@ -1375,6 +1379,11 @@ struct ConnectionBase {
         visit_http1_prebuilt_response_proof_fields(
             *this, [](auto& value, const auto& reset_value) { value = reset_value; });
         http1_prebuilt_deadline_upload = ResponseReadDeadlineUploadProof{};
+    }
+
+    void reset_passive_health_observations() {
+        passive_response_episode = 0;
+        passive_timeout_episode = 0;
     }
 
     // Advance the token without wrapping. Zero is the invalid sentinel and

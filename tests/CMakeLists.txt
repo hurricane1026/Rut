@@ -5622,6 +5622,11 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
     foreach(weighted_backend epoll io_uring)
+        add_test(NAME test_passive_health_${weighted_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_passive_health.py
+                --server $<TARGET_FILE:rut> --backend ${weighted_backend})
+        set_tests_properties(test_passive_health_${weighted_backend} PROPERTIES
+            LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_consistent_hash_${weighted_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consistent_hash.py
                 --server $<TARGET_FILE:rut> --backend ${weighted_backend})

@@ -91144,3 +91144,191 @@ TEST(consistent_hash, grpc_invalid_key_is_trailers_only_with_protocol_status) {
         }
     conn->h2 = nullptr;
 }
+
+namespace {
+PassiveHealthPolicy test_passive_policy() {
+    PassiveHealthPolicy policy{};
+    policy.enabled = true;
+    policy.tcp_failures = 2;
+    policy.timeouts = 2;
+    policy.http_failures = 2;
+    policy.successes = 2;
+    policy.healthy_statuses[0] = 1;  // 200
+    policy.unhealthy_statuses[(503 - 200) / 64] = u64{1} << ((503 - 200) % 64);
+    return policy;
+}
+}  // namespace
+
+TEST(passive_health, independent_counters_latch_and_active_recovery) {
+    ScopedBackendHealthReset reset;
+    const auto policy = test_passive_policy();
+    REQUIRE(policy.valid());
+    auto* health = backend_health(0, 0);
+    REQUIRE(health);
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::TcpFailure);
+    CHECK_FALSE(backend_ejected(0, 0, 100));
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
+    CHECK(backend_ejected(0, 0, ~u64{0}));  // no cooldown recovery
+    CHECK_EQ(health->passive_http_failures, 2u);
+    CHECK_EQ(health->passive_tcp_failures, 1u);
+    CHECK_EQ(select_backend(0, 2, 100), 1u);
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::Success);
+    CHECK_EQ(health->passive_http_failures, 0u);
+    CHECK_EQ(health->passive_tcp_failures, 0u);
+    CHECK(backend_ejected(0, 0, 100));
+    record_active_probe_result(0, 0, true, 100, {1, 2});
+    CHECK(backend_ejected(0, 0, 100));
+    record_active_probe_result(0, 0, true, 100, {1, 2});
+    CHECK_FALSE(backend_ejected(0, 0, 100));
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::Timeout);
+    record_passive_health_result(0, 0, policy, PassiveHealthOutcome::Timeout);
+    CHECK(backend_ejected(0, 0, 100));
+    reset_backend_health();
+    CHECK_FALSE(backend_ejected(0, 0, 100));
+}
+
+TEST(passive_health, disabled_thresholds_saturation_and_capacity) {
+    ScopedBackendHealthReset reset;
+    auto policy = test_passive_policy();
+    policy.tcp_failures = 0;
+    policy.timeouts = 0;
+    policy.http_failures = 255;
+    for (u32 i = 0; i < 300; ++i) {
+        record_passive_health_result(0, 0, policy, PassiveHealthOutcome::TcpFailure);
+        record_passive_health_result(0, 0, policy, PassiveHealthOutcome::Timeout);
+    }
+    CHECK_FALSE(backend_ejected(0, 0, 0));
+    for (u32 i = 0; i < 254; ++i)
+        record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
+    CHECK_FALSE(backend_ejected(0, 0, 0));
+    for (u32 i = 0; i < 300; ++i)
+        record_passive_health_result(0, 0, policy, PassiveHealthOutcome::HttpFailure);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 255u);
+    UpstreamTarget target{};
+    target.addr_count = 2;
+    target.weights[0] = 3;
+    target.weights[1] = 1;
+    target.minimum_healthy_weight_percent = 25;
+    CHECK(upstream_capacity_available(target, 0, 0));
+    target.minimum_healthy_weight_percent = 26;
+    CHECK_FALSE(upstream_capacity_available(target, 0, 0));
+}
+
+TEST(passive_health, final_headers_once_per_attempt_and_reload_fence) {
+    ScopedBackendHealthReset reset;
+    rut::test::RouteConfigFixture old_owner;
+    rut::test::RouteConfigFixture new_owner;
+    REQUIRE(old_owner.config);
+    REQUIRE(new_owner.config);
+    auto& config = *old_owner.config;
+    REQUIRE(config.add_upstream("api", 0x7f000001, 9001));
+    REQUIRE(new_owner.config->add_upstream("api", 0x7f000001, 9002));
+    config.upstreams[0].passive_health = test_passive_policy();
+    const RouteConfig* current = &config;
+    struct Loop {
+        const RouteConfig** config_ptr;
+    } loop{&current};
+    Connection conn{};
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    record_passive_response_status(&loop, &config, conn, 103);
+    CHECK_EQ(conn.passive_response_episode, 0u);
+    record_passive_response_status(&loop, &config, conn, 503);
+    record_passive_response_status(&loop, &config, conn, 503);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 1u);
+    record_passive_connect_result(&loop, &config, conn, 0);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 1u);
+    REQUIRE(conn.next_upstream_episode());
+    record_passive_response_status(&loop, &config, conn, 404);  // neutral
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 1u);
+    REQUIRE(conn.next_upstream_episode());
+    record_passive_response_status(&loop, &config, conn, 200);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 0u);
+    // io_uring pool borrowing may retain the episode: the next attempt must
+    // explicitly release the observation marker, without touching I/O owners.
+    const u32 episode = conn.upstream_episode;
+    conn.reset_passive_health_observations();
+    CHECK_EQ(conn.upstream_episode, episode);
+    record_passive_response_status(&loop, &config, conn, 503);
+    record_passive_response_status(&loop, &config, conn, 503);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 1u);
+    record_passive_connect_result(&loop, &config, conn, -ECANCELED);
+    CHECK_EQ(backend_health(0, 0)->passive_tcp_failures, 0u);
+    record_passive_connect_result(&loop, &config, conn, -ECONNREFUSED);
+    CHECK_EQ(backend_health(0, 0)->passive_tcp_failures, 1u);
+    record_passive_connect_result(&loop, &config, conn, -ETIMEDOUT);
+    CHECK_EQ(backend_health(0, 0)->passive_timeouts, 1u);
+    current = new_owner.config;
+    REQUIRE(conn.next_upstream_episode());
+    record_passive_response_status(&loop, &config, conn, 503);
+    record_passive_connect_result(&loop, &config, conn, -ECONNREFUSED);
+    CHECK_EQ(backend_health(0, 0)->passive_http_failures, 1u);
+    CHECK_EQ(backend_health(0, 0)->passive_tcp_failures, 1u);
+    new_owner.config->upstream_count = 0;  // removed upstream slot
+    CHECK_FALSE(admit_passive_health_result(&loop, &config, 0));
+    current = nullptr;
+    CHECK_FALSE(admit_passive_health_result(&loop, &config, 0));
+}
+
+TEST(passive_health, timeout_once_and_never_from_retired_attempt) {
+    ScopedBackendHealthReset reset;
+    rut::test::RouteConfigFixture owner;
+    REQUIRE(owner.config);
+    auto& config = *owner.config;
+    REQUIRE(config.add_upstream("api", 0x7f000001, 9001));
+    config.upstreams[0].passive_health = test_passive_policy();
+    const RouteConfig* current = &config;
+    struct Loop {
+        const RouteConfig** config_ptr;
+    } loop{&current};
+    Connection conn{};
+    conn.request_config = &config;
+    conn.upstream_fd = 10;  // metadata-only helper, no fd access
+    record_passive_timeout(&loop, conn);
+    record_passive_timeout(&loop, conn);
+    CHECK_EQ(backend_health(0, 0)->passive_timeouts, 1u);
+    REQUIRE(conn.next_upstream_episode());
+    conn.upstream_fd = -1;
+    record_passive_timeout(&loop, conn);
+    CHECK_EQ(backend_health(0, 0)->passive_timeouts, 1u);
+    conn.upstream_fd = 10;
+    record_passive_timeout(&loop, conn);
+    CHECK(backend_ejected(0, 0, 0));
+}
+
+TEST(passive_health, timer_dispatch_records_pre_response_timeout_and_reclaims_attempt) {
+    ScopedBackendHealthReset reset;
+    rut::test::RouteConfigFixture owner;
+    REQUIRE(owner.config);
+    REQUIRE(owner.config->add_upstream("api", 0x7f000001, 9001));
+    owner.config->upstreams[0].passive_health = test_passive_policy();
+    owner.config->upstreams[0].passive_health.timeouts = 1;
+    const RouteConfig* current = owner.config;
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    loop->config_ptr = &current;
+    i32 client[2], origin[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, client), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, origin), 0);
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = client[0];
+    conn->request_config = current;
+    conn->state = ConnState::Proxying;
+    conn->protocol = ConnProtocol::Http11;
+    conn->upstream_fd = origin[0];
+    loop->timer.add(conn, 1);
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 2));
+    CHECK_EQ(conn->resp_status, 504u);
+    CHECK_EQ(backend_health(0, 0)->passive_timeouts, 1u);
+    CHECK(backend_ejected(0, 0, 0));
+    CHECK_EQ(conn->upstream_fd, -1);
+    const u32 id = conn->id;
+    loop->dispatch(make_ev(id, IoEventType::Send, conn->send_buf.len()));
+    CHECK_EQ(loop->conns[id].fd, -1);
+    CHECK_EQ(backend_health(0, 0)->passive_timeouts, 1u);
+    loop->shutdown();
+    close(client[1]);
+    close(origin[1]);
+}

@@ -577,6 +577,7 @@ struct MirUpstream {
     u32 hc_interval_ms = 0;
     u16 hc_expected_status = 200;
     ActiveHealthThresholds hc_thresholds{};
+    PassiveHealthPolicy passive_health{};
 };
 
 struct MirCacheInstance {

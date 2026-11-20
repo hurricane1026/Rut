@@ -151,6 +151,7 @@ public:
         return self().submit_send_impl(c, buf, len);
     }
     bool submit_connect(Connection& c, const void* addr, u32 addr_len) {
+        c.reset_passive_health_observations();
         if constexpr (
             requires {
                 self().pool.alloc();

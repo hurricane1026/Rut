@@ -48506,3 +48506,73 @@ TEST(frontend, consistent_hash_arguments_and_key_types) {
         out.destroy();
     }
 }
+
+TEST(frontend, passive_health_explicit_policy_validation) {
+    const char* cases[] = {
+        "tcp_failures: 2, timeouts: 1, http_failures: 3, successes: 1, "
+        "healthy_statuses: [200, 204], unhealthy_statuses: [429, 503, 599]",
+        "tcp_failures: 255 timeouts: 0 http_failures: 0 successes: 255 "
+        "healthy_statuses: [200,] unhealthy_statuses: []",
+    };
+    for (const auto* fields : cases) {
+        char src[1024];
+        snprintf(src, sizeof(src), "upstream api { passive_health: { %s } }\n", fields);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        const auto& policy = ast.value().items[0].upstream.passive_health;
+        CHECK(policy.enabled);
+        CHECK(policy.valid());
+        CHECK(PassiveHealthPolicy::contains(policy.healthy_statuses, 200));
+    }
+}
+
+TEST(frontend, passive_health_rejects_ambiguous_or_unbounded_policies) {
+    const char* fields[] = {
+        "",
+        "tcp_failures: 1",
+        "unknown: 1",
+        "tcp_failures: 1, tcp_failures: 2",
+        "tcp_failures: -1",
+        "tcp_failures: 256",
+        "tcp_failures: 18446744073709551617",
+        "tcp_failures: 0 timeouts: 0 http_failures: 0 successes: 1 healthy_statuses: [200] "
+        "unhealthy_statuses: []",
+        "tcp_failures: 1 timeouts: 0 http_failures: 0 successes: 0 healthy_statuses: [200] "
+        "unhealthy_statuses: []",
+        "tcp_failures: 1 timeouts: 0 http_failures: 0 successes: 1 healthy_statuses: [] "
+        "unhealthy_statuses: []",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [200] "
+        "unhealthy_statuses: []",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [503] "
+        "unhealthy_statuses: [503]",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [200, 200] "
+        "unhealthy_statuses: [503]",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [199] "
+        "unhealthy_statuses: [503]",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [200] "
+        "unhealthy_statuses: [600]",
+        "tcp_failures: 1 timeouts: 0 http_failures: 1 successes: 1 healthy_statuses: [200] "
+        "unhealthy_statuses: [4294967799]",
+    };
+    for (const auto* value : fields) {
+        char src[1024];
+        snprintf(src, sizeof(src), "upstream api { passive_health: { %s } }\n", value);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        CHECK_FALSE(parse_file_heap(lexed.value()));
+    }
+    const char* suffixes[] = {"protocol: .http2", "passive_health: {}"};
+    for (const auto* suffix : suffixes) {
+        char src[1024];
+        snprintf(src,
+                 sizeof(src),
+                 "upstream api { passive_health: { tcp_failures: 1 timeouts: 0 http_failures: 0 "
+                 "successes: 1 healthy_statuses: [200] unhealthy_statuses: [] } %s }\n",
+                 suffix);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        CHECK_FALSE(parse_file_heap(lexed.value()));
+    }
+}

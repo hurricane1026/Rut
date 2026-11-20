@@ -11507,3 +11507,27 @@ The optional `opa.tenantStatus` follows the existing trusted structured
 OPA decision contract with an exact configured tenant comparison before forwarding.
 Denied decisions and mismatches return 403; malformed or unavailable decisions and
 invalid configuration return 503. See [the contract](docs/opa-authorization.md#optional-structured-decision-tenant-binding).
+
+
+### Passive upstream health policy
+
+An upstream may opt into `passive_health` with six explicit fields:
+`tcp_failures`, `timeouts`, `http_failures`, `successes`, `healthy_statuses`, and
+`unhealthy_statuses`. This is configuration data, propagated AST → HIR → MIR →
+RIR → RouteConfig and serialized in native ABI 24. It introduces no keyword,
+allocation, library dependency, handler operation or hidden suspension.
+
+The HTTP/1 origin path records final headers once per fenced upstream episode;
+HTTP/2 downstream translation shares the same observer. Connect failures and
+upstream timer expiry have separate categories. Counters saturate at their
+threshold, and listed healthy responses reset failure counters. An unhealthy
+verdict is latched until an active probe reaches its recovery threshold or the
+configuration is replaced; passive successes and elapsed time cannot recover it.
+Health belongs to each shard and target. Results from replaced configurations
+are ignored for configured passive health. All selection policies and the
+healthy-weight floor consume the verdict. Without the option, existing passive
+connect cooldown behavior is preserved. Native gRPC origins reject this policy
+until a separate HTTP/2/`grpc-status` observation contract exists.
+
+See [language contract](docs/language-card.md#passive-http-upstream-health-checks)
+and [verification and compatibility boundaries](docs/passive-health.md).

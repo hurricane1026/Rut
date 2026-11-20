@@ -543,7 +543,7 @@ it remaps keys. Backend declaration order, shard count and connection reuse do
 not change selection. Weight zero, health, capacity and retry exclusions apply;
 no eligible target returns 503. Explicit `wait(upstream(...).connect())` retains
 its existing selection policy. WebSocket upgrades are rejected with 503 for this
-policy; `websocket(...)` does not accept these arguments. Native ABI 23 requires
+policy; `websocket(...)` does not accept these arguments. Native ABI 24 requires
 recompiling older artifacts. See [the implementation design](consistent-hash-design.md)
 for the deterministic algorithm and compatibility boundaries.
 
@@ -618,6 +618,60 @@ tried. When the healthy share falls below the threshold, new forwarding and
 explicit `wait(upstream(api).connect())` requests receive 503. A retry that
 cannot select another target retains its earlier failure result. Health verdicts
 start fresh on each shard after a configuration reload.
+
+## Passive HTTP upstream health checks
+
+```swift
+upstream api {
+    backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    minimum_healthy_weight_percent: 1
+    passive_health: {
+        tcp_failures: 3, timeouts: 2, http_failures: 3, successes: 1,
+        healthy_statuses: [200, 201, 204, 302],
+        unhealthy_statuses: [429, 500, 502, 503, 504]
+    }
+}
+```
+
+All six fields are required. Counters accept literal integers 0–255; zero
+turns off that failure category. `successes` must be positive and at least one
+failure threshold must be positive. Status lists contain distinct literal final
+HTTP statuses (200–599), cannot overlap, and must include at least one healthy
+status. A positive `http_failures` threshold requires an unhealthy status.
+Duplicate fields, unknown fields and invalid policies fail compilation/load.
+A policy-only upstream block can decorate a host-prebound endpoint.
+
+Each shard and target owns independent, saturating TCP-connect-failure, timeout,
+HTTP-failure and success counters. A configured healthy final response resets all
+failure counters; an unhealthy final response increments only HTTP failures and
+clears successes. Connection errors and dispatched pre-response upstream timeouts increment
+only their category and clear successes. `ETIMEDOUT` on connect counts as a
+timeout. Successful TCP connects, informational responses and unlisted final
+statuses are neutral. Final headers count once per upstream attempt, including
+pooled origins and fragmented responses. Local errors and cached replies do not
+count as origin responses. HTTP status is observed at complete final headers,
+not at body completion; a timeout dispatched before downstream response publication is a separate
+observation. Post-publication stalls are excluded because downstream backpressure
+can cause them.
+
+Reaching any enabled failure threshold latches the target unhealthy. There is
+no passive cooldown recovery: business traffic cannot clear the verdict. An
+active probe's full success streak, or a configuration reload, restores it.
+`successes` bounds the observed healthy-result counter; it does not enable
+passive recovery. Active and passive verdicts both affect all load-balancing
+policies and the configured healthy-weight floor. The default floor of zero
+retains existing all-unhealthy fail-open behavior; use a positive floor when
+all-unhealthy must reject with 503. Old requests cannot update replacement
+configuration health when either configuration enables this policy.
+
+Omitting `passive_health` preserves the legacy three-connect-failures / five-second
+cooldown behavior. This option supports HTTP/1 upstreams with HTTP/1 or HTTP/2
+downstreams on epoll and io_uring. Native HTTP/2/gRPC upstreams reject the option;
+`grpc-status` is not interpreted as an HTTP status. Explicit socket operations
+through `wait(upstream(...).connect())` use target eligibility but do not report
+business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
+cross-shard health synchronization is implied. Native ABI 24 requires rebuilding
+older artifacts. See [passive-health implementation](passive-health.md).
 
 ## Native gRPC forwarding
 

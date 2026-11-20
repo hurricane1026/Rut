@@ -577,6 +577,7 @@ public:
             ::close(fd);
             return false;
         }
+        c.reset_passive_health_observations();
         c.upstream_fd = fd;
         if (c.id < connection_capacity) backend.upstream_fd_map[c.id] = fd;
         return true;
