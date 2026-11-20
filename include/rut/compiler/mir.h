@@ -572,6 +572,9 @@ struct MirUpstream {
     bool has_max_inflight = false;
     u32 max_inflight = 0;
     PassiveHealthPolicy passive_health{};
+
+    u32 priority_count = 0;
+    u8 backend_priorities[8]{};
     u32 weight_count = 0;
     u16 backend_weights[8]{};
     // Active health-check config copied from HIR (data only; no probing yet).

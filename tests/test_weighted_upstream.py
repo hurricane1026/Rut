@@ -57,6 +57,9 @@ def main():
         source = f'''
 upstream api {{ backends: [{addresses}] }}
 upstream off {{ backends: [{disabled}] }}
+upstream priority {{ backends: ["127.0.0.1:{ports[0]}", "127.0.0.1:{ports[1]}"], priorities: [1, 0] }}
+upstream priority_connect {{ backends: ["127.0.0.1:{dead.getsockname()[1]}", "127.0.0.1:{ports[1]}"], priorities: [1, 0] }}
+upstream priority_retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}", "127.0.0.1:{ports[1]}"], priorities: [0, 1] }}
 upstream retry {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
 upstream one {{ connect_attempts: 1, backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
 upstream two {{ connect_attempts: 2, backends: ["127.0.0.1:{dead.getsockname()[1]}": 65535, "127.0.0.1:{ports[1]}": 1] }}
@@ -64,6 +67,13 @@ upstream connect_api {{ backends: ["127.0.0.1:{dead.getsockname()[1]}": 0, "127.
 route GET "/rr" {{ return forward(api, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(api, load_balance: .leastRequests) }}
 route GET "/off" {{ return forward(off, load_balance: .roundRobin) }}
+route GET "/priority" {{ return forward(priority, load_balance: .roundRobin) }}
+route GET "/priority-least" {{ return forward(priority, load_balance: .leastRequests) }}
+route GET "/priority-retry" {{ return forward(priority_retry, load_balance: .roundRobin) }}
+route GET "/priority-connect" {{
+    let ev = wait(upstream(priority_connect).connect())
+    if ev.ok {{ return 204 }} else {{ return 502 }}
+}}
 route GET "/retry" {{ return forward(retry, load_balance: .roundRobin) }}
 route GET "/one" {{ return forward(one, load_balance: .roundRobin) }}
 route GET "/two" {{ return forward(two, load_balance: .roundRobin) }}
@@ -117,6 +127,10 @@ route GET "/connect-off" {{
                         assert code == 200, (protocol, path, code, body)
                         replies[body] += 1
                     assert replies == {b'A': 30, b'B': 10}, (protocol, path, replies)
+                for path in ('/priority', '/priority-least', '/priority-retry'):
+                    for _ in range(5):
+                        code, body = request(path)
+                        assert (code, body) == (200, b'B'), (protocol, path, code, body)
                 for _ in range(8):
                     code, body = request('/off')
                     assert code == 503, (protocol, 'all disabled', code, body)
@@ -125,7 +139,7 @@ route GET "/connect-off" {{
                     assert (code, body) == (200, b'B'), (protocol, 'retry', code, body)
             assert h1('/one')[0] == 502
             assert h1('/two') == (200, b'B')
-            for path, status in (('/connect', 204), ('/connect-off', 503)):
+            for path, status in (('/connect', 204), ('/connect-off', 503), ('/priority-connect', 204)):
                 for _ in range(2):
                     code, body = h1(path)
                     assert code == status, (path, code, body)

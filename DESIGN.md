@@ -1615,6 +1615,14 @@ and HTTP/2-to-HTTP/1 forwarding reject excess requests with 503; native gRPC
 uses its existing stream failure path. Slots are released on completion or
 failure. This is an upstream-wide gauge, not a per-backend or per-route limit.
 
+An optional `priorities` array assigns each backend an integer tier 0–255;
+all default to zero. Selection considers healthy enabled targets not excluded
+by the request, then applies its weighted policy within the lowest tier. If none
+are healthy and the minimum healthy weight threshold is disabled, fail-open
+selects from the lowest enabled unexcluded tier. Direct connect uses the same
+tier rule. Capacity checks count enabled weights across all tiers, independent
+of retry exclusions. Native artifact version 28 records these priorities.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active
@@ -1657,6 +1665,8 @@ the inclusive range accepts complete responses with status 100–599. The pair
 is mutually exclusive with exact `status`, and omission keeps exact 200. Native
 artifact version 27 records the range and rejects older artifacts for
 recompilation.
+
+Native artifacts also record the minimum healthy weight percentage.
 
 The compiler contract is:
 

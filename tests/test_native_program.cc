@@ -3796,7 +3796,7 @@ TEST(native_program, mtls_consumer_registry_pins_verified_connection_identity_ac
 TEST(native_program, weighted_upstream_metadata_survives_compiler_exit_and_source_removal) {
     Source source;
     REQUIRE(source.append(R"rut(
-upstream api { backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1, "127.0.0.1:9003": 0] }
+upstream api { priorities: [0, 2, 255], backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1, "127.0.0.1:9003": 0] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
     Program owner;
@@ -3818,6 +3818,8 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
     CHECK_EQ(cfg.upstreams[0].weights[1], 1u);
     CHECK_EQ(cfg.upstreams[0].weights[2], 0u);
+    CHECK_EQ(cfg.upstreams[0].priorities[1], 2u);
+    CHECK_EQ(cfg.upstreams[0].priorities[2], 255u);
     CHECK_EQ(cfg.backend_selection[0].weighted_eligible[0], 0u);
     activate_native_program(*owner.p);
     CHECK_EQ(cfg.upstreams[0].weights[2], 0u);

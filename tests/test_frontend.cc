@@ -48309,7 +48309,7 @@ route GET "/" {
 
 TEST(frontend, upstream_weights_round_trip_and_prebound_validation) {
     const char* source = R"rut(
-upstream api { minimum_healthy_weight_percent: 50, backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
+upstream api { priorities: [0, 1, 255], minimum_healthy_weight_percent: 50, backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 0, "127.0.0.1:9003": 65535,] }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut";
     auto tokens = lex(lit(source));
@@ -48322,17 +48322,23 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     REQUIRE(mir);
     FrontendRirModule rir{};
     REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.upstreams[0].priority_count, 3u);
     CHECK_EQ(rir.module.upstreams[0].weight_count, 3u);
     CHECK_EQ(rir.module.upstreams[0].minimum_healthy_weight_percent, 50u);
     RouteConfig cfg;
     REQUIRE(populate_route_config(cfg, rir.module));
     CHECK_EQ(cfg.upstreams[0].minimum_healthy_weight_percent, 50u);
+    CHECK_EQ(cfg.upstreams[0].priorities[1], 1u);
+    CHECK_EQ(cfg.upstreams[0].priorities[2], 255u);
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
     CHECK_EQ(cfg.upstreams[0].weights[1], 0u);
     CHECK_EQ(cfg.upstreams[0].weights[2], 65535u);
     cfg.upstreams[0].weights[0] = 9;
     REQUIRE(populate_route_config(cfg, rir.module));
     CHECK_EQ(cfg.upstreams[0].weights[0], 3u);
+    rir.module.upstreams[0].priority_count = 2;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.module.upstreams[0].priority_count = 3;
     rir.module.upstreams[0].weight_count = 2;
     CHECK_FALSE(populate_route_config(cfg, rir.module));
     rir.module.upstreams[0].weight_count = 9;
@@ -48342,6 +48348,13 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 
 TEST(frontend, upstream_weights_reject_invalid_shapes_and_integer_overflow) {
     const char* fields[] = {
+        "priorities: []",
+        "priorities: [256]",
+        "priorities: [999999999999999999999999]",
+        "priorities: [-1]",
+        "priorities: [0], priorities: [1]",
+        "backends: [\"127.0.0.1:9001\", \"127.0.0.1:9002\"], priorities: [0]",
+        "host: \"127.0.0.1\", port: 9001, priorities: [0, 1]",
         "backends: []",
         "backends: [:]",
         "backends: [\"127.0.0.1:9001\": -1]",

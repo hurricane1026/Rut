@@ -22102,6 +22102,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.has_max_inflight = item.upstream.has_max_inflight;
         up.max_inflight = item.upstream.max_inflight;
         up.passive_health = item.upstream.passive_health;
+
+        up.priority_count = item.upstream.priority_count;
+        for (u32 b = 0; b < up.priority_count; ++b)
+            up.backend_priorities[b] = item.upstream.backend_priorities[b];
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

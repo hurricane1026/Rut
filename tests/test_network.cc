@@ -91029,6 +91029,48 @@ TEST(route_config_fixture, aligns_mmap_storage_before_constructing_snapshot) {
     CHECK(fixture.config->add_upstream("api", 0x7f000001, 9001));
 }
 
+TEST(weighted_load_balance, priority_health_exclusion_capacity_and_fail_open) {
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("priority", 0x7f000001, 9001));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9002));
+    REQUIRE(cfg.add_upstream_backend(0, 0x7f000001, 9003));
+    auto& target = cfg.upstreams[0];
+    target.priorities[0] = 1;
+    target.priorities[1] = 0;
+    target.priorities[2] = 0;
+    target.weights[1] = 3;
+    for (u32 i = 0; i < 3; ++i) *backend_health(0, i) = {};
+    for (auto policy : {LoadBalancePolicy::RoundRobin, LoadBalancePolicy::LeastRequests}) {
+        const ForwardLoadBalance spec{1, policy};
+        u32 counts[3]{};
+        for (u32 i = 0; i < 40; ++i) ++counts[select_forward_backend(&cfg, 0, spec, 0, 3, 0, 0)];
+        CHECK_EQ(counts[0], 0u);
+        CHECK_EQ(counts[1], 30u);
+        CHECK_EQ(counts[2], 10u);
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 3, 0, 6), 0u);
+        backend_health(0, 1)->active_down = true;
+        backend_health(0, 2)->active_down = true;
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 3, 0, 0), 0u);
+        backend_health(0, 0)->active_down = true;
+        CHECK_NE(select_forward_backend(&cfg, 0, spec, 0, 3, 0, 0), 0u);
+        target.minimum_healthy_weight_percent = 1;
+        CHECK_EQ(select_forward_backend(&cfg, 0, spec, 0, 3, 0, 0), 3u);
+        target.minimum_healthy_weight_percent = 0;
+        for (u32 i = 0; i < 3; ++i) *backend_health(0, i) = {};
+    }
+    target.weights[1] = 1;
+    CHECK_NE(select_forward_backend(&cfg, 0, {0, LoadBalancePolicy::None}, 0, 3, 0, 0), 0u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, {0, LoadBalancePolicy::None}, 0, 3, 0, 6), 0u);
+    target.weights[1] = 3;
+    CHECK_EQ(select_backend(0, 3, 0, target.weights, false, 6, target.priorities), 0u);
+    target.minimum_healthy_weight_percent = 21;
+    backend_health(0, 1)->active_down = true;
+    CHECK_EQ(select_strict_backend(target, 0, 0, 0), 2u);
+    target.minimum_healthy_weight_percent = 41;
+    CHECK_EQ(select_strict_backend(target, 0, 0, 0), 3u);
+    for (u32 i = 0; i < 3; ++i) *backend_health(0, i) = {};
+}
+
 TEST(weighted_load_balance, minimum_healthy_capacity_uses_configured_weight) {
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("weighted", 0x7f000001, 9001));

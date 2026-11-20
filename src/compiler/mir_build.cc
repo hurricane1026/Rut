@@ -1531,6 +1531,10 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.has_max_inflight = module.upstreams[i].has_max_inflight;
         up.max_inflight = module.upstreams[i].max_inflight;
         up.passive_health = module.upstreams[i].passive_health;
+
+        up.priority_count = module.upstreams[i].priority_count;
+        for (u32 b = 0; b < up.priority_count; ++b)
+            up.backend_priorities[b] = module.upstreams[i].backend_priorities[b];
         up.weight_count = module.upstreams[i].weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = module.upstreams[i].backend_weights[b];

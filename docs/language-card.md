@@ -636,6 +636,16 @@ and HTTP/2-to-HTTP/1 forwarding reject excess requests with 503; native gRPC
 uses its existing stream failure path. Slots are released on completion or
 failure. This is an upstream-wide gauge, not a per-backend or per-route limit.
 
+An upstream can set `priorities: [0, 1]` alongside its ordered `backends`.
+The list must contain one integer from 0 through 255 per backend (at most eight).
+The default is zero for every backend. Selection first uses the lowest-numbered
+tier with healthy, enabled targets not excluded by this request; the configured
+load-balancing policy applies within that tier. If every enabled, untried
+target is unhealthy, default fail-open uses the lowest eligible tier. A positive
+minimum healthy weight percentage still measures all configured enabled weights
+across tiers and suppresses fail-open. Direct `wait(upstream(...).connect())`
+also uses priority tiers.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts
