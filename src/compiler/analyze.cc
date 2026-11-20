@@ -22004,6 +22004,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
         up.connect_attempts = item.upstream.connect_attempts;
+        up.has_max_inflight = item.upstream.has_max_inflight;
+        up.max_inflight = item.upstream.max_inflight;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];

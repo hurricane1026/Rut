@@ -5582,3 +5582,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(inflight_backend epoll io_uring)
+        add_test(NAME test_upstream_max_inflight_${inflight_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_upstream_max_inflight.py
+                --server $<TARGET_FILE:rut> --backend ${inflight_backend})
+        set_tests_properties(test_upstream_max_inflight_${inflight_backend} PROPERTIES
+            LABELS "integration;network;admission" TIMEOUT 75 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

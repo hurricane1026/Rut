@@ -48595,3 +48595,48 @@ TEST(frontend, upstream_connect_attempts_bounds_and_prebound) {
     REQUIRE(duplicate);
     CHECK_FALSE(parse_file_heap(duplicate.value()));
 }
+
+TEST(frontend, upstream_max_inflight_bounds_and_prebound) {
+    for (const char* value : {"0", "1", "4294967295"}) {
+        char source[128];
+        snprintf(source, sizeof(source), "upstream api { max_inflight: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(ast->items[0].upstream.has_address);
+        CHECK(ast->items[0].upstream.has_max_inflight);
+    }
+    for (const char* value : {"4294967296", "999999999999999999999", "-1", "true"}) {
+        char source[128];
+        snprintf(source, sizeof(source), "upstream api { max_inflight: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto duplicate = lex(lit("upstream api { max_inflight: 0, max_inflight: 1 }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+    for (const char* source : {"upstream api { max_inflight: 0 }",
+                               "upstream api { max_inflight: 17 }",
+                               "upstream api"}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+        REQUIRE(cfg.set_upstream_max_inflight(0, 9));
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(
+            cfg.upstreams[0].max_inflight,
+            rir.module.upstreams[0].has_max_inflight ? rir.module.upstreams[0].max_inflight : 9u);
+        rir.destroy();
+    }
+}

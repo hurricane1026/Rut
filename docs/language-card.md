@@ -585,6 +585,14 @@ old results, including reuse of a configuration address. Existing all-ejected
 fail-open selection remains unchanged. HTTPS and HTTP/2/gRPC probes are absent.
 See [active-health scope and verification](kong-active-health.md).
 
+An upstream may declare `max_inflight: 32` to cap concurrent forwarding
+operations across routes and shards in this process. Values from 1 through
+4294967295 set the cap; 0 disables it. Omission defaults to unlimited for a
+source-bound upstream and preserves an existing host pre-bound limit. HTTP/1
+and HTTP/2-to-HTTP/1 forwarding reject excess requests with 503; native gRPC
+uses its existing stream failure path. Slots are released on completion or
+failure. This is an upstream-wide gauge, not a per-backend or per-route limit.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts

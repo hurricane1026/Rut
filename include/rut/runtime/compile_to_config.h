@@ -602,6 +602,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].http2 = up.http2;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
+            if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
+                return false;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -656,6 +658,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].http2 = up.http2;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
+            if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
+                return false;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
