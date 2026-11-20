@@ -1,5 +1,9 @@
 #include "rut/runtime/send_progress.h"
 
+#include "rut/common/types.h"
+
+#include <stdint.h>
+
 namespace rut {
 namespace {
 consteval bool send_progress_matches(u32 offset, u32 remaining, u32 completed) {
