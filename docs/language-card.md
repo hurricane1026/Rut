@@ -646,6 +646,15 @@ minimum healthy weight percentage still measures all configured enabled weights
 across tiers and suppresses fail-open. Direct `wait(upstream(...).connect())`
 also uses priority tiers.
 
+An upstream may declare `max_request_body_bytes: 4096` for ordinary HTTP/1
+to HTTP/1 forwarding. A known Content-Length greater than the limit returns 413
+before upstream connection; a request with Transfer-Encoding returns 411.
+Both rejections close the downstream connection. A missing body counts as zero;
+0 or omission disables the limit. Values are integers from 0 through 4294967295.
+For a host pre-bound upstream, omission preserves its existing setting. Explicit
+upstream connect waits honor the same gate. HTTP/2 and native gRPC forwarding are
+outside this cap.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts
