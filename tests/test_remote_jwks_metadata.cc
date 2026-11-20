@@ -128,6 +128,12 @@ TEST(remote_jwks_metadata, stage_timeouts_require_their_stage_and_fit_the_total)
                document.parse({bytes, static_cast<u32>(length)}) && config.load(document, 0);
     };
     REQUIRE(load("", ""));
+    CHECK_FALSE(config.require_non_empty_keys);
+    REQUIRE(load("", R"(,"requireNonEmptyKeys":true)"));
+    CHECK(config.require_non_empty_keys);
+    REQUIRE(load("", R"(,"requireNonEmptyKeys":false)"));
+    CHECK_FALSE(config.require_non_empty_keys);
+    CHECK_FALSE(load("", R"(,"requireNonEmptyKeys":1)"));
     CHECK_EQ(config.dns_timeout_seconds, 0u);
     CHECK_EQ(config.discovery_timeout_seconds, 0u);
     CHECK_FALSE(load("", R"(,"dnsTimeoutSeconds":1)"));
