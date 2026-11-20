@@ -304,6 +304,7 @@ struct MirTerminator {
     MirTerminatorSourceKind source_kind = MirTerminatorSourceKind::Literal;
     i32 status_code = 0;
     bool commit_response_mutations = false;
+    bool checked_response_status = false;
     u32 local_ref_index = 0xffffffffu;
     u32 upstream_index = 0;
     bool use_cmp = false;

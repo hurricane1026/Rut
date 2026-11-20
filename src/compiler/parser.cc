@@ -3242,6 +3242,14 @@ struct Parser {
                 pos++;  // consume `response`
                 auto lparen = expect(TokenType::LParen);
                 if (!lparen) return core::make_unexpected(lparen.error());
+                if (cur().type == TokenType::Ident) {
+                    stmt.response_status_local = cur().text;
+                    ++pos;
+                    auto close = expect(TokenType::RParen);
+                    if (!close) return core::make_unexpected(close.error());
+                    stmt.span = Span{start.start, close.value()->end, start.line, start.col};
+                    return stmt;
+                }
                 auto status = expect(TokenType::IntLit);
                 if (!status) return core::make_unexpected(status.error());
                 auto parsed = parse_status_i32(*status.value());

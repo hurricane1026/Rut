@@ -48888,3 +48888,35 @@ TEST(frontend, response_local_status_is_read_only_i32) {
         if (bad_ast) CHECK_FALSE(analyze_file_heap(bad_ast.value()));
     }
 }
+
+TEST(frontend, computed_response_status_requires_unwrapped_i32_local) {
+    auto tokens = lex(lit(R"rut(route GET "/" {
+        let code = parseInt(req.query("code").or("")).or(0)
+        return response(code)
+    })rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.checked_response_status);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::CmpGe));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::CmpLe));
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::Select));
+    rir.destroy();
+    for (const char* source :
+         {R"rut(route GET "/" { let code = "200" return response(code) })rut",
+          R"rut(route GET "/" { let code = parseInt("200") return response(code) })rut",
+          R"rut(route GET "/" { let code = 200 return response(code, body: "x") })rut",
+          R"rut(route GET "/" { let code = 200 wait(1ms) return response(code) })rut"}) {
+        auto ts = lex(lit(source));
+        REQUIRE(ts);
+        auto parsed = parse_file_heap(ts.value());
+        if (parsed) CHECK_FALSE(analyze_file_heap(parsed.value()));
+    }
+}

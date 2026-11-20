@@ -1770,6 +1770,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             out->span = term.span;
             out->status_code = term.status_code;
             out->commit_response_mutations = term.commit_response_mutations;
+            out->checked_response_status = term.checked_response_status;
             out->upstream_index = term.upstream_index;
             out->kind =
                 term.kind == HirTerminatorKind::ReturnStatus ? MirTerminatorKind::ReturnStatus

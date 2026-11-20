@@ -132,6 +132,10 @@ route GET "/capture-limit" {{
 }}
 route GET "/plain" {{ return forward(backend, load_balance: .roundRobin) }}
 ''' + r'''
+route "/computed-status" {
+    let code = parseInt(req.query("code").or("")).or(0)
+    return response(code)
+}
 route GET "/local-status" {
     let resp = response(429)
     resp.set("X-Status", formatInt(resp.status).or("error"))
@@ -324,6 +328,18 @@ route "/" {
                     finally:
                         probe.close()
                 assert result == (200, expected_name), ('metadata', result)
+                if not args.h2:
+                    for method, value, expected in [('GET', '201', 201), ('GET', '199', 500),
+                                                     ('GET', '65736', 500), ('HEAD', '204', 204),
+                                                     ('HEAD', '600', 500)]:
+                        probe = connection(port)
+                        try:
+                            probe.request(method, '/computed-status?code=' + value)
+                            reply = probe.getresponse()
+                            result = (reply.status, reply.read())
+                        finally:
+                            probe.close()
+                        assert result[0] == expected and (method != 'HEAD' or result[1] == b''), (method, value, result)
                 if not args.h2:
                     probe = connection(port)
                     try:

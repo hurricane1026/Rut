@@ -10021,6 +10021,10 @@ capacity limits and wire validation are unchanged. Chain-after mutations commit
 on normal terminators and explicit guard status returns; runtime-generated
 failures still do not commit them. The policy-free legacy upstream-connect 502
 may serialize already-committed mutations without changing mutation commit state.
+`return response(code)` accepts a plain i32 local as a synchronous direct route
+terminator without body or headers. The RIR checks 200–599 before ABI packing;
+out-of-range values become 500.
+
 A local literal-status Response builder exposes `resp.status` as a read-only
 `i32`, folded from its initializer. Runtime chain-after and upstream Response
 status reads and status assignment remain unsupported.

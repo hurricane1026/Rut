@@ -289,6 +289,7 @@ struct AstStatement {
     // created by `response(status)`. Kept distinct from the literal-status
     // form while reusing ReturnStatus as the control-flow terminator kind.
     bool returns_response_local = false;
+    Str response_status_local{};
     // Response headers from `response(N, headers: { "K": "V", ... })`.
     // Inline-stored (no external pool) so analyze/lowering don't need
     // the AstFile handle. `response_headers.len == 0` means "no kwarg";

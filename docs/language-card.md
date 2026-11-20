@@ -351,6 +351,7 @@ req.ctx.userId               // typed per-request context (user declares struct 
 
 // Response construction — names are literal; values may be runtime strings
 let resp = response(429)          // ✅ literal status
+return response(code)             // unwrapped i32 local; 200–599 or safe 500
 return response(200, body: "static body") // ✅ configured local/static body, ≤ 1 MiB
 resp.set("Retry-After", "60")     // ✅ literal replace/dedupe
 resp.set("X-Request-Path", req.path) // ✅ dynamic value
@@ -382,6 +383,9 @@ request version. HTTP/2 uses its separate serializer.
 values. A request can record up to 16 header mutations and copy up to 8 KiB of
 names and values for dynamic mutations into request-owned storage. Invalid
 runtime values or exhausted bounds stop forwarding.
+
+`return response(code)` accepts an unwrapped `i32` local in a synchronous direct
+route with no body or header arguments. Values outside 200–599 return 500.
 
 A local `response(429)` builder exposes its literal status as read-only `i32`
 through `resp.status`. Runtime chain-after and upstream Response status reads and
