@@ -1113,6 +1113,50 @@ def test_targeted_metadata(tool, root):
             expected = json.loads(json.dumps(initial))
             expected['credentials'][index]['enabled'] = enabled
             update('set-credential-enabled', record['id'], str(enabled).lower(), expected)
+    for index, record in enumerate(credentials):
+        expected = json.loads(json.dumps(initial))
+        expected['credentials'][index].update(notBefore=10, expiresAt=20)
+        out = work / f'window-{index}.json'
+        result = run(tool, 'set-credential-window', source, record['id'], '10', '20', out)
+        assert result.returncode == 0 and not result.stdout and not result.stderr
+        assert json.loads(out.read_bytes()) == expected
+        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+        assert run(tool, 'validate', out).returncode == 0
+        reset = work / f'window-reset-{index}.json'
+        assert run(tool, 'set-credential-window', out, record['id'], '0', '0', reset).returncode == 0
+        expected['credentials'][index].update(notBefore=0, expiresAt=0)
+        assert json.loads(reset.read_bytes()) == expected
+    for start, end in (('', '0'), ('-1', '0'), ('+1', '0'), ('01', '0'),
+                       (' 1', '0'), ('0', '1.0'), ('0', '9223372036854775808'),
+                       ('10', '10'), ('11', '10')):
+        out = work / 'invalid-window.json'
+        result = run(tool, 'set-credential-window', source, credentials[0]['id'], start, end, out)
+        assert result.returncode == 2 and not result.stdout and not out.exists()
+        assert b'private-key' not in result.stderr
+    for index, (start, end) in enumerate((('0', '1'), ('1', '0'), ('0', '9223372036854775807'))):
+        out = work / f'window-bound-{index}.json'
+        assert run(tool, 'set-credential-window', source, credentials[0]['id'], start, end, out).returncode == 0
+        value = json.loads(out.read_bytes())['credentials'][0]
+        assert value['notBefore'] == int(start) and value['expiresAt'] == int(end)
+    raced = work / 'window-race.json'
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: run(tool, 'set-credential-window', source,
+                                                   credentials[0]['id'], '1', '2', raced), range(2)))
+    assert sorted(result.returncode for result in results) == [0, 2]
+    assert json.loads(raced.read_bytes())['credentials'][0]['expiresAt'] == 2
+    for args in ([], ['a'], ['a', 'b'], ['a', 'b', 'c'], ['a', 'b', 'c', 'd'],
+                 ['a', 'b', 'c', 'd', 'e', 'f']):
+        assert run(tool, 'set-credential-window', *args).returncode == 2
+    source.chmod(0o644)
+    out = work / 'insecure-window.json'
+    assert run(tool, 'set-credential-window', source, credentials[0]['id'], '1', '2', out).returncode == 2
+    assert not out.exists()
+    source.chmod(0o600)
+    out = work / 'unknown-window.json'
+    assert run(tool, 'set-credential-window', source, 'missing', '1', '2', out).returncode == 2
+    assert not out.exists()
+    assert run(tool, 'set-credential-window', source, credentials[0]['id'], '1', '2', source).returncode == 2
+    assert json.loads(source.read_bytes()) == initial
     paused = json.loads(json.dumps(initial))
     paused['consumers'][1]['enabled'] = True
     update('set-consumer-enabled', 'paused', 'true', paused)

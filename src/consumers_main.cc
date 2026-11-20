@@ -986,6 +986,58 @@ int metadata_command(const char* command,
     return kError ? failure(kError) : 0;
 }
 
+int credential_window_command(const char* source,
+                              const char* id_text,
+                              const char* start_text,
+                              const char* end_text,
+                              const char* destination) {
+    const Str kId{id_text, bounded_argument(id_text, 65)};
+    i64 start = 0, end = 0;
+    if (!provision_id_valid(kId)) return failure("invalid registry record ID\n");
+    if ((strcmp(start_text, "0") != 0 && !parse_positive_unix_seconds(start_text, start)) ||
+        (strcmp(end_text, "0") != 0 && !parse_positive_unix_seconds(end_text, end)) ||
+        (start && end && start >= end))
+        return failure("invalid credential validity window\n");
+    Buffer input;
+    SensitiveDocument base;
+    if (!read_private(source, input)) return failure("cannot read private registry file\n");
+    if (!consumer_registry_valid(base, input.view()))
+        return failure("invalid Consumer registry snapshot\n");
+    const u32 kRecords = field(base, 0, lit_str("credentials"));
+    u32 record = json::kNone;
+    for (u32 n = base.nodes[kRecords].child; n != json::kNone; n = base.nodes[n].next)
+        if (field_equals(base, field(base, n, lit_str("id")), kId)) record = n;
+    if (record == json::kNone) return failure("registry record ID does not exist\n");
+    Buffer replacement;
+    json::Writer object{replacement.data, json::kMaxBytes};
+    object.put('{');
+    bool first = true;
+    for (u32 n = base.nodes[record].child; n != json::kNone; n = base.nodes[n].next) {
+        if (n == field(base, record, lit_str("notBefore")) ||
+            n == field(base, record, lit_str("expiresAt")))
+            continue;
+        if (!first) object.put(',');
+        first = false;
+        if (!base.write(base.nodes[n].key, object)) return failure("cannot encode credential\n");
+        object.put(':');
+        if (!base.write(n, object)) return failure("cannot encode credential\n");
+    }
+    object.text(lit_str(",\"notBefore\":"));
+    object.text({start_text, static_cast<u32>(strlen(start_text))});
+    object.text(lit_str(",\"expiresAt\":"));
+    object.text({end_text, static_cast<u32>(strlen(end_text))});
+    object.put('}');
+    Buffer result;
+    json::Writer output{result.data, json::kMaxBytes};
+    if (!object.ok || !base.write(0, output, record, {replacement.data, object.len}))
+        return failure("updated registry exceeds supported capacity\n");
+    SensitiveDocument checked;
+    if (!consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* const kError = publish(destination, {result.data, output.len});
+    return kError ? failure(kError) : 0;
+}
+
 constexpr char kUsage[] =
     "Usage: rut-consumers init OUTPUT\n"
     "       rut-consumers validate INPUT\n"
@@ -1004,6 +1056,7 @@ constexpr char kUsage[] =
     "       rut-consumers provision-key-verifier INPUT PROFILE SNAPSHOT_OUTPUT KEY_OUTPUT\n"
     "       rut-consumers set-consumer-enabled INPUT CONSUMER_ID true|false OUTPUT\n"
     "       rut-consumers set-credential-enabled INPUT CREDENTIAL_ID true|false OUTPUT\n"
+    "       rut-consumers set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT\n"
     "       rut-consumers set-consumer-groups INPUT CONSUMER_ID GROUPS_FILE OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
@@ -1030,6 +1083,8 @@ constexpr char kUsage[] =
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 7 && strcmp(argv[1], "set-credential-window") == 0)
+        return credential_window_command(argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 5 && strcmp(argv[1], "check-policy") == 0)
         return check_policy_command(argv[2], argv[3], argv[4]);
     if (argc == 2 && strcmp(argv[1], "--help") == 0)
