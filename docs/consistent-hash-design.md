@@ -1,28 +1,37 @@
-# 一致性哈希负载均衡实现设计
+# Consistent Hashing for Upstream Selection
 
-状态：**提案，尚未实现**。本文只定义后续实现与验收，不新增当前可用语法。
-基线：`388fc48ba`；对应场景 K017/K018。当前只接受 `.roundRobin` 与
-`.leastRequests`，见 [语言卡](language-card.md#explicit-load-balancing-at-each-forward-call)。
+Status: **proposal, not implemented**. This document specifies future implementation
+and acceptance criteria; it does not introduce currently supported syntax.
+Baseline: `388fc48ba`; scenarios K017/K018. Only `.roundRobin` and `.leastRequests`
+are currently accepted. See the [language card](language-card.md#explicit-load-balancing-at-each-forward-call).
 
-## 1. 目标与范围
+## 1. Goals and scope
 
-提供按请求键稳定选择上游目标的第三种策略，支持既有 0–65535 权重、零权重禁用、
-健康摘除、容量门槛、重试和配置 RCU。相同键、种子、目标身份及权重、可选集合和
-算法版本，必须在不同 shard、进程、后端、编译器和受支持架构上选择相同目标。
-选择不依赖请求到达顺序、连接池命中、活跃请求数或负载均衡调用点编号。
+Add a third policy that selects upstream targets consistently by request key,
+with existing 0–65535 weights, zero-weight disablement, health ejection, capacity
+thresholds, retries and configuration RCU. Given the same key, seed, target
+identities and weights, eligible set and algorithm version, selection must agree
+across shards, processes, I/O backends, compilers and supported architectures.
+Selection must not depend on arrival order, connection-pool hits, active request
+counts or load-balancing call-site numbers.
 
-一致性指目标集合变化时限制重映射，不承诺跨节点健康状态一致，也不保证会话持久化。
-目标下线后的请求可能迁移，已有 WebSocket、SSE 或 gRPC 流不迁移。
+Consistency means limiting remapping when the target set changes. It does not
+promise identical health observations across nodes or persistent sessions.
+Requests can move after a target goes down; established WebSocket, SSE and gRPC
+streams do not migrate.
 
-首版范围：静态 IPv4:port 目标、最多 8 个目标，所有现有权重均可使用；普通 HTTP
-转发及原生 gRPC 转发同时验收 epoll/io_uring、JIT/Native artifact。
-WebSocket 仅在确认其握手转发可通过相同键与选择路径后开放，并补独立测试；首版未接入时
-编译拒绝该组合，不能退回轮询。显式 `wait(upstream(...).connect())` 不增加哈希参数，
-保留其当前契约。不包含 DNS 动态目标、Target 管理 API、自动 Cookie 签发或 Kong 配置导入。
+The first release covers up to eight static IPv4:port targets with all existing
+weights. Ordinary HTTP forwarding and native gRPC forwarding must pass acceptance
+on epoll/io_uring and JIT/Native artifacts. Enable WebSocket only after verifying
+that handshake forwarding uses the same key and selection path, with separate
+tests. Until integrated, reject that combination at compile time rather than
+falling back to round-robin. Explicit `wait(upstream(...).connect())` keeps its
+current contract and gains no hash arguments. DNS-driven targets, Target management
+APIs, automatic Cookie issuance and Kong configuration import are outside this scope.
 
-## 2. 拟议 Rut 接口
+## 2. Proposed Rut interface
 
-以下代码是**未来编译器接口**，当前不得作为可运行示例使用：
+The following is a **future compiler interface**, not a runnable example today:
 
 ```swift
 upstream api {
@@ -36,226 +45,310 @@ route GET "/orders" {
 }
 ```
 
-- 复用成员值、带标签调用参数及现有表达式语法，不新增 keyword 或外部库。
-  `.consistentHash` 是策略枚举成员，`hash_key` / `hash_seed` 是普通参数标签。
-- 只在 `.consistentHash` 下接受这两个参数，且两者必填、每个最多一次；其他策略
-  携带它们、缺参数、重复参数或未知成员均编译拒绝，不允许推断上游默认策略。
-- `hash_key` 接受非 optional 的 `str` 或 `IP`，恰好求值一次。首版只接受当前纯表达式
-  子集：字面量、绑定局部值、请求标量读取和已验证纯 helper；等待/I/O、状态修改或
-  无法证明纯性的调用拒绝。不引入隐式认证、请求属性或任意用户对象序列化。
-- `str` 是精确字节串，允许 NUL，长度 1–4096 字节；空键或超长键在任何连接、活跃
-  计数或上游容量获取之前返回 400。不是截断、随机散列或隐式轮询。
-  已知无效常量直接编译拒绝；动态值走相同运行时校验。原生 gRPC 调用将无效键映射为
-  HTTP 200 的 trailers-only `grpc-status: 3`（INVALID_ARGUMENT），内部摘要/配置不可用映射
-  为 `grpc-status: 14`（UNAVAILABLE）；复用既有响应拥有者，未实现该错误映射前拒绝开放组合。
-- `IP` 首版仅接受当前运行时的 IPv4，编码为网络序四字节；未来 IPv6 必须另定义
-  家族标签和 16 字节编码。IP 与同文本字符串具有不同类型标签，互不混同。
-- `hash_seed` 是编译/加载期常量字符串：恰好 32 个小写十六进制字符，解码成 16 字节，
-  禁止全零。环境变量使用现有 compile/load-time `env()`；不能读取请求输入。
-  种子是部署配置，所有需要相同映射的实例必须一致；改种子视作主动全量重映射。
-  不提供每进程随机默认值，也不把种子、请求键或键摘要写入日志/指标。
+- Reuse member values, labelled call arguments and existing expression syntax.
+  Add no keywords or external libraries. `.consistentHash` is a policy enum member;
+  `hash_key` and `hash_seed` are ordinary argument labels.
+- Accept these two arguments only with `.consistentHash`. Both are required and
+  each may appear once. Reject arguments on other policies, missing or duplicate
+  arguments and unknown members at compile time. Infer no upstream default policy.
+- `hash_key` accepts a non-optional `str` or `IP`, evaluated exactly once. Initially,
+  accept only the existing pure-expression subset: literals, bound locals, scalar
+  request reads and verified pure helpers. Reject waits/I/O, state mutation and
+  calls whose purity cannot be established. Add no implicit authentication,
+  request attributes or arbitrary user-object serialization.
+- `str` means exact bytes, including NUL, with a length of 1–4096 bytes. Empty or
+  oversized keys produce 400 before opening a connection, acquiring upstream
+  capacity or incrementing an active count. Do not truncate, select randomly or
+  implicitly use round-robin. Reject known invalid constants at compile time;
+  validate dynamic values at runtime. Native gRPC maps invalid keys to an HTTP 200
+  trailers-only response with `grpc-status: 3` (INVALID_ARGUMENT), and internal
+  digest/configuration unavailability to `grpc-status: 14` (UNAVAILABLE). Reuse
+  existing response ownership; reject the combination until this mapping exists.
+- `IP` initially accepts the runtime's existing IPv4 type, encoded as four bytes
+  in network order. Future IPv6 support needs an explicit family tag and 16-byte
+  encoding. An IP and its textual string representation have distinct type tags.
+- `hash_seed` is a compile/load-time constant string of exactly 32 lowercase hex
+  characters, decoded to 16 bytes; all-zero seeds are invalid. Environment values
+  use existing compile/load-time `env()`, never request input. Instances requiring
+  the same mapping must share the seed. Changing it deliberately remaps the key
+  space. Provide no random per-process default. Never log or label metrics with
+  the seed, request key or key digest.
 
-键来源由 Rut 代码明确处理：Header 推荐 `uniqueHeader`，缺失/重复均拒绝；
-Query/Cookie 复用对应 accessor 的既有首值/原始字节规则，不声称能检测重复值。
-需要严格唯一性时，等待唯一值 accessor 或先做显式校验。可用已认证 Consumer ID
-作为键，但必须先完成认证；客户端自报的 ID 没有认证含义。
-`req.remoteAddr` 是可信边界确定的对端地址，不自动信任 `X-Forwarded-For`。
-缺键回退可在现有 `match` 分支中显式选择另一个 forward，不能隐藏在哈希选择器里。
+Rut code handles key sources explicitly. Prefer `uniqueHeader` for headers and
+reject missing or duplicate values. Query/Cookie sources retain their accessors'
+existing first-value/raw-byte rules; they do not claim duplicate detection.
+Strict uniqueness requires a unique-value accessor or explicit validation first.
+An authenticated Consumer ID can be a key only after authentication; a client
+asserting an ID does not authenticate it. `req.remoteAddr` is the peer address
+established by the trust boundary, not an implicitly trusted `X-Forwarded-For`.
+Missing-key fallback can explicitly select another forward in an existing `match`
+branch; the hash selector must not hide a fallback.
 
-键表达式在该 forward 被执行时、请求转发改写之前读取既有逻辑请求视图。
-既有 `req.set/remove` 的上游改写不会悄悄改变原请求读取结果。
-所有后续重试复用本次求值结果，禁止重读会变化的原始缓冲区。
+Evaluate the key when its forward executes, against the existing logical request
+view before forwarding rewrites. Existing upstream `req.set/remove` mutations
+must not silently alter original-request reads. All subsequent retries reuse
+that evaluation; never re-read a mutable raw request buffer.
 
-## 3. 算法决策
+## 3. Algorithm choice
 
-采用 **加权 Rendezvous / HRW（Highest Random Weight）** 的指数竞争形式。
-每个目标只计算一个独立分数，选择 `-log2(U) / weight` 最小者。
-理想连续随机模型下目标份额为 `weight / sum(weights)`；实现使用下述有界整数近似，
-分布通过统计验收，不宣称有限样本精确比例或数学上无量化误差。
+Use **weighted Rendezvous / HRW (Highest Random Weight)** in exponential-race
+form. Compute one independent score per target and choose the smallest
+`-log2(U) / weight`. Under an ideal continuous random model, a target's share is
+`weight / sum(weights)`. The implementation uses the bounded integer approximation
+below. Validate distribution statistically; promise neither exact finite-sample
+ratios nor the absence of quantization error.
 
-| 方案 | 取舍 |
+| Option | Tradeoff |
 | --- | --- |
-| `hash % count` / 按累计权重取模 | 集合变化会重新分配大量键，不满足一致性目标 |
-| Ketama 虚拟节点环 | 可行，但有限虚拟点的权重精度、环内存和重建规则更复杂；不以逐点兼容 Kong 为首版目标 |
-| Maglev 固定查找表 | 适合大池高速查找，当前最多 8 目标时表构建与常驻内存收益不明显 |
-| 加权 HRW | O(N)、无环、无可变调度状态，目标重排不改变映射，适合当前有界小池 |
+| `hash % count` / cumulative-weight modulo | Target-set changes remap many keys; fails the consistency goal |
+| Ketama virtual-node ring | Viable, but finite-point weight precision, ring memory and rebuild rules add complexity; point-for-point Kong compatibility is not a first-release goal |
+| Maglev lookup table | Useful for fast lookup in large pools; construction and resident-memory costs offer less benefit with at most eight targets |
+| Weighted HRW | O(N), no ring or mutable scheduling state, and declaration reordering preserves mappings; fits the bounded small pool |
 
-### 3.1 稳定身份与摘要编码
+### 3.1 Stable identity and digest encoding
 
-目标身份为固定 7 字节：`0x04 || IPv4[4] || port_u16_be`，不使用结构体原始内存、
-地址文本、声明下标、upstream 名称、site ID、shard ID 或 RCU generation。
-重复身份必须在源配置、手工 RouteConfig 和 Native loader 中拒绝；不能靠名字分成两个目标。
-端口为 1–65535；字节序、长度与比较规则必须由共同编码 helper 实现。
-同一端点在不同 upstream/forward 上、同种子和同键时得到同一分数，这是首版契约。
-需要独立映射时使用不同种子或显式构造带命名空间的业务键。
+A target identity is exactly seven bytes: `0x04 || IPv4[4] || port_u16_be`.
+Do not use raw structure memory, address text, declaration indexes, upstream
+names, site IDs, shard IDs or RCU generations. Reject duplicate identities in
+source configuration, hand-built RouteConfig and the Native loader; names must
+not turn one endpoint into two targets. Ports are 1–65535. Shared encoding
+helpers must define byte order, lengths and comparison rules.
+The same endpoint in different upstreams/forwards receives the same score for
+the same seed and key. Use different seeds or explicitly namespaced business
+keys when independent mappings are required.
 
-复用 [现有原始摘要接口](../include/rut/runtime/hash.h)，不调用返回 hex 字符串的 Rut builtin：
+Reuse the [raw digest interface](../include/rut/runtime/hash.h), rather than a
+Rut builtin returning a hex string:
 
 ```text
 key_frame = "rut-lb-key-v1" || type_u8 || key_length_u32_be || key_bytes
-D = HMAC-SHA256(seed[16], key_frame)               # 保存全部 32 字节
+D = HMAC-SHA256(seed[16], key_frame)               # retain all 32 bytes
 H(endpoint) = SHA256("rut-lb-hrw-v1" || D[32] || endpoint_id[7])
 h = max(1, big_endian_u64(H[0:8]))
 ```
 
-域分隔字符串是所示 ASCII 字节，不含末尾 NUL；type 为 str=1、IPv4=2。
-实现用 `hash_digest_parts` 避免拼接大键，所有临时摘要为栈 scratch；输入读取有界，
-无需增加第三方依赖。摘要失败返回本地 503，不给后端记故障，也不切换到轮询。
-HMAC 用于降低未知种子时的离线目标预测，不代替认证或抗热点限流；公开/泄漏种子、
-在线试探、低基数键和单个热门键仍可能制造严重倾斜。
+Domain separators are the ASCII bytes shown, without trailing NUL; type is
+str=1 or IPv4=2. Use `hash_digest_parts` to avoid concatenating large keys.
+Temporary digests use stack scratch, input reads are bounded and no third-party
+dependency is needed. Digest failure returns local 503 without marking a target
+unhealthy or switching to round-robin.
+HMAC reduces offline target prediction when the seed is unknown; it replaces
+neither authentication nor hotspot rate limiting. Public/leaked seeds, online
+probing, low-cardinality keys and individual hot keys can still cause severe skew.
 
-### 3.2 确定性整数分数
+### 3.2 Deterministic integer scores
 
-禁止热路径 `double`、`log()`、平台 libm、浮点快速数学或运行时随机盐。
-定义 `cost(h)` 为如下 Q32.32 定点负对数近似，所有移位与乘法使用无符号值：
+Do not use hot-path `double`, `log()`, platform libm, floating-point fast-math
+or random runtime salts. Define `cost(h)` with this Q32.32 negative-log
+approximation; all shifts and multiplication are unsigned:
 
 ```text
-n = floor(log2(h))                 # 非零 u64 的最高置位索引，0..63
-x = u128(h) << (63 - n)            # Q1.63，2^63 <= x < 2^64
+n = floor(log2(h))                 # highest set-bit index of nonzero u64, 0..63
+x = u128(h) << (63 - n)            # Q1.63, 2^63 <= x < 2^64
 fraction = 0u64
 for j in 1..32:
-    y = (x * x) >> 63             # x*x < 2^128；y 可达 65 bit
+    y = (x * x) >> 63             # x*x < 2^128; y can require 65 bits
     if y >= 2^64:
         y = y >> 1
         fraction |= 1u64 << (32 - j)
-    x = y                         # 仍在 [2^63, 2^64)
+    x = y                         # remains in [2^63, 2^64)
 cost = ((64 - n) << 32) - fraction
 ```
 
-`floor(log2(h))` 用整数位操作，不调用对数库。`x/y` 保持 u128，不能在归一化前截为 u64。
-每轮平方后的低位截断、归一化顺序即算法的一部分；不得用不同精度替代。
-`cost` 在 1..`64 * 2^32` 内。比较目标 a/b 时比较
-`cost_a * weight_b` 与 `cost_b * weight_a`，均可放入 u64（小于 2^54），禁止先整除。
-完全相等时取 endpoint_id 按无符号字节字典序较小者；不能用轮询 cursor 或声明顺序。
+Compute `floor(log2(h))` with integer bit operations, not a logarithm library.
+Keep `x/y` as u128; do not truncate to u64 before normalization. Low-bit
+truncation after each square and the normalization order are part of the
+algorithm; a different precision is not interchangeable.
+`cost` lies in 1..`64 * 2^32`. Compare targets a/b using `cost_a * weight_b`
+and `cost_b * weight_a`; both fit u64 (less than 2^54). Do not divide first.
+Break exact ties by the smaller endpoint_id in unsigned-byte lexicographic
+order, never a round-robin cursor or declaration order.
 
-版本命名为 `rut-hrw-sha256-q32-v1`。哈希、编码、精度或平局规则任何变化都可能迁移键，
-须新版本及显式迁移说明，不能借 compiler build ID 或 Native artifact 升级静默改变映射。
-首版不开放算法版本参数；配置诊断/发布预览应显示版本，后续版本上线前另定迁移接口。
+Name this version `rut-hrw-sha256-q32-v1`. Changes to hashing, encoding, precision
+or tie-breaking can migrate keys and require a new version with an explicit
+migration contract. Compiler build IDs or Native artifact upgrades must not
+silently change mappings. The first release exposes no algorithm-version
+argument. Configuration diagnostics/publication previews should show the version;
+define a migration interface before shipping a later algorithm version.
 
-### 3.3 可证明的变化边界
+### 3.3 Guaranteed remapping boundaries
 
-在未变化目标的身份、权重、种子和键保持不变时，各目标分数独立，因此：
+Scores are independent when unchanged targets retain their identities and
+weights, and the seed and key remain fixed. Therefore:
 
-- 增加一个目标：变动键只能从原赢家迁向新增目标。
-- 删除/禁用一个目标：原赢家不是该目标的键不变；恢复它时只可能迁向恢复目标。
-- 只提高某目标权重：变动键只能迁向该目标；降低时只能从它迁出。
-- 声明重排、重新编译、单纯 site/shard 编号改变或无关配置更新：映射不变。
+- Adding one target moves keys only from their original winner to the new target.
+- Removing/disabling one target leaves keys owned by other targets unchanged;
+  restoring it can move keys only to the restored target.
+- Increasing one target's weight moves keys only toward it; decreasing its
+  weight moves keys only away from it.
+- Reordering declarations, recompiling, renumbering sites/shards or changing
+  unrelated configuration preserves mappings.
 
-一次修改多个目标、改变键、种子或端点身份不享有单目标迁移边界。
-统计均匀性以大量不同键衡量；同一个键的百万次请求必须一直落在同一目标，不能用
-它们的请求量宣称 3:1 分流失败。相同键的跨节点一致性还要求可选集合与健康观察一致。
+Changing several targets, the key, seed or endpoint identity is outside these
+single-target guarantees. Measure distribution over many distinct keys. A million
+requests with one key must continue selecting one target; those requests cannot
+be used to claim that 3:1 distribution failed. Cross-node agreement also requires
+the same eligible set and health observations.
 
-## 4. 健康、容量与重试
+## 4. Health, capacity and retries
 
-复用 `select_forward_backend` 的门控语义，不建立第二份健康表。调用者现有的健康配置
-generation 校验、请求准入及路由/协议检查必须保留；不能用旧快照的下标读取新配置健康值。
+Reuse `select_forward_backend` gates rather than creating a second health table.
+Retain existing caller-side health-configuration generation validation, request
+admission and route/protocol checks. An old snapshot's indexes must not read
+health values belonging to a replacement configuration.
 
-1. 校验上下文、配置、策略和请求键；weight=0 永远不可选。
-2. 在配置的全部启用目标上计算 `minimum_healthy_weight_percent`，不能因为本次重试
-   已排除部分目标就缩小门槛分母；容量门槛不满足时，连接前 503。
-3. 正值门槛只允许健康目标；门槛为 0 时，沿用现有行为：剩余未尝试目标中有健康者
-   就跳过不健康者，全部不健康时允许 fail-open 到剩余启用目标。
-4. 对当前可选目标按 HRW 分数挑选。容量计数获取/释放沿用既有路径，选择失败不
-   伪造上游失败，不扣未获取的容量。
+1. Validate context, configuration, policy and request key. Weight zero is
+   always ineligible.
+2. Evaluate `minimum_healthy_weight_percent` across all configured enabled
+   targets. Retry exclusions must not shrink its denominator. Return 503 before
+   connecting if the capacity threshold is unmet.
+3. Positive thresholds allow healthy targets only. Threshold zero retains
+   existing behavior: skip unhealthy targets when a healthy unattempted target
+   remains; otherwise allow fail-open to remaining enabled targets.
+4. Select by HRW score among eligible targets. Reuse existing capacity
+   acquisition/release paths. Selection failure must not invent an upstream
+   failure or release capacity that was never acquired.
 
-健康变化只修改候选 mask，不改身份/分数、不重建环、不改其他目标积分。
-恢复后新请求回归原来的首选目标；已建立的流不迁移，也不声称健康故障期间仍粘住原目标。
-单节点健康状态可能不同，所以不得承诺跨节点故障时选同一后端。
+Health changes update only the candidate mask, not identities/scores, a ring
+or other targets' scheduling credits. After recovery, new requests return to
+their original preferred target. Established streams do not migrate, and affinity
+to an unhealthy target is not promised. Nodes can observe different health,
+so selection across nodes during failures is not guaranteed to agree.
 
-重试顺序为同一键的分数排名，经当次健康与容量筛选，并排除已尝试目标。
-重用既有 backend exclusion bitmask（最多 8 位）与重试资格/次数/截止时间；
-不得仅为提高粘性而重试已发送的非幂等请求、流式已提交响应或同一个失败目标。
-只对尚未尝试目标重新评估健康，允许其在两次尝试间变化；稳定健康下顺序固定。
-连接池只复用选定目标的连接，不能为了命中空闲连接绕过哈希选择。
+Retry order follows the same key's score ranking, filtered by current health,
+capacity and previously attempted targets. Reuse the existing backend exclusion
+bitmask (up to eight bits), retry eligibility, attempt limits and deadlines.
+Affinity must not justify retrying a transmitted non-idempotent request, an
+already committed streaming response or the same failed target. Re-evaluate
+health only for unattempted targets; it may change between attempts. With stable
+health, retry order is deterministic. Pools may reuse only the selected target's
+connection; an idle connection must not override hash selection.
 
-## 5. 编译器、JIT、Native 和生命周期
+## 5. Compiler, JIT, Native and ownership
 
-建议沿现有链条实现，具体结构名可以调整，但每一层必须保留元数据并严格验证：
+Follow the existing compilation chain. Structure names may change, but every
+layer must preserve metadata and validate it strictly:
 
-| 层 | 改动 |
+| Layer | Change |
 | --- | --- |
-| `common/load_balance.h` | 新策略枚举及严格合法性检查；哈希算法版本、key carrier 和 policy 定义 |
-| AST → HIR → MIR → RIR | 保存键表达式、类型、种子策略引用及 site 身份；显式 lowering，不通过额外字符串标签旁路类型检查 |
-| JIT helpers / outcome | forward 前恰好求值一次并计算键摘要；suspend/resume 后保留请求拥有的值 |
-| RouteConfig / Native metadata | 不可变种子及版本表，最多 512 个 site；加载时检查索引、常量长度及 policy 组合 |
-| HTTP/1 connection、HTTP/2 stream / gRPC 上下文 | 保存 D[32] 与显式 valid 标记；不能复用 conn-id/shard-id 当键，不能跨 H2 流共用单个键 |
-| runtime selector | 单个有界 HRW helper，经模板/现有分支接入两后端；旧策略保留原行为 |
+| `common/load_balance.h` | Policy enum and strict validity checks; algorithm version, key carrier and policy definitions |
+| AST → HIR → MIR → RIR | Preserve key expression/type, seed-policy reference and site identity; explicit lowering without string-label shortcuts around type checking |
+| JIT helpers / outcome | Evaluate once and digest before forward; preserve request-owned values across suspend/resume |
+| RouteConfig / Native metadata | Immutable seed/version table for up to 512 sites; validate indexes, constant lengths and policy combinations on load |
+| HTTP/1 connection, HTTP/2 stream / gRPC context | Store D[32] and an explicit valid flag; neither connection/shard IDs nor a single shared H2 connection key can substitute for per-request keys |
+| Runtime selector | One bounded HRW helper integrated through existing templates/branches on both backends; preserve existing policies |
 
-请求键摘要必须保存到请求/stream 自有存储，重试不保存借用 `Str`。摘要和策略绑定
-固定的请求配置 epoch，旧请求不能用新种子；现有 active gauge 仍在原配置释放。
-同连接下一个请求、H2 RST/END_STREAM、JIT 异常返回、取消及关闭路径清除 valid 和摘要。
-对重用上下文显式测试，不能只靠默认零初始化。
+Keep the key digest in request/stream-owned storage. Do not retain borrowed
+`Str` values for retries. Bind digest and policy to the pinned request
+configuration epoch; old requests cannot use a new seed, and existing active
+gauges are released in the original configuration. Clear validity and digest
+on the next request, H2 RST/END_STREAM, JIT error returns, cancellation and close.
+Test context reuse explicitly rather than relying on default zero initialization.
 
-不可变 hash policy 表以配置 Arena/已有拥有者持有；最多 512×32=16 KiB 的条目预算
-（种子16字节、版本/标志及预留，不含已有 expression IR），按需分配，仅配置期分配。
-请求载荷预算为 32 字节摘要加标记/策略引用，预计不超过 48 字节/活跃请求；实现时分别
-实测 Connection、H2 stream、outcome 的 padding，不能把三者增长合并漏算。
-不复制种子到每个 shard/site 的可变调度状态，也不增加 64×512×8 大型打分数组。
+Own the immutable policy table through the configuration Arena/existing owner.
+Budget up to 512×32=16 KiB of entries (16-byte seed, version/flags and padding,
+excluding existing expression IR), allocated on demand during configuration only.
+Budget a 32-byte digest plus flags/policy reference per request, expected to fit
+within 48 bytes per active request. Measure padding growth separately in
+Connection, H2 stream and outcome; do not omit costs by counting them together.
+Do not copy seeds into mutable per-shard/site state or add a 64×512×8 score array.
 
-每次首次选择最多处理 4096 字节键、8 次目标摘要、256 轮整数平方；重试可重算最多
-8 个目标分数，不分配、不排序，绝对每次请求有既有尝试次数上限。
-若要缓存排名，须另给空间/清理证据，不作为首版前提。
-`rut_runtime` 保持 LLVM-free，使用现有固定 OpenSSL 与编译器整数支持，不新增 libm、
-C++ 标准库、普通堆分配、虚分派、协程或跨 shard 同步。
+Initial selection processes at most 4096 key bytes, eight target digests and
+256 integer squarings. A retry can recompute at most eight target scores without
+allocation or sorting; existing attempt limits bound total work per request.
+Caching rankings requires separate storage/cleanup evidence and is not assumed.
+Keep `rut_runtime` LLVM-free. Reuse pinned OpenSSL and compiler integer support;
+add no libm, C++ standard library, ordinary heap allocation, virtual dispatch,
+coroutines or cross-shard synchronization.
 
-Native artifact 在真正引入元数据/请求 ABI 改动时升**当时最新版本 +1**；不能在文档中
-冻结当前整数或提前改 artifact。旧产物应拒绝并提示重新编译，畸形/伪造策略不得静默降级。
-嵌入式手工 RouteConfig 也要提供通过校验的 hash policy，不能依赖编译器替它补默认值。
+When metadata/request ABI changes are implemented, bump the Native artifact
+version to **the then-current version +1**. Do not freeze an integer in this
+proposal or change artifacts prematurely. Reject old artifacts with a recompilation
+diagnostic; malformed/forged policies must not silently fall back.
+Hand-built embedded RouteConfig values also require validated hash policies;
+the compiler cannot be relied on to supply defaults for them.
 
-## 6. Kong 对照边界
+## 6. Kong comparison boundaries
 
-Kong 官方描述 consistent-hashing 使用 Ketama，可从 Consumer/IP/Header/Cookie 取键，
-并提供某些来源的 fallback；健康变化跳过目标而不改变原哈希布局。
-参见 [Upstreams：consistent-hashing](https://developer.konghq.com/gateway/entities/upstream/#consistent-hashing)。
+Kong documents Ketama-based consistent hashing with Consumer/IP/Header/Cookie
+inputs, fallback for some sources and health-based target skipping without
+changing the hash layout. See [Upstreams: consistent-hashing](https://developer.konghq.com/gateway/entities/upstream/#consistent-hashing).
 
-本设计覆盖“显式键稳定分流、权重、目标变化的有限重映射、健康目标替代”的语义，
-但选择 HRW，因此不承诺相同键在 Kong/Rut 落到相同端点，也不承诺逐请求/逐权重完全一致。
-Kong Cookie 自动生成及 sticky-sessions 是另外的能力，本提案不实现它们。
+This design covers explicit-key affinity, weighting, limited remapping after
+target changes and healthy-target substitution. It uses HRW, so identical keys
+need not select the same endpoint in Kong and Rut; neither per-request nor
+per-weight mapping identity is promised. Automatic Cookie generation and
+sticky-sessions are separate capabilities outside this proposal.
 
-差分固定使用仓库既有 [Kong 镜像 digest](../tests/pinned-kong-image.txt) 与
-[差分基线](kong-compatibility-baseline.md) 所定义版本，而不是追随滚动官方页面。
-开始实现时核实该版本 hash_on/weights/健康参数，仅声称实际测试版本的覆盖。
-两端比较稳定性、启停、迁移性质及分布统计，不把“端点序列不同”伪装为相同映射。
-当前本文没有新增或运行真实 Kong 差分。
+Differentials must use the repository's pinned [Kong image digest](../tests/pinned-kong-image.txt)
+and [comparison baseline](kong-compatibility-baseline.md), not a moving documentation
+version. At implementation time, verify that version's hash_on, weights and
+health parameters. Claim coverage only for versions actually tested. Compare
+stability, enable/disable behavior, remapping properties and distribution;
+do not describe differing endpoint sequences as identical mappings.
+This document adds no differential tests and reports no live Kong execution.
 
-## 7. 实施批次与验收门槛
+## 7. Implementation stages and acceptance gates
 
-| 批次 | 交付与必需验收 |
+| Stage | Deliverables and required evidence |
 | --- | --- |
-| A：纯算法 | 稳定编码、HMAC/SHA256和定点分数 helper；固定黄金向量、边界和平局测试，尚不开放 DSL |
-| B：语言与存储 | 完整编译链、一次求值、上下文所有权、Native 校验/版本；未知策略和无效组合全部拒绝 |
-| C：真实数据面 | HTTP/1、HTTP/2、gRPC、两I/O后端，健康/重试/容量/池复用/RCU和取消回收；更新语言卡标记可用 |
-| D：兼容与性能 | 固定版本 Kong 行为差分，分布/迁移报告及性能数据；WebSocket 未验收就明确拒绝 |
+| A: pure algorithm | Stable encoding, HMAC/SHA256 and integer-score helpers; golden vectors, boundaries and ties; no exposed DSL yet |
+| B: language and storage | Complete compiler chain, single evaluation, context ownership and Native validation/version; reject unknown policies and invalid combinations |
+| C: real data plane | HTTP/1, HTTP/2, gRPC and both I/O backends; health, retries, capacity, pooling, RCU, cancellation and reclamation; mark supported syntax in the language card |
+| D: compatibility and performance | Pinned Kong behavior differentials, distribution/remapping reports and performance data; explicitly reject WebSocket until accepted |
 
-A/B 的合并不构成用户可用功能完成，只有 C/D 的门槛全部满足才标记 K018 子集完成。
-实现 PR 同步 DESIGN、语言卡、示例和场景索引；本设计 PR 只增加提案入口。
+Merging A/B does not complete a usable feature. Mark the K018 subset complete
+only after all C/D gates pass. Implementation PRs must update DESIGN, the
+language card, examples and scenario index. This design PR only links the proposal.
 
-具体测试要求：
+Required tests:
 
-- 黄金向量：独立整数参考实现与 C++ 逐字节比较，覆盖 key frame、D、H、h、cost、赢家；
-  h=0（钳到1）、1、2的幂、最大u64、最大权重、平局。x86_64/arm64、Clang/GCC、
-  Debug/Release/Native 均一致。引用同一个待测 helper 作为 oracle 不算独立验证。
-- 稳定与迁移：固定公开种子、至少 100,000 个确定性不同键，在 1–8 目标下验证全部
-  重排、单目标增删/0权重/恢复/增减权重性质；不得只测分布。
-- 分布：等权、3:1、1:65535 以及8目标混合。用明确的二项/多项统计容差与固定语料，
-  稀有目标允许零命中，不能对极端权重设固定百分比误差；统计标准在实施前冻结。
-- 请求键：缺失/重复Header、空键、4096/4097边界、二进制NUL、IP家族、类型区分、
-  显式缺键回退、认证前后、请求改写视图、错误种子及纯性拒绝；无效键不触达上游。
-- 生命周期：两后端H1 keepalive/pipeline、H2并行不同键与RST、gRPC trailers/取消、
-  收发部分完成、SQ压力、超时和 Native 源文件移除；每次尝试只持有/释放一次 active。
-- 热更新：旧请求跨新种子/权重/目标重排仍使用旧快照，完成后只释放旧计数；同值配置
-  重载的新请求映射保持，故障健康状态不同造成的迁移单独记录，不能归因算法漂移。
-- 健康：正值容量门槛503、默认fail-open、零权重永不复活、重试排除不改变门槛分母、
-  全目标不可用、恢复及共享上游不同forward的稳定性。
-- 性能：单独按需运行benchmark，比较两个旧策略与HRW在1/2/8目标、短键/4KiB键下的
-  cycles、吞吐和p50/p99，报告首次/重试及并发H2；禁止为过性能测试改用进程随机盐。
-  先记录项目现有基线和接受阈值再测，不编造当前性能承诺；benchmark不进入每次PR默认CI。
-- 资源：ASan/UBSan、请求复用的键隔离、无C++运行库/ELF依赖检查，实测结构大小和
-  配置常驻内存，冷路径分配失败和digest失败均 fail closed；日志不含种子/键/摘要。
+- Golden vectors: compare an independent integer reference implementation with
+  C++ byte for byte, covering key_frame, D, H, h, cost and winner. Include h=0
+  (clamped to 1), 1, powers of two, maximum u64/weight and ties. Require identical
+  x86_64/arm64, Clang/GCC and Debug/Release/Native results. Reusing the helper
+  under test as its own oracle is not independent validation.
+- Stability/remapping: use a fixed public seed and at least 100,000 deterministic
+  distinct keys with 1–8 targets. Check all reorderings and single-target
+  add/remove, zero weight, recovery and weight increases/decreases; distribution
+  alone is insufficient.
+- Distribution: equal weights, 3:1, 1:65535 and mixed eight-target pools. Use
+  explicit binomial/multinomial tolerances with a fixed corpus. Rare targets may
+  receive zero samples; a fixed relative-error requirement is inappropriate for
+  extreme weights. Freeze statistical criteria before implementation.
+- Keys: missing/duplicate headers, empty keys, 4096/4097-byte boundaries, binary
+  NUL, IP families/type separation, explicit missing-key fallback, authentication
+  ordering, request-rewrite views, invalid seeds and purity rejection. Invalid
+  keys must never contact upstreams.
+- Ownership: H1 keepalive/pipelining on both backends, concurrent H2 streams with
+  different keys and RST, gRPC trailers/cancellation, partial send/receive, SQ
+  pressure, timeout and Native execution after source removal. Acquire/release
+  each attempt's active count exactly once.
+- Reload: old requests retain their snapshot through seed/weight changes and
+  target reordering, and release only old counters. New requests preserve mapping
+  after an equivalent reload. Record migration from changed health separately;
+  do not attribute it to algorithm drift.
+- Health: positive capacity-threshold 503, default fail-open, no reactivation of
+  zero-weight targets, retry exclusions preserving the threshold denominator,
+  all targets unavailable, recovery and stable selection across forward sites
+  sharing an upstream.
+- Performance: run benchmarks separately on demand. Compare existing policies
+  and HRW at 1/2/8 targets with short/4 KiB keys, reporting cycles, throughput and
+  p50/p99 for initial selection, retries and concurrent H2. Do not introduce
+  per-process random salts to pass benchmarks. Record existing baselines and
+  acceptance thresholds before measurement; invent no current performance
+  promise. Keep benchmarks out of default per-PR CI.
+- Resources: ASan/UBSan, key isolation after request reuse, no-C++-runtime/ELF
+  dependency checks, measured structure sizes and resident configuration memory.
+  Cold-path allocation and digest failures fail closed. Logs must not contain
+  seeds, keys or digests.
 
-## 8. 评审决策记录
+## 8. Decision record
 
-本提案选择：调用点显式策略、必填显式键/种子、加权HRW、确定性整数打分、静态端点身份、
-旧健康/重试策略复用。暂不引入环大小、虚拟节点数、hash_on字符串枚举、自动Cookie、
-动态目标ID或新的状态存储。未来扩展DNS/IPv6/管理面时，先定义稳定目标身份及分布式
-配置一致性，再扩大功能范围；不能直接用解析结果数组下标作为身份。
+This proposal chooses explicit per-forward policies, required keys/seeds,
+weighted HRW, deterministic integer scores, static endpoint identities and reuse
+of existing health/retry policies. It introduces no ring-size or virtual-node
+settings, hash_on string enum, automatic Cookies, dynamic target IDs or state
+store. Before extending to DNS, IPv6 or a management plane, define stable target
+identities and distributed configuration consistency. Resolver-result array
+indexes must never serve as target identities.

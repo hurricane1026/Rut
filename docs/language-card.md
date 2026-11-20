@@ -554,8 +554,9 @@ Retries release the failed attempt before selecting again. Both algorithms
 skip ejected backends when healthy ones exist and retain the existing fail-open
 behavior when all are ejected. Empty backend sets remain invalid. See [DESIGN.md §3.4.1](../DESIGN.md#341-listening-tls-and-upstream).
 
-一致性哈希目前未实现；拟议接口、加权 HRW 算法和验收计划见
-[一致性哈希实现设计](consistent-hash-design.md)（提案，不是当前支持语法）。
+Consistent hashing is not implemented. See the
+[consistent-hash implementation design](consistent-hash-design.md) for the proposed
+interface, weighted HRW algorithm and acceptance plan; this is not supported syntax.
 
 ## Active HTTP upstream health checks
 
