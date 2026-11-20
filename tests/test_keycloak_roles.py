@@ -53,7 +53,7 @@ def signed(claims, header=None):
 
 
 @contextmanager
-def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False):
+def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False, client_without=False):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -71,6 +71,13 @@ def gateway(args, directory, client='orders', realm='member', role='read', party
             '    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
             '    let access = keycloak.requireBearerAccessToken(document)\n' + \
             '    let allowed = keycloak.requireRealmRoleWithout(access, env("KEYCLOAK_REALM_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
+            '    return 204\n}\n'
+    if client_without:
+        program = program[:program.index('route GET "/realm"')] + \
+            'route GET "/client-without" {\n' + \
+            '    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
+            '    let access = keycloak.requireBearerAccessToken(document)\n' + \
+            '    let allowed = keycloak.requireClientRoleWithout(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
             '    return 204\n}\n'
     source.write_text(program.replace('listen :8080', f'listen :{port}'))
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
@@ -247,6 +254,22 @@ def main():
         for forbidden in ('', 'x' * 129, 'member'):
             with gateway(args, root, forbidden=forbidden, restricted=True) as port:
                 assert request(port, '/restricted', signed(valid), 'h2') == 503
+                checks += 1
+        with gateway(args, root, client_without=True) as port:
+            for version in ('HTTP/1.1', 'h2'):
+                for client_roles, status in ((['read'], 204), (['read', 'suspended'], 403),
+                                             (['suspended', 'read'], 403), (['read', 'other'], 204),
+                                             (['other'], 403), (['read', 7], 403), ([], 403)):
+                    claims = dict(valid, resource_access=dict(orders=dict(roles=client_roles)))
+                    assert request(port, '/client-without', signed(claims), version) == status
+                    checks += 1
+                for resource in ([], {'orders': []}, {'other': {'roles': ['read']}}, {}):
+                    assert request(port, '/client-without', signed(dict(valid, resource_access=resource)), version) == 403
+                    checks += 1
+        for client, role, forbidden in (('bad/client', 'read', 'suspended'), ('orders', '', 'suspended'),
+                                         ('orders', 'read', 'read'), ('orders', 'read', '')):
+            with gateway(args, root, client=client, role=role, forbidden=forbidden, client_without=True) as port:
+                assert request(port, '/client-without', signed(valid), 'h2') == 503
                 checks += 1
         for subject in ('', 'x' * 129):
             with gateway(args, root, subject=subject) as port:
