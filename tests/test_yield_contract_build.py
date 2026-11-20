@@ -74,6 +74,25 @@ def main():
         check(compiler, root, overlay, "Yield contract disagrees with RIR wait arms")
         probe.unlink()
 
+        source = "src/runtime/io_generation.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("counter >= maximum", "counter == maximum"),
+            ("counter >= maximum", "counter > maximum"),
+            ("owner = counter;", "owner = counter - 1;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
+            check(compiler, root, overlay, "I/O generation allocation violates the non-wrapping contract",
+                  source=source)
+            probe.unlink()
+
+        probe = mutate(root / "include", overlay, "rut/runtime/io_event.h",
+                       "kResponseReadTimerGenerationMask = 0x7FFFFFFFu",
+                       "kResponseReadTimerGenerationMask = 0xFFFFFFFFu")
+        check(compiler, root, overlay, "Cancellation marker must remain outside the generation range",
+              source=source)
+        probe.unlink()
+
         runtime = "src/runtime/jit_dispatch.cc"
         check(compiler, root, overlay, source=runtime)
         header = "rut/runtime/jit_dispatch.h"

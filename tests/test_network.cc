@@ -13397,6 +13397,38 @@ TEST(connection_base, tls_send_owners_reset_and_share_nonwrapping_tokens) {
     CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
 }
 
+TEST(connection_base, response_generations_publish_the_last_token_once_across_reset) {
+    Connection conn{};
+    conn.reset();
+    conn.response_read_deadline_send_generation = kNonUpstreamSendGenerationMask - 1;
+    conn.response_read_timer_generation = kResponseReadTimerGenerationMask - 1;
+    conn.response_read_deadline_generation = 0xfffffffeu;
+    REQUIRE(conn.next_response_read_deadline_send_generation());
+    REQUIRE(conn.next_response_read_timer_generation());
+    REQUIRE(conn.next_response_read_deadline_generation());
+    CHECK_EQ(conn.response_read_deadline_send_owner_generation, kNonUpstreamSendGenerationMask);
+    CHECK_EQ(conn.response_read_timer_owner_generation, kResponseReadTimerGenerationMask);
+    CHECK_EQ(conn.response_read_deadline_owner_generation, 0xffffffffu);
+
+    REQUIRE(conn.clear_response_read_timer_owner());
+    conn.reset();
+    CHECK_FALSE(conn.next_response_read_deadline_send_generation());
+    CHECK_FALSE(conn.next_response_read_timer_generation());
+    CHECK_FALSE(conn.next_response_read_deadline_generation());
+    CHECK_EQ(conn.response_read_deadline_send_owner_generation, 0u);
+    CHECK_EQ(conn.response_read_timer_owner_generation, 0u);
+    CHECK_EQ(conn.response_read_deadline_owner_generation, 0u);
+
+    // A contaminated counter must never yield a cancel-tagged or wrapped send.
+    for (const u32 invalid : {kNonUpstreamSendCancelBit, 0xffffffffu}) {
+        conn.response_read_deadline_send_generation = invalid;
+        u32 tls_generation = 41;
+        CHECK_FALSE(conn.next_non_upstream_send_generation(tls_generation));
+        CHECK_EQ(tls_generation, 41u);
+        CHECK_EQ(conn.response_read_deadline_send_generation, invalid);
+    }
+}
+
 TEST(iouring_send, file_send_continuation_never_writes_to_a_closed_or_reused_fd) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());

@@ -97,6 +97,15 @@ inline constexpr u32 kNonUpstreamSendGenerationMask = 0x7FFFFFFFu;
 inline constexpr u32 kResponseReadTimerCancelBit = 0x80000000u;
 inline constexpr u32 kResponseReadTimerGenerationMask = 0x7FFFFFFFu;
 
+// A persistent counter may publish its last representable generation once.
+// On exhaustion, leave both the counter and the caller's owner untouched.
+constexpr bool allocate_io_generation(u32& counter, u32& owner, u32 maximum) {
+    if (counter >= maximum) return false;
+    ++counter;
+    owner = counter;
+    return true;
+}
+
 inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
     return token.conn_id <= kIoUserDataMaxConnId && io_event_uses_upstream_episode(token.type) &&
            token.episode != 0 && token.episode <= kIoUserDataMaxUpstreamEpisode;
