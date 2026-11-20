@@ -1,0 +1,18 @@
+import "middleware/browser_origin.rut"
+import "middleware/browser_fetch_metadata.rut"
+
+listen :8080
+
+// These policies are trusted deployment configuration. Attach both checks
+// before authentication/session state changes or any administrative mutation.
+route POST "/admin/write" {
+    let origin = browser_origin.requireOrigin(env("BROWSER_ORIGIN"))
+    let site = browser_fetch_metadata.requireSameOrigin(env("BROWSER_FETCH_SITE"))
+    return 204
+}
+route POST "/session" {
+    let origin = browser_origin.requireOrigin(env("BROWSER_ORIGIN"))
+    let site = browser_fetch_metadata.requireSameOrigin(env("BROWSER_FETCH_SITE"))
+    return 204
+}
+route "/" { return 404 }

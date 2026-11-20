@@ -1,0 +1,9 @@
+// This strict browser profile is deployment-owned and accepts only the
+// literal same-origin value. It complements Origin and authentication; request
+// headers are forgeable by non-browser clients.
+func requireSameOrigin(_ configuredSite: str) -> i32 {
+    guard configuredSite == "same-origin" else { respond 503 }
+    guard let site = req.uniqueHeader("Sec-Fetch-Site") else { respond 403 }
+    guard site == configuredSite else { respond 403 }
+    0
+}
