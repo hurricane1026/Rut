@@ -348,7 +348,8 @@ void Es256Policies::maintain(u32 shard, u64 monotonic_ms) {
         } else if (remote->fetch.state() == HttpsFetch::State::Done) {
             Es256KeySet keys;
             const auto kPrepared = policies[i].prepare_refresh(remote->fetch.body(), keys);
-            if (kPrepared != Es256Policy::Refresh::Invalid) {
+            if (kPrepared != Es256Policy::Refresh::Invalid &&
+                !(policy.require_non_empty_keys && kPrepared == Es256Policy::Refresh::Empty)) {
                 auto& candidate = remote->use_alternate ? row.verifiers[i] : remote->alternate;
                 candidate.reset();
                 if (kPrepared == Es256Policy::Refresh::Empty || candidate.init(keys)) {

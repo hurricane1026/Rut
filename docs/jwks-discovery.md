@@ -112,6 +112,19 @@ claimed to be DNSSEC-authenticated; address allowlisting plus mandatory HTTPS
 identity validation preserves the configured destination trust
 boundary and prevents rebinding to an unconfigured internal service.
 
+## Optional nonempty key refresh
+
+`requireNonEmptyKeys` is an optional Boolean, default false. When true, a valid
+JWKS with no configured approved kids is a failed refresh, including a nonempty
+JWKS containing only unapproved kids. It leaves the previous keys, validator and
+last-success time unchanged and uses the normal failure retry schedule. Existing
+keys remain usable only until their original hard `maxAgeSeconds` deadline;
+a cold or expired cache remains unavailable until a nonempty approved refresh.
+The default accepts an empty intersection and immediately removes existing keys.
+This option delays the effect of an authoritative empty set until expiry, so use
+it only when that availability and revocation tradeoff is intended. It never
+admits unapproved kids or extends maximum age.
+
 ## Conditional key refresh
 
 Optional `conditionalRequests` is a Boolean, defaulting to false. The default

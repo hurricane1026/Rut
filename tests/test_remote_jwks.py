@@ -33,6 +33,7 @@ def main():
     parser.add_argument("--stage-timeout", action="store_true")
     parser.add_argument("--conditional-discovery", action="store_true")
     parser.add_argument("--discovery-cache", action="store_true")
+    parser.add_argument("--require-non-empty-keys", action="store_true")
     args = parser.parse_args()
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -224,6 +225,8 @@ def main():
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
+        if args.require_non_empty_keys:
+            policy["remoteJwks"].update(requireNonEmptyKeys=True, maxAgeSeconds=6)
         if args.conditional:
             policy["remoteJwks"].update(conditionalRequests=True, timeoutSeconds=5, retrySeconds=1)
         retry_profile = not args.discovery_dns and not args.access_profile and not args.conditional
@@ -387,7 +390,18 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.discovery_cache:
+            if args.require_non_empty_keys:
+                wait_status(fixture["a"], 200)
+                publish(b'{"keys":[]}')
+                with lock:
+                    previous = state["requests"]
+                wait_for_origin_request(previous)
+                time.sleep(0.2)
+                assert request(fixture["a"]) == 200, "empty response replaced fresh keys"
+                wait_status(fixture["a"], 401)
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+            elif args.discovery_cache:
                 wait_status(fixture["a"], 200)
                 with lock:
                     assert len(state["discoveries"]) == 1
