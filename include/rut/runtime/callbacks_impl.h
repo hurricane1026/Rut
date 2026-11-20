@@ -380,9 +380,13 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
         buf.write(reinterpret_cast<const u8*>("/"), 1);
     static const char kProto[] = " HTTP/1.1\r\nHost: ";
     buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
-    char host[24];
-    const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
-    buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    if (target.hc_host_len) {
+        buf.write(reinterpret_cast<const u8*>(target.hc_host), target.hc_host_len);
+    } else {
+        char host[24];
+        const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
+        buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    }
     static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
     buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
 }

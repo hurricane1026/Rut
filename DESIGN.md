@@ -1616,8 +1616,12 @@ another target follows the previous failure path. Retired configurations can
 drain established requests. A current target with an enabled threshold ignores
 late connect results from a retired configuration. The default of 0 preserves
 fail-open selection and the existing handling of passive results.
-Native artifact version 23 records the active health timeout as well as the
-minimum healthy weight percentage.
+The optional health-check `host` is a validated literal HTTP authority, up to
+260 bytes, copied into each plaintext probe's Host header; its original spelling
+is preserved. Without it the probe uses the selected backend address and port.
+This field neither enables TLS probes nor changes forwarded request headers.
+Native artifact version 26 records the health-check host and rejects older
+artifacts for recompilation.
 
 An upstream may set `connect_attempts: N` to allow 1 through 8 fresh TCP
 connection attempts for ordinary HTTP/1 forwarding, including the first attempt.

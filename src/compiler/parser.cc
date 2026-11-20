@@ -4,6 +4,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/route_host.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
+#include "rut/common/upstream_health.h"
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
@@ -4010,6 +4011,7 @@ struct Parser {
                     auto hc_lbrace = expect(TokenType::LBrace);
                     if (!hc_lbrace) return core::make_unexpected(hc_lbrace.error());
                     bool seen_path = false;
+                    bool hc_seen_host = false;
                     bool seen_interval = false;
                     bool seen_timeout = false;
                     bool seen_status = false;
@@ -4021,7 +4023,20 @@ struct Parser {
                         const Str hc_key = hc_field.value()->text;
                         auto hc_colon = expect(TokenType::Colon);
                         if (!hc_colon) return core::make_unexpected(hc_colon.error());
-                        if (hc_key.eq({"path", 4})) {
+                        if (hc_key.eq({"host", 4})) {
+                            if (hc_seen_host)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto host = expect(TokenType::StringLit);
+                            if (!host) return core::make_unexpected(host.error());
+                            if (!active_health_host_valid(host.value()->text))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*host.value()),
+                                                      host.value()->text);
+                            item.upstream.hc_host_lit = host.value()->text;
+                            hc_seen_host = true;
+                        } else if (hc_key.eq({"path", 4})) {
                             if (seen_path)
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*hc_field.value()),

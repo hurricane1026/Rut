@@ -48690,3 +48690,54 @@ TEST(frontend, passive_health_policy_bounds_and_prebound) {
         CHECK_FALSE(parse_file_heap(invalid.value()));
     }
 }
+
+TEST(frontend, upstream_health_probe_host_authority) {
+    for (const char* host : {"api.example", "Api.Example:8080", "[::1]:443"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { host: \"127.0.0.1\", port: 8080, health_check: { "
+                 "path: \"/health\", interval: 1s, host: \"%s\" } }",
+                 host);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK((Str{cfg.upstreams[0].hc_host, cfg.upstreams[0].hc_host_len}.eq(lit(host))));
+        rir.destroy();
+    }
+    for (const char* host : {"",
+                             "bad host",
+                             "bad/path",
+                             "user@example",
+                             "bad,host",
+                             "*.example",
+                             "host:65536",
+                             "host:",
+                             "[bad]",
+                             "host\\r\\nX:evil"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/health\", interval: 1s, host: \"%s\" } }",
+                 host);
+        auto tokens = lex(lit(source));
+        if (tokens) CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto duplicate = lex(lit(
+        "upstream api { health_check: { path: \"/\", interval: 1s, host: \"a\", host: \"b\" } }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+    char long_host[262];
+    for (u32 i = 0; i < 261; ++i) long_host[i] = 'a';
+    long_host[261] = '\0';
+    CHECK_FALSE(active_health_host_valid({long_host, 261}));
+}

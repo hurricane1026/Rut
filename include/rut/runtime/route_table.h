@@ -95,6 +95,8 @@ struct UpstreamTarget {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    char hc_host[261]{};
+    u32 hc_host_len = 0;
     char hc_path[64];
     u32 hc_path_len = 0;
     u32 hc_interval_ms = 0;
@@ -1895,10 +1897,12 @@ public:
                                    u32 interval_ms,
                                    u16 status,
                                    ActiveHealthThresholds thresholds = {},
-                                   u32 timeout_seconds = 0) {
+                                   u32 timeout_seconds = 0,
+                                   Str host = {}) {
         if (uid >= upstream_count) return false;
         UpstreamTarget& up = upstreams[uid];
         if (path == nullptr) return false;
+        if (host.len && !active_health_host_valid(host)) return false;
         if (path_len >= sizeof(up.hc_path)) return false;
         if (interval_ms == 0 || timeout_seconds >= TimerWheel::kSlots) return false;
         if (status < 100 || status > 599 || !thresholds.valid()) return false;
@@ -1911,6 +1915,9 @@ public:
             const unsigned char ch = static_cast<unsigned char>(path[i]);
             if (ch <= 0x20 || ch == 0x7f) return false;
         }
+        for (u32 i = 0; i < host.len; ++i) up.hc_host[i] = host.ptr[i];
+        up.hc_host[host.len] = '\0';
+        up.hc_host_len = host.len;
         for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
         up.hc_path[path_len] = '\0';
         up.hc_path_len = path_len;
