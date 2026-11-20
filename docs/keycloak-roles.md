@@ -139,3 +139,9 @@ the exact forbidden role. The entire array must be valid even after a match.
 Invalid client or role selectors, including equal roles, return 503; missing or
 malformed claims and failed role checks return 403. Verify the token and apply
 the Bearer access gate first.
+
+`requireAllClientRoles(document, client, first, second)` requires both exact
+roles in the selected client's complete valid role array. Roles in other
+clients do not contribute. Invalid selectors or equal role names return 503;
+missing, malformed or nonmatching roles return 403. Verify the token and apply
+the Bearer access gate first.
