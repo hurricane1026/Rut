@@ -17,3 +17,11 @@ func requireOrigin(_ trustedOrigin: str) -> i32 {
     guard origin == trustedOrigin else { respond 403 }
     0
 }
+
+// Both origins are trusted deployment configuration, never request input.
+func requireEitherOrigin(_ first: str, _ second: str) -> i32 {
+    guard validOrigin(first) && validOrigin(second) && first != second else { respond 503 }
+    guard let origin = req.uniqueHeader("Origin") else { respond 403 }
+    guard origin == first || origin == second else { respond 403 }
+    0
+}

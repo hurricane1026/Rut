@@ -14,4 +14,10 @@ route POST "/session" {
     return 204
 }
 
+// An explicitly configured second frontend may share this mutation route.
+route POST "/shared/write" {
+    let guarded = browser_origin.requireEitherOrigin(env("BROWSER_ORIGIN"), env("BROWSER_SECOND_ORIGIN"))
+    return 204
+}
+
 route "/" { return 404 }
