@@ -132,3 +132,10 @@ realm role and denies the distinct forbidden role in the same fully validated
 role array. Invalid or equal trusted selectors return 503; a missing, malformed
 or nonmatching array or present forbidden role returns 403. It returns the
 unchanged verified Bearer access-token document.
+
+`requireClientRoleWithout(document, client, allowed, forbidden)` selects one
+client's `resource_access` role array, requires the exact allowed role and denies
+the exact forbidden role. The entire array must be valid even after a match.
+Invalid client or role selectors, including equal roles, return 503; missing or
+malformed claims and failed role checks return 403. Verify the token and apply
+the Bearer access gate first.
