@@ -100,7 +100,10 @@ inline u32 timer_seconds_from_ms(u32 ms) {
     return secs > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(secs);
 }
 
-inline bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch-enum"
+#pragma GCC diagnostic error "-Wswitch"
+constexpr bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
     // Event eligibility is payload-independent here. Timer delivery also checks
     // the armed timer in the loop; a timer-only wait uses its own resume path.
     const auto contract = jit::yield_contract(kind, 1);
@@ -128,7 +131,7 @@ inline bool yield_kind_matches_event(jit::YieldKind kind, IoEventType type) {
     return false;
 }
 
-inline jit::YieldKind yield_kind_from_event(IoEventType type) {
+constexpr jit::YieldKind yield_kind_from_event(IoEventType type) {
     switch (type) {
         case IoEventType::Recv:
             return jit::YieldKind::Recv;
@@ -153,6 +156,7 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
     }
     return jit::YieldKind::Timer;
 }
+#pragma GCC diagnostic pop
 
 // Invoke a JIT-compiled handler once and translate the packed result
 // into an event-loop-facing outcome. Does NOT loop: a Yield returns either
