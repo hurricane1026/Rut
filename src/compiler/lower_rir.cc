@@ -2069,6 +2069,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         const auto type = value.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
                           : value.type == MirTypeKind::I64 ? rir::TypeKind::I64
                           : value.type == MirTypeKind::I32 ? rir::TypeKind::I32
+                          : value.type == MirTypeKind::IP  ? rir::TypeKind::IP
                                                            : rir::TypeKind::Str;
         auto result = b.emit_json(static_cast<u32>(value.int_value),
                                   type,

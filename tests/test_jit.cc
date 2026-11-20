@@ -2225,6 +2225,88 @@ TEST(jit, frontend_req_standard_header_alias_any_fallback) {
     rir.destroy();
 }
 
+TEST(jit, ip_parse_compares_runtime_value_to_remote_address) {
+    const char* source = R"rut(
+route GET "/" {
+    guard let value = IP.parse(req.query("ip").or("")) else { return 400 }
+    guard value == req.remoteAddr else { return 403 }
+    return 204
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    Connection conn;
+    conn.reset();
+    conn.peer_addr = 0x0a000001u;
+    struct Case {
+        const char* request;
+        u16 status;
+    };
+    const Case cases[] = {
+        {"GET /?ip=10.0.0.1 HTTP/1.1\r\nHost: h\r\n\r\n", 204},
+        {"GET /?ip=10.0.0.2 HTTP/1.1\r\nHost: h\r\n\r\n", 403},
+        {"GET /?ip=010.0.0.1 HTTP/1.1\r\nHost: h\r\n\r\n", 400},
+        {"GET /?ip=10.0.0.256 HTTP/1.1\r\nHost: h\r\n\r\n", 400},
+        {"GET / HTTP/1.1\r\nHost: h\r\n\r\n", 400},
+    };
+    for (const auto& test : cases) {
+        auto result = HandlerResult::unpack(handler(&conn,
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(test.request),
+                                                    static_cast<u32>(strlen(test.request)),
+                                                    nullptr));
+        CHECK_EQ(result.status_code, test.status);
+    }
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(helpers, strict_ipv4_parse) {
+    struct Case {
+        const char* text;
+        bool valid;
+        u32 value;
+    };
+    const Case cases[] = {{"0.0.0.0", true, 0},
+                          {"255.255.255.255", true, 0xffffffffu},
+                          {"10.0.0.1", true, 0x0a000001u},
+                          {"", false, 0},
+                          {"1.2.3", false, 0},
+                          {"1.2.3.4.5", false, 0},
+                          {"01.2.3.4", false, 0},
+                          {"1.02.3.4", false, 0},
+                          {"1.2.3.256", false, 0},
+                          {"1.2.3.0000", false, 0},
+                          {" 1.2.3.4", false, 0},
+                          {"1.2.3.4 ", false, 0},
+                          {"+1.2.3.4", false, 0},
+                          {"1.2.3.-4", false, 0},
+                          {"::1", false, 0},
+                          {"1.2.3.4:80", false, 0}};
+    for (const auto& test : cases) {
+        u32 value = 99;
+        CHECK_EQ(rut_helper_parse_ip(test.text, static_cast<u32>(strlen(test.text)), &value),
+                 test.valid);
+        CHECK_EQ(value, test.value);
+    }
+}
+
 TEST(jit, frontend_req_remote_addr_read) {
     const char* src = "route GET \"/addr\" { let addr = req.remoteAddr return 204 }\n";
 

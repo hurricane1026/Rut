@@ -598,6 +598,10 @@ req.body(User)          // parse body as User struct, error-capable
 req.bodyRaw             // raw body as string, error-capable
 req.bodyRaw = newBody   // replace body before forward (recomputes Content-Length)
 
+// `IP.parse(text)` returns IP? for strict dotted IPv4: four decimal octets
+// in 0...255, no whitespace or multi-digit leading zeros; otherwise nil.
+// The value uses the same representation as req.remoteAddr.
+
 // Cookies
 req.cookie("session_id")       // string? — first matching pair
 req.uniqueCookie("session_id") // string? — exactly one matching pair

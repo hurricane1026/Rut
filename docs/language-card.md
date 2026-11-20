@@ -230,11 +230,16 @@ User impl Hashable { func hash() -> u64 => fnv64(self.id) }  // Type impl Protoc
 
 parseInt("42")             // i32? — strict decimal, str or Bytes
 parseInt64(b"9223372036854775807")  // i64? — inferred wide result
-// ⏳ parseFloat, IP.parse, CIDR.parse and Duration.parse remain pending
+IP.parse("192.0.2.1")     // IP? — strict dotted IPv4
+// ⏳ parseFloat, CIDR.parse and Duration.parse remain pending
 200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
 
 ## Decimal integer parsing
+
+`IP.parse(value)` accepts an unwrapped `str` and returns `IP?`. It accepts four
+decimal octets from 0 through 255, with no whitespace or leading zero in a
+multi-digit octet; invalid input returns nil. IPv6 is not supported.
 
 `parseInt(value)` returns `i32?`; `parseInt64(value)` returns `i64?`.
 Both accept an unwrapped `str` or `Bytes`, without imports, allocation or text
