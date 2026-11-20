@@ -10021,6 +10021,10 @@ capacity limits and wire validation are unchanged. Chain-after mutations commit
 on normal terminators and explicit guard status returns; runtime-generated
 failures still do not commit them. The policy-free legacy upstream-connect 502
 may serialize already-committed mutations without changing mutation commit state.
+A local literal-status Response builder exposes `resp.status` as a read-only
+`i32`, folded from its initializer. Runtime chain-after and upstream Response
+status reads and status assignment remain unsupported.
+
 `add` still requires a non-optional string, and local Response builders retain
 their existing restrictions. This general primitive lets the CORS module omit
 credentials/preflight/exposure headers without adding conditional effect syntax.

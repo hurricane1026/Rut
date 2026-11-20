@@ -48855,3 +48855,36 @@ TEST(frontend, upstream_health_status_range_runtime_validation) {
     CHECK_EQ(cfg.upstreams[0].hc_status_max, 0u);
     CHECK_EQ(cfg.upstreams[0].hc_expected_status, 204u);
 }
+
+TEST(frontend, response_local_status_is_read_only_i32) {
+    auto tokens = lex(lit(R"rut(route GET "/" {
+        let resp = response(429)
+        let status = resp.status
+        resp.set("X-Status", formatInt(resp.status).or("error"))
+        return resp
+    })rut"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE(hir->routes[0].locals.len >= 2);
+    CHECK_EQ(static_cast<u32>(hir->routes[0].locals[1].init.type),
+             static_cast<u32>(HirTypeKind::I32));
+    CHECK_EQ(hir->routes[0].locals[1].init.int_value, 429);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    rir.destroy();
+    for (const char* source :
+         {R"rut(route GET "/" { let resp = response(429) resp.status = 200 return resp })rut",
+          R"rut(func inspect(_ resp: Response) -> i32 { resp.status }
+                    route GET "/" { return 200 })rut"}) {
+        auto bad_tokens = lex(lit(source));
+        REQUIRE(bad_tokens);
+        auto bad_ast = parse_file_heap(bad_tokens.value());
+        if (bad_ast) CHECK_FALSE(analyze_file_heap(bad_ast.value()));
+    }
+}

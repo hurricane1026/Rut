@@ -132,6 +132,11 @@ route GET "/capture-limit" {{
 }}
 route GET "/plain" {{ return forward(backend, load_balance: .roundRobin) }}
 ''' + r'''
+route GET "/local-status" {
+    let resp = response(429)
+    resp.set("X-Status", formatInt(resp.status).or("error"))
+    return resp
+}
 func originalPath(_ req: i32, _ resp: Response) -> i32 {
     resp.set("X-Original-Path", req.path)
     0
@@ -319,6 +324,15 @@ route "/" {
                     finally:
                         probe.close()
                 assert result == (200, expected_name), ('metadata', result)
+                if not args.h2:
+                    probe = connection(port)
+                    try:
+                        probe.request('GET', '/local-status')
+                        reply = probe.getresponse()
+                        result = (reply.status, reply.getheader('X-Status'), reply.read())
+                    finally:
+                        probe.close()
+                    assert result == (429, '429', b'Too Many Requests'), ('local status', result)
                 # Physical occurrences stay ordered, including empty values and
                 # commas, and request mutations do not change original reads.
                 fields = [('X-List', 'first,second'), ('x-list', ''), ('X-LIST', 'third')]
