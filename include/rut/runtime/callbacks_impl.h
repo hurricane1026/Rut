@@ -5939,9 +5939,6 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
     conn.upstream_attempts++;
-    if (conn.access_log_upstream_attempts_plus_one > 0 &&
-        conn.access_log_upstream_attempts_plus_one < 255)
-        ++conn.access_log_upstream_attempts_plus_one;
     conn.release_backend_active();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
@@ -5956,6 +5953,9 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
         (void)detach_upstream_close(loop, conn);
         return false;
     }
+    if (conn.access_log_upstream_attempts_plus_one > 0 &&
+        conn.access_log_upstream_attempts_plus_one < 255)
+        ++conn.access_log_upstream_attempts_plus_one;
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
     hold_backend_active(conn);
