@@ -11492,3 +11492,10 @@ The optional `opa.tenantStatus` follows the existing trusted structured
 OPA decision contract with an exact configured tenant comparison before forwarding.
 Denied decisions and mismatches return 403; malformed or unavailable decisions and
 invalid configuration return 503. See [the contract](docs/opa-authorization.md#optional-structured-decision-tenant-binding).
+
+### Strict introspection token type
+
+The opt-in `introspection.requireActiveBearer` composes active-token validation
+with mandatory Bearer token-type metadata, retaining the existing case-insensitive
+comparison and 401 invalid-token response. The original optional-type policy is
+unchanged. See [the contract](docs/oauth-introspection.md#optional-mandatory-bearer-token-type).

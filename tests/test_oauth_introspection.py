@@ -52,6 +52,9 @@ def main():
                 'bad-audience': dict(aud=['reports-api', 7]), 'typed-active': dict(active='true'),
                 'typed-exp': dict(exp=str(now + 3600)), 'typed-scope': dict(scope=['reports:read']),
                 'wrong-scope': dict(scope='reports:reader'), 'wrong-type': dict(token_type='MAC'),
+                'bearer-type': dict(token_type='Bearer'), 'mixed-type': dict(token_type='bEaReR'),
+                'empty-type': dict(token_type=''), 'null-type': dict(token_type=None),
+                'typed-type': dict(token_type=True), 'spaced-type': dict(token_type='Bearer '),
                 'read-only': dict(scope='reports:read'), 'write-only': dict(scope='reports:write'),
                 'audit-only': dict(scope='reports:audit'),
                 'all-scopes': dict(scope='reports:audit reports:write reports:read'),
@@ -114,6 +117,8 @@ def main():
                 data = data[:-1] + b', "client_id":"other"}'
             if token == 'aliased-issuer':
                 data = data[:-1] + b', "i\\u0073s":"https://other.example"}'
+            if token == 'duplicate-type':
+                data = data[:-1] + b', "token_type":"Bearer", "token\\u005ftype":"MAC"}'
             if token == 'malformed':
                 data = b'{'
             elif token == 'duplicate':
@@ -273,6 +278,15 @@ route GET "/{path}" {{
     return 204
 }}
 '''
+            source += """
+route GET "/strict-type" {
+    let request = introspection.request(req.authorization.or(""), env("INTROSPECTION_AUTH"))
+    let pending = httpCall(env("INTROSPECTION_ENDPOINT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let document = introspection.requireActiveBearer(reply, "reports-api")
+    return 204
+}
+"""
             program, log = root / 'gateway.rut', root / 'gateway.log'
             program.write_text(source)
             env = dict(os.environ, INTROSPECTION_AUTH=service_auth, INTROSPECTION_ENDPOINT=json.dumps(endpoint),
@@ -410,6 +424,16 @@ route GET "/{path}" {{
                         assert len(received) == before and not forwarded
                     assert request('x' * 1025)[0] == 503  # Bounded request cannot be constructed.
                     assert not received and not forwarded
+                    for token, expected in (('bearer-type', 204), ('mixed-type', 204),
+                                            ('valid', 401), ('wrong-type', 401),
+                                            ('empty-type', 401), ('null-type', 401),
+                                            ('typed-type', 401), ('spaced-type', 401),
+                                            ('duplicate-type', 503), ('inactive', 401),
+                                            ('malformed', 503)):
+                        status, headers, data = request(token, '/strict-type')
+                        assert status == expected, (token, status, data)
+                        if expected == 401:
+                            assert 'invalid_token' in headers.get('WWW-Authenticate', '')
                     for token in ('valid', 'special+/=='):
                         status, headers, data = request(token)
                         assert (status, data) == (200, ('subject-' + token).encode()), (status, data)
