@@ -2522,6 +2522,25 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 c.set_value(inst.result, result);
                 break;
             }
+            if (kJsonOp == json::Op::ParseIp) {
+                const auto text = c.get_value(inst.operands[0]);
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty};
+                const auto type = LLVMFunctionType(c.i8_ty, params, 3, 0);
+                auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_parse_ip");
+                if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_parse_ip", type);
+                const auto output = LLVMBuildAlloca(c.builder, c.i32_ty, "ip.output");
+                LLVMValueRef args[] = {LLVMBuildExtractValue(c.builder, text, 0, "ip.ptr"),
+                                       LLVMBuildExtractValue(c.builder, text, 1, "ip.len"),
+                                       output};
+                const auto has = LLVMBuildCall2(c.builder, type, helper, args, 3, "ip.has");
+                const auto payload = LLVMBuildLoad2(c.builder, c.i32_ty, output, "ip.value");
+                const auto* result_type = c.cur_fn->values[inst.result.id].type;
+                auto result = LLVMGetUndef(c.map_type(result_type));
+                result = LLVMBuildInsertValue(c.builder, result, has, 0, "");
+                result = LLVMBuildInsertValue(c.builder, result, payload, 1, "");
+                c.set_value(inst.result, result);
+                break;
+            }
             if (kJsonOp == json::Op::ParseInt || kJsonOp == json::Op::ParseInt64) {
                 const bool wide = kJsonOp == json::Op::ParseInt64;
                 const auto text = c.get_value(inst.operands[0]);

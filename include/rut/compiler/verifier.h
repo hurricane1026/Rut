@@ -157,7 +157,8 @@ inline bool valid_bytes_construction(const Function& fn, const Instruction& inst
 inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
     if (inst.op != Opcode::JsonOp) return true;
     const auto op = static_cast<json::Op>(inst.imm.i32_val);
-    if (op != json::Op::ParseInt && op != json::Op::ParseInt64) return true;
+    if (op != json::Op::ParseInt && op != json::Op::ParseInt64 && op != json::Op::ParseIp)
+        return true;
     if (inst.operand_count != 1 || inst.extra_operands) return false;
     const auto type_of = [&](ValueId id) -> const Type* {
         return id != kNoValue && id.id < fn.value_count && fn.values ? fn.values[id.id].type
@@ -167,7 +168,9 @@ inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
     const Type* result = type_of(inst.result);
     return input && input->kind == TypeKind::Str && !input->inner && !input->struct_def && result &&
            result->kind == TypeKind::Optional && !result->struct_def && result->inner &&
-           result->inner->kind == (op == json::Op::ParseInt64 ? TypeKind::I64 : TypeKind::I32) &&
+           result->inner->kind == (op == json::Op::ParseIp      ? TypeKind::IP
+                                   : op == json::Op::ParseInt64 ? TypeKind::I64
+                                                                : TypeKind::I32) &&
            !result->inner->inner && !result->inner->struct_def;
 }
 

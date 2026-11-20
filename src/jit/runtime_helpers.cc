@@ -3,6 +3,7 @@
 #include "core/placement_new.h"
 #include "rut/common/forward_target.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/ipv4.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -3316,6 +3317,11 @@ extern "C" void rut_helper_resp_body(
     c.jit_response_head = parsed.ok && parsed.req.method == HttpMethod::HEAD;
     c.jit_response_body = {ptr, len};
     c.jit_response_body_valid = ptr != nullptr && len <= SlicePool::kSliceSize;
+}
+
+extern "C" rut::u8 rut_helper_parse_ip(const char* data, rut::u32 length, rut::u32* output) {
+    if (!output) return 0;
+    return rut::parse_ipv4_canonical({data, length}, *output);
 }
 
 extern "C" rut::u8 rut_helper_parse_int(const char* data,

@@ -9482,6 +9482,24 @@ TEST(frontend, decimal_integer_builtins_preserve_optional_width_and_accept_bytes
     }
 }
 
+TEST(frontend, ip_parse_requires_one_unwrapped_string) {
+    const char* expressions[] = {"IP.parse()",
+                                 "IP.parse(1)",
+                                 "IP.parse(b\"1.2.3.4\")",
+                                 "IP.parse(req.query(\"ip\"))",
+                                 "IP.parse(\"1.2.3.4\", \"x\")"};
+    for (const auto* expression : expressions) {
+        std::string source = "route GET \"/\" { let value = ";
+        source += expression;
+        source += " return 204 }";
+        auto lexed = lex(lit(source.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
 TEST(frontend, decimal_integer_builtins_require_one_unwrapped_text_or_bytes_argument) {
     const char* expressions[] = {"parseInt()",
                                  "parseInt(\"1\", \"2\")",

@@ -94,6 +94,7 @@ enum class Op : u8 {
     ConsumerAuthenticateForm,
     ConsumerAuthenticateMtls,
     OauthClientBasicAuthorization,
+    ParseIp,
 
 };
 

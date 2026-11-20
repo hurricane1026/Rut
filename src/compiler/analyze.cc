@@ -4799,6 +4799,26 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         route->exprs.len = probe_saved_exprs;
         route->guards.len = probe_saved_guards;
     }
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("IP")) && expr.name.eq(lit_str("parse")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("IP"))) {
+        constexpr auto detail = lit_str("IP.parse expects one unwrapped str");
+        if (!route || expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        auto value = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!value) return core::make_unexpected(value.error());
+        if (value->may_nil || value->may_error || value->type != HirTypeKind::Str)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
+        return make_json_op(json::Op::ParseIp,
+                            HirTypeKind::IP,
+                            true,
+                            &value.value(),
+                            nullptr,
+                            nullptr,
+                            expr.span,
+                            route);
+    }
+
     // Builtin `bitwise` namespace (DESIGN.md §3.2.1) — see
     // analyze_bitwise_namespace_call. A user binding named `bitwise` (local,
     // alias, function, type, import namespace) shadows the builtin.
@@ -14999,7 +15019,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                         operation != json::Op::BytesSlice && operation != json::Op::BytesFind &&
                         operation != json::Op::BytesConcat && operation != json::Op::FormatInt &&
                         operation != json::Op::BytesFromString && operation != json::Op::ParseInt &&
-                        operation != json::Op::ParseInt64)
+                        operation != json::Op::ParseInt64 && operation != json::Op::ParseIp)
                         return false;
                     break;
                 }
