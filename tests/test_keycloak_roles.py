@@ -53,7 +53,7 @@ def signed(claims, header=None):
 
 
 @contextmanager
-def gateway(args, directory, client='orders', realm='member', role='read'):
+def gateway(args, directory, client='orders', realm='member', role='read', party='storefront'):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -68,7 +68,8 @@ def gateway(args, directory, client='orders', realm='member', role='read'):
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
                   jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), KEYCLOAK_CLIENT=client,
-               KEYCLOAK_REALM_ROLE=realm, KEYCLOAK_CLIENT_ROLE=role)
+               KEYCLOAK_REALM_ROLE=realm, KEYCLOAK_CLIENT_ROLE=role,
+               KEYCLOAK_AUTHORIZED_PARTY=party)
     log = root / 'gateway.log'
     with log.open('w') as output:
         process = subprocess.Popen([args.server, str(source), '--backend', args.backend,
@@ -172,10 +173,23 @@ def main():
             for version in ('HTTP/1.0', 'HTTP/1.1', 'h2'):
                 for claims, decisions in cases:
                     credential = signed(claims)
-                    for path, expected in zip(('/realm', '/client', '/both'), decisions):
+                    realm, client, both = decisions
+                    either = 401 if both == 401 else 204 if 204 in (realm, client) else 403
+                    for path, expected in zip(('/realm', '/client', '/both', '/either'),
+                                              (*decisions, either)):
                         actual = request(port, path, credential, version)
                         assert actual == expected, (version, path, claims, actual, expected)
                         checks += 1
+                for party, status in (('storefront', 204), ('Storefront', 401),
+                                      ('storefront-extra', 401), ('orders', 401), ('', 401),
+                                      (None, 401), (['storefront'], 401), (7, 401)):
+                    claim = signed(dict(valid, azp=party))
+                    assert request(port, '/party', claim, version) == status
+                    checks += 1
+                for claims in (valid, dict(valid, azp='storefront', aud='other'),
+                               dict(valid, azp='storefront', typ='Refresh')):
+                    assert request(port, '/party', signed(claims), version) == 401
+                    checks += 1
                 good = signed(valid)
                 bad = good[:-5] + ('A' if good[-5] != 'A' else 'B') + good[-4:]
                 for credential, duplicate_header in ((None, False), ('malformed', False), (bad, False), (good, True),
@@ -197,6 +211,10 @@ def main():
                     assert request(port, '/client', signed(dict(valid, resource_access=[dict(roles=['read'])])), 'h2') == 403
                     checks += 1
                 checks += 2
+        with gateway(args, root, client='bad/client', party='') as port:
+            assert request(port, '/party', signed(dict(valid, azp='storefront')), 'h2') == 503
+            assert request(port, '/either', signed(valid), 'HTTP/1.1') == 503
+            checks += 2
         # Maximum accepted byte lengths are usable, without truncating a client
         # pointer or matching a role prefix. Wider configuration already denies.
         with gateway(args, root, 'c' * 128, 'm' * 128, 'r' * 128) as port:

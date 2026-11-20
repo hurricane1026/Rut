@@ -19,7 +19,7 @@ AUDIENCE = 'casdoor-api'
 
 
 @contextmanager
-def gateway(args, directory, org='tenant', group='staff', second='billing:read'):
+def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended'):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -34,7 +34,7 @@ def gateway(args, directory, org='tenant', group='staff', second='billing:read')
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
                   jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), CASDOOR_ORG=org,
-               CASDOOR_GROUP=group, CASDOOR_SECOND_GROUP=second)
+               CASDOOR_GROUP=group, CASDOOR_SECOND_GROUP=second, CASDOOR_FORBIDDEN_GROUP=forbidden)
     log = root / 'gateway.log'
     with log.open('w') as output:
         process = subprocess.Popen([args.server, str(source), '--backend', args.backend,
@@ -143,6 +143,23 @@ def main():
                         actual = request(port, path, token, version)
                         assert actual == status, (version, path, claims, actual, status)
                         checks += 1
+                for claims, any_status, restricted in (
+                        (accepted, 204, 204),
+                        (dict(base, groups=['tenant/billing:read']), 204, 403),
+                        (dict(base, groups=['tenant/staff', 'tenant/suspended']), 204, 403),
+                        (dict(base, groups=['tenant/suspended', 'tenant/staff']), 204, 403),
+                        (dict(base, groups=['tenant/staff', 'other/suspended']), 204, 204),
+                        (dict(base, groups=['tenant/staff', 'tenant/suspended-extra']), 204, 204),
+                        (dict(base, groups=['tenant/staff', 7]), 403, 403),
+                        (dict(base, groups=['other/staff', 'other/billing:read']), 403, 403),
+                        (dict(base, groups=['tenant/suspended']), 403, 403),
+                        (dict(base, owner='other', groups=['tenant/staff']), 401, 401),
+                        (dict(base, tokenType='refresh-token', groups=['tenant/staff']), 401, 401),
+                        (base, 403, 403)):
+                    token = signed(claims)
+                    assert request(port, '/any', token, version) == any_status
+                    assert request(port, '/restricted', token, version) == restricted
+                    checks += 2
                 valid = signed(accepted)
                 bad = valid[:-5] + ('A' if valid[-5] != 'A' else 'B') + valid[-4:]
                 for token, duplicate_header, header in (
@@ -168,6 +185,10 @@ def main():
                     assert request(port, path, signed(dict(accepted, tokenType='id-token')), 'HTTP/1.1') == 503
                     checks += 1
                 checks += 2
+        with gateway(args, root, second='bad/group', forbidden='staff') as port:
+            assert request(port, '/any', signed(accepted), 'HTTP/1.1') == 503
+            assert request(port, '/restricted', signed(accepted), 'h2') == 503
+            checks += 2
         # Organization selection is trusted configuration, not a request value.
         with gateway(args, root, 'tenant-other') as port:
             assert request(port, '/group', signed(accepted), 'h2') == 401

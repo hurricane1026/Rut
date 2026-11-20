@@ -41,7 +41,8 @@ role even when it contains identically named roles. Existing approved-kid,
 remote-JWKS freshness and failure behavior remain with the RS256 policy; this
 adapter introduces no fetch or positive decision cache.
 
-`KEYCLOAK_CLIENT`, `KEYCLOAK_REALM_ROLE` and `KEYCLOAK_CLIENT_ROLE` are explicit
+`KEYCLOAK_CLIENT`, `KEYCLOAK_REALM_ROLE`, `KEYCLOAK_CLIENT_ROLE` and
+`KEYCLOAK_AUTHORIZED_PARTY` are explicit
 trusted configuration snapshots. Requests cannot select them through headers,
 query parameters, body fields, `azp` or another claim. Bearer clients should use
 HTTPS. The example defines authorization responses, not an application backend.
@@ -52,7 +53,9 @@ HTTPS. The example defines authorization responses, not an application backend.
 | --- | --- |
 | `GET /realm` | Configured role in `realm_access.roles` |
 | `GET /client` | Configured role in `resource_access[configured client].roles` |
-| `GET /both` | Both of the above, in the same verified token |
+| `GET /both` | Both memberships in the same verified token |
+| `GET /either` | At least one membership in its configured namespace |
+| `GET /party` | The signed `azp` matches the configured authorized party |
 
 A realm role does not become a client role, and another client's role cannot
 satisfy the selected client. Top-level `groups`, OAuth `scope`, realm roles,
@@ -84,6 +87,19 @@ so invalid credentials still return 401. Role denial is plain 403 and does not
 mislabel a Keycloak role as an OAuth scope. JSON/storage projection failures deny;
 no identity or allow is published from an unchecked intermediate value.
 
+`requireRealmOrClientRole` treats the realm and client memberships as
+independent ways to authorize the request. It validates all configured selectors
+before checking either membership. A missing or malformed role array cannot
+satisfy its branch. A verified role in the other namespace can satisfy its
+own branch.
+
+`requireAuthorizedParty(document, party)` requires the signed `azp` to match a
+nonempty trusted value of at most 128 UTF-8 bytes. Apply it to a verified
+Bearer access token. This gate restricts which OAuth client obtained the token.
+The resource audience still comes from the verified `aud` claim. A missing,
+non-string or mismatching `azp` returns challenged 401. Invalid configuration
+returns 503.
+
 ## Snapshots and validation
 
 Helpers use ordinary Rut JSON projection and the existing whole-array group
@@ -96,8 +112,8 @@ their original policy. There is no cross-node synchronization guarantee.
 
 Registered native tests exercise epoll/io_uring at O0/O2, two shards, both HTTP/1
 versions and HTTP/2. They delete the source/modules after native loading, verify
-independent realm/client/intersection matrices, cross-client and cross-realm
-isolation, audience-versus-azp separation, exact names, malformed suffixes and
+independent realm/client/intersection/alternative matrices, cross-client and
+cross-realm isolation, and exact authorized-party validation after audience checks, exact names, malformed suffixes and
 containers, signature/algorithm/kid rejection, credential duplication and policy
 replacement. Replacement tests load successive gateway snapshots; they do not
 claim to exercise in-process RCU publication or a live IdP outage. Existing
