@@ -25,6 +25,11 @@ inline bool active_health_host_valid(Str authority) {
     return route_host_from_authority(authority, normalized, &length);
 }
 
+inline bool active_health_status_range_valid(u16 minimum, u16 maximum) {
+    return (minimum == 0 && maximum == 0) ||
+           (minimum >= 100 && maximum <= 599 && minimum <= maximum);
+}
+
 struct ActiveHealthThresholds {
     static constexpr u32 kMax = 255;
 

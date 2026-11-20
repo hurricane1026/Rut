@@ -588,6 +588,11 @@ HTTP Host authority sent on plaintext probes. It accepts a nonempty, valid
 authority up to 260 bytes; omission uses the probed IPv4 address and port. It
 does not enable TLS or alter forwarding requests.
 
+A health check can use `status_min: 200, status_max: 299` to accept an
+inclusive range of complete response statuses. Both bounds are required,
+each must be 100–599, and the minimum cannot exceed the maximum. This pair
+cannot be combined with `status`; without either, the exact default is 200.
+
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
 A complete response with the expected status counts as success. Connect/read
 errors, malformed responses, unexpected status and timeouts count as failures.

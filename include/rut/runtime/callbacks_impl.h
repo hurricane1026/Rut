@@ -616,7 +616,10 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // recording (the stale result must not touch the new backend at this index).
     if (const auto* target = current_probe_target(loop, conn)) {
         const bool kHealthy =
-            kStatus == ParseStatus::Complete && resp.status_code == target->hc_expected_status;
+            kStatus == ParseStatus::Complete &&
+            (target->hc_status_min ? resp.status_code >= target->hc_status_min &&
+                                         resp.status_code <= target->hc_status_max
+                                   : resp.status_code == target->hc_expected_status);
         record_active_probe_result(conn.upstream_idx,
                                    conn.upstream_backend_idx,
                                    kHealthy,

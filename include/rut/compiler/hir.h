@@ -75,6 +75,8 @@ struct HirUpstream {
     u32 hc_interval_ms = 0;
     u32 hc_timeout_seconds = 0;  // 0 uses the upstream timeout.
     u16 hc_expected_status = 200;
+    u16 hc_status_min = 0;
+    u16 hc_status_max = 0;
     ActiveHealthThresholds hc_thresholds{};
 };
 

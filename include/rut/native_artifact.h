@@ -8,8 +8,8 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-// Version 26 records the active probe Host authority.
-constexpr u32 kVersion = 26;
+// Version 27 records the active probe status range.
+constexpr u32 kVersion = 27;
 struct StreamHeader {
     u64 magic;
     u32 version;
