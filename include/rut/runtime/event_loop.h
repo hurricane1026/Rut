@@ -1462,7 +1462,8 @@ public:
                         // See EpollEventLoop: don't let stray events bump a
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
-                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed)
+                        if (!conn.throttle_paused && !conn.ws_shutdown_deadline_armed &&
+                            conn.connect_timeout_episode == 0)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);

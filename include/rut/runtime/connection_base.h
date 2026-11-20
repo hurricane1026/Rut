@@ -908,6 +908,7 @@ struct ConnectionBase {
     // reset()/slot reuse; the transport slices will advance it before each
     // upstream episode so stale completions cannot match a later episode.
     u32 upstream_episode = 1;
+    u32 connect_timeout_episode = 0;
 
     // Fail-closed terminal state for an exhausted io_uring episode token. Like
     // upstream_episode, this deliberately survives reset(): a quarantined slot
@@ -2179,6 +2180,8 @@ struct ConnectionBase {
         upstream_idx = 0;
         upstream_attempts = 0;
         access_log_upstream_attempts_plus_one = 0;
+
+        connect_timeout_episode = 0;
         upstream_backend_idx = 0;
         upstream_attempted_backends = 0;
         proxy_resp_started = false;

@@ -940,6 +940,7 @@ public:
                         } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
                             grpc_tick<KqueueEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
+                            c->connect_timeout_episode = 0;
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
                             // bytes would corrupt the stream); anything else uses
@@ -1006,7 +1007,8 @@ public:
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.h1_tls_transport && !conn.throttle_paused &&
-                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
+                            conn.connect_timeout_episode == 0 && !conn.is_health_probe &&
+                            !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

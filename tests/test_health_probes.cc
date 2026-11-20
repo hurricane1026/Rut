@@ -248,6 +248,88 @@ void timeout_and_reclaim(rut::test::TestCase* _tc) {
 }
 
 template <typename Loop>
+void connect_timeout_wheel_ownership(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->protocol = ConnProtocol::Http11;
+    const u32 episode = c->upstream_episode;
+    auto& target = rig.owner.config->upstreams[0];
+    target.connect_timeout_seconds = 2;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, episode);
+    u32 expired = 0;
+    for (u32 i = 0; i < 2; ++i) rig.loop->timer.tick([&](Connection*) { ++expired; });
+    CHECK_EQ(expired, 0u);
+    rig.loop->timer.tick([&](Connection* value) {
+        CHECK(value == c);
+        ++expired;
+    });
+    CHECK_EQ(expired, 1u);
+    c->connect_timeout_episode = 0;
+    rig.loop->free_conn(*c);
+}
+
+TEST(health_probe, epoll_connect_timeout_wheel_ownership) {
+    connect_timeout_wheel_ownership<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_connect_timeout_wheel_ownership) {
+    connect_timeout_wheel_ownership<IoUringEventLoop>(_tc);
+}
+
+template <typename Loop>
+void connect_timeout_dispatches_and_fences_late_completion(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.loop->upstream_timeout = 10;
+    auto& target = rig.owner.config->upstreams[0];
+    target.connect_timeout_seconds = 1;
+    Socket peer;
+    int downstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    peer.fd = downstream[1];
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->fd = downstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(c->upstream_fd >= 0);
+    c->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    REQUIRE(rig.loop->submit_connect(*c, &target.addrs[0], sizeof(target.addrs[0])));
+    const u32 episode = c->upstream_episode;
+    arm_connect_timeout(rig.loop, *c, target);
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(c->connect_timeout_episode, episode);
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    CHECK_EQ(c->resp_status, 504u);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK(c->upstream_abandoned);
+    const auto status = c->resp_status;
+    const auto state = c->state;
+    const auto callback = c->on_send;
+    // A late old-episode event must not replace the 504 response owner.
+    rig.loop->dispatch({c->id, 0, 0, 0, IoEventType::UpstreamConnect, 1, 0, episode});
+    CHECK_EQ(c->resp_status, status);
+    CHECK_EQ(c->state, state);
+    CHECK_EQ(c->on_send, callback);
+    REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+}
+
+TEST(health_probe, epoll_connect_timeout_dispatch) {
+    connect_timeout_dispatches_and_fences_late_completion<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_connect_timeout_dispatch) {
+    connect_timeout_dispatches_and_fences_late_completion<IoUringEventLoop>(_tc);
+}
+
+template <typename Loop>
 void zero_weight_and_slot_reserve(rut::test::TestCase* _tc) {
     ProbeRig<Loop> rig;
     REQUIRE(rig.init());

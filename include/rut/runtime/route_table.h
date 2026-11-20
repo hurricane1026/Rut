@@ -91,6 +91,8 @@ struct UpstreamTarget {
     u8 connect_attempts = 3;
     PassiveHealthPolicy passive_health{};
 
+    u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
+
     // Active HTTP health-check config. hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
