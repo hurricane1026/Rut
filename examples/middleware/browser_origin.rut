@@ -1,0 +1,19 @@
+// The configured value is a trusted, canonical serialized browser origin.
+// This deliberately accepts only HTTP(S) DNS/IPv4-style hosts and an optional
+// port; configure IDNs in ASCII form. It does not infer policy from Host,
+// forwarded headers, a request parameter, or a CORS response-sharing policy.
+func validOrigin(_ origin: str) -> bool {
+    origin.matches(re"^https?://[A-Za-z0-9.-]+(:[0-9]+)?$") &&
+        httpOriginListAllows(origin, origin, true)
+}
+
+// Attach to every browser mutation/session route before any side effect.
+// Missing, repeated, opaque (null), and foreign origins are denied alike.
+// This guard complements authentication and authorization; Origin is not a
+// credential and non-browser clients can forge it.
+func requireOrigin(_ trustedOrigin: str) -> i32 {
+    guard validOrigin(trustedOrigin) else { respond 503 }
+    guard let origin = req.uniqueHeader("Origin") else { respond 403 }
+    guard origin == trustedOrigin else { respond 403 }
+    0
+}

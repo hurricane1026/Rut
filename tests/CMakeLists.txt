@@ -4238,6 +4238,17 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_jwt_scope_lists_${scope_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(origin_backend epoll io_uring)
+                foreach(origin_opt 0 2)
+                    add_test(NAME test_browser_origin_auth_${origin_backend}_opt${origin_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_browser_origin_auth.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/browser-origin-auth.rut
+                            --backend ${origin_backend} --opt ${origin_opt})
+                    set_tests_properties(test_browser_origin_auth_${origin_backend}_opt${origin_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(header_backend epoll io_uring)
                 add_test(NAME test_optional_multi_header_auth_${header_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_optional_multi_header_auth.py
