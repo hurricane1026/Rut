@@ -4,6 +4,7 @@
 #include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_health.h"
 #include "rut/common/utf8.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
@@ -22069,7 +22070,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         // Active health-check config (parser already validated path/interval
         // presence + ranges). Carried verbatim; no probing in this slice.
-        if ((item.upstream.http2 || item.upstream.tls.enabled) && item.upstream.hc_enabled)
+        if ((item.upstream.http2 || item.upstream.tls.enabled) && item.upstream.hc_enabled &&
+            item.upstream.hc_type != ActiveHealthType::Tcp)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.upstream.addr_span,
                                   lit_str("HTTP/2 and TLS health checks are not supported"));
@@ -22081,6 +22083,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_expected_status = item.upstream.hc_expected_status;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.passive_health = item.upstream.passive_health;
+        up.hc_type = item.upstream.hc_type;
+        up.hc_timeout_ms = item.upstream.hc_timeout_ms;
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)

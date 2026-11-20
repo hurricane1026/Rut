@@ -5662,6 +5662,11 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
     foreach(health_backend epoll io_uring)
+        add_test(NAME test_tcp_health_${health_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_tcp_health.py
+                --server $<TARGET_FILE:rut> --backend ${health_backend})
+        set_tests_properties(test_tcp_health_${health_backend} PROPERTIES
+            LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_active_health_${health_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_active_health.py
                 --server $<TARGET_FILE:rut> --backend ${health_backend})

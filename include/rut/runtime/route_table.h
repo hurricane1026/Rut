@@ -97,6 +97,8 @@ struct UpstreamTarget {
     u16 hc_expected_status = 200;
     ActiveHealthThresholds hc_thresholds{};
     PassiveHealthPolicy passive_health{};
+    ActiveHealthType hc_type = ActiveHealthType::Http;
+    u32 hc_timeout_ms = 0;  // 0 inherits the host loop upstream timeout
 
     void set_name(const char* n) {
         name_len = 0;
@@ -1381,13 +1383,16 @@ public:
     // `status` the status code that marks a backend healthy. Returns false on a
     // bad upstream id, an over-long path, a non-origin-form path (empty, missing
     // the leading '/', or containing bytes that would break the request line),
-    // or an impossible expected HTTP status.
+    // or an impossible expected HTTP status. TCP mode requires zero path length
+    // and status instead. timeout_ms is zero (inherit) or whole seconds 1..60.
     bool set_upstream_health_check(u32 uid,
                                    const char* path,
                                    u32 path_len,
                                    u32 interval_ms,
                                    u16 status,
-                                   ActiveHealthThresholds thresholds = {});
+                                   ActiveHealthThresholds thresholds = {},
+                                   ActiveHealthType type = ActiveHealthType::Http,
+                                   u32 timeout_ms = 0);
 
     // Add a static response route. Same failure modes as add_proxy(),
     // minus the upstream-id check that doesn't apply here.

@@ -4,6 +4,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/route_host.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
+#include "rut/common/upstream_health.h"
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
@@ -4010,6 +4011,8 @@ struct Parser {
                     bool seen_path = false;
                     bool seen_interval = false;
                     bool seen_status = false;
+                    bool seen_type = false;
+                    bool seen_timeout = false;
                     bool seen_failure_threshold = false;
                     bool seen_success_threshold = false;
                     while (true) {
@@ -4018,7 +4021,39 @@ struct Parser {
                         const Str hc_key = hc_field.value()->text;
                         auto hc_colon = expect(TokenType::Colon);
                         if (!hc_colon) return core::make_unexpected(hc_colon.error());
-                        if (hc_key.eq({"path", 4})) {
+                        if (hc_key.eq({"type", 4})) {
+                            if (seen_type)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto dot = expect(TokenType::Dot);
+                            if (!dot) return core::make_unexpected(dot.error());
+                            auto value = expect(TokenType::Ident);
+                            if (!value) return core::make_unexpected(value.error());
+                            if (value.value()->text.eq({"tcp", 3}))
+                                item.upstream.hc_type = ActiveHealthType::Tcp;
+                            else if (value.value()->text.eq({"http", 4}))
+                                item.upstream.hc_type = ActiveHealthType::Http;
+                            else
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*value.value()),
+                                                      hc_key);
+                            seen_type = true;
+                        } else if (hc_key.eq({"timeout", 7})) {
+                            if (seen_timeout)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto duration = expect(TokenType::DurLit);
+                            if (!duration) return core::make_unexpected(duration.error());
+                            const u32 kTimeout = dur_lit_to_ms(duration.value()->text);
+                            if (!kTimeout || !valid_active_health_timeout(kTimeout))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*duration.value()),
+                                                      hc_key);
+                            item.upstream.hc_timeout_ms = kTimeout;
+                            seen_timeout = true;
+                        } else if (hc_key.eq({"path", 4})) {
                             if (seen_path)
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*hc_field.value()),
@@ -4135,13 +4170,16 @@ struct Parser {
                     }
                     auto hc_rbrace = expect(TokenType::RBrace);
                     if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
-                    if (!seen_path || !seen_interval) {
-                        // path before interval in the dict order; name the first
-                        // missing required field so the user knows what to add.
-                        const Str detail = !seen_path ? Str{"path", 4} : Str{"interval", 8};
+                    const bool kTcp = item.upstream.hc_type == ActiveHealthType::Tcp;
+                    if (!seen_interval || (!kTcp && !seen_path) ||
+                        (kTcp && (seen_path || seen_status))) {
+                        const Str kDetail = !seen_interval ? Str{"interval", 8}
+                                            : kTcp         ? Str{"type", 4}
+                                                           : Str{"path", 4};
                         return frontend_error(
-                            FrontendError::UnsupportedSyntax, span_from(*field.value()), detail);
+                            FrontendError::UnsupportedSyntax, span_from(*field.value()), kDetail);
                     }
+                    if (kTcp) item.upstream.hc_expected_status = 0;
                     item.upstream.hc_enabled = true;
                 } else {
                     return frontend_error(

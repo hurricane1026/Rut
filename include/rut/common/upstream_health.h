@@ -4,6 +4,13 @@
 
 namespace rut {
 
+enum class ActiveHealthType : u8 { Http, Tcp };
+
+constexpr bool valid_active_health_timeout(u32 milliseconds) {
+    return milliseconds == 0 ||
+           (milliseconds >= 1000 && milliseconds <= 60000 && milliseconds % 1000 == 0);
+}
+
 struct ActiveHealthThresholds {
     static constexpr u32 kMax = 255;
 
@@ -42,5 +49,24 @@ struct PassiveHealthPolicy {
         return healthy && (!http_failures || unhealthy);
     }
 };
+inline bool valid_active_health_check(ActiveHealthType type,
+                                      const char* path,
+                                      u32 path_len,
+                                      u32 interval_ms,
+                                      u16 status,
+                                      ActiveHealthThresholds thresholds,
+                                      u32 timeout_ms) {
+    if (!interval_ms || !thresholds.valid() || !valid_active_health_timeout(timeout_ms))
+        return false;
+    if (type == ActiveHealthType::Tcp) return path_len == 0 && status == 0;
+    if (type != ActiveHealthType::Http || !path || !path_len || path[0] != '/' || status < 100 ||
+        status > 599)
+        return false;
+    for (u32 i = 0; i < path_len; ++i) {
+        const auto kCh = static_cast<unsigned char>(path[i]);
+        if (kCh <= 0x20 || kCh == 0x7f) return false;
+    }
+    return true;
+}
 
 }  // namespace rut
