@@ -12,10 +12,10 @@ It accepts Keycloak's default access-token role claim layout, described in the
 }
 ```
 
-This is a bounded claim adapter. The tests use independently signed RS256 tokens
-with this documented layout, not a live Keycloak deployment or a full provider
-conformance suite. It adds no OAuth grant, OIDC browser login, refresh flow,
-management API, Casdoor adapter or external role lookup. The token-use gate
+This is a bounded claim adapter. Verification covers independently signed RS256
+fixtures and tokens issued by a pinned local Keycloak deployment. The adapter
+adds no OAuth grant, OIDC browser login, refresh flow, management API, Casdoor
+adapter or external role lookup. The token-use gate
 follows [Keycloak 26.2.5 token generation](https://github.com/keycloak/keycloak/blob/26.2.5/services/src/main/java/org/keycloak/protocol/oidc/TokenManager.java).
 
 ## Authentication and trust
@@ -117,7 +117,7 @@ independent realm/client/intersection/alternative matrices, cross-client and
 cross-realm isolation, and exact authorized-party validation after audience checks, exact names, malformed suffixes and
 containers, signature/algorithm/kid rejection, credential duplication and policy
 replacement. Replacement tests load successive gateway snapshots; they do not
-claim to exercise in-process RCU publication or a live IdP outage. Existing
+claim to exercise in-process RCU publication. Existing
 RS256/JWKS tests own key activation, refresh, TLS and remote-service failures.
 
 `requireSubject(document, expected)` pins the signed stable `sub` exactly and
@@ -132,3 +132,14 @@ realm role and denies the distinct forbidden role in the same fully validated
 role array. Invalid or equal trusted selectors return 503; a missing, malformed
 or nonmatching array or present forbidden role returns 403. It returns the
 unchanged verified Bearer access-token document.
+
+## Live provider fixture
+
+`ctest --test-dir build -R test_keycloak_live --output-on-failure` starts
+Keycloak 26.2.5 by image digest, imports two isolated test realms and uses each
+realm's authenticated token endpoint on loopback. The test-only clients use
+direct access grants to obtain real access, ID and refresh tokens. The Rut route
+tests static approved RS256 keys, independent role namespaces, the expected
+resource audience, realm isolation and rejection of ID and refresh tokens over
+HTTP/1.1 and HTTP/2. Docker is required. This fixture leaves key rotation and
+provider availability to the separate remote-JWKS coverage.

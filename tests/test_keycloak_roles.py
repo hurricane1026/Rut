@@ -53,7 +53,7 @@ def signed(claims, header=None):
 
 
 @contextmanager
-def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False):
+def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False, policy=None):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -73,8 +73,9 @@ def gateway(args, directory, client='orders', realm='member', role='read', party
             '    let allowed = keycloak.requireRealmRoleWithout(access, env("KEYCLOAK_REALM_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
             '    return 204\n}\n'
     source.write_text(program.replace('listen :8080', f'listen :{port}'))
-    policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
-                  jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
+    if policy is None:
+        policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
+                      jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), KEYCLOAK_CLIENT=client,
                KEYCLOAK_REALM_ROLE=realm, KEYCLOAK_CLIENT_ROLE=role,
                KEYCLOAK_AUTHORIZED_PARTY=party, KEYCLOAK_SUBJECT=subject, KEYCLOAK_FORBIDDEN_ROLE=forbidden)
