@@ -78,6 +78,7 @@ struct UpstreamTarget {
     struct sockaddr_in addrs[kMaxBackends];
     u32 addr_count;
     u16 weights[kMaxBackends]{1, 1, 1, 1, 1, 1, 1, 1};
+    u8 priorities[kMaxBackends]{};
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];
     u32 name_len;

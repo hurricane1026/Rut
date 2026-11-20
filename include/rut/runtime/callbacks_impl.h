@@ -208,24 +208,33 @@ inline u32 select_backend(u16 upstream_id,
                           u64 now_us,
                           const u16* weights,
                           bool strict = false,
-                          u8 excluded = 0) {
+                          u8 excluded = 0,
+                          const u8* priorities = nullptr) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
     if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
-    if (backend_count == 1 && !strict) return weights && weights[0] == 0 ? backend_count : 0;
-    u32 fallback = backend_count;
-    for (u32 step = 0; step < backend_count; step++) {
-        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
-        if ((weights && weights[idx] == 0) || (excluded & (1u << idx))) continue;
-        if (fallback == backend_count) fallback = idx;
-        if (!backend_ejected(upstream_id, idx, now_us)) {
-            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
-            return idx;
+    bool any_healthy = false;
+    u32 tier = 256;
+    for (u32 i = 0; i < backend_count; ++i) {
+        if ((weights && weights[i] == 0) || (excluded & (1u << i))) continue;
+        const bool healthy = !backend_ejected(upstream_id, i, now_us);
+        const u32 priority = priorities ? priorities[i] : 0;
+        if (healthy && !any_healthy) {
+            any_healthy = true;
+            tier = 256;
         }
+        if ((healthy || !any_healthy) && priority < tier) tier = priority;
     }
-    if (strict) return backend_count;
-    if (fallback != backend_count)
-        rr_cursor[upstream_id] = static_cast<u16>((fallback + 1) % backend_count);
-    return fallback;
+    if (strict && !any_healthy) return backend_count;
+    for (u32 step = 0; step < backend_count; ++step) {
+        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        if ((weights && weights[idx] == 0) || (excluded & (1u << idx)) ||
+            (priorities ? priorities[idx] : 0) != tier ||
+            (any_healthy && backend_ejected(upstream_id, idx, now_us)))
+            continue;
+        rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+        return idx;
+    }
+    return backend_count;
 }
 
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
@@ -249,7 +258,8 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
 
 inline u32 select_strict_backend(const UpstreamTarget& target, u16 uid, u64 now, u8 excluded) {
     if (!upstream_capacity_available(target, uid, now)) return target.addr_count;
-    return select_backend(uid, target.addr_count, now, target.weights, true, excluded);
+    return select_backend(
+        uid, target.addr_count, now, target.weights, true, excluded, target.priorities);
 }
 
 // Selection uses only the owning shard's sidecar in the pinned configuration.
@@ -273,7 +283,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         for (u32 i = 0; i < count; ++i)
             if (cfg->upstreams[uid].weights[i] != 1) return count;
         if (strict) return select_strict_backend(target, uid, now, excluded_backends);
-        return select_backend(uid, count, now);
+        return select_backend(
+            uid, count, now, target.weights, false, excluded_backends, target.priorities);
     }
     if (strict && !upstream_capacity_available(target, uid, now)) return count;
     auto& state = cfg->backend_selection[shard];
@@ -284,11 +295,19 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         if (weights[i] != 0 && (excluded_backends & (1u << i)) == 0)
             any_healthy |= !backend_ejected(uid, i, now);
     }
+    u32 tier = 256;
+    for (u32 i = 0; i < count; ++i) {
+        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0 ||
+            ((strict || any_healthy) && backend_ejected(uid, i, now)))
+            continue;
+        if (target.priorities[i] < tier) tier = target.priorities[i];
+    }
     u8 eligible = 0;
     u32 best = count;
     for (u32 step = 0; step < count; ++step) {
         const u32 i = (cursor + step) % count;
-        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0) continue;
+        if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0 || target.priorities[i] != tier)
+            continue;
         if ((strict || any_healthy) && backend_ejected(uid, i, now)) continue;
         // Compare exact active/weight ratios without division or narrowing.
         if (spec.policy == LoadBalancePolicy::LeastRequests && best != count) {
@@ -4648,7 +4667,10 @@ void handle_jit_outcome(Loop* loop,
                         : select_backend(static_cast<u16>(upstream_id),
                                          target.addr_count,
                                          kStartUs,
-                                         target.weights);
+                                         target.weights,
+                                         false,
+                                         0,
+                                         target.priorities);
                 if (kBackend >= target.addr_count) {
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;

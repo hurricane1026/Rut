@@ -606,6 +606,12 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
                 return false;
             cfg.upstreams[i].passive_health = up.passive_health;
+
+            if (up.priority_count != 0 && (up.priority_count > UpstreamTarget::kMaxBackends ||
+                                           up.priority_count != cfg.upstreams[i].addr_count))
+                return false;
+            for (u32 b = 0; b < cfg.upstreams[i].addr_count; ++b)
+                cfg.upstreams[i].priorities[b] = up.priority_count ? up.backend_priorities[b] : 0;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -666,6 +672,12 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (up.has_max_inflight && !cfg.set_upstream_max_inflight(i, up.max_inflight))
                 return false;
             cfg.upstreams[i].passive_health = up.passive_health;
+
+            if (up.priority_count != 0 && (up.priority_count > UpstreamTarget::kMaxBackends ||
+                                           up.priority_count != cfg.upstreams[i].addr_count))
+                return false;
+            for (u32 b = 0; b < cfg.upstreams[i].addr_count; ++b)
+                cfg.upstreams[i].priorities[b] = up.priority_count ? up.backend_priorities[b] : 0;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

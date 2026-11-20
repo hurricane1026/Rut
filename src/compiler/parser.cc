@@ -3713,6 +3713,8 @@ struct Parser {
             bool seen_minimum_healthy_weight_percent = false;
             bool seen_connect_attempts = false;
             bool seen_passive_health = false;
+
+            bool seen_priorities = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -3896,6 +3898,37 @@ struct Parser {
                         percent = percent * 10u + digit;
                     }
                     item.upstream.minimum_healthy_weight_percent = static_cast<u8>(percent);
+                } else if (field_name.eq({"priorities", 10})) {
+                    if (seen_priorities)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_priorities = true;
+                    auto open = expect(TokenType::LBracket);
+                    if (!open) return core::make_unexpected(open.error());
+                    if (cur().type == TokenType::RBracket)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax, span_from(cur()), field_name);
+                    while (true) {
+                        auto lit = expect(TokenType::IntLit);
+                        if (!lit) return core::make_unexpected(lit.error());
+                        if (item.upstream.priority_count >= AstUpstreamDecl::kMaxBackends)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*lit.value()));
+                        u32 value = 0;
+                        for (u32 n = 0; n < lit.value()->text.len; ++n) {
+                            const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
+                            if (value > (255u - digit) / 10u)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*lit.value()),
+                                                      field_name);
+                            value = value * 10u + digit;
+                        }
+                        item.upstream.backend_priorities[item.upstream.priority_count++] =
+                            static_cast<u8>(value);
+                        if (!take(TokenType::Comma) || cur().type == TokenType::RBracket) break;
+                    }
+                    auto close = expect(TokenType::RBracket);
+                    if (!close) return core::make_unexpected(close.error());
                 } else if (field_name.eq({"backends", 8})) {
                     // String arrays retain equal weights; dictionary entries bind each
                     // endpoint directly to its literal weight in declaration order.
@@ -4216,6 +4249,12 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (seen_priorities && ((item.upstream.backend_count > 0 &&
+                                     item.upstream.priority_count != item.upstream.backend_count) ||
+                                    (seen_host && item.upstream.priority_count != 1)))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      item.upstream.addr_span,
+                                      lit_str("priorities must match the backend count"));
             if (item.upstream.backend_count > 0) {
                 // `backends:` is mutually exclusive with host/port — mixing
                 // them is ambiguous about which is the primary endpoint.
@@ -4225,7 +4264,7 @@ struct Parser {
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
                         seen_minimum_healthy_weight_percent || seen_connect_attempts ||
-                        seen_passive_health || item.upstream.has_max_inflight)) {
+                        seen_passive_health || seen_priorities || item.upstream.has_max_inflight)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config
