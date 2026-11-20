@@ -59,6 +59,26 @@ def test_targeted_registry_commands(tool, root):
             assert result.returncode == 0 and not result.stderr, result
             assert json.loads(result.stdout) == expected
 
+    def mutate(command, args, expected, input_path=source, output_path=None):
+        destination = output_path or root / f'targeted-{command}.json'
+        before_input = input_path.read_bytes()
+        before_output = destination.read_bytes() if destination.exists() else None
+        result = run(tool, command, input_path, *args, destination)
+        check_output(result)
+        assert not result.stdout and input_path.read_bytes() == before_input
+        if expected is None:
+            assert result.returncode == 2, result
+            if before_output is None:
+                assert not destination.exists()
+            else:
+                assert destination.read_bytes() == before_output
+            return None
+        assert result.returncode == 0 and not result.stderr, result
+        assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+        assert json.loads(destination.read_bytes()) == expected
+        assert run(tool, 'validate', destination).returncode == 0
+        return destination
+
     inspect('inspect-consumer', alice['id'], alice)
     inspect('inspect-consumer', 'missing', None)
     inspect('inspect-credential', parked['id'],
@@ -67,6 +87,9 @@ def test_targeted_registry_commands(tool, root):
             {k: v for k, v in raw.items() if k != 'secret'})
     inspect('inspect-credential', alice['id'], None)
     inspect('inspect-credential', 'x' * 65, None)
+
+    mutate('remove-consumer', [alice['id']], None)
+    mutate('remove-consumer', [vacant['id']], dict(snapshot, consumers=[alice, bob]))
     assert source.read_bytes() == original
 
 

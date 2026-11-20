@@ -728,6 +728,7 @@ bool provision_profile(json::Document& base, json::Document& profile) {
 enum class RegistryAction : u8 {
     InspectConsumer,
     InspectCredential,
+    RemoveConsumer,
 };
 
 struct RegistryCommand {
@@ -739,6 +740,7 @@ struct RegistryCommand {
 constexpr RegistryCommand kRegistryCommands[] = {
     {"inspect-consumer", 4, RegistryAction::InspectConsumer},
     {"inspect-credential", 4, RegistryAction::InspectCredential},
+    {"remove-consumer", 5, RegistryAction::RemoveConsumer},
 };
 
 u32 record_by_id(json::Document& doc, u32 records, Str id) {
@@ -749,7 +751,7 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
-int registry_command(RegistryAction action, char** args) {
+int registry_command(RegistryAction action, int argc, char** args) {
     Buffer input;
     SensitiveDocument doc;
     if (!read_private(args[2], input) || !consumer_registry_valid(doc, input.view()))
@@ -758,19 +760,42 @@ int registry_command(RegistryAction action, char** args) {
     const u32 kConsumers = field(doc, 0, lit_str("consumers"));
     const u32 kCredentials = field(doc, 0, lit_str("credentials"));
     const bool kInspectConsumer = action == RegistryAction::InspectConsumer;
+    const bool kRemoveConsumer = action == RegistryAction::RemoveConsumer;
+    const bool kConsumer = kInspectConsumer || kRemoveConsumer;
     const u32 kTarget = provision_id_valid(id)
-                            ? record_by_id(doc, kInspectConsumer ? kConsumers : kCredentials, id)
+                            ? record_by_id(doc, kConsumer ? kConsumers : kCredentials, id)
                             : json::kNone;
     if (kTarget == json::kNone) return failure("registry record not found\n");
 
     Buffer result;
     json::Writer output{result.data, json::kMaxBytes};
-    u32 hidden = field(doc, kTarget, lit_str("secret"));
-    if (hidden == json::kNone) hidden = field(doc, kTarget, lit_str("secretSha256"));
-    if (!doc.write(kTarget, output, hidden, {}, true))
-        return failure("cannot encode redacted registry record\n");
-    output.put('\n');
-    return output.ok && write_all(STDOUT_FILENO, {result.data, output.len}) ? 0 : 2;
+    if (kInspectConsumer || action == RegistryAction::InspectCredential) {
+        u32 hidden = field(doc, kTarget, lit_str("secret"));
+        if (hidden == json::kNone) hidden = field(doc, kTarget, lit_str("secretSha256"));
+        if (!doc.write(kTarget, output, hidden, {}, true))
+            return failure("cannot encode redacted registry record\n");
+        output.put('\n');
+        return output.ok && write_all(STDOUT_FILENO, {result.data, output.len}) ? 0 : 2;
+    }
+
+    output.text(lit_str("{\"version\":1,\"consumers\":"));
+    if (!doc.write(kConsumers, output, kConsumer ? kTarget : json::kNone, {}, true))
+        return failure("cannot encode Consumer records\n");
+    output.text(lit_str(",\"credentials\":["));
+    bool first = true;
+    for (u32 record = doc.nodes[kCredentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!first) output.put(',');
+        first = false;
+        if (!doc.write(record, output)) return failure("cannot encode credential record\n");
+    }
+    output.text(lit_str("]}"));
+    SensitiveDocument checked;
+    const Str value{result.data, output.len};
+    if (!output.ok || !consumer_registry_valid(checked, value))
+        return failure("updated registry snapshot is invalid\n");
+    const char* error = publish(args[argc - 1], value);
+    return error ? failure(error) : 0;
 }
 
 bool provision_change(json::Document& profile, Str digest, json::Writer& output) {
@@ -852,6 +877,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
+    "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
@@ -891,7 +917,7 @@ int main(int argc, char** argv) {
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
     for (const RegistryCommand& command : kRegistryCommands)
         if (argc == command.argc && strcmp(argv[1], command.name) == 0)
-            return registry_command(command.action, argv);
+            return registry_command(command.action, argc, argv);
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
         return prune_credentials_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)
