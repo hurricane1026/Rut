@@ -22,6 +22,53 @@ def private(path, value):
     return path
 
 
+def test_deployment_policy(tool, root):
+    alice = dict(id='alice', enabled=True, groups=['operators'])
+    disabled = dict(id='disabled', enabled=False, groups=[])
+    digest = hashlib.sha256(b'fixture-verifier').hexdigest()
+    key = dict(id='key', consumerId='alice', method='bearer', enabled=True,
+               secretSha256=digest, notBefore=100, expiresAt=200, groups=['operators'])
+    parked = dict(key, id='parked', method='header', enabled=False)
+    raw = dict(key, secret='private-policy-fixture')
+    del raw['secretSha256']
+    hidden = [digest.encode(), raw['secret'].encode(), b'fixture-password']
+    source = root / 'policy-source.json'
+    profile = root / 'deployment-policy.json'
+
+    def check(rules, *, records=None, consumers=None, now=120, ok=False, rule=None):
+        snapshot = dict(version=1, consumers=[alice, disabled] if consumers is None else consumers,
+                        credentials=[key, parked] if records is None else records)
+        private(source, snapshot)
+        private(profile, rules)
+        before = (source.read_bytes(), profile.read_bytes(), set(root.iterdir()))
+        result = run(tool, 'check-policy', source, profile, now)
+        assert result.returncode == (0 if ok else 2), (rules, result)
+        assert not result.stdout
+        assert all(secret not in result.stderr for secret in hidden)
+        assert (source.read_bytes(), profile.read_bytes(), set(root.iterdir())) == before
+        if ok:
+            assert not result.stderr
+        if rule:
+            assert result.stderr.endswith(rule.encode() + b'\n')
+
+    check({'unknown': True})
+    check(br'{"requireHashedKeys":false,"requireHashed\u004beys":true}')
+    check({})
+    check([])
+    check({'requireHashedKeys': True}, now=0)
+    check({'requireHashedKeys': True}, now='9223372036854775808')
+    check({'requireHashedKeys': True}, records=[dict(key, consumerId='missing')])
+    profile.chmod(0o644)
+    assert run(tool, 'check-policy', source, profile, 120).returncode == 2
+    assert run(tool, 'check-policy', source, profile).returncode == 2
+
+    check({'requireHashedKeys': True}, ok=True)
+    check({'requireHashedKeys': False}, ok=True, records=[raw, parked])
+    check({'requireHashedKeys': True}, records=[raw, parked], rule='requireHashedKeys')
+    check({'requireHashedKeys': True}, records=[dict(raw, enabled=False)], rule='requireHashedKeys')
+    check({'requireHashedKeys': 1}, rule='requireHashedKeys')
+
+
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
     return dict(consumers=list(consumers), credentials=list(credentials),
                 removeConsumers=list(remove_consumers), removeCredentials=list(remove_credentials))
@@ -1162,6 +1209,7 @@ def main(tool):
         assert result.returncode == 2 and not result.stdout
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
+        test_deployment_policy(tool, root)
         test_prune_credentials(tool, root)
         test_targeted_registry_commands(tool, root)
         test_generated_keys(tool, root)

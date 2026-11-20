@@ -573,3 +573,21 @@ candidates. No third-party registry, dynamic collection syntax, keyword or exter
 library is introduced. Parsing/matching is bounded and allocation-free apart from
 the normal request-arena identity result; this is not a constant-cost indexed
 lookup or a promise of unbounded directory size.
+
+## Deployment policy checks
+
+`rut-consumers check-policy INPUT POLICY NOW_UNIX_SECONDS` validates a registry
+and evaluates a private, nonempty JSON policy object before deployment. Both
+files use the normal private-input rules. Supply a positive Unix second
+explicitly. A credential counts as active when its Consumer and credential are
+enabled, its start has been reached, and its finite expiry has not been reached.
+
+Rules combine with AND. Omitted rules have no effect. Boolean rules accept
+`true` to enforce the check and `false` to disable it. Unknown or duplicate rule
+names, malformed policy values and rule violations all produce exit status 2.
+The command emits no stdout or input values, creates no files and does not
+activate a snapshot. Use the same snapshot for deployment that passed the check.
+
+| Policy field | Effect |
+| --- | --- |
+| `requireHashedKeys` | Require a SHA-256 verifier for every bearer or header key, including disabled records. |
