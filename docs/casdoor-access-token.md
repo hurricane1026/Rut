@@ -89,3 +89,12 @@ RFC 7515 test key, then load the example through `rut` and remove its source and
 middleware files before requests. They exercise both backends at O0/O2 and
 HTTP/1.0, HTTP/1.1 and HTTP/2. These tests verify the documented claims adapter;
 they do not contact a Casdoor server or establish provider conformance.
+
+`requirePrincipal(document, org, subject)` additionally pins the signed stable
+`sub` exactly within the configured owner and requires the DefaultJWT access
+token type. It returns the unchanged verified document. The trusted subject
+must be nonempty and at most 128 UTF-8 bytes; invalid owner or subject
+configuration returns 503. Missing, non-string or mismatching subjects, owners
+or token types return a Bearer-challenged 401. Call it after the configured
+signature, issuer, audience and time verifier. Names and request metadata do not
+substitute for the signed subject. The native fixture exercises this policy using trusted `CASDOOR_SUBJECT` configuration.
