@@ -4470,6 +4470,15 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_mtls_consumers_${mtls_consumer_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(mtls_deny_backend epoll io_uring)
+                add_test(NAME test_mtls_deny_${mtls_deny_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_deny.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/consumer-mtls-deny-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${mtls_deny_backend})
+                set_tests_properties(test_mtls_deny_${mtls_deny_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(mtls_rotation_backend epoll io_uring)
                 add_test(NAME test_mtls_rotation_${mtls_rotation_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_mtls_rotation.py

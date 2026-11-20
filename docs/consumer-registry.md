@@ -196,6 +196,14 @@ fingerprint remains attached to its connection; new requests on an existing TLS
 connection use the adopted Consumer snapshot against that same verified
 fingerprint.
 
+The [verified certificate deny example](../examples/consumer-mtls-deny-auth.rut)
+checks one or two configured SHA-256 certificate pins before Consumer mapping.
+Use lowercase 64-digit hexadecimal pins and leave an unused slot empty. A denied
+fingerprint or missing verified client certificate returns 403. Invalid or
+duplicate pins, or two empty slots, return 503. This policy acts at request
+admission, including on existing TLS connections, and does not replace the
+listener's [issuer-signed CRL verification](mtls-client-crl.md).
+
 The configuration host uses the existing `Shard::reload_config` publication path
 and retains each native program until its old RCU readers retire. Authentication
 and subsequent group checks within an already admitted request use the captured
