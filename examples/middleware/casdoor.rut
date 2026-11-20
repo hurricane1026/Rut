@@ -61,3 +61,14 @@ func requirePrincipal(_ document: Json, _ org: str, _ subject: str) -> Json {
     guard json.string(json.get(access, "/sub").or(access)).or("") == subject else { respond denied }
     access
 }
+
+// Either allowed group may authorize, but the forbidden group vetoes both.
+func requireGroupUnionWithout(_ document: Json, _ org: str, _ first: str,
+                              _ second: str, _ forbidden: str) -> Json {
+    guard validSelector(org) && validSelector(first) && validSelector(second) &&
+        validSelector(forbidden) && first != second && first != forbidden && second != forbidden else { respond 503 }
+    let access = requireAccessToken(document, org)
+    guard (jwtHasGroup(access, org + "/" + first) || jwtHasGroup(access, org + "/" + second)) &&
+        !jwtHasGroup(access, org + "/" + forbidden) else { respond 403 }
+    access
+}
