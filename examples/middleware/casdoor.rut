@@ -31,9 +31,7 @@ func requireGroup(_ document: Json, _ org: str, _ group: str) -> Json {
 func requireAllGroups(_ document: Json, _ org: str, _ first: str, _ second: str) -> Json {
     guard validSelector(org) && validSelector(first) && validSelector(second) else { respond 503 }
     let access = requireAccessToken(document, org)
-    let first_matches = jwtHasGroup(access, org + "/" + first)
-    let second_matches = jwtHasGroup(access, org + "/" + second)
-    guard first_matches && second_matches else { respond 403 }
+    guard jwtHasGroup(access, org + "/" + first) && jwtHasGroup(access, org + "/" + second) else { respond 403 }
     access
 }
 
@@ -51,5 +49,15 @@ func requireGroupWithout(_ document: Json, _ org: str, _ allowed: str, _ forbidd
     let access = requireAccessToken(document, org)
     guard jwtHasGroup(access, org + "/" + allowed) &&
         !jwtHasGroup(access, org + "/" + forbidden) else { respond 403 }
+    access
+}
+
+// Pin a stable signed subject within the verified DefaultJWT owner.
+func requirePrincipal(_ document: Json, _ org: str, _ subject: str) -> Json {
+    guard subject != "" && Bytes(subject).count <= 128 else { respond 503 }
+    let access = requireAccessToken(document, org)
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard json.string(json.get(access, "/sub").or(access)).or("") == subject else { respond denied }
     access
 }
