@@ -3357,8 +3357,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
         // carrier is width-generic.)
         if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
             local_shape.type != MirTypeKind::Str && local_shape.type != MirTypeKind::Variant &&
-            local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::IP &&
-            local_shape.type != MirTypeKind::Unknown)
+            local_shape.type != MirTypeKind::Struct && local_shape.type != MirTypeKind::Unknown)
             return frontend_error(FrontendError::UnsupportedSyntax, local.span);
         auto inner = make_inner_type(local_shape, local.span);
         if (!inner) return core::make_unexpected(inner.error());
