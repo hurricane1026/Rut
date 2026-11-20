@@ -877,6 +877,37 @@ bool policy_minimum_methods_per_enabled_consumer(PolicySnapshot& snapshot, u32 v
     return true;
 }
 
+bool policy_reachable_group(PolicySnapshot& snapshot, u32 value) {
+    char name[128];
+    json::Writer text{name, sizeof(name)};
+    if (!snapshot.policy.string(value, text) || !text.ok || !text.len) return false;
+    for (u32 i = 0; i < text.len; ++i)
+        if (static_cast<u8>(name[i]) < 0x21 || static_cast<u8>(name[i]) > 0x7e) return false;
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (!policy_enabled(doc, consumer)) continue;
+        const u32 id = field(doc, consumer, lit_str("id"));
+        bool reachable = false;
+        for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+             record = doc.nodes[record].next) {
+            if (!policy_owner_matches(doc, record, id) || !policy_active(snapshot, record))
+                continue;
+            u32 groups = field(doc, record, lit_str("groups"));
+            if (groups == json::kNone) groups = field(doc, consumer, lit_str("groups"));
+            for (u32 group = doc.nodes[groups].child; group != json::kNone;
+                 group = doc.nodes[group].next) {
+                char bytes[128];
+                json::Writer decoded{bytes, sizeof(bytes)};
+                if (doc.string(group, decoded) && Str{bytes, decoded.len}.eq({name, text.len}))
+                    reachable = true;
+            }
+        }
+        if (!reachable) return false;
+    }
+    return true;
+}
+
 bool policy_consumer_groups(PolicySnapshot& snapshot, u32) {
     auto& doc = snapshot.registry;
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
@@ -926,6 +957,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("minActiveMethodsPerEnabledConsumer"),
      false,
      policy_minimum_methods_per_enabled_consumer},
+    {lit_str("requiredReachableGroupPerEnabledConsumer"), false, policy_reachable_group},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
