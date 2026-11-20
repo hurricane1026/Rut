@@ -1,0 +1,17 @@
+import "middleware/browser_origin.rut"
+
+listen :8080
+
+// BROWSER_ORIGIN is deployment-owned, e.g. https://admin.example.com.
+// Install the guard before authentication/session state or any mutation.
+route POST "/admin/write" {
+    let guarded = browser_origin.requireOrigin(env("BROWSER_ORIGIN"))
+    return 204
+}
+
+route POST "/session" {
+    let guarded = browser_origin.requireOrigin(env("BROWSER_ORIGIN"))
+    return 204
+}
+
+route "/" { return 404 }
