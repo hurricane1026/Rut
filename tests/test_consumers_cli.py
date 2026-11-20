@@ -82,6 +82,13 @@ def test_deployment_policy(tool, root):
     check(expiry, ok=True, records=[dict(key, expiresAt=0, enabled=False)])
     check(expiry, records=[dict(key, expiresAt=0, consumerId='disabled', groups=[])],
           rule=next(iter(expiry)))
+    limit = 'maxCredentialLifetimeSeconds'
+    check({limit: 100}, ok=True)
+    check({limit: 99}, rule=limit)
+    check({limit: 100}, records=[dict(key, notBefore=0)], rule=limit)
+    check({limit: 100}, records=[dict(key, expiresAt=0)], rule=limit)
+    for invalid in (-0.0, 0, -1, 1.5, '100', 9223372036854775808):
+        check({limit: invalid}, rule=limit)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
