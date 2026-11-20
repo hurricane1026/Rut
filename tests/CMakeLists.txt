@@ -4253,6 +4253,17 @@ if(RUT_ENABLE_JIT)
                         LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            foreach(method_replay_backend epoll io_uring)
+                foreach(method_replay_opt 0 2)
+                    add_test(NAME test_signed_method_replay_${method_replay_backend}_opt${method_replay_opt}
+                        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_signed_method_replay.py
+                            --server $<TARGET_FILE:rut>
+                            --source ${PROJECT_SOURCE_DIR}/examples/signed-method-replay-auth.rut
+                            --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${method_replay_backend} --opt ${method_replay_opt})
+                    set_tests_properties(test_signed_method_replay_${method_replay_backend}_opt${method_replay_opt} PROPERTIES
+                        LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
             foreach(origin_backend epoll io_uring)
                 foreach(origin_opt 0 2)
                     add_test(NAME test_browser_origin_auth_${origin_backend}_opt${origin_opt}
