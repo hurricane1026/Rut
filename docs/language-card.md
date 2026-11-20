@@ -595,6 +595,15 @@ explicit `wait(upstream(api).connect())` requests receive 503. A retry that
 cannot select another target retains its earlier failure result. Health verdicts
 start fresh on each shard after a configuration reload.
 
+An upstream may set `connect_attempts: N` to allow 1 through 8 fresh TCP
+connection attempts for ordinary HTTP/1 forwarding, including the first attempt.
+The default is 3; attempts are also limited by available distinct backends.
+Only failed connects before sending a request are retried. Backend eligibility,
+health capacity, and existing policy exclusions still apply. This does not alter
+HTTP/2 or gRPC upstream forwarding or explicit `connect()`. Pooled-connection
+replay retains its existing rules; if its fresh reconnect fails, subsequent
+backend selection uses this budget.
+
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

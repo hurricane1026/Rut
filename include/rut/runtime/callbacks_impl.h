@@ -5828,12 +5828,6 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev);
 
-// Maximum upstream connect attempts per request (initial + retries), capped by
-// the upstream's backend count. Retrying here is safe regardless of HTTP method:
-// the connect failed before any request bytes were sent upstream, so no
-// non-idempotent side effect can have occurred.
-inline constexpr u32 kMaxConnectAttempts = 3;
-
 inline bool fixed_upload_head_timeout_response_is_stable(const Connection& conn,
                                                          const ForwardFailurePolicySpec& policy,
                                                          const u8* response,
@@ -5885,7 +5879,7 @@ inline bool fixed_upload_head_timeout_response_is_stable(const Connection& conn,
            conn.keep_alive && conn.req_client_keep_alive;
 }
 
-// On a failed upstream connect, try the next backend (round-robin) if the retry
+// On a failed upstream connect, try the next backend if the retry
 // budget isn't exhausted. Closes the dead fd, opens a fresh socket, and submits
 // a new connect routed back to on_upstream_connected. Returns true if a retry
 // was submitted; false (budget/socket/submit exhausted) → caller answers 502.
@@ -5897,7 +5891,7 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     if (target.minimum_healthy_weight_percent != 0 && !current_health_generation(loop, config))
         return false;
     const u32 kBudget =
-        target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
+        target.addr_count < target.connect_attempts ? target.addr_count : target.connect_attempts;
     if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
     if (conn.upstream_backend_idx < target.addr_count)
         conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
