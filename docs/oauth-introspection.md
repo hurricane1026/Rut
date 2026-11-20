@@ -242,3 +242,13 @@ HTTP/1 and HTTP/2, two certificates sharing a key but having different DER,
 source/module removal, spoofed identity/certificate headers, absent TLS client
 identity, malformed confirmation metadata, authorization failures, AS errors,
 timeout/disconnect cleanup, concurrent connection isolation and revocation.
+
+### Optional mandatory Bearer token type
+
+`introspection.requireActiveBearer(reply, audience)` applies `requireActive` to
+the trusted HTTPS introspection reply and additionally requires `token_type` to
+be present. Its value must be a case-insensitive `Bearer`, with no surrounding
+whitespace. Missing, null, mistyped, or unsupported values return 401 with the
+`invalid_token` challenge; malformed or unavailable replies return 503. This is
+an opt-in resource policy: `requireActive` continues to accept a missing type.
+The token type hint in the request does not satisfy this requirement.

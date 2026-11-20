@@ -22,6 +22,17 @@ func requireActive(_ reply: Json, _ audience: str) -> Json {
     document
 }
 
+// Opt-in strict token-type policy. requireActive validates any present type
+// case-insensitively as Bearer; this additionally requires the field to exist.
+func requireActiveBearer(_ reply: Json, _ audience: str) -> Json {
+    let document = requireActive(reply, audience)
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard let tokenType = json.string(json.get(document, "/token_type").or(document)) else { respond denied }
+    guard tokenType != "" else { respond denied }
+    document
+}
+
 // Project only checked AS metadata; this does not authenticate arbitrary JSON.
 func subject(_ document: Json) -> str {
     let value = json.string(json.get(document, "/sub").or(document)).or("")
