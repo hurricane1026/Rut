@@ -3859,3 +3859,21 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.hc_thresholds.failures, 3u);
     CHECK_EQ(target.hc_thresholds.successes, 2u);
 }
+
+TEST(native_program, literal_response_status_survives_source_removal) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+route GET "/" {
+    let resp = response(429)
+    guard resp.status == 429 else { return 500 }
+    return resp
+}
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto result =
+        invoke(owner.p->config.routes[0], "GET / HTTP/1.1\r\nHost: example\r\n\r\n");
+    CHECK_EQ(result.status_code, 429u);
+}

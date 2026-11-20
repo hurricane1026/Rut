@@ -11857,6 +11857,24 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
     }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        // Only a lexically resolved, literal local builder has a known status.
+        // Runtime Response parameters and forwarded responses have no carrier here.
+        if (expr.name.eq({"status", 6}) && expr.lhs->kind == AstExprKind::Ident) {
+            for (u32 li = local_count; li > 0; --li) {
+                const auto& local = locals[li - 1];
+                if (!local.name.eq(expr.lhs->name)) continue;
+                if (local.init.kind == HirExprKind::ResponseInit && local.init.int_value >= 100 &&
+                    local.init.int_value <= 599) {
+                    HirExpr status{};
+                    status.kind = HirExprKind::IntLit;
+                    status.type = HirTypeKind::I32;
+                    status.span = expr.span;
+                    status.int_value = local.init.int_value;
+                    return status;
+                }
+                break;
+            }
+        }
         // `req.params.<name>` — route captures live in the params namespace
         // (DESIGN.md §3.3.4). Mirrors the ReqParam lowering of req.param("name").
         if (expr.lhs->kind == AstExprKind::Field && expr.lhs->lhs != nullptr &&

@@ -358,7 +358,7 @@ resp.remove("Server")             // ✅ literal delete
 resp.add("Set-Cookie", "a=1")     // ✅ literal append/multi-value
 resp.header("Retry-After")        // ✅ str?; observes prior set/add/remove mutations
 resp.body = json(data)            // body
-resp.status                       // StatusCode, read/write
+resp.status                       // i32, read-only for a local literal-status builder
 return resp
 ```
 
@@ -382,6 +382,10 @@ request version. HTTP/2 uses its separate serializer.
 values. A request can record up to 16 header mutations and copy up to 8 KiB of
 names and values for dynamic mutations into request-owned storage. Invalid
 runtime values or exhausted bounds stop forwarding.
+
+A local `response(429)` builder exposes its literal status as read-only `i32`
+through `resp.status`. Runtime chain-after and upstream Response status reads and
+status assignment remain unsupported.
 
 Dynamic handler-local Response mutations require a direct route with no guards,
 decorators, `wait`, or `for`, exactly one builder, and that builder must be
