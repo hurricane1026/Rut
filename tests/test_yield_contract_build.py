@@ -30,11 +30,27 @@ def check(compiler, root, overlay, diagnostic=None, source="src/compiler/handler
         raise RuntimeError(f"Expected compilation to fail with {diagnostic!r}\n{result.stderr}")
 
 
+def check_timer_transport(compiler, root, overlay):
+    source = "src/runtime/response_read_timer_transport.cc"
+    header = "rut/runtime/io_event.h"
+    check(compiler, root, overlay, source=source)
+    for before, after, diagnostic in [
+        ("event.result == -ENOENT", "event.result == -ETIME", "Response timer result domain mismatch"),
+        ("event.copy_end == 0 && ", "", "Response timer accepts unrelated event metadata"),
+        ("u8 provided_ring_empty = 0;", "u8 provided_ring_empty = 0;\n    u8 new_field = 0;",
+         "names"),  # Both compilers report the mismatch in the number of binding names.
+    ]:
+        probe = mutate(root / "include", overlay, header, before, after)
+        check(compiler, root, overlay, diagnostic, source=source)
+        probe.unlink()
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory() as directory:
         overlay = Path(directory)
         compiler = sys.argv[1]
+        check_timer_transport(compiler, root, overlay)
         check(compiler, root, overlay)
         probe = mutate(root / "include", overlay, "rut/jit/handler_abi.h",
                        "enum class YieldKind : u8 {",
