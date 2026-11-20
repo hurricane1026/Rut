@@ -81,3 +81,12 @@ func requireRealmOrClientRole(_ document: Json, _ realmRole: str,
     guard hasRealmRole(document, realmRole) || hasClientRole(document, client, clientRole) else { respond 403 }
     document
 }
+
+// Pin the stable signed subject after verification and the Bearer access gate.
+func requireSubject(_ document: Json, _ expected: str) -> Json {
+    guard roleValid(expected) else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer")
+    guard json.string(json.get(document, "/sub").or(document)).or("") == expected else { respond denied }
+    document
+}

@@ -45,4 +45,13 @@ route GET "/either" {
     return 204
 }
 
+// KEYCLOAK_SUBJECT pins the stable subject, not a mutable username.
+route GET "/subject" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let principal = keycloak.requireSubject(access, env("KEYCLOAK_SUBJECT"))
+    let allowed = keycloak.requireRealmRole(principal, env("KEYCLOAK_REALM_ROLE"))
+    return 204
+}
+
 route "/" { return 404 }
