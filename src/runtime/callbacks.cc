@@ -22,10 +22,21 @@
 namespace rut {
 
 void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
+    grpc_record_handshake_result(conn, success, now_us, nullptr);
+}
+
+void grpc_record_handshake_result(Connection& conn,
+                                  bool success,
+                                  u64 now_us,
+                                  const RouteConfig* config) {
     if (success) return;
     if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
     conn.h2->grpc.session_failure_recorded = true;
-    grpc_record_connect_result(conn, success, now_us);
+    record_backend_result(conn.upstream_idx,
+                          conn.upstream_backend_idx,
+                          success,
+                          now_us,
+                          passive_health_policy(config, conn.upstream_idx));
 }
 
 #ifdef __APPLE__

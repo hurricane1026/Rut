@@ -264,11 +264,15 @@ bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void grpc_tls_ready(Loop* loop, Connection& conn);
 void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us);
+void grpc_record_handshake_result(Connection& conn,
+                                  bool success,
+                                  u64 now_us,
+                                  const RouteConfig* config);
 template <typename Loop>
 inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
-    grpc_record_handshake_result(conn, success, now_us);
+    grpc_record_handshake_result(conn, success, now_us, conn.request_config);
 }
 template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn);

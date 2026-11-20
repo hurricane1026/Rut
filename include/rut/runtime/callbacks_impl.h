@@ -84,8 +84,8 @@ inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us) {
 // Record the outcome of a connect attempt to (upstream_id, backend_idx).
 // On success: clear the record. On failure: bump the consecutive-failure count
 // and eject the backend once it crosses the threshold.
-inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us,
-                                  PassiveHealthPolicy policy) {
+inline void record_backend_result(
+    u16 upstream_id, u32 backend_idx, bool success, u64 now_us, PassiveHealthPolicy policy) {
     BackendHealth* h = backend_health(upstream_id, backend_idx);
     if (h == nullptr) return;
     if (success) {
@@ -107,7 +107,7 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
 
 inline PassiveHealthPolicy passive_health_policy(const RouteConfig* config, u16 uid) {
     return config && uid < config->upstream_count ? config->upstreams[uid].passive_health
-                                                 : PassiveHealthPolicy{};
+                                                  : PassiveHealthPolicy{};
 }
 
 template <typename Loop>
@@ -413,9 +413,12 @@ inline const UpstreamTarget* current_probe_target(Loop* loop, const Connection& 
 template <typename Loop>
 inline void record_probe_if_current(Loop* loop, Connection& conn, bool healthy, u64 now_us) {
     if (const auto* target = current_probe_target(loop, conn))
-        record_active_probe_result(
-            conn.upstream_idx, conn.upstream_backend_idx, healthy, now_us, target->hc_thresholds,
-            target->passive_health.configured);
+        record_active_probe_result(conn.upstream_idx,
+                                   conn.upstream_backend_idx,
+                                   healthy,
+                                   now_us,
+                                   target->hc_thresholds,
+                                   target->passive_health.configured);
 }
 
 template <typename Loop>
@@ -610,9 +613,12 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     if (const auto* target = current_probe_target(loop, conn)) {
         const bool kHealthy =
             kStatus == ParseStatus::Complete && resp.status_code == target->hc_expected_status;
-        record_active_probe_result(
-            conn.upstream_idx, conn.upstream_backend_idx, kHealthy, kNowUs, target->hc_thresholds,
-            target->passive_health.configured);
+        record_active_probe_result(conn.upstream_idx,
+                                   conn.upstream_backend_idx,
+                                   kHealthy,
+                                   kNowUs,
+                                   target->hc_thresholds,
+                                   target->passive_health.configured);
     }
     free_probe_conn(loop, conn);
 }
@@ -8798,9 +8804,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         // next backend within the retry budget; only answer 502 once all
         // candidates are exhausted.
         if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
-            record_backend_result(
-                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us(),
-                passive_health_policy(conn.request_config, conn.upstream_idx));
+            record_backend_result(conn.upstream_idx,
+                                  conn.upstream_backend_idx,
+                                  /*success=*/false,
+                                  monotonic_us(),
+                                  passive_health_policy(conn.request_config, conn.upstream_idx));
         if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
             loop->close_conn(conn);
             return;
@@ -8831,9 +8839,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // Reused pooled sockets only prove health once they return a response.
     if (!conn.upstream_reused) {
         if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
-            record_backend_result(
-                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us(),
-                passive_health_policy(conn.request_config, conn.upstream_idx));
+            record_backend_result(conn.upstream_idx,
+                                  conn.upstream_backend_idx,
+                                  /*success=*/true,
+                                  monotonic_us(),
+                                  passive_health_policy(conn.request_config, conn.upstream_idx));
     }
 
     if (conn.req_malformed) {
@@ -9895,15 +9905,21 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     if (ev.result < 0) {
         if (admit_passive_health_result(loop, h2 ? h2->async_cfg : nullptr, conn.upstream_idx))
             record_backend_result(
-                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us(),
+                conn.upstream_idx,
+                conn.upstream_backend_idx,
+                /*success=*/false,
+                monotonic_us(),
                 passive_health_policy(h2 ? h2->async_cfg : nullptr, conn.upstream_idx));
         h2_proxy_fail(loop, conn, 502, /*connect_failure=*/true);
         return;
     }
     if (admit_passive_health_result(loop, h2 ? h2->async_cfg : nullptr, conn.upstream_idx))
         record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us(),
-                passive_health_policy(h2 ? h2->async_cfg : nullptr, conn.upstream_idx));
+            conn.upstream_idx,
+            conn.upstream_backend_idx,
+            /*success=*/true,
+            monotonic_us(),
+            passive_health_policy(h2 ? h2->async_cfg : nullptr, conn.upstream_idx));
     if (!loop->alloc_upstream_buf(conn)) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -13730,9 +13746,11 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
     }
 
     if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us(),
-                passive_health_policy(conn.request_config, conn.upstream_idx));
+        record_backend_result(conn.upstream_idx,
+                              conn.upstream_backend_idx,
+                              /*success=*/false,
+                              monotonic_us(),
+                              passive_health_policy(conn.request_config, conn.upstream_idx));
 
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
@@ -15226,9 +15244,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     auto record_reused_response_health = [&]() {
         if (!conn.upstream_reused) return;
         if (admit_passive_health_result(loop, conn.request_config, conn.upstream_idx))
-            record_backend_result(
-                conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us(),
-                passive_health_policy(conn.request_config, conn.upstream_idx));
+            record_backend_result(conn.upstream_idx,
+                                  conn.upstream_backend_idx,
+                                  /*success=*/true,
+                                  monotonic_us(),
+                                  passive_health_policy(conn.request_config, conn.upstream_idx));
         conn.upstream_reused = false;
     };
     const bool configured_head_candidate =

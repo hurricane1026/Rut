@@ -422,7 +422,10 @@ inline void grpc_record_connect_result(Loop* loop,
                                        u64 now_us) {
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
-    record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, success, now_us,
+    record_backend_result(conn.upstream_idx,
+                          conn.upstream_backend_idx,
+                          success,
+                          now_us,
                           passive_health_policy(conn.request_config, conn.upstream_idx));
 }
 template <typename Loop>
