@@ -81,6 +81,18 @@ key is never part of the claim. Keep the namespace and Redis database stable whe
 switching keys or restarting the gateway. The overlap and removal are configured
 at restart; this does not create a dynamic key registry or extend claim retention.
 
+[signed-request-durable-rotation-replay-auth.rut](../examples/signed-request-durable-rotation-replay-auth.rut)
+uses `SIGNED_REQUEST_CURRENT_KEY_ID` and `SIGNED_REQUEST_CURRENT_KEY` for the
+current key, plus `SIGNED_REQUEST_PREVIOUS_KEY_ID` and `SIGNED_REQUEST_PREVIOUS_KEY`
+for overlap. Clear both previous values together to retire that slot. Both keys
+are for the same logical signer and share the fixed POST claim derived from the
+authenticated target, Date and Digest. Key IDs and signatures are excluded from
+the claim, so re-signing the same tuple during rotation cannot admit it again.
+Keep `REPLAY_NAMESPACE` and the Redis database stable to preserve claims from
+the fixed-key durable example. The TLS fixture verifies that transition across
+gateway restart and Redis SIGKILL/AOF recovery on epoll and io_uring, including
+preserved TTL, overlap, and removal of the previous key.
+
 The trusted endpoint must be Redis 7.2 or newer, with local AOF enabled, no
 live-key eviction and an ACL permitting AUTH, SELECT, SET and WAITAOF. RESET
 must remain available for acknowledged cleanup.

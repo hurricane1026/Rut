@@ -2311,6 +2311,9 @@ challenge. Both enabled slots verify the same captured request fields, and the
 matching credential ID is returned. Clearing the previous pair revokes it.
 This policy has no remote key refresh or replay store. See
 [`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
+The [durable rotation example](../examples/signed-request-durable-rotation-replay-auth.rut)
+composes it with `redisReplayDurableClaim` and retains claims from the fixed-key
+durable POST profile under the same namespace and Redis database.
 
 `auth.hmac(message, signature, key, consumerId, credentialId)` publishes an
 Identity only after verification. `auth.rotatingHmac(...)` evaluates current
