@@ -126,3 +126,9 @@ and time verification and the Bearer access-token gate. The trusted expected
 subject must be nonempty and at most 128 UTF-8 bytes; invalid configuration
 returns 503. Missing, non-string or unequal subjects return a Bearer-challenged
 401. Usernames and request metadata do not supply a substitute.
+
+`requireRealmRoleWithout(document, required, forbidden)` requires the exact
+realm role and denies the distinct forbidden role in the same fully validated
+role array. Invalid or equal trusted selectors return 503; a missing, malformed
+or nonmatching array or present forbidden role returns 403. It returns the
+unchanged verified Bearer access-token document.

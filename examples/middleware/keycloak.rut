@@ -90,3 +90,12 @@ func requireSubject(_ document: Json, _ expected: str) -> Json {
     guard json.string(json.get(document, "/sub").or(document)).or("") == expected else { respond denied }
     document
 }
+
+// The required and forbidden roles share one validated realm array.
+func requireRealmRoleWithout(_ document: Json, _ required: str, _ forbidden: str) -> Json {
+    guard roleValid(required) && roleValid(forbidden) && required != forbidden else { respond 503 }
+    guard let roles = json.get(document, "/realm_access/roles") else { respond 403 }
+    guard let projected = json.value({groups: roles}) else { respond 403 }
+    guard jwtHasGroup(projected, required) && !jwtHasGroup(projected, forbidden) else { respond 403 }
+    document
+}
