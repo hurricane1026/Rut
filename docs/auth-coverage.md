@@ -18,7 +18,7 @@ whether a competing open-source edition includes them.
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
-| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, bounded A/CNAME DNS and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, DNS transports beyond the bounded A/CNAME profile, IPv6 discovery, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
+| JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, bounded A/AAAA DNS with CNAME support and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, other DNS transports and dual-family selection in one profile, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
 | HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny; optional exact static Consumer-ID-to-route-tenant binding before RBAC | Larger policy sets, intrinsic tenant claims/ownership and storage isolation, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
@@ -93,8 +93,8 @@ The 2026-10-27 audit separates these layers:
   and returns metadata from the matched configuration. This is a static bounded
   policy, not a persistent Consumer registry or a claim of plugin equivalence.
 - RS256/ES256 JWK/JWKS policies support bounded authenticated refresh, optional
-  trusted bounded A/CNAME DNS and exact issuer/JWKS-URI discovery. The remote
-  access-token integration composes that cache with strict `at+jwt` claims,
+  trusted bounded A/AAAA DNS with CNAME support and exact issuer/JWKS-URI discovery.
+  The remote access-token integration composes that cache with strict `at+jwt` claims,
   client and scope
   checks. Live and durable token revocation remain outstanding.
 - Anonymous access needs a presence distinction: singleton Authorization reads
@@ -895,15 +895,15 @@ Credential provisioning and other endpoint authentication methods remain open.
 ## Bounded remote JWKS refresh
 
 Compiled RS256 and ES256 policies accept a trusted `remoteJwks` endpoint with
-fixed IPv4, TLS hostname, CA, path, refresh interval, maximum cache age and total
-fetch timeout. The initial JWKS defines approved IDs but does not authenticate
+a fixed IPv4/IPv6 address, TLS hostname, CA, path, refresh interval, maximum cache
+age and total fetch timeout. The initial JWKS defines approved IDs but does not authenticate
 remote-mode requests before the first successful fetch. Only configured approved
 kids can be imported. A valid empty intersection immediately removes cached keys by default. Optional
 `requireNonEmptyKeys` instead fails that refresh and retains the last snapshot
 only until its original maximum age, delaying empty-set revocation.
-There is no token-triggered fetch or redirect following. Optional bounded A/CNAME
-DNS and exact issuer/JWKS URI discovery validation now share the same cold refresh
-lifecycle; duplicate DNS allowlist entries fail configuration load; see [the trust contract](jwks-discovery.md).
+The cold refresh lifecycle supports bounded A/AAAA DNS with CNAME and exact
+issuer/JWKS URI discovery validation. Duplicate DNS allowlist entries fail
+configuration load. See [the trust contract](jwks-discovery.md).
 Optional integer `retrySeconds` (1–3600, defaulting to `refreshSeconds`) separates
 failure delay from successful refresh cadence for both algorithms. All failures
 wait from completion, including slow timeouts and import failures; successful
@@ -1685,8 +1685,8 @@ JIT tests also cover the 1024/1025-byte bound. See
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL tests with verified TLS on
   both backends. Eviction policy, volume integrity and replicated failover remain
   deployment responsibilities (#1076).
-- [JWKS DNS/discovery](jwks-discovery.md): bounded nonblocking A/CNAME resolution,
-  finite address allowlist, sequential failover after definitive TCP connect
+- [JWKS DNS/discovery](jwks-discovery.md) provides bounded nonblocking A or AAAA
+  resolution with CNAME support, a finite address allowlist, sequential failover after definitive TCP connect
   failures, exact issuer and pre-authorized URI, opt-in TTL-bounded DNS reuse,
   capped exponential retries and bounded authenticated Retry-After hints.
   Both asymmetric algorithms and both Linux backends are covered (#1077).

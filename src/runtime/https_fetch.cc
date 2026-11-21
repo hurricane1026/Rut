@@ -40,10 +40,12 @@ u64 jwt_monotonic_ms() {
 }
 
 bool HttpsEndpoint::valid() const {
-    in_addr parsed{};
+    sockaddr_storage parsed{};
     if (!port || !tls.enabled || !valid_upstream_tls(tls) ||
-        !terminated(address, sizeof(address)) || inet_pton(AF_INET, address, &parsed) != 1 ||
-        !terminated(path, sizeof(path)) || path[0] != '/')
+        !terminated(address, sizeof(address)) ||
+        !platform::ip_socket_address(address, port, parsed) ||
+        (!allow_ipv6 && parsed.ss_family == AF_INET6) || !terminated(path, sizeof(path)) ||
+        path[0] != '/')
         return false;
     for (u32 i = 0; path[i]; ++i) {
         const u8 kByte = static_cast<u8>(path[i]);
@@ -320,13 +322,13 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
     sent_ = 0;
     connect_failed_ = false;
     state_ = State::Busy;
-    fd_ = platform::stream_socket();
+    sockaddr_storage address{};
+    const socklen_t length =
+        platform::ip_socket_address(endpoint_.address, endpoint_.port, address);
+    if (!length) return fail();
+    fd_ = platform::stream_socket(address.ss_family);
     if (fd_ < 0) return fail();
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(endpoint_.port);
-    if (inet_pton(AF_INET, endpoint_.address, &address.sin_addr) != 1) return fail();
-    const int kResult = connect(fd_, reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+    const int kResult = connect(fd_, reinterpret_cast<const sockaddr*>(&address), length);
     if (kResult != 0 && errno != EINPROGRESS) return fail_connect(errno);
     step_ = kResult == 0 ? start_tls : connected;
     return true;

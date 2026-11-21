@@ -843,3 +843,43 @@ TEST(remote_jwks_metadata, conditional_response_etag_is_unique_and_strong) {
     CHECK(jwks_response_etag(headers, tag));
     CHECK(!tag.len);
 }
+
+TEST(remote_jwks_metadata, ipv6_configuration_is_bounded_to_one_family) {
+    const auto load = [](const char* address, const char* dns_fields, RemoteJwks& policy) {
+        char input[1024];
+        const int size =
+            snprintf(input,
+                     sizeof(input),
+                     "{\"address\":\"%s\",\"port\":443,\"serverName\":\"issuer.example\","
+                     "\"ca\":\"ca.pem\",\"path\":\"/keys\",\"refreshSeconds\":1,"
+                     "\"maxAgeSeconds\":3,\"timeoutSeconds\":1%s}",
+                     address,
+                     dns_fields);
+        if (size <= 0 || static_cast<u32>(size) >= sizeof(input)) return false;
+        json::Document document;
+        return document.parse({input, static_cast<u32>(size)}) && policy.load(document, 0);
+    };
+    RemoteJwks configuration;
+    CHECK(load("::1", "", configuration));
+    CHECK(!load("[::1]", "", configuration));
+    CHECK(!load("fe80::1%eth0", "", configuration));
+    CHECK(!load("::ffff:192.0.2.1", "", configuration));
+    CHECK(
+        load("192.0.2.1",
+             R"(,"dnsRecordType":"AAAA","dnsAddress":"::1","allowedAddresses":["0:0:0:0:0:0:0:1"])",
+             configuration));
+    CHECK(configuration.dns_aaaa);
+    CHECK(strcmp(configuration.allowed_addresses[0], "::1") == 0);
+    CHECK(!load("192.0.2.1", R"(,"dnsRecordType":"AAAA")", configuration));
+    CHECK(!load(
+        "192.0.2.1",
+        R"(,"dnsRecordType":"AAAA","dnsAddress":"::1","allowedAddresses":["::1","0:0:0:0:0:0:0:1"])",
+        configuration));
+    CHECK(!load("192.0.2.1",
+                R"(,"dnsRecordType":"AAAA","dnsAddress":"::1","allowedAddresses":["192.0.2.1"])",
+                configuration));
+    CHECK(!load(
+        "192.0.2.1",
+        R"(,"dnsRecordType":"AAAA","dnsAddress":"::1","allowedAddresses":["::ffff:192.0.2.1"])",
+        configuration));
+}
