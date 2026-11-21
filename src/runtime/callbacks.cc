@@ -1296,6 +1296,7 @@ template void on_early_upstream_recvd_send_inflight<IoUringEventLoop>(void*, Con
 template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void record_passive_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_request_body_overflow<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
