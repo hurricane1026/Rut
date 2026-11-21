@@ -240,6 +240,25 @@ explicit logout may complete with the absent-key acknowledgement. A successful
 stale replicas, snapshot restoration and already-admitted requests retain the
 limitations described above.
 
+## Browser logout with durable revocation
+
+Serve [browser-session-revoke.rut](../examples/browser-session-revoke.rut)
+over HTTPS using the same host as the application that set the
+`__Host-rut_session` cookie. Set `BROWSER_ORIGIN` to the exact HTTPS origin and
+`BROWSER_FETCH_SITE` to `same-origin`. Use the same JWT verification and Redis
+authority settings as the bearer profile. The POST route rejects missing,
+duplicate or foreign browser guard headers before contacting Redis. It
+requires a unique host-bound cookie containing a locally valid token.
+
+The route writes the exact-token tombstone to the configured authenticated
+Redis authority through the local-AOF contract below. A confirmed write and
+acknowledged connection cleanup yield 204, `Cache-Control: no-store`, and the
+[fixed cookie expiry response](browser-origin.md#clearing-the-host-bound-session-cookie).
+An authority error returns 503 without clearing the cookie. A write can have
+taken effect before an error, so retry with the same cookie to confirm
+revocation while its token remains valid. The route can be paired with a
+trusted application that enrolls the token and sets the cookie over HTTPS.
+
 ## Local-AOF durable logout
 
 `POST /logout-durable` is an opt-in Redis 7.2+ profile for single-instance
