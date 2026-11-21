@@ -222,6 +222,14 @@ struct ResponseBodyChain {
         return result > 0 && received <= kLimit && static_cast<u32>(result) <= kLimit - received;
     }
 
+    // The retained header and this batch's newly copied bytes are both in the
+    // observed buffer. Only previously accounted origin bytes can have been sent.
+    static constexpr bool matches_buffered_length(
+        u32 buffered, u32 header, u32 received, u32 completed, u32 newly_copied) {
+        return completed <= received && static_cast<u64>(buffered) + completed ==
+                                            static_cast<u64>(header) + received + newly_copied;
+    }
+
     // Record bytes a direct recv wrote straight into write_ptr()'s
     // destination (n <= the write_avail() observed when it was armed).
     constexpr void commit(u32 n) {

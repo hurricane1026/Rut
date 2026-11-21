@@ -1871,9 +1871,9 @@ public:
         const u32 header = buffering || phase == ResponseReadDeadlinePostCommitPhase::HeaderSend
                                ? raw_header_end
                                : 0;
-        if (received >= declared || kBodyRoom == 0 || raw_header_end == 0 || completed > received ||
-            header > 0xFFFFFFFFu - (received - completed) ||
-            c.buffered_response_len() != header + received - completed ||
+        if (received >= declared || kBodyRoom == 0 || raw_header_end == 0 ||
+            !ResponseBodyChain::matches_buffered_length(
+                c.buffered_response_len(), header, received, completed, 0) ||
             !response_read_deadline_identity_is_stable(c) || c.chain_direct_recv_owner.active ||
             c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
@@ -5367,9 +5367,10 @@ public:
             const u32 received = c.response_read_deadline_post_commit_origin_received;
             const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
             const u32 header = c.response_read_deadline_post_commit_raw_header_end;
-            if (completed > received || header > 0xffffffffu - (received - completed)) continue;
-            const u32 buffer_begin = header + received - completed;
-            if (buffer_begin != c.buffered_response_len()) continue;
+            const u32 buffer_begin = c.buffered_response_len();
+            if (!ResponseBodyChain::matches_buffered_length(
+                    buffer_begin, header, received, completed, 0))
+                continue;
 
             u32 timer_index = count;
             bool duplicate = false;
@@ -5806,8 +5807,7 @@ public:
                                    ResponseReadDeadlinePostCommitPhase::HeaderSend
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
-        if (completed > received || received > declared ||
-            owner.positive_bytes > declared - received ||
+        if (received > declared || owner.positive_bytes > declared - received ||
             (owner.terminal_fault && !bounded_clean_eof &&
              owner.positive_bytes != declared - received) ||
             (owner.saw_positive &&
@@ -5815,9 +5815,8 @@ public:
               owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)) ||
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0)) ||
-            header > 0xFFFFFFFFu - (received - completed) ||
-            header + received - completed > 0xFFFFFFFFu - owner.positive_bytes ||
-            c.buffered_response_len() != header + received - completed + owner.positive_bytes ||
+            !ResponseBodyChain::matches_buffered_length(
+                c.buffered_response_len(), header, received, completed, owner.positive_bytes) ||
             c.response_read_deadline_progress_generation != owner.deadline_generation ||
             c.response_read_deadline_progress_episode != owner.upstream_episode ||
             c.response_read_deadline_progress_bytes != received)
