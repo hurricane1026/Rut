@@ -1305,9 +1305,12 @@ int main(int argc, char** argv) {
 
     TlsServerContext* tls_server = nullptr;
     if (tls_cert_path && tls_key_path) {
-        auto tls_result = create_tls_server_context(
-            tls_cert_path, tls_key_path, offer_h2, tls_client_ca_path, tls_client_crl_path,
-            tls_client_crl_verify_issuer);
+        auto tls_result = create_tls_server_context(tls_cert_path,
+                                                    tls_key_path,
+                                                    offer_h2,
+                                                    tls_client_ca_path,
+                                                    tls_client_crl_path,
+                                                    tls_client_crl_verify_issuer);
         if (!tls_result) {
             write_error("Failed to initialize TLS", tls_result.error());
             return 1;
