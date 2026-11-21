@@ -1828,10 +1828,7 @@ public:
     bool add_response_read_recv(Connection& c, bool direct_buffered_body = false) {
         const auto phase = c.response_read_deadline_post_commit_phase;
         const bool bounded_stream =
-            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
-            (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-             phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
-             phase == ResponseReadDeadlinePostCommitPhase::WaitingBody);
+            bounded_body_recv_phase(c.response_read_deadline_buffering, phase);
         if (direct_buffered_body || bounded_stream) return arm_response_read_direct_body_recv(c);
         const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
             c.response_read_deadline_buffering);
@@ -1861,10 +1858,7 @@ public:
         const auto phase = c.response_read_deadline_post_commit_phase;
         const bool buffering = phase == ResponseReadDeadlinePostCommitPhase::Buffering;
         const bool bounded_stream =
-            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
-            (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-             phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
-             phase == ResponseReadDeadlinePostCommitPhase::WaitingBody);
+            bounded_body_recv_phase(c.response_read_deadline_buffering, phase);
         if ((!buffering && !bounded_stream) ||
             c.response_read_deadline_post_commit_terminal_pending ||
             c.response_read_deadline_post_commit_close_after_drain)

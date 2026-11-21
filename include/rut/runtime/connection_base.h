@@ -15,6 +15,7 @@
 #include "rut/runtime/arena.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
+#include "rut/runtime/direct_body_recv_phase.h"
 #include "rut/runtime/http_cache.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -100,19 +101,6 @@ enum class ResponseReadDeadlineState : u8 {
     BatchPending,
     RefreshPending,
     BodyComplete,
-};
-
-enum class ResponseReadDeadlinePostCommitPhase : u8 {
-    None,
-    // The strict response header is pinned, but no downstream byte has been
-    // published.  Positive Content-Length bytes remain behind the header in
-    // upstream_recv_buf until a terminal buffering disposition is selected.
-    Buffering,
-    HeaderSend,
-    BodySend,
-    WaitingBody,
-    OriginComplete,
-    CombinedSend,
 };
 
 enum class CompleteContentLengthResponseClass : u8 {

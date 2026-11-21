@@ -1778,22 +1778,14 @@ u32 IoUringBackend::wait(
                 }
             }
 
-            const bool bounded_live_post_commit =
-                conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
-                (conn.response_read_deadline_post_commit_phase ==
-                     ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-                 conn.response_read_deadline_post_commit_phase ==
-                     ResponseReadDeadlinePostCommitPhase::BodySend ||
-                 conn.response_read_deadline_post_commit_phase ==
-                     ResponseReadDeadlinePostCommitPhase::WaitingBody) &&
-                !conn.response_read_deadline_post_commit_terminal_pending &&
-                !conn.response_read_deadline_post_commit_close_after_drain;
             const bool stale_target =
                 conn.fd < 0 || conn.upstream_fd < 0 || !conn.upstream_recv_armed ||
                 target.episode != conn.upstream_episode ||
-                (conn.response_read_deadline_post_commit_phase !=
-                     ResponseReadDeadlinePostCommitPhase::Buffering &&
-                 !bounded_live_post_commit) ||
+                !direct_body_recv_commit_phase(
+                    conn.response_read_deadline_buffering,
+                    conn.response_read_deadline_post_commit_phase,
+                    conn.response_read_deadline_post_commit_terminal_pending,
+                    conn.response_read_deadline_post_commit_close_after_drain) ||
                 conn.response_read_deadline_post_commit_episode != target.episode;
             const u32 declared = conn.response_read_deadline_post_commit_declared_body;
             const u32 received = conn.response_read_deadline_post_commit_origin_received;
