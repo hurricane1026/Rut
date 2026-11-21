@@ -79378,8 +79378,8 @@ TEST(iouring_send_generation, backend_wait_bypasses_stale_cancel_and_more_before
     conns[0].id = 0;
     conns[0].fd = 91;
 
-    auto expect_default = [&](u32 incoming, i32 result, u32 flags) {
-        backend.send_state[0] = {payload, 91, 4, 5, IoEventType::Send, 0, 41};
+    auto expect_default = [&](u32 incoming, i32 result, u32 flags, u32 owner = 41) {
+        backend.send_state[0] = {payload, 91, 4, 5, IoEventType::Send, 0, owner};
         const auto before = backend.send_state[0];
         const u32 sq_tail_before = fixture.sq_tail;
         const u32 pending_before = backend.pending;
@@ -79413,6 +79413,10 @@ TEST(iouring_send_generation, backend_wait_bypasses_stale_cancel_and_more_before
     // corrupt its nonzero-offset proactor if accepted: partial, apparent
     // completion, and overflow.
     expect_default(40, 1, 0);
+    expect_default(41u ^ (1u << 30), 2, 0);
+    // An invalid stored owner must never let a cancellation advance the send.
+    const u32 kCancel = 41u | kNonUpstreamSendCancelBit;
+    expect_default(kCancel, 2, 0, kCancel);
     expect_default(39, 5, 0);
     expect_default(42, 6, 0);
     // Equality rejects both generation-zero mismatch directions.

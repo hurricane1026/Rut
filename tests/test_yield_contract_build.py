@@ -7,6 +7,24 @@ import sys
 import tempfile
 
 
+def check_downstream_send(compiler, root, overlay):
+    # The backend contract uses the Linux completion flag definitions.
+    if not sys.platform.startswith("linux"):
+        return
+    source = "src/runtime/io_uring_send_target.h"
+    check(compiler, root, overlay, source=source)
+    for before, after in [
+        ("owner == incoming &&", "(owner & 0xffff) == (incoming & 0xffff) &&"),
+        ("(incoming & kNonUpstreamSendCancelBit) == 0 &&", ""),
+        ("(flags & IORING_CQE_F_MORE) == 0;", "true;"),
+        ("(flags & IORING_CQE_F_MORE) == 0;", "flags != IORING_CQE_F_MORE;"),
+    ]:
+        probe = mutate(root, overlay, source, before, after)
+        check(compiler, root, overlay, "Downstream send completion violates target identity",
+              source=probe)
+        probe.unlink()
+
+
 def mutate(include, overlay, header, before, after):
     source = (include / header).read_text()
     if source.count(before) != 1:
@@ -52,6 +70,7 @@ def main():
         compiler = sys.argv[1]
         check_timer_transport(compiler, root, overlay)
         check(compiler, root, overlay)
+        check_downstream_send(compiler, root, overlay)
         source = "src/runtime/io_event.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
