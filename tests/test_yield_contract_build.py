@@ -52,6 +52,18 @@ def main():
         compiler = sys.argv[1]
         check_timer_transport(compiler, root, overlay)
         check(compiler, root, overlay)
+        source = "src/runtime/io_event.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("token.aux) << 56", "token.aux) << 55"),
+            ("token.episode = kInvalidUpstreamEventEpisode;", "token.episode = 0;"),
+            ("case IoEventType::RelayWrite:\n            return true;",
+             "case IoEventType::RelayWrite:\n            return type != IoEventType::RelayWrite;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
+            check(compiler, root, overlay, "Upstream completion token violates wire or episode contract",
+                  source=source)
+            probe.unlink()
         probe = mutate(root / "include", overlay, "rut/jit/handler_abi.h",
                        "enum class YieldKind : u8 {",
                        "enum class YieldKind : u8 {\n    UndeclaredContractProbe = 255,")

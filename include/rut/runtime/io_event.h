@@ -54,10 +54,30 @@ inline constexpr bool io_event_is_upstream(IoEventType type) {
            type == IoEventType::UpstreamSend;
 }
 
+// New event types must choose their wire layout explicitly.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch-enum"
+#pragma GCC diagnostic error "-Wswitch"
 inline constexpr bool io_event_uses_upstream_episode(IoEventType type) {
-    return io_event_is_upstream(type) || type == IoEventType::RelayRead ||
-           type == IoEventType::RelayWrite;
+    switch (type) {
+        case IoEventType::UpstreamConnect:
+        case IoEventType::UpstreamRecv:
+        case IoEventType::UpstreamSend:
+        case IoEventType::RelayRead:
+        case IoEventType::RelayWrite:
+            return true;
+        case IoEventType::Accept:
+        case IoEventType::Recv:
+        case IoEventType::Send:
+        case IoEventType::Timeout:
+        case IoEventType::HandlerTimer:
+        case IoEventType::ResponseReadTimer:
+        case IoEventType::Count:
+            return false;
+    }
+    return false;
 }
+#pragma GCC diagnostic pop
 
 struct UpstreamEventToken {
     u32 conn_id = 0;
@@ -92,14 +112,22 @@ inline constexpr u64 encode_upstream_event_token(const UpstreamEventToken& token
            (static_cast<u64>(token.episode) << 32) | (static_cast<u64>(token.aux) << 56);
 }
 
-inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* out) {
-    if (out == nullptr) return false;
+// A CQE may still own resources even when its token is malformed. Preserve the
+// routing fields for cleanup and give dispatch an unconditionally stale episode.
+inline constexpr UpstreamEventToken decode_upstream_completion_token(u64 data) {
     UpstreamEventToken token;
     token.type = static_cast<IoEventType>(data & 0xFFu);
     token.conn_id = static_cast<u32>((data >> 8) & kIoUserDataMaxConnId);
     token.episode = static_cast<u32>((data >> 32) & kIoUserDataMaxUpstreamEpisode);
     token.aux = static_cast<u8>(data >> 56);
-    if (!valid_upstream_event_token(token)) return false;
+    if (!valid_upstream_event_token(token)) token.episode = kInvalidUpstreamEventEpisode;
+    return token;
+}
+
+inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* out) {
+    if (out == nullptr) return false;
+    const auto token = decode_upstream_completion_token(data);
+    if (token.episode == kInvalidUpstreamEventEpisode) return false;
     *out = token;
     return true;
 }

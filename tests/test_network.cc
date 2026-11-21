@@ -41415,6 +41415,26 @@ TEST(state_invariant, response_read_timer_cancel_owners_drain_in_either_order) {
     }
 }
 
+#ifdef __linux__
+TEST(iouring_episode, relay_completion_decoder_preserves_high_bits_and_rejects_zero_episode) {
+    constexpr u64 valid = 0x8412345689abcd00ULL | static_cast<u8>(IoEventType::RelayWrite);
+    for (const u64 data : {valid, valid & ~u64{0xffffff00000000}}) {
+        u32 id, aux, episode;
+        IoEventType type;
+        IoUringBackend::decode_user_data(data, id, type, aux, episode);
+        CHECK_EQ(type, IoEventType::RelayWrite);
+        CHECK_EQ(id, 0x89abcdu);
+        CHECK_EQ(aux, 0x84u);
+        CHECK_EQ(episode, data == valid ? 0x123456u : kInvalidUpstreamEventEpisode);
+        IoEvent event{};
+        event.type = type;
+        event.upstream_episode = episode;
+        CHECK_EQ(io_event_is_tagged_stale(event, 0x123456), data != valid);
+        CHECK(io_event_is_tagged_stale(event, 0x123457));
+    }
+}
+#endif
+
 TEST(state_invariant, upstream_event_token_layout_round_trips_and_separates_generations) {
     for (const IoEventType type :
          {IoEventType::UpstreamConnect, IoEventType::UpstreamRecv, IoEventType::UpstreamSend}) {

@@ -190,6 +190,7 @@ add_library(rut_runtime STATIC
     runtime/shard.cc
     ${RUT_IO_SOURCES}
     runtime/timer_wheel.cc
+    runtime/io_event.cc
     runtime/socket.cc
     runtime/tls.cc
     runtime/tls_engine.cc
