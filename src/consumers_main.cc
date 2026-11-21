@@ -1019,6 +1019,56 @@ int metadata_command(const char* command,
     return kError ? failure(kError) : 0;
 }
 
+int credential_groups_command(const char* source,
+                              const char* id_text,
+                              const char* groups_path,
+                              const char* destination) {
+    const Str kId{id_text, bounded_argument(id_text, 65)};
+    if (!provision_id_valid(kId)) return failure("invalid registry record ID\n");
+    Buffer input;
+    SensitiveDocument base;
+    if (!read_private(source, input) || !consumer_registry_valid(base, input.view()))
+        return failure("cannot read valid private registry snapshot\n");
+    const u32 record = record_by_id(base, field(base, 0, lit_str("credentials")), kId);
+    if (record == json::kNone) return failure("registry record ID does not exist\n");
+
+    Buffer groups;
+    SensitiveDocument parsed_groups;
+    if (groups_path && (!read_private(groups_path, groups) || !parsed_groups.parse(groups.view()) ||
+                        parsed_groups.nodes[0].kind != json::Kind::Array))
+        return failure("cannot read valid private credential groups array\n");
+
+    Buffer replacement;
+    json::Writer object{replacement.data, json::kMaxBytes};
+    object.put('{');
+    const u32 kGroups = field(base, record, lit_str("groups"));
+    bool first = true;
+    for (u32 member = base.nodes[record].child; member != json::kNone;
+         member = base.nodes[member].next) {
+        if (member == kGroups) continue;
+        if (!first) object.put(',');
+        first = false;
+        if (!base.write(base.nodes[member].key, object))
+            return failure("cannot encode credential\n");
+        object.put(':');
+        if (!base.write(member, object)) return failure("cannot encode credential\n");
+    }
+    if (groups_path) {
+        object.text(lit_str(",\"groups\":"));
+        if (!parsed_groups.write(0, object)) return failure("cannot encode groups\n");
+    }
+    object.put('}');
+
+    Buffer result;
+    json::Writer output{result.data, json::kMaxBytes};
+    SensitiveDocument checked;
+    if (!object.ok || !base.write(0, output, record, {replacement.data, object.len}) ||
+        !consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* const kError = publish(destination, {result.data, output.len});
+    return kError ? failure(kError) : 0;
+}
+
 int credential_window_command(const char* source,
                               const char* id_text,
                               const char* start_text,
@@ -1093,6 +1143,8 @@ constexpr char kUsage[] =
     "       rut-consumers set-credential-enabled INPUT CREDENTIAL_ID true|false OUTPUT\n"
     "       rut-consumers set-credential-window INPUT CREDENTIAL_ID NOT_BEFORE EXPIRES_AT OUTPUT\n"
     "       rut-consumers set-consumer-groups INPUT CONSUMER_ID GROUPS_FILE OUTPUT\n"
+    "       rut-consumers set-credential-groups INPUT CREDENTIAL_ID GROUPS_FILE OUTPUT\n"
+    "       rut-consumers inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers hash-keys INPUT OUTPUT\n"
     "       rut-consumers --help\n"
     "Inputs must be owned private regular JSON files, at most 8192 bytes.\n"
@@ -1118,6 +1170,10 @@ constexpr char kUsage[] =
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 6 && strcmp(argv[1], "set-credential-groups") == 0)
+        return credential_groups_command(argv[2], argv[3], argv[4], argv[5]);
+    if (argc == 5 && strcmp(argv[1], "inherit-credential-groups") == 0)
+        return credential_groups_command(argv[2], argv[3], nullptr, argv[4]);
     if (argc == 7 && strcmp(argv[1], "set-credential-window") == 0)
         return credential_window_command(argv[2], argv[3], argv[4], argv[5], argv[6]);
     if (argc == 5 && strcmp(argv[1], "check-policy") == 0)

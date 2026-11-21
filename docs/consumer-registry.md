@@ -572,6 +572,13 @@ All commands take a validated private input snapshot.
 | --- | --- |
 | `inspect-consumer INPUT CONSUMER_ID` | Print the selected Consumer's metadata as one JSON object. |
 | `inspect-credential INPUT CREDENTIAL_ID` | Print one credential's metadata with secret and verifier fields omitted. |
+| `set-credential-groups INPUT CREDENTIAL_ID GROUPS_FILE OUTPUT` | Set one credential's explicit group subset from a private JSON array. An empty array grants no groups. |
+| `inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT` | Remove the explicit subset so the credential inherits its Consumer's groups. |
+
+Both group commands preserve the credential's owner, verifier, enabled state,
+and validity window. They validate the entire candidate before publishing a
+new private file. Applying the candidate to a running gateway uses the normal
+deployment path.
 
 ## Product scope
 
