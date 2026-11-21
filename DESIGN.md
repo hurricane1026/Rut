@@ -11311,14 +11311,15 @@ slots and the original fixed-key deployment. Neither the signature nor the
 matched key ID changes the replay identity.
 
 `JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
-nonblocking UDP A query with a bounded CNAME answer chain and optional
+nonblocking UDP A or AAAA query with a bounded CNAME answer chain and optional
 authenticated metadata fetch before the JWKS GET. A single response permits at
-most four alias hops and eight total answer records; every terminal IPv4 address
-must match an explicit finite allowlist. TLS name/CA, issuer, endpoint URI and
+most four alias hops and eight total answer records; every terminal address
+must match the selected family and an explicit finite allowlist. TLS name/CA, issuer, endpoint URI and
 kid/algorithm inventory remain configuration-owned. The validated terminal
 addresses are tried in answer order after definitive TCP establishment failures.
 Each address runs its own discovery and key exchange within the shared deadline.
-The DNS destination allowlist rejects duplicate IPv4 entries at configuration load. Optional
+The UDP resolver and HTTPS endpoint each support bare IPv4 or IPv6 literals.
+The allowlist rejects duplicate binary addresses at configuration load. Optional
 `requireNonEmptyKeys` treats a zero-approved-key refresh as failure, retaining
 last-good keys only within their original maximum age; the default removes keys.
 
