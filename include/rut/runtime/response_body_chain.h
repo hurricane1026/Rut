@@ -209,6 +209,12 @@ struct ResponseBodyChain {
         return tail ? payload_capacity(pool, tail) - tail->len : 0;
     }
 
+    // Allow one extra byte so a completion can report a body overrun. Once
+    // already over the limit, there is no valid receive to arm.
+    static constexpr u32 direct_receive_room(u32 received) {
+        return received <= kMaxBody ? kMaxBody - received + 1u : 0u;
+    }
+
     // Origin byte counts include bytes already sent. The live chain size alone
     // cannot tell whether another completion fits the declared response.
     static constexpr bool direct_receive_fits_body(u32 received, u32 declared, i32 result) {

@@ -163,6 +163,30 @@ consteval bool direct_receive_body_bounds_contract() {
 }
 
 static_assert(direct_receive_body_bounds_contract(), "Direct receive violates logical body bounds");
+
+// The maximum request must end exactly one byte beyond the logical limit.
+// That last byte can expose an overrun but must never enter the response.
+consteval bool direct_receive_room_contract() {
+    constexpr u32 kCap = ResponseBodyChain::kMaxBody;
+    constexpr u32 kCounts[] = {0, 1, kCap / 2, kCap - 1, kCap, kCap + 1, kCap + 2, UINT32_MAX};
+    for (const u32 kReceived : kCounts) {
+        const u32 kRoom = ResponseBodyChain::direct_receive_room(kReceived);
+        if (kReceived > kCap) {
+            if (kRoom != 0) return false;
+            continue;
+        }
+        if (static_cast<u64>(kReceived) + kRoom != static_cast<u64>(kCap) + 1 || kRoom > INT32_MAX)
+            return false;
+        const i32 kProbe = static_cast<i32>(kRoom);
+        if (ResponseBodyChain::direct_receive_fits_body(kReceived, UINT32_MAX, kProbe))
+            return false;
+        if (kProbe > 1 && !ResponseBodyChain::direct_receive_fits_body(kReceived, kCap, kProbe - 1))
+            return false;
+    }
+    return true;
+}
+
+static_assert(direct_receive_room_contract(), "Direct receive reservation violates body limit");
 }  // namespace
 
 void ResponseBodyChain::consume(u32 len, bool tail_pinned, bool recycle_bulk) {
