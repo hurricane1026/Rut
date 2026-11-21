@@ -91,6 +91,17 @@ def main():
             check(compiler, root, overlay, "Pinned receive commit violates buffered response suffix contract",
                   source=source)
             probe.unlink()
+        for before, after in [
+            ("address - begin > capacity", "static_cast<u32>(address - begin) > capacity"),
+            ("count > capacity - kOffset", "count >= capacity - kOffset"),
+            ("count > capacity - kOffset", "kOffset + count > capacity"),
+            ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
+            ("if (kEnd > tail_dirty) tail_dirty = kEnd;", "tail_dirty = kEnd;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
+            check(compiler, root, overlay, "Direct receive violates physical write extent contract",
+                  source=source)
+            probe.unlink()
         check_timer_transport(compiler, root, overlay)
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)

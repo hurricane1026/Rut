@@ -3,6 +3,21 @@
 #include "rut/runtime/slice_pool.h"
 
 namespace rut {
+namespace detail {
+
+// Only physical extents may change before a receive completion is accepted.
+constexpr bool record_direct_write_extent(
+    u64 begin, u64 address, u32 capacity, u32 count, u32& tail_dirty, u32& node_dirty) {
+    if (address < begin || address - begin > capacity) return false;
+    const u32 kOffset = static_cast<u32>(address - begin);
+    if (count > capacity - kOffset) return false;
+    const u32 kEnd = kOffset + count;
+    if (kEnd > tail_dirty) tail_dirty = kEnd;
+    if (kEnd > node_dirty) node_dirty = kEnd;
+    return true;
+}
+
+}  // namespace detail
 
 // Overflow storage for complete-buffered responses. The ordinary receive slice
 // remains the header/prefix owner; only bytes beyond it allocate these slices.
@@ -207,17 +222,13 @@ struct ResponseBodyChain {
     // complete-buffered responses do not consume or send body nodes while the
     // origin recv is active, and close defers chain release until its CQE drains.
     bool record_direct_write(Node* node, const u8* ptr, u32 n, const SlicePool& pool) {
-        if (node == nullptr || node != tail || ptr == nullptr) return false;
-        const u64 begin = reinterpret_cast<u64>(payload(node));
-        const u64 address = reinterpret_cast<u64>(ptr);
-        const u32 capacity = payload_capacity(pool, node);
-        if (address < begin || address - begin > capacity ||
-            n > capacity - static_cast<u32>(address - begin))
-            return false;
-        const u32 end = static_cast<u32>(address - begin) + n;
-        if (end > tail_dirty_end) tail_dirty_end = end;
-        if (end > node->dirty_end) node->dirty_end = end;
-        return true;
+        if (!node || node != tail || !ptr) return false;
+        return detail::record_direct_write_extent(reinterpret_cast<u64>(payload(node)),
+                                                  reinterpret_cast<u64>(ptr),
+                                                  payload_capacity(pool, node),
+                                                  n,
+                                                  tail_dirty_end,
+                                                  node->dirty_end);
     }
 
 private:
