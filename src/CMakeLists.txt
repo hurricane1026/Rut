@@ -202,6 +202,7 @@ add_library(rut_runtime STATIC
     runtime/http2_conn.cc
     runtime/hpack.cc
     runtime/buffered_send_vector.cc
+    runtime/direct_body_recv_phase.cc
     runtime/response_body_chain.cc
     runtime/chunked_parser.cc
     runtime/ws_frame.cc

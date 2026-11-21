@@ -126,6 +126,23 @@ def main():
                   source=source)
             probe.unlink()
         check(compiler, root, overlay)
+        source = "src/runtime/direct_body_recv_phase.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("return mode == ForwardResponseBufferingMode::Bounded;", "return true;"),
+            ("return mode == ForwardResponseBufferingMode::Bounded;",
+             "return mode == ForwardResponseBufferingMode::Bounded && phase != Phase::WaitingBody;"),
+            (" && !terminal_pending", ""),
+            (" && !close_after_drain", ""),
+            ("phase == ResponseReadDeadlinePostCommitPhase::Buffering ||", ""),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/direct_body_recv_phase.h", before, after)
+            check(compiler, root, overlay, "Direct body receive violates phase contract", source=source)
+            probe.unlink()
+        probe = mutate(root / "include", overlay, "rut/runtime/direct_body_recv_phase.h",
+                       "    CombinedSend,", "    CombinedSend,\n    UnclassifiedBodyPhase,")
+        check(compiler, root, overlay, "UnclassifiedBodyPhase", source=source)
+        probe.unlink()
         check_downstream_send(compiler, root, overlay)
         source = "src/runtime/io_event.cc"
         check(compiler, root, overlay, source=source)
