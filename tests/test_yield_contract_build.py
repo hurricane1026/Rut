@@ -113,6 +113,15 @@ def main():
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Direct receive violates logical body bounds", source=source)
             probe.unlink()
+        for before, after in [
+            ("received <= kMaxBody ? kMaxBody - received + 1u : 0u", "kMaxBody - received + 1u"),
+            ("received <= kMaxBody ?", "received < kMaxBody ?"),
+            ("kMaxBody - received + 1u", "kMaxBody - received"),
+            ("kMaxBody - received + 1u", "kMaxBody - received + 2u"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
+            check(compiler, root, overlay, "Direct receive reservation violates body limit", source=source)
+            probe.unlink()
         check_timer_transport(compiler, root, overlay)
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)

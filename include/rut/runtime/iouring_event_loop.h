@@ -1865,12 +1865,13 @@ public:
             return false;
         const u32 declared = c.response_read_deadline_post_commit_declared_body;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 kBodyRoom = ResponseBodyChain::direct_receive_room(received);
         const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
         const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
         const u32 header = buffering || phase == ResponseReadDeadlinePostCommitPhase::HeaderSend
                                ? raw_header_end
                                : 0;
-        if (received >= declared || raw_header_end == 0 || completed > received ||
+        if (received >= declared || kBodyRoom == 0 || raw_header_end == 0 || completed > received ||
             header > 0xFFFFFFFFu - (received - completed) ||
             c.buffered_response_len() != header + received - completed ||
             !response_read_deadline_identity_is_stable(c) || c.chain_direct_recv_owner.active ||
@@ -1887,8 +1888,7 @@ public:
                 : c.buffered_response_bulk_after();
         if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
         const u32 avail = c.response_body_tail.write_avail(pool);
-        const u32 body_room = ResponseBodyChain::kMaxBody - received + 1u;
-        const u32 len = avail < body_room ? avail : body_room;
+        const u32 len = avail < kBodyRoom ? avail : kBodyRoom;
         if (len == 0) return false;
         u8* dst = c.response_body_tail.write_ptr(pool);
         if (!backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len))
