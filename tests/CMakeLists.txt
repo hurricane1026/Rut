@@ -4331,6 +4331,15 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_bound_credentials_${binding_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(refresh_backend epoll io_uring)
+                add_test(NAME test_refresh_family_${refresh_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_refresh_family.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-refresh-family.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${refresh_backend} --tls)
+                set_tests_properties(test_refresh_family_${refresh_backend} PROPERTIES
+                    LABELS "integration;auth;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+            endforeach()
             foreach(auth_free_backend epoll io_uring)
                 foreach(durable_replay_opt 0 2)
                     add_test(NAME test_auth_durable_replay_${auth_free_backend}_opt${durable_replay_opt}
