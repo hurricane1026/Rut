@@ -33,8 +33,8 @@ def signed(claims, key=KEY, algorithm="HS256"):
     return (message + b"." + encode(hmac.new(key.encode(), message, hashlib.sha384 if algorithm == "HS384" else hashlib.sha256).digest())).decode()
 
 
-def permit_key(token):
-    return (NAMESPACE + ":" + hashlib.sha256(token.encode()).hexdigest()).encode()
+def permit_key(token, namespace=NAMESPACE):
+    return (namespace + ":" + hashlib.sha256(token.encode()).hexdigest()).encode()
 
 
 class Peer:

@@ -296,6 +296,29 @@ tombstone expiry, ACL denial, capacity, read-only role and disabled AOF. Both
 backends, O0/O2 wire tests and verified TLS service tests are registered. These
 single-instance tests do not establish replication/failover consistency.
 
+## Recovery after losing authoritative state
+
+If the latest revocations cannot be proved after an authority failure or
+snapshot restore, stop admitting traffic on the prior gateway generation.
+Before admitting traffic again:
+
+1. Choose a fresh `JWT_SESSION_NAMESPACE` that has never been used for this
+   issuer and application. Restrict the gateway Redis ACL to the new namespace.
+2. Start all issuance, protected routes and logout routes with the new namespace.
+   Keep every gateway using the previous namespace out of service.
+3. Reissue sessions after the usual authentication. Leave old permits in the old
+   namespace until they expire. Copying those permits would also copy grants
+   whose revocations might have been lost.
+
+The new namespace starts without permits, so an otherwise valid JWT from the
+previous namespace needs a fresh authenticated session before it can be used.
+This procedure deliberately ends all prior sessions. It applies to deployments
+where every protected route checks the authoritative permit. It does not detect
+stale storage automatically or affect routes relying only on JWT signature
+verification. The live durable-session test checks that a surviving old permit
+is ignored while a new session can be issued, used and revoked in the new
+namespace.
+
 ## Validation scope
 
 The JIT test uses the example's real typed mapper to cover every
