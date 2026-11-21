@@ -1798,10 +1798,8 @@ u32 IoUringBackend::wait(
             const u32 declared = conn.response_read_deadline_post_commit_declared_body;
             const u32 received = conn.response_read_deadline_post_commit_origin_received;
             const bool logical_commit =
-                cqe->res > 0 && !stale_target && received <= declared &&
-                static_cast<u32>(cqe->res) <= declared - received &&
-                received <= ResponseBodyChain::kMaxBody &&
-                static_cast<u32>(cqe->res) <= ResponseBodyChain::kMaxBody - received &&
+                !stale_target &&
+                ResponseBodyChain::direct_receive_fits_body(received, declared, cqe->res) &&
                 target.node == conn.response_body_tail.tail && response_pool != nullptr &&
                 target.ptr == conn.response_body_tail.write_ptr(*response_pool);
             const bool deadline_active =
