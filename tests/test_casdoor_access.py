@@ -19,7 +19,8 @@ AUDIENCE = 'casdoor-api'
 
 
 @contextmanager
-def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended', subject='alice', principal=False):
+def gateway(args, directory, org='tenant', group='staff', second='billing:read', forbidden='suspended',
+            subject='alice', principal=False, policy=None):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -39,8 +40,9 @@ def gateway(args, directory, org='tenant', group='staff', second='billing:read',
             '    guard json.string(json.get(principal, "/owner").or(principal)).or("") == env("CASDOOR_ORG") else { return 403 }\n' + \
             '    return 204\n}\n'
     source.write_text(program.replace('listen :8080', f'listen :{port}'))
-    policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
-                  jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
+    if policy is None:
+        policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
+                      jwks=dict(keys=[dict(kid='current', kty='RSA', alg='RS256', n=MODULUS, e='AQAB')]))
     env = dict(os.environ, JWT_RS256_POLICY=json.dumps(policy), CASDOOR_ORG=org,
                CASDOOR_GROUP=group, CASDOOR_SECOND_GROUP=second, CASDOOR_FORBIDDEN_GROUP=forbidden,
                CASDOOR_SUBJECT=subject)
