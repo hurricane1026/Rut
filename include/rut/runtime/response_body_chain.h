@@ -48,7 +48,7 @@ struct ResponseBodyChain {
     u32 tail_dirty_end = 0;
 
     const u8* data() const { return head ? payload(head) + head->offset : nullptr; }
-    u32 front_size() const { return head ? head->len - head->offset : 0; }
+    constexpr u32 front_size() const { return head ? head->len - head->offset : 0; }
 
     // Stored bytes after which new nodes prefer bulk buffers. Plaintext
     // switches as soon as the body outgrew one slice. TLS waits until four:
@@ -124,33 +124,7 @@ struct ResponseBodyChain {
     // Completed sends may consume the committed prefix while a direct recv
     // still owns the tail's reserved capacity. Retain that node until the
     // receive target settles; consume(0) then removes any empty retained head.
-    void consume(u32 len, bool tail_pinned = false, bool recycle_bulk = false) {
-        while (head && (len != 0 || head->offset == head->len)) {
-            const u32 n = len < front_size() ? len : front_size();
-            head->offset += n;
-            size -= n;
-            len -= n;
-            if (head->offset == head->len) {
-                if (head == tail && tail_pinned) break;
-                Node* old = head;
-                head = head->next;
-                if (recycle_bulk && recycled == nullptr &&
-                    owner->is_bulk(reinterpret_cast<const u8*>(old))) {
-                    if (old == tail && old->dirty_end < tail_dirty_end)
-                        old->dirty_end = tail_dirty_end;
-                    old->next = nullptr;
-                    recycled = old;
-                } else {
-                    release_node(old);
-                }
-            }
-        }
-        if (!head) {
-            tail = nullptr;
-            if (!recycled) owner = nullptr;
-            tail_dirty_end = 0;
-        }
-    }
+    void consume(u32 len, bool tail_pinned = false, bool recycle_bulk = false);
 
     void release_recycled() {
         if (recycled) {

@@ -68,6 +68,17 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         overlay = Path(directory)
         compiler = sys.argv[1]
+        source = "src/runtime/response_body_chain.cc"
+        check(compiler, root, overlay, source=source)
+        for before, after in [
+            ("(node == chain.tail && tail_pinned)", "false"),
+            ("chain.size -= kUsed;", "chain.size = 0;"),
+            ("chain.head = node->next;", "chain.head = nullptr;"),
+        ]:
+            probe = mutate(root, overlay, source, before, after)
+            check(compiler, root, overlay, "Response body consumption violates prefix or tail ownership",
+                  source=probe)
+            probe.unlink()
         check_timer_transport(compiler, root, overlay)
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)
