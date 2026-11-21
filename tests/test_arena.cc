@@ -1197,6 +1197,37 @@ TEST(response_body_chain, fragmented_bytes_drain_without_copying_live_nodes) {
     pool.destroy();
 }
 
+TEST(response_body_chain, cross_node_completion_preserves_the_receive_tail) {
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 0).has_value());
+    ResponseBodyChain chain;
+    u8 bytes[ResponseBodyChain::kPayload]{};
+    REQUIRE(chain.append(pool, bytes, sizeof(bytes)));
+    const u8 suffix[] = {7, 8, 9};
+    REQUIRE(chain.append(pool, suffix, sizeof(suffix)));
+    auto* const tail = chain.tail;
+    REQUIRE(chain.head != tail);
+    chain.consume(sizeof(bytes) - 1, true);
+    chain.consume(2, true);
+    REQUIRE_EQ(chain.head, tail);
+    CHECK_EQ(chain.size, 2u);
+    CHECK_EQ(chain.front_size(), 2u);
+    CHECK_EQ(*chain.data(), 8u);
+    CHECK_EQ(pool.in_use(), 1u);
+    chain.consume(2, true);
+    chain.consume(0, true);
+    REQUIRE_EQ(chain.head, tail);
+    CHECK_EQ(chain.size, 0u);
+    CHECK_EQ(pool.in_use(), 1u);
+    chain.consume(0, false);
+    chain.consume(0, false);
+    CHECK_EQ(chain.head, nullptr);
+    CHECK_EQ(chain.tail, nullptr);
+    CHECK_EQ(chain.owner, nullptr);
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
 TEST(response_body_chain, exhausted_reservation_is_atomic_and_reusable) {
     SlicePool pool;
     constexpr u32 kTestBulk = 4;
