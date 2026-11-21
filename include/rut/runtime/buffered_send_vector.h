@@ -12,7 +12,7 @@ struct BufferedSendVector {
     const u8* second_source = nullptr;
     u32 first_size = 0;
     u32 total_size = 0;
-    void bind(const u8* first, u32 first_len, const u8* second, u32 second_len) {
+    constexpr void bind(const u8* first, u32 first_len, const u8* second, u32 second_len) {
         first_source = first;
         second_source = second;
         first_size = first_len;
@@ -23,18 +23,23 @@ struct BufferedSendVector {
         message.msg_iov = parts;
         message.msg_iovlen = 2;
     }
-    bool matches(const u8* first, u32 total) const {
-        return message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
+    constexpr bool matches(const u8* first, u32 total) const {
+        return first != nullptr && first_source == first && first_size == parts[0].iov_len &&
+               second_source == parts[1].iov_base && total_size == total &&
+               message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
                parts[0].iov_len != 0 && parts[1].iov_base != nullptr && parts[1].iov_len != 0 &&
                parts[0].iov_len <= total && parts[1].iov_len == total - parts[0].iov_len;
     }
-    void advance(u32 n) {
+    constexpr void advance(u32 n) {
         while (n && message.msg_iovlen) {
             auto& part = *message.msg_iov;
-            const u32 step = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
-            part.iov_base = static_cast<u8*>(part.iov_base) + step;
-            part.iov_len -= step;
-            n -= step;
+            const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
+            part.iov_len -= kStep;
+            const bool kFirst = &part == parts;
+            const u8* source = kFirst ? first_source : second_source;
+            const u32 kSize = kFirst ? first_size : total_size - first_size;
+            part.iov_base = const_cast<u8*>(source + (kSize - part.iov_len));
+            n -= kStep;
             if (part.iov_len == 0) {
                 ++message.msg_iov;
                 --message.msg_iovlen;
