@@ -168,7 +168,7 @@ class Store:
         assert not self.errors, self.errors
 
 
-def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'event', h2=False, abort_when=None):
+def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'event', h2=False, abort_when=None, key_id='billing-key'):
     signed_timestamp = SIGNED_TIME if timestamp is None else timestamp
     timestamp = str(int(time.time()) if timestamp is None else timestamp)
     digest = hmac.new(key.encode(), message.encode()+b'.'+timestamp.encode()+b'.'+body,
@@ -181,9 +181,9 @@ def exchange(port, message, timestamp=None, key=KEY, duplicate=False, body=b'eve
         target='/signed?event='+message
         date=formatdate(signed_timestamp, usegmt=True)
         digest='SHA-256='+base64.b64encode(hashlib.sha256(body).digest()).decode()
-        canonical=f'billing-key\nPOST {target}\ndate: {date}\ndigest: {digest}\n'
+        canonical=f'{key_id}\nPOST {target}\ndate: {date}\ndigest: {digest}\n'
         signature=base64.b64encode(hmac.new(key.encode(),canonical.encode(),hashlib.sha256).digest()).decode()
-        fields=f'Authorization: Signature keyId="billing-key",algorithm="hmac-sha256",headers="@request-target date digest",signature="{signature}"\r\nDate: {date}\r\nDigest: {digest}\r\n'
+        fields=f'Authorization: Signature keyId="{key_id}",algorithm="hmac-sha256",headers="@request-target date digest",signature="{signature}"\r\nDate: {date}\r\nDigest: {digest}\r\n'
         if duplicate: fields+=f'Date: {date}\r\n'
     if h2:
         headers=[tuple(line.split(': ',1)) for line in fields.strip().split('\r\n')]
@@ -245,6 +245,11 @@ def gateway(args, source, store, directory):
              REDIS_PASSWORD='service-password',REDIS_DATABASE='1')
     if hasattr(args, 'previous_key'):
         env['STANDARD_WEBHOOK_PREVIOUS_RAW_KEY'] = args.previous_key
+    if hasattr(args, 'current_key_id'):
+        env.update(SIGNED_REQUEST_CURRENT_KEY_ID=args.current_key_id,
+                   SIGNED_REQUEST_CURRENT_KEY=args.current_key,
+                   SIGNED_REQUEST_PREVIOUS_KEY_ID=args.previous_key_id,
+                   SIGNED_REQUEST_PREVIOUS_KEY=args.previous_key)
     log=root/'gateway.log'
     with log.open('w') as output:
         process=subprocess.Popen([args.server,str(path),'--backend',args.backend,'--opt',str(getattr(args,'opt',2)),

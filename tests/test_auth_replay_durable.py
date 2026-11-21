@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Confirmed replay admission against pinned Redis, including SIGKILL/AOF recovery."""
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
+from email.utils import formatdate
 import hashlib
 from pathlib import Path
 import socket
@@ -11,6 +13,7 @@ import tempfile
 import time
 import uuid
 
+import test_auth_replay
 from test_auth_replay import KEY, exchange, gateway
 from test_redis_commands import REDIS_IMAGE, packet, read_value
 
@@ -109,6 +112,50 @@ def cleanup_failure_recovery(args, root):
         store.close()
 
 
+def signed_rotation_recovery(args, store, root):
+    source = Path(args.source).resolve()
+    # The original fixed-key route and the rotating route use the same claim
+    # format. Keep the signed timestamp, target and body fixed across both.
+    original = source.with_name('signed-request-durable-replay-auth.rut')
+    timestamp = int(time.time())
+    next_key = 'signed-request-next-fixture-9876543210'
+    next_id = 'billing-key-next'
+    target = '/signed?event=rotation-persisted'
+    digest = base64.b64encode(hashlib.sha256(b'event').digest()).decode()
+    claim_input = f'{target}\n{formatdate(timestamp, usegmt=True)}\nSHA-256={digest}'
+    claim = b'replay:billing:signed-post:' + hashlib.sha256(claim_input.encode()).hexdigest().encode()
+
+    with gateway(args, original, store, root) as port:
+        assert exchange(port, 'rotation-persisted', timestamp=timestamp) == 204
+        ttl = store.command(b'PTTL', claim)
+        assert 590000 < ttl <= 601000
+
+    store.kill()
+    store.start()
+    assert store.command(b'GET', claim) == b'claimed'
+    recovered_ttl = store.command(b'PTTL', claim)
+    assert 0 < recovered_ttl < ttl
+
+    args.current_key_id, args.current_key = next_id, next_key
+    args.previous_key_id, args.previous_key = 'billing-key', KEY
+    with gateway(args, source, store, root) as port:
+        assert exchange(port, 'rotation-persisted', timestamp=timestamp,
+                        key=next_key, key_id=next_id, h2=True) == 409
+        assert exchange(port, 'overlap-old', timestamp=timestamp) == 204
+        assert exchange(port, 'overlap-new', timestamp=timestamp,
+                        key=next_key, key_id=next_id) == 204
+
+    args.previous_key_id, args.previous_key = '', ''
+    with gateway(args, source, store, root) as port:
+        assert exchange(port, 'old-retired', timestamp=timestamp) == 401
+        assert exchange(port, 'overlap-old', timestamp=timestamp,
+                        key=next_key, key_id=next_id, h2=True) == 409
+        assert exchange(port, 'old-retired', timestamp=timestamp,
+                        key=next_key, key_id=next_id) == 204
+    assert 0 < store.command(b'PTTL', claim) <= recovered_ttl
+    print('PASS: TLS Redis durable signed-request replay across signing-key rotation and restarts')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--server', required=True)
@@ -116,9 +163,15 @@ def main():
     parser.add_argument('--testdata', required=True)
     parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
     parser.add_argument('--tls', action='store_true')
-    parser.add_argument('--rotation', action='store_true')
+    rotation = parser.add_mutually_exclusive_group()
+    rotation.add_argument('--rotation', action='store_true')
+    rotation.add_argument('--signed-rotation', action='store_true')
     parser.add_argument('--opt', type=int, choices=(0, 2), default=2)
     args = parser.parse_args()
+    if args.signed_rotation:
+        if not args.tls:
+            parser.error('--signed-rotation requires --tls')
+        test_auth_replay.SIGNED = True
     store = DurableStore(args)
     try:
         assert store.command(b'CONFIG', b'GET', b'appendonly') == [b'appendonly', b'yes']
@@ -126,6 +179,9 @@ def main():
         assert store.command(b'CONFIG', b'GET', b'maxmemory-policy') == [b'maxmemory-policy', b'noeviction']
         with tempfile.TemporaryDirectory(prefix='rut-auth-durable-') as directory:
             root = Path(directory)
+            if args.signed_rotation:
+                signed_rotation_recovery(args, store, root)
+                return
             if args.rotation:
                 assert args.tls
                 next_key = 'standard-webhook-next-fixture-9876543210'
