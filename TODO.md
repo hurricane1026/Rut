@@ -123,6 +123,13 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] Expose byte-exact `str.trimPrefix(str)` / `str.trimSuffix(str)` as pure,
+  allocation-free borrowed views through HIR/MIR/RIR, JIT and native compilation.
+  Each removes one match; empty/nonmatching affixes preserve the input. Dynamic
+  helper composition and consistent-hash keys are covered alongside binary and
+  empty-span boundaries. This is one M1 string primitive slice, not completion
+  of the broader collections/state work.
+
 - [x] Reject a fifth stacked `@rateLimit` decorator with a capacity diagnostic at
   that decorator, instead of silently omitting the rule. Boundary regression
   tests cover all four rules and independent per-route capacity.

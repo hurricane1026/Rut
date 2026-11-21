@@ -2,6 +2,7 @@
 #include "es256_fixture.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_cache_context.h"
@@ -3952,4 +3953,25 @@ route GET "/" { return 200 }
     CHECK_EQ(target.hc_timeout_ms, 1000u);
     CHECK_EQ(target.hc_expected_status, 200u);
     CHECK_EQ(target.hc_path_len, 7u);
+}
+
+TEST(native_program, string_trim_executes_after_source_removal) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.fd >= 0);
+        REQUIRE(source.append(test::string_trim::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto* route = &program.p->config.routes[0];
+        REQUIRE(route->fn);
+        for (const auto& scenario : test::string_trim::kCases) {
+            const std::string request = std::string("GET / HTTP/1.1\r\nHost: local\r\nX-Text: ") +
+                                        scenario.text + "\r\nX-Prefix: " + scenario.prefix +
+                                        "\r\nX-Suffix: " + scenario.suffix +
+                                        "\r\nX-Expected: " + scenario.expected + "\r\n\r\n";
+            CHECK_EQ(invoke(*route, request).status_code, scenario.status);
+        }
+    }
 }

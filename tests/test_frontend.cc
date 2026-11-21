@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
 #include "fixtures/ws_cache_context.h"
@@ -48656,4 +48657,84 @@ TEST(frontend, unique_cookie_requires_literal_token_name) {
         REQUIRE(ast);
         CHECK(!analyze_file_heap(ast.value()));
     }
+}
+
+TEST(frontend, string_trim_lowers_helpers_and_consistent_hash_composition) {
+    const char* sources[] = {
+        test::string_trim::kSource,
+        R"rut(upstream app at "127.0.0.1:9001"
+route GET "/" {
+ return forward(app, load_balance: .consistentHash,
+     hash_key: req.path.trimPrefix("/").trimSuffix("/"),
+     hash_seed: "00112233445566778899aabbccddeeff")
+})rut",
+    };
+    for (const auto* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto copied = std::make_unique<HirModule>(hir.value());
+        hir.reset();
+        auto mir = build_mir_heap(*copied);
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        CHECK(function_has_op(rir.module.functions[0], rir::Opcode::StrTrimPrefix));
+        CHECK(function_has_op(rir.module.functions[0], rir::Opcode::StrTrimSuffix));
+        rir.destroy();
+    }
+}
+
+TEST(frontend, string_trim_rejects_wrong_arity_types_and_wrapped_values) {
+    for (const auto* expression : {"req.path.trimPrefix()",
+                                   "req.path.trimSuffix()",
+                                   "req.path.trimPrefix(\"a\", \"b\")",
+                                   "req.path.trimSuffix(\"a\", \"b\")",
+                                   "req.path.trimPrefix(1)",
+                                   "req.path.trimSuffix(true)",
+                                   "req.path.trimPrefix(b\"a\")",
+                                   "b\"a\".trimSuffix(\"a\")",
+                                   "req.header(\"X\").trimPrefix(\"a\")",
+                                   "req.path.trimSuffix(req.header(\"X\"))"}) {
+        const std::string source =
+            std::string("route GET \"/\" { let value = ") + expression + " return 200 }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, string_trim_is_pure_in_bounded_parser_steps) {
+    const char* source = R"rut(
+func step(_ data: Bytes, _ state: i32) -> (i32, str, bool) {
+    (state + 1, "prefix:value:suffix".trimPrefix("prefix:").trimSuffix(":suffix"), true)
+}
+route POST "/" {
+    guard let values = collectBytes(req.bodyBytes, 0, 1, step) else { return 400 }
+    guard values.get(0).or("") == "value" else { return 500 }
+    return 204
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    bool trimmed = false;
+    for (u32 i = 0; i < rir.module.func_count; ++i)
+        trimmed |= function_has_op(rir.module.functions[i], rir::Opcode::StrTrimSuffix);
+    CHECK(trimmed);
+    rir.destroy();
 }

@@ -2604,22 +2604,26 @@ extern "C" u32 rut_helper_regex_scratch_cache_count_for_test() {
 
 void rut_helper_str_trim_prefix(
     const char* s, u32 s_len, const char* pfx, u32 pfx_len, const char** out_ptr, u32* out_len) {
-    if (pfx_len <= s_len) {
-        bool match = true;
-        for (u32 i = 0; i < pfx_len; i++) {
-            if (s[i] != pfx[i]) {
-                match = false;
-                break;
-            }
-        }
-        if (match) {
-            *out_ptr = s + pfx_len;
-            *out_len = s_len - pfx_len;
-            return;
-        }
-    }
     *out_ptr = s;
     *out_len = s_len;
+    if ((!s && s_len) || (!pfx && pfx_len) || pfx_len == 0 || pfx_len > s_len) return;
+    if (__builtin_memcmp(s, pfx, pfx_len) == 0) {
+        *out_ptr = s + pfx_len;
+        *out_len = s_len - pfx_len;
+    }
+}
+
+void rut_helper_str_trim_suffix(const char* s,
+                                u32 s_len,
+                                const char* suffix,
+                                u32 suffix_len,
+                                const char** out_ptr,
+                                u32* out_len) {
+    *out_ptr = s;
+    *out_len = s_len;
+    if ((!s && s_len) || (!suffix && suffix_len) || suffix_len == 0 || suffix_len > s_len) return;
+    if (__builtin_memcmp(s + s_len - suffix_len, suffix, suffix_len) == 0)
+        *out_len = s_len - suffix_len;
 }
 
 // JSON workspace is shard-thread local and cannot escape a synchronous helper.

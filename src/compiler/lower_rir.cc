@@ -1543,13 +1543,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
-    if (value.kind == MirValueKind::StringConcat || value.kind == MirValueKind::StringPredicate) {
+    if (value.kind == MirValueKind::StringConcat || value.kind == MirValueKind::StringPredicate ||
+        value.kind == MirValueKind::StringTrim) {
         const bool kPredicate = value.kind == MirValueKind::StringPredicate;
+        const bool kTrim = value.kind == MirValueKind::StringTrim;
         if (!value.lhs || !value.rhs || value.lhs->type != MirTypeKind::Str ||
             value.rhs->type != MirTypeKind::Str || value.lhs->may_nil || value.lhs->may_error ||
             value.rhs->may_nil || value.rhs->may_error || value.may_nil || value.may_error ||
             value.type != (kPredicate ? MirTypeKind::Bool : MirTypeKind::Str) ||
-            (kPredicate && (value.int_value < 0 || value.int_value > 3)))
+            (kPredicate && (value.int_value < 0 || value.int_value > 3)) ||
+            (kTrim && (value.int_value < 0 || value.int_value > 1)))
             return frontend_error(FrontendError::UnsupportedSyntax, span);
         const auto kOperand = [&](const MirValue& input) {
             return materialize_value(input,
@@ -1575,7 +1578,10 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             kPredicate
                 ? b.emit_str_predicate(
                       parts[0], parts[1], static_cast<u32>(value.int_value), {span.line, span.col})
-                : b.emit_str_interpolate(parts, 2, {span.line, span.col});
+            : kTrim ? (value.int_value == 0
+                           ? b.emit_str_trim_prefix(parts[0], parts[1], {span.line, span.col})
+                           : b.emit_str_trim_suffix(parts[0], parts[1], {span.line, span.col}))
+                    : b.emit_str_interpolate(parts, 2, {span.line, span.col});
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }

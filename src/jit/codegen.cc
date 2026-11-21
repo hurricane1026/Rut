@@ -2112,7 +2112,8 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, b);
             break;
         }
-        case rir::Opcode::StrTrimPrefix: {
+        case rir::Opcode::StrTrimPrefix:
+        case rir::Opcode::StrTrimSuffix: {
             LLVMValueRef s = c.get_value(inst.operands[0]);
             LLVMValueRef pfx = c.get_value(inst.operands[1]);
             LLVMValueRef s_ptr = LLVMBuildExtractValue(c.builder, s, 0, "s.ptr");
@@ -2122,12 +2123,18 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "tp.ptr");
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "tp.len");
             LLVMValueRef args[] = {s_ptr, s_len, p_ptr, p_len, out_ptr, out_len};
-            LLVMBuildCall2(c.builder,
-                           LLVMGlobalGetValueType(c.get_str_trim_prefix()),
-                           c.get_str_trim_prefix(),
-                           args,
-                           6,
-                           "");
+            LLVMValueRef helper = c.get_str_trim_prefix();
+            if (inst.op == rir::Opcode::StrTrimSuffix) {
+                helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_str_trim_suffix");
+                if (!helper) {
+                    LLVMTypeRef params[] = {
+                        c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+                    helper = LLVMAddFunction(c.llvm_mod,
+                                             "rut_helper_str_trim_suffix",
+                                             LLVMFunctionType(c.void_ty, params, 6, 0));
+                }
+            }
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 6, "");
             LLVMValueRef rp = LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "tp.rp");
             LLVMValueRef rl = LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "tp.rl");
             LLVMValueRef strval = LLVMGetUndef(c.str_ty);

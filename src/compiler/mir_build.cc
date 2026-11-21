@@ -613,13 +613,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.str_value = expr.str_value;
         return v;
     }
-    if (expr.kind == HirExprKind::StringConcat || expr.kind == HirExprKind::StringPredicate) {
+    if (expr.kind == HirExprKind::StringConcat || expr.kind == HirExprKind::StringPredicate ||
+        expr.kind == HirExprKind::StringTrim) {
         const bool kPredicate = expr.kind == HirExprKind::StringPredicate;
+        const bool kTrim = expr.kind == HirExprKind::StringTrim;
         if (!expr.lhs || !expr.rhs || expr.lhs->type != HirTypeKind::Str ||
             expr.rhs->type != HirTypeKind::Str || expr.lhs->may_nil || expr.lhs->may_error ||
             expr.rhs->may_nil || expr.rhs->may_error || expr.may_nil || expr.may_error ||
             expr.type != (kPredicate ? HirTypeKind::Bool : HirTypeKind::Str) ||
-            (kPredicate && (expr.int_value < 0 || expr.int_value > 3)))
+            (kPredicate && (expr.int_value < 0 || expr.int_value > 3)) ||
+            (kTrim && (expr.int_value < 0 || expr.int_value > 1)))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
@@ -631,7 +634,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         if (!fn->values.push(rhs.value()))
             return frontend_error(FrontendError::OutOfMemory, expr.span);
         v.rhs = &fn->values[fn->values.len - 1];
-        v.kind = kPredicate ? MirValueKind::StringPredicate : MirValueKind::StringConcat;
+        v.kind = kPredicate ? MirValueKind::StringPredicate
+                 : kTrim    ? MirValueKind::StringTrim
+                            : MirValueKind::StringConcat;
         v.type = kPredicate ? MirTypeKind::Bool : MirTypeKind::Str;
         v.int_value = expr.int_value;
         return v;

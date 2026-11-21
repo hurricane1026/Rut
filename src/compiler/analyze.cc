@@ -5403,6 +5403,28 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (recv.type == HirTypeKind::Str &&
+        (expr.name.eq(lit_str("trimPrefix")) || expr.name.eq(lit_str("trimSuffix")))) {
+        constexpr auto kDetail = lit_str("trimPrefix/trimSuffix expects one unwrapped str");
+        if (expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        auto needle = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!needle) return core::make_unexpected(needle.error());
+        if (needle->type != HirTypeKind::Str || needle->may_nil || needle->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr out{};
+        out.kind = HirExprKind::StringTrim;
+        out.type = HirTypeKind::Str;
+        out.span = expr.span;
+        out.int_value = expr.name.eq(lit_str("trimSuffix")) ? 1 : 0;
+        if (!route->exprs.push(recv)) return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(needle.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     if (recv.type == HirTypeKind::Str && expr.args.len == 1 &&
         (expr.name.eq(lit_str("hasPrefix")) || expr.name.eq(lit_str("hasSuffix")) ||
          expr.name.eq(lit_str("contains")))) {
@@ -14982,6 +15004,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 case HirExprKind::BytesCount:
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringPredicate:
+                case HirExprKind::StringTrim:
                 case HirExprKind::HashDigest:
                 case HirExprKind::ConstantTimeEqual:
                 case HirExprKind::JsonDecode:
@@ -16227,6 +16250,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::NoError:
                 case HirExprKind::LetIn:
                 case HirExprKind::StringConcat:
+                case HirExprKind::StringTrim:
                     break;
                 default:
                     return false;

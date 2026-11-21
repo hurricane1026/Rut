@@ -213,6 +213,7 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
                !type->inner->struct_def;
     }
     if (inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate &&
+        inst.op != Opcode::StrTrimPrefix && inst.op != Opcode::StrTrimSuffix &&
         inst.op != Opcode::ReqSetPath && inst.op != Opcode::ReqSetHash)
         return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
@@ -247,6 +248,10 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
         return block.insts && value.def_inst < block.inst_count &&
                block.insts[value.def_inst].op == Opcode::ConstStr &&
                block.insts[value.def_inst].result == inst.operand(0);
+    }
+    if (inst.op == Opcode::StrTrimPrefix || inst.op == Opcode::StrTrimSuffix) {
+        return inst.operand_count == 2 && kExact(inst.result, TypeKind::Str) &&
+               kExact(inst.operand(0), TypeKind::Str) && kExact(inst.operand(1), TypeKind::Str);
     }
     if (inst.op == Opcode::StrPredicate) {
         return inst.operand_count == 2 && inst.imm.i32_val >= 0 && inst.imm.i32_val <= 3 &&

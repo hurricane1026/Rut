@@ -38,6 +38,7 @@ enum class MirValueKind : u8 {
     RegexCapture,
     StringConcat,
     StringPredicate,
+    StringTrim,  // byte-exact prefix/suffix removal; borrowed result
     Tuple,
     TupleSlot,
     VariantCase,
