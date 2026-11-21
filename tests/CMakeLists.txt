@@ -4242,6 +4242,13 @@ if(RUT_ENABLE_JIT)
                     set_tests_properties(test_keycloak_roles_${keycloak_backend}_opt${keycloak_opt} PROPERTIES
                         LABELS "integration;auth" TIMEOUT 300 SKIP_RETURN_CODE 77)
                 endforeach()
+                add_test(NAME test_keycloak_live_${keycloak_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_keycloak_live.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/keycloak-role-auth.rut
+                        --backend ${keycloak_backend})
+                set_tests_properties(test_keycloak_live_${keycloak_backend} PROPERTIES
+                    LABELS "integration;auth;docker" TIMEOUT 360 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
             foreach(casdoor_backend epoll io_uring)
                 foreach(casdoor_opt 0 2)
