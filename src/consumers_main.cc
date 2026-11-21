@@ -741,9 +741,66 @@ bool policy_allowed_methods(PolicySnapshot& snapshot, u32 value) {
     return true;
 }
 
+bool policy_enabled(json::Document& doc, u32 record) {
+    return doc.raw(field(doc, record, lit_str("enabled"))).eq(lit_str("true"));
+}
+
+i64 policy_time(json::Document& doc, u32 record, Str field_name) {
+    const u32 node = field(doc, record, field_name);
+    i64 seconds = 0;
+    // The runtime schema validator already checked any supplied value.
+    if (node != json::kNone) json::integer(doc.raw(node), seconds);
+    return seconds;
+}
+
+bool policy_expiry(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) && !policy_time(doc, record, lit_str("expiresAt")))
+            return false;
+    }
+    return true;
+}
+
+bool policy_quantity(json::Document& doc, u32 node, i64 minimum, i64& value) {
+    return doc.nodes[node].kind == json::Kind::Number && doc.raw(node).ptr[0] != '-' &&
+           json::integer(doc.raw(node), value) && value >= minimum;
+}
+
+bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
+    i64 maximum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, maximum)) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!policy_enabled(doc, record)) continue;
+        const i64 start = policy_time(doc, record, lit_str("notBefore"));
+        const i64 end = policy_time(doc, record, lit_str("expiresAt"));
+        if (!start || !end || end - start > maximum) return false;
+    }
+    return true;
+}
+
+bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
+    i64 minimum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, minimum)) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) &&
+            policy_time(doc, record, lit_str("expiresAt")) - snapshot.now < minimum)
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
+    {lit_str("requireExpiryForEnabledCredentials"), true, policy_expiry},
+    {lit_str("maxCredentialLifetimeSeconds"), false, policy_max_lifetime},
+    {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},
 };
 
 int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {

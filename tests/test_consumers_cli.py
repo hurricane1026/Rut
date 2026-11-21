@@ -76,6 +76,26 @@ def test_deployment_policy(tool, root):
     check({'allowedMethods': ['basic']}, ok=True, records=[basic])
     check({'allowedMethods': ['mtls']}, ok=True, records=[mtls])
     check({'allowedMethods': ['header']}, records=[basic], rule='allowedMethods')
+    expiry = {'requireExpiryForEnabledCredentials': True}
+    check(expiry, ok=True)
+    check(expiry, records=[dict(key, expiresAt=0)], rule=next(iter(expiry)))
+    check(expiry, ok=True, records=[dict(key, expiresAt=0, enabled=False)])
+    check(expiry, records=[dict(key, expiresAt=0, consumerId='disabled', groups=[])],
+          rule=next(iter(expiry)))
+    limit = 'maxCredentialLifetimeSeconds'
+    check({limit: 100}, ok=True)
+    check({limit: 99}, rule=limit)
+    check({limit: 100}, records=[dict(key, notBefore=0)], rule=limit)
+    check({limit: 100}, records=[dict(key, expiresAt=0)], rule=limit)
+    for invalid in (-0.0, 0, -1, 1.5, '100', 9223372036854775808):
+        check({limit: invalid}, rule=limit)
+    remaining = 'minimumRemainingValiditySeconds'
+    check({remaining: 80}, ok=True)
+    check({remaining: 81}, rule=remaining)
+    check({remaining: 1}, now=200, rule=remaining)
+    check({remaining: 1}, records=[dict(key, expiresAt=0)], rule=remaining)
+    check({remaining: 1}, records=[dict(key, expiresAt=0, enabled=False)], ok=True)
+    check({remaining: 9223372036854775807}, now=9223372036854775807, rule=remaining)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
