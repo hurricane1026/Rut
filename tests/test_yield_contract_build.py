@@ -79,6 +79,18 @@ def main():
             check(compiler, root, overlay, "Response body consumption violates prefix or tail ownership",
                   source=probe)
             probe.unlink()
+        for before, after in [
+            ("tail->len += n;", "tail->len = n;"),
+            ("size += n;", "size = tail->len - tail->offset;"),
+            ("if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;",
+             "tail->dirty_end = tail->len;"),
+            ("tail->len += n;", "tail->offset = 0; tail->len += n;"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h",
+                           before, after)
+            check(compiler, root, overlay, "Pinned receive commit violates buffered response suffix contract",
+                  source=source)
+            probe.unlink()
         check_timer_transport(compiler, root, overlay)
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)
