@@ -96,6 +96,83 @@ def test_deployment_policy(tool, root):
     check({remaining: 1}, records=[dict(key, expiresAt=0)], rule=remaining)
     check({remaining: 1}, records=[dict(key, expiresAt=0, enabled=False)], ok=True)
     check({remaining: 9223372036854775807}, now=9223372036854775807, rule=remaining)
+    active = 'minimumActiveCredentials'
+    check({active: 1}, now=100, ok=True)
+    check({active: 1}, now=99, rule=active)
+    check({active: 1}, now=200, rule=active)
+    check({active: 1}, records=[dict(key, consumerId='disabled', groups=[])], rule=active)
+    check({active: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({active: 0}, records=[], ok=True)
+    for invalid in (65, True, '1'):
+        check({active: invalid}, rule=active)
+    each_active = 'requireActiveCredentialForEnabledConsumers'
+    check({each_active: True}, ok=True)
+    enabled_owner = dict(disabled, enabled=True)
+    check({each_active: True}, consumers=[alice, enabled_owner], rule=each_active)
+    check({each_active: True}, consumers=[alice, enabled_owner],
+          records=[key, dict(parked, consumerId='disabled', enabled=True, groups=[])], ok=True)
+    check({each_active: True}, now=200, rule=each_active)
+    group_required = 'requireGroupsForEnabledConsumers'
+    check({group_required: True}, ok=True)
+    check({group_required: True}, consumers=[dict(alice, groups=[]), disabled],
+          records=[dict(key, groups=[])], rule=group_required)
+    check({group_required: False}, consumers=[dict(alice, groups=[]), disabled],
+          records=[dict(key, groups=[])], ok=True)
+    explicit = 'requireExplicitCredentialGroups'
+    check({explicit: True}, ok=True)
+    inheriting = {k: v for k, v in key.items() if k != 'groups'}
+    check({explicit: True}, records=[inheriting], rule=explicit)
+    check({explicit: True}, records=[dict(inheriting, enabled=False)], ok=True)
+    check({explicit: True}, records=[dict(key, groups=[])], ok=True)
+    capacity = 'maxCredentialsPerConsumer'
+    check({capacity: 2}, ok=True)
+    check({capacity: 1}, rule=capacity)
+    check({capacity: 1}, records=[key, dict(parked, consumerId='disabled', groups=[])], ok=True)
+    check({capacity: 0}, records=[], ok=True)
+    check({capacity: 0}, records=[dict(parked, consumerId='disabled', groups=[])], rule=capacity)
+    check({capacity: 65}, rule=capacity)
+    per_owner = 'minimumActiveCredentialsPerEnabledConsumer'
+    check({per_owner: 0}, records=[], ok=True)
+    check({per_owner: 1}, now=100, ok=True)
+    check({per_owner: 1}, now=99, rule=per_owner)
+    check({per_owner: 1}, now=200, rule=per_owner)
+    check({per_owner: 2}, rule=per_owner)
+    check({per_owner: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({per_owner: 1}, consumers=[alice, enabled_owner], rule=per_owner)
+    check({per_owner: 1}, consumers=[disabled], records=[], ok=True)
+    check({'minimumActiveCredentials': 2, per_owner: 1},
+          consumers=[alice, enabled_owner], records=[key, dict(parked, enabled=True)],
+          rule=per_owner)
+    for invalid in (-1, -0.0, 1.5, True, '1', 65, 9223372036854775808):
+        check({per_owner: invalid}, rule=per_owner)
+    methods = 'minActiveMethodsPerEnabledConsumer'
+    check({methods: 1}, now=100, ok=True)
+    check({methods: 1}, now=99, rule=methods)
+    check({methods: 1}, now=200, rule=methods)
+    check({methods: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({methods: 2}, records=[key, dict(key, id='second', secretSha256='a' * 64)], rule=methods)
+    check({methods: 2}, records=[key, parked], rule=methods)
+    check({methods: 1}, consumers=[alice, enabled_owner], rule=methods)
+    check({methods: 4}, consumers=[disabled], records=[], ok=True)
+    for invalid in (0, -1, 1.5, True, '1', 5, 9223372036854775808):
+        check({methods: invalid}, rule=methods)
+    reachable = 'requiredReachableGroupPerEnabledConsumer'
+    check({reachable: 'operators'}, now=100, ok=True)
+    check({reachable: 'operators'}, now=99, rule=reachable)
+    check({reachable: 'operators'}, now=200, rule=reachable)
+    check({reachable: 'operators'}, records=[dict(key, groups=[])], rule=reachable)
+    check({reachable: 'operators'}, records=[inheriting], ok=True)
+    check({reachable: 'operators'}, records=[dict(key, enabled=False)], rule=reachable)
+    check({reachable: 'operators'}, consumers=[alice, enabled_owner], rule=reachable)
+    check({reachable: 'operators'}, consumers=[disabled], records=[], ok=True)
+    check({reachable: 'x' * 128}, consumers=[dict(alice, groups=['x' * 128])],
+          records=[dict(inheriting)], ok=True)
+    for invalid in ('', 'x' * 129, 'bad group', True, ['operators']):
+        check({reachable: invalid}, rule=reachable)
+    check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
+           'minimumActiveCredentials': 1, capacity: 2}, ok=True)
+    check({'requireHashedKeys': True, 'allowedMethods': ['bearer', 'header'],
+           'minimumActiveCredentials': 1, capacity: 1}, rule=capacity)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
