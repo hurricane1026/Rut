@@ -66,6 +66,48 @@ static_assert(
         return true;
     }(),
     "Response body consumption violates prefix or tail ownership");
+
+// A send covers only the bytes visible when it was armed. Receiving into its
+// pinned tail before or after that send completes must leave the same suffix.
+consteval bool pinned_commit_contract(bool receive_first, u32 sent, u32 received, u32 dirty) {
+    ResponseBodyChain::Node prefix{};
+    ResponseBodyChain::Node tail{};
+    prefix.next = &tail;
+    prefix.len = prefix.dirty_end = 3;
+    prefix.offset = 1;
+    tail.len = 2;
+    tail.dirty_end = dirty;
+    ResponseBodyChain chain{};
+    chain.head = &prefix;
+    chain.tail = &tail;
+    chain.size = 4;
+
+    if (receive_first) chain.commit(received);
+    u32 pending = sent;
+    if (sent >= 2 && consume_head(chain, pending, true) != &prefix) return false;
+    if (consume_head(chain, pending, true) || pending != 0) return false;
+    if (!receive_first) chain.commit(received);
+
+    const u32 kExpectedLen = 2 + received;
+    return chain.head == (sent < 2 ? &prefix : &tail) && chain.tail == &tail &&
+           (sent >= 2 || prefix.next == &tail) && prefix.len == 3 &&
+           prefix.offset == 1 + (sent < 2 ? sent : 2) && tail.next == nullptr &&
+           tail.len == kExpectedLen && tail.offset == (sent > 2 ? sent - 2 : 0) &&
+           chain.size == 4 - sent + received &&
+           tail.dirty_end == (dirty > kExpectedLen ? dirty : kExpectedLen);
+}
+
+static_assert(
+    [] {
+        for (u32 sent = 0; sent <= 4; ++sent)
+            for (u32 received = 0; received <= 2; ++received)
+                for (u32 dirty = 2; dirty <= 5; ++dirty)
+                    if (!pinned_commit_contract(false, sent, received, dirty) ||
+                        !pinned_commit_contract(true, sent, received, dirty))
+                        return false;
+        return true;
+    }(),
+    "Pinned receive commit violates buffered response suffix contract");
 }  // namespace
 
 void ResponseBodyChain::consume(u32 len, bool tail_pinned, bool recycle_bulk) {

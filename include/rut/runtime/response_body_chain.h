@@ -196,7 +196,7 @@ struct ResponseBodyChain {
 
     // Record bytes a direct recv wrote straight into write_ptr()'s
     // destination (n <= the write_avail() observed when it was armed).
-    void commit(u32 n) {
+    constexpr void commit(u32 n) {
         tail->len += n;
         if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;
         size += n;
