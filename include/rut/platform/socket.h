@@ -1,5 +1,6 @@
 #pragma once
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -50,20 +51,44 @@ inline int prepare_or_close(int fd) {
     return -1;
 }
 
-inline int stream_socket() {
+inline int stream_socket(int family = AF_INET) {
 #ifdef __APPLE__
-    return prepare_or_close(socket(AF_INET, SOCK_STREAM, 0));
+    return prepare_or_close(socket(family, SOCK_STREAM, 0));
 #else
-    return socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    return socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 #endif
 }
 
-inline int datagram_socket() {
+inline int datagram_socket(int family = AF_INET) {
 #ifdef __APPLE__
-    return prepare_or_close(socket(AF_INET, SOCK_DGRAM, 0));
+    return prepare_or_close(socket(family, SOCK_DGRAM, 0));
 #else
-    return socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    return socket(family, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 #endif
+}
+
+// Parse a trusted bare address literal without resolving names.
+inline socklen_t ip_socket_address(const char* literal, in_port_t port, sockaddr_storage& result) {
+    sockaddr_in ipv4{};
+    if (inet_pton(AF_INET, literal, &ipv4.sin_addr) == 1) {
+        ipv4.sin_family = AF_INET;
+        ipv4.sin_port = htons(port);
+#ifdef __APPLE__
+        ipv4.sin_len = sizeof(ipv4);
+#endif
+        __builtin_memcpy(&result, &ipv4, sizeof(ipv4));
+        return sizeof(ipv4);
+    }
+    sockaddr_in6 ipv6{};
+    if (inet_pton(AF_INET6, literal, &ipv6.sin6_addr) != 1 || IN6_IS_ADDR_V4MAPPED(&ipv6.sin6_addr))
+        return 0;
+    ipv6.sin6_family = AF_INET6;
+    ipv6.sin6_port = htons(port);
+#ifdef __APPLE__
+    ipv6.sin6_len = sizeof(ipv6);
+#endif
+    __builtin_memcpy(&result, &ipv6, sizeof(ipv6));
+    return sizeof(ipv6);
 }
 
 inline int accept_nonblocking(int listener) {

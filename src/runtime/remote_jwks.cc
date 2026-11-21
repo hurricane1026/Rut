@@ -80,15 +80,20 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
                 if (next.allowed_count == 8) return false;
                 auto& address = next.allowed_addresses[next.allowed_count++];
                 json::Writer value{address, sizeof(address) - 1};
-                in_addr parsed{};
                 if (!document.string(n, value) || !value.ok || !value.len) return false;
                 address[value.len] = 0;
-                if (strlen(address) != value.len || inet_pton(AF_INET, address, &parsed) != 1)
-                    return false;
-                for (u32 i = 0; i + 1 < next.allowed_count; ++i)
-                    if (strcmp(address, next.allowed_addresses[i]) == 0) return false;
+                if (strlen(address) != value.len) return false;
             }
             fields |= 256;
+            continue;
+        }
+        if (kKey.eq(lit_str("dnsRecordType"))) {
+            json::Writer value{document.other};
+            if (!document.string(entry, value)) return false;
+            const Str type{document.other, value.len};
+            if (!type.eq(lit_str("A")) && !type.eq(lit_str("AAAA"))) return false;
+            next.dns_aaaa = type.eq(lit_str("AAAA"));
+            fields |= 8192;
             continue;
         }
         if (kKey.eq(lit_str("requireNonEmptyKeys"))) {
@@ -199,14 +204,30 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         next.discovery_timeout_seconds > next.timeout_seconds)
         return false;
     next.endpoint.tls.enabled = true;
+    next.endpoint.allow_ipv6 = true;
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
         return false;
-    if ((fields & (256 | 512 | 4096)) || next.dns_cache_seconds || next.dns_timeout_seconds) {
-        in_addr resolver{};
+    if ((fields & (256 | 512 | 4096 | 8192)) || next.dns_cache_seconds ||
+        next.dns_timeout_seconds) {
+        sockaddr_storage resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
-            inet_pton(AF_INET, next.dns_address, &resolver) != 1)
+            !platform::ip_socket_address(next.dns_address, next.dns_port, resolver))
             return false;
+        for (u32 i = 0; i < next.allowed_count; ++i) {
+            auto& address = next.allowed_addresses[i];
+            if (next.dns_aaaa) {
+                in6_addr ipv6{};
+                if (inet_pton(AF_INET6, address, &ipv6) != 1 || IN6_IS_ADDR_V4MAPPED(&ipv6) ||
+                    !inet_ntop(AF_INET6, &ipv6, address, sizeof(address)))
+                    return false;
+            } else {
+                in_addr ipv4{};
+                if (inet_pton(AF_INET, address, &ipv4) != 1) return false;
+            }
+            for (u32 j = 0; j < i; ++j)
+                if (strcmp(address, next.allowed_addresses[j]) == 0) return false;
+        }
     }
     if (next.discovery_cache_seconds > next.max_age_seconds) return false;
     if ((fields & (1024 | 2048)) || next.discovery_timeout_seconds || next.conditional_discovery ||
@@ -251,8 +272,9 @@ bool JwksValidator::bind(Str entity_tag, Str selected_address) {
         selected_address.len >= sizeof(address))
         return false;
     __builtin_memcpy(address, selected_address.ptr, selected_address.len);
-    in_addr parsed{};
-    if (strlen(address) != selected_address.len || inet_pton(AF_INET, address, &parsed) != 1) {
+    sockaddr_storage parsed{};
+    if (strlen(address) != selected_address.len ||
+        !platform::ip_socket_address(address, 0, parsed)) {
         clear();
         return false;
     }
@@ -410,17 +432,18 @@ bool jwks_dns_answer(Str packet,
     if (!answers || answers > kMaxAnswers ||
         configuration.allowed_count > RemoteJwks::kMaxDnsAddresses)
         return false;
+    const u16 kRecordType = configuration.dns_aaaa ? 28 : 1;
     bool boundaries[512]{};
     char current[254]{};
     u32 question_end = 12;
     if (!jwks_dns_name(bytes, packet.len, question_end, boundaries, current) ||
-        question_end + 4 != query.len || read16(bytes + question_end) != 1 ||
+        question_end + 4 != query.len || read16(bytes + question_end) != kRecordType ||
         read16(bytes + question_end + 2) != 1)
         return false;
     struct Record {
         char owner[254]{};
         char target[254]{};
-        char address[16]{};
+        char address[HttpsEndpoint::kAddressCapacity]{};
         u16 type = 0;
         bool used = false;
     };
@@ -445,9 +468,11 @@ bool jwks_dns_answer(Str packet,
             if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.target) ||
                 offset != end)
                 return false;
-        } else if (record.type == 1) {
-            if (size != 4 ||
-                !inet_ntop(AF_INET, bytes + offset, record.address, sizeof(record.address)))
+        } else if (record.type == kRecordType) {
+            const u32 expected_size = configuration.dns_aaaa ? 16 : 4;
+            const int family = configuration.dns_aaaa ? AF_INET6 : AF_INET;
+            if (size != expected_size ||
+                !inet_ntop(family, bytes + offset, record.address, sizeof(record.address)))
                 return false;
             bool allowed = false;
             for (u32 n = 0; n < configuration.allowed_count; ++n)
@@ -626,15 +651,16 @@ bool JwksFetch::start(u64 now,
     }
     query_[query_length_++] = 0;
     query_[query_length_++] = 0;
-    query_[query_length_++] = 1;
+    query_[query_length_++] = configuration_.dns_aaaa ? 28 : 1;
     query_[query_length_++] = 0;
     query_[query_length_++] = 1;
-    dns_fd_ = platform::prepare_or_close(::socket(AF_INET, SOCK_DGRAM, 0));
-    sockaddr_in resolver{};
-    resolver.sin_family = AF_INET;
-    resolver.sin_port = htons(configuration_.dns_port);
-    if (dns_fd_ < 0 || inet_pton(AF_INET, configuration_.dns_address, &resolver.sin_addr) != 1 ||
-        ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), sizeof(resolver)) != 0 ||
+    sockaddr_storage resolver{};
+    const socklen_t length =
+        platform::ip_socket_address(configuration_.dns_address, configuration_.dns_port, resolver);
+    if (!length) return fail();
+    dns_fd_ = platform::datagram_socket(resolver.ss_family);
+    if (dns_fd_ < 0 ||
+        ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length) != 0 ||
         ::send(dns_fd_, query_, query_length_, platform::kSendFlags) != query_length_)
         return fail();
     return true;

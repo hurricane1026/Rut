@@ -1113,6 +1113,13 @@ if(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set_tests_properties(test_remote_es256_jwks_${jwks_backend} PROPERTIES
             LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
         foreach(discovery_algorithm RS256 ES256)
+            add_test(NAME test_jwks_ipv6_${discovery_algorithm}_${jwks_backend}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
+                    --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
+                    --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${jwks_backend}
+                    --algorithm ${discovery_algorithm} --ipv6)
+            set_tests_properties(test_jwks_ipv6_${discovery_algorithm}_${jwks_backend} PROPERTIES
+                LABELS "integration;auth" SKIP_RETURN_CODE 77 TIMEOUT 45)
             add_test(NAME test_jwks_require_non_empty_${discovery_algorithm}_${jwks_backend}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_remote_jwks.py
                     --server $<TARGET_FILE:rut> --helper $<TARGET_FILE:test_https_fetch>
