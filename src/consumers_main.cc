@@ -746,14 +746,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("allowedMethods"), false, policy_allowed_methods},
 };
 
-int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
-    i64 now = 0;
-    if (!parse_positive_unix_seconds(seconds, now))
-        return failure("invalid policy evaluation time\n");
-    Buffer input;
-    SensitiveDocument registry;
-    if (!read_private(input_path, input) || !consumer_registry_valid(registry, input.view()))
-        return failure("invalid private Consumer registry snapshot\n");
+int evaluate_deployment_policy(json::Document& registry, const char* policy_path, i64 now) {
     Buffer policy_bytes;
     SensitiveDocument policy;
     if (!read_private(policy_path, policy_bytes) || !policy.parse(policy_bytes.view()) ||
@@ -790,6 +783,17 @@ int check_policy_command(const char* input_path, const char* policy_path, const 
         return 2;
     }
     return 0;
+}
+
+int check_policy_command(const char* input_path, const char* policy_path, const char* seconds) {
+    i64 now = 0;
+    if (!parse_positive_unix_seconds(seconds, now))
+        return failure("invalid policy evaluation time\n");
+    Buffer input;
+    SensitiveDocument registry;
+    if (!read_private(input_path, input) || !consumer_registry_valid(registry, input.view()))
+        return failure("invalid private Consumer registry snapshot\n");
+    return evaluate_deployment_policy(registry, policy_path, now);
 }
 
 bool provision_profile(json::Document& base, json::Document& profile) {
@@ -1047,6 +1051,7 @@ constexpr char kUsage[] =
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
+    "       rut-consumers apply-checked INPUT CHANGES POLICY NOW_UNIX_SECONDS OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
     "       rut-consumers generate-key-verifier INPUT CONSUMER_ID CREDENTIAL_ID METHOD "
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
@@ -1103,7 +1108,8 @@ int main(int argc, char** argv) {
     const bool kInspect = argc == 3 && strcmp(argv[1], "inspect") == 0;
     const bool kDiff = argc == 4 && strcmp(argv[1], "diff") == 0;
     const bool kPlan = argc == 4 && strcmp(argv[1], "plan") == 0;
-    const bool kApply = argc == 5 && strcmp(argv[1], "apply") == 0;
+    const bool kApplyChecked = argc == 7 && strcmp(argv[1], "apply-checked") == 0;
+    const bool kApply = kApplyChecked || (argc == 5 && strcmp(argv[1], "apply") == 0);
     const bool kGenerateKey = argc == 7 && strcmp(argv[1], "generate-key") == 0;
     const bool kGenerateKeyVerifier = argc == 8 && strcmp(argv[1], "generate-key-verifier") == 0;
     const bool kRotateKeyVerifier = argc == 7 && strcmp(argv[1], "rotate-key-verifier") == 0;
@@ -1315,6 +1321,13 @@ int main(int argc, char** argv) {
         if (!inspect(checked, preview)) return failure("cannot produce redacted registry\n");
         return write_all(STDOUT_FILENO, {preview.data, preview.len}) ? 0 : 2;
     }
-    const char* error = publish(argv[4], {output.data, output.len});
+    if (kApplyChecked) {
+        i64 now = 0;
+        if (!parse_positive_unix_seconds(argv[5], now))
+            return failure("invalid policy evaluation time\n");
+        const int status = evaluate_deployment_policy(checked, argv[4], now);
+        if (status != 0) return status;
+    }
+    const char* error = publish(argv[kApplyChecked ? 6 : 4], {output.data, output.len});
     return error ? failure(error) : 0;
 }

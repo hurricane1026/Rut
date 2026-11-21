@@ -11175,6 +11175,9 @@ Offline `rut-consumers check-policy` evaluates a bounded private policy object
 against a validated private registry snapshot. An explicit Unix-second argument
 makes preflight decisions reproducible. Checks consume metadata and emit only
 fixed rule names on failure.
+`apply-checked` uses the same evaluator on the in-memory post-transaction
+snapshot before publishing the exact validated bytes. A rejected rule leaves
+input and destination state intact.
 
 Offline `rut-consumers diff BEFORE AFTER` validates both private snapshots and
 buffers a bounded redacted change report before stdout. Stable decoded IDs match

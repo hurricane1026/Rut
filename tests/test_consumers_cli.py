@@ -83,6 +83,54 @@ def changes(consumers=(), credentials=(), remove_consumers=(), remove_credential
                 removeConsumers=list(remove_consumers), removeCredentials=list(remove_credentials))
 
 
+def test_apply_checked(tool, root):
+    consumer = dict(id='checked-owner', enabled=True, groups=['staff'])
+    raw = dict(id='checked-raw', consumerId=consumer['id'], method='bearer',
+               enabled=True, secret='checked-private-secret')
+    digest = hashlib.sha256(b'checked-fixture').hexdigest()
+    hashed = dict(id='checked-verifier', consumerId=consumer['id'], method='header',
+                  enabled=True, secretSha256=digest, groups=['staff'])
+    source = private(root / 'checked-input.json',
+                     dict(version=1, consumers=[consumer], credentials=[raw]))
+    policy = private(root / 'checked-policy.json',
+                     dict(requireHashedKeys=True, allowedMethods=['header']))
+    patch = private(root / 'checked-changes.json', changes())
+    output = root / 'checked-output.json'
+    source_bytes = source.read_bytes()
+
+    def apply_checked(now=120, expected=2):
+        inputs = [path.read_bytes() for path in (source, patch, policy)]
+        files = set(root.iterdir())
+        result = run(tool, 'apply-checked', source, patch, policy, now, output)
+        assert result.returncode == expected, result
+        assert not result.stdout
+        assert all(secret not in result.stderr for secret in (raw['secret'].encode(), digest.encode()))
+        assert [path.read_bytes() for path in (source, patch, policy)] == inputs
+        if expected != 0:
+            assert set(root.iterdir()) == files
+        return result
+
+    assert b'requireHashedKeys' in apply_checked().stderr
+    assert not output.exists()
+    updated = changes(credentials=[hashed], remove_credentials=[raw['id']])
+    private(patch, updated)
+    assert b'evaluation time' in apply_checked(now=0).stderr
+    policy.chmod(0o644)
+    assert b'invalid private' in apply_checked().stderr
+    policy.chmod(0o600)
+    assert not output.exists()
+
+    assert not apply_checked(expected=0).stderr
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert json.loads(output.read_bytes()) == dict(version=1, consumers=[consumer],
+                                                  credentials=[hashed])
+    assert run(tool, 'check-policy', output, policy, 120).returncode == 0
+    published = output.read_bytes()
+    apply_checked()
+    assert output.read_bytes() == published
+    assert source.read_bytes() == source_bytes
+
+
 def test_targeted_registry_commands(tool, root):
     alice = dict(id='ali"ce', enabled=True, groups=['staff', 'readers'])
     bob = dict(id='bob', enabled=True, groups=['readers'])
@@ -1263,6 +1311,7 @@ def main(tool):
     with tempfile.TemporaryDirectory(prefix='rut-consumers-cli-') as directory:
         root = Path(directory)
         test_deployment_policy(tool, root)
+        test_apply_checked(tool, root)
         test_prune_credentials(tool, root)
         test_targeted_registry_commands(tool, root)
         test_generated_keys(tool, root)

@@ -1670,7 +1670,8 @@ JIT tests also cover the 1024/1025-byte bound. See
   fields for explicitly rebuilt requests and opt-in query target replacement.
   Offline `rut-consumers` administration
   supports full-record updates/removals, credential rotation, group replacement,
-  redacted inspection/preflight, structured snapshot diff and validated atomic
+  redacted inspection, deployment-policy validation of a replacement before
+  publication, structured snapshot diff and validated atomic
   private files. The paired `rotate-key-verifier` command retains the old disabled
   record and creates a fresh hash-only replacement with the exact owner, method,
   optional groups and time bounds. It requires an unused ID and free slot,

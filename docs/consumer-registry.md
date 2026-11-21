@@ -596,6 +596,14 @@ names, malformed policy values and rule violations all produce exit status 2.
 The command emits no stdout or input values, creates no files and does not
 activate a snapshot. Use the same snapshot for deployment that passed the check.
 
+`rut-consumers apply-checked INPUT CHANGES POLICY NOW_UNIX_SECONDS OUTPUT`
+applies the same transaction as `apply`, evaluates the deployment policy
+against the validated replacement in memory and then publishes those exact
+bytes as a private no-replace file. A malformed policy, rejected rule or
+invalid timestamp prevents publication. The current snapshot may violate the
+policy, so a transaction can bring it into compliance. The running gateway
+continues to adopt snapshots through its existing deployment path.
+
 | Policy field | Effect |
 | --- | --- |
 | `requireHashedKeys` | Require a SHA-256 verifier for every bearer or header key, including disabled records. |
