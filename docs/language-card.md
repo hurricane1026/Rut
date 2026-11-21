@@ -319,12 +319,19 @@ req.getAll("Accept")         // Collected<str>?
 req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
 req.queryAll("tags")         // ⏳ [str]
-req.cookie("session")        // str?
+req.cookie("session")        // str? (first match)
+req.uniqueCookie("session")  // str? (exactly one matching pair)
 req.body(User)               // typed parse, error-capable → guard let
 req.body                     // raw body as str
 req.bodyBytes                // raw body as Bytes; same request-body buffering rules
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
+
+// uniqueCookie requires a nonempty literal HTTP token name. Names are
+// case-sensitive. Absent or duplicate pairs yield nil, even across Cookie
+// fields; one empty value remains present. It reads the original parsed
+// request with cookie() pair rules. HTTP/2 Cookie fields are joined in the
+// synthesized request view.
 
 // Response construction — names are literal; values may be runtime strings
 let resp = response(429)          // ✅ literal status
