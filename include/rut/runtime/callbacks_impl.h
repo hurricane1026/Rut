@@ -6011,13 +6011,15 @@ inline bool fixed_upload_head_timeout_response_is_stable(const Connection& conn,
            conn.keep_alive && conn.req_client_keep_alive;
 }
 
-// On a failed upstream connect, try the next backend (round-robin) if the retry
-// budget isn't exhausted. Closes the dead fd, opens a fresh socket, and submits
-// a new connect routed back to on_upstream_connected. Returns true if a retry
-// was submitted; false (budget/socket/submit exhausted) → caller answers 502.
+// Retry a failed connect using the request-owned configuration and selection
+// policy. The caller must prove no application request bytes have been sent.
+// Keep the upstream admission slot; only the failed backend/socket is released.
 template <typename Loop>
-bool try_connect_next_backend(Loop* loop, Connection& conn) {
-    const RouteConfig* config = conn.request_config;
+bool try_connect_next_backend_impl(Loop* loop,
+                                   Connection& conn,
+                                   const RouteConfig* config,
+                                   ForwardLoadBalance load_balance,
+                                   Connection::Callback on_connected) {
     if (!config || conn.upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[conn.upstream_idx];
     if (target.minimum_healthy_weight_percent != 0 && !current_health_generation(loop, config))
@@ -6028,17 +6030,17 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     if (conn.upstream_backend_idx < target.addr_count)
         conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
 
-    (void)detach_upstream_close(loop, conn);
+    if (!detach_upstream_close(loop, conn)) return false;
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
     conn.upstream_attempts++;
     conn.release_backend_active();
     conn.upstream_start_us = monotonic_us();
-    conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    conn.set_slots(nullptr, nullptr, nullptr, on_connected);
     const u32 kBackend = select_forward_backend(config,
                                                 conn.shard_id,
-                                                conn.forward_load_balance,
+                                                load_balance,
                                                 conn.upstream_idx,
                                                 target.addr_count,
                                                 conn.upstream_start_us,
@@ -6049,11 +6051,17 @@ bool try_connect_next_backend(Loop* loop, Connection& conn) {
     }
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
-    hold_backend_active(conn);
+    hold_backend_active(conn, config);
     if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
         return true;
     (void)detach_upstream_close(loop, conn);
     return false;
+}
+
+template <typename Loop>
+bool try_connect_next_backend(Loop* loop, Connection& conn) {
+    return try_connect_next_backend_impl(
+        loop, conn, conn.request_config, conn.forward_load_balance, &on_upstream_connected<Loop>);
 }
 
 // Admit only the first bounded timeout-policy runtime slice: a complete,
@@ -10007,6 +10015,20 @@ void h2_on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     Http2Conn* h2 = conn.h2;
     if (ev.result < 0) {
         record_passive_connect_result(loop, h2 ? h2->async_cfg : nullptr, conn, ev.result);
+        // Retry only this stream's connect completion, before any request send.
+        // A reload may retire async_cfg while its epoch remains pinned: finish
+        // that stream with an error instead of opening I/O for a retired config.
+        const bool kCurrentConfig =
+            h2 && h2->async_cfg && (!loop->config_ptr || *loop->config_ptr == h2->async_cfg);
+        if (kCurrentConfig && ev.type == IoEventType::UpstreamConnect && ev.result != -ECANCELED &&
+            ev.aux != kLocalSubmitFailureAux && h2->async_stream != 0 &&
+            h2->async_kind == H2AsyncKind::Proxy &&
+            conn.on_upstream_send == &h2_on_upstream_connected<Loop> && h2->async_synth_sent == 0 &&
+            !h2->async_proxy_response_seen && !conn.upstream_send_armed &&
+            !conn.upstream_recv_armed &&
+            try_connect_next_backend_impl(
+                loop, conn, h2->async_cfg, h2->async_load_balance, &h2_on_upstream_connected<Loop>))
+            return;
         h2_proxy_fail(loop, conn, 502, /*connect_failure=*/true);
         return;
     }
@@ -10042,6 +10064,7 @@ template <typename Loop>
 void h2_proxy_begin(Loop* loop, Connection& conn) {
     Http2Conn* h2 = conn.h2;
     h2->async_proxy_response_seen = false;
+    h2->async_synth_sent = 0;
     const RouteConfig* cfg = h2->async_cfg;
     const u16 upstream_id = h2->async_upstream_id;
     if (cfg == nullptr || upstream_id >= cfg->upstream_count ||

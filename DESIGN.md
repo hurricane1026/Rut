@@ -1547,6 +1547,15 @@ route POST "/jobs" {
 }
 ```
 
+HTTP/1 forwarding and HTTP/2 streams forwarding to HTTP/1 origins share a
+connect-establishment failover budget of at most three distinct endpoints.
+HTTP/2 retains the stream-owned policy, hash digest, synthesized request,
+configuration epoch and upstream admission slot while replacing the failed
+endpoint/socket. Failover stops before request transmission and does not replay
+HTTP status errors, response resets or timeouts. See
+[upstream connect failover](docs/upstream-connect-failover.md) for ownership,
+selection and verification boundaries.
+
 `load_balance` is an ordinary named argument, not a new keyword. Its value has
 a closed policy type; its vocabulary is `.roundRobin`, `.leastRequests` and
 `.consistentHash`. The compiler requires this argument at every `forward` call; legacy
