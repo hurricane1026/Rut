@@ -22,6 +22,16 @@ changes describe another signed request. This prevents exact signed-request repl
 not repeated business operations deliberately signed with a fresh timestamp.
 Other methods need independent namespaces and method binding.
 
+The separate [method-bound example](../examples/signed-method-replay-auth.rut)
+uses a new `:signed-method-v1` namespace and places the verified actual POST or
+PUT method before the target, Date and Digest in the claim identity. The method
+route is checked explicitly before verification and each method has a distinct
+claim for an otherwise identical signed tuple. Keep its namespace stable across
+key rotation. It does not alter the legacy fixed-POST key. Switching an existing
+endpoint to this new key format requires draining the full 601-second replay
+window before accepting traffic under the new profile; otherwise outstanding
+claims in the old namespace do not protect the new one.
+
 ## Claim and failure contract
 
 `SET key claimed NX EX 601` is one atomic operation on a single authoritative
