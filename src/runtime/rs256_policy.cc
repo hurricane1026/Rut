@@ -355,7 +355,8 @@ void Rs256Policies::maintain(u32 shard, u64 monotonic_ms) {
         } else if (remote->fetch.state() == HttpsFetch::State::Done) {
             Rs256KeySet keys;
             const auto kPrepared = policies_[i].prepare_refresh(remote->fetch.body(), keys);
-            if (kPrepared != Rs256Policy::Refresh::Invalid) {
+            if (kPrepared != Rs256Policy::Refresh::Invalid &&
+                !(policy.require_non_empty_keys && kPrepared == Rs256Policy::Refresh::Empty)) {
                 auto& candidate = remote->use_alternate ? row.verifiers[i] : remote->alternate;
                 candidate.reset();
                 if (kPrepared == Rs256Policy::Refresh::Empty || candidate.init(keys)) {

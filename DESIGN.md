@@ -11293,7 +11293,9 @@ must match an explicit finite allowlist. TLS name/CA, issuer, endpoint URI and
 kid/algorithm inventory remain configuration-owned. The validated terminal
 addresses are tried in answer order after definitive TCP establishment failures.
 Each address runs its own discovery and key exchange within the shared deadline.
-The DNS destination allowlist rejects duplicate IPv4 entries at configuration load.
+The DNS destination allowlist rejects duplicate IPv4 entries at configuration load. Optional
+`requireNonEmptyKeys` treats a zero-approved-key refresh as failure, retaining
+last-good keys only within their original maximum age; the default removes keys.
 
 Optional `dnsCacheSeconds` caps reuse of the fully validated address set by its
 shortest record TTL and the configured limit. The set is owned by the shard

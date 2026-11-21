@@ -894,7 +894,9 @@ Compiled RS256 and ES256 policies accept a trusted `remoteJwks` endpoint with
 fixed IPv4, TLS hostname, CA, path, refresh interval, maximum cache age and total
 fetch timeout. The initial JWKS defines approved IDs but does not authenticate
 remote-mode requests before the first successful fetch. Only configured approved
-kids can be imported. A valid empty intersection immediately removes cached keys.
+kids can be imported. A valid empty intersection immediately removes cached keys by default. Optional
+`requireNonEmptyKeys` instead fails that refresh and retains the last snapshot
+only until its original maximum age, delaying empty-set revocation.
 There is no token-triggered fetch or redirect following. Optional bounded A/CNAME
 DNS and exact issuer/JWKS URI discovery validation now share the same cold refresh
 lifecycle; duplicate DNS allowlist entries fail configuration load; see [the trust contract](jwks-discovery.md).
