@@ -98,3 +98,10 @@ configuration returns 503. Missing, non-string or mismatching subjects, owners
 or token types return a Bearer-challenged 401. Call it after the configured
 signature, issuer, audience and time verifier. Names and request metadata do not
 substitute for the signed subject. The native fixture exercises this policy using trusted `CASDOOR_SUBJECT` configuration.
+
+`requireGroupUnionWithout(document, org, first, second, forbidden)` accepts
+either exact owner-qualified allowed group and vetoes the forbidden group. All
+three group selectors must be valid and distinct. The selected signed group
+array must be fully valid; malformed arrays deny. Invalid configuration returns
+503, failed access-token or owner checks return challenged 401, and a failed
+group policy returns 403. The verified document is returned unchanged.
