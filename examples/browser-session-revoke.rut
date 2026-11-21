@@ -41,4 +41,32 @@ route POST "/logout" use chain browserLogout {
     return cleared
 }
 
+func permitStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => if data == b"active" { 1 } else { 0 }
+        .missing => 0
+        _ => -1
+    }
+}
+
+// Publish the verified subject only after the authority confirms the exact
+// token and the authenticated Redis connection completes cleanup.
+func browserSessionKey(_ token: str) -> Bytes {
+    guard req.isTls else { nil }
+    jwt_session.key(token, env("JWT_SESSION_NAMESPACE"))
+}
+
+route GET "/private" {
+    let token = req.uniqueCookie("__Host-rut_session").or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = browserSessionKey(token) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")),
+        parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let allowed = jwt_session.requireActiveStatus(permitStatus(result))
+    guard let subject = json.string(json.get(document, "/sub").or(document)) else { return 503 }
+    return response(200, body: subject, headers: {"Cache-Control": "no-store"})
+}
+
 route "/" { return 404 }
