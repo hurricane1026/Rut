@@ -18,17 +18,16 @@ CLEAR_COOKIE = "__Host-rut_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSi
 ORIGIN = "https://localhost"
 
 
-def post(port, context, headers):
+def exchange(port, context, method, path, headers):
     connection = http.client.HTTPSConnection("localhost", port, timeout=5, context=context)
     try:
-        connection.putrequest("POST", "/logout")
+        connection.putrequest(method, path)
         for name, value in headers:
             connection.putheader(name, value)
         connection.putheader("Content-Length", "0")
         connection.endheaders()
         response = connection.getresponse()
-        response.read()
-        return response.status, response.headers
+        return response.status, response.headers, response.read()
     finally:
         connection.close()
 
@@ -69,16 +68,31 @@ def exercise(args, peer):
                 ([origin, fetch, ("Cookie", "__Host-rut_session=malformed")], 401),
                 ([origin, fetch, cookie, cookie], 401),
             ]:
-                actual, response = post(port, context, headers)
+                actual, response, _ = exchange(port, context, "POST", "/logout", headers)
                 assert actual == status, (actual, status)
                 assert response.get_all("Set-Cookie") is None
             with peer.lock:
                 assert peer.accepted == accepted and peer.store[key] == b"active"
 
+            status, response, body = exchange(port, context, "GET", "/private", [cookie])
+            assert (status, body) == (200, b"alice")
+            assert response.get("Cache-Control") == "no-store"
+            same_claims = signed(dict(sub="alice", iss="issuer", aud="gateway", iat=now,
+                                      exp=expiry, jti="browser", nonce="other"))
+            for headers in [[("Authorization", "Bearer " + token)],
+                            [("Cookie", "__Host-rut_session=" + same_claims)],
+                            [cookie, cookie]]:
+                status, _, body = exchange(port, context, "GET", "/private", headers)
+                assert status == 401 and b"alice" not in body
+            with peer.lock:
+                peer.mode = "reset-error"
+            status, _, body = exchange(port, context, "GET", "/private", [cookie])
+            assert status == 503 and b"alice" not in body
+
             for mode in ("aof-timeout", "reset-error", "normal", "normal"):
                 with peer.lock:
                     peer.mode = mode
-                status, response = post(port, context, [origin, fetch, cookie])
+                status, response, _ = exchange(port, context, "POST", "/logout", [origin, fetch, cookie])
                 if mode == "normal":
                     assert status == 204
                     assert response.get_all("Set-Cookie") == [CLEAR_COOKIE]
@@ -89,6 +103,9 @@ def exercise(args, peer):
                 else:
                     assert status == 503
                     assert response.get_all("Set-Cookie") is None
+
+            status, _, body = exchange(port, context, "GET", "/private", [cookie])
+            assert status == 401 and b"alice" not in body
 
 
 def main():
