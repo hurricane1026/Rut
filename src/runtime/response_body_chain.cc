@@ -144,6 +144,25 @@ consteval bool direct_write_extent_contract() {
 
 static_assert(direct_write_extent_contract(),
               "Direct receive violates physical write extent contract");
+
+// Use a widened total as the reference for the production remaining-room check.
+consteval bool direct_receive_body_bounds_contract() {
+    constexpr u32 kCap = ResponseBodyChain::kMaxBody;
+    constexpr u32 kLengths[] = {0, 1, 2, kCap - 1, kCap, kCap + 1, UINT32_MAX};
+    constexpr i32 kResults[] = {INT32_MIN, -1, 0, 1, 2, static_cast<i32>(kCap), INT32_MAX};
+    for (const u32 kReceived : kLengths)
+        for (const u32 kDeclared : kLengths)
+            for (const i32 kResult : kResults) {
+                const i64 kTotal = static_cast<i64>(kReceived) + kResult;
+                const bool kFits = kResult > 0 && kTotal <= kDeclared && kTotal <= kCap;
+                if (ResponseBodyChain::direct_receive_fits_body(kReceived, kDeclared, kResult) !=
+                    kFits)
+                    return false;
+            }
+    return true;
+}
+
+static_assert(direct_receive_body_bounds_contract(), "Direct receive violates logical body bounds");
 }  // namespace
 
 void ResponseBodyChain::consume(u32 len, bool tail_pinned, bool recycle_bulk) {

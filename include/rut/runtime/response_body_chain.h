@@ -209,6 +209,13 @@ struct ResponseBodyChain {
         return tail ? payload_capacity(pool, tail) - tail->len : 0;
     }
 
+    // Origin byte counts include bytes already sent. The live chain size alone
+    // cannot tell whether another completion fits the declared response.
+    static constexpr bool direct_receive_fits_body(u32 received, u32 declared, i32 result) {
+        const u32 kLimit = declared < kMaxBody ? declared : kMaxBody;
+        return result > 0 && received <= kLimit && static_cast<u32>(result) <= kLimit - received;
+    }
+
     // Record bytes a direct recv wrote straight into write_ptr()'s
     // destination (n <= the write_avail() observed when it was armed).
     constexpr void commit(u32 n) {

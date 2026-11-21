@@ -102,6 +102,17 @@ def main():
             check(compiler, root, overlay, "Direct receive violates physical write extent contract",
                   source=source)
             probe.unlink()
+        for before, after in [
+            ("result > 0 && received <= kLimit", "result >= 0 && received <= kLimit"),
+            ("received <= kLimit && ", ""),
+            ("declared < kMaxBody ? declared : kMaxBody", "declared"),
+            ("declared < kMaxBody ? declared : kMaxBody", "kMaxBody"),
+            ("static_cast<u32>(result) <= kLimit - received",
+             "static_cast<u32>(result) < kLimit - received"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
+            check(compiler, root, overlay, "Direct receive violates logical body bounds", source=source)
+            probe.unlink()
         check_timer_transport(compiler, root, overlay)
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)
