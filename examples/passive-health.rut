@@ -1,0 +1,18 @@
+// Run with: rut 8080 examples/passive-health.rut --backend epoll --shards 1 --no-pin
+// Failure categories are independent. Healthy final headers reset failure counts.
+// A positive capacity floor prevents all-unhealthy fail-open forwarding.
+upstream api {
+    backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    minimum_healthy_weight_percent: 1
+    passive_health: {
+        tcp_failures: 3, timeouts: 2, http_failures: 3, successes: 1,
+        healthy_statuses: [200, 201, 204, 302],
+        unhealthy_statuses: [429, 500, 502, 503, 504]
+    }
+    // Passive ejection is latched. Two successful probes restore the target.
+    health_check: {
+        path: "/healthz", interval: 1s, status: 200,
+        failure_threshold: 3, success_threshold: 2
+    }
+}
+route GET "/" { return forward(api, load_balance: .roundRobin) }

@@ -3876,3 +3876,33 @@ route GET "/" { return forward(api, load_balance: .consistentHash,
     CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
     CHECK_EQ(result.status_code, 400u);
 }
+
+TEST(native_program, passive_health_survives_native_activation) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api {
+    backends: ["127.0.0.1:9001": 3, "127.0.0.1:9002": 1]
+    minimum_healthy_weight_percent: 25
+    passive_health: {
+        tcp_failures: 2, timeouts: 3, http_failures: 4, successes: 5,
+        healthy_statuses: [200, 204, 302], unhealthy_statuses: [429, 503, 599]
+    }
+}
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    activate_native_program(*owner.p);
+    const auto& policy = owner.p->config.upstreams[0].passive_health;
+    CHECK(policy.enabled);
+    CHECK(policy.valid());
+    CHECK_EQ(policy.tcp_failures, 2u);
+    CHECK_EQ(policy.timeouts, 3u);
+    CHECK_EQ(policy.http_failures, 4u);
+    CHECK_EQ(policy.successes, 5u);
+    CHECK(PassiveHealthPolicy::contains(policy.healthy_statuses, 302));
+    CHECK_FALSE(PassiveHealthPolicy::contains(policy.healthy_statuses, 503));
+    CHECK(PassiveHealthPolicy::contains(policy.unhealthy_statuses, 599));
+}

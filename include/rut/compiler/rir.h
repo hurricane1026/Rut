@@ -631,6 +631,7 @@ struct Module {
         u32 hc_interval_ms = 0;
         u16 hc_expected_status = 200;
         ActiveHealthThresholds hc_thresholds{};
+        PassiveHealthPolicy passive_health{};
     };
     static constexpr u32 kMaxUpstreams = 32;
     Upstream upstreams[kMaxUpstreams];

@@ -403,6 +403,7 @@ struct AstUpstreamDecl {
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
     ActiveHealthThresholds hc_thresholds{};
+    PassiveHealthPolicy passive_health{};
 };
 
 struct AstFunctionDecl {

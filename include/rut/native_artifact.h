@@ -9,7 +9,7 @@ namespace rut::native {
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 23 records request-owned consistent-hash forwarding metadata.
-constexpr u32 kVersion = 23;
+constexpr u32 kVersion = 24;
 struct StreamHeader {
     u64 magic;
     u32 version;

@@ -3922,6 +3922,83 @@ struct Parser {
                     }
                     auto rbrk = expect(TokenType::RBracket);
                     if (!rbrk) return core::make_unexpected(rbrk.error());
+                } else if (field_name.eq({"passive_health", 14})) {
+                    auto& policy = item.upstream.passive_health;
+                    if (policy.enabled)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto open = expect(TokenType::LBrace);
+                    if (!open) return core::make_unexpected(open.error());
+                    u32 seen = 0;
+                    while (cur().type != TokenType::RBrace) {
+                        auto key = expect(TokenType::Ident);
+                        if (!key) return core::make_unexpected(key.error());
+                        const Str kName = key.value()->text;
+                        u32 index = 6;
+                        if (kName.eq({"tcp_failures", 12})) index = 0;
+                        if (kName.eq({"timeouts", 8})) index = 1;
+                        if (kName.eq({"http_failures", 13})) index = 2;
+                        if (kName.eq({"successes", 9})) index = 3;
+                        if (kName.eq({"healthy_statuses", 16})) index = 4;
+                        if (kName.eq({"unhealthy_statuses", 18})) index = 5;
+                        if (index == 6 || (seen & (1u << index)))
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*key.value()), kName);
+                        seen |= 1u << index;
+                        auto colon = expect(TokenType::Colon);
+                        if (!colon) return core::make_unexpected(colon.error());
+                        if (index < 4) {
+                            auto literal = expect(TokenType::IntLit);
+                            if (!literal) return core::make_unexpected(literal.error());
+                            u32 value = 0;
+                            for (u32 n = 0; n < literal.value()->text.len; ++n) {
+                                const u32 kDigit = literal.value()->text.ptr[n] - '0';
+                                if (value > (255u - kDigit) / 10u)
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*literal.value()),
+                                                          kName);
+                                value = value * 10 + kDigit;
+                            }
+                            if (index == 0) policy.tcp_failures = static_cast<u8>(value);
+                            if (index == 1) policy.timeouts = static_cast<u8>(value);
+                            if (index == 2) policy.http_failures = static_cast<u8>(value);
+                            if (index == 3) policy.successes = static_cast<u8>(value);
+                        } else {
+                            auto bracket = expect(TokenType::LBracket);
+                            if (!bracket) return core::make_unexpected(bracket.error());
+                            auto* statuses =
+                                index == 4 ? policy.healthy_statuses : policy.unhealthy_statuses;
+                            while (cur().type != TokenType::RBracket) {
+                                auto literal = expect(TokenType::IntLit);
+                                if (!literal) return core::make_unexpected(literal.error());
+                                u32 status = 0;
+                                for (u32 n = 0; n < literal.value()->text.len; ++n) {
+                                    const u32 kDigit = literal.value()->text.ptr[n] - '0';
+                                    if (status > (599u - kDigit) / 10u)
+                                        return frontend_error(FrontendError::InvalidInteger,
+                                                              span_from(*literal.value()),
+                                                              kName);
+                                    status = status * 10 + kDigit;
+                                }
+                                if (status < 200 || PassiveHealthPolicy::contains(statuses, status))
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*literal.value()),
+                                                          kName);
+                                statuses[(status - 200) / 64] |= u64{1} << ((status - 200) % 64);
+                                if (!take(TokenType::Comma)) break;
+                            }
+                            auto end = expect(TokenType::RBracket);
+                            if (!end) return core::make_unexpected(end.error());
+                        }
+                        (void)take(TokenType::Comma);
+                    }
+                    auto close = expect(TokenType::RBrace);
+                    if (!close) return core::make_unexpected(close.error());
+                    policy.enabled = true;
+                    if (seen != 63u || !policy.valid())
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*field.value()),
+                                              field_name);
                 } else if (field_name.eq({"health_check", 12})) {
                     // Active health requires a path and interval. Status defaults to
                     // 200, and each consecutive-outcome threshold defaults to one.
@@ -4080,6 +4157,10 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (item.upstream.passive_health.enabled && item.upstream.http2)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      item.upstream.addr_span,
+                                      {"passive_health", 14});
             if (item.upstream.backend_count > 0) {
                 // `backends:` is mutually exclusive with host/port — mixing
                 // them is ambiguous about which is the primary endpoint.
@@ -4088,6 +4169,7 @@ struct Parser {
                                           item.upstream.addr_span);
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
+                        item.upstream.passive_health.enabled ||
                         seen_minimum_healthy_weight_percent)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
