@@ -6,13 +6,15 @@
 #include "rut/runtime/tls.h"
 
 namespace rut {
-// Trusted, pointer-free HTTP/1.1-over-TLS endpoint. A fixed IPv4 address avoids
+// Trusted, pointer-free HTTP/1.1-over-TLS endpoint. A fixed IP address avoids
 // blocking DNS and request-driven resolution. Hostname/CA always authenticate TLS.
 struct HttpsEndpoint {
-    char address[16]{};
+    static constexpr u32 kAddressCapacity = 46;
+    char address[kAddressCapacity]{};
     u16 port = 443;
     char path[1024]{};
     UpstreamTlsSpec tls{};
+    bool allow_ipv6 = false;
     bool valid() const;
 };
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real gateway/native-artifact and local authenticated HTTPS JWKS regression."""
 import argparse
+import errno
 import http.server
 import json
 import pathlib
@@ -34,7 +35,10 @@ def main():
     parser.add_argument("--conditional-discovery", action="store_true")
     parser.add_argument("--discovery-cache", action="store_true")
     parser.add_argument("--require-non-empty-keys", action="store_true")
+    parser.add_argument("--ipv6", action="store_true")
     args = parser.parse_args()
+    if args.ipv6:
+        args.discovery_dns = True
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
         fixture_option = "--fixture-es256-access" if args.algorithm == "ES256" else "--fixture-access"
@@ -159,19 +163,31 @@ def main():
         def log_message(self, *unused):
             pass
 
-    origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    family = socket.AF_INET6 if args.ipv6 else socket.AF_INET
+    loopback = "::1" if args.ipv6 else "127.0.0.1"
+    origin_type = type("JwksOrigin", (http.server.ThreadingHTTPServer,),
+                       {"address_family": family})
+    try:
+        origin = origin_type((loopback, 0), Handler)
+    except OSError as error:
+        if args.ipv6 and error.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            print("SKIP: IPv6 loopback unavailable")
+            raise SystemExit(77)
+        raise
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                             str(pathlib.Path(args.testdata) / "localhost_key.pem"))
     origin.socket = context.wrap_socket(origin.socket, server_side=True)
-    origin2 = http.server.ThreadingHTTPServer(("127.0.0.2", origin.server_port), Handler)
-    origin2.socket = context.wrap_socket(origin2.socket, server_side=True)
+    origin2 = worker2 = None
+    if not args.ipv6:
+        origin2 = origin_type(("127.0.0.2", origin.server_port), Handler)
+        origin2.socket = context.wrap_socket(origin2.socket, server_side=True)
+        worker2 = threading.Thread(target=origin2.serve_forever, daemon=True)
+        worker2.start()
     worker = threading.Thread(target=origin.serve_forever, daemon=True)
     worker.start()
-    worker2 = threading.Thread(target=origin2.serve_forever, daemon=True)
-    worker2.start()
-    dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    dns.bind(("127.0.0.1", 0))
+    dns = socket.socket(family, socket.SOCK_DGRAM)
+    dns.bind((loopback, 0))
     dns.settimeout(.1)
     dns_stop = threading.Event()
     def resolve():
@@ -186,21 +202,26 @@ def main():
                     state["dnsTimes"].append(time.monotonic())
             if mode == "timeout": continue
             target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
-            address = socket.inet_aton(target)
+            kind = 28 if args.ipv6 else 1
+            if args.ipv6:
+                if not query.endswith(b"\0\x1c\0\1"):
+                    continue
+                target = "2001:db8::1" if mode == "rebind" else loopback
+            address = socket.inet_pton(family, target)
             def name(host):
                 return b"".join(bytes((len(label),)) + label.encode() for label in host.split(".")) + b"\0"
             def record(owner, kind, data, ttl=30):
                 return owner + kind.to_bytes(2, "big") + b"\0\1" + ttl.to_bytes(4, "big") + len(data).to_bytes(2, "big") + data
-            records = [record(b"\xc0\x0c", 1, address)]
+            records = [record(b"\xc0\x0c", kind, address)]
             if mode.startswith("cname"):
                 alias = name("keys.example")
                 records = [record(b"\xc0\x0c", 5, alias)]
                 # The A owner points to the already decoded CNAME RDATA.
                 alias_offset = len(query) + 12
                 pointer = (0xc000 | alias_offset).to_bytes(2, "big")
-                records.append(record(pointer, 1, address))
+                records.append(record(pointer, kind, address))
                 if mode == "cname-reordered":
-                    records = [record(alias, 1, address), record(b"\xc0\x0c", 5, alias)]
+                    records = [record(alias, kind, address), record(b"\xc0\x0c", 5, alias)]
                 elif mode == "cname-failover":
                     records[-1] = record(pointer, 1, socket.inet_aton("127.0.0.4"))
                     records.append(record(pointer, 1, socket.inet_aton("127.0.0.2")))
@@ -236,7 +257,15 @@ def main():
             policy["remoteJwks"].update(retrySeconds=1, maxRetryAfterSeconds=3)
         if args.retry_backoff:
             policy["remoteJwks"].update(retrySeconds=1, maxRetrySeconds=3)
-        if args.discovery_dns:
+        if args.ipv6:
+            state["dns"] = "cname"
+            policy["remoteJwks"].update(
+                address="127.0.0.1",  # A DNS failure must never use the fixed address.
+                dnsRecordType="AAAA", dnsAddress="::1", dnsPort=dns.getsockname()[1],
+                allowedAddresses=["0:0:0:0:0:0:0:1"], maxAgeSeconds=5,
+                discoveryPath="/.well-known/openid-configuration",
+                discoveryIssuer=policy["issuer"])
+        elif args.discovery_dns:
             # Reserve the allowlisted first address without listening on it.
             refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             refusing.bind(("127.0.0.4", origin.server_port))
@@ -390,7 +419,20 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.require_non_empty_keys and args.conditional:
+            if args.ipv6:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    assert state["locals"] and all(address == "::1" for address in state["locals"])
+                    assert state["discoveries"]
+                    state["dns"] = "rebind"
+                    previous_dns = state["dnsRequests"]
+                wait_for_dns_request(previous_dns)
+                wait_status(fixture["a"], 401)
+                with lock:
+                    state.update(dns="cname", body=json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                assert request(fixture["a"]) == 401
+            elif args.require_non_empty_keys and args.conditional:
                 with lock:
                     state.update(conditionalMode="auto")
                 wait_status(fixture["a"], 200)
@@ -890,9 +932,10 @@ def main():
         origin.shutdown()
         origin.server_close()
         worker.join(timeout=5)
-        origin2.shutdown()
-        origin2.server_close()
-        worker2.join(timeout=5)
+        if origin2 is not None:
+            origin2.shutdown()
+            origin2.server_close()
+            worker2.join(timeout=5)
 
 
 if __name__ == "__main__":

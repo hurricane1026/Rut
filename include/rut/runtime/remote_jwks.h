@@ -9,11 +9,12 @@ namespace rut {
 struct RemoteJwks {
     static constexpr u32 kMaxDnsAddresses = 8;
     HttpsEndpoint endpoint{};
-    char dns_address[16]{};
+    char dns_address[HttpsEndpoint::kAddressCapacity]{};
+    bool dns_aaaa = false;
     u16 dns_port = 53;
     u32 dns_cache_seconds = 0;
     u32 dns_timeout_seconds = 0;
-    char allowed_addresses[kMaxDnsAddresses][16]{};
+    char allowed_addresses[kMaxDnsAddresses][HttpsEndpoint::kAddressCapacity]{};
     u32 allowed_count = 0;
     char discovery_path[1024]{};
     char discovery_issuer[1024]{};
@@ -43,15 +44,15 @@ private:
 };
 
 struct JwksDnsAddresses {
-    char values[RemoteJwks::kMaxDnsAddresses][16]{};
+    char values[RemoteJwks::kMaxDnsAddresses][HttpsEndpoint::kAddressCapacity]{};
     u32 count = 0;
     u32 ttl_seconds = 0;
 };
 
-// Owned validator bound to the accepted key representation and selected IPv4.
+// Owned validator bound to the accepted key representation and selected IP address.
 struct JwksValidator {
     char tag[129]{};
-    char address[16]{};
+    char address[HttpsEndpoint::kAddressCapacity]{};
     void clear();
     bool bind(Str entity_tag, Str selected_address);
     Str matching(Str selected_address) const;
@@ -85,7 +86,7 @@ private:
     JwksValidator request_validator_{};
     JwksValidator response_validator_{};
     JwksValidator discovery_validator_{};
-    char discovery_address_[16]{};
+    char discovery_address_[HttpsEndpoint::kAddressCapacity]{};
     u64 discovery_accepted_at_ = 0;
     bool sent_discovery_validator_ = false;
     bool sent_validator_ = false;

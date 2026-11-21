@@ -64,30 +64,35 @@ interval. Discovery and successful key responses ignore this header. These
 throttle responses are failures and do not update the keys, validators or
 last-success time.
 
-`dnsAddress` and a nonempty `allowedAddresses` list must appear together. Resolver
-and allowed destinations are IPv4 literals; at most eight destination addresses
-are accepted, and duplicate entries are rejected. `dnsPort` is optional (default 53), otherwise 1–65535. The original
-`address` remains a mandatory valid configuration field but is **never a fallback**
-when DNS is enabled. By default each attempt resolves the configured TLS server
-name again through one connected nonblocking UDP socket to the configured resolver.
-No blocking libc resolver, system search list, request-selected name or new DNS
-library is used.
+`address` and `dnsAddress` accept bare IPv4 or IPv6 literals. IPv6 transport
+continues to authenticate the configured TLS hostname and CA. Brackets, zone IDs
+and IPv4-mapped IPv6 literals are rejected. The DNS resolver and HTTPS origin may
+use different address families.
 
-The deliberately bounded DNS profile sends one random-ID IN A query (labels at
-most 63 bytes) without EDNS. It accepts one echoed question and 1–8 total answer
-records in a single reply of at most 512 bytes. Answers must form exactly one
-chain from the echoed question, with at most four CNAME hops followed by one or
-more A records. Chain validation accepts records in any order and compares names
-case-insensitively. Every record must have a positive 31-bit TTL. Before making
-any HTTPS connection, the gateway validates the whole reply and requires each
-terminal A address to be allowlisted, including later answers.
+`dnsAddress` and a nonempty `allowedAddresses` list must appear together. The
+optional `dnsRecordType` selects exactly one family per policy. It defaults to
+`"A"` (IPv4); `"AAAA"` selects IPv6. Use `dnsRecordType` only with DNS enabled.
+All allowed destinations must belong to the selected family. At most eight
+destinations are accepted, and duplicate entries (including equivalent IPv6
+spellings) are rejected. `dnsPort` defaults to 53 and accepts 1–65535. The
+original `address` remains mandatory and is **never a fallback** in DNS mode.
+By default each attempt resolves the configured TLS hostname through one
+connected nonblocking UDP socket to the configured resolver. No blocking libc
+resolver, system search list, request-selected name or new library is used.
+
+The query uses a random ID and one IN A or IN AAAA question without EDNS. The
+response must echo the question and contain 1–8 total answers within 512 bytes.
+Answers must form exactly one chain from the echoed question, with at most four
+CNAME hops followed by one or more records of the requested type. The gateway
+validates the whole reply, including a positive 31-bit TTL for every record,
+and requires every terminal address to be allowlisted before opening HTTPS.
 
 Names are bounded to 253 expanded bytes and 63 bytes per label. Compression may
 only point backwards to a previously decoded valid label boundary, with bounded
 pointer traversal. Forks, duplicate CNAMEs, cycles, an owner with both A and CNAME,
 missing terminal A records, unrelated answers, malformed or trailing RDATA/bytes,
-AAAA, truncation, DNS errors and authority/additional sections fail the attempt.
-The configured resolver must provide this bounded UDP A/CNAME profile.
+answers of another address family, truncation, DNS errors and authority/additional
+sections fail the attempt.
 
 Optional `dnsCacheSeconds` (integer 1–3600) requires DNS mode. It enables one
 owned address set per policy and shard. A validated reply may be reused until
@@ -98,7 +103,7 @@ DNS expiry. Cancel, clock failure or reversal, and exhaustion of the cached
 address set on a TCP connect failure discard it. A reply rejected by the
 resolver policy never enters the cache.
 
-Within an attempt the gateway tries distinct terminal A addresses in their
+Within an attempt the gateway tries distinct terminal addresses in their
 original answer order. It moves to the next address only when TCP establishment
 reports a connection refusal or another definitive network error. TLS, HTTP,
 metadata and key validation failures end the attempt. The next address uses
@@ -139,7 +144,7 @@ This profile accepts one strong quoted tag of at most 128 bytes including quotes
 Inside the quotes only ASCII `!` and `#` through `~` are allowed. It excludes weak
 validators and non-ASCII bytes. See the general
 [RFC 9110 ETag syntax](https://www.rfc-editor.org/rfc/rfc9110.html#name-etag).
-The tag and selected IPv4 address are owned by one policy/shard and tied to that
+The tag and selected IP address are owned by one policy/shard and tied to that
 accepted representation. A later key GET sends `If-None-Match` only on its initial
 candidate, at that same address, while the accepted cache remains fresh. Changed
 addresses and failover candidates always receive unconditional GETs. TLS name,
@@ -194,7 +199,7 @@ endpoint checks can commit its own strong ETag under the same 128-byte syntax as
 key ETags. Missing ETag clears the discovery validator. Duplicate, weak or
 malformed ETags fail the discovery attempt.
 
-The exact selected IPv4 address and the immutable configured discovery endpoint
+The exact selected IP address and the immutable configured discovery endpoint
 bind the owned validator to that representation. The initial candidate can send
 this tag while the metadata remains younger than `maxAgeSeconds`. Address changes
 and TCP failover candidates always fetch full metadata. A 304 must be bodyless,
@@ -209,7 +214,7 @@ the stored discovery validator.
 
 Optional `discoveryCacheSeconds` (integer 1–3600 and at most
 `maxAgeSeconds`) requires discovery and defaults to disabled. It remembers the
-last accepted metadata and exact selected IPv4 address. While younger than this
+last accepted metadata and exact selected IP address. While younger than this
 limit, a later attempt with the same initial address may skip the discovery GET
 and proceed directly to the key GET. The entry remains bound to the configured
 issuer, discovery endpoint and TLS trust. Changed addresses and failover require
@@ -248,5 +253,7 @@ metadata stage timeouts preserve the normal retry path.
 Real native-loaded RS256 and ES256 gateways run after source removal on both
 Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
-Other DNS transports, IPv6, alternative discovery origins, automatic kid inventory
-and full OIDC provider workflows remain outside this profile. #1077 remains open.
+The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
+a disallowed destination and recovery with rotated keys on both Linux backends.
+Other DNS transports, dual-family selection in one policy, alternative discovery
+origins, automatic kid inventory and full OIDC workflows remain open under #1077.
