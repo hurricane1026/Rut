@@ -193,6 +193,7 @@ add_library(rut_runtime STATIC
     runtime/timer_wheel.cc
     runtime/io_event.cc
     runtime/socket.cc
+    runtime/send_progress.cc
     runtime/tls.cc
     runtime/tls_engine.cc
     runtime/response_read_timer_transport.cc

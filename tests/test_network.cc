@@ -33630,6 +33630,23 @@ TEST(epoll_episode, current_recv_drops_stale_send_interest_without_mutating_stat
     backend.shutdown();
 }
 
+TEST(epoll_episode, oversized_send_leaves_the_submission_queue_empty) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1).has_value());
+    Connection conn{};
+    conn.reset();
+    conn.id = 0;
+    const u8 byte = 1;
+    constexpr u32 kTooLarge = static_cast<u32>(INT32_MAX) + 1;
+    CHECK_FALSE(backend.add_send(-1, 0, &byte, kTooLarge));
+    CHECK_FALSE(backend.add_send_upstream(-1, 0, &byte, kTooLarge, 1));
+    CHECK_FALSE(backend.add_send_tls(conn, &byte, kTooLarge));
+    CHECK_EQ(backend.pending_count, 0u);
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.upstream_send_state[0].remaining, 0u);
+    backend.shutdown();
+}
+
 TEST(epoll_episode, stale_partial_send_does_not_touch_state_or_wire) {
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
@@ -79500,6 +79517,47 @@ TEST(iouring_send_generation, backend_wait_accepts_only_current_proactor_and_kee
     CHECK_EQ(overflow.result, -EOVERFLOW);
     CHECK_EQ(overflow.non_upstream_generation, 23u);
     CHECK_EQ(backend.send_state[0].remaining, 0u);
+}
+
+TEST(iouring_send_generation, partial_completions_conserve_bytes_and_fit_event_result) {
+    UserspaceSendWaitFixture fixture;
+    REQUIRE(fixture.init());
+    auto& backend = fixture.backend;
+    static const u8 payload[] = "abcdefghi";
+    constexpr u32 kTooLarge = static_cast<u32>(INT32_MAX) + 1;
+    CHECK_FALSE(backend.add_send(91, 0, payload, kTooLarge, 23));
+    CHECK_FALSE(backend.add_send_after_direct_write(91, 0, payload, kTooLarge, 1, 23));
+    CHECK_FALSE(backend.add_send_upstream(91, 0, payload, kTooLarge, 1));
+    CHECK_EQ(fixture.sq_tail, 0u);
+
+    auto& state = backend.send_state[0];
+    state = {payload, 91, 0, 9, IoEventType::Send, 0, 23};
+    IoEvent event{};
+    u32 sent = 0;
+    for (u32 chunk : {2u, 4u, 3u}) {
+        backend.pending = 0;  // The fixture consumes submissions without a kernel.
+        REQUIRE(fixture.push(23, static_cast<i32>(chunk)));
+        sent += chunk;
+        REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), sent == 9 ? 1u : 0u);
+        CHECK_EQ(state.offset, sent);
+        CHECK_EQ(state.remaining, 9 - sent);
+        if (sent != 9) {
+            const auto& suffix = fixture.sq_entries[(fixture.sq_tail - 1) & fixture.sq_mask];
+            CHECK_EQ(suffix.addr, reinterpret_cast<u64>(payload + sent));
+            CHECK_EQ(suffix.len, 9 - sent);
+        }
+    }
+    CHECK_EQ(event.result, 9);
+    CHECK_EQ(fixture.sq_tail, 2u);
+
+    // An inconsistent stored total must not narrow to a negative success result.
+    state = {payload, 91, INT32_MAX, 1, IoEventType::Send, 0, 23};
+    REQUIRE(fixture.push(23, 1));
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.result, -EOVERFLOW);
+    CHECK_EQ(state.offset, static_cast<u32>(INT32_MAX));
+    CHECK_EQ(state.remaining, 0u);
+    CHECK_EQ(fixture.sq_tail, 2u);
 }
 
 TEST(iouring_send_generation, backend_wait_stale_then_current_in_one_batch) {
