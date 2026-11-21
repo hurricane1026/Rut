@@ -231,6 +231,13 @@ struct IoEvent {
     u8 provided_ring_empty = 0;
 };
 
+// A full positive copy must cover exactly the next interval in the buffer.
+constexpr bool matches_positive_copy_span(const IoEvent& event, u32 expected_begin) {
+    return event.copy_witness == IoEventCopyWitness::Full && event.result > 0 &&
+           event.copy_begin == expected_begin && event.copy_end >= event.copy_begin &&
+           event.copy_end - event.copy_begin == static_cast<u32>(event.result);
+}
+
 // ResponseReadTimer is a transport-only event. Accept only the exact result
 // domains emitted by IORING_OP_TIMEOUT / IORING_OP_ASYNC_CANCEL and require
 // every unrelated payload field to remain canonical-neutral before ownership

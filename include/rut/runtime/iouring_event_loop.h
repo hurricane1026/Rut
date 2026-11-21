@@ -5502,13 +5502,11 @@ public:
                 }
                 if (ev.result > 0) {
                     if (!c.upstream_recv_cancel_inflight || !c.upstream_recv_terminal_stale ||
-                        ev.copy_witness != IoEventCopyWitness::Full || ev.more == false ||
+                        ev.more == false ||
                         ev.copy_deadline_generation != owner.deadline_generation ||
                         ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
-                        ev.copy_deadline_method != owner.method || ev.copy_end < ev.copy_begin ||
-                        ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
-                        ev.copy_begin != owner.expected_copy_end ||
-                        owner.expected_copy_end > 0xffffffffu - static_cast<u32>(ev.result)) {
+                        ev.copy_deadline_method != owner.method ||
+                        !matches_positive_copy_span(ev, owner.expected_copy_end)) {
                         owner.bounded_terminal_custody_invalid = true;
                     } else {
                         if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
@@ -5563,18 +5561,15 @@ public:
             if (ev.result > 0) {
                 owner.last_positive = i;
                 if (owner.saw_terminal && !owner.terminal_fault) owner.valid = false;
-                if (ev.copy_witness != IoEventCopyWitness::Full ||
+                const u32 kExpectedBegin =
+                    owner.saw_positive ? owner.expected_copy_end : ev.copy_begin;
+                if (!matches_positive_copy_span(ev, kExpectedBegin) ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
                     ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
-                    ev.copy_deadline_method != owner.method || ev.copy_end < ev.copy_begin ||
-                    ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result)) {
+                    ev.copy_deadline_method != owner.method) {
                     owner.valid = false;
                 } else {
-                    if (!owner.saw_positive) {
-                        owner.first_copy_begin = ev.copy_begin;
-                        owner.expected_copy_end = ev.copy_begin;
-                    }
-                    if (ev.copy_begin != owner.expected_copy_end) owner.valid = false;
+                    if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
                     owner.expected_copy_end = ev.copy_end;
                     const u32 positive = static_cast<u32>(ev.result);
                     if (owner.positive_bytes > 0xFFFFFFFFu - positive)
