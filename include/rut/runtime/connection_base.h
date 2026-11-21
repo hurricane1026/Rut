@@ -1063,12 +1063,10 @@ struct ConnectionBase {
     }
 
     bool next_response_read_timer_generation() {
-        if (!response_read_timer_owner_is_neutral() ||
-            response_read_timer_generation >= kResponseReadTimerGenerationMask)
-            return false;
-        ++response_read_timer_generation;
-        response_read_timer_owner_generation = response_read_timer_generation;
-        return true;
+        return response_read_timer_owner_is_neutral() &&
+               allocate_io_generation(response_read_timer_generation,
+                                      response_read_timer_owner_generation,
+                                      kResponseReadTimerGenerationMask);
     }
 
     // Consume one exact target/cancel CQE. CancelPending owners drain
@@ -1098,9 +1096,8 @@ struct ConnectionBase {
     // raw TLS sends. Allocating a raw/logical TLS token must not overwrite the
     // active strict plaintext owner's generation.
     bool next_non_upstream_send_generation(u32& generation) {
-        if (response_read_deadline_send_generation == kNonUpstreamSendGenerationMask) return false;
-        generation = ++response_read_deadline_send_generation;
-        return true;
+        return allocate_io_generation(
+            response_read_deadline_send_generation, generation, kNonUpstreamSendGenerationMask);
     }
 
     template <typename Self, typename Visitor>
@@ -1202,10 +1199,9 @@ struct ConnectionBase {
     }
 
     bool next_response_read_deadline_generation() {
-        if (response_read_deadline_generation == 0xFFFFFFFFu) return false;
-        ++response_read_deadline_generation;
-        response_read_deadline_owner_generation = response_read_deadline_generation;
-        return true;
+        return allocate_io_generation(response_read_deadline_generation,
+                                      response_read_deadline_owner_generation,
+                                      0xFFFFFFFFu);
     }
 
     // Canonical inventories of active response-read-deadline ownership and
