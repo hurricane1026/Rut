@@ -11305,6 +11305,10 @@ fencing. See [the recovery boundary](docs/auth-replay.md#confirmed-local-aof-pro
 The durable Standard Webhooks rotation example composes the static two-key verifier
 with confirmed local AOF replay claims. Both keys share one stable signer namespace
 and event identity across Redis and gateway restarts; see [the replay contract](docs/auth-replay.md).
+The durable signed-request rotation example likewise shares one stable namespace
+and the existing authenticated POST target/Date/Digest tuple across both key
+slots and the original fixed-key deployment. Neither the signature nor the
+matched key ID changes the replay identity.
 
 `JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
 nonblocking UDP A query with a bounded CNAME answer chain and optional

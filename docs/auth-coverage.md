@@ -1685,6 +1685,9 @@ JIT tests also cover the 1024/1025-byte bound. See
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL tests with verified TLS on
   both backends. Eviction policy, volume integrity and replicated failover remain
   deployment responsibilities (#1076).
+  Static current/previous key rotation preserves existing durable claims for
+  Standard Webhooks and fixed POST signed requests across provider key changes
+  and single-instance Redis recovery.
 - [JWKS DNS/discovery](jwks-discovery.md): bounded nonblocking A/CNAME resolution,
   finite address allowlist, sequential failover after definitive TCP connect
   failures, exact issuer and pre-authorized URI, opt-in TTL-bounded DNS reuse,
