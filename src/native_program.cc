@@ -1,4 +1,5 @@
 #include "rut/common/types.h"
+#include "rut/common/upstream_health.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_artifact.h"
 #include "rut/runtime/cache_table.h"
@@ -565,6 +566,17 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream passive health policy");
         if (target.hc_enabled && !target.hc_thresholds.valid())
             return fail("invalid native upstream health thresholds");
+        if (target.hc_enabled &&
+            (target.hc_path_len >= sizeof(target.hc_path) ||
+             !valid_active_health_check(target.hc_type,
+                                        target.hc_path,
+                                        target.hc_path_len,
+                                        target.hc_interval_ms,
+                                        target.hc_expected_status,
+                                        target.hc_thresholds,
+                                        target.hc_timeout_ms) ||
+             ((target.tls.enabled || target.http2) && target.hc_type != ActiveHealthType::Tcp)))
+            return fail("invalid native upstream health check");
     }
     // The artifact has no live compiler addresses. Restore only declared byte
     // views and native symbols, then reconstruct indices against the new owner.

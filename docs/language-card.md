@@ -543,7 +543,7 @@ it remaps keys. Backend declaration order, shard count and connection reuse do
 not change selection. Weight zero, health, capacity and retry exclusions apply;
 no eligible target returns 503. Explicit `wait(upstream(...).connect())` retains
 its existing selection policy. WebSocket upgrades are rejected with 503 for this
-policy; `websocket(...)` does not accept these arguments. Native ABI 24 requires
+policy; `websocket(...)` does not accept these arguments. Native ABI 25 requires
 recompiling older artifacts. See [the implementation design](consistent-hash-design.md)
 for the deterministic algorithm and compatibility boundaries.
 
@@ -606,8 +606,40 @@ Each shard/target has at most one probe, including cancellation drain. Weight 0
 suppresses probes and forwarding. Probe capacity is bounded and reserved away
 from client slots; drain starts no new probes. Configuration replacement drops
 old results, including reuse of a configuration address. Existing all-ejected
-fail-open selection remains unchanged. HTTPS and HTTP/2/gRPC probes are absent.
+fail-open selection remains unchanged. HTTPS and application-level HTTP/2/gRPC probes are absent; TCP probes are described below.
 See [active-health scope and verification](kong-active-health.md).
+
+Active probes also accept `type: .tcp`:
+
+```swift
+upstream greeter {
+    host: "127.0.0.1", port: 50051, protocol: .http2
+    health_check: {
+        type: .tcp, interval: 1s, timeout: 2s,
+        failure_threshold: 3, success_threshold: 2
+    }
+}
+```
+
+`type` defaults to `.http`; `.http` may also be explicit. HTTP mode requires
+`path` and accepts an optional `status`. TCP mode forbids both fields, including
+empty paths: a completed TCP connect is success, connection failure/timeout is
+failure. TCP probes send no HTTP request, HTTP/2 preface, TLS handshake or other
+application bytes, and close immediately after recording the connect result.
+They work with plaintext, TLS and HTTP/2/gRPC upstream declarations. This tests
+port reachability, not TLS identity or application/gRPC health; the business
+connection still performs its configured TLS verification.
+
+Both modes accept optional `timeout` in whole seconds, 1–60 seconds (`1000ms`
+and `1m` are equivalent spellings). Zero, fractional seconds, duplicates,
+unknown probe types and larger durations are compile/load errors. Omission
+preserves the host loop's upstream timeout (30 seconds in ordinary `rut`). The
+existing one-second timer wheel bounds the entire probe, not each read; expiry
+may be dispatched up to one tick later. Partial HTTP input does not extend it.
+TCP mode allocates no response receive slice. Slot reserve, submission budget,
+one-probe-per-target guard, reload generation fencing, disabled-weight behavior,
+and io_uring cancellation drain apply to both modes. Native ABI 25 requires
+recompiling older artifacts. See [tcp-health.rut](../examples/tcp-health.rut).
 
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
@@ -670,7 +702,7 @@ downstreams on epoll and io_uring. Native HTTP/2/gRPC upstreams reject the optio
 `grpc-status` is not interpreted as an HTTP status. Explicit socket operations
 through `wait(upstream(...).connect())` use target eligibility but do not report
 business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
-cross-shard health synchronization is implied. Native ABI 24 requires rebuilding
+cross-shard health synchronization is implied. Native ABI 25 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
 
 ## Native gRPC forwarding
@@ -709,7 +741,7 @@ before forwarding; body-reading handlers and HTTP/1-specific forward policies
 are outside this streaming path. HTTP/1 requests cannot use an HTTP/2 upstream.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
 needed. gRPC-Web, JSON transcoding and gRPC health probes are
-not implemented by this option; `health_check` with `.http2` is rejected.
+not implemented by this option; HTTP probes with `.http2` are rejected; `health_check: { type: .tcp, interval: 1s }` is supported.
 
 For a TLS upstream, add a `tls` field with explicit trust and identity:
 

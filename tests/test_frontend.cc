@@ -48576,3 +48576,65 @@ TEST(frontend, passive_health_rejects_ambiguous_or_unbounded_policies) {
         CHECK_FALSE(parse_file_heap(lexed.value()));
     }
 }
+
+TEST(frontend, active_tcp_health_type_and_timeout) {
+    const char* configs[] = {
+        "type: .tcp, interval: 1s, timeout: 2s, failure_threshold: 2, success_threshold: 3",
+        "interval: 2s type: .tcp timeout: 1m",
+        "type: .tcp interval: 1s",
+    };
+    for (const auto* fields : configs) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { protocol: .http2 health_check: { %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto parsed = parse_file_heap(tokens.value());
+        REQUIRE(parsed);
+        const auto& up = parsed.value().items[0].upstream;
+        CHECK(up.hc_enabled);
+        CHECK_EQ(up.hc_type, ActiveHealthType::Tcp);
+        CHECK_EQ(up.hc_expected_status, 0u);
+        CHECK_EQ(up.hc_path_lit.len, 0u);
+        CHECK(valid_active_health_timeout(up.hc_timeout_ms));
+    }
+    auto tokens =
+        lex(lit("upstream api { health_check: { type: .http path: \"/health\" interval: 1s "
+                "timeout: 1s } }"));
+    REQUIRE(tokens);
+    auto parsed = parse_file_heap(tokens.value());
+    REQUIRE(parsed);
+    CHECK_EQ(parsed.value().items[0].upstream.hc_type, ActiveHealthType::Http);
+    CHECK_EQ(parsed.value().items[0].upstream.hc_timeout_ms, 1000u);
+}
+
+TEST(frontend, active_tcp_health_rejects_http_fields_invalid_types_and_timeouts) {
+    const char* fields[] = {
+        "type: .tcp",
+        "type: .tcp interval: 1s path: \"/health\"",
+        "path: \"/health\" interval: 1s type: .tcp",
+        "type: .tcp interval: 1s status: 200",
+        "type: .udp interval: 1s",
+        "type: \"tcp\" interval: 1s",
+        "type: tcp interval: 1s",
+        "type: .tcp type: .tcp interval: 1s",
+        "type: .http interval: 1s",
+        "type: .tcp interval: 1s timeout: 0s",
+        "type: .tcp interval: 1s timeout: 1ms",
+        "type: .tcp interval: 1s timeout: 1500ms",
+        "type: .tcp interval: 1s timeout: 61s",
+        "type: .tcp interval: 1s timeout: 18446744073709552616ms",
+        "type: .tcp interval: 1s timeout: 1s timeout: 2s",
+        "type: .tcp interval: 1s timeout: 1",
+        "type: .tcp interval: 1s success_threshold: 0",
+    };
+    for (const auto* value : fields) {
+        char source[512];
+        snprintf(source, sizeof(source), "upstream api { health_check: { %s } }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+}

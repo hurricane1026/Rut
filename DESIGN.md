@@ -11514,7 +11514,7 @@ invalid configuration return 503. See [the contract](docs/opa-authorization.md#o
 An upstream may opt into `passive_health` with six explicit fields:
 `tcp_failures`, `timeouts`, `http_failures`, `successes`, `healthy_statuses`, and
 `unhealthy_statuses`. This is configuration data, propagated AST → HIR → MIR →
-RIR → RouteConfig and serialized in native ABI 24. It introduces no keyword,
+RIR → RouteConfig and serialized in native ABI 25. It introduces no keyword,
 allocation, library dependency, handler operation or hidden suspension.
 
 The HTTP/1 origin path records final headers once per fenced upstream episode;
@@ -11531,3 +11531,26 @@ until a separate HTTP/2/`grpc-status` observation contract exists.
 
 See [language contract](docs/language-card.md#passive-http-upstream-health-checks)
 and [verification and compatibility boundaries](docs/passive-health.md).
+### Active upstream probe types and deadlines
+
+`health_check.type` is a contextual configuration field, with `.http` (the
+existing default) and `.tcp` variants. TCP mode forbids HTTP path/status fields;
+HTTP mode retains its existing path/status contract. Both modes carry optional
+whole-second `timeout` (1–60 seconds) through AST, HIR, MIR, RIR and owned
+RouteConfig/native metadata (ABI 25). Omission retains the host loop timeout.
+No language keyword, library dependency, handler operation or suspension is added.
+
+TCP probes record a successful connect and close without sending application
+bytes. They can target TLS and HTTP/2/gRPC origins because they do not negotiate
+TLS/HTTP; they prove reachability rather than certificate or application health.
+Normal business TLS validation is unchanged. Each probe owns its launch mode
+and connect address, so configuration retirement cannot change its callback
+protocol or expose kernel I/O to freed configuration storage. TCP probes skip
+HTTP response-buffer allocation and automatic upstream TLS setup.
+
+The existing per-shard probe guard, connection reserve, fixed sweep budget,
+thresholds, healthy-weight floor, RCU identity fencing and exact I/O cancellation
+ledger remain authoritative. The single timer-wheel deadline covers the entire
+probe; progress does not extend it. HTTP and TCP paths share teardown, including
+Connect cancellation when the timeout or drain wins before connect completion.
+See [active health scope and verification](docs/kong-active-health.md).

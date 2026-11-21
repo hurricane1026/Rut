@@ -526,7 +526,16 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (config == nullptr || upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[upstream_idx];
-    if (backend_idx >= target.addr_count || target.tls.enabled || target.weights[backend_idx] == 0)
+    if (backend_idx >= target.addr_count || target.weights[backend_idx] == 0 ||
+        !target.hc_enabled || target.hc_path_len >= sizeof(target.hc_path) ||
+        !valid_active_health_check(target.hc_type,
+                                   target.hc_path,
+                                   target.hc_path_len,
+                                   target.hc_interval_ms,
+                                   target.hc_expected_status,
+                                   target.hc_thresholds,
+                                   target.hc_timeout_ms) ||
+        ((target.tls.enabled || target.http2) && target.hc_type != ActiveHealthType::Tcp))
         return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
@@ -558,6 +567,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     }
     Connection& conn = *cptr;
     conn.is_health_probe = true;
+    conn.health_probe_tcp = target.hc_type == ActiveHealthType::Tcp;
     conn.set_metrics_client(false);
     conn.fd = -1;
     conn.upstream_idx = upstream_idx;
@@ -584,13 +594,13 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     }
     conn.upstream_fd = kProbeFd;
     // The response lands in upstream_recv_buf (recv_buf holds the request).
-    if (!loop->alloc_upstream_buf(conn)) {
+    if (!conn.health_probe_tcp && !loop->alloc_upstream_buf(conn)) {
         free_probe_conn(loop, conn);
         return false;
     }
 
     conn.reset_request_receive_buffer();
-    build_probe_request(conn, target, backend_idx);
+    if (!conn.health_probe_tcp) build_probe_request(conn, target, backend_idx);
 
     // io_uring reads the connect address after submission. Keep it in an owned,
     // otherwise unused send slice instead of borrowing a reloadable config.
@@ -608,22 +618,33 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // connect but never responds (or a connect that stays pending) would otherwise
     // keep this Connection alive forever with upstream I/O armed and
     // probe_in_flight set — permanently suppressing all future probes for the
-    // backend and leaking the slot. Arm it on the 1s timer wheel with the same
-    // bound a real proxied upstream response gets (upstream_timeout, default 30s,
-    // already < TimerWheel::kSlots): the Timeout tick reaps a stalled probe as a
+    // backend and leaking the slot. Arm one 1s-wheel deadline for the entire
+    // probe, using the configured timeout or inheriting upstream_timeout (30s
+    // by default). The Timeout tick reaps a stalled probe as a
     // health FAILURE and frees it (clearing probe_in_flight so the next sweep
     // re-probes). Every fast completion path frees via free_probe_conn ->
     // free_health_probe -> free_conn, which removes the wheel entry, so a completed
     // probe can never leave a stale entry to fire later against a reused slot.
-    loop->timer.add(&conn, loop->upstream_timeout);
+    const u32 kTimeoutSeconds =
+        target.hc_timeout_ms ? target.hc_timeout_ms / 1000 : loop->upstream_timeout;
+    loop->timer.add(&conn, kTimeoutSeconds);
     return true;
 }
 
 template <typename Loop>
 void on_probe_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    if (ev.aux == kLocalSubmitFailureAux) {
+        free_probe_conn(loop, conn);
+        return;
+    }
     if (ev.result < 0) {
         record_probe_if_current(loop, conn, /*healthy=*/false, monotonic_us());
+        free_probe_conn(loop, conn);
+        return;
+    }
+    if (conn.health_probe_tcp) {
+        record_probe_if_current(loop, conn, /*healthy=*/true, monotonic_us());
         free_probe_conn(loop, conn);
         return;
     }

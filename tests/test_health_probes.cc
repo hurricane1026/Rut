@@ -301,6 +301,139 @@ void sweep_respects_disabled_interval_and_drain(rut::test::TestCase* _tc) {
     CHECK_FALSE(probe_in_flight(0, 0));
 }
 
+template <typename Loop>
+void tcp_health_and_recovery(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    REQUIRE(rig.owner.config->set_upstream_health_check(
+        0, nullptr, 0, 1000, 0, {2, 2}, ActiveHealthType::Tcp, 1000));
+    const u32 kFreeSlots = rig.loop->free_conn_slots();
+    ::close(rig.listener.fd);
+    rig.listener.fd = -1;
+    for (u32 i = 0; i < 2; ++i) {
+        REQUIRE(start_health_probe(rig.loop, 0, 0));
+        REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+        CHECK_EQ(backend_ejected(0, 0, ~u64{0}), i == 1);
+        CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    }
+    rig.listener.fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(rig.listener.fd >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(rig.port);
+    REQUIRE_EQ(bind(rig.listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    REQUIRE_EQ(listen(rig.listener.fd, 16), 0);
+    // TCP probes deliberately do not instantiate upstream TLS or HTTP/2 state.
+    rig.owner.config->upstreams[0].tls.enabled = true;
+    for (u32 i = 0; i < 2; ++i) {
+        rig.owner.config->upstreams[0].http2 = i == 1;
+        REQUIRE(start_health_probe(rig.loop, 0, 0));
+        Connection* probe = rig.probe();
+        REQUIRE(probe);
+        CHECK(probe->health_probe_tcp);
+        CHECK_EQ(probe->recv_buf.len(), 0u);
+        CHECK_EQ(probe->upstream_recv_slice, nullptr);
+        CHECK_FALSE(probe->h1_tls_transport);
+        CHECK_EQ(probe->h2, nullptr);
+        Socket peer;
+        REQUIRE(rig.until([&] {
+            if (peer.fd < 0)
+                peer.fd = accept4(rig.listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            return peer.fd >= 0 && !probe_in_flight(0, 0);
+        }));
+        char data[64]{};
+        CHECK_EQ(recv(peer.fd, data, sizeof(data), MSG_DONTWAIT), 0);  // EOF, no application bytes
+        CHECK_EQ(backend_ejected(0, 0, 0), i == 0);
+        CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    }
+    CHECK_EQ(rig.loop->active_count(), 0u);
+    CHECK_EQ(rig.metrics.connections_total, 0u);
+    CHECK_EQ(rig.metrics.connections_closed, 0u);
+    CHECK_EQ(rig.metrics.requests_total, 0u);
+}
+
+template <typename Loop>
+void tcp_pending_timeout_and_reload(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.loop->upstream_timeout = 30;
+    REQUIRE(rig.owner.config->set_upstream_health_check(
+        0, nullptr, 0, 1000, 0, {}, ActiveHealthType::Tcp, 1000));
+    const u32 kFreeSlots = rig.loop->free_conn_slots();
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    REQUIRE(rig.probe());
+    // Expire before polling the queued Connect: late successful completion must
+    // drain rather than restore health or release the guard twice.
+    for (u32 i = 0; i < 2; ++i) rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK(backend_ejected(0, 0, ~u64{0}));
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK(backend_ejected(0, 0, ~u64{0}));
+    CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    rig.owner.config->http_cache_identity = http_cache_config_identity();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    record_active_probe_result(0, 0, false, 0);
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK(backend_ejected(0, 0, ~u64{0}));  // old success ignored at same config address
+    CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    rig.loop->force_close_all();
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    CHECK_EQ(rig.metrics.connections_closed, 0u);
+}
+
+template <typename Loop>
+void explicit_http_probe_timeout(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.loop->upstream_timeout = 30;
+    REQUIRE(rig.owner.config->set_upstream_health_check(
+        0, "/healthz", 8, 1000, 200, {}, ActiveHealthType::Http, 1000));
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    Socket peer;
+    char request[512]{};
+    REQUIRE(rig.receive_request(peer, request, sizeof(request)));
+    for (u32 i = 0; i < 2; ++i) rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK(backend_ejected(0, 0, ~u64{0}));
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_EQ(rig.loop->active_count(), 0u);
+}
+
+template <typename Loop>
+void tcp_mode_survives_destroyed_configuration(rut::test::TestCase* _tc) {
+    rut::test::RouteConfigFixture next;
+    REQUIRE(next.config);
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    REQUIRE(rig.owner.config->set_upstream_health_check(
+        0, nullptr, 0, 1000, 0, {}, ActiveHealthType::Tcp, 1000));
+    REQUIRE(next.config->add_upstream("api", 0x7f000001u, rig.port));
+    REQUIRE(next.config->set_upstream_health_check(0, "/next", 5, 1000, 200));
+    const u32 kFreeSlots = rig.loop->free_conn_slots();
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    REQUIRE(rig.probe());
+    CHECK(rig.probe()->health_probe_tcp);
+    rig.active = next.config;
+    rig.owner.config->~RouteConfig();
+    rig.owner.config = nullptr;
+    rig.owner.arena.destroy();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    record_active_probe_result(0, 0, false, 0);
+    Socket peer;
+    REQUIRE(rig.until([&] {
+        if (peer.fd < 0)
+            peer.fd = accept4(rig.listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        return peer.fd >= 0 && !probe_in_flight(0, 0);
+    }));
+    char data[16]{};
+    CHECK_EQ(recv(peer.fd, data, sizeof(data), MSG_DONTWAIT), 0);
+    CHECK(backend_ejected(0, 0, ~u64{0}));  // never apply old TCP success to the HTTP replacement
+    CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
+    CHECK_EQ(rig.metrics.connections_closed, 0u);
+}
+
 }  // namespace
 
 namespace rut::detail {
@@ -422,6 +555,55 @@ TEST(health_probe, epoll_sweep_respects_disabled_interval_and_drain) {
 }
 TEST(health_probe, iouring_sweep_respects_disabled_interval_and_drain) {
     sweep_respects_disabled_interval_and_drain<IoUringEventLoop>(_tc);
+}
+
+TEST(health_probe, epoll_tcp_health_and_recovery) {
+    tcp_health_and_recovery<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_tcp_health_and_recovery) {
+    tcp_health_and_recovery<IoUringEventLoop>(_tc);
+}
+TEST(health_probe, epoll_tcp_pending_timeout_and_reload) {
+    tcp_pending_timeout_and_reload<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_tcp_pending_timeout_and_reload) {
+    tcp_pending_timeout_and_reload<IoUringEventLoop>(_tc);
+}
+TEST(health_probe, epoll_explicit_http_probe_timeout) {
+    explicit_http_probe_timeout<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_explicit_http_probe_timeout) {
+    explicit_http_probe_timeout<IoUringEventLoop>(_tc);
+}
+
+TEST(health_probe, public_health_api_rejects_ambiguous_or_invalid_modes) {
+    rut::test::RouteConfigFixture owner;
+    REQUIRE(owner.config);
+    auto& cfg = *owner.config;
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 0, {}, ActiveHealthType::Tcp));
+    CHECK_FALSE(cfg.set_upstream_health_check(0, nullptr, 0, 1000, 200, {}, ActiveHealthType::Tcp));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, nullptr, 0, 1000, 0, {}, static_cast<ActiveHealthType>(255)));
+    CHECK_FALSE(
+        cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 1500));
+    CHECK_FALSE(
+        cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 61000));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 0xffffffffu));
+    CHECK_FALSE(cfg.upstreams[0].hc_enabled);
+    cfg.upstreams[0].http2 = true;
+    CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200));
+    CHECK(cfg.set_upstream_health_check(0, nullptr, 0, 1000, 0, {}, ActiveHealthType::Tcp, 60000));
+    CHECK_EQ(cfg.upstreams[0].hc_type, ActiveHealthType::Tcp);
+    CHECK_EQ(cfg.upstreams[0].hc_timeout_ms, 60000u);
+}
+
+TEST(health_probe, epoll_tcp_mode_survives_destroyed_configuration) {
+    tcp_mode_survives_destroyed_configuration<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_tcp_mode_survives_destroyed_configuration) {
+    tcp_mode_survives_destroyed_configuration<IoUringEventLoop>(_tc);
 }
 
 int main(int argc, char** argv) {

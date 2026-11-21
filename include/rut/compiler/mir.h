@@ -578,6 +578,8 @@ struct MirUpstream {
     u16 hc_expected_status = 200;
     ActiveHealthThresholds hc_thresholds{};
     PassiveHealthPolicy passive_health{};
+    ActiveHealthType hc_type = ActiveHealthType::Http;
+    u32 hc_timeout_ms = 0;  // 0 inherits the host loop upstream timeout
 };
 
 struct MirCacheInstance {

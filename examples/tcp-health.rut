@@ -1,0 +1,12 @@
+// TCP probes test port reachability, not gRPC health or TLS certificate identity.
+upstream greeter {
+    host: "127.0.0.1", port: 50051, protocol: .http2
+    minimum_healthy_weight_percent: 1
+    health_check: {
+        type: .tcp, interval: 1s, timeout: 2s,
+        failure_threshold: 3, success_threshold: 2
+    }
+}
+route POST "/helloworld.Greeter/SayHello" {
+    return forward(greeter, load_balance: .roundRobin)
+}

@@ -622,28 +622,24 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             u32 path_len,
                                             u32 interval_ms,
                                             u16 status,
-                                            ActiveHealthThresholds thresholds) {
+                                            ActiveHealthThresholds thresholds,
+                                            ActiveHealthType type,
+                                            u32 timeout_ms) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
-    if (path == nullptr) return false;
-    if (path_len >= sizeof(up.hc_path)) return false;
-    if (interval_ms == 0) return false;
-    if (status < 100 || status > 599 || !thresholds.valid()) return false;
-    // The probe writes this verbatim into `GET <path> HTTP/1.1`, so it must
-    // be an origin-form target that cannot inject spaces/control bytes into
-    // the request line. The DSL path is also checked at parse time; this is
-    // defense-in-depth for the public API.
-    if (path_len == 0 || path[0] != '/') return false;
-    for (u32 i = 0; i < path_len; i++) {
-        const unsigned char ch = static_cast<unsigned char>(path[i]);
-        if (ch <= 0x20 || ch == 0x7f) return false;
-    }
+    if (path_len >= sizeof(up.hc_path) ||
+        !valid_active_health_check(
+            type, path, path_len, interval_ms, status, thresholds, timeout_ms) ||
+        ((up.tls.enabled || up.http2) && type != ActiveHealthType::Tcp))
+        return false;
     for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
     up.hc_path[path_len] = '\0';
     up.hc_path_len = path_len;
     up.hc_interval_ms = interval_ms;
     up.hc_expected_status = status;
     up.hc_thresholds = thresholds;
+    up.hc_type = type;
+    up.hc_timeout_ms = timeout_ms;
     up.hc_enabled = true;
     return true;
 }

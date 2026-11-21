@@ -3906,3 +3906,50 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_FALSE(PassiveHealthPolicy::contains(policy.healthy_statuses, 503));
     CHECK(PassiveHealthPolicy::contains(policy.unhealthy_statuses, 599));
 }
+
+TEST(native_program, active_tcp_health_survives_native_activation) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api {
+    host: "127.0.0.1" port: 9001 protocol: .http2
+    health_check: { type: .tcp interval: 2s timeout: 3s failure_threshold: 2 success_threshold: 3 }
+}
+route GET "/" { return 200 }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    activate_native_program(*owner.p);
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK(target.http2);
+    CHECK(target.hc_enabled);
+    CHECK_EQ(target.hc_type, ActiveHealthType::Tcp);
+    CHECK_EQ(target.hc_path_len, 0u);
+    CHECK_EQ(target.hc_expected_status, 0u);
+    CHECK_EQ(target.hc_timeout_ms, 3000u);
+    CHECK_EQ(target.hc_interval_ms, 2000u);
+    CHECK_EQ(target.hc_thresholds.failures, 2u);
+    CHECK_EQ(target.hc_thresholds.successes, 3u);
+}
+
+TEST(native_program, active_http_health_timeout_survives_native_activation) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api {
+    host: "127.0.0.1" port: 9001
+    health_check: { type: .http path: "/health" interval: 2s timeout: 1s }
+}
+route GET "/" { return 200 }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    activate_native_program(*owner.p);
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK_EQ(target.hc_type, ActiveHealthType::Http);
+    CHECK_EQ(target.hc_timeout_ms, 1000u);
+    CHECK_EQ(target.hc_expected_status, 200u);
+    CHECK_EQ(target.hc_path_len, 7u);
+}
