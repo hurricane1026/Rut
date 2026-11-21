@@ -53,7 +53,7 @@ def signed(claims, header=None):
 
 
 @contextmanager
-def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False, client_without=False):
+def gateway(args, directory, client='orders', realm='member', role='read', party='storefront', subject='alice', forbidden='suspended', restricted=False, client_without=False, client_all=False):
     original = Path(args.source).resolve()
     root = directory / str(time.monotonic_ns())
     root.mkdir()
@@ -78,6 +78,13 @@ def gateway(args, directory, client='orders', realm='member', role='read', party
             '    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
             '    let access = keycloak.requireBearerAccessToken(document)\n' + \
             '    let allowed = keycloak.requireClientRoleWithout(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
+            '    return 204\n}\n'
+    if client_all:
+        program = program[:program.index('route GET "/realm"')] + \
+            'route GET "/client-all" {\n' + \
+            '    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))\n' + \
+            '    let access = keycloak.requireBearerAccessToken(document)\n' + \
+            '    let allowed = keycloak.requireAllClientRoles(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"), env("KEYCLOAK_FORBIDDEN_ROLE"))\n' + \
             '    return 204\n}\n'
     source.write_text(program.replace('listen :8080', f'listen :{port}'))
     policy = dict(issuer=ISSUER, audience=AUDIENCE, kids=['current'],
@@ -270,6 +277,22 @@ def main():
                                          ('orders', 'read', 'read'), ('orders', 'read', '')):
             with gateway(args, root, client=client, role=role, forbidden=forbidden, client_without=True) as port:
                 assert request(port, '/client-without', signed(valid), 'h2') == 503
+                checks += 1
+        with gateway(args, root, forbidden='write', client_all=True) as port:
+            for version in ('HTTP/1.1', 'h2'):
+                for client_roles, status in ((['read', 'write'], 204), (['write', 'read'], 204),
+                                             (['read'], 403), (['write'], 403),
+                                             (['read', 'write', 7], 403), ([], 403)):
+                    claims = dict(valid, resource_access=dict(orders=dict(roles=client_roles)))
+                    assert request(port, '/client-all', signed(claims), version) == status
+                    checks += 1
+                split = dict(valid, resource_access=dict(orders=dict(roles=['read']), other=dict(roles=['write'])))
+                assert request(port, '/client-all', signed(split), version) == 403
+                checks += 1
+        for client, role, second in (('bad/client', 'read', 'write'), ('orders', '', 'write'),
+                                      ('orders', 'read', 'read'), ('orders', 'read', '')):
+            with gateway(args, root, client=client, role=role, forbidden=second, client_all=True) as port:
+                assert request(port, '/client-all', signed(valid), 'h2') == 503
                 checks += 1
         for subject in ('', 'x' * 129):
             with gateway(args, root, subject=subject) as port:
