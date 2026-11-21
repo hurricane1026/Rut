@@ -571,6 +571,7 @@ All commands take a validated private input snapshot.
 | Command after `rut-consumers` | Effect |
 | --- | --- |
 | `inspect-consumer INPUT CONSUMER_ID` | Print the selected Consumer's metadata as one JSON object. |
+| `inspect-credential INPUT CREDENTIAL_ID` | Print one credential's metadata with secret and verifier fields omitted. |
 
 ## Product scope
 
