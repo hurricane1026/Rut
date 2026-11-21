@@ -11285,6 +11285,10 @@ original TTL retention on both backends, including service TLS. This adds no
 runtime operation or syntax, and provides no replica promotion or stale-restore
 fencing. See [the recovery boundary](docs/auth-replay.md#confirmed-local-aof-profile).
 
+The durable Standard Webhooks rotation example composes the static two-key verifier
+with confirmed local AOF replay claims. Both keys share one stable signer namespace
+and event identity across Redis and gateway restarts; see [the replay contract](docs/auth-replay.md).
+
 `JwksFetch` extends the cold RS256/ES256 refresh lifecycle with a connected
 nonblocking UDP A query with a bounded CNAME answer chain and optional
 authenticated metadata fetch before the JWKS GET. A single response permits at

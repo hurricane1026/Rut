@@ -74,6 +74,12 @@ requires acknowledged RESET/release before returning the same 1/0/-1 statuses.
 Use [webhook-durable-replay-auth.rut](../examples/webhook-durable-replay-auth.rut)
 or [signed-request-durable-replay-auth.rut](../examples/signed-request-durable-replay-auth.rut).
 The ordinary profile remains available with its original contract.
+[webhook-durable-rotation-replay-auth.rut](../examples/webhook-durable-rotation-replay-auth.rut)
+combines the same confirmed claim with static current/previous Standard Webhooks
+keys. Both slots share the configured signer namespace and event ID; the matched
+key is never part of the claim. Keep the namespace and Redis database stable when
+switching keys or restarting the gateway. The overlap and removal are configured
+at restart; this does not create a dynamic key registry or extend claim retention.
 
 The trusted endpoint must be Redis 7.2 or newer, with local AOF enabled, no
 live-key eviction and an ACL permitting AUTH, SELECT, SET and WAITAOF. RESET
@@ -110,6 +116,10 @@ requires a successful barrier and cleanup before returning 0/409. A SET may have
 applied before any of these failures: keep its claim, do not compensate with DEL,
 and do not automatically retry. A held barrier cannot publish 204 before its reply;
 successful barrier confirmation alone cannot bypass a failed RESET.
+
+The TLS rotation fixture verifies old-key admission, Redis SIGKILL/AOF recovery,
+same-ID rejection under the new key, overlap, and previous-key removal across
+gateway restarts.
 
 The tested recovery boundary is a **single authoritative instance and its intact
 AOF volume**, with normal clocks and no live-key eviction. Pinned Redis 7.2.11
