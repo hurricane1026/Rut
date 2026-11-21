@@ -2,6 +2,8 @@
 
 #include "rut/common/types.h"
 
+#include <stdint.h>
+
 namespace rut {
 namespace {
 
@@ -108,6 +110,40 @@ static_assert(
         return true;
     }(),
     "Pinned receive commit violates buffered response suffix contract");
+
+consteval bool direct_write_extent_contract() {
+    constexpr u64 kBegin = 32;
+    constexpr u32 kCapacity = 8;
+    // Compare to an end-position oracle in a wider integer domain. Include
+    // offsets that alias a valid position if narrowed before validation.
+    const u64 kAddresses[] = {kBegin - 1,
+                              kBegin,
+                              kBegin + 3,
+                              kBegin + 7,
+                              kBegin + 8,
+                              kBegin + 9,
+                              kBegin + (1ULL << 32),
+                              UINT64_MAX};
+    const u32 kCounts[] = {0, 1, 5, 6, 8, 9, UINT32_MAX};
+    for (const u64 kAddress : kAddresses) {
+        for (const u32 kCount : kCounts) {
+            u32 tail_dirty = 2;
+            u32 node_dirty = 6;
+            const bool kValid = kAddress >= kBegin && kAddress <= kBegin + kCapacity &&
+                                kAddress + kCount <= kBegin + kCapacity;
+            if (detail::record_direct_write_extent(
+                    kBegin, kAddress, kCapacity, kCount, tail_dirty, node_dirty) != kValid)
+                return false;
+            const u64 kEnd = kValid ? kAddress + kCount - kBegin : 0;
+            if (tail_dirty != (kEnd > 2 ? kEnd : 2) || node_dirty != (kEnd > 6 ? kEnd : 6))
+                return false;
+        }
+    }
+    return true;
+}
+
+static_assert(direct_write_extent_contract(),
+              "Direct receive violates physical write extent contract");
 }  // namespace
 
 void ResponseBodyChain::consume(u32 len, bool tail_pinned, bool recycle_bulk) {

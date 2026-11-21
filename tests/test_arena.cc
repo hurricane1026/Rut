@@ -1283,6 +1283,29 @@ TEST(response_body_chain, direct_dirty_extent_is_zeroed_without_logical_commit) 
     pool.destroy();
 }
 
+TEST(response_body_chain, rejected_direct_write_preserves_logical_and_physical_extents) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool));
+    const u32 kRoom = chain.write_avail(pool);
+    auto* first = chain.tail;
+    u8* first_bytes = chain.write_ptr(pool);
+    chain.commit(kRoom);
+    REQUIRE(chain.reserve_tail(pool));
+    u8* dst = chain.write_ptr(pool);
+    const u32 kCapacity = chain.write_avail(pool);
+    REQUIRE(chain.record_direct_write(chain.tail, dst + kCapacity - 2, 1, pool));
+    CHECK(!chain.record_direct_write(first, first_bytes, 1, pool));
+    CHECK(!chain.record_direct_write(chain.tail, dst + kCapacity - 1, 2, pool));
+    CHECK_EQ(chain.tail_dirty_end, kCapacity - 1);
+    CHECK_EQ(chain.tail->dirty_end, kCapacity - 1);
+    CHECK_EQ(chain.size, kRoom);
+    CHECK_EQ(chain.tail->len, 0u);
+    chain.release();
+    pool.destroy();
+}
+
 TEST(response_body_chain, direct_dirty_extent_resets_when_tail_changes) {
     SlicePool pool;
     REQUIRE(pool.init(4).has_value());
