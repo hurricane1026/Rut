@@ -99,3 +99,20 @@ func requireRealmRoleWithout(_ document: Json, _ required: str, _ forbidden: str
     guard jwtHasGroup(projected, required) && !jwtHasGroup(projected, forbidden) else { respond 403 }
     document
 }
+
+// Select one client object and validate its complete role array.
+func clientRolesMatch(_ document: Json, _ client: str, _ first: str, _ second: str, _ exclude: bool) -> bool {
+    guard let resources = json.get(document, "/resource_access") else { false }
+    guard json.kind(resources).or("") == "object" else { false }
+    guard let resource = json.get(resources, "/" + client) else { false }
+    guard json.kind(resource).or("") == "object" else { false }
+    guard let roles = json.get(resource, "/roles") else { false }
+    guard let projected = json.value({groups: roles}) else { false }
+    jwtHasGroup(projected, first) && (jwtHasGroup(projected, second) != exclude)
+}
+
+func requireClientRoleWithout(_ document: Json, _ client: str, _ allowed: str, _ forbidden: str) -> Json {
+    guard clientValid(client) && roleValid(allowed) && roleValid(forbidden) && allowed != forbidden else { respond 503 }
+    guard clientRolesMatch(document, client, allowed, forbidden, true) else { respond 403 }
+    document
+}
