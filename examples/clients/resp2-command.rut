@@ -240,3 +240,14 @@ func resp2ExpireRequest(_ key: Bytes, _ amount: i32, _ milliseconds: bool, _ con
     guard let prefix = concatBytes(named, arguments, 8192) else { nil }
     concatBytes(prefix, resp2ExpireCondition(condition), 8192)
 }
+
+// Always write, including repeated logout and absent permits. A DEL returning
+// zero would not establish this connection's write offset for the AOF barrier.
+func sessionRevokeRequest(_ key: Bytes, _ expiry: Bytes) {
+    guard let keyed = resp2BulkArgument(key, 8192) else { nil }
+    guard let expiration = resp2BulkArgument(expiry, 8192) else { nil }
+    guard let prefix = concatBytes(b"*5\r\n$3\r\nSET\r\n", keyed, 8192) else { nil }
+    guard let arguments = concatBytes(prefix, b"$7\r\nrevoked\r\n$4\r\nEXAT\r\n", 8192) else { nil }
+    guard let write = concatBytes(arguments, expiration, 8192) else { nil }
+    concatBytes(write, b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192)
+}

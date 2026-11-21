@@ -1741,6 +1741,12 @@ failure-closed behavior and TLS. The existing acknowledged-DEL logout remains
 available. See [the durability boundary](jwt-sessions.md#local-aof-durable-logout);
 replica/failover consensus and cancellation of admitted work remain outside it.
 
+The [browser logout profile](jwt-sessions.md#browser-logout-with-durable-revocation)
+requires the fixed cookie, exact Origin and same-origin Fetch Metadata. It
+reuses exact-token durable revocation and sends the clear cookie only after
+the AOF barrier and connection cleanup succeed. HTTPS fixtures on both Linux
+backends cover malformed and ambiguous cookies and retention on storage failure.
+
 ### Keycloak role claim adapter
 
 The free `keycloak` Rut module maps the documented `realm_access.roles` and
