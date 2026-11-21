@@ -970,6 +970,7 @@ int main(int argc, char** argv) {
     const char* tls_key_path = nullptr;
     const char* tls_client_ca_path = nullptr;
     const char* tls_client_crl_path = nullptr;
+    bool tls_client_crl_verify_issuer = false;
     const char* config_path = nullptr;
     ListenerSpec source_listener{};
     bool source_listener_present = false;
@@ -1000,7 +1001,7 @@ int main(int argc, char** argv) {
     //                      [--shards N] [--no-pin] [--drain N]
     //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
-    //                      [--tls-client-crl PATH]
+    //                      [--tls-client-crl PATH] [--tls-client-crl-verify-issuer]
     //                      [--access-log PATH] [--access-log-compress] [--access-log-path-only]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
@@ -1207,6 +1208,7 @@ int main(int argc, char** argv) {
             cli_access_log_compress_present = true;
         }
         if (str_eq(argv[i], "--access-log-path-only")) cli_access_log_path_only = true;
+        if (str_eq(argv[i], "--tls-client-crl-verify-issuer")) tls_client_crl_verify_issuer = true;
         if (str_eq(argv[i], "--h2")) offer_h2 = true;
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
@@ -1238,7 +1240,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (tls_cert_path || tls_key_path || tls_client_ca_path || tls_client_crl_path ||
-            offer_h2) {
+            tls_client_crl_verify_issuer || offer_h2) {
             write_str(
                 "eBPF plan diagnostics use source listener metadata; TLS/h2 CLI options are "
                 "unsupported\n");
@@ -1296,10 +1298,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (tls_client_crl_verify_issuer && !tls_client_crl_path) {
+        write_str("--tls-client-crl-verify-issuer requires --tls-client-crl\n");
+        return 1;
+    }
+
     TlsServerContext* tls_server = nullptr;
     if (tls_cert_path && tls_key_path) {
-        auto tls_result = create_tls_server_context(
-            tls_cert_path, tls_key_path, offer_h2, tls_client_ca_path, tls_client_crl_path);
+        auto tls_result = create_tls_server_context(tls_cert_path,
+                                                    tls_key_path,
+                                                    offer_h2,
+                                                    tls_client_ca_path,
+                                                    tls_client_crl_path,
+                                                    tls_client_crl_verify_issuer);
         if (!tls_result) {
             write_error("Failed to initialize TLS", tls_result.error());
             return 1;

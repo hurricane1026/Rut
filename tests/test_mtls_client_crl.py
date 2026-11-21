@@ -34,7 +34,7 @@ def base_command(args, source, port):
 
 
 @contextmanager
-def gateway(args, root, crl, keep_file=False):
+def gateway(args, root, crl, keep_file=False, strict_issuer=False):
     folder = root / str(time.monotonic_ns())
     folder.mkdir()
     original = Path(args.source).resolve()
@@ -55,7 +55,8 @@ def gateway(args, root, crl, keep_file=False):
                MTLS_FIRST_ID='alice-cert', MTLS_SECOND_ID='bob-cert')
     log = folder / 'gateway.log'
     with log.open('w') as out:
-        process = subprocess.Popen(base_command(args, source, port) + ['--tls-client-crl', str(snapshot)],
+        process = subprocess.Popen(base_command(args, source, port) + ['--tls-client-crl', str(snapshot)] +
+                                   (['--tls-client-crl-verify-issuer'] if strict_issuer else []),
                                    env=env, stdout=out, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 60
@@ -140,6 +141,14 @@ def startup_rejections(args, root):
         if args.backend == 'io_uring' and b'io_uring is unavailable' in result.stderr + result.stdout:
             raise SystemExit(77)
         assert result.returncode == 1 and b'Failed to initialize TLS' in result.stderr + result.stdout, (name, result)
+    for name in ('bad-signature.pem', 'wrong-issuer.pem'):
+        result = subprocess.run(base_command(args, source, 0) +
+                                ['--tls-client-crl', str(root / name), '--tls-client-crl-verify-issuer'],
+                                capture_output=True, timeout=10)
+        assert result.returncode == 1 and b'Failed to initialize TLS' in result.stderr + result.stdout, (name, result)
+    result = subprocess.run([args.server, '0', str(source), '--tls-client-crl-verify-issuer'],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 1 and b'--tls-client-crl-verify-issuer requires' in result.stderr + result.stdout
     bundle = root / 'ca-with-crl.pem'
     bundle.write_bytes((Path(args.testdata) / 'localhost_cert.pem').read_bytes() +
                        (root / 'clear.pem').read_bytes())
@@ -157,6 +166,9 @@ def startup_rejections(args, root):
 def exercise(args, root):
     subprocess.run([args.helper, args.testdata, str(root)], check=True, timeout=10)
     startup_rejections(args, root)
+    with gateway(args, root, 'revoked.pem', strict_issuer=True) as (port, _):
+        denied(port, context(args, root, 'first.pem', ssl.TLSVersion.TLSv1_3))
+        allowed(port, context(args, root, 'second.pem', ssl.TLSVersion.TLSv1_3), b'bob')
     for profile in ('revoked.pem', 'bad-signature.pem', 'wrong-issuer.pem'):
         with gateway(args, root, profile) as (port, _):
             for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):

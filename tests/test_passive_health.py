@@ -18,8 +18,8 @@ from auth_h2_fixture import request as h2_request
 class Origin(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self):
-        super().__init__(('127.0.0.1', 0), Handler)
+    def __init__(self, port=0):
+        super().__init__(('127.0.0.1', port), Handler)
         self.codes = []
         self.observed = 0
         self.persistent = True
@@ -171,11 +171,26 @@ def main():
         origin.informational = False
         with socket.socket() as reserved:
             reserved.bind(('127.0.0.1', 0))
-            endpoints = f'"127.0.0.1:{reserved.getsockname()[1]}": 1, {endpoint}: 1'
+            refused_port = reserved.getsockname()[1]
+            endpoints = f'"127.0.0.1:{refused_port}": 1, {endpoint}: 1'
             with gateway(args, endpoints, 'leastRequests') as (port, _, __):
-                results = [h2_request(port, '/', [])[0] for _ in range(12)]
-                assert results.count(502) == 2 and results[-6:] == [200] * 6, results
-                assert origin.observed == results.count(200), (origin.observed, results)
+                assert [h2_request(port, '/', [])[0] for _ in range(2)] == [200, 200]
+                reserved.close()
+                resurrected = Origin(refused_port)
+                resurrected.codes = [200]
+                resurrected.persistent = False
+                resurrected_thread = threading.Thread(target=resurrected.serve_forever, daemon=True)
+                resurrected_thread.start()
+                try:
+                    origin.observed = 0
+                    results = [h2_request(port, '/', [])[0] for _ in range(8)]
+                    assert results == [200] * len(results), results
+                    assert resurrected.observed == 0, resurrected.observed
+                    assert origin.observed == len(results), (origin.observed, results)
+                finally:
+                    resurrected.shutdown()
+                    resurrected.server_close()
+                    resurrected_thread.join(timeout=2)
         # Active checks restore a latched passive target only after their full streak.
         origin.codes = [503, 503, 200]
         origin.observed = origin.probes = 0
