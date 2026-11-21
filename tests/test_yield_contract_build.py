@@ -147,6 +147,16 @@ def main():
         source = "src/runtime/io_event.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
+            ("event.copy_begin == expected_begin &&", ""),
+            ("event.copy_end >= event.copy_begin &&", ""),
+            ("event.result > 0 &&", "event.result >= 0 &&"),
+            ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
+            ("event.copy_end - event.copy_begin ==", "event.copy_end - event.copy_begin >="),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
+            check(compiler, root, overlay, "Response copy violates positive span contract", source=source)
+            probe.unlink()
+        for before, after in [
             ("token.aux) << 56", "token.aux) << 55"),
             ("token.episode = kInvalidUpstreamEventEpisode;", "token.episode = 0;"),
             ("case IoEventType::RelayWrite:\n            return true;",

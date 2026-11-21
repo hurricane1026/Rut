@@ -2,6 +2,8 @@
 
 #include "rut/common/types.h"
 
+#include <stdint.h>
+
 namespace rut {
 namespace {
 
@@ -68,6 +70,37 @@ consteval bool upstream_wire_contract() {
 
 static_assert(upstream_wire_contract(),
               "Upstream completion token violates wire or episode contract");
+
+// Compare the observed end to a widened sum, including endpoints that would
+// alias a valid buffer position if the sum wrapped in 32 bits.
+consteval bool positive_copy_span_contract() {
+    constexpr u32 kOffsets[] = {0, 1, 2, UINT32_MAX - 1, UINT32_MAX};
+    constexpr i32 kResults[] = {-1, 0, 1, 2, INT32_MAX};
+    constexpr IoEventCopyWitness kWitnesses[] = {
+        IoEventCopyWitness::None, IoEventCopyWitness::Invalid, IoEventCopyWitness::Full};
+    IoEvent event{};
+    for (const auto kWitness : kWitnesses) {
+        event.copy_witness = kWitness;
+        for (const u32 kBegin : kOffsets) {
+            event.copy_begin = kBegin;
+            for (const u32 kEnd : kOffsets) {
+                event.copy_end = kEnd;
+                for (const i32 kResult : kResults) {
+                    event.result = kResult;
+                    for (const u32 kCursor : kOffsets) {
+                        const bool kMatches = kWitness == IoEventCopyWitness::Full && kResult > 0 &&
+                                              kBegin == kCursor &&
+                                              static_cast<i64>(kCursor) + kResult == kEnd;
+                        if (matches_positive_copy_span(event, kCursor) != kMatches) return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static_assert(positive_copy_span_contract(), "Response copy violates positive span contract");
 
 }  // namespace
 }  // namespace rut
