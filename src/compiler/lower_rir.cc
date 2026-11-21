@@ -1874,8 +1874,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
-    if (value.kind == MirValueKind::ReqCookie) {
-        auto v = b.emit_req_cookie(value.str_value, {span.line, span.col});
+    if (value.kind == MirValueKind::ReqCookie || value.kind == MirValueKind::ReqUniqueCookie) {
+        auto v = b.emit_req_cookie(
+            value.str_value, {span.line, span.col}, value.kind == MirValueKind::ReqUniqueCookie);
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }

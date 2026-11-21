@@ -225,6 +225,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqContentLength:
             buf.put_cstr("req.content_length");
             break;
+        case Opcode::ReqUniqueCookie:
+            buf.put_cstr("req.uniqueCookie");
+            break;
         case Opcode::ReqCookie:
             buf.put_cstr("req.cookie");
             break;
@@ -772,6 +775,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ReqParam:
         case Opcode::ReqQuery:
         case Opcode::ReqCookie:
+        case Opcode::ReqUniqueCookie:
             buf.put(' ');
             print_quoted_str(buf, inst.imm.str_val);
             break;

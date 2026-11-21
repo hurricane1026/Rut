@@ -48484,8 +48484,10 @@ TEST(frontend, consistent_hash_arguments_and_key_types) {
         auto ast = parse_file_heap(tokens.value());
         if (ast) CHECK_FALSE(analyze_file_heap(ast.value()));
     }
-    for (const char* key :
-         {"req.path", "req.remoteAddr", "req.header(\"X-Key\").or(\"fallback\")"}) {
+    for (const char* key : {"req.path",
+                            "req.remoteAddr",
+                            "req.header(\"X-Key\").or(\"fallback\")",
+                            "req.uniqueCookie(\"sid\").or(\"fallback\")"}) {
         const std::string source =
             std::string(
                 "upstream api at \"127.0.0.1:9001\"\nroute GET \"/\" { return forward(api, "
@@ -48636,5 +48638,22 @@ TEST(frontend, active_tcp_health_rejects_http_fields_invalid_types_and_timeouts)
         auto tokens = lex(lit(source));
         REQUIRE(tokens);
         CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+}
+
+TEST(frontend, unique_cookie_requires_literal_token_name) {
+    const char* args[] = {"\"\"", "\"bad name\"", "\"a=b\"", "name", "42"};
+    for (const char* arg : args) {
+        char src[256];
+        snprintf(
+            src,
+            sizeof(src),
+            "route GET \"/\" { let name = \"sid\" let value = req.uniqueCookie(%s) return 200 }\n",
+            arg);
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        CHECK(!analyze_file_heap(ast.value()));
     }
 }
