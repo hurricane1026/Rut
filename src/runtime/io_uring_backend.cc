@@ -296,7 +296,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     cq_ring_entries = params.cq_entries;
 
     // Map SQ ring
-    sq_ring_sz = params.sq_off.array + params.sq_entries * sizeof(u32);
+    sq_ring_sz =
+        static_cast<u64>(params.sq_off.array) + static_cast<u64>(params.sq_entries) * sizeof(u32);
     sq_ring_ptr = mmap(nullptr,
                        sq_ring_sz,
                        PROT_READ | PROT_WRITE,
@@ -311,11 +312,11 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
 
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
-    sq_head = reinterpret_cast<u32*>(sq_base + params.sq_off.head);
-    sq_tail = reinterpret_cast<u32*>(sq_base + params.sq_off.tail);
-    sq_flags = reinterpret_cast<u32*>(sq_base + params.sq_off.flags);
-    sq_ring_mask = reinterpret_cast<u32*>(sq_base + params.sq_off.ring_mask);
-    sq_array = reinterpret_cast<u32*>(sq_base + params.sq_off.array);
+    sq_head = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.head));
+    sq_tail = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.tail));
+    sq_flags = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.flags));
+    sq_ring_mask = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.ring_mask));
+    sq_array = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.array));
 
     // Map SQEs
     sqes_sz = params.sq_entries * sizeof(io_uring_sqe);
@@ -334,7 +335,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     sq_entries = static_cast<io_uring_sqe*>(sqes_ptr);
 
     // Map CQ ring
-    cq_ring_sz = params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe);
+    cq_ring_sz = static_cast<u64>(params.cq_off.cqes) +
+                 static_cast<u64>(params.cq_entries) * sizeof(io_uring_cqe);
     cq_ring_ptr = mmap(nullptr,
                        cq_ring_sz,
                        PROT_READ | PROT_WRITE,
@@ -349,10 +351,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
 
     auto* cq_base = static_cast<u8*>(cq_ring_ptr);
-    cq_head = reinterpret_cast<u32*>(cq_base + params.cq_off.head);
-    cq_tail = reinterpret_cast<u32*>(cq_base + params.cq_off.tail);
-    cq_ring_mask = reinterpret_cast<u32*>(cq_base + params.cq_off.ring_mask);
-    cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + params.cq_off.cqes);
+    cq_head = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.head));
+    cq_tail = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.tail));
+    cq_ring_mask = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.ring_mask));
+    cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + static_cast<i64>(params.cq_off.cqes));
 
     // Terminal-recv quarantine inventory (see the header): a FIFO ring sized for
     // the worst case of one window per CQ slot, plus an 8-byte-per-connection
