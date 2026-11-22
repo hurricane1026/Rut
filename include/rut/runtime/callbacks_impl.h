@@ -16430,22 +16430,27 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
         bool rewritten = false;
         if (kHdrEnd > 0) {
-            for (u32 j = 0; j + 14 <= kHdrEnd; j++) {
-                if (d[j] == '\r' && d[j + 1] == '\n' && ascii_ci_eq(d + j + 2, "connection", 10) &&
-                    d[j + 12] == ':') {
-                    u32 val_start = j + 13;
+            for (u32 j = 0; static_cast<i64>(j) + 14 <= static_cast<i64>(kHdrEnd); j++) {
+                if (d[j] == '\r' && d[static_cast<i64>(j) + 1] == '\n' &&
+                    ascii_ci_eq(d + static_cast<i64>(j) + 2, "connection", 10) &&
+                    d[static_cast<i64>(j) + 12] == ':') {
+                    u32 val_start = static_cast<u32>(static_cast<i64>(j) + 13);
                     while (val_start < kHdrEnd && d[val_start] == ' ') val_start++;
                     u32 val_end = val_start;
-                    while (val_end + 1 < kHdrEnd && (d[val_end] != '\r' || d[val_end + 1] != '\n'))
+                    while (static_cast<i64>(val_end) + 1 < static_cast<i64>(kHdrEnd) &&
+                           (d[val_end] != '\r' || d[static_cast<i64>(val_end) + 1] != '\n'))
                         val_end++;
-                    const u32 kValLen = val_end - val_start;
+                    const u32 kValLen =
+                        static_cast<u32>(static_cast<i64>(val_end) - static_cast<i64>(val_start));
                     if (kValLen >= 5) {
                         d[val_start] = 'c';
                         d[val_start + 1] = 'l';
                         d[val_start + 2] = 'o';
                         d[val_start + 3] = 's';
                         d[val_start + 4] = 'e';
-                        for (u32 k = val_start + 5; k < val_end; k++) d[k] = ' ';
+                        for (u32 k = static_cast<u32>(static_cast<i64>(val_start) + 5); k < val_end;
+                             k++)
+                            d[k] = ' ';
                         rewritten = true;
                     }
                     break;
@@ -16454,8 +16459,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
 
         if (!rewritten && kHdrEnd > 0) {
-            const u32 kBodyStart = kHdrEnd + kHeaderEndLen;
-            const u32 kRawBodyLen = (kLen > kBodyStart) ? kLen - kBodyStart : 0;
+            const u32 kBodyStart =
+                static_cast<u32>(static_cast<i64>(kHdrEnd) + static_cast<i64>(kHeaderEndLen));
+            const u32 kRawBodyLen =
+                kLen > kBodyStart ? static_cast<u32>(static_cast<i64>(kLen) - kBodyStart) : 0;
             u32 body_len = kRawBodyLen;
             if (conn.resp_body_mode == BodyMode::None)
                 body_len = 0;
@@ -16463,11 +16470,14 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                      body_len > resp.content_length)
                 body_len = resp.content_length;
             static const char kConnClose[] = "Connection: close\r\n";
-            if (kHdrEnd + kConnCloseLen + kHeaderEndLen + body_len <= conn.send_buf.capacity()) {
+            const i64 drain_len = static_cast<i64>(kHdrEnd) + kConnCloseLen + kHeaderEndLen +
+                                  static_cast<i64>(body_len);
+            if (drain_len <= static_cast<i64>(conn.send_buf.capacity())) {
                 conn.send_buf.reset();
-                conn.send_buf.write(d, kHdrEnd + 2);
+                conn.send_buf.write(d, static_cast<u32>(static_cast<i64>(kHdrEnd) + 2));
                 conn.send_buf.write(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);
-                conn.send_buf.write(d + kHdrEnd + 2, 2 + body_len);
+                conn.send_buf.write(d + static_cast<i64>(kHdrEnd) + 2,
+                                    static_cast<u32>(static_cast<i64>(body_len) + 2));
                 conn.keep_alive = false;
                 conn.resp_body_sent = conn.send_buf.len();
                 const bool kDrainBodyDone =
