@@ -1512,11 +1512,12 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         d.conn->forward_load_balance = load_balance;
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
-            dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
+            dst.name = {reinterpret_cast<const char*>(h2->pending_synth +
+                                                      static_cast<i64>(mutations[i].name_offset)),
                         mutations[i].name_len};
-            dst.value = {
-                reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
-                mutations[i].value_len};
+            dst.value = {reinterpret_cast<const char*>(h2->pending_synth +
+                                                       static_cast<i64>(mutations[i].value_offset)),
+                         mutations[i].value_len};
             dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
         }
         d.conn->resp_header_mutation_count = mutation_count;
@@ -2060,16 +2061,21 @@ void h2_on_data_cb(
         }
     }
     if (c.pending_stream != stream_id) return;
-    if (c.pending_body_len > 0xffffffffu - len) {
+    if (static_cast<i64>(c.pending_body_len) >
+        static_cast<i64>(UINT32_MAX) - static_cast<i64>(len)) {
         c.pending_overflow = true;
     } else {
-        c.pending_body_len += len;
+        c.pending_body_len =
+            static_cast<u32>(static_cast<i64>(c.pending_body_len) + static_cast<i64>(len));
     }
-    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_buffer_body && static_cast<i64>(c.pending_synth_len) + static_cast<i64>(len) >
+                                     static_cast<i64>(Http2Conn::kBodySynthCap)) {
         c.pending_overflow = true;
     } else if (c.pending_buffer_body) {
-        for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
-        c.pending_synth_len += len;
+        for (u32 i = 0; i < len; i++)
+            c.pending_synth[static_cast<i64>(c.pending_synth_len) + static_cast<i64>(i)] = data[i];
+        c.pending_synth_len =
+            static_cast<u32>(static_cast<i64>(c.pending_synth_len) + static_cast<i64>(len));
     }
     if (end_stream) h2_finish_body(*d, stream_id);
 }
