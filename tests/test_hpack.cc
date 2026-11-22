@@ -189,6 +189,16 @@ TEST(hpack_string, plain_roundtrip) {
     CHECK(bytes_eq(out, reinterpret_cast<const u8*>(s), 10));
 }
 
+TEST(hpack_string, length_prefix_sentinel_and_continuation_boundaries) {
+    u8 input[128] = {};
+    u8 enc[256];
+    CHECK_EQ(hpack::encode_string(enc, input, 126), 127);
+    CHECK_EQ(hpack::encode_string(enc, input, 127), 129);
+    CHECK_EQ(hpack::encode_string(enc, input, 128), 130);
+    CHECK_EQ(enc[0], 0x7f);
+    CHECK_EQ(enc[1], 0x01);
+}
+
 TEST(hpack_string, chooses_huffman_when_shorter) {
     // "www.example.com" is 15 raw but 12 Huffman → encoder sets the H bit.
     const char* s = "www.example.com";

@@ -207,7 +207,7 @@ bool Http2Conn::consume_data(u32 stream_id, u32 len) {
 namespace {
 constexpr i64 hpack_integer_octets(u32 value, u8 prefix_bits) {
     const u32 kPrefixMax = (1u << prefix_bits) - 1u;
-    if (value <= kPrefixMax) return 1;
+    if (value < kPrefixMax) return 1;
     i64 n = 1;
     value -= kPrefixMax;
     while (value >= 128) {
@@ -226,17 +226,19 @@ u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
     if (out_cap < kFrameHeaderSize) return 0;
     u32 o = kFrameHeaderSize;
+    static constexpr u32 kMaxFramePayload = 0x00ffffffu;
     for (u32 i = 0; i < n; i++) {
         // Prefix width follows the actual 32-bit lengths; check in i64 so huge
         // direct inputs are rejected before any pointer arithmetic.
         const i64 kWorst = static_cast<i64>(o) + hs[i].name.len + hs[i].value.len +
                            hpack_field_overhead(hs[i].name.len, hs[i].value.len);
-        if (kWorst > out_cap) return 0;
+        if (kWorst > out_cap || kWorst - kFrameHeaderSize > kMaxFramePayload) return 0;
         const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
         // kWorst is a complete write-before bound for encode_header.
         o += static_cast<u32>(kEncoded);
     }
     const u32 kPayload = o - kFrameHeaderSize;
+    if (kPayload > kMaxFramePayload) return 0;
     u8 flags = http2_flag::kEndHeaders;
     if (end_stream) flags |= http2_flag::kEndStream;
     Http2FrameHeader h;
@@ -249,6 +251,7 @@ u32 http2_write_headers(
 }
 
 u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream) {
+    if (len > 0x00ffffffu) return 0;
     Http2FrameHeader h;
     h.length = len;
     h.type = static_cast<u8>(Http2FrameType::Data);
@@ -288,6 +291,7 @@ static u32 http2_write_response_impl(u8* out,
                                      u32 body_len,
                                      bool headers_only,
                                      bool end_stream) {
+    if (body_len > 0x00ffffffu) return 0;
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
