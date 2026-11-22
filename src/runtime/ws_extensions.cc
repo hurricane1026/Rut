@@ -53,7 +53,8 @@ struct Cursor {
             if (byte < '0' || byte > '9' || result.digits >= 2)
                 result.decimal = false;
             else
-                result.number = result.number * 10 + byte - '0';
+                result.number = static_cast<u32>(static_cast<i64>(result.number) * 10 +
+                                                 static_cast<i64>(byte) - '0');
             ++result.digits;
             ++offset;
         }
@@ -229,12 +230,15 @@ u32 ws_rewrite_extensions(
         pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    const u64 kNewHeader =
-        static_cast<u64>(header_len) - static_cast<u64>(removed) +
-        (extension_value.len ? static_cast<u64>(kPrefix.len) + extension_value.len + 2ull : 0);
-    if (kNewHeader + static_cast<u64>(total_len) - static_cast<u64>(header_len) >
-        static_cast<u64>(capacity))
+    const i64 added = extension_value.len ? static_cast<i64>(kPrefix.len) +
+                                                static_cast<i64>(extension_value.len) + 2
+                                          : 0;
+    const i64 new_header_wide = static_cast<i64>(header_len) - static_cast<i64>(removed) + added;
+    if (new_header_wide < 0 ||
+        new_header_wide + static_cast<i64>(total_len) - static_cast<i64>(header_len) >
+            static_cast<i64>(capacity))
         return 0;
+    const u64 kNewHeader = static_cast<u64>(new_header_wide);
     u32 written = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
     for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
          static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
@@ -278,7 +282,9 @@ Str ws_selected_subprotocol(const u8* header, u32 header_len) {
             u32 start = static_cast<u32>(static_cast<i64>(colon) + 1);
             u32 end = kEnd;
             while (start < end && (header[start] == ' ' || header[start] == '\t')) ++start;
-            while (end > start && (header[end - 1] == ' ' || header[end - 1] == '\t')) --end;
+            while (end > start && (header[static_cast<i64>(end) - 1] == ' ' ||
+                                   header[static_cast<i64>(end) - 1] == '\t'))
+                end = static_cast<u32>(static_cast<i64>(end) - 1);
             return {reinterpret_cast<const char*>(header + static_cast<i64>(start)),
                     static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
         }
