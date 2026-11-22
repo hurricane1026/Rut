@@ -641,6 +641,20 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.int_value = expr.int_value;
         return v;
     }
+    if (expr.kind == HirExprKind::IpParse) {
+        if (!expr.lhs || expr.lhs->type != HirTypeKind::Str || expr.lhs->may_nil ||
+            expr.lhs->may_error || expr.type != HirTypeKind::IP || !expr.may_nil || expr.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto text = mir_value(*expr.lhs, module, fn, ctx);
+        if (!text) return core::make_unexpected(text.error());
+        if (!fn->values.push(text.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.kind = MirValueKind::IpParse;
+        v.type = MirTypeKind::IP;
+        v.may_nil = true;
+        v.lhs = &fn->values[fn->values.len - 1];
+        return v;
+    }
     if (expr.kind == HirExprKind::RegexMatch || expr.kind == HirExprKind::RegexCapture) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());

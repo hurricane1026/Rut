@@ -1955,6 +1955,24 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, b);
             break;
         }
+        case rir::Opcode::IpParse: {
+            const auto kText = c.get_value(inst.operand(0));
+            LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty};
+            const auto kType = LLVMFunctionType(c.i8_ty, params, 3, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_ip_parse");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_ip_parse", kType);
+            const auto kOutput = LLVMBuildAlloca(c.builder, c.i32_ty, "ip.output");
+            LLVMValueRef args[] = {LLVMBuildExtractValue(c.builder, kText, 0, "ip.ptr"),
+                                   LLVMBuildExtractValue(c.builder, kText, 1, "ip.len"),
+                                   kOutput};
+            const auto kHas = LLVMBuildCall2(c.builder, kType, helper, args, 3, "ip.has");
+            const auto kPayload = LLVMBuildLoad2(c.builder, c.i32_ty, kOutput, "ip.value");
+            auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result = LLVMBuildInsertValue(c.builder, result, kHas, 0, "");
+            result = LLVMBuildInsertValue(c.builder, result, kPayload, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::StrPredicate:
         case rir::Opcode::StrHasPrefix: {
             LLVMValueRef s = c.get_value(inst.operands[0]);

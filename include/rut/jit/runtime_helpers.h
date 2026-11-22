@@ -17,6 +17,8 @@ inline constexpr u32 kMaxConstantTimeEqualBytes = 16 * 1024;
 // data. JIT'd code passes raw request bytes; helpers parse as needed.
 
 extern "C" {
+// Strict IPv4 text -> network-order IP; false initializes output to zero.
+rut::u8 rut_helper_ip_parse(const char* data, rut::u32 length, rut::u32* output);
 // Strict signed decimal parsing. Always initializes output, including on failure.
 rut::u8 rut_helper_parse_int(const char* data, rut::u32 length, rut::u32 bits, rut::i64* output);
 // Raw byte search; returns an absolute byte offset, or -1 for missing/invalid input.

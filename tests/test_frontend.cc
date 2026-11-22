@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/ip_parse.h"
 #include "fixtures/query_all.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_trim.h"
@@ -183,6 +184,56 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     auto mir = build_mir(module);
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
+}
+
+TEST(frontend, ip_parse_lowers_optional_domain_values_and_hash_keys) {
+    const char* sources[] = {
+        test::ip_parse::kSource,
+        R"rut(upstream app at "127.0.0.1:9001"
+route GET "/" {
+    return forward(app, load_balance: .consistentHash,
+        hash_key: IP.parse(req.header("X-IP").or("")).or(req.remoteAddr),
+        hash_seed: "0123456789abcdef0123456789abcdef")
+})rut",
+    };
+    for (const auto* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        CHECK(function_has_op(rir.module.functions[0], rir::Opcode::IpParse));
+        rir.destroy();
+    }
+}
+
+TEST(frontend, ip_parse_rejects_wrong_arity_wrapped_values_and_shadowed_names) {
+    for (const auto* expression : {"IP.parse()",
+                                   "IP.parse(\"1.2.3.4\", \"1.2.3.4\")",
+                                   "IP.parse(123)",
+                                   "IP.parse(b\"1.2.3.4\")",
+                                   "IP.parse(req.header(\"X-IP\"))",
+                                   "IP.parse(\"1.2.3.4\").or(0)"}) {
+        const std::string source =
+            std::string("route GET \"/\" { let value = ") + expression + " return 200 }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+    auto tokens =
+        lex(lit("route GET \"/\" { let IP = 1 let value = IP.parse(\"1.2.3.4\") return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 static HeapFrontendResult<MirModule> build_mir_heap_for_internal_propagation(
     const HirModule& module) {

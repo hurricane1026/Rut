@@ -128,6 +128,12 @@ without presenting lossy or per-shard state as exact shared state.
   binary and invalid ranges, optional typing, helper/native composition and
   HTTP/1/HTTP/2 on both backends are covered; views retain their source lifetime.
 
+- [x] `IP.parse(str) -> IP?` adds allocation-free strict IPv4 text conversion,
+  with network-order scalar values compatible with `req.remoteAddr`, typed
+  helper/optional lowering and JIT/native execution. Octet boundaries, canonical
+  spelling and invalid-input/guard-page behavior have focused tests. IPv6 and
+  CIDR/Duration parsing remain separate M1 work.
+
 - [x] Expose byte-exact `str.trimPrefix(str)` / `str.trimSuffix(str)` as pure,
   allocation-free borrowed views through HIR/MIR/RIR, JIT and native compilation.
   Each removes one match; empty/nonmatching affixes preserve the input. Dynamic

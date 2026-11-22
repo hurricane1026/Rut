@@ -260,6 +260,7 @@ enum class Opcode : u8 {
     HttpTokenListAllows,
     HttpOriginListAllows,
     HashDigest,
+    IpParse,               // unwrapped Str -> Optional<IP>, network byte order
     StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
     StrPredicate,          // two Str operands, predicate id 0/1/2/3: prefix/suffix/contains/isEmpty
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool

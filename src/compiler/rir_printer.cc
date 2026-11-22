@@ -300,6 +300,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::BasicMatches:
             buf.put_cstr("auth.basic_matches");
             break;
+        case Opcode::IpParse:
+            buf.put_cstr("ip.parse");
+            break;
         case Opcode::StrConstantTimeEqual:
             buf.put_cstr("str.constant_time_equal");
             break;

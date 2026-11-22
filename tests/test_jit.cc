@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/ip_parse.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/query_all.h"
@@ -80,6 +81,7 @@ TEST(jit, crypto_c_abi_symbol_resolves_in_jit) {
     CHECK_EQ(output[31], 0xadu);
     engine.shutdown();
 }
+
 using namespace rut::jit;
 
 TEST(jit, native_helper_allowlist_matches_orc_symbol_bindings) {
@@ -197,6 +199,55 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     auto mir = build_mir(module);
     if (!mir) return {core::make_unexpected(mir.error())};
     return {mir.value()};
+}
+
+TEST(helpers, ip_parse_publishes_zero_on_failure_without_storage) {
+    u32 address = 123;
+    CHECK_EQ(rut_helper_ip_parse("0.0.0.0", 7, &address), 1u);
+    CHECK_EQ(address, 0u);
+    CHECK_EQ(rut_helper_ip_parse("bad", 3, &address), 0u);
+    CHECK_EQ(address, 0u);
+    CHECK_EQ(rut_helper_ip_parse(nullptr, 7, &address), 0u);
+    CHECK_EQ(address, 0u);
+    CHECK_EQ(rut_helper_ip_parse("1.2.3.4", 7, nullptr), 0u);
+}
+
+TEST(jit, ip_parse_executes_optional_helpers_and_fallback_without_an_arena) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::ip_parse::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        for (const auto& item : test::ip_parse::kCases) {
+            const std::string request =
+                std::string("POST / HTTP/1.1\r\nHost: local\r\nX-Expected: ") + item.expected +
+                "\r\nContent-Length: " + std::to_string(strlen(item.input)) + "\r\n\r\n" +
+                item.input;
+            const auto result =
+                HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              nullptr));
+            CHECK_EQ(result.status_code, item.status);
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
 }
 
 // Unwrap Expected.
