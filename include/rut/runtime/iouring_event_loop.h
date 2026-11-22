@@ -1081,11 +1081,13 @@ private:
         const u8* data = c.response_header_buf.data();
         if (data == nullptr || len < 16u || __builtin_memcmp(data, "HTTP/1.1 ", 9) != 0 ||
             data[9] < '1' || data[9] > '5' || data[10] < '0' || data[10] > '9' || data[11] < '0' ||
-            data[11] > '9' || data[12] != ' ' || data[len - 4] != '\r' || data[len - 3] != '\n' ||
-            data[len - 2] != '\r' || data[len - 1] != '\n')
+            data[11] > '9' || data[12] != ' ' || data[static_cast<i64>(len) - 4] != '\r' ||
+            data[static_cast<i64>(len) - 3] != '\n' || data[static_cast<i64>(len) - 2] != '\r' ||
+            data[static_cast<i64>(len) - 1] != '\n')
             return false;
-        const u16 status =
-            static_cast<u16>((data[9] - '0') * 100u + (data[10] - '0') * 10u + (data[11] - '0'));
+        const u16 status = static_cast<u16>((static_cast<i64>(data[9]) - '0') * 100 +
+                                            (static_cast<i64>(data[10]) - '0') * 10 +
+                                            static_cast<i64>(data[11]) - '0');
         return status == c.resp_status;
     }
 
@@ -1120,9 +1122,11 @@ private:
                 if (c.http1_prebuilt_deadline_config != nullptr &&
                     c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                         c.http1_prebuilt_deadline_bundle_id)) {
-                    copied_buffering = c.http1_prebuilt_deadline_config
-                                           ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                                           .response_buffering;
+                    copied_buffering =
+                        c.http1_prebuilt_deadline_config
+                            ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) -
+                                             1]
+                            .response_buffering;
                 }
                 if (!http1_pipeline_request_generation_prebuilt_is_stable(
                         c,
@@ -1173,7 +1177,8 @@ private:
             c.http1_prebuilt_status != c.resp_status)
             return false;
         const auto& bundle =
-            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1];
+            c.request_config
+                ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1];
         const bool bodyless_get_retained_policy =
             c.http1_prebuilt_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1209,9 +1214,12 @@ private:
             !c.request_config->failure_policy_id_is_valid(c.failure_policy_id) ||
             !c.request_config->timeout_failure_policy_id_is_valid(c.timeout_failure_policy_id))
             return false;
-        const auto& response = c.request_config->response_policies[c.response_policy_id - 1];
-        const auto& failure = c.request_config->failure_policies[c.failure_policy_id - 1];
-        const auto& timeout = c.request_config->failure_policies[c.timeout_failure_policy_id - 1];
+        const auto& response =
+            c.request_config->response_policies[static_cast<i64>(c.response_policy_id) - 1];
+        const auto& failure =
+            c.request_config->failure_policies[static_cast<i64>(c.failure_policy_id) - 1];
+        const auto& timeout =
+            c.request_config->failure_policies[static_cast<i64>(c.timeout_failure_policy_id) - 1];
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead) {
             if (!response_read_deadline_profile_suppresses_head(
                     c.http1_prebuilt_deadline_profile) ||
