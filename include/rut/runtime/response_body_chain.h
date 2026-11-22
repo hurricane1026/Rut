@@ -91,10 +91,15 @@ struct ResponseBodyChain {
     // Reserve before publishing: allocation failure leaves the existing bytes
     // and length unchanged, as required by the receive copy witness.
     bool append(SlicePool& pool, const u8* src, u32 len, u32 bulk_after = kBulkAfterPlaintext) {
-        if (len > kMaxBody - size || (owner && owner != &pool)) return false;
+        if (static_cast<i64>(len) > static_cast<i64>(kMaxBody) - static_cast<i64>(size) ||
+            (owner && owner != &pool))
+            return false;
         if (len == 0) return true;
-        const u32 spare = tail ? payload_capacity(pool, tail) - tail->len : 0;
-        u32 missing = len > spare ? len - spare : 0;
+        const u32 spare = tail ? static_cast<u32>(static_cast<i64>(payload_capacity(pool, tail)) -
+                                                  static_cast<i64>(tail->len))
+                               : 0;
+        u32 missing =
+            len > spare ? static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(spare)) : 0;
         Node* first = nullptr;
         Node* last = nullptr;
         while (missing != 0) {
@@ -110,22 +115,28 @@ struct ResponseBodyChain {
             if (!node) {
                 while (first) {
                     Node* next = first->next;
-                    pool.free_response_body_written(reinterpret_cast<u8*>(first),
-                                                    header_size() + first->dirty_end);
+                    const u32 extent = static_cast<u32>(static_cast<i64>(header_size()) +
+                                                        static_cast<i64>(first->dirty_end));
+                    pool.free_response_body_written(reinterpret_cast<u8*>(first), extent);
                     first = next;
                 }
                 return false;
             }
             node->next = nullptr;
             node->len = node->offset = 0;
-            node->dirty_end = previous_dirty > header_size() ? previous_dirty - header_size() : 0;
+            node->dirty_end = previous_dirty > header_size()
+                                  ? static_cast<u32>(static_cast<i64>(previous_dirty) -
+                                                     static_cast<i64>(header_size()))
+                                  : 0;
             if (last)
                 last->next = node;
             else
                 first = node;
             last = node;
             const u32 cap = payload_capacity(pool, node);
-            missing = missing > cap ? missing - cap : 0;
+            missing = missing > cap
+                          ? static_cast<u32>(static_cast<i64>(missing) - static_cast<i64>(cap))
+                          : 0;
         }
         Node* write = tail ? tail : first;
         if (tail)
@@ -137,15 +148,16 @@ struct ResponseBodyChain {
             tail_dirty_end = 0;
         }
         owner = &pool;
-        size += len;
+        size = static_cast<u32>(static_cast<i64>(size) + static_cast<i64>(len));
         while (len != 0) {
-            const u32 room = payload_capacity(pool, write) - write->len;
+            const u32 room = static_cast<u32>(static_cast<i64>(payload_capacity(pool, write)) -
+                                              static_cast<i64>(write->len));
             const u32 n = len < room ? len : room;
-            __builtin_memcpy(payload(write) + write->len, src, n);
-            write->len += n;
+            __builtin_memcpy(payload(write) + static_cast<i64>(write->len), src, n);
+            write->len = static_cast<u32>(static_cast<i64>(write->len) + static_cast<i64>(n));
             if (write->dirty_end < write->len) write->dirty_end = write->len;
-            src += n;
-            len -= n;
+            src += static_cast<i64>(n);
+            len = static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(n));
             write = write->next;
         }
         return true;
