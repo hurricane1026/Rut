@@ -49,21 +49,21 @@ static constexpr u64 u64_lit(const char* s) {
 static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
     constexpr u64 kMask8 = 0x2020202020202020ULL;
     constexpr u32 kMask4 = 0x20202020U;
-    u32 i = 0;
-    for (; i + 8 <= len; i += 8) {
+    i64 i = 0;
+    for (; i + 8 <= static_cast<i64>(len); i += 8) {
         u64 va = load_u64(a + i);
         u64 vb;
         __builtin_memcpy(&vb, b + i, 8);
         if ((va | kMask8) != (vb | kMask8)) return false;
     }
-    if (i + 4 <= len) {
+    if (i + 4 <= static_cast<i64>(len)) {
         u32 va = load_u32(a + i);
         u32 vb;
         __builtin_memcpy(&vb, b + i, 4);
         if ((va | kMask4) != (vb | kMask4)) return false;
         i += 4;
     }
-    for (; i < len; i++) {
+    for (; i < static_cast<i64>(len); i++) {
         if ((a[i] | 0x20) != (static_cast<u8>(b[i]) | 0x20)) return false;
     }
     return true;
@@ -99,60 +99,60 @@ static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
 // ============================================================================
 
 static inline HttpMethod parse_method_direct(const u8* buf, u32 end, u32& pos) {
-    if (UNLIKELY(pos + 4 > end)) return HttpMethod::Unknown;
+    if (UNLIKELY(static_cast<i64>(pos) + 4 > static_cast<i64>(end))) return HttpMethod::Unknown;
 
     // Fast path: load first 4 bytes and dispatch
     u32 v4 = load_u32(buf + pos);
 
     // 3-byte methods: "GET " or "PUT "
     if (v4 == u32_lit('G', 'E', 'T', ' ')) {
-        pos += 4;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 4);
         return HttpMethod::GET;
     }
     if (v4 == u32_lit('P', 'U', 'T', ' ')) {
-        pos += 4;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 4);
         return HttpMethod::PUT;
     }
 
     // 4-byte methods: "POST" + ' ' or "HEAD" + ' '
-    if (UNLIKELY(pos + 5 > end)) return HttpMethod::Unknown;
+    if (UNLIKELY(static_cast<i64>(pos) + 5 > static_cast<i64>(end))) return HttpMethod::Unknown;
     if (v4 == u32_lit('P', 'O', 'S', 'T') && buf[pos + 4] == ' ') {
-        pos += 5;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 5);
         return HttpMethod::POST;
     }
     if (v4 == u32_lit('H', 'E', 'A', 'D') && buf[pos + 4] == ' ') {
-        pos += 5;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 5);
         return HttpMethod::HEAD;
     }
 
     // 5-byte methods
-    if (UNLIKELY(pos + 6 > end)) return HttpMethod::Unknown;
+    if (UNLIKELY(static_cast<i64>(pos) + 6 > static_cast<i64>(end))) return HttpMethod::Unknown;
     if (v4 == u32_lit('P', 'A', 'T', 'C') && buf[pos + 4] == 'H' && buf[pos + 5] == ' ') {
-        pos += 6;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 6);
         return HttpMethod::PATCH;
     }
     if (v4 == u32_lit('T', 'R', 'A', 'C') && buf[pos + 4] == 'E' && buf[pos + 5] == ' ') {
-        pos += 6;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 6);
         return HttpMethod::TRACE;
     }
 
     // 6-byte method: "DELETE"
-    if (UNLIKELY(pos + 7 > end)) return HttpMethod::Unknown;
+    if (UNLIKELY(static_cast<i64>(pos) + 7 > static_cast<i64>(end))) return HttpMethod::Unknown;
     if (v4 == u32_lit('D', 'E', 'L', 'E') && buf[pos + 4] == 'T' && buf[pos + 5] == 'E' &&
         buf[pos + 6] == ' ') {
-        pos += 7;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 7);
         return HttpMethod::DELETE;
     }
 
     // 7-byte methods: "OPTIONS" or "CONNECT"
-    if (UNLIKELY(pos + 8 > end)) return HttpMethod::Unknown;
+    if (UNLIKELY(static_cast<i64>(pos) + 8 > static_cast<i64>(end))) return HttpMethod::Unknown;
     u32 hi = load_u32(buf + pos + 4);
     if (v4 == u32_lit('O', 'P', 'T', 'I') && hi == u32_lit('O', 'N', 'S', ' ')) {
-        pos += 8;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 8);
         return HttpMethod::OPTIONS;
     }
     if (v4 == u32_lit('C', 'O', 'N', 'N') && hi == u32_lit('E', 'C', 'T', ' ')) {
-        pos += 8;
+        pos = static_cast<u32>(static_cast<i64>(pos) + 8);
         return HttpMethod::CONNECT;
     }
 
