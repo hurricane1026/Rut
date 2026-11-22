@@ -191,7 +191,7 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
 namespace {
 u32 line_end(const u8* buffer, u32 start, u32 header_len) {
     for (u32 i = start; static_cast<i64>(i) + 1 < static_cast<i64>(header_len); ++i)
-        if (buffer[i] == '\r' && buffer[i + 1] == '\n') return i;
+        if (buffer[i] == '\r' && buffer[static_cast<i64>(i) + 1] == '\n') return i;
     return header_len;
 }
 bool field_is(const u8* buffer, u32 start, u32 end, Str name, u32* colon = nullptr) {
@@ -210,7 +210,7 @@ u32 ws_rewrite_extensions(
     u8* buffer, u32 header_len, u32 total_len, u32 capacity, Str extension_value) {
     if (!buffer || header_len < 4 || total_len < header_len || total_len > capacity ||
         (!extension_value.ptr && extension_value.len) ||
-        memcmp(buffer + header_len - 4, "\r\n\r\n", 4) != 0)
+        memcmp(buffer + static_cast<i64>(header_len) - 4, "\r\n\r\n", 4) != 0)
         return 0;
     for (u32 i = 0; i < extension_value.len; ++i) {
         const u8 kByte = static_cast<u8>(extension_value.ptr[i]);
@@ -229,9 +229,11 @@ u32 ws_rewrite_extensions(
         pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    const u64 kNewHeader = static_cast<u64>(header_len) - removed +
-                           (extension_value.len ? kPrefix.len + extension_value.len + 2ull : 0);
-    if (kNewHeader + static_cast<u64>(total_len) - static_cast<u64>(header_len) > capacity)
+    const u64 kNewHeader =
+        static_cast<u64>(header_len) - static_cast<u64>(removed) +
+        (extension_value.len ? static_cast<u64>(kPrefix.len) + extension_value.len + 2ull : 0);
+    if (kNewHeader + static_cast<u64>(total_len) - static_cast<u64>(header_len) >
+        static_cast<u64>(capacity))
         return 0;
     u32 written = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
     for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
@@ -251,14 +253,15 @@ u32 ws_rewrite_extensions(
             buffer + static_cast<i64>(header_len),
             static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
     if (extension_value.len) {
-        memcpy(buffer + written, kPrefix.ptr, kPrefix.len);
-        written += kPrefix.len;
-        memcpy(buffer + written, extension_value.ptr, extension_value.len);
-        written += extension_value.len;
-        memcpy(buffer + written, "\r\n", 2);
-        written += 2;
+        memcpy(buffer + static_cast<i64>(written), kPrefix.ptr, kPrefix.len);
+        written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(kPrefix.len));
+        memcpy(buffer + static_cast<i64>(written), extension_value.ptr, extension_value.len);
+        written =
+            static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(extension_value.len));
+        memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
+        written = static_cast<u32>(static_cast<i64>(written) + 2);
     }
-    memcpy(buffer + written, "\r\n", 2);
+    memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
     return static_cast<u32>(kNewHeader);
 }
 
@@ -266,18 +269,20 @@ Str ws_selected_subprotocol(const u8* header, u32 header_len) {
     if (!header || header_len < 4) return {};
     const u32 kFirstEnd = line_end(header, 0, header_len);
     if (kFirstEnd == header_len) return {};
-    for (u32 pos = kFirstEnd + 2; pos < header_len - 2;) {
+    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
+         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
         const u32 kEnd = line_end(header, pos, header_len);
         if (kEnd == header_len || kEnd == pos) return {};
         u32 colon = 0;
         if (field_is(header, pos, kEnd, lit_str("sec-websocket-protocol"), &colon)) {
-            u32 start = colon + 1;
+            u32 start = static_cast<u32>(static_cast<i64>(colon) + 1);
             u32 end = kEnd;
             while (start < end && (header[start] == ' ' || header[start] == '\t')) ++start;
             while (end > start && (header[end - 1] == ' ' || header[end - 1] == '\t')) --end;
-            return {reinterpret_cast<const char*>(header + start), end - start};
+            return {reinterpret_cast<const char*>(header + static_cast<i64>(start)),
+                    static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
         }
-        pos = kEnd + 2;
+        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     return {};
 }
