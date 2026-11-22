@@ -913,7 +913,7 @@ bool write_consumer_removals(json::Document& base,
     return patch.ok;
 }
 
-enum class RegistryRemoval { Credential, Consumer, ConsumerWithCredentials };
+enum class RegistryRemoval : u8 { Credential, Consumer, ConsumerWithCredentials };
 
 int remove_registry_record(const char* source,
                            const char* id_text,
