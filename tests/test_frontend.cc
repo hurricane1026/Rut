@@ -1,4 +1,5 @@
 #include "deferred_preflight_fixture.h"
+#include "fixtures/query_all.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
@@ -48737,4 +48738,99 @@ route POST "/" {
         trimmed |= function_has_op(rir.module.functions[i], rir::Opcode::StrTrimSuffix);
     CHECK(trimmed);
     rir.destroy();
+}
+TEST(frontend, request_query_all_lowers_owned_collections_through_helpers) {
+    auto tokens = lex(lit(test::query_all::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto copy = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    auto mir = build_mir_heap(*copy);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir::verify_module(rir.module).ok);
+    CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ReqQueryAll));
+    rir.destroy();
+}
+
+TEST(frontend, request_query_all_rejects_invalid_names_and_contexts) {
+    const char* sources[] = {
+        "route GET \"/\" { let tags = req.queryAll() return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"tag\", \"x\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(req.path) return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"a&b\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"a=b\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"a#b\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"a b\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"a\\n\") return 200 }",
+        "route GET \"/\" { let tags = req.queryAll(\"tag\") guard tags.count == 0 else { return "
+        "400 } return 200 }",
+        "timer test, every: 1s { let tags = req.queryAll(\"tag\") }",
+#if RUT_ENABLE_WEBSOCKET
+        "upstream backend\nroute GET \"/\" { return websocket(backend) { msg in "
+        "let pending = req.queryAll(\"tag\") guard let tags = pending else { msg.drop() } "
+        "msg.forward() } }",
+#endif
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "unexpectedly accepted: %s\n", source);
+        CHECK_FALSE(hir);
+    }
+    // Explicit waits reject both direct reads and reads hidden by helpers,
+    // independently of whether the wait appears before or after the read.
+    for (const char* body : {"wait(1ms) let pending = req.queryAll(\"tag\") guard let tags = "
+                             "pending else { return 500 } return 204",
+                             "let pending = req.queryAll(\"tag\") guard let tags = pending else { "
+                             "return 500 } wait(1ms) return 204",
+                             "let pending = readTags() guard let tags = pending else { return 500 "
+                             "} wait(1ms) return 204"}) {
+        const std::string source =
+            std::string(
+                "func readTags() -> Collected<str> { req.queryAll(\"tag\") }\nroute GET \"/\" { ") +
+            body + " }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        // Locals after a wait are rejected by the existing continuation checker
+        // before the query-specific diagnostic can be emitted.
+        if (hir.error().detail.len)
+            CHECK(hir.error().detail.eq(
+                lit("req.queryAll() requires a route without explicit wait")));
+    }
+}
+
+TEST(frontend, request_query_all_requires_binding_before_guard_or_if_narrowing) {
+    const char* bodies[] = {
+        "guard let tags = req.queryAll(\"tag\") else { return 503 } return 204",
+        "guard let tags = readTags() else { return 503 } return 204",
+        "if let tags = req.queryAll(\"tag\") { return 204 } else { return 503 }",
+    };
+    for (const char* body : bodies) {
+        const std::string source =
+            std::string(
+                "func readTags() -> Collected<str> { req.queryAll(\"tag\") }\nroute GET \"/\" { ") +
+            body + " }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(
+            hir.error().detail.eq(lit("bind req.queryAll() to a let before guard let/if let; fresh "
+                                      "collections must be evaluated once")));
+    }
 }

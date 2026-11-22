@@ -3,6 +3,7 @@
 #include "core/placement_new.h"
 #include "rut/common/forward_target.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/http_query.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -1059,6 +1060,50 @@ void rut_helper_req_query(const u8* req_data,
             return;
         }
     }
+}
+
+void* rut_helper_req_query_all(
+    void* conn, void* arena, const u8* req_data, u32 req_len, const char* name, u32 name_len) {
+    if (!req_data || !http_query_name_valid({name, name_len})) return nullptr;
+    const ParseCache& pc = parse_cached(req_data, req_len);
+    if (!pc.ok) return nullptr;
+    const Str kTarget = pc.req.path;
+    u32 pos = 0;
+    while (pos < kTarget.len && kTarget.ptr[pos] != '?' && kTarget.ptr[pos] != '#') ++pos;
+    u32 end = pos;
+    if (pos < kTarget.len && kTarget.ptr[pos] == '?') {
+        ++pos;
+        end = pos;
+        while (end < kTarget.len && kTarget.ptr[end] != '#') ++end;
+    }
+    FixedVec<Str, CollectedValues::kMaxItems> matches;
+    while (pos < end) {
+        if (kTarget.ptr[pos] == '&') {
+            ++pos;
+            continue;
+        }
+        const u32 kKeyStart = pos;
+        while (pos < end && kTarget.ptr[pos] != '&' && kTarget.ptr[pos] != '=') ++pos;
+        const u32 kKeyEnd = pos;
+        u32 value_start = pos;
+        if (pos < end && kTarget.ptr[pos] == '=') {
+            value_start = ++pos;
+            while (pos < end && kTarget.ptr[pos] != '&') ++pos;
+        }
+        if (kKeyEnd - kKeyStart == name_len &&
+            __builtin_memcmp(kTarget.ptr + kKeyStart, name, name_len) == 0 &&
+            !matches.push({kTarget.ptr + value_start, pos - value_start}))
+            return nullptr;
+    }
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    const u32 kOffset = 0;
+    auto* values =
+        CollectedValues::create(storage, sizeof(Str), matches.len ? matches.len : 1, &kOffset, 1);
+    if (!values) return nullptr;
+    for (u32 i = 0; i < matches.len; ++i)
+        if (!values->append(&matches[i], sizeof(Str))) return nullptr;
+    return values;
 }
 
 void rut_helper_req_query_string(

@@ -46,6 +46,7 @@ enum class MirValueKind : u8 {
     StructInit,
     Field,
     ReqHeaderAll,
+    ReqQueryAll,     // ordered, owned raw values -> Collected<str>?
     ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,

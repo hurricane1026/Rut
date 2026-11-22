@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/http_query.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
@@ -488,6 +489,16 @@ struct Builder {
         auto* array = TRY(make_type(TypeKind::Array, element));
         auto* ty = TRY(make_type(TypeKind::Optional, array));
         auto [inst, vid] = TRY(emit(Opcode::ReqHeaderAll, ty, loc));
+        inst->imm.str_val = name;
+        return vid;
+    }
+
+    Result<ValueId> emit_req_query_all(Str name, SourceLoc loc = {}) {
+        if (!http_query_name_valid(name)) return err(RirError::InvalidState);
+        auto* element = TRY(make_type(TypeKind::Str));
+        auto* array = TRY(make_type(TypeKind::Array, element));
+        auto* ty = TRY(make_type(TypeKind::Optional, array));
+        auto [inst, vid] = TRY(emit(Opcode::ReqQueryAll, ty, loc));
         inst->imm.str_val = name;
         return vid;
     }

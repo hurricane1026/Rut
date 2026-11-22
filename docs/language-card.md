@@ -339,7 +339,7 @@ req.getAll("Accept")         // Collected<str>?
 // Route captures / query / cookies / body
 req.params.id                // from :id — captures NEVER shadow built-ins
 req.query("page")            // str? (first value)
-req.queryAll("tags")         // ⏳ [str]
+req.queryAll("tags")         // Collected<str>? — all raw matching values, in order
 req.cookie("session")        // str? (first match)
 req.uniqueCookie("session")  // str? (exactly one matching pair)
 req.body(User)               // typed parse, error-capable → guard let
@@ -371,6 +371,37 @@ Unwrap the result of `req.getAll` before reading `.count` or using `.get(index)`
 Indexing starts at zero and returns `nil` outside the collection. The request
 view used by `getAll` is limited to 64 header fields. The collection copies its
 values into the existing request arena and shares its allocation budget.
+
+`req.queryAll("tags")` requires a nonempty literal raw query key. Keys are
+case-sensitive and cannot contain ASCII whitespace/control bytes, `&`, `=` or `#`.
+Values follow request-target order; `?tags` and `?tags=` each contribute one
+empty value, while empty `&` segments are ignored. Only `&` separates pairs;
+the first `=` separates key and value. Parsing stops at `#`. Percent escapes,
+`+`, semicolons and non-ASCII bytes are preserved without decoding or
+normalization, matching `req.query`'s raw-value behavior.
+
+The result is `Collected<str>?`, with `.count` and `.get(index)` after unwrap.
+Bind the read (or a helper returning it) to `let` before `guard let`/`if let`,
+as below. Fresh reads directly in these narrowing expressions are rejected
+until they can be lowered with one evaluation.
+
+No match, no query, or an empty query produces a present empty collection.
+More than 64 matching values, a malformed request, missing arena storage,
+SlicePool exhaustion or the shared 256 KiB arena budget produces nil; no
+truncated collection is exposed. Unrelated query keys do not consume the
+64-value limit. Collection strings are copied and remain valid until request
+retirement/reset. HTTP/2 reads the synthesized request-target view. Explicit
+`wait` routes, including hidden helper reads, and timer/WebSocket callbacks
+cannot read this request-owned collection yet.
+
+```swift
+route GET "/tags" {
+    let pending = req.queryAll("tag")
+    guard let tags = pending else { return 503 }
+    guard let first = tags.get(0) else { return 404 }
+    return response(200, body: first)
+}
+```
 
 Ordinary local HTTP/1 responses mirror the version of a complete strictly
 parsed request (`HTTP/1.0` or `HTTP/1.1`). Responses to requests without a

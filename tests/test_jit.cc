@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/jwt_secret_rotation.h"
+#include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
 #include "fixtures/string_trim.h"
 #include "framing_selection_preflight_fixture.h"
@@ -33278,6 +33279,134 @@ TEST(jit, frontend_string_trim_composes_without_an_arena) {
                                               nullptr));
             CHECK_EQ(result.status_code, scenario.status);
         }
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+TEST(helpers, request_query_all_preserves_raw_order_and_owns_values) {
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char request[] =
+        "GET /?tag=a%26b+c&tag=&tag&other=x&tag=last#tag=wrong HTTP/1.1\r\nHost: local\r\n\r\n";
+    auto* values = static_cast<CollectedValues*>(rut_helper_req_query_all(
+        nullptr, &arena, reinterpret_cast<const u8*>(request), sizeof(request) - 1, "tag", 3));
+    REQUIRE(values);
+    REQUIRE_EQ(values->count, 4u);
+    const auto* first = static_cast<const Str*>(values->get(0, sizeof(Str)));
+    REQUIRE(first);
+    CHECK(first->eq(lit("a%26b+c")));
+    CHECK(static_cast<const Str*>(values->get(1, sizeof(Str)))->eq(lit("")));
+    CHECK(static_cast<const Str*>(values->get(2, sizeof(Str)))->eq(lit("")));
+    CHECK(static_cast<const Str*>(values->get(3, sizeof(Str)))->eq(lit("last")));
+    memset(request, 'z', sizeof(request));
+    CHECK(first->eq(lit("a%26b+c")));
+    CHECK(!values->get(-1, sizeof(Str)));
+    CHECK(!values->get(4, sizeof(Str)));
+    arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(helpers, request_query_all_enforces_capacity_and_storage_failures) {
+    SlicePool pool;
+    REQUIRE(pool.init(40));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    for (u32 count : {0u, 64u, 65u}) {
+        arena.reset();
+        std::string request = "GET /?";
+        for (u32 i = 0; i < count; ++i) request += "tag=x&";
+        request += " HTTP/1.1\r\nHost: local\r\n\r\n";
+        auto* values = static_cast<CollectedValues*>(
+            rut_helper_req_query_all(nullptr,
+                                     &arena,
+                                     reinterpret_cast<const u8*>(request.data()),
+                                     request.size(),
+                                     "tag",
+                                     3));
+        if (count <= 64) {
+            REQUIRE(values);
+            CHECK_EQ(values->count, count);
+        } else {
+            CHECK(values == nullptr);
+            CHECK_EQ(arena.space_used(), 0u);
+        }
+    }
+    const auto request = lit("GET /?tag=x HTTP/1.1\r\nHost: local\r\n\r\n");
+    const auto* bytes = reinterpret_cast<const u8*>(request.ptr);
+    CHECK(!rut_helper_req_query_all(nullptr, nullptr, bytes, request.len, "tag", 3));
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, nullptr, 0, "tag", 3));
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, bytes, request.len - 2, "tag", 3));
+    for (const char* key : {"", "a&b", "a=b", "a#b", "a b", "a\n"})
+        CHECK(!rut_helper_req_query_all(nullptr, &arena, bytes, request.len, key, strlen(key)));
+    arena.reset();
+    for (u32 i = 0; i < 32; ++i) REQUIRE(arena.alloc(8192));
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, bytes, request.len, "tag", 3));
+    arena.destroy();
+    u8* held[40]{};
+    for (auto& slice : held) {
+        slice = pool.alloc();
+        REQUIRE(slice);
+    }
+    CHECK(!rut_helper_req_query_all(nullptr, &arena, bytes, request.len, "tag", 3));
+    for (auto* slice : held) pool.free(slice);
+    arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
+TEST(jit, request_query_all_executes_dynamic_matrix_at_both_optimization_levels) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::query_all::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        for (const auto& item : test::query_all::kCases) {
+            arena.reset();
+            const std::string request =
+                std::string("GET ") + item.target +
+                " HTTP/1.1\r\nHost: local\r\nX-Count: " + std::to_string(item.count) +
+                "\r\nX-First: " + item.first + "\r\nX-Last: " + item.last + "\r\n\r\n";
+            const auto result =
+                HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              &arena));
+            CHECK_EQ(result.status_code, 204u);
+            const u32 capacity = item.count ? item.count : 1;
+            const u64 minimum = sizeof(CollectedValues) + capacity * sizeof(Str);
+            // All reads of the bound helper result must share one allocation.
+            CHECK(arena.space_used() >= minimum);
+            CHECK(arena.space_used() <= minimum + request.size() + 7u * item.count);
+        }
+        const auto request = lit("GET /?tag=x HTTP/1.1\r\nHost: local\r\n\r\n");
+        const auto failed = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(failed.status_code, 503u);
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
         engine.shutdown();
         rir.destroy();
     }

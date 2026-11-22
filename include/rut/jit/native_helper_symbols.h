@@ -17,6 +17,7 @@
     X(rut_helper_req_flag)                            \
     X(rut_helper_req_method)                          \
     X(rut_helper_req_header_count)                    \
+    X(rut_helper_req_query_all)                       \
     X(rut_helper_req_header_all)                      \
     X(rut_helper_req_unique_header)                   \
     X(rut_helper_req_header)                          \

@@ -3154,3 +3154,35 @@ TEST(RirVerifier, StringTrimRequiresTwoUnwrappedStrings) {
     CHECK(verify_function(fn).ok);
     ctx.destroy();
 }
+TEST(RirVerifier, RequestQueryAllRejectsForgedNamesAndCarriers) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("query_all"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    for (const char* name : {"", "a&b", "a=b", "a#b", "a b", "a\n"})
+        CHECK_FALSE(b.emit_req_query_all(lit(name)));
+    V(b.emit_req_query_all(lit("a?b+%20")));
+    auto number = V(b.emit_const_i32(0));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    auto& inst = fn->entry()->insts[0];
+    REQUIRE_EQ(inst.op, Opcode::ReqQueryAll);
+    const auto original = inst;
+    for (const char* name : {"", "a&b", "a=b", "a#b", "a b"}) {
+        inst.imm.str_val = lit(name);
+        CHECK_FALSE(verify_function(fn).ok);
+    }
+    inst = original;
+    inst.operand_count = 1;
+    inst.operands[0] = number;
+    CHECK_FALSE(verify_function(fn).ok);
+    inst = original;
+    inst.result = number;
+    CHECK_FALSE(verify_function(fn).ok);
+    inst = original;
+    CHECK(verify_function(fn).ok);
+    tc.destroy();
+}
