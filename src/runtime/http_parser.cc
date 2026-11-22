@@ -116,37 +116,39 @@ static inline HttpMethod parse_method_direct(const u8* buf, u32 end, u32& pos) {
 
     // 4-byte methods: "POST" + ' ' or "HEAD" + ' '
     if (UNLIKELY(static_cast<i64>(pos) + 5 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('P', 'O', 'S', 'T') && buf[pos + 4] == ' ') {
+    if (v4 == u32_lit('P', 'O', 'S', 'T') && buf[static_cast<i64>(pos) + 4] == ' ') {
         pos = static_cast<u32>(static_cast<i64>(pos) + 5);
         return HttpMethod::POST;
     }
-    if (v4 == u32_lit('H', 'E', 'A', 'D') && buf[pos + 4] == ' ') {
+    if (v4 == u32_lit('H', 'E', 'A', 'D') && buf[static_cast<i64>(pos) + 4] == ' ') {
         pos = static_cast<u32>(static_cast<i64>(pos) + 5);
         return HttpMethod::HEAD;
     }
 
     // 5-byte methods
     if (UNLIKELY(static_cast<i64>(pos) + 6 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('P', 'A', 'T', 'C') && buf[pos + 4] == 'H' && buf[pos + 5] == ' ') {
+    if (v4 == u32_lit('P', 'A', 'T', 'C') && buf[static_cast<i64>(pos) + 4] == 'H' &&
+        buf[static_cast<i64>(pos) + 5] == ' ') {
         pos = static_cast<u32>(static_cast<i64>(pos) + 6);
         return HttpMethod::PATCH;
     }
-    if (v4 == u32_lit('T', 'R', 'A', 'C') && buf[pos + 4] == 'E' && buf[pos + 5] == ' ') {
+    if (v4 == u32_lit('T', 'R', 'A', 'C') && buf[static_cast<i64>(pos) + 4] == 'E' &&
+        buf[static_cast<i64>(pos) + 5] == ' ') {
         pos = static_cast<u32>(static_cast<i64>(pos) + 6);
         return HttpMethod::TRACE;
     }
 
     // 6-byte method: "DELETE"
     if (UNLIKELY(static_cast<i64>(pos) + 7 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    if (v4 == u32_lit('D', 'E', 'L', 'E') && buf[pos + 4] == 'T' && buf[pos + 5] == 'E' &&
-        buf[pos + 6] == ' ') {
+    if (v4 == u32_lit('D', 'E', 'L', 'E') && buf[static_cast<i64>(pos) + 4] == 'T' &&
+        buf[static_cast<i64>(pos) + 5] == 'E' && buf[static_cast<i64>(pos) + 6] == ' ') {
         pos = static_cast<u32>(static_cast<i64>(pos) + 7);
         return HttpMethod::DELETE;
     }
 
     // 7-byte methods: "OPTIONS" or "CONNECT"
     if (UNLIKELY(static_cast<i64>(pos) + 8 > static_cast<i64>(end))) return HttpMethod::Unknown;
-    u32 hi = load_u32(buf + pos + 4);
+    u32 hi = load_u32(buf + static_cast<i64>(pos) + 4);
     if (v4 == u32_lit('O', 'P', 'T', 'I') && hi == u32_lit('O', 'N', 'S', ' ')) {
         pos = static_cast<u32>(static_cast<i64>(pos) + 8);
         return HttpMethod::OPTIONS;
