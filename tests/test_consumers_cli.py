@@ -249,6 +249,51 @@ def test_targeted_registry_commands(tool, root):
     assert source.read_bytes() == original
 
 
+def test_create_consumer(tool, root):
+    alice = dict(id='alice', enabled=True, groups=['staff'])
+    credential = dict(id='alice-key', consumerId='alice', method='bearer',
+                      enabled=True, secret='keep-this-key-private')
+    snapshot = dict(version=1, consumers=[alice], credentials=[credential])
+    source = private(root / 'create-source.json', snapshot)
+    original = source.read_bytes()
+    new_consumer = dict(id='bob', enabled=False, groups=['staff'])
+    record = private(root / 'create-record.json', new_consumer)
+    output = root / 'create-output.json'
+    command = lambda: run(tool, 'create-consumer', source, record, output)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: command(), range(2)))
+    assert sorted(result.returncode for result in results) == [0, 2], results
+    assert all(not result.stdout and credential['secret'].encode() not in result.stderr
+               for result in results)
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert json.loads(output.read_bytes()) == dict(snapshot, consumers=[alice, new_consumer])
+    assert run(tool, 'validate', output).returncode == 0
+    published = output.read_bytes()
+    private(record, dict(new_consumer, id='charlie'))
+    assert command().returncode == 2 and output.read_bytes() == published
+    output.unlink()
+
+    for invalid in (dict(alice, enabled=False), br'{"id":"al\u0069ce","enabled":false,"groups":[]}',
+                    dict(new_consumer, groups=['staff', 'staff']), dict(id='bob', groups=[]),
+                    dict(new_consumer, secret=credential['secret']),
+                    br'{"id":"bob","\u0069d":"charlie","enabled":true,"groups":[]}', [new_consumer]):
+        private(record, invalid)
+        result = command()
+        assert result.returncode == 2 and not result.stdout and not output.exists(), result
+        assert credential['secret'].encode() not in result.stderr
+    private(record, new_consumer).chmod(0o644)
+    assert command().returncode == 2 and not output.exists()
+    assert source.read_bytes() == original
+
+    private(record, new_consumer)
+    private(source, dict(version=1, credentials=[], consumers=[
+        dict(id=f'consumer-{i}', enabled=True, groups=[]) for i in range(32)
+    ]))
+    assert run(tool, 'validate', source).returncode == 0
+    assert command().returncode == 2 and not output.exists()
+
+
 def test_prune_credentials(tool, root):
     for args in (['prune-credentials'], ['prune-credentials', 'a', '1'],
                  ['prune-credentials', 'a', '1', 'b', 'c']):
@@ -1395,6 +1440,7 @@ def main(tool):
         test_apply_checked(tool, root)
         test_prune_credentials(tool, root)
         test_targeted_registry_commands(tool, root)
+        test_create_consumer(tool, root)
         test_generated_keys(tool, root)
         test_time_window_metadata_survives_cli(tool, root)
         test_hash_keys(tool, root)
