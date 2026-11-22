@@ -1,0 +1,41 @@
+import "clients/redis-client.rut"
+import "middleware/browser_origin.rut"
+import "middleware/jwt_session.rut"
+
+func allowBrowserExchange(_ tls: bool, _ origin: str, _ site: str, _ expected: str) -> bool {
+    tls && browser_origin.validOrigin(expected) && origin == expected && site == "same-origin"
+}
+
+chain browserExchange {
+    before allowBrowserExchange(req.isTls, req.uniqueHeader("Origin").or(""),
+        req.uniqueHeader("Sec-Fetch-Site").or(""), env("BROWSER_ORIGIN")) else 403
+}
+
+func permitStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => if data == b"active" { 1 } else { 0 }
+        .missing => 0
+        _ => -1
+    }
+}
+
+// An application that already holds an enrolled bearer session can exchange it
+// for a host-bound cookie on the same HTTPS origin.
+route POST "/session/cookie" use chain browserExchange {
+    let token = bearerToken(req.uniqueHeader("Authorization").or("")).or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"),
+        env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let allowed = jwt_session.requireActiveStatus(permitStatus(result))
+    let responseCookie = "__Host-rut_session=" + token + "; Path=/; Secure; HttpOnly; SameSite=Strict"
+    let reply = response(204)
+    reply.set("Cache-Control", "no-store")
+    reply.add("Set-Cookie", responseCookie)
+    return reply
+}
+
+route "/" { return 404 }

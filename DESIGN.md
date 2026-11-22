@@ -10016,9 +10016,17 @@ capacity limits and wire validation are unchanged. Chain-after mutations commit
 on normal terminators and explicit guard status returns; runtime-generated
 failures still do not commit them. The policy-free legacy upstream-connect 502
 may serialize already-committed mutations without changing mutation commit state.
-`add` still requires a non-optional string, and local Response builders retain
-their existing restrictions. This general primitive lets the CORS module omit
+`add` still requires a non-optional string. This general primitive lets the CORS module omit
 credentials/preflight/exposure headers without adding conditional effect syntax.
+
+An HTTP route with guards may mutate a local Response's headers dynamically
+in the final mutation sequence immediately before returning the builder.
+After the first dynamic mutation, the sequence uses the bounded MIR block
+effect list. Lowering emits it only in the block reached after all guards pass.
+Guard failures never execute this sequence, even when a header value refers to
+a guard-bound string. Static header values folded into the builder also apply
+only to its return. This form excludes waits, loops, fallible bindings and
+chain-after effects.
 
 ### Fixed-key RS256 compact JWT decoding
 

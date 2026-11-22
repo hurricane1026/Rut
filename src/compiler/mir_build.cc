@@ -1698,6 +1698,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         }
 
         for (u32 li = 0; li < source_route.locals.len; li++) {
+            if (source_route.locals[li].run_at_response_return) continue;
             if (source_route.locals[li].type == HirTypeKind::Tuple) continue;
             // Array locals are compile-time constants for for-loop unroll
             // only. They have no runtime MirValue carrier yet, so do not
@@ -1868,6 +1869,19 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     return frontend_error(FrontendError::OutOfMemory, arm.span);
                 if (!out->effects.push({fn.values.len - 1, source_route.exprs[expr_index].span}))
                     return frontend_error(FrontendError::TooManyItems, arm.span);
+            }
+            return {};
+        };
+        auto set_response_return_effects = [&](MirBlock& block) -> FrontendResult<void> {
+            for (u32 li = 0; li < source_route.locals.len; li++) {
+                const auto& local = source_route.locals[li];
+                if (!local.run_at_response_return) continue;
+                auto effect = mir_value(local.init, module, &fn);
+                if (!effect) return core::make_unexpected(effect.error());
+                if (!fn.values.push(effect.value()))
+                    return frontend_error(FrontendError::OutOfMemory, local.span);
+                if (!block.effects.push({fn.values.len - 1, local.span}))
+                    return frontend_error(FrontendError::TooManyItems, local.span);
             }
             return {};
         };
@@ -3385,6 +3399,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 MirBlock cont_block{};
                 cont_block.label = cont_label();
                 set_term_from_hir(&cont_block.term, source_route.control.direct_term);
+                auto effects = set_response_return_effects(cont_block);
+                if (!effects) return core::make_unexpected(effects.error());
                 if (!fn.blocks.push(cont_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
 
@@ -3865,6 +3881,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
         } else {
             set_term_from_hir(&block.term, source_route.control.direct_term);
+            auto effects = set_response_return_effects(block);
+            if (!effects) return core::make_unexpected(effects.error());
             if (!fn.blocks.push(block)) return frontend_error(FrontendError::TooManyItems, fn.span);
         }
         if (invalid_forward_path) return core::make_unexpected(forward_path_error);

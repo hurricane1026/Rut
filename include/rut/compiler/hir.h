@@ -895,6 +895,7 @@ struct HirLocal {
     bool is_wait_result = false;
     bool is_magic_request_proxy = false;
     bool is_runtime_synthetic = false;
+    bool run_at_response_return = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
