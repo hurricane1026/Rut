@@ -9848,7 +9848,12 @@ void h2_proxy_finish(Loop* loop,
     }
 
     // Bodyless proxy responses retain the existing bounded header path.
-    const u8* body = conn.upstream_recv_buf.data() + hdr_end;
+    const i64 body_offset = static_cast<i64>(hdr_end);
+    if (body_offset > static_cast<i64>(conn.upstream_recv_buf.len())) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    const u8* body = conn.upstream_recv_buf.data() + body_offset;
     H2Dispatch<Loop> d{loop, &conn, h2->pending_synth, Http2Conn::kBodySynthCap, 0, false};
     // A re-framed response too large for the scratch buffer (large body OR large
     // header block) must NOT close the whole connection (dropping unrelated
