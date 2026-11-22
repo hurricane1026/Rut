@@ -221,14 +221,14 @@ i64 huffman_encoded_len(const u8* src, u32 len) {
     return (bits + 7) / 8;
 }
 
-u32 huffman_encode(u8* out, const u8* src, u32 len) {
+i64 huffman_encode(u8* out, const u8* src, u32 len) {
     u64 acc = 0;    // bit accumulator, MSB-first
-    u32 nbits = 0;  // valid bits in acc
-    u32 o = 0;
+    i64 nbits = 0;  // valid bits in acc
+    i64 o = 0;
     for (u32 i = 0; i < len; i++) {
         const HuffCode kEntry = kHuff[src[i]];
         acc = (acc << kEntry.bits) | kEntry.code;
-        nbits += kEntry.bits;
+        nbits += static_cast<i64>(kEntry.bits);
         while (nbits >= 8) {
             nbits -= 8;
             out[o++] = static_cast<u8>((acc >> nbits) & 0xff);
@@ -236,8 +236,8 @@ u32 huffman_encode(u8* out, const u8* src, u32 len) {
     }
     if (nbits > 0) {
         // Pad the remaining bits with the EOS prefix (all 1s) to an octet.
-        const u32 kPad = 8 - nbits;
-        acc = (acc << kPad) | ((1u << kPad) - 1u);
+        const i64 kPad = 8 - nbits;
+        acc = (acc << kPad) | ((u64{1} << kPad) - u64{1});
         out[o++] = static_cast<u8>(acc & 0xff);
     }
     return o;
@@ -289,15 +289,15 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     return kHdr + slen;
 }
 
-u32 encode_string(u8* out, const u8* src, u32 len) {
+i64 encode_string(u8* out, const u8* src, u32 len) {
     const i64 kHlen = huffman_encoded_len(src, len);
     if (kHlen < static_cast<i64>(len)) {
         // kHlen < len <= UINT32_MAX proves this narrowing is representable.
-        const u32 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
-        const u32 kN = huffman_encode(out + kHdr, src, len);
+        const i64 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
+        const i64 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }
-    const u32 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
+    const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
     for (u32 i = 0; i < len; i++) out[kHdr + i] = src[i];
     return kHdr + len;
 }
@@ -592,19 +592,19 @@ bool decode_header_block(DynamicTable& dyn,
     return true;
 }
 
-u32 encode_header(u8* out, Str name, Str value) {
+i64 encode_header(u8* out, Str name, Str value) {
     const i32 kFull = static_find_full(name, value);
     if (kFull > 0) return encode_integer(out, static_cast<u32>(kFull), 7, 0x80);
 
     const i32 kNameIdx = static_find_name(name);
     // Literal without indexing (0000xxxx): name index (0 = literal name).
-    u32 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
+    i64 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
     if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     return o;
 }
 
-u32 Encoder::encode(u8* out, Str name, Str value) {
+i64 Encoder::encode(u8* out, Str name, Str value) {
     // Exact (name,value) match → Indexed Header Field (§6.1, 1 byte for small
     // indices). Check the dynamic table first: in steady state most fields hit
     // it, and it is far smaller than the 61-entry static table, so this skips
@@ -618,7 +618,7 @@ u32 Encoder::encode(u8* out, Str name, Str value) {
     // and add the field so the next occurrence indexes to 1 byte.
     i32 nidx = static_find_name(name);
     if (nidx == 0) nidx = dyn_find_name(dyn, name);
-    u32 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
+    i64 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
     if (nidx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     // Index resolution above used the pre-add table — the same order the peer's

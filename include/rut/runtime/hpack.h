@@ -29,7 +29,7 @@ i64 huffman_encoded_len(const u8* src, u32 len);
 
 // Huffman-encode src[0..len) into out (must hold huffman_encoded_len(src,len)).
 // Pads the final octet with the EOS prefix (1-bits). Returns octets written.
-u32 huffman_encode(u8* out, const u8* src, u32 len);
+i64 huffman_encode(u8* out, const u8* src, u32 len);
 
 // Huffman-decode src[0..len) into out[0..cap). Returns the decoded length, or
 // -1 on error: capacity overflow, an EOS symbol in the stream, padding longer
@@ -47,7 +47,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len);
 // Encode src[0..len) as a string literal into out, choosing Huffman iff it is
 // strictly shorter. out must hold worst case (len + 1 + integer prefix).
 // Returns octets written.
-u32 encode_string(u8* out, const u8* src, u32 len);
+i64 encode_string(u8* out, const u8* src, u32 len);
 
 // --- Header field representations (§6) ---
 
@@ -105,7 +105,7 @@ bool decode_header_block(DynamicTable& dyn,
 // Never mutates a dynamic table (we don't index on the encode side). Literal
 // strings are Huffman-coded when shorter. Returns octets written. out must hold
 // the worst case (~ name.len + value.len + a few prefix octets).
-u32 encode_header(u8* out, Str name, Str value);
+i64 encode_header(u8* out, Str name, Str value);
 
 // Stateful HPACK encoder. Unlike encode_header (which never indexes), this
 // indexes into a dynamic table: an exact (name,value) match emits a 1-byte
@@ -145,7 +145,7 @@ struct Encoder {
     // Encode one header field into out, possibly emitting an index and growing
     // the dynamic table. Returns octets written. name/value must not alias
     // dyn.buf (callers pass their own header storage, so this always holds).
-    u32 encode(u8* out, Str name, Str value);
+    i64 encode(u8* out, Str name, Str value);
 };
 
 }  // namespace rut::hpack

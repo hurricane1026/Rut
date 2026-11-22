@@ -211,7 +211,9 @@ u32 http2_write_headers(
     for (u32 i = 0; i < n; i++) {
         // Worst-case per header: name+value+small prefixes. Bail if it won't fit.
         if (o + hs[i].name.len + hs[i].value.len + 8 > out_cap) return 0;
-        o += hpack::encode_header(out + o, hs[i].name, hs[i].value);
+        const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
+        if (kEncoded < 0 || kEncoded > static_cast<i64>(out_cap - o)) return 0;
+        o += static_cast<u32>(kEncoded);
     }
     const u32 kPayload = o - kFrameHeaderSize;
     u8 flags = http2_flag::kEndHeaders;
@@ -276,7 +278,9 @@ static u32 http2_write_response_impl(u8* out,
     sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
     sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
     sbuf[2] = static_cast<char>('0' + status % 10);
-    hb += enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    const i64 kStatusEncoded = enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
+    if (kStatusEncoded < 0 || kStatusEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
+    hb += static_cast<u32>(kStatusEncoded);
     // Worst-case HPACK literal overhead beyond the raw name+value bytes: one field-
     // line prefix octet plus a length-prefix integer for each of name and value (up
     // to 5 bytes each for 32-bit lengths). The peer (or an upstream we proxy) can
@@ -312,13 +316,18 @@ static u32 http2_write_response_impl(u8* out,
                 if (kC >= 'A' && kC <= 'Z') return 0;
             }
         }
-        hb += enc.encode(hblock + hb, name, hdrs[i].value);
+        const i64 kEncoded = enc.encode(hblock + hb, name, hdrs[i].value);
+        if (kEncoded < 0 || kEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
+        hb += static_cast<u32>(kEncoded);
     }
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
         if (hb + 14 + kClLen + kHpackFieldOverhead > sizeof(hblock)) return 0;  // (reserved above)
-        hb += enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
+        const i64 kClEncoded =
+            enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
+        if (kClEncoded < 0 || kClEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
+        hb += static_cast<u32>(kClEncoded);
     }
 
     const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
