@@ -17,7 +17,7 @@ bool discovery_issuer_valid(const char* value) {
     while (authority_end < length && value[authority_end] != '/') ++authority_end;
     u32 host_end = 8;
     while (host_end < authority_end && value[host_end] != ':') ++host_end;
-    if (host_end == 8 || host_end - 8 > 253) return false;
+    if (host_end == 8 || static_cast<i64>(host_end) - 8 > 253) return false;
     u32 label = 0;
     for (u32 i = 8; i < host_end; ++i) {
         const char byte = value[i];
@@ -32,10 +32,10 @@ bool discovery_issuer_valid(const char* value) {
             if (++label > 63) return false;
         }
     }
-    if (!label || value[host_end - 1] == '-') return false;
+    if (!label || value[static_cast<i64>(host_end) - 1] == '-') return false;
     if (host_end < authority_end) {
         u32 port = 0;
-        if (host_end + 1 == authority_end) return false;
+        if (static_cast<i64>(host_end) + 1 == static_cast<i64>(authority_end)) return false;
         for (u32 i = host_end + 1; i < authority_end; ++i) {
             if (value[i] < '0' || value[i] > '9' || port > 6553) return false;
             port = port * 10 + static_cast<u32>(value[i] - '0');
@@ -49,7 +49,9 @@ bool discovery_issuer_valid(const char* value) {
     for (u32 i = authority_end; i < length; ++i) {
         const char byte = value[i];
         if (byte == '%') {
-            if (length - i < 3 || !hex(value[i + 1]) || !hex(value[i + 2])) return false;
+            if (static_cast<i64>(length) - static_cast<i64>(i) < 3 ||
+                !hex(value[static_cast<i64>(i) + 1]) || !hex(value[static_cast<i64>(i) + 2]))
+                return false;
             i += 2;
         } else if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' ||
@@ -144,7 +146,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             fields |= 2048;
         }
         if (target) {
-            json::Writer value{target, capacity - 1};
+            json::Writer value{target, static_cast<u32>(static_cast<i64>(capacity) - 1)};
             if (!document.string(entry, value) || !value.ok || !value.len) return false;
             for (u32 i = 0; i < value.len; ++i)
                 if (!target[i]) return false;
@@ -255,8 +257,11 @@ bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
 }
 
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
-    const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
-    return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
+    u64 interval_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(interval_seconds), u64{1000}, &interval_ms))
+        return ~u64{0};
+    u64 deadline = 0;
+    return __builtin_add_overflow(completed_ms, interval_ms, &deadline) ? ~u64{0} : deadline;
 }
 
 u32 JwksRetry::failure(const RemoteJwks& policy, u32 server_hint) {
@@ -319,15 +324,21 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
             const char kDigit = kValue.ptr[j];
             if (kDigit < '0' || kDigit > '9') return 0;
             const u32 kNumber = static_cast<u32>(kDigit - '0');
-            if (delay > (~u32{0} - kNumber) / 10) return 0;
-            delay = delay * 10 + kNumber;
+            if (static_cast<i64>(delay) >
+                (static_cast<i64>(UINT32_MAX) - static_cast<i64>(kNumber)) / 10)
+                return 0;
+            delay = static_cast<u32>(static_cast<i64>(delay) * 10 + static_cast<i64>(kNumber));
         }
     }
     return delay < cap_seconds ? delay : cap_seconds;
 }
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
-    return now && last_success && now >= last_success &&
-           now - last_success < static_cast<u64>(max_age_seconds) * 1000;
+    if (!now || !last_success || now < last_success) return false;
+    u64 max_age_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(max_age_seconds), u64{1000}, &max_age_ms))
+        return false;
+    u64 age = 0;
+    return !__builtin_sub_overflow(now, last_success, &age) && age < max_age_ms;
 }
 
 namespace {
@@ -365,8 +376,9 @@ bool jwks_dns_name(
             out[used] = 0;
             return true;
         }
-        if (static_cast<u64>(at) + count > length || used + count + (used ? 1u : 0u) > 253 ||
-            packet[at] == '-' || packet[at + count - 1] == '-')
+        if (static_cast<i64>(at) + static_cast<i64>(count) > static_cast<i64>(length) ||
+            static_cast<i64>(used) + static_cast<i64>(count) + (used ? 1 : 0) > 253 ||
+            packet[at] == '-' || packet[static_cast<i64>(at) + static_cast<i64>(count) - 1] == '-')
             return false;
         if (used) out[used++] = '.';
         for (u32 i = 0; i < count; ++i) {
