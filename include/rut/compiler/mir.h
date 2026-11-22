@@ -41,6 +41,8 @@ enum class MirValueKind : u8 {
     StringTrim,   // byte-exact prefix/suffix removal; borrowed result
     IpParse,      // strict IPv4 text -> optional IP
     StringSplit,  // request-owned bounded string fields
+    StringTransform,  // owned upper/lower/literal replacement, optional str
+    RegexReplace,     // owned bounded RE2 replacement, optional str
     Tuple,
     TupleSlot,
     VariantCase,

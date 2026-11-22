@@ -2084,6 +2084,55 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, text);
             break;
         }
+        case rir::Opcode::StrTransform:
+        case rir::Opcode::StrRegexReplace: {
+            const bool regex = inst.op == rir::Opcode::StrRegexReplace;
+            const auto text = c.get_value(inst.operands[0]);
+            const auto replacement = c.get_value(inst.operands[regex ? 1 : 2]);
+            const auto ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "string.output.ptr");
+            const auto len = LLVMBuildAlloca(c.builder, c.i32_ty, "string.output.len");
+            LLVMValueRef args[11]{};
+            LLVMTypeRef types[11]{};
+            u32 count = 0;
+            const auto add = [&](LLVMValueRef value, LLVMTypeRef type) {
+                args[count] = value;
+                types[count++] = type;
+            };
+            const auto add_text = [&](LLVMValueRef value) {
+                add(LLVMBuildExtractValue(c.builder, value, 0, "string.ptr"), c.ptr_ty);
+                add(LLVMBuildExtractValue(c.builder, value, 1, "string.len"), c.i32_ty);
+            };
+            add(c.param_conn, c.ptr_ty);
+            add(c.param_arena, c.ptr_ty);
+            if (!regex) add(LLVMConstInt(c.i32_ty, inst.imm.i32_val, 0), c.i32_ty);
+            add_text(text);
+            if (regex)
+                add(c.make_regex_db_load(inst.imm.str_val, true), c.ptr_ty);
+            else
+                add_text(c.get_value(inst.operands[1]));
+            add_text(replacement);
+            add(ptr, c.ptr_ty);
+            add(len, c.ptr_ty);
+            const char* name = regex ? "rut_helper_regex_replace" : "rut_helper_str_transform";
+            const auto type = LLVMFunctionType(c.i8_ty, types, count, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, name);
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, name, type);
+            const auto state = LLVMBuildCall2(c.builder, type, helper, args, count, "string.has");
+            auto opt = LLVMGetUndef(c.opt_str_ty);
+            opt = LLVMBuildInsertValue(c.builder, opt, state, 0, "string.optional.has");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "string.data"),
+                                       1,
+                                       "string.optional.ptr");
+            opt = LLVMBuildInsertValue(c.builder,
+                                       opt,
+                                       LLVMBuildLoad2(c.builder, c.i32_ty, len, "string.size"),
+                                       2,
+                                       "string.optional.len");
+            c.set_value(inst.result, opt);
+            break;
+        }
         case rir::Opcode::StrRegexCapture: {
             LLVMValueRef text = c.get_value(inst.operands[0]);
             LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "capture.ptr");
@@ -2156,6 +2205,37 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMValueRef b =
                 LLVMBuildICmp(c.builder, LLVMIntEQ, r, LLVMConstInt(c.i8_ty, 1, 0), "rx.bool");
             c.set_value(inst.result, b);
+            break;
+        }
+        case rir::Opcode::StrTrimAscii: {
+            const auto text = c.get_value(inst.operands[0]);
+            const auto ptr = LLVMBuildExtractValue(c.builder, text, 0, "trim.ptr");
+            const auto len = LLVMBuildExtractValue(c.builder, text, 1, "trim.len");
+            const auto output_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "trim.output.ptr");
+            const auto output_len = LLVMBuildAlloca(c.builder, c.i32_ty, "trim.output.len");
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_str_trim_ascii");
+            if (!helper) {
+                LLVMTypeRef params[] = {c.ptr_ty, c.i32_ty, c.ptr_ty, c.ptr_ty};
+                helper = LLVMAddFunction(c.llvm_mod,
+                                         "rut_helper_str_trim_ascii",
+                                         LLVMFunctionType(c.void_ty, params, 4, 0));
+            }
+            LLVMValueRef args[] = {ptr, len, output_ptr, output_len};
+            LLVMBuildCall2(c.builder, LLVMGlobalGetValueType(helper), helper, args, 4, "");
+            auto result = LLVMGetUndef(c.str_ty);
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.ptr_ty, output_ptr, "trim.data"),
+                                     0,
+                                     "trim.result.ptr");
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.i32_ty, output_len, "trim.size"),
+                                     1,
+                                     "trim.result.len");
+            c.set_value(inst.result, result);
             break;
         }
         case rir::Opcode::StrTrimPrefix:
@@ -4309,7 +4389,10 @@ static CodegenResult codegen_impl(const rir::Module& rir_mod,
                         !ws_message_field_valid(static_cast<u32>(inst.imm.i32_val)))
                         return {nullptr, nullptr, false};
                 }
-                if (ws_body_mode && inst.op == rir::Opcode::StrRegexCapture)
+                if (ws_body_mode &&
+                    (inst.op == rir::Opcode::StrRegexCapture ||
+                     inst.op == rir::Opcode::StrRegexReplace ||
+                     inst.op == rir::Opcode::StrTransform || inst.op == rir::Opcode::StrSplit))
                     return {nullptr, nullptr, false};
                 if (inst.op == rir::Opcode::ReqRoutingString ||
                     inst.op == rir::Opcode::ReqConnectionScalar) {

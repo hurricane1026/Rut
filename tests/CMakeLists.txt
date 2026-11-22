@@ -4745,6 +4745,12 @@ add_test(NAME test_wait_scheduler_manifest
 set_tests_properties(test_wait_scheduler_manifest PROPERTIES LABELS "unit;model")
 
 
+add_executable(test_string_ops test_string_ops.cc)
+target_link_libraries(test_string_ops rut_runtime)
+target_include_directories(test_string_ops PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_string_ops COMMAND test_string_ops)
+set_tests_properties(test_string_ops PROPERTIES LABELS "unit")
+
 # Bounded owned string fields share the existing runtime arena.
 add_executable(test_string_split test_string_split.cc)
 target_link_libraries(test_string_split rut_runtime)
@@ -4877,12 +4883,13 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_format_integer>
+        COMMAND $<TARGET_FILE:test_string_ops>
         COMMAND $<TARGET_FILE:test_string_split>
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
-        DEPENDS test_network test_h2_failover ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_string_split test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_routing_properties test_regex_capture
+        DEPENDS test_network test_h2_failover ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_jwt_group_policies test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_string_ops test_string_split test_parse_integer test_format_integer test_collected_values test_json test_json_network test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_routing_properties test_regex_capture
         COMMENT "Running all tests..."
     )
 else()
@@ -4970,11 +4977,12 @@ else()
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_format_integer>
+        COMMAND $<TARGET_FILE:test_string_ops>
         COMMAND $<TARGET_FILE:test_string_split>
         COMMAND $<TARGET_FILE:test_parse_integer>
         COMMAND $<TARGET_FILE:test_collected_values>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_h2_failover ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_string_split test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_regex_capture
+        DEPENDS test_network test_h2_failover ${HEALTH_PROBE_CHECK_DEPENDS} test_wait_scheduler ${TIMER_MODEL_CHECK_DEPENDS} test_ws_shutdown_deadline test_ws_lifecycle test_integration test_h1_tls_upstream test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_jwt_claims test_jwt_hs256_issue test_compiler_node_pool test_auth_forwarding test_http_tokens test_http_cache test_auth test_webhook test_hash test_crypto_c test_crypto_digest_c test_crypto_rsa_core_c test_dns test_https_fetch test_jwt_rs256 test_jwt_es256 test_es256_access_token_signer test_ec_public_key test_rsa_verify test_public_key test_types test_rir test_concurrency_verifier test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_string_ops test_string_split test_parse_integer test_format_integer test_collected_values test_json test_ws_bulk test_ws_deflate test_ws_extensions test_consumer_registry test_remote_jwks_metadata test_regex_capture
         COMMENT "Running non-JIT tests..."
     )
 endif()
@@ -5418,6 +5426,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 LABELS "integration;network" TIMEOUT 120 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(binary_opt 0 2)
+            add_test(NAME test_string_ops_${backend}_opt${binary_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_string_ops.py
+                    --server $<TARGET_FILE:rut> --backend ${backend} --opt ${binary_opt})
+            set_tests_properties(test_string_ops_${backend}_opt${binary_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 120 SKIP_RETURN_CODE 77)
             add_test(NAME test_string_find_${backend}_opt${binary_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_string_find.py
                     --server $<TARGET_FILE:rut> --backend ${backend} --opt ${binary_opt})

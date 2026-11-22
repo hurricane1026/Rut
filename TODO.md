@@ -2,6 +2,13 @@
 
 Outstanding work items, prioritized for the next implementation passes.
 
+Completed string core: byte length/search/slice, predicates and affix/ASCII trim,
+ASCII upper/lower, bounded owned literal/RE2 replacement and splitting, plus
+existing full-match and capture APIs. All are consolidated into one feature PR;
+see [language card](docs/language-card.md#byte-string-core) for bounds/lifetimes.
+Unicode semantics and Swift Regex.Match remain absent, with existing explicit
+byte/capture APIs available.
+
 ## P0: Front-End Migration to the Revised Syntax Spec (branch design_syntax)
 
 **Goal**: Migrate lexer/parser/checker to the 2026-07 DESIGN.md §3 revision

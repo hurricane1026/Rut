@@ -16,4 +16,8 @@ Str capture_regex_pattern(const void* program);
 u32 capture_regex_group_count(const void* program);
 // 0 = no participating capture, 1 = present (including empty), 2 = resource/error.
 u8 capture_regex_match(void* program, SliceArena& arena, Str subject, u32 group, Str* output);
+// Literal replacement bytes; at most 64 matches, 8192-byte inputs, 16384-byte output.
+// Returns 1 on success, 0 on invalid input/budget/storage exhaustion.
+u8 capture_regex_replace(
+    void* program, SliceArena& arena, Str subject, Str replacement, Str* output);
 }  // namespace rut

@@ -1552,7 +1552,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             value.rhs->may_nil || value.rhs->may_error || value.may_nil || value.may_error ||
             value.type != (kPredicate ? MirTypeKind::Bool : MirTypeKind::Str) ||
             (kPredicate && (value.int_value < 0 || value.int_value > 3)) ||
-            (kTrim && (value.int_value < 0 || value.int_value > 1)))
+            (kTrim && (value.int_value < 0 || value.int_value > 2)))
             return frontend_error(FrontendError::UnsupportedSyntax, span);
         const auto kOperand = [&](const MirValue& input) {
             return materialize_value(input,
@@ -1578,7 +1578,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             kPredicate
                 ? b.emit_str_predicate(
                       parts[0], parts[1], static_cast<u32>(value.int_value), {span.line, span.col})
-            : kTrim ? (value.int_value == 0
+            : kTrim ? (value.int_value == 2 ? b.emit_str_trim_ascii(parts[0], {span.line, span.col})
+                       : value.int_value == 0
                            ? b.emit_str_trim_prefix(parts[0], parts[1], {span.line, span.col})
                            : b.emit_str_trim_suffix(parts[0], parts[1], {span.line, span.col}))
                     : b.emit_str_interpolate(parts, 2, {span.line, span.col});
@@ -1880,6 +1881,43 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
             subject.value(), field_name, field_type.value(), {span.line, span.col});
         if (!field) return frontend_error(FrontendError::OutOfMemory, span);
         return field.value();
+    }
+    if (value.kind == MirValueKind::StringTransform || value.kind == MirValueKind::RegexReplace) {
+        if (value.args.len != 3 || value.type != MirTypeKind::Str || !value.may_nil ||
+            value.may_error || value.int_value < 0 || value.int_value > 3 ||
+            ((value.kind == MirValueKind::RegexReplace) != (value.int_value == 3)))
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        rir::ValueId parts[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            if (!value.args[i] || value.args[i]->type != MirTypeKind::Str ||
+                value.args[i]->may_nil || value.args[i]->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, span);
+            auto item = materialize_value(*value.args[i],
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          span);
+            if (!item) return core::make_unexpected(item.error());
+            parts[i] = item.value();
+        }
+        auto result = value.kind == MirValueKind::RegexReplace
+                          ? b.emit_str_regex_replace(
+                                parts[0], parts[2], value.str_value, {span.line, span.col})
+                          : b.emit_str_transform(parts[0],
+                                                 parts[1],
+                                                 parts[2],
+                                                 static_cast<u32>(value.int_value),
+                                                 {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::StringSplit) {
         if (!value.lhs || !value.rhs || value.type != MirTypeKind::Collected || !value.may_nil ||

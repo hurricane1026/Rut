@@ -1967,7 +1967,8 @@ func waf(_ req: Request) {
 }
 
 func blockBots(_ req: Request) {
-    let ua = req.userAgent.lower()
+    let pending = req.userAgent.lower()
+    guard let ua = pending else { respond 503 }
     guard !ua.isEmpty else { respond 403 }
     let blocked = ["bot", "spider", "crawler", "scraper"]
     for word in blocked {
@@ -3844,7 +3845,8 @@ get /stream => read(path: "/tmp/data_pipe")
 // Buffered — read into memory for modification
 get /index.html {
     guard let content = read(path: "/var/www/index.html") else { return 404 }
-    let html = content.replace("{{VERSION}}", env("APP_VERSION"))
+    let pending = content.replace("{{VERSION}}", env("APP_VERSION"))
+    guard let html = pending else { return 503 }
     let resp = response(200)
     resp.set("Content-Type", "text/html")
     resp.body = html
@@ -4036,13 +4038,13 @@ database for one-pass scanning.
 // Matching
 guard req.path.matches(re"^/api/v\d+/") else { return 404 }
 
-// Capture groups — error-capable match extraction
-guard let m = req.path.match(re"^/api/v(\d+)/(.*)") else { return 404 }
-let version = m[1]    // "2"
-let rest = m[2]       // "users/123"
+// Capture groups — current borrowed byte captures (Swift Regex.Match remains absent)
+guard let version = regexCapture(req.path, re"^/api/v(\d+)/(.*)", 1) else { return 404 }
+guard let rest = regexCapture(req.path, re"^/api/v(\d+)/(.*)", 2) else { return 404 }
 
 // Replace
-let clean = req.path.replace(re"/+", "/")
+let pending = req.path.replace(re"/+", "/")
+guard let clean = pending else { return 503 }
 
 // In match expressions
 match req.userAgent {
@@ -4674,16 +4676,16 @@ s.hasPrefix(prefix)               // bool
 s.hasSuffix(suffix)               // bool
 s.contains(sub)                   // bool
 s.find(delimiter[, start])         // i32? — absolute byte offset, default start 0
-s.upper()                         // string
-s.lower()                         // string
-s.trim()                          // string
+s.upper()                         // str? — owned ASCII uppercase
+s.lower()                         // str? — owned ASCII lowercase
+s.trim()                          // str — borrowed ASCII whitespace trim
 s.trimPrefix(prefix)              // string
 s.trimSuffix(suffix)              // string
-s.replace(old, new)               // string
+s.replace(old, new)               // str? — bounded owned literal replacement
 s.split(sep)                      // Collected<str>? (bounded byte splitting)
 s.slice(start, end)               // str? — checked, borrowed half-open byte range
 s.matches(re"pattern")            // bool (Vectorscan)
-s.match(re"pattern")              // error-capable match object (capture groups)
+s.match(re"pattern")              // ⏳ absent; use regexCapture(s, re"...", group)
 
 // str.slice uses the same checked intrinsic as Bytes.slice, retaining str type.
 // Unwrapped i32 bounds must satisfy 0 <= start <= end <= s.len; invalid ranges
@@ -4716,8 +4718,8 @@ resp.body                         // response body string
 // --- Regex (Vectorscan) ---
 re"pattern"                       // compile-time validated regex literal
 s.matches(re"pat")                // bool
-s.match(re"(group)")              // match object on success
-s.replace(re"pat", replacement)   // string
+s.match(re"(group)")              // ⏳ absent; regexCapture exposes borrowed str? groups
+s.replace(re"pat", replacement)   // str? — bounded RE2, literal replacement bytes
 
 // --- Hash ---
 md5(data)                     // str? (lowercase hex)
@@ -11659,3 +11661,55 @@ ledger remain authoritative. The single timer-wheel deadline covers the entire
 probe; progress does not extend it. HTTP and TCP paths share teardown, including
 Connect cancellation when the timeout or drain wins before connect completion.
 See [active health scope and verification](docs/kong-active-health.md).
+
+
+## Implemented byte-string core
+
+`str` operations count and preserve bytes, including NUL and non-UTF-8 data.
+They do not provide Unicode case folding, normalization or grapheme indexing.
+`trim()` removes only ASCII whitespace (space and bytes 0x09...0x0d) from both
+ends and returns a borrowed view without allocating. Interior bytes remain
+unchanged; empty/all-whitespace input yields an empty string.
+
+`upper()` and `lower()` map only ASCII a...z/A...Z. They return request-owned
+`str?`, including a present empty string for empty input. `replace(old, new)`
+replaces every nonoverlapping literal byte sequence, left to right. Both
+arguments may be dynamic strings; an empty `old` is invalid. The free forms
+`upper(text)`, `lower(text)`, `trim(text)`, `replace(text, old, new)` and pipeline
+forms such as `text | lower(_)` have the same behavior. User bindings shadow
+these free builtin names.
+
+`replace(re"pattern", new)` uses the existing pinned RE2 byte engine (Latin-1),
+with a compile/load-time literal pattern of 1...1024 bytes and at most 8 capture
+groups. Backreferences and lookaround are rejected. Replacement bytes are
+literal: `$1` and backslashes do not expand captures. Every match is replaced,
+with anchors/boundaries evaluated against the original subject. Empty matches
+insert the replacement and advance the search by one byte, preserving that
+byte; an empty match at end-of-input is processed once. At most 64 matches are
+allowed; exceeding that bound returns `nil`, never partial output.
+
+Owned operations accept input/replacement up to 8192 bytes, literal needles of
+1...256 bytes and output up to 16384 bytes, subject also to available contiguous
+arena storage and a shared 256 KiB request construction budget.
+Missing/exhausted request storage, invalid limits or excessive
+output return `nil`. Even unchanged output owns a copy. Bind an owned result
+(including a helper returning it) to `let` before `guard let`/`if let` so the
+allocation executes once. Owned operations currently require HTTP routes
+without explicit `wait`; timers and WebSocket callbacks are rejected. Borrowed
+`trim`, `slice` and prefix/suffix trimming retain the source lifetime.
+
+```swift
+route POST "/normalize" {
+    let pending = req.body.trim().lower()
+    guard let text = pending else { return 503 }
+    let replaced = text.replace(re"/+", "/")
+    guard let clean = replaced else { return 503 }
+    return response(200, body: clean)
+}
+```
+
+The core also includes concatenation, predicates, checked `slice`, optional
+byte-offset `find`, `len`/`isEmpty`, bounded owned `split`, Vectorscan full-match
+`matches`, and borrowed `regexCapture`. Swift's `Regex.Match` carrier and
+`s.match(re"")` remain absent; use `regexCapture` for participating groups.
+Runnable example: [string-core.rut](examples/string-core.rut).

@@ -2,6 +2,7 @@
 #include "fixtures/ip_parse.h"
 #include "fixtures/query_all.h"
 #include "fixtures/string_find.h"
+#include "fixtures/string_ops.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -49160,8 +49161,109 @@ TEST(frontend, string_split_fresh_narrowing_requires_a_single_evaluation_binding
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir);
-        CHECK(
-            hir.error().detail.eq(lit("bind split() to a let before guard let/if let; fresh "
-                                      "collections must be evaluated once")));
+        CHECK(hir.error().detail.eq(
+            lit("bind owned string results to a let before guard let/if let")));
     }
+}
+
+TEST(frontend, string_core_lowers_bounded_owned_operations_and_borrowed_trim) {
+    auto tokens = lex(lit(test::string_ops::kSource));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    u32 transforms = 0, regex = 0, trim = 0;
+    for (u32 f = 0; f < rir.module.func_count; ++f)
+        for (u32 b = 0; b < rir.module.functions[f].block_count; ++b)
+            for (u32 i = 0; i < rir.module.functions[f].blocks[b].inst_count; ++i) {
+                const auto op = rir.module.functions[f].blocks[b].insts[i].op;
+                transforms += op == rir::Opcode::StrTransform;
+                regex += op == rir::Opcode::StrRegexReplace;
+                trim += op == rir::Opcode::StrTrimAscii;
+            }
+    CHECK(transforms >= 3u);
+    CHECK(regex >= 1u);
+    CHECK(trim >= 1u);
+    rir.destroy();
+}
+
+TEST(frontend, string_core_rejects_invalid_types_arity_fresh_narrowing_and_wait_lifetimes) {
+    const char* bodies[] = {
+        R"(let p = req.body.upper(1) return 204)",
+        R"(let p = req.body.lower("x") return 204)",
+        R"(let p = req.body.trim("x") return 204)",
+        R"(let p = req.body.replace("a") return 204)",
+        R"(let p = req.body.replace(1, "x") return 204)",
+        R"(let p = req.body.replace("a", 1) return 204)",
+        R"(let p = req.header("X").upper() return 204)",
+        R"(guard let p = req.body.upper() else { return 503 } return 204)",
+        R"(if let p = req.body.replace(re"a", "b") { return 204 } else { return 503 })",
+        R"(let p = req.body.lower() wait(1ms) return 204)",
+        R"(let p = req.body.replace(re"[", "b") return 204)",
+        R"rut(let p = req.body.replace(re"(?=x)", "b") return 204)rut",
+    };
+    for (const char* body : bodies) {
+        const std::string source = std::string("route POST \"/\" { ") + body + " }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "unexpectedly accepted: %s\n", source.c_str());
+        CHECK_FALSE(hir);
+    }
+}
+
+TEST(frontend, string_core_owned_helpers_reject_timers_websockets_and_wait_resume) {
+    const char* sources[] = {
+        R"(timer test, every: 1s { let p = "a".upper() })",
+        R"(route POST "/" { wait(1ms) let p = req.body.lower() return 204 })",
+        R"(func change(_ s: str) -> str { s.replace(re"a", "b") }
+            route POST "/" { let p = change(req.body) wait(1ms) return 204 })",
+#if RUT_ENABLE_WEBSOCKET
+        R"(upstream backend
+            route GET "/" { return websocket(backend) { msg in
+                let p = msg.text.upper() msg.forward() } })",
+        R"(func change(_ s: str) -> str { s.replace(re"a", "b") }
+            upstream backend
+            route GET "/" { return websocket(backend) { msg in
+                let p = change(msg.text) msg.forward() } })",
+#endif
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, string_core_free_names_obey_user_shadowing) {
+    const auto source = lit(R"rut(
+func upper(_ s: str) -> str { "shadow" }
+func replace(_ s: str, _ old: str, _ new: str) -> str { "shadow" }
+route POST "/" {
+    let first = upper(req.body)
+    let second = replace(first, "a", "b")
+    return response(200, body: second)
+}
+)rut");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_FALSE(function_has_op(rir.module.functions[0], rir::Opcode::StrTransform));
+    rir.destroy();
 }

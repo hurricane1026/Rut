@@ -1000,6 +1000,48 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_transform(
+        ValueId text, ValueId needle, ValueId replacement, u32 mode, SourceLoc loc = {}) {
+        if (mode > 2 || !val_has_type(text, TypeKind::Str) ||
+            !val_has_type(needle, TypeKind::Str) || !val_has_type(replacement, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::StrTransform, ty, loc));
+        inst->operands[0] = text;
+        inst->operands[1] = needle;
+        inst->operands[2] = replacement;
+        inst->operand_count = 3;
+        inst->imm.i32_val = static_cast<i32>(mode);
+        return vid;
+    }
+
+    Result<ValueId> emit_str_regex_replace(ValueId text,
+                                           ValueId replacement,
+                                           Str pattern,
+                                           SourceLoc loc = {}) {
+        if (!val_has_type(text, TypeKind::Str) || !val_has_type(replacement, TypeKind::Str) ||
+            !pattern.ptr || pattern.len == 0 || pattern.len > 1024)
+            return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::Str));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::StrRegexReplace, ty, loc));
+        inst->operands[0] = text;
+        inst->operands[1] = replacement;
+        inst->operand_count = 2;
+        inst->imm.str_val = pattern;
+        return vid;
+    }
+
+    Result<ValueId> emit_str_trim_ascii(ValueId str, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Str));
+        auto [inst, vid] = TRY(emit(Opcode::StrTrimAscii, ty, loc));
+        inst->operands[0] = str;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_str_trim_prefix(ValueId str, ValueId prefix, SourceLoc loc = {}) {
         if (!val_has_type(str, TypeKind::Str) || !val_has_type(prefix, TypeKind::Str))
             return err(RirError::InvalidState);

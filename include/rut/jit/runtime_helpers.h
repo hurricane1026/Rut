@@ -134,6 +134,27 @@ void* rut_helper_req_header_all(void* conn,
                                 rut::u32 name_len);
 
 // Split bounded byte strings into at most 64 owned fields; null on failure.
+rut::u8 rut_helper_str_transform(void* conn,
+                                 void* arena,
+                                 rut::u32 mode,
+                                 const char* text,
+                                 rut::u32 length,
+                                 const char* needle,
+                                 rut::u32 needle_length,
+                                 const char* replacement,
+                                 rut::u32 replacement_length,
+                                 const char** output,
+                                 rut::u32* output_length);
+rut::u8 rut_helper_regex_replace(void* conn,
+                                 void* arena,
+                                 const char* text,
+                                 rut::u32 length,
+                                 void* db,
+                                 const char* replacement,
+                                 rut::u32 replacement_length,
+                                 const char** output,
+                                 rut::u32* output_length);
+
 void* rut_helper_str_split(void* conn,
                            void* arena,
                            const char* data,
@@ -534,6 +555,12 @@ rut::u8 rut_helper_str_concat(void* conn,
                               rut::u32 count,
                               const char** out_ptr,
                               rut::u32* out_size);
+
+// Borrow the span after trimming ASCII HT/LF/VT/FF/CR/SP from both ends.
+void rut_helper_str_trim_ascii(const char* s,
+                               rut::u32 size,
+                               const char** out_ptr,
+                               rut::u32* out_size);
 
 // Trim prefix from string. If s starts with pfx, out = remainder.
 // Otherwise out = s unchanged.

@@ -175,6 +175,24 @@ inline bool valid_integer_parse(const Function& fn, const Instruction& inst) {
 }
 
 inline bool valid_string_instruction(const Function& fn, const Instruction& inst) {
+    if (inst.op == Opcode::StrTransform || inst.op == Opcode::StrRegexReplace) {
+        const bool regex = inst.op == Opcode::StrRegexReplace;
+        if (inst.operand_count != (regex ? 2u : 3u) || inst.extra_operands || !fn.values ||
+            inst.result == kNoValue || inst.result.id >= fn.value_count)
+            return false;
+        for (u32 i = 0; i < inst.operand_count; ++i) {
+            const auto id = inst.operands[i];
+            if (id == kNoValue || id.id >= fn.value_count) return false;
+            const Type* t = fn.values[id.id].type;
+            if (!t || t->kind != TypeKind::Str || t->inner || t->struct_def) return false;
+        }
+        const Type* t = fn.values[inst.result.id].type;
+        return t && t->kind == TypeKind::Optional && !t->struct_def && t->inner &&
+               t->inner->kind == TypeKind::Str && !t->inner->inner && !t->inner->struct_def &&
+               (regex ? inst.imm.str_val.ptr && inst.imm.str_val.len > 0 &&
+                            inst.imm.str_val.len <= 1024
+                      : inst.imm.i32_val >= 0 && inst.imm.i32_val <= 2);
+    }
     if (inst.op == Opcode::StrRegexCapture) {
         if (inst.operand_count != 2 || inst.extra_operands || !fn.values || !fn.blocks ||
             !inst.imm.str_val.ptr || inst.imm.str_val.len == 0 || inst.imm.str_val.len > 1024 ||
@@ -215,7 +233,8 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
     }
     if (inst.op != Opcode::IpParse && inst.op != Opcode::StrPredicate &&
         inst.op != Opcode::StrInterpolate && inst.op != Opcode::StrTrimPrefix &&
-        inst.op != Opcode::StrTrimSuffix && inst.op != Opcode::ReqSetPath &&
+        inst.op != Opcode::StrTrimSuffix && inst.op != Opcode::StrTrimAscii &&
+        inst.op != Opcode::ReqSetPath &&
         inst.op != Opcode::ReqSetHash)
         return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
@@ -259,6 +278,10 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
         return block.insts && value.def_inst < block.inst_count &&
                block.insts[value.def_inst].op == Opcode::ConstStr &&
                block.insts[value.def_inst].result == inst.operand(0);
+    }
+    if (inst.op == Opcode::StrTrimAscii) {
+        return inst.operand_count == 1 && kExact(inst.result, TypeKind::Str) &&
+               kExact(inst.operand(0), TypeKind::Str);
     }
     if (inst.op == Opcode::StrTrimPrefix || inst.op == Opcode::StrTrimSuffix) {
         return inst.operand_count == 2 && kExact(inst.result, TypeKind::Str) &&

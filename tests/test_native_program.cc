@@ -5,6 +5,7 @@
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
 #include "fixtures/string_find.h"
+#include "fixtures/string_ops.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -4216,3 +4217,85 @@ TEST(native_program, string_split_executes_owned_dynamic_fields_at_both_optimiza
         pool.destroy();
     }
 }
+
+TEST(native_program, string_core_executes_owned_and_borrowed_results_without_source) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::string_ops::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        jit::HandlerCtx ctx{};
+
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_ops::kCases) {
+            arena.reset();
+            std::string request = "POST / HTTP/1.1\r\nHost: local\r\nContent-Length: " +
+                                  std::to_string(item.input.len) + "\r\n\r\n";
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto handler = program.p->config.routes[item.route].fn;
+            REQUIRE(handler);
+            const auto result =
+                jit::HandlerResult::unpack(handler(connection.get(),
+                                                   &ctx,
+                                                   reinterpret_cast<const u8*>(request.data()),
+                                                   request.size(),
+                                                   &arena));
+            REQUIRE_EQ(result.status_code, 200u);
+            REQUIRE(connection->jit_response_body_valid);
+            CHECK(connection->jit_response_body.eq(item.output));
+            if (item.route != 4 && item.output.len) {
+                memset(request.data(), 'z', request.size());
+                CHECK(connection->jit_response_body.eq(item.output));
+                const u64 expected_storage =
+                    item.route == 4
+                        ? 0
+                        : ((static_cast<u64>(item.output.len ? item.output.len : 1) + 7) & ~u64{7});
+                CHECK_EQ(arena.space_used(), expected_storage);
+            }
+        }
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, string_core_trim_borrows_websocket_payload_without_request_storage) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(R"rut(
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    let value = message.text.trim()
+    guard value == "a" else { message.drop() }
+    message.forward()
+} }
+)rut"));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        const Str payloads[] = {lit_str("a"),
+                                lit_str(" \t\r\na\v\f"),
+                                lit_str(""),
+                                lit_str(" \0a "),
+                                lit_str("\xc2\xa0"
+                                        "a")};
+        for (u32 i = 0; i < 5; ++i)
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payloads[i].ptr),
+                          payloads[i].len,
+                          true) == (i < 2 ? WsFrameAction::Forward : WsFrameAction::Drop));
+    }
+}
+#endif
