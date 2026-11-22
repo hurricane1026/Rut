@@ -1001,8 +1001,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                     i++;
                     continue;
                 }
-                for (u32 move = i + 1; move < nhdrs; move++) hdrs[move - 1] = hdrs[move];
-                nhdrs--;
+                for (u32 move = static_cast<u32>(static_cast<i64>(i) + 1); move < nhdrs; move++)
+                    hdrs[static_cast<u32>(static_cast<i64>(move) - 1)] = hdrs[move];
+                nhdrs = static_cast<u32>(static_cast<i64>(nhdrs) - 1);
             }
         }
         if (!remove && !h2_is_prohibited_response_header(mutation.name.ptr, mutation.name.len)) {
@@ -1021,14 +1022,19 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         o.status_code < 200 || o.status_code == 204 || o.status_code == 205 || o.status_code == 304;
     if (body_len != 0 && !bodyless_status && is_head) {
         hpack::Encoder staged = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
-        const u32 n = http2_write_head_response_headers(d.resp + d.resp_len,
-                                                        d.resp_cap - d.resp_len,
-                                                        staged,
-                                                        stream_id,
-                                                        o.status_code,
-                                                        hdrs,
-                                                        nhdrs,
-                                                        body_len);
+        if (d.resp_len > d.resp_cap) {
+            d.overflow = true;
+            return;
+        }
+        const u32 n = http2_write_head_response_headers(
+            d.resp + static_cast<i64>(d.resp_len),
+            static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+            staged,
+            stream_id,
+            o.status_code,
+            hdrs,
+            nhdrs,
+            body_len);
         if (n == 0) {
             if (d.resp_len != 0)
                 d.overflow = true;
@@ -1040,7 +1046,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             d.owned_hpack_after = staged;
         else
             d.conn->h2->hpack_enc = staged;
-        d.resp_len += n;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(n));
         h2_close_stream(d.conn->h2, stream_id);
     } else if (body_len != 0 && !bodyless_status) {
         if (!h2_stage_owned_response(d,
