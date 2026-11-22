@@ -56,7 +56,8 @@ ParseStatus ws_parse_header(
         // §5.2: the most significant bit of a 64-bit length MUST be 0.
         if ((buf[2] & 0x80) != 0) return ParseStatus::Error;
         for (u32 i = 0; i < 8; i++) {
-            payload_len = (payload_len << 8) | static_cast<u64>(buf[static_cast<i64>(2) + i]);
+            payload_len = (payload_len << 8) |
+                          static_cast<u64>(buf[static_cast<i64>(2) + static_cast<i64>(i)]);
         }
         offset = 10;
         // Minimal-length rule: a 64-bit length that fits in 16 bits is non-canonical.
@@ -87,7 +88,8 @@ void ws_unmask(u8* payload, u64 len, const u8 mask_key[4]) {
 
 void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset) {
     const u32 phase = static_cast<u32>(offset & 3);
-    for (u64 i = 0; i < len; i++) payload[i] ^= mask_key[(static_cast<u64>(phase) + (i & 3)) & 3];
+    for (u64 i = 0; i < len; i++)
+        payload[i] ^= mask_key[(static_cast<i64>(phase) + static_cast<i64>(i & 3)) & 3];
 }
 
 u32 ws_write_header(u8* out,
