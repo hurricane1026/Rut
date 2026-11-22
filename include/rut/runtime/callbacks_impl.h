@@ -16296,7 +16296,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();
-    const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
+    const u32 kInitialBodyLen =
+        kTotalLen > kHeaderLen
+            ? static_cast<u32>(static_cast<i64>(kTotalLen) - static_cast<i64>(kHeaderLen))
+            : 0;
 
     if (conn.resp_header_mutation_count != 0 || force_downstream_close_header) {
         // Keep the body in upstream_recv_buf while rewritten headers drain, but
@@ -16305,13 +16308,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // with the connection-owned parser after the header send completes.
         if (conn.resp_body_mode == BodyMode::Chunked && kInitialBodyLen > 0) {
             ChunkedParser probe = conn.resp_chunk_parser;
-            const u8* body_start = conn.upstream_recv_buf.data() + kHeaderLen;
+            const u8* body_start = conn.upstream_recv_buf.data() + static_cast<i64>(kHeaderLen);
             u32 pos = 0;
             while (pos < kInitialBodyLen) {
                 u32 consumed = 0, out_start = 0, out_len = 0;
                 const ChunkStatus kChunkStatus = probe.feed(
-                    body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
-                pos += consumed;
+                    body_start + static_cast<i64>(pos),
+                    static_cast<u32>(static_cast<i64>(kInitialBodyLen) - static_cast<i64>(pos)),
+                    &consumed,
+                    &out_start,
+                    &out_len);
+                pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
                 if (kChunkStatus == ChunkStatus::Error) {
                     (void)detach_upstream_close_only(loop, conn);
                     static const char k502[] =
@@ -16357,19 +16364,24 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > 0) {
         u32 consume = kInitialBodyLen;
         if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
-        conn.resp_body_remaining -= consume;
+        conn.resp_body_remaining = static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) -
+                                                    static_cast<i64>(consume));
     }
 
     bool chunked_done = false;
     u32 chunked_consumed = kInitialBodyLen;
     if (conn.resp_body_mode == BodyMode::Chunked && kInitialBodyLen > 0) {
-        const u8* body_start = conn.upstream_recv_buf.data() + kHeaderLen;
+        const u8* body_start = conn.upstream_recv_buf.data() + static_cast<i64>(kHeaderLen);
         u32 pos = 0;
         while (pos < kInitialBodyLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
             const ChunkStatus kChunkStatus = conn.resp_chunk_parser.feed(
-                body_start + pos, kInitialBodyLen - pos, &consumed, &out_start, &out_len);
-            pos += consumed;
+                body_start + static_cast<i64>(pos),
+                static_cast<u32>(static_cast<i64>(kInitialBodyLen) - static_cast<i64>(pos)),
+                &consumed,
+                &out_start,
+                &out_len);
+            pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
             if (kChunkStatus == ChunkStatus::Done) {
                 chunked_done = true;
                 break;
