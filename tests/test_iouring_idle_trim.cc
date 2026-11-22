@@ -785,7 +785,7 @@ TEST(iouring_idle_trim, wheel_cursor_wraps_and_each_idle_period_trims_once) {
         c->send_slice[0] = 1;
         r.loop->timer.refresh(c, r.loop->keepalive_timeout);  // ...and re-arm
     }
-    CHECK_GT(static_cast<u32>(r.loop->timer.cursor), 2 * TimerWheel::kSlots);
+    CHECK_GT(r.loop->timer.cursor, TimerWheel::Tick{2 * TimerWheel::kSlots});
 }
 
 TEST(iouring_idle_trim, clipped_window_scans_oldest_first_across_cursor_wrap) {

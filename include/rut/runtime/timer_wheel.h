@@ -35,6 +35,29 @@ struct TimerWheel {
     enum class Tick : u32 {};
     Tick cursor;  // Absolute tick modulo 2^32. Only its low bits select a slot.
 
+    // Tick is a modular timestamp. Widen before each step, then select the low 32 bits.
+    friend constexpr Tick& operator++(Tick& t) {
+        t = Tick{static_cast<u32>(static_cast<u64>(t) + 1)};
+        return t;
+    }
+
+    friend constexpr Tick& operator--(Tick& t) {
+        t = Tick{static_cast<u32>(static_cast<i64>(t) - 1)};
+        return t;
+    }
+
+    friend constexpr Tick operator++(Tick& t, int) {
+        const Tick old = t;
+        ++t;
+        return old;
+    }
+
+    friend constexpr Tick operator--(Tick& t, int) {
+        const Tick old = t;
+        --t;
+        return old;
+    }
+
     constexpr Tick tick_after(u32 seconds) const {
         u32 result;
         (void)__builtin_add_overflow(static_cast<u32>(cursor), seconds, &result);
@@ -90,7 +113,7 @@ struct TimerWheel {
             count++;
             node = next;
         }
-        cursor = tick_after(1);
+        ++cursor;
         return count;
     }
 
