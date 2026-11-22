@@ -7075,12 +7075,13 @@ public:
                             ResponseReadDeadlineState::RefreshPending)) {
                 const u32 received = c.response_read_deadline_post_commit_origin_received;
                 const u32 declared = c.response_read_deadline_post_commit_declared_body;
-                if (owner.positive_bytes > declared - received) {
+                if (static_cast<i64>(owner.positive_bytes) >
+                    static_cast<i64>(declared) - static_cast<i64>(received)) {
                     close_conn(c);
                     continue;
                 }
-                c.response_read_deadline_post_commit_origin_received =
-                    received + owner.positive_bytes;
+                c.response_read_deadline_post_commit_origin_received = static_cast<u32>(
+                    static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
                 c.response_read_deadline_progress_bytes =
@@ -7136,12 +7137,13 @@ public:
                             ResponseReadDeadlineState::RefreshPending)) {
                 const u32 received = c.response_read_deadline_post_commit_origin_received;
                 const u32 declared = c.response_read_deadline_post_commit_declared_body;
-                if (owner.positive_bytes > declared - received) {
+                if (static_cast<i64>(owner.positive_bytes) >
+                    static_cast<i64>(declared) - static_cast<i64>(received)) {
                     close_conn(c);
                     continue;
                 }
-                c.response_read_deadline_post_commit_origin_received =
-                    received + owner.positive_bytes;
+                c.response_read_deadline_post_commit_origin_received = static_cast<u32>(
+                    static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
                 c.response_read_deadline_progress_bytes =
@@ -7323,10 +7325,12 @@ public:
                 c.buffered_response_len() != 0 || c.send_armed ||
                 c.response_read_deadline_send_owner_active || c.send_progress != 0 ||
                 c.resp_body_mode != BodyMode::ContentLength ||
-                c.resp_body_remaining != c.response_read_deadline_post_commit_declared_body -
-                                             c.response_read_deadline_post_commit_origin_received ||
-                c.resp_body_sent != c.response_header_buf.len() +
-                                        c.response_read_deadline_post_commit_origin_received ||
+                static_cast<i64>(c.resp_body_remaining) !=
+                    static_cast<i64>(c.response_read_deadline_post_commit_declared_body) -
+                        static_cast<i64>(c.response_read_deadline_post_commit_origin_received) ||
+                static_cast<i64>(c.resp_body_sent) !=
+                    static_cast<i64>(c.response_header_buf.len()) +
+                        static_cast<i64>(c.response_read_deadline_post_commit_origin_received) ||
                 c.on_send != &on_response_body_sent<Self>)
                 return false;
             // ExpiryPending is the single timer-side entry point. Completion consumes
@@ -7400,10 +7404,12 @@ private:
                 const u64 ready = body_pump_ready_words[word_index] & remaining_mask;
                 if (ready == 0) break;
                 const u32 bit = static_cast<u32>(__builtin_ctzll(ready));
-                const u32 id = word_index * 64u + bit;
+                const i64 id_wide = static_cast<i64>(word_index) * 64 + static_cast<i64>(bit);
+                if (id_wide > static_cast<i64>(UINT32_MAX)) continue;
+                const u32 id = static_cast<u32>(id_wide);
                 const u64 bit_mask = u64{1} << bit;
                 body_pump_ready_words[word_index] &= ~bit_mask;
-                remaining_mask = bit == 63u ? 0 : (~u64{0} << (bit + 1u));
+                remaining_mask = bit == 63u ? 0 : (~u64{0} << (static_cast<i64>(bit) + 1));
 
                 if (id >= slots_initialized) continue;
                 Connection& c = conns[id];
