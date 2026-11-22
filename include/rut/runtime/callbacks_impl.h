@@ -9720,7 +9720,8 @@ void h2_proxy_finish(Loop* loop,
         }
         http_cache_complete(conn, conn.upstream_recv_buf.data(), static_cast<u32>(total_len));
     }
-    constexpr u32 kMaxForwardHeaders = kMaxHeaders + Connection::kMaxRespHeaderMutations;
+    constexpr u32 kMaxForwardHeaders = static_cast<u32>(
+        static_cast<i64>(kMaxHeaders) + static_cast<i64>(Connection::kMaxRespHeaderMutations));
     hpack::Header hdrs[kMaxForwardHeaders];
     u32 nhdrs = 0;
     for (u32 i = 0; i < resp.header_count && nhdrs < kMaxHeaders; i++) {
@@ -9789,8 +9790,11 @@ void h2_proxy_finish(Loop* loop,
         }
     }
     if (body_len != 0) {
-        if (body_len > Http2Conn::kBodySynthCap || hdr_end > conn.upstream_recv_buf.len() ||
-            body_len > conn.upstream_recv_buf.len() - hdr_end || conn.upstream_send_armed ||
+        const i64 recv_len = static_cast<i64>(conn.upstream_recv_buf.len());
+        const i64 hdr_end_wide = static_cast<i64>(hdr_end);
+        const i64 body_len_wide = static_cast<i64>(body_len);
+        if (body_len_wide > static_cast<i64>(Http2Conn::kBodySynthCap) || hdr_end_wide > recv_len ||
+            body_len_wide > recv_len - hdr_end_wide || conn.upstream_send_armed ||
             conn.on_upstream_send != nullptr || h2->async_synth_sent != h2->async_synth_len ||
             conn.h2_proxy_synth_quarantined || h2->outbound_stream != 0) {
             h2_proxy_fail(loop, conn, 502);
@@ -9798,7 +9802,7 @@ void h2_proxy_finish(Loop* loop,
         }
         // Preserve the body before retiring upstream_recv_buf. The owner points
         // only at this bounded scratch after teardown.
-        const u8* body = conn.upstream_recv_buf.data() + hdr_end;
+        const u8* body = conn.upstream_recv_buf.data() + hdr_end_wide;
         memcpy(h2->pending_synth, body, body_len);
         u8 response_scratch[8192];
         H2Dispatch<Loop> d{loop, &conn, response_scratch, sizeof(response_scratch), 0, false};
