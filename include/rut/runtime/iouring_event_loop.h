@@ -5885,12 +5885,17 @@ public:
                                    ResponseReadDeadlinePostCommitPhase::HeaderSend
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
-        if (received > declared || owner.positive_bytes > declared - received ||
+        if (received > declared ||
+            static_cast<i64>(owner.positive_bytes) >
+                static_cast<i64>(declared) - static_cast<i64>(received) ||
             (owner.terminal_fault && !bounded_clean_eof &&
-             owner.positive_bytes != declared - received) ||
+             owner.positive_bytes !=
+                 static_cast<u32>(static_cast<i64>(declared) - static_cast<i64>(received))) ||
             (owner.saw_positive &&
-             (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-              owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)) ||
+             (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                  UINT32_MAX ||
+              static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                  owner.expected_copy_end)) ||
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0)) ||
             !ResponseBodyChain::matches_buffered_length(
@@ -5902,10 +5907,12 @@ public:
         // prepare validated the pre-batch copy range. A valid Send CQE in this
         // batch may already have consumed header/body bytes; the retained range
         // above is checked against the current completed count, not offset zero.
-        c.response_read_deadline_post_commit_origin_received = received + owner.positive_bytes;
+        c.response_read_deadline_post_commit_origin_received =
+            static_cast<u32>(static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
         c.response_read_deadline_progress_generation = owner.deadline_generation;
         c.response_read_deadline_progress_episode = owner.upstream_episode;
-        c.response_read_deadline_progress_bytes = received + owner.positive_bytes;
+        c.response_read_deadline_progress_bytes =
+            static_cast<u32>(static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
         c.response_read_timer_last_progress_ns = monotonic_ns();
         return true;
     }
@@ -5922,9 +5929,11 @@ public:
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
             c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
             raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
-            declared_body > c.upstream_recv_buf.capacity() - raw_header_end)
+            static_cast<i64>(declared_body) >
+                static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
             return false;
-        const u32 initial_body = c.buffered_response_len() - raw_header_end;
+        const u32 initial_body = static_cast<u32>(static_cast<i64>(c.buffered_response_len()) -
+                                                  static_cast<i64>(raw_header_end));
         if (initial_body > declared_body) return false;
         const bool fragmented_header_transition =
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
