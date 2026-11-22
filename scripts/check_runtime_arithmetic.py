@@ -27,10 +27,13 @@ def paired_checker(query):
     if not location:
         return None
     name = Path(location).name
-    if not name.startswith('clang-query-'):
+    if name == 'clang-query':
+        checker_name = 'clang-check'
+    elif name.startswith('clang-query-'):
+        checker_name = 'clang-check-' + name.removeprefix('clang-query-')
+    else:
         return None
-    paired = Path(location).absolute().with_name(
-        'clang-check-' + name.removeprefix('clang-query-'))
+    paired = Path(location).absolute().with_name(checker_name)
     return str(paired) if shutil.which(str(paired)) else None
 
 
@@ -118,7 +121,9 @@ def self_test(tool):
         path_bin.mkdir()
         local_bin.mkdir()
         for candidate in (path_bin / 'clang-query-22', path_bin / 'clang-check-22',
-                          local_bin / 'clang-query-22', local_bin / 'clang-check-22'):
+                          local_bin / 'clang-query-22', local_bin / 'clang-check-22',
+                          path_bin / 'clang-query', path_bin / 'clang-check',
+                          local_bin / 'clang-query', local_bin / 'clang-check'):
             candidate.write_text('#!/bin/sh\nexit 0\n')
             candidate.chmod(0o755)
         old_path = os.environ.get('PATH', '')
@@ -135,6 +140,18 @@ def self_test(tool):
             raise RuntimeError(f'clang checker self-test: local pair mismatch: {local_pair}')
         if path_pair != str(path_bin / 'clang-check-22'):
             raise RuntimeError(f'clang checker self-test: PATH pair mismatch: {path_pair}')
+        os.environ['PATH'] = str(path_bin) + os.pathsep + old_path
+        try:
+            os.chdir(local_bin)
+            local_unversioned = paired_checker('./clang-query')
+            path_unversioned = paired_checker('clang-query')
+        finally:
+            os.chdir(old_cwd)
+            os.environ['PATH'] = old_path
+        if local_unversioned != str((local_bin / 'clang-check').absolute()):
+            raise RuntimeError(f'clang checker self-test: local unversioned mismatch: {local_unversioned}')
+        if path_unversioned != str(path_bin / 'clang-check'):
+            raise RuntimeError(f'clang checker self-test: PATH unversioned mismatch: {path_unversioned}')
 
         file = Path(directory) / 'probe.cc'
         file.write_text("""using U = unsigned;
@@ -282,9 +299,11 @@ def main():
     args = parser.parse_args()
     global SYNTAX_CHECK
     if args.clang_check is None and args.clang_query != 'clang-query':
+        if not shutil.which(args.clang_query):
+            raise SystemExit(f'cannot locate clang-query executable: {args.clang_query}')
         paired = paired_checker(args.clang_query)
         if not paired:
-            raise SystemExit(f'cannot locate clang-query executable: {args.clang_query}')
+            raise SystemExit(f'no matching clang-check for {args.clang_query}; pass --clang-check explicitly')
         args.clang_check = paired
     SYNTAX_CHECK = args.clang_check or 'clang-check'
     self_test(args.clang_query)
