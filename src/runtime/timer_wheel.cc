@@ -8,6 +8,16 @@ namespace rut {
 
 namespace {
 
+consteval bool cursor_wrap_contract() {
+    TimerWheel wheel{};
+    wheel.cursor = UINT32_MAX;
+    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == 0 &&
+           wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == UINT32_MAX - 1 &&
+           TimerWheel::elapsed_ticks(UINT32_MAX - 1, 1) == 3;
+}
+
+static_assert(cursor_wrap_contract());
+
 // Check both ends of every representable bucket against the wheel geometry.
 consteval bool yield_fallback_contract() {
     if (TimerWheel::yield_fallback_seconds(0) != 1) return false;
@@ -41,8 +51,7 @@ void TimerWheel::add(Connection* c, u32 seconds) {
     // earlier arming must not look "already handled" in its new list, whatever
     // timeout and expiry tick the new arming picked.
     c->idle_trim_examined = false;
-    u32 slot = (cursor + seconds) & (kSlots - 1);
-    slots[slot].insert_after(&c->timer_node);
+    slots[slot_after(seconds)].insert_after(&c->timer_node);
 }
 
 void TimerWheel::refresh(Connection* c, u32 seconds) {

@@ -32,7 +32,21 @@ struct TimerWheel {
     }
 
     ListNode slots[kSlots];
-    u32 cursor;
+    u32 cursor;  // Absolute tick modulo 2^32. Only its low bits select a slot.
+
+    constexpr u32 tick_after(u32 seconds) const {
+        return static_cast<u32>(static_cast<u64>(cursor) + seconds);
+    }
+
+    constexpr u32 slot_after(u32 seconds) const {
+        static_assert(kSlots > 0 && (kSlots & (kSlots - 1)) == 0);
+        return tick_after(seconds) & (kSlots - 1);
+    }
+
+    // Elapsed ticks for intervals shorter than one complete 32-bit cycle.
+    static constexpr u32 elapsed_ticks(u32 start, u32 now) {
+        return static_cast<u32>(static_cast<i64>(now) - start);
+    }
 
     void init() {
         cursor = 0;
@@ -55,7 +69,7 @@ struct TimerWheel {
     template <typename Fn>
     u32 tick(Fn on_expire) {
         u32 count = 0;
-        ListNode* head = &slots[cursor & (kSlots - 1)];
+        ListNode* head = &slots[slot_after(0)];
         ListNode* node = head->next;
         while (node != head) {
             ListNode* next = node->next;
@@ -67,7 +81,7 @@ struct TimerWheel {
             count++;
             node = next;
         }
-        cursor++;
+        cursor = tick_after(1);
         return count;
     }
 

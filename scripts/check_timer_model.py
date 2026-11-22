@@ -31,10 +31,10 @@ CASES = (
 def check_manifest() -> None:
     # Drift alarms only; concrete tests supply implementation evidence.
     anchors = {
-        "include/rut/runtime/timer_wheel.h": ("cursor++", "node->detach()"),
+        "include/rut/runtime/timer_wheel.h": ("cursor = tick_after(1)", "node->detach()"),
         "include/rut/runtime/epoll_event_loop.h": ("schedule_yield_timer", "drain_yield_heap", "c.handler_gen != entry.handler_gen"),
         "include/rut/runtime/iouring_event_loop.h": ("schedule_yield_timer", "ev.result == static_cast<i32>(c.yield_timer_gen)"),
-        "src/runtime/timer_wheel.cc": ("cursor + seconds", "c->timer_node.detach()"),
+        "src/runtime/timer_wheel.cc": ("slots[slot_after(seconds)]", "c->timer_node.detach()"),
         "tests/test_timer_model.cc": ("bounded_wheel_sequences", "heap_matches_deadline_oracle",
                                       "stale_uring_completion_preserves_successor",
                                       "epoll_disarm_removes_all_entries_and_preserves_peer"),
