@@ -131,6 +131,14 @@ void* rut_helper_req_header_all(void* conn,
                                 const char* name,
                                 rut::u32 name_len);
 
+// Collect at most 64 raw query values; returned strings own request-arena copies.
+void* rut_helper_req_query_all(void* conn,
+                               void* arena,
+                               const rut::u8* req_data,
+                               rut::u32 req_len,
+                               const char* name,
+                               rut::u32 name_len);
+
 // Low 32 bits: 1/0/-1/-2, or 0x80000000 while pending. High 32 bits:
 // pending retry milliseconds. The worker owns credential copies across yields.
 rut::u64 rut_helper_password_verify_header(void* connection,

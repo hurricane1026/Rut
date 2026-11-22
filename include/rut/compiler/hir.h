@@ -160,6 +160,7 @@ enum class HirExprKind : u8 {
     StructInit,
     Field,
     ReqHeaderAll,
+    ReqQueryAll,     // ordered, owned raw values -> Collected<str>?
     ReqHeaderCount,  // original case-insensitive field count; -1 on parse failure
     ReqUniqueHeader,
     ReqHeader,
@@ -596,8 +597,8 @@ struct HirExpr {
 inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
     if (depth > 128) return true;
     if (value.kind == HirExprKind::StringConcat || value.kind == HirExprKind::ReqHeaderAll ||
-        value.kind == HirExprKind::CollectBytes || value.kind == HirExprKind::CollectedCount ||
-        value.kind == HirExprKind::CollectedGet)
+        value.kind == HirExprKind::ReqQueryAll || value.kind == HirExprKind::CollectBytes ||
+        value.kind == HirExprKind::CollectedCount || value.kind == HirExprKind::CollectedGet)
         return true;
     if (value.kind == HirExprKind::JsonOp &&
         (value.int_value == static_cast<i64>(json::Op::BytesConcat) ||

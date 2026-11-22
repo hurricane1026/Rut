@@ -76,11 +76,11 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   [x] `Response` locals with ordered `set/remove/add/header`: literal prefixes
   fold into response-header sets and dynamic string values lower through a
   bounded per-request mutation log for direct routes; [x] `chain after`
-  response-header mutation for direct and forwarded responses. Still pending:
-  buffered body/status mutation and after middleware on `wait`/`for` routes
-  (needs a resumable, stream-owned runtime Response);
-  `req.queryAll` (needs a runtime [str] value type — none exists);
-  `stats()/metrics()/reload()/upstream.mark()` declarations.
+  response-header mutation for direct and forwarded responses; [x] `req.queryAll`
+  through the bounded `Collected<str>?` runtime. Still pending: buffered body/status
+  mutation and after middleware on `wait`/`for` routes (needs a resumable,
+  stream-owned runtime Response); `stats()/metrics()/reload()/upstream.mark()`
+  declarations.
 - Diagnostics: [x] §3.6 fix-its for `?.`/`??`, postfix `!`, truthiness
   guards, bitwise symbols, placeholder-less pipelines, and `case`/colon match
   arms; [x] middleware status-`return` and handler `respond` context errors
@@ -129,6 +129,13 @@ without presenting lossy or per-shard state as exact shared state.
   helper composition and consistent-hash keys are covered alongside binary and
   empty-span boundaries. This is one M1 string primitive slice, not completion
   of the broader collections/state work.
+
+- [x] `req.queryAll("key")` returns at most 64 ordered raw query values through
+  `Collected<str>?`. Missing keys produce empty collections; limits and request
+  storage failures produce nil. Bind the read before guard/if-let narrowing.
+  Values are copied; raw encoding/empty-value semantics are documented, and
+  explicit-wait/non-request contexts are rejected. This
+  completes the repeated-query read primitive, not general arrays or iteration.
 
 - [x] Reject a fifth stacked `@rateLimit` decorator with a capacity diagnostic at
   that decorator, instead of silently omitting the rule. Boundary regression

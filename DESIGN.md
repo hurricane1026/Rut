@@ -591,7 +591,20 @@ req.params.postId       // string (from :postId)
 // Query string
 req.queryString         // string? — raw query string: "page=1&limit=20"
 req.query("page")       // string? — first value of the parameter
-req.queryAll("tags")    // [string] — all values (?tags=a&tags=b), like getAll for headers
+req.queryAll("tags")    // Collected<str>? — ordered raw values (?tags=a&tags=b)
+
+// queryAll requires a nonempty literal raw key: no ASCII whitespace/control bytes,
+// '&', '=' or '#'. Matching is case-sensitive; percent spelling and '+' are
+// not decoded. '&' separates pairs and the first '=' separates key/value;
+// a bare key or empty value contributes an empty string, and '#' ends the query.
+// At most 64 matching values are copied into request-owned Collected<str> storage;
+// absence is a present empty collection. Malformed requests, capacity or shared
+// 256 KiB arena/SlicePool exhaustion produce nil without publishing a prefix.
+// Bind the read/helper result to let before guard-let/if-let narrowing: direct
+// fresh reads there are rejected to avoid rematerializing an allocation.
+// Read .count/.get(index) after unwrap; explicit wait routes and non-request
+// callbacks reject this allocation, including helper-hidden reads. HTTP/2 uses
+// its synthesized request-target view, and values survive until request reset.
 
 // Body
 req.body(User)          // parse body as User struct, error-capable
@@ -4624,7 +4637,7 @@ upstream { retry: ... }       // retry policy (on specific status codes, with ba
 
 // --- Request ---
 req.query("key")              // string? — first value of a query parameter
-req.queryAll("key")           // [string] — all values of a query parameter
+req.queryAll("key")           // Collected<str>? — ordered raw values
 req.queryString               // raw query string
 req.cookie("name")            // cookie access
 

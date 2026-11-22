@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "es256_fixture.h"
 #include "fixtures/jwt_lifetime.h"
+#include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
@@ -3973,5 +3974,39 @@ TEST(native_program, string_trim_executes_after_source_removal) {
                                         "\r\nX-Expected: " + scenario.expected + "\r\n\r\n";
             CHECK_EQ(invoke(*route, request).status_code, scenario.status);
         }
+    }
+}
+TEST(native_program, request_query_all_survives_source_removal) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::query_all::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        const auto& route = program.p->config.routes[0];
+        REQUIRE(route.fn);
+        for (const auto& item : test::query_all::kCases) {
+            arena.reset();
+            const std::string request =
+                std::string("GET ") + item.target +
+                " HTTP/1.1\r\nHost: local\r\nX-Count: " + std::to_string(item.count) +
+                "\r\nX-First: " + item.first + "\r\nX-Last: " + item.last + "\r\n\r\n";
+            jit::HandlerCtx ctx{};
+            const auto result =
+                jit::HandlerResult::unpack(route.fn(nullptr,
+                                                    &ctx,
+                                                    reinterpret_cast<const u8*>(request.data()),
+                                                    request.size(),
+                                                    &arena));
+            CHECK_EQ(result.status_code, 204u);
+        }
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
     }
 }
