@@ -54,6 +54,8 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // shard = one ring = one submitting thread already holds by construction.
 //
 struct IoUringBackend {
+    using CompletionUserData = decltype(io_uring_cqe::user_data);
+
     IoUringInitFailureDetail last_init_failure_detail = IoUringInitFailureDetail::None;
     SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
@@ -156,7 +158,7 @@ struct IoUringBackend {
     // first callback observe bytes that are ordered after it.  Keep the exact
     // unadvanced CQ head here so the next wait can validate and resume it.
     struct DeferredDownstreamRecv {
-        u64 user_data = 0;
+        CompletionUserData user_data = 0;
         u32 head = 0;
         u32 frozen_tail = 0;
         bool active = false;
@@ -199,7 +201,7 @@ struct IoUringBackend {
     //    `out_of_range_windows` counts such live windows and lookups for those
     //    tokens scan the ring only while that counter is nonzero.
     struct DownstreamRecvTerminalWindow {
-        u64 user_data = 0;
+        CompletionUserData user_data = 0;
         u32 tail_exclusive = 0;
     }* downstream_recv_terminal_windows = nullptr;
     struct DownstreamRecvTerminalSlot {
@@ -548,7 +550,7 @@ private:
     }
 
     // conn_id of a window's token, via the same decode the CQE path uses.
-    static u32 terminal_window_conn_id(u64 user_data) {
+    static u32 terminal_window_conn_id(CompletionUserData user_data) {
         u32 conn_id = 0;
         IoEventType type = IoEventType::Count;
         decode_user_data(user_data, conn_id, type);

@@ -1307,7 +1307,7 @@ u32 IoUringBackend::wait(
     // skips the table.  A window whose tail equals head has reached its
     // boundary and no longer quarantines anything.
     const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
-    auto terminal_window_lookup = [&](u64 user_data, u32& window_tail) -> i32 {
+    auto terminal_window_lookup = [&](CompletionUserData user_data, u32& window_tail) -> i32 {
         // Steady state: no live window, so never touch the side table.
         if (downstream_recv_terminal_window_count == 0) return -1;
         if (downstream_recv_terminal_window_count != 0 &&
@@ -1368,7 +1368,7 @@ u32 IoUringBackend::wait(
         const u16 buf_id = static_cast<u16>(cqe.flags >> IORING_CQE_BUFFER_SHIFT);
         return buf_id < kProvidedBufCount;
     };
-    auto add_terminal_window = [&](u64 user_data, u32 tail_exclusive) {
+    auto add_terminal_window = [&](CompletionUserData user_data, u32 tail_exclusive) {
         if (tail_exclusive - head > cq_ring_entries ||
             downstream_recv_terminal_window_count >= downstream_recv_terminal_window_capacity) {
             protocol_failure();
