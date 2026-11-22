@@ -133,6 +133,14 @@ void* rut_helper_req_header_all(void* conn,
                                 const char* name,
                                 rut::u32 name_len);
 
+// Split bounded byte strings into at most 64 owned fields; null on failure.
+void* rut_helper_str_split(void* conn,
+                           void* arena,
+                           const char* data,
+                           rut::u32 length,
+                           const char* separator,
+                           rut::u32 separator_length);
+
 // Collect at most 64 raw query values; returned strings own request-arena copies.
 void* rut_helper_req_query_all(void* conn,
                                void* arena,

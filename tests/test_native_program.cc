@@ -5,6 +5,7 @@
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
 #include "fixtures/string_slice.h"
+#include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
@@ -33,6 +34,7 @@
 #include "rut/native_program.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/collected_values.h"
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/password_gateway.h"
@@ -4014,7 +4016,6 @@ TEST(native_program, request_query_all_survives_source_removal) {
         pool.destroy();
     }
 }
-
 TEST(native_program, string_slice_returns_checked_borrowed_text_without_arena_storage) {
     for (u8 opt : {0u, 2u}) {
         Source source;
@@ -4122,3 +4123,53 @@ TEST(native_program, ip_parse_compares_websocket_text_with_connection_ip) {
     }
 }
 #endif
+TEST(native_program, string_split_executes_owned_dynamic_fields_at_both_optimization_levels) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::string_split::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].fn;
+        jit::HandlerCtx ctx{};
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        for (const auto& item : test::string_split::kCases) {
+            arena.reset();
+            std::string request = "POST / HTTP/1.1\r\nHost: local\r\nX-Separator: ";
+            request.append(item.separator.ptr, item.separator.len);
+            request += "\r\nX-Count: " + std::to_string(item.count) + "\r\nX-First: ";
+            request.append(item.first.ptr, item.first.len);
+            request += "\r\nX-Last: ";
+            request.append(item.last.ptr, item.last.len);
+            request += "\r\nContent-Length: " + std::to_string(item.input.len) + "\r\n\r\n";
+            request.append(item.input.ptr, item.input.len);
+            const auto result =
+                jit::HandlerResult::unpack(handler(nullptr,
+                                                   &ctx,
+                                                   reinterpret_cast<const u8*>(request.data()),
+                                                   request.size(),
+                                                   &arena));
+            CHECK_EQ(result.status_code, item.status);
+            if (item.status == 204) {
+                const u64 minimum = sizeof(CollectedValues) + item.count * sizeof(Str);
+                CHECK(arena.space_used() >= minimum);
+                CHECK(arena.space_used() <= minimum + item.input.len + 7u * item.count);
+            } else {
+                CHECK_EQ(arena.space_used(), 0u);
+            }
+        }
+        const auto request =
+            lit_str("POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\na,b");
+        const auto failed = jit::HandlerResult::unpack(
+            handler(nullptr, &ctx, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(failed.status_code, 503u);
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
+    }
+}

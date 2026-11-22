@@ -431,6 +431,37 @@ route GET "/tags" {
 }
 ```
 
+
+`text.split(separator)` and `split(text, separator)` split byte strings into
+`Collected<str>?`. Both operands must be unwrapped `str` values. The explicit
+pipeline form is `text | split(_, separator)`. A user-defined `split` binding
+keeps ordinary name resolution.
+
+The separator is a complete byte sequence, matched left to right without
+overlap. Leading, trailing and consecutive separators produce empty fields;
+empty input produces one present empty field. Bytes, including NUL and percent
+escapes, are preserved. The separator must contain 1–256 bytes, the input may
+contain at most 8192 bytes, and the result may contain at most 64 fields. Invalid
+bounds, missing storage, SlicePool exhaustion or the shared 256 KiB request
+arena budget produce nil, with no truncated result.
+
+Bind the split (including a helper returning it) to `let` before narrowing with
+`guard let` or `if let`; fresh splits nested inside narrowing expressions are
+also rejected to ensure one evaluation. After unwrap, use `.count` and
+zero-based `.get(index)`; out-of-range indices return nil. Fields own copies
+until request retirement/reset. Splitting is supported in HTTP routes and
+helpers called by them; explicit `wait` routes and timer/WebSocket callbacks
+cannot use it yet. General arrays and collection iteration remain unimplemented.
+
+```swift
+route POST "/fields" {
+    let pending = req.body.split(",")
+    guard let fields = pending else { return 503 }
+    guard let first = fields.get(0) else { return 404 }
+    return response(200, body: first)
+}
+```
+
 Ordinary local HTTP/1 responses mirror the version of a complete strictly
 parsed request (`HTTP/1.0` or `HTTP/1.1`). Responses to requests without a
 captured valid version keep the HTTP/1.1 fallback. This does not change

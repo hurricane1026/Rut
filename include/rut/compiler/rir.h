@@ -266,6 +266,7 @@ enum class Opcode : u8 {
     StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
     StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
     StrTrimSuffix,         // %r = str.trim_suffix %s, %sfx   → str
+    StrSplit,              // %r = str.split %s, %sep → Optional<Array<str>>
     StrRegexCapture,       // regexCapture(str, literal regex, literal group) -> str?
     StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
     StrInterpolate,        // %r = str.interpolate [%a, %b..]  → str (variadic)

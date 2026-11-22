@@ -3215,3 +3215,51 @@ TEST(RirVerifier, IpParseRequiresAStringAndOptionalIpCarrier) {
     CHECK(verify_function(fn).ok);
     tc.destroy();
 }
+
+TEST(RirVerifier, StringSplitRejectsForgedOperandAndResultCarriers) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("split"), lit("/"), 'P'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    auto text = V(b.emit_const_str(lit("a,b")));
+    auto number = V(b.emit_const_i32(0));
+    CHECK_FALSE(b.emit_str_split(number, text));
+    CHECK_FALSE(b.emit_str_split(text, number));
+    V(b.emit_str_split(text, text));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    auto& inst = fn->entry()->insts[2];
+    REQUIRE_EQ(inst.op, Opcode::StrSplit);
+    const auto original = inst;
+    for (u32 mode = 0; mode < 6; ++mode) {
+        inst = original;
+        if (mode == 0) inst.operand_count = 1;
+        if (mode == 1) inst.operand_count = 3;
+        if (mode == 2) inst.operands[0] = number;
+        if (mode == 3) inst.operands[1] = number;
+        if (mode == 4) inst.result = number;
+        if (mode == 5) inst.operands[1] = kNoValue;
+        CHECK_FALSE(verify_function(fn).ok);
+    }
+    inst = original;
+    CHECK(verify_function(fn).ok);
+    const auto* saved_type = fn->values[inst.result.id].type;
+    fn->values[inst.result.id].type = saved_type->inner;
+    CHECK_FALSE(verify_function(fn).ok);
+    auto* integer = V(b.make_type(TypeKind::I32));
+    auto* wrong_array = V(b.make_type(TypeKind::Array, integer));
+    auto* wrong_result = V(b.make_type(TypeKind::Optional, wrong_array));
+    fn->values[inst.result.id].type = wrong_result;
+    CHECK_FALSE(verify_function(fn).ok);
+    fn->values[inst.result.id].type = const_cast<Type*>(saved_type);
+    const auto* saved_operand = fn->values[text.id].type;
+    auto* optional_text = V(b.make_type(TypeKind::Optional, const_cast<Type*>(saved_operand)));
+    fn->values[text.id].type = optional_text;
+    CHECK_FALSE(verify_function(fn).ok);
+    fn->values[text.id].type = const_cast<Type*>(saved_operand);
+    CHECK(verify_function(fn).ok);
+    tc.destroy();
+}

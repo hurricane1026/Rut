@@ -318,6 +318,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
             break;
+        case Opcode::StrSplit:
+            buf.put_cstr("str.split");
+            break;
         case Opcode::StrTrimSuffix:
             buf.put_cstr("str.trim_suffix");
             break;

@@ -943,16 +943,18 @@ inline bool verify_phi_types_equal(const Type* first, const Type* second, u32 de
 inline bool valid_collected_instruction(const Function& fn, const Instruction& inst) {
     const bool header_all = inst.op == Opcode::ReqHeaderAll;
     const bool kQueryAll = inst.op == Opcode::ReqQueryAll;
-    const bool kAllocation = inst.op == Opcode::ArrayNew || header_all || kQueryAll;
+    const bool kSplit = inst.op == Opcode::StrSplit;
+    const bool kAllocation = inst.op == Opcode::ArrayNew || header_all || kQueryAll || kSplit;
     const bool push = inst.op == Opcode::ArrayPush;
     const bool count = inst.op == Opcode::ArrayLen;
     const bool get = inst.op == Opcode::ArrayGet;
     if (!kAllocation && !push && !count && !get) return true;
     if (!fn.values || inst.result == kNoValue || inst.result.id >= fn.value_count ||
         inst.extra_operands ||
-        inst.operand_count != (kAllocation ? 0u
-                               : count     ? 1u
-                                           : 2u))
+        inst.operand_count != (kSplit        ? 2u
+                               : kAllocation ? 0u
+                               : count       ? 1u
+                                             : 2u))
         return false;
     for (u32 i = 0; i < inst.operand_count; ++i)
         if (inst.operands[i] == kNoValue || inst.operands[i].id >= fn.value_count) return false;
@@ -962,6 +964,15 @@ inline bool valid_collected_instruction(const Function& fn, const Instruction& i
     if (!array || array->kind != TypeKind::Array || array->struct_def ||
         !collected_element_type(array->inner))
         return false;
+    if (kSplit) {
+        if (result->kind != TypeKind::Optional || array->inner->kind != TypeKind::Str) return false;
+        for (u32 i = 0; i < 2; ++i) {
+            const Type* type = fn.values[inst.operands[i].id].type;
+            if (!type || type->kind != TypeKind::Str || type->inner || type->struct_def)
+                return false;
+        }
+        return true;
+    }
     if (header_all || kQueryAll) {
         if (result->kind != TypeKind::Optional || array->inner->kind != TypeKind::Str ||
             !inst.imm.str_val.ptr || !inst.imm.str_val.len)
