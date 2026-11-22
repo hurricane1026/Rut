@@ -146,9 +146,11 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
     while (cursor < value.len) {
         const u8 byte = static_cast<u8>(value.ptr[cursor]);
         if (byte < '0' || byte > '9') break;
-        const u64 digit = byte - '0';
-        if (parsed > (UINT64_MAX - digit) / 10u) return false;
-        parsed = parsed * 10u + digit;
+        const u64 digit = static_cast<u64>(static_cast<i64>(byte) - static_cast<i64>('0'));
+        u64 scaled = 0;
+        if (__builtin_mul_overflow(parsed, u64{10}, &scaled) ||
+            __builtin_add_overflow(scaled, digit, &parsed))
+            return false;
         ++cursor;
     }
     if (cursor == first_digit) return false;
@@ -200,9 +202,13 @@ inline CompleteContentLengthResponseClassification classify_complete_content_len
     ++position;
     if (!complete_content_length_parse_u64(content_range, &position, &classification.total) ||
         position != content_range.len || classification.first > classification.last ||
-        classification.last >= classification.total ||
-        classification.last - classification.first !=
-            static_cast<u64>(response.content_length) - 1u)
+        classification.last >= classification.total)
+        return {};
+    u64 range_length = 0;
+    u64 expected_length = static_cast<u64>(response.content_length);
+    if (__builtin_sub_overflow(classification.last, classification.first, &range_length) ||
+        __builtin_sub_overflow(expected_length, u64{1}, &expected_length) ||
+        range_length != expected_length)
         return {};
     classification.response_class = CompleteContentLengthResponseClass::CoherentSingleRange206;
     return classification;
