@@ -788,6 +788,34 @@ TEST(iouring_idle_trim, wheel_cursor_wraps_and_each_idle_period_trims_once) {
     CHECK_GT(r.loop->timer.cursor, 2 * TimerWheel::kSlots);
 }
 
+TEST(iouring_idle_trim, clipped_window_scans_oldest_first_across_cursor_wrap) {
+    IoUringEventLoop loop{};
+    loop.timer.init();
+    loop.keepalive_timeout = kMinIdleTicks + 3;
+    // Enable the sweep with a sentinel. Closed connections are examined but
+    // never queue pages, so neither a live ring nor a pidfd syscall is needed.
+    loop.idle_trim_pidfd = 12345;
+    loop.idle_trim_budget_ns = 0;  // Stop after the first unexamined node.
+    constexpr u32 kNow = 0xfffffffeu;
+    Connection owners[5]{};
+    for (u32 i = 0; i < 5; ++i) {
+        owners[i].fd = -1;
+        owners[i].timer_node.init();
+        // Expiries at now + [0,4]: already due, three eligible, too young.
+        loop.timer.cursor = kNow - (loop.keepalive_timeout - i);
+        loop.timer.add(&owners[i], loop.keepalive_timeout);
+    }
+    loop.timer.cursor = kNow;
+    for (u32 sweep = 1; sweep <= 4; ++sweep) {
+        loop.sweep_idle_trim();
+        for (u32 i = 0; i < 5; ++i)
+            CHECK_EQ(owners[i].idle_trim_examined, i >= 1 && i <= 3 && i <= sweep);
+    }
+    CHECK_EQ(loop.idle_trim_examined, 3u);
+    CHECK_EQ(loop.idle_trim_batches, 0u);
+    loop.idle_trim_pidfd = -1;
+}
+
 TEST(iouring_idle_trim, unusable_timeouts_make_the_sweep_a_no_op_and_small_ones_clip_the_ages) {
     TrimRig r;
     if (!r.init(8, false)) SKIP("io_uring or process_madvise unavailable");

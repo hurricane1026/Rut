@@ -11,6 +11,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/http2_conn.h"
+#include "rut/runtime/idle_trim_window.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_backend.h"
@@ -7955,8 +7956,8 @@ public:
     // rounds only). TLB shootdowns on the shard CPUs during the trim window fell
     // from ~20-35k (2 shards) and ~100-113k (4 shards) with per-slice madvise to
     // ~40 and ~125 with the batch (~25 without trimming), i.e. >99% removed.
-    static constexpr u32 kIdleTrimMinIdleTicks = 5;
-    static constexpr u32 kIdleTrimAgeWindow = 40;
+    static constexpr u32 kIdleTrimMinIdleTicks = IdleTrimWindow::kMinIdleTicks;
+    static constexpr u32 kIdleTrimAgeWindow = IdleTrimWindow::kAgeWindow;
     static constexpr u32 kIdleTrimMaxExamined = 2048;
     static constexpr u32 kIdleTrimMaxTrims = 512;     // connections queued per tick
     static constexpr u32 kIdleTrimSlicesPerConn = 3;  // recv, send, upstream recv
@@ -8271,16 +8272,13 @@ public:
     // stall, and a longer one only skips nodes that are about to expire anyway.
     void sweep_idle_trim() {
         if (idle_trim_pidfd < 0) return;
-        const u32 timeout = keepalive_timeout;
-        if (timeout >= TimerWheel::kSlots || timeout <= kIdleTrimMinIdleTicks) return;
+        const auto kWindow = idle_trim_window(timer.cursor, keepalive_timeout);
+        if (kWindow.begin == kWindow.end) return;
         const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
         u32 examined = 0;
         u32 queued = 0;
-        for (u32 back = kIdleTrimAgeWindow; back-- != 0;) {
-            const u32 age = kIdleTrimMinIdleTicks + back;
-            if (age >= timeout) continue;
-            if (!idle_trim_walk_list(timer.cursor + (timeout - age), deadline_ns, examined, queued))
-                break;
+        for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
+            if (!idle_trim_walk_list(expiry, deadline_ns, examined, queued)) break;
         }
         idle_trim_flush();
     }
