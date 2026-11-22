@@ -72,7 +72,8 @@ bool parse_authorization(Str auth, AuthFields& out) {
         ++pos;
         if (pos >= auth.len || auth.ptr[pos] != '"') return false;
         ++pos;
-        const Str kName{auth.ptr + kNameBegin, pos - kNameBegin - 2};
+        const Str kName{auth.ptr + static_cast<i64>(kNameBegin),
+                        static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(kNameBegin) - 2)};
         const u32 kValueBegin = pos;
         while (pos < auth.len && auth.ptr[pos] != '"') {
             const u8 kC = static_cast<u8>(auth.ptr[pos]);
@@ -80,7 +81,8 @@ bool parse_authorization(Str auth, AuthFields& out) {
             ++pos;
         }
         if (pos >= auth.len) return false;
-        const Str kValue{auth.ptr + kValueBegin, pos - kValueBegin};
+        const Str kValue{auth.ptr + static_cast<i64>(kValueBegin),
+                         static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(kValueBegin))};
         ++pos;
 
         u8 bit = 0;
@@ -125,7 +127,7 @@ bool parse_http_date(Str value, u64& seconds) {
         for (u32 i = 0; i < count; ++i) {
             const char kC = p[start + i];
             if (kC < '0' || kC > '9') return false;
-            result = result * 10 + static_cast<u32>(kC - '0');
+            result = static_cast<u32>(static_cast<i64>(result) * 10 + static_cast<i64>(kC - '0'));
         }
         return true;
     };
@@ -137,16 +139,20 @@ bool parse_http_date(Str value, u64& seconds) {
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     constexpr u32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     u32 month = 0;
-    while (month < 12 && !equal({p + 8, 3}, kMonths + static_cast<u64>(month) * 3, 3)) ++month;
+    while (month < 12 && !equal({p + 8, 3}, kMonths + static_cast<i64>(month) * 3, 3)) ++month;
     if (month == 12) return false;
     const bool kLeap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day == 0 || day > kDays[month] + (month == 1 && kLeap ? 1u : 0u)) return false;
+    if (day == 0 ||
+        static_cast<i64>(day) > static_cast<i64>(kDays[month]) + (month == 1 && kLeap ? 1 : 0))
+        return false;
     auto leap_years = [](u32 y) -> u64 { return y / 4 - y / 100 + y / 400; };
-    u64 days = static_cast<u64>(year - 1970) * 365 + leap_years(year - 1) - leap_years(1969);
-    for (u32 i = 0; i < month; ++i) days += kDays[i] + (i == 1 && kLeap ? 1u : 0u);
-    days += day - 1;
+    u64 days = static_cast<u64>(static_cast<i64>(year) - 1970) * 365 + leap_years(year - 1) -
+               leap_years(1969);
+    for (u32 i = 0; i < month; ++i)
+        days += static_cast<u64>(static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0));
+    days += static_cast<u64>(static_cast<i64>(day) - 1);
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!equal({p, 3}, kWeekdays + ((days + 4) % 7) * 3, 3)) return false;
+    if (!equal({p, 3}, kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3)) return false;
     seconds = days * 86400 + static_cast<u64>(hour) * 3600 + static_cast<u64>(minute) * 60 + second;
     return true;
 }
