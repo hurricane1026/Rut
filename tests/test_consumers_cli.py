@@ -218,6 +218,19 @@ def test_targeted_registry_commands(tool, root):
     assert result.returncode == 0 and not result.stdout, result
     expected = {name: value for name, value in parked.items() if name != 'groups'}
     assert json.loads(output.read_bytes())['credentials'] == [raw, expected, inherited]
+    removed = root / 'removed-one.json'
+    result = run(tool, 'remove-credential', source, parked['id'], removed)
+    check_output(result)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    assert stat.S_IMODE(removed.stat().st_mode) == 0o600
+    assert json.loads(removed.read_bytes()) == dict(snapshot, credentials=[raw, inherited])
+    original_result = removed.read_bytes()
+    for credential, destination in [('missing', root / 'not-created.json'), (raw['id'], removed)]:
+        result = run(tool, 'remove-credential', source, credential, destination)
+        check_output(result)
+        assert result.returncode == 2 and not result.stdout
+    assert removed.read_bytes() == original_result
+    assert not (root / 'not-created.json').exists()
     assert source.read_bytes() == original
 
 
