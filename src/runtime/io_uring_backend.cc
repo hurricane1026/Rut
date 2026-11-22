@@ -1115,7 +1115,7 @@ void IoUringBackend::cancel_accept() {
     if (pending > 0) {
         i32 ret = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
         if (ret > 0)
-            pending -= static_cast<u32>(ret);
+            pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
         else if (ret < 0)
             record_enter_error(ret);
     }
@@ -1251,7 +1251,7 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
     for (;;) {
         i32 ret = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
         if (ret >= 0) {
-            pending -= static_cast<u32>(ret);
+            pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
             break;
         }
         if (ret == -EINTR) continue;
@@ -1281,7 +1281,8 @@ u32 IoUringBackend::wait(
     while (pending != 0 || (wait_for_event && !ready) || kernel_work) {
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
-            if (ret >= 0) pending -= static_cast<u32>(ret);
+            if (ret >= 0)
+                pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
         } else {
             ret = io_uring_enter(ring_fd, 0, wait_for_event ? 1u : 0u, flags);
         }
@@ -1314,9 +1315,10 @@ u32 IoUringBackend::wait(
     // Only an aux-0 downstream Recv token can own a window, so every other CQE
     // skips the table.  A window whose tail equals head has reached its
     // boundary and no longer quarantines anything.
-    const u32 ring_mask = downstream_recv_terminal_window_capacity == 0
-                              ? 0
-                              : downstream_recv_terminal_window_capacity - 1u;
+    const u32 ring_mask =
+        downstream_recv_terminal_window_capacity == 0
+            ? 0
+            : static_cast<u32>(static_cast<i64>(downstream_recv_terminal_window_capacity) - 1);
     auto terminal_window_lookup = [&](CompletionUserData user_data, u32& window_tail) -> i32 {
         // Steady state: no live window, so never touch the side table.
         if (downstream_recv_terminal_window_count == 0) return -1;
@@ -1337,9 +1339,9 @@ u32 IoUringBackend::wait(
         }
         if (downstream_recv_terminal_out_of_range_windows == 0) return -1;
         for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
-            const auto& window =
-                downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
-                                                 ring_mask];
+            const auto& window = downstream_recv_terminal_windows
+                [(static_cast<i64>(downstream_recv_terminal_window_start) + static_cast<i64>(i)) &
+                 ring_mask];
             if (window.user_data == user_data && window.tail_exclusive != head.value) {
                 window_tail = window.tail_exclusive;
                 return 0;
@@ -1362,8 +1364,8 @@ u32 IoUringBackend::wait(
             else if (downstream_recv_terminal_out_of_range_windows != 0)
                 downstream_recv_terminal_out_of_range_windows--;
             window = {};
-            downstream_recv_terminal_window_start =
-                (downstream_recv_terminal_window_start + 1u) & ring_mask;
+            downstream_recv_terminal_window_start = static_cast<u32>(
+                (static_cast<i64>(downstream_recv_terminal_window_start) + 1) & ring_mask);
             downstream_recv_terminal_window_count--;
             expired = true;
         }
