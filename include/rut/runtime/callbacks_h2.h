@@ -289,13 +289,15 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         return 0;
     }
     if (h2.conn_send_window <= 0 || stream->send_window <= 0) return 0;
-    if (cap < kFrameHeaderSize + 1) return 0;
-    const u32 kRemaining = h2.outbound_body_len - h2.outbound_body_offset;
+    if (static_cast<i64>(cap) < static_cast<i64>(kFrameHeaderSize) + 1) return 0;
+    const u32 kRemaining = static_cast<u32>(static_cast<i64>(h2.outbound_body_len) -
+                                            static_cast<i64>(h2.outbound_body_offset));
     u32 n = kRemaining;
     if (n > h2.peer_settings.max_frame_size) n = h2.peer_settings.max_frame_size;
     if (static_cast<i64>(n) > h2.conn_send_window) n = static_cast<u32>(h2.conn_send_window);
     if (static_cast<i64>(n) > stream->send_window) n = static_cast<u32>(stream->send_window);
-    if (n > cap - kFrameHeaderSize) n = cap - kFrameHeaderSize;
+    if (static_cast<i64>(n) > static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize))
+        n = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize));
     if (n == 0) return 0;
     Http2FrameHeader frame{};
     frame.length = n;
@@ -303,13 +305,18 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
     frame.flags = (n == kRemaining) ? http2_flag::kEndStream : 0;
     frame.stream_id = h2.outbound_stream;
     write_frame_header(out, frame);
-    __builtin_memcpy(out + kFrameHeaderSize, h2.outbound_body + h2.outbound_body_offset, n);
-    h2.outbound_body_offset += n;
-    h2.conn_send_window -= n;
-    stream->send_window -= static_cast<i32>(n);
+    __builtin_memcpy(out + static_cast<i64>(kFrameHeaderSize),
+                     h2.outbound_body + static_cast<i64>(h2.outbound_body_offset),
+                     n);
+    h2.outbound_body_offset =
+        static_cast<u32>(static_cast<i64>(h2.outbound_body_offset) + static_cast<i64>(n));
+    h2.conn_send_window =
+        static_cast<i32>(static_cast<i64>(h2.conn_send_window) - static_cast<i64>(n));
+    stream->send_window =
+        static_cast<i32>(static_cast<i64>(stream->send_window) - static_cast<i64>(n));
     h2.outbound_final_staged = n == kRemaining;
     status = H2PumpStatus::Produced;
-    return kFrameHeaderSize + n;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(n));
 }
 
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
@@ -380,21 +387,23 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     }
     if (!d.owned_hpack_pending) d.owned_hpack_after = h2.hpack_enc;
     auto& enc = d.owned_hpack_after;
-    const u32 n = http2_write_response_headers(d.resp + d.resp_len,
-                                               d.resp_cap - d.resp_len,
-                                               enc,
-                                               stream_id,
-                                               status,
-                                               hdrs,
-                                               nhdrs,
-                                               body_len,
-                                               false);
+    if (d.resp_len > d.resp_cap) return false;
+    const u32 n = http2_write_response_headers(
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        status,
+        hdrs,
+        nhdrs,
+        body_len,
+        false);
     if (n == 0) {
         if (body_slice != nullptr) body_pool->free(body_slice);
         if (d.resp_len != 0) d.overflow = true;
         return false;
     }
-    d.resp_len += n;
+    d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(n));
     if (queued) {
         d.queued_resp_end = d.resp_len;
         h2.queued_stream = stream_id;
