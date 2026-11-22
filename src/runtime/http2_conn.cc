@@ -475,9 +475,11 @@ Str h2_canon_path(Str path) {
     u32 end = 0;
     while (end < path.len && p[end] != '?' && p[end] != '#') end++;
     u32 start = 0;
-    if (start < end && p[start] == '/') start++;
-    while (end > start && p[end - 1] == '/') end--;
-    return {p + start, end - start};
+    if (start < end && p[start] == '/') start = static_cast<u32>(static_cast<i64>(start) + 1);
+    while (end > start && p[static_cast<u32>(static_cast<i64>(end) - 1)] == '/')
+        end = static_cast<u32>(static_cast<i64>(end) - 1);
+    return {p + static_cast<i64>(start),
+            static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
 }
 
 bool h2_value_to_u32(Str v, u32* out) {
@@ -485,9 +487,9 @@ bool h2_value_to_u32(Str v, u32* out) {
     u32 acc = 0;
     for (u32 i = 0; i < v.len; i++) {
         if (v.ptr[i] < '0' || v.ptr[i] > '9') return false;
-        const u32 digit = static_cast<u32>(v.ptr[i] - '0');
+        const u32 digit = static_cast<u32>(static_cast<i64>(v.ptr[i]) - static_cast<i64>('0'));
         if (acc > 429496729u || (acc == 429496729u && digit > 5u)) return false;
-        acc = acc * 10 + digit;
+        acc = static_cast<u32>(static_cast<i64>(acc) * 10 + static_cast<i64>(digit));
     }
     *out = acc;
     return true;
@@ -663,7 +665,9 @@ struct OutWriter {
     u8* out;
     u32 cap;
     u32 len;
-    bool room(u32 n) const { return len + n <= cap; }
+    bool room(u32 n) const {
+        return static_cast<i64>(n) <= static_cast<i64>(cap) - static_cast<i64>(len);
+    }
 };
 
 // Decode the accumulated header block and deliver it; reset assembly state.
@@ -686,8 +690,11 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream, bool ref
     c.cont_refuse = false;
     if (refuse) {
         if (Http2Stream* s = c.find_stream(stream_id)) s->state = Http2StreamState::Closed;
-        if (!w.room(kFrameHeaderSize + 4)) return Http2Error::InternalError;
-        w.len += write_rst_stream(w.out + w.len, stream_id, Http2Error::RefusedStream);
+        if (!w.room(static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4)))
+            return Http2Error::InternalError;
+        w.len = static_cast<u32>(static_cast<i64>(w.len) +
+                                 static_cast<i64>(write_rst_stream(
+                                     w.out + w.len, stream_id, Http2Error::RefusedStream)));
         return Http2Error::NoError;
     }
     if (c.client) {
@@ -764,9 +771,12 @@ Http2Error discard_headers(Http2Conn& c, bool* has_pseudo = nullptr) {
 
 // Append a header-block fragment, guarding the assembly buffer.
 Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
-    if (c.hdr_block_len + n > Http2Conn::kHeaderBlockCap) return Http2Error::CompressionError;
-    for (u32 i = 0; i < n; i++) c.hdr_block[c.hdr_block_len + i] = p[i];
-    c.hdr_block_len += n;
+    if (static_cast<i64>(n) >
+        static_cast<i64>(Http2Conn::kHeaderBlockCap) - static_cast<i64>(c.hdr_block_len))
+        return Http2Error::CompressionError;
+    for (u32 i = 0; i < n; i++)
+        c.hdr_block[static_cast<i64>(c.hdr_block_len) + static_cast<i64>(i)] = p[i];
+    c.hdr_block_len = static_cast<u32>(static_cast<i64>(c.hdr_block_len) + static_cast<i64>(n));
     return Http2Error::NoError;
 }
 
@@ -807,8 +817,10 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
 
 Http2Error reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {
     Http2Stream* s = c.find_stream(stream_id);
-    if (!w.room(kFrameHeaderSize + 4)) return Http2Error::InternalError;
-    w.len += write_rst_stream(w.out + w.len, stream_id, error);
+    if (!w.room(static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4)))
+        return Http2Error::InternalError;
+    w.len = static_cast<u32>(static_cast<i64>(w.len) +
+                             static_cast<i64>(write_rst_stream(w.out + w.len, stream_id, error)));
     clear_pending_upload(c, stream_id);
     if (s == nullptr || s->state == Http2StreamState::Closed) return Http2Error::NoError;
     s->state = Http2StreamState::Closed;
