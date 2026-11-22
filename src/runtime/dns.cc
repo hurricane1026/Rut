@@ -126,14 +126,15 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
     u32 at = 12;
     char question[254]{};
     if (!name_at(p, len, at, question) || strcmp(question, name) != 0 ||
-        static_cast<i64>(at) + 4 > static_cast<i64>(len) || word(p + at) != 1 ||
-        word(p + at + 2) != 1)
+        static_cast<i64>(at) + 4 > static_cast<i64>(len) || word(p + static_cast<i64>(at)) != 1 ||
+        word(p + static_cast<i64>(at) + 2) != 1)
         return DnsAnswer::Invalid;
     at = static_cast<u32>(static_cast<i64>(at) + 4);
     if (word(p + 2) & 0x0200) return DnsAnswer::Truncated;
     if (word(p + 2) & 15) return DnsAnswer::Failure;
     const u32 kAnswers = word(p + 6);
-    const u32 kTotal = static_cast<u32>(static_cast<i64>(kAnswers) + word(p + 8) + word(p + 10));
+    const u32 kTotal = static_cast<u32>(static_cast<i64>(kAnswers) + static_cast<i64>(word(p + 8)) +
+                                        static_cast<i64>(word(p + 10)));
     if (kTotal > 64) return DnsAnswer::Invalid;
     struct Record {
         char owner[254]{};
@@ -146,16 +147,16 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         if (!name_at(p, len, at, r.owner) || static_cast<i64>(at) + 10 > static_cast<i64>(len))
             return DnsAnswer::Invalid;
         r.type = word(p + static_cast<i64>(at) + 2) == 1 ? word(p + static_cast<i64>(at)) : 0;
-        r.ttl = number(p + at + 4);
+        r.ttl = number(p + static_cast<i64>(at) + 4);
         if (r.ttl & 0x80000000u) r.ttl = 0;
-        r.size = word(p + at + 8);
+        r.size = word(p + static_cast<i64>(at) + 8);
         r.data = static_cast<u32>(static_cast<i64>(at) + 10);
         const i64 end_wide = static_cast<i64>(r.data) + static_cast<i64>(r.size);
         if (end_wide > static_cast<i64>(len)) return DnsAnswer::Invalid;
         at = static_cast<u32>(end_wide);
     }
     if (at != len) return DnsAnswer::Invalid;
-    memcpy(result.canonical, name, strlen(name) + 1);
+    memcpy(result.canonical, name, static_cast<size_t>(static_cast<i64>(strlen(name)) + 1));
     for (u32 depth = 0; depth <= 8; ++depth) {
         bool alias = false;
         char target[254]{};
@@ -164,7 +165,10 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             if (strcmp(r.owner, result.canonical) != 0) continue;
             if (r.type == 1) {
                 if (r.size != 4) return DnsAnswer::Invalid;
-                if (result.count < 8) memcpy(&result.addresses[result.count++], p + r.data, 4);
+                if (result.count < 8) {
+                    memcpy(&result.addresses[result.count], p + static_cast<i64>(r.data), 4);
+                    result.count = static_cast<u32>(static_cast<i64>(result.count) + 1);
+                }
                 if (r.ttl < result.ttl) result.ttl = r.ttl;
             } else if (r.type == 5) {
                 u32 pos = r.data;
@@ -232,8 +236,9 @@ int DnsResolver::resolve(
             expires = e.expires;
             return 1;
         }
-        q.valid_until = now + 60000;
-        memcpy(q.name, host, strlen(host) + 1);
+        u64 next_valid = 0;
+        q.valid_until = __builtin_add_overflow(now, u64{60000}, &next_valid) ? ~u64{0} : next_valid;
+        memcpy(q.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
         q.phase = 1;
     }
     const u32 kAvailable = server ? 1 : count;
@@ -303,10 +308,11 @@ int DnsResolver::resolve(
         return 0;
     } else if (q.phase == 6) {
         const u32 kTarget = q.received < 2 ? 2 : static_cast<u32>(static_cast<i64>(q.size) + 2);
-        const auto kN = recv(q.fd,
-                             q.packet + static_cast<i64>(q.received),
-                             static_cast<u32>(static_cast<i64>(kTarget) - q.received),
-                             0);
+        const auto kN =
+            recv(q.fd,
+                 q.packet + static_cast<i64>(q.received),
+                 static_cast<u32>(static_cast<i64>(kTarget) - static_cast<i64>(q.received)),
+                 0);
         if (kN < 0 && pending()) return 0;
         if (kN <= 0) return retry();
         q.received = static_cast<u32>(static_cast<i64>(q.received) + kN);
@@ -360,7 +366,7 @@ int DnsResolver::resolve(
     if (result.ttl && expires > now) {
         auto& e = cache[replacement++ % 16];
         e = {};
-        memcpy(e.name, host, strlen(host) + 1);
+        memcpy(e.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
         e.server = server;
         e.port = port;
         e.epoch = epoch;
