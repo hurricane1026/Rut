@@ -1100,27 +1100,36 @@ bool format_response_with_body_and_headers(Connection& conn,
     // fail closed: emit a 500 + Connection: close via the fallback
     // formatter. The cap is per-connection (send_buf is a 16KB
     // slice), so this only trips on pathological hand-built configs.
-    constexpr u32 kStatusLineFixed = 15;
+    constexpr u32 kStatusLineFixed = 15;      // 9 + 3 + 1 + 2 status-line bytes
     constexpr u32 kContentLengthPrefix = 16;  // "Content-Length: "
     constexpr u32 kDefaultContentTypeLine =
         sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
-    i64 needed = static_cast<i64>(kStatusLineFixed) + static_cast<i64>(reason_len) +
-                 static_cast<i64>(kContentLengthPrefix) +
-                 static_cast<i64>(decimal_digit_count(body_len_emit)) + 2;
-    if (emit_default_content_type) needed += static_cast<i64>(kDefaultContentTypeLine);
+    u64 needed = 0;
+    bool needed_overflow = false;
+    auto add_needed = [&](u64 value) {
+        if (!needed_overflow) needed_overflow = __builtin_add_overflow(needed, value, &needed);
+    };
+    add_needed(kStatusLineFixed);
+    add_needed(reason_len);
+    add_needed(kContentLengthPrefix);
+    add_needed(decimal_digit_count(body_len_emit));
+    add_needed(2);
+    if (emit_default_content_type) add_needed(kDefaultContentTypeLine);
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
-        needed +=
-            static_cast<i64>(headers[i].key_len) + 2 + static_cast<i64>(headers[i].value_len) + 2;
+        add_needed(headers[i].key_len);
+        add_needed(2);
+        add_needed(headers[i].value_len);
+        add_needed(2);
     }
-    needed += static_cast<i64>(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
-    needed += static_cast<i64>(2);  // blank line terminator
-    if (!headers_only) needed += static_cast<i64>(body_len_emit);
-    if (needed < 0 || static_cast<u64>(needed) > conn.send_buf.capacity()) {
+    add_needed(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
+    add_needed(2);  // blank line terminator
+    if (!headers_only) add_needed(body_len_emit);
+    if (needed_overflow || needed > conn.send_buf.capacity()) {
         // Fail closed: force connection close and emit a small 500.
         // format_static_response uses the reason-phrase body which is
         // guaranteed to fit. Update conn state too — resp_status and
