@@ -5258,15 +5258,20 @@ public:
     u16 find_response_read_batch_owner(u32 cid) const {
         if (!response_read_batch_owner_index_active) {
             for (u32 i = 0; i < response_read_batch_owner_count; ++i)
-                if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
+                if (response_read_batch_owners[i].conn_id == cid)
+                    return static_cast<u16>(static_cast<i64>(i) + 1);
             return 0;
         }
-        u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+        u32 hash = 0;
+        __builtin_mul_overflow(cid, 2654435761u, &hash);
+        u32 slot = hash & (kResponseReadOwnerIndexSize - 1u);
         for (u32 probes = 0; probes < kResponseReadOwnerIndexSize; ++probes) {
             const u16 index = response_read_batch_owner_index[slot];
             if (index == 0) return 0;
-            if (response_read_batch_owners[index - 1u].conn_id == cid) return index;
-            slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+            if (response_read_batch_owners[static_cast<i64>(index) - 1].conn_id == cid)
+                return index;
+            slot =
+                static_cast<u32>((static_cast<i64>(slot) + 1) & (kResponseReadOwnerIndexSize - 1u));
         }
         return 0;
     }
@@ -5274,10 +5279,13 @@ public:
     u16 publish_response_read_batch_owner() {
         const u16 index = static_cast<u16>(++response_read_batch_owner_count);
         if (response_read_batch_owner_index_active) {
-            const u32 cid = response_read_batch_owners[index - 1u].conn_id;
-            u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+            const u32 cid = response_read_batch_owners[static_cast<i64>(index) - 1].conn_id;
+            u32 hash = 0;
+            __builtin_mul_overflow(cid, 2654435761u, &hash);
+            u32 slot = hash & (kResponseReadOwnerIndexSize - 1u);
             while (response_read_batch_owner_index[slot] != 0)
-                slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+                slot = static_cast<u32>((static_cast<i64>(slot) + 1) &
+                                        (kResponseReadOwnerIndexSize - 1u));
             response_read_batch_owner_index[slot] = index;
         }
         return index;
@@ -5309,7 +5317,7 @@ public:
 
     u16 find_or_add_precise_timer_batch_owner(u32 cid) {
         if (const u16 index = find_response_read_batch_owner(cid)) {
-            auto& owner = response_read_batch_owners[index - 1u];
+            auto& owner = response_read_batch_owners[static_cast<i64>(index) - 1];
             const Connection& c = conns[cid];
             if (!c.response_read_timer_owner_is_valid()) {
                 owner.valid = false;
@@ -5363,10 +5371,13 @@ public:
                                                ResponseReadDeadlinePostCommitPhase::Buffering
                                        ? c.response_read_deadline_post_commit_raw_header_end
                                        : 0;
+                const u32 delta =
+                    static_cast<u32>(static_cast<i64>(received) - static_cast<i64>(completed));
                 owner.bounded_terminal_buffer_begin =
-                    received >= completed && header <= 0xffffffffu - (received - completed)
-                        ? header + received - completed
-                        : 0xffffffffu;
+                    received >= completed &&
+                            static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+                        ? static_cast<u32>(static_cast<i64>(header) + delta)
+                        : UINT32_MAX;
                 owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
                 owner.post_commit_at_start = true;
                 owner.valid =
@@ -5396,10 +5407,13 @@ public:
                                        ResponseReadDeadlinePostCommitPhase::Buffering
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
+        const u32 delta =
+            static_cast<u32>(static_cast<i64>(received) - static_cast<i64>(completed));
         owner.bounded_terminal_buffer_begin =
-            received >= completed && header <= 0xffffffffu - (received - completed)
-                ? header + received - completed
-                : 0xffffffffu;
+            received >= completed &&
+                    static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+                ? static_cast<u32>(static_cast<i64>(header) + delta)
+                : UINT32_MAX;
         owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
         owner.valid =
             c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
