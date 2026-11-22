@@ -70,9 +70,10 @@ and IPv4-mapped IPv6 literals are rejected. The DNS resolver and HTTPS origin ma
 use different address families.
 
 `dnsAddress` and a nonempty `allowedAddresses` list must appear together. The
-optional `dnsRecordType` selects exactly one family per policy. It defaults to
-`"A"` (IPv4); `"AAAA"` selects IPv6. Use `dnsRecordType` only with DNS enabled.
-All allowed destinations must belong to the selected family. At most eight
+optional `dnsRecordType` defaults to `"A"` (IPv4). Use `"AAAA"` for IPv6 or
+`"A+AAAA"` for an explicitly dual-stack origin. Use `dnsRecordType` only with DNS
+enabled. A single-family allowlist accepts only its selected family. A dual-stack
+allowlist must contain at least one address of each family. At most eight
 destinations are accepted, and duplicate entries (including equivalent IPv6
 spellings) are rejected. `dnsPort` defaults to 53 and accepts 1–65535. The
 original `address` remains mandatory and is **never a fallback** in DNS mode.
@@ -80,7 +81,14 @@ By default each attempt resolves the configured TLS hostname through one
 connected nonblocking UDP socket to the configured resolver. No blocking libc
 resolver, system search list, request-selected name or new library is used.
 
-The query uses a random ID and one IN A or IN AAAA question without EDNS. The
+Each query uses a fresh random ID and one IN A or IN AAAA question without EDNS.
+Dual-stack attempts require a positive, fully validated reply to both queries
+within the shared DNS and attempt deadlines. The gateway queries AAAA first and
+uses the validated IPv6 candidates before the IPv4 candidates. Both replies
+together may supply at most eight unique addresses. A rejected, empty or missing
+second response prevents the attempt from opening an HTTPS connection. If both
+replies pass, the existing TCP connection failover may continue to the other
+family. The DNS cache uses the shorter TTL measured from the attempt start. The
 response must echo the question and contain 1–8 total answers within 512 bytes.
 Answers must form exactly one chain from the echoed question, with at most four
 CNAME hops followed by one or more records of the requested type. The gateway
@@ -255,5 +263,4 @@ Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
 The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
 a disallowed destination and recovery with rotated keys on both Linux backends.
-Other DNS transports, dual-family selection in one policy, alternative discovery
-origins, automatic kid inventory and full OIDC workflows remain open under #1077.
+Other DNS transports, alternative discovery origins, automatic kid inventory and full OIDC workflows remain open under #1077.

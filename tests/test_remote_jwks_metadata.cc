@@ -883,3 +883,25 @@ TEST(remote_jwks_metadata, ipv6_configuration_is_bounded_to_one_family) {
         R"(,"dnsRecordType":"AAAA","dnsAddress":"::1","allowedAddresses":["::ffff:192.0.2.1"])",
         configuration));
 }
+
+TEST(remote_jwks_metadata, dual_stack_allowlist_requires_both_families) {
+    auto load = [](const char* addresses, RemoteJwks& policy) {
+        char input[640];
+        const int size = snprintf(
+            input,
+            sizeof(input),
+            R"({"address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":1,"dnsRecordType":"A+AAAA","dnsAddress":"192.0.2.53","allowedAddresses":%s})",
+            addresses);
+        if (size <= 0 || static_cast<u32>(size) >= sizeof(input)) return false;
+        json::Document document;
+        return document.parse({input, static_cast<u32>(size)}) && policy.load(document, 0);
+    };
+    RemoteJwks policy;
+    CHECK(load(R"(["192.0.2.1","0:0:0:0:0:0:0:1"])", policy));
+    CHECK(policy.dns_dual_stack);
+    CHECK(strcmp(policy.allowed_addresses[1], "::1") == 0);
+    CHECK(!load(R"(["192.0.2.1"])", policy));
+    CHECK(!load(R"(["::1"])", policy));
+    CHECK(!load(R"(["192.0.2.1","::ffff:192.0.2.2"])", policy));
+    CHECK(!load(R"(["192.0.2.1","::1","0:0:0:0:0:0:0:1"])", policy));
+}

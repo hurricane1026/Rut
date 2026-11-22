@@ -36,8 +36,10 @@ def main():
     parser.add_argument("--discovery-cache", action="store_true")
     parser.add_argument("--require-non-empty-keys", action="store_true")
     parser.add_argument("--ipv6", action="store_true")
+    parser.add_argument("--dual-stack", action="store_true")
     args = parser.parse_args()
-    if args.ipv6:
+    assert not (args.dual_stack and args.ipv6)
+    if args.ipv6 or args.dual_stack:
         args.discovery_dns = True
     fixture_option = "--fixture-es256" if args.algorithm == "ES256" else "--fixture"
     if args.access_profile:
@@ -52,6 +54,7 @@ def main():
              "discovery": "valid", "dns": "valid",
              "etag": '"v1"', "conditionalMode": "force304" if args.conditional else "auto",
              "conditionalRequests": [], "discoveries": [], "discoveryDelay": 0}
+    dns_types = []
     state.update(metadataTag='"metadata-v1"', metadataRequests=[])
     if args.conditional_discovery:
         state["discovery"] = "force304"
@@ -203,11 +206,21 @@ def main():
             if mode == "timeout": continue
             target = "127.0.0.3" if mode == "rebind" else "127.0.0.2" if mode == "move" else "127.0.0.1"
             kind = 28 if args.ipv6 else 1
+            answer_family = family
+            if args.dual_stack:
+                kind = int.from_bytes(query[-4:-2], "big")
+                with lock:
+                    dns_types.append(kind)
+                if kind == 28:
+                    target = "::1"
+                    answer_family = socket.AF_INET6
+                elif kind != 1:
+                    continue
             if args.ipv6:
                 if not query.endswith(b"\0\x1c\0\1"):
                     continue
                 target = "2001:db8::1" if mode == "rebind" else loopback
-            address = socket.inet_pton(family, target)
+            address = socket.inet_pton(answer_family, target)
             def name(host):
                 return b"".join(bytes((len(label),)) + label.encode() for label in host.split(".")) + b"\0"
             def record(owner, kind, data, ttl=30):
@@ -263,6 +276,19 @@ def main():
                 address="127.0.0.1",  # A DNS failure must never use the fixed address.
                 dnsRecordType="AAAA", dnsAddress="::1", dnsPort=dns.getsockname()[1],
                 allowedAddresses=["0:0:0:0:0:0:0:1"], maxAgeSeconds=5,
+                discoveryPath="/.well-known/openid-configuration",
+                discoveryIssuer=policy["issuer"])
+        elif args.dual_stack:
+            try:
+                refusing = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                refusing.bind(("::1", origin.server_port))
+            except OSError as error:
+                if error.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                    raise SystemExit(77)
+                raise
+            policy["remoteJwks"].update(
+                dnsRecordType="A+AAAA", dnsAddress="127.0.0.1", dnsPort=dns.getsockname()[1],
+                allowedAddresses=["::1", "127.0.0.1"], maxAgeSeconds=5,
                 discoveryPath="/.well-known/openid-configuration",
                 discoveryIssuer=policy["issuer"])
         elif args.discovery_dns:
@@ -423,6 +449,20 @@ def main():
                 wait_status(fixture["a"], 200)
                 with lock:
                     assert state["locals"] and all(address == "::1" for address in state["locals"])
+                    assert state["discoveries"]
+                    state["dns"] = "rebind"
+                    previous_dns = state["dnsRequests"]
+                wait_for_dns_request(previous_dns)
+                wait_status(fixture["a"], 401)
+                with lock:
+                    state.update(dns="cname", body=json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                assert request(fixture["a"]) == 401
+            elif args.dual_stack:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    assert dns_types[:2] == [28, 1], dns_types
+                    assert state["locals"] and set(state["locals"]) == {"127.0.0.1"}
                     assert state["discoveries"]
                     state["dns"] = "rebind"
                     previous_dns = state["dnsRequests"]

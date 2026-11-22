@@ -11,6 +11,7 @@ struct RemoteJwks {
     HttpsEndpoint endpoint{};
     char dns_address[HttpsEndpoint::kAddressCapacity]{};
     bool dns_aaaa = false;
+    bool dns_dual_stack = false;
     u16 dns_port = 53;
     u32 dns_cache_seconds = 0;
     u32 dns_timeout_seconds = 0;
@@ -107,6 +108,7 @@ private:
     u32 address_index_ = 0;
     bool discovering_ = false;
     bool initialized_ = false;
+    bool send_dns_query(bool aaaa);
     bool begin_http(u64 now);
     bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
