@@ -509,8 +509,8 @@ public:
     // Batch-local owner index: at most 256 owners in 512 slots. No Connection
     // state or allocation is retained across dispatch/reclamation boundaries.
     static constexpr u32 kResponseReadOwnerIndexSize = 2u * kMaxEventsPerWait;
+    static_assert(kResponseReadOwnerIndexSize == 512u);
     static constexpr u32 kResponseReadOwnerIndexMask = 511u;
-    static_assert((kResponseReadOwnerIndexSize & kResponseReadOwnerIndexMask) == 0);
     u16 response_read_batch_owner_index[kResponseReadOwnerIndexSize]{};
     bool response_read_batch_owner_index_active = false;
     // Counters default to empty so a loop whose slots are used before init()
@@ -5270,14 +5270,13 @@ public:
         }
         u32 hash = 0;
         __builtin_mul_overflow(cid, 2654435761u, &hash);
-        u32 slot = hash & (kResponseReadOwnerIndexSize - 1u);
+        u32 slot = hash & kResponseReadOwnerIndexMask;
         for (u32 probes = 0; probes < kResponseReadOwnerIndexSize; ++probes) {
             const u16 index = response_read_batch_owner_index[slot];
             if (index == 0) return 0;
             if (response_read_batch_owners[static_cast<i64>(index) - 1].conn_id == cid)
                 return index;
-            slot =
-                static_cast<u32>((static_cast<i64>(slot) + 1) & (kResponseReadOwnerIndexSize - 1u));
+            slot = static_cast<u32>((static_cast<i64>(slot) + 1) & kResponseReadOwnerIndexMask);
         }
         return 0;
     }
@@ -5288,10 +5287,9 @@ public:
             const u32 cid = response_read_batch_owners[static_cast<i64>(index) - 1].conn_id;
             u32 hash = 0;
             __builtin_mul_overflow(cid, 2654435761u, &hash);
-            u32 slot = hash & (kResponseReadOwnerIndexSize - 1u);
+            u32 slot = hash & kResponseReadOwnerIndexMask;
             while (response_read_batch_owner_index[slot] != 0)
-                slot = static_cast<u32>((static_cast<i64>(slot) + 1) &
-                                        (kResponseReadOwnerIndexSize - 1u));
+                slot = static_cast<u32>((static_cast<i64>(slot) + 1) & kResponseReadOwnerIndexMask);
             response_read_batch_owner_index[slot] = index;
         }
         return index;
