@@ -398,7 +398,7 @@ bool HttpsFetch::write(HttpsFetch& self) {
         self.request_ + static_cast<i64>(self.sent_),
         static_cast<int>(static_cast<i64>(self.request_len_) - static_cast<i64>(self.sent_)));
     if (kResult <= 0) return retry_ssl(self.ssl_, kResult) ? false : self.fail();
-    self.sent_ += static_cast<u32>(kResult);
+    self.sent_ = static_cast<u32>(static_cast<i64>(self.sent_) + kResult);
     if (self.sent_ == self.request_len_) self.step_ = read;
     return true;
 }
