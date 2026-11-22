@@ -150,8 +150,9 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         if (r.ttl & 0x80000000u) r.ttl = 0;
         r.size = word(p + at + 8);
         r.data = static_cast<u32>(static_cast<i64>(at) + 10);
-        at = static_cast<u32>(static_cast<i64>(r.data) + r.size);
-        if (at > len) return DnsAnswer::Invalid;
+        const i64 end_wide = static_cast<i64>(r.data) + static_cast<i64>(r.size);
+        if (end_wide > static_cast<i64>(len)) return DnsAnswer::Invalid;
+        at = static_cast<u32>(end_wide);
     }
     if (at != len) return DnsAnswer::Invalid;
     memcpy(result.canonical, name, strlen(name) + 1);
