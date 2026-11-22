@@ -1555,12 +1555,13 @@ void grpc_kick_downstream(Loop* loop, Connection& down) {
 template <typename Loop>
 void grpc_request_data(
     Loop* loop, Connection& down, GrpcExchange& x, const u8* data, u32 len, bool end) {
-    x.request_bytes += len;
+    (void)__builtin_add_overflow(x.request_bytes, static_cast<u64>(len), &x.request_bytes);
     if (x.failure || !x.upstream) {
         down.h2->consume_data(x.downstream_stream, len);
         return;
     }
-    if (len > sizeof(x.upload) - x.upload_len ||
+    if (static_cast<i64>(len) >
+            static_cast<i64>(sizeof(x.upload)) - static_cast<i64>(x.upload_len) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
         down.h2->consume_data(x.downstream_stream, len);
@@ -1568,8 +1569,8 @@ void grpc_request_data(
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len) __builtin_memcpy(x.upload + x.upload_len, data, len);
-    x.upload_len += len;
+    if (len) __builtin_memcpy(x.upload + static_cast<i64>(x.upload_len), data, len);
+    x.upload_len = static_cast<u32>(static_cast<i64>(x.upload_len) + static_cast<i64>(len));
     if (x.ws) {
         if (!ws_h2_process(x, true)) x.failure = 13;
         if (end) ws_h2_eof(x, true);
@@ -1636,7 +1637,11 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     g.timer_deadline_us = earliest;
     if (!earliest) return;
     const u64 now = monotonic_us();
-    u64 delay = earliest > now ? earliest - now : 1;
+    u64 delay = 1;
+    if (earliest > now && __builtin_sub_overflow(earliest, now, &delay)) {
+        g.timer_deadline_us = 0;
+        return;
+    }
     if (delay > 3600000000ull) delay = 3600000000ull;
     if constexpr (!(requires { loop->arm_throttle_timer(conn, delay * 1000); })) {
         g.timer_deadline_us = 0;
