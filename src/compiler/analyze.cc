@@ -5032,11 +5032,15 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         auto receiver = receiver_override
                             ? FrontendResult<HirExpr>(*receiver_override)
                             : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
-        if (receiver && receiver->type == HirTypeKind::Bytes) {
-            const bool kSlicing = expr.name.eq(lit_str("slice"));
-            constexpr auto kDetail = lit_str(
-                "Bytes fields require unwrapped values: slice(i32 start, i32 end) or "
-                "find(Bytes delimiter[, i32 start])");
+        const bool kSlicing = expr.name.eq(lit_str("slice"));
+        if (receiver && (receiver->type == HirTypeKind::Bytes ||
+                         (kSlicing && receiver->type == HirTypeKind::Str))) {
+            const auto kDetail = receiver->type == HirTypeKind::Str
+                                     ? lit_str("str.slice requires unwrapped str and i32 bounds")
+                                     : lit_str(
+                                           "Bytes fields require unwrapped values: "
+                                           "slice(i32 start, i32 end) or "
+                                           "find(Bytes delimiter[, i32 start])");
             if (receiver->may_nil || receiver->may_error ||
                 (kSlicing ? expr.args.len != 2 : expr.args.len < 1 || expr.args.len > 2))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
@@ -5057,7 +5061,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             if (last.type != HirTypeKind::I32 || last.may_nil || last.may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             return make_json_op(kSlicing ? json::Op::BytesSlice : json::Op::BytesFind,
-                                kSlicing ? HirTypeKind::Bytes : HirTypeKind::I32,
+                                kSlicing ? receiver->type : HirTypeKind::I32,
                                 true,
                                 &receiver.value(),
                                 &first.value(),
@@ -16267,6 +16271,10 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::LetIn:
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringTrim:
+                    break;
+                case HirExprKind::JsonOp:
+                    // str.slice is a bounded, allocation-free borrowed view.
+                    if (e.int_value != static_cast<i64>(json::Op::BytesSlice)) return false;
                     break;
                 default:
                     return false;

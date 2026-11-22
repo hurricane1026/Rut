@@ -14,6 +14,12 @@ be unwrapped i32 values. Arguments are evaluated once in source order, receiver
 first. These are methods of Rut's custom Bytes type, not Swift String or Array
 collection APIs. No range syntax or implicit Bytes/str coercion is added.
 
+The byte-oriented `str.slice(start, end) -> str?` uses the same checked
+intrinsic and borrowed-view lifetime, preserving the source-level `str` type.
+Its bounds compare against `text.len`, and it can split multibyte characters;
+there is no decoding or Unicode boundary adjustment. See
+[string byte slices](language-card.md#string-byte-slices).
+
 ## Bounds and empty values
 
 Slice succeeds only when `0 <= start <= end <= data.count`. Negative, reversed

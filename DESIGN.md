@@ -4654,9 +4654,16 @@ s.trimPrefix(prefix)              // string
 s.trimSuffix(suffix)              // string
 s.replace(old, new)               // string
 s.split(sep)                      // [string]
-s.slice(start, end)               // string
+s.slice(start, end)               // str? — checked, borrowed half-open byte range
 s.matches(re"pattern")            // bool (Vectorscan)
 s.match(re"pattern")              // error-capable match object (capture groups)
+
+// str.slice uses the same checked intrinsic as Bytes.slice, retaining str type.
+// Unwrapped i32 bounds must satisfy 0 <= start <= end <= s.len; invalid ranges
+// produce nil. Equal bounds yield present empty text, including at end-of-input.
+// The immutable view borrows its input without allocation/copy/decoding and keeps
+// that input's lifetime. Indices count bytes, including NUL/non-UTF-8 octets;
+// Unicode character boundaries are not adjusted. No Swift range syntax is added.
 
 // --- Type Conversion / Parse ---
 42 as string                      // string (infallible conversion)

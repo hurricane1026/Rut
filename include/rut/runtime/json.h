@@ -78,7 +78,7 @@ enum class Op : u8 {
     ParseInt,
     ParseInt64,
     OauthTokenExchangeRequest,
-    BytesSlice,
+    BytesSlice,  // checked borrowed byte range, shared by str.slice and Bytes.slice
     BytesFind,
     JwtCertificateBound,
 

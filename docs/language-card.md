@@ -3519,6 +3519,33 @@ existing bounded byte search; neither operation allocates, performs I/O or chang
 contract. These custom Bytes methods use existing call syntax; Swift collection
 range syntax is not added. See [the full contract](bytes-fields.md).
 
+## String byte slices
+
+`text.slice(start, end) -> str?` returns a checked half-open **byte** range
+`[start, end)`. The receiver must be an unwrapped `str`; both bounds must be
+unwrapped `i32` values. It succeeds when `0 <= start <= end <= text.len`.
+Negative, reversed or out-of-range bounds return nil without clamping. Equal
+bounds produce a present empty string, including `"".slice(0, 0)` and a slice
+at the end of the input.
+
+This is an immutable borrowed view: no allocation, copy, decoding or Unicode
+boundary adjustment occurs. NUL and non-UTF-8 bytes are preserved; a range can
+split a multibyte character. The view keeps its source's lifetime and the
+existing request, callback and continuation storage rules. It uses the same
+checked intrinsic as `Bytes.slice`, while preserving `str` as the source-level
+result type. This custom Rut method adds no Swift range/index syntax or
+implicit Bytes/text conversion. It can be used inline in a consistent-hash key,
+for example `hash_key: req.path.slice(1, 9).or("fallback")`. See
+[byte field extraction](bytes-fields.md).
+
+```rut
+func middle(_ text: str) -> str => text.slice(1, 3)
+route POST "/field" {
+    guard let field = middle(req.body) else { return 400 }
+    return response(200, body: field)
+}
+```
+
 ## Bounded buffer parsing
 
 `collectBytes(input, initialState, maxItems, step) -> Collected<Item>?` scans a

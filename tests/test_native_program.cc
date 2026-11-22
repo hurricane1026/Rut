@@ -3,6 +3,7 @@
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_slice.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
@@ -37,6 +38,7 @@
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include <errno.h>
@@ -4010,3 +4012,79 @@ TEST(native_program, request_query_all_survives_source_removal) {
         pool.destroy();
     }
 }
+
+TEST(native_program, string_slice_returns_checked_borrowed_text_without_arena_storage) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::string_slice::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].fn;
+        jit::HandlerCtx ctx{};
+        REQUIRE(handler);
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_slice::kCases) {
+            std::string request =
+                "POST / HTTP/1.1\r\nHost: local\r\nX-Start: " + std::to_string(item.start) +
+                "\r\nX-End: " + std::to_string(item.end) +
+                "\r\nContent-Length: " + std::to_string(item.input.len) + "\r\n\r\n";
+            const auto body_offset = request.size();
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto result =
+                jit::HandlerResult::unpack(handler(connection.get(),
+                                                   &ctx,
+                                                   reinterpret_cast<const u8*>(request.data()),
+                                                   request.size(),
+                                                   nullptr));
+            CHECK_EQ(result.status_code, item.status);
+            if (item.status == 200) {
+                REQUIRE(connection->jit_response_body_valid);
+                CHECK(connection->jit_response_body.eq(item.expected));
+                if (item.expected.len)
+                    CHECK(connection->jit_response_body.ptr ==
+                          request.data() + body_offset + item.start);
+            } else {
+                CHECK_FALSE(connection->jit_response_body_valid);
+            }
+            CHECK_EQ(connection->json_arena.space_used(), 0u);
+        }
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, string_slice_extracts_text_in_websocket_callbacks) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(R"rut(
+func field(_ text: str) -> str => text.slice(1, 3)
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard let value = field(message.text) else { message.drop() }
+    guard value == "12" else { message.drop() }
+    message.forward()
+} }
+)rut"));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        const Str payloads[] = {lit_str("$12"),
+                                lit_str("$12end"),
+                                lit_str("$1"),
+                                lit_str("$13"),
+                                lit_str(""),
+                                lit_str("$\0\xff")};
+        for (u32 i = 0; i < 6; ++i)
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payloads[i].ptr),
+                          payloads[i].len,
+                          true) == (i < 2 ? WsFrameAction::Forward : WsFrameAction::Drop));
+    }
+}
+#endif
