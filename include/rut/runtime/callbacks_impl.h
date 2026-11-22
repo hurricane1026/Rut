@@ -99,7 +99,12 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
         return;
     }
     if (h->fails < 0xffff) h->fails++;
-    if (h->fails >= kBackendFailThreshold) h->eject_until_us = now_us + kBackendEjectCooldownUs;
+    if (h->fails >= kBackendFailThreshold) {
+        u64 eject_until = 0;
+        h->eject_until_us = __builtin_add_overflow(now_us, kBackendEjectCooldownUs, &eject_until)
+                                 ? ~u64{0}
+                                 : eject_until;
+    }
 }
 
 enum class PassiveHealthOutcome : u8 { TcpFailure, Timeout, HttpFailure, Success };
