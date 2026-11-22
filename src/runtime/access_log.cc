@@ -18,16 +18,20 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+static u64 saturating_mul_u64(u64 value, u64 scale) {
+    u64 result = 0;
+    return __builtin_mul_overflow(value, scale, &result) ? UINT64_MAX : result;
+}
+
 static u64 timespec_to_units(const timespec& ts, u64 scale) {
     if (ts.tv_sec < 0 || ts.tv_nsec < 0) return 0;
     const u64 seconds = static_cast<u64>(ts.tv_sec);
     const u64 fraction = scale == 1'000'000'000ULL ? static_cast<u64>(ts.tv_nsec)
                                                    : static_cast<u64>(ts.tv_nsec) / 1000;
-    u64 whole = 0;
+    const u64 whole = saturating_mul_u64(seconds, scale);
+    if (whole == UINT64_MAX) return UINT64_MAX;
     u64 result = 0;
-    if (__builtin_mul_overflow(seconds, scale, &whole) ||
-        __builtin_add_overflow(whole, fraction, &result))
-        return UINT64_MAX;
+    if (__builtin_add_overflow(whole, fraction, &result)) return UINT64_MAX;
     return result;
 }
 
@@ -66,7 +70,7 @@ u64 monotonic_us() {
 u64 monotonic_ns() {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return g_last_monotonic_us * 1000ULL;  // best-effort fallback
+        return saturating_mul_u64(g_last_monotonic_us, 1000ULL);  // best-effort fallback
     }
     return timespec_to_units(ts, 1'000'000'000ULL);
 }
