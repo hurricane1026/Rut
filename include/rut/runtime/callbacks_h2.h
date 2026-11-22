@@ -1169,7 +1169,9 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         auto& value = ctx->route_params[i].value;
         if (value == nullptr) continue;
         const auto* ptr = reinterpret_cast<const u8*>(value);
-        if (ptr < synth || ptr + ctx->route_params[i].value_len > synth + synth_len) continue;
+        if (ptr < synth || ptr + static_cast<i64>(ctx->route_params[i].value_len) >
+                               synth + static_cast<i64>(synth_len))
+            continue;
         value = reinterpret_cast<const char*>(h2->pending_synth + (ptr - synth));
     }
     h2->async_stream = stream_id;
@@ -1307,7 +1309,9 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                 return;
             }
             kOutcome.response_read_timeout_seconds =
-                cfg->policy_bundles[kOutcome.policy_bundle_id - 1].response_read_timeout_seconds;
+                cfg->policy_bundles[static_cast<u32>(static_cast<i64>(kOutcome.policy_bundle_id) -
+                                                     1)]
+                    .response_read_timeout_seconds;
         }
         if (kOutcome.response_read_timeout_seconds != 0) {
             d.close_after_process = true;
@@ -1317,8 +1321,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     if (d.conn->target_transform_recorded &&
         (kOutcome.kind != JitDispatchOutcome::Kind::Forward || cfg == nullptr ||
          !cfg->target_transform_id_is_valid(d.conn->target_transform_id) ||
-         cfg->target_transforms[d.conn->target_transform_id - 1].mode ==
-             ForwardTargetTransformMode::CleanPrefix)) {
+         cfg->target_transforms[static_cast<u32>(static_cast<i64>(d.conn->target_transform_id) - 1)]
+                 .mode == ForwardTargetTransformMode::CleanPrefix)) {
         h2_emit_status(d, stream_id, 400);
         return;
     }
