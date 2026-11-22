@@ -751,21 +751,25 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
             break;
         }
         const auto& src = d.conn->resp_header_mutations[i];
-        const u32 need = src.name.len + src.value.len;
-        if (need > Http2Conn::kBodySynthCap - h2.pending_local_mutation_bytes) {
+        const i64 need_wide = static_cast<i64>(src.name.len) + static_cast<i64>(src.value.len);
+        if (need_wide > static_cast<i64>(Http2Conn::kBodySynthCap) -
+                            static_cast<i64>(h2.pending_local_mutation_bytes)) {
             h2.pending_local_mutation_overflow = true;
             break;
         }
+        const u32 need = static_cast<u32>(need_wide);
         auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
-        u8* storage = h2.pending_synth + h2.pending_local_mutation_bytes;
+        u8* storage = h2.pending_synth + static_cast<i64>(h2.pending_local_mutation_bytes);
         dst.name_offset = static_cast<u16>(h2.pending_local_mutation_bytes);
         dst.name_len = static_cast<u16>(src.name.len);
         for (u32 j = 0; j < src.name.len; j++) storage[j] = static_cast<u8>(src.name.ptr[j]);
-        storage += src.name.len;
-        dst.value_offset = static_cast<u16>(h2.pending_local_mutation_bytes + src.name.len);
+        storage += static_cast<i64>(src.name.len);
+        dst.value_offset = static_cast<u16>(static_cast<i64>(h2.pending_local_mutation_bytes) +
+                                            static_cast<i64>(src.name.len));
         dst.value_len = static_cast<u16>(src.value.len);
         for (u32 j = 0; j < src.value.len; j++) storage[j] = static_cast<u8>(src.value.ptr[j]);
-        h2.pending_local_mutation_bytes += need;
+        h2.pending_local_mutation_bytes = static_cast<u32>(
+            static_cast<i64>(h2.pending_local_mutation_bytes) + static_cast<i64>(need));
         dst.mode = static_cast<u8>(src.mode);
     }
     if (replace_owned_async) h2_clear_async(h2);
@@ -798,17 +802,18 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
         while (t > 0) digits[nd++] = tmp[--t];
     }
     static const char kKey[] = "content-length: ";
-    const u32 kKeyLen = 16;             // strlen("content-length: ")
-    const u32 kIns = kKeyLen + nd + 2;  // header line + CRLF
-    if (*len + kIns > cap) return false;
-    const u32 kAt = body_start - 2;  // before the blank-line CRLF
-    for (u32 i = *len; i > kAt; i--) buf[i - 1 + kIns] = buf[i - 1];
+    const u32 kKeyLen = 16;  // strlen("content-length: ")
+    const u32 kIns = static_cast<u32>(static_cast<i64>(kKeyLen) + static_cast<i64>(nd) + 2);
+    if (static_cast<i64>(*len) + static_cast<i64>(kIns) > static_cast<i64>(cap)) return false;
+    const u32 kAt = static_cast<u32>(static_cast<i64>(body_start) - 2);
+    for (u32 i = *len; i > kAt; i--)
+        buf[static_cast<i64>(i) - 1 + static_cast<i64>(kIns)] = buf[static_cast<i64>(i) - 1];
     u32 o = kAt;
     for (u32 i = 0; i < kKeyLen; i++) buf[o++] = static_cast<u8>(kKey[i]);
     for (u32 i = 0; i < nd; i++) buf[o++] = static_cast<u8>(digits[i]);
     buf[o++] = '\r';
     buf[o++] = '\n';
-    *len += kIns;
+    *len = static_cast<u32>(static_cast<i64>(*len) + static_cast<i64>(kIns));
     return true;
 }
 
