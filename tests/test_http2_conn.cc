@@ -2073,6 +2073,7 @@ TEST(http2_conn, header_writers_check_wide_bounds_before_encoding) {
     CHECK_NE(http2_write_response_headers(
                  probe, sizeof(probe), enc_headers_only, 1, 200, nullptr, 0, UINT32_MAX, false),
              0u);
+    CHECK_EQ(http2_write_data(probe, 1, reinterpret_cast<const u8*>(&byte), UINT32_MAX, true), 0u);
 }
 
 // A header name too long to lowercase in http2_write_response's stack buffer must
