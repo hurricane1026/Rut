@@ -2623,11 +2623,13 @@ public:
         const u8 cancel = c.upstream_retirement_cancel_owned;
         const u8 retry = c.upstream_retirement_cancel_retry;
         const bool has_owner = target != 0 || cancel != 0 || retry != 0;
-        const u32 counted_owners = static_cast<u32>(target != 0) + static_cast<u32>(cancel != 0);
+        const u32 counted_owners =
+            static_cast<u32>(static_cast<i64>(target != 0) + static_cast<i64>(cancel != 0));
         const bool exact_normal_successor =
             !c.upstream_episode_quarantined &&
             c.upstream_retiring_episode < kIoUserDataMaxUpstreamEpisode &&
-            c.upstream_episode == c.upstream_retiring_episode + 1u;
+            c.upstream_episode ==
+                static_cast<u32>(static_cast<i64>(c.upstream_retiring_episode) + 1);
         const bool exact_quarantined_successor =
             c.upstream_episode_quarantined &&
             c.upstream_retiring_episode == kIoUserDataMaxUpstreamEpisode &&
