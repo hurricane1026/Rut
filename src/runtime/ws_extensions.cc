@@ -25,7 +25,8 @@ struct Cursor {
     Str token() {
         const u32 kStart = offset;
         while (offset < value.len && is_http_tchar(static_cast<u8>(value.ptr[offset]))) ++offset;
-        return {value.ptr + kStart, offset - kStart};
+        return {value.ptr + static_cast<i64>(kStart),
+                static_cast<u32>(static_cast<i64>(offset) - static_cast<i64>(kStart))};
     }
     bool parameter_value(Value& result) {
         result.present = true;
@@ -160,8 +161,12 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
         return 0;
     u32 written = 0;
     auto append = [&](Str text) {
-        if (text.len > capacity - written) return false;
-        for (u32 i = 0; i < text.len; ++i) output[written++] = text.ptr[i];
+        if (static_cast<i64>(text.len) > static_cast<i64>(capacity) - static_cast<i64>(written))
+            return false;
+        for (u32 i = 0; i < text.len; ++i) {
+            output[static_cast<i64>(written)] = text.ptr[i];
+            written = static_cast<u32>(static_cast<i64>(written) + 1);
+        }
         return true;
     };
     auto number = [&](u8 value) {
@@ -185,7 +190,7 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
 
 namespace {
 u32 line_end(const u8* buffer, u32 start, u32 header_len) {
-    for (u32 i = start; i + 1 < header_len; ++i)
+    for (u32 i = start; static_cast<i64>(i) + 1 < static_cast<i64>(header_len); ++i)
         if (buffer[i] == '\r' && buffer[i + 1] == '\n') return i;
     return header_len;
 }
@@ -194,8 +199,10 @@ bool field_is(const u8* buffer, u32 start, u32 end, Str name, u32* colon = nullp
     while (pos < end && buffer[pos] != ':') ++pos;
     if (colon) *colon = pos;
     return pos < end &&
-           http_header_name_eq_ci(
-               reinterpret_cast<const char*>(buffer + start), pos - start, name.ptr, name.len);
+           http_header_name_eq_ci(reinterpret_cast<const char*>(buffer + static_cast<i64>(start)),
+                                  static_cast<u32>(static_cast<i64>(pos) - static_cast<i64>(start)),
+                                  name.ptr,
+                                  name.len);
 }
 }  // namespace
 
@@ -212,29 +219,37 @@ u32 ws_rewrite_extensions(
     const u32 kFirstEnd = line_end(buffer, 0, header_len);
     if (kFirstEnd == header_len || kFirstEnd == 0) return 0;
     u32 removed = 0;
-    for (u32 pos = kFirstEnd + 2; pos < header_len - 2;) {
+    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
+         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
         const u32 kEnd = line_end(buffer, pos, header_len);
         if (kEnd == header_len || kEnd == pos) return 0;
         if (field_is(buffer, pos, kEnd, lit_str("sec-websocket-extensions")))
-            removed += kEnd + 2 - pos;
-        pos = kEnd + 2;
+            removed = static_cast<u32>(static_cast<i64>(removed) + static_cast<i64>(kEnd) + 2 -
+                                       static_cast<i64>(pos));
+        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
     const u64 kNewHeader = static_cast<u64>(header_len) - removed +
                            (extension_value.len ? kPrefix.len + extension_value.len + 2ull : 0);
-    if (kNewHeader + total_len - header_len > capacity) return 0;
-    u32 written = kFirstEnd + 2;
-    for (u32 pos = kFirstEnd + 2; pos < header_len - 2;) {
+    if (kNewHeader + static_cast<u64>(total_len) - static_cast<u64>(header_len) > capacity)
+        return 0;
+    u32 written = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
+    for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
+         static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
         const u32 kEnd = line_end(buffer, pos, header_len);
         if (!field_is(buffer, pos, kEnd, lit_str("sec-websocket-extensions"))) {
-            memmove(buffer + written, buffer + pos, kEnd + 2 - pos);
-            written += kEnd + 2 - pos;
+            const u32 line_size =
+                static_cast<u32>(static_cast<i64>(kEnd) + 2 - static_cast<i64>(pos));
+            memmove(buffer + static_cast<i64>(written), buffer + static_cast<i64>(pos), line_size);
+            written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(line_size));
         }
-        pos = kEnd + 2;
+        pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     // Shift the tail after scanning the old header; shrinking must not destroy
     // fields still being read, and growing must not overwrite early frame bytes.
-    memmove(buffer + kNewHeader, buffer + header_len, total_len - header_len);
+    memmove(buffer + static_cast<i64>(kNewHeader),
+            buffer + static_cast<i64>(header_len),
+            static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
     if (extension_value.len) {
         memcpy(buffer + written, kPrefix.ptr, kPrefix.len);
         written += kPrefix.len;
