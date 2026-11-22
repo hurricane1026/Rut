@@ -7814,13 +7814,8 @@ public:
         // the wait actually fits: 64 slots × 1s, so seconds in
         // [1, 63] land faithfully; seconds 64+ would wrap mod-64 and
         // fire far too early. Fail the request rather than shorten.
-        u32 secs = timer_seconds_from_ms(ms);
-        if (secs >= TimerWheel::kSlots) return false;
-        // Minimum 1 second: wait(0) on the wheel would land in the
-        // current slot, which the ongoing tick has already drained —
-        // the entry would then sit idle until the wheel wraps (~64s).
-        // analyze rejects wait(0) upstream, so this is defence-in-depth.
-        if (secs == 0) secs = 1;
+        const u32 secs = TimerWheel::yield_fallback_seconds(ms);
+        if (secs == 0) return false;
         conn.yield_armed = true;
         conn.yield_timeout_armed = false;
         timer.add(&conn, secs);

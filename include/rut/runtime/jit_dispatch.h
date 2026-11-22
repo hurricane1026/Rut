@@ -5,6 +5,7 @@
 #include "rut/jit/yield_contract.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/password_gateway.h"
+#include "rut/runtime/timer_wheel.h"
 
 namespace rut {
 
@@ -89,16 +90,6 @@ struct JitDispatchOutcome {
     // ReturnStatus — next_state has no resumption meaning there).
     u16 response_headers_idx = 0;
 };
-
-// Round-up conversion from ms to seconds. Callers using a 1-second
-// TimerWheel (legacy keepalive mechanism) can use this to bucket timer_ms.
-// Native ms-precision paths (IORING_OP_TIMEOUT / epoll min-heap) should
-// consume outcome.timer_ms directly.
-inline u32 timer_seconds_from_ms(u32 ms) {
-    if (ms == 0) return 0;
-    const u64 secs = (static_cast<u64>(ms) + 999u) / 1000u;
-    return secs > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<u32>(secs);
-}
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch-enum"

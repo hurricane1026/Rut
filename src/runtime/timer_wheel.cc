@@ -6,6 +6,25 @@
 
 namespace rut {
 
+namespace {
+
+// Check both ends of every representable bucket against the wheel geometry.
+consteval bool yield_fallback_contract() {
+    if (TimerWheel::yield_fallback_seconds(0) != 1) return false;
+    for (u32 seconds = 1; seconds < TimerWheel::kSlots; ++seconds) {
+        if (TimerWheel::yield_fallback_seconds((seconds - 1) * 1000 + 1) != seconds ||
+            TimerWheel::yield_fallback_seconds(seconds * 1000) != seconds)
+            return false;
+    }
+    return TimerWheel::yield_fallback_seconds((TimerWheel::kSlots - 1) * 1000 + 1) == 0 &&
+           TimerWheel::yield_fallback_seconds(TimerWheel::kSlots * 1000) == 0 &&
+           TimerWheel::yield_fallback_seconds(0xffffffffu) == 0;
+}
+
+static_assert(yield_fallback_contract(), "Yield fallback must fit within one timer wheel rotation");
+
+}  // namespace
+
 // The idle-trim mark should share the cache line timer_node is about to dirty, so
 // the clear in add() costs no extra line on every arm. alignof(Connection) is 8 and
 // sizeof(Connection) is 3696 (48 mod 64), so a slot's offsets may sit 48 bytes

@@ -292,13 +292,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     u32 last_yield_ms = 0;
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        u32 secs = timer_seconds_from_ms(ms);
-        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
-        // seconds >= kSlots would wrap mod-64. Fail the request so
-        // tests exercising long waits under simulated SQ pressure
-        // behave like the production loops.
-        if (secs >= TimerWheel::kSlots) return false;
-        if (secs == 0) secs = 1;
+        const u32 secs = TimerWheel::yield_fallback_seconds(ms);
+        if (secs == 0) return false;
         // timer.add doesn't detach an existing entry — calling it twice
         // on the same connection would double-insert and corrupt the
         // intrusive list. Production loops remove first; mirror that
@@ -762,13 +757,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u32 last_yield_ms = 0;
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        u32 secs = timer_seconds_from_ms(ms);
-        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
-        // seconds >= kSlots would wrap mod-64. Fail the request so
-        // tests exercising long waits under simulated SQ pressure
-        // behave like the production loops.
-        if (secs >= TimerWheel::kSlots) return false;
-        if (secs == 0) secs = 1;
+        const u32 secs = TimerWheel::yield_fallback_seconds(ms);
+        if (secs == 0) return false;
         // timer.add doesn't detach an existing entry — calling it twice
         // on the same connection would double-insert and corrupt the
         // intrusive list. Production loops remove first; mirror that
@@ -1102,13 +1092,8 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     u32 last_yield_ms = 0;
     [[nodiscard]] bool schedule_yield_timer(Connection& c, u32 ms) {
         last_yield_ms = ms;
-        u32 secs = timer_seconds_from_ms(ms);
-        // Mirror real-loop wheel-fallback boundary: 64 slots × 1s, so
-        // seconds >= kSlots would wrap mod-64. Fail the request so
-        // tests exercising long waits under simulated SQ pressure
-        // behave like the production loops.
-        if (secs >= TimerWheel::kSlots) return false;
-        if (secs == 0) secs = 1;
+        const u32 secs = TimerWheel::yield_fallback_seconds(ms);
+        if (secs == 0) return false;
         // timer.add doesn't detach an existing entry — calling it twice
         // on the same connection would double-insert and corrupt the
         // intrusive list. Production loops remove first; mirror that
