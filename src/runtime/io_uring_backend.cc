@@ -371,7 +371,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // Terminal-recv quarantine inventory (see the header): a FIFO ring sized for
     // the worst case of one window per CQ slot, plus an 8-byte-per-connection
     // side table.  Both are demand-paged so an idle shard pays nothing.
-    if (cq_ring_entries == 0 || (cq_ring_entries & (cq_ring_entries - 1u)) != 0) {
+    if (cq_ring_entries == 0 ||
+        (cq_ring_entries & static_cast<u32>(static_cast<i64>(cq_ring_entries) - 1)) != 0) {
         last_init_failure_detail = IoUringInitFailureDetail::RingSizeInvariant;
         shutdown();
         return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
@@ -489,7 +490,8 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Fill the ring with buffer entries
     for (u32 i = 0; i < kProvidedBufCount; i++) {
         io_uring_buf* buf = &buf_ring->bufs[i];
-        buf->addr = reinterpret_cast<u64>(buf_base + static_cast<u64>(i) * kProvidedBufSize);
+        buf->addr = reinterpret_cast<u64>(buf_base +
+                                          static_cast<i64>(i) * static_cast<i64>(kProvidedBufSize));
         buf->len = kProvidedBufSize;
         buf->bid = static_cast<u16>(i);
     }
@@ -566,14 +568,16 @@ void IoUringBackend::return_buffer(u16 buf_id) {
     }
     // Add buffer back to the provided ring
     u16 tail = __atomic_load_n(&buf_ring->tail, __ATOMIC_RELAXED);
-    u16 mask = kProvidedBufCount - 1;  // power of 2
+    u16 mask = static_cast<u16>(static_cast<i64>(kProvidedBufCount) - 1);  // power of 2
 
     io_uring_buf* buf = &buf_ring->bufs[tail & mask];
-    buf->addr = reinterpret_cast<u64>(buf_base + static_cast<u64>(buf_id) * kProvidedBufSize);
+    buf->addr = reinterpret_cast<u64>(buf_base + static_cast<i64>(buf_id) *
+                                                     static_cast<i64>(kProvidedBufSize));
     buf->len = kProvidedBufSize;
     buf->bid = buf_id;
 
-    __atomic_store_n(&buf_ring->tail, static_cast<u16>(tail + 1), __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &buf_ring->tail, static_cast<u16>(static_cast<i64>(tail) + 1), __ATOMIC_RELEASE);
 }
 
 void IoUringBackend::submit_timer_read() {
@@ -963,9 +967,10 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
         sqe->opcode = vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
         sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
         sqe->fd = fd;
-        sqe->addr =
-            vector ? reinterpret_cast<u64>(&vector->message) : reinterpret_cast<u64>(buf + written);
-        sqe->len = vector ? 1u : len - written;
+        sqe->addr = vector ? reinterpret_cast<u64>(&vector->message)
+                           : reinterpret_cast<u64>(buf + static_cast<i64>(written));
+        sqe->len =
+            vector ? 1u : static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(written));
     }
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
     sqe_advance_tail(sq_tail);
