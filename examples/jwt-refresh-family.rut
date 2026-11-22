@@ -8,12 +8,25 @@ func redisRefreshFamilyScript() -> Bytes {
     Bytes("local function d(v) return v and #v==64 and not string.find(v,'[^0-9a-f]') end if #KEYS~=1 or #ARGV~=2 or #KEYS[1]==0 or #KEYS[1]>256 or not d(ARGV[1]) or not d(ARGV[2]) or ARGV[1]==ARGV[2] then return -1 end local v=redis.call('GET',KEYS[1]) if not v then return 0 end if redis.call('PTTL',KEYS[1])<0 then return -1 end if v=='revoked' then return 0 end if #v~=67 or string.sub(v,1,3)~='v1:' or not d(string.sub(v,4)) then return -1 end if v=='v1:'..ARGV[1] then redis.call('SET',KEYS[1],'v1:'..ARGV[2],'KEEPTTL') return 1 end redis.call('SET',KEYS[1],'revoked','KEEPTTL') return 2")
 }
 
+// Explicit logout shares the same key and acknowledgement contract as rotation.
+func redisRefreshFamilyLogoutScript() -> Bytes {
+    Bytes("if #KEYS~=1 or #ARGV~=0 or #KEYS[1]==0 or #KEYS[1]>256 then return -1 end local v=redis.call('GET',KEYS[1]) if not v then return 0 end if redis.call('PTTL',KEYS[1])<0 then return -1 end if v~='revoked' and (#v~=67 or string.sub(v,1,3)~='v1:' or string.find(string.sub(v,4),'[^0-9a-f]')) then return -1 end redis.call('SET',KEYS[1],'revoked','KEEPTTL') return 1")
+}
+
 func redisRefreshFamilyRequestFinish(_ count: Bytes, _ family: Bytes, _ old: Bytes, _ replacement: Bytes) {
     guard let keyed = concatBytes(count, family, 8192) else { nil }
     guard let previous = concatBytes(keyed, old, 8192) else { nil }
     guard let mutation = concatBytes(previous, replacement, 8192) else { nil }
     concatBytes(mutation, b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192)
 }
+func redisRefreshFamilyLogoutRequest(_ key: Bytes) {
+    guard let source = resp2BulkArgument(redisRefreshFamilyLogoutScript(), 8192) else { nil }
+    guard let family = resp2BulkArgument(key, 8192) else { nil }
+    guard let command = concatBytes(b"*4\r\n$4\r\nEVAL\r\n", source, 8192) else { nil }
+    guard let count = concatBytes(command, b"$1\r\n1\r\n", 8192) else { nil }
+    redisRefreshFamilyRequestFinish(count, family, b"", b"")
+}
+
 func redisRefreshFamilyRequest(_ key: Bytes, _ presented: Bytes, _ next: Bytes) {
     guard let source = resp2BulkArgument(redisRefreshFamilyScript(), 8192) else { nil }
     guard let family = resp2BulkArgument(key, 8192) else { nil }
@@ -67,11 +80,11 @@ func redisRefreshFamilyFinish(_ connection: TcpConnection, _ result: RedisSessio
     }
 }
 
-func redisRefreshFamily(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
-                        _ database: i32, _ key: Bytes, _ presented: Bytes, _ next: Bytes) -> i32 {
+func redisRefreshFamilyOperation(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                                _ database: i32, _ request: Bytes) -> i32 {
     let initialized = redisInitialize(connection, username, password, database)
     guard redisInitializeSucceeded(initialized) else { -1 }
-    let result = redisRefreshFamilyExecute(connection, redisRefreshFamilyRequest(key, presented, next).or(Bytes("")))
+    let result = redisRefreshFamilyExecute(connection, request)
     if redisSessionAlreadyClosed(result) {
         redisRefreshFailure(connection)
     } else { redisRefreshFamilyFinish(connection, result) }
@@ -104,10 +117,20 @@ route POST "/refresh" {
     guard let plan = refreshIssue(token, env("REFRESH_SUBJECT"), tokenId) else { return 503 }
     let opening = tcp(env("REDIS_ENDPOINT"), 1000)
     guard let connection = opening else { return 503 }
-    let status = redisRefreshFamily(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), plan.family, plan.currentDigest, plan.nextDigest)
+    let status = redisRefreshFamilyOperation(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), redisRefreshFamilyRequest(plan.family, plan.currentDigest, plan.nextDigest).or(b""))
     guard status != -1 else { return 503 }
     guard status == 1 else { return 401 }
     let issuedToken = plan.token
     return response(200, body: issuedToken, headers: {"Content-Type": "application/jwt", "Cache-Control": "no-store", "Pragma": "no-cache"})
+}
+route POST "/refresh/logout" {
+    let token = bearerToken(req.authorization.or("")).or("")
+    let authenticated = refreshAuthenticated(token)
+    guard let family = jwt_session.key(env("REFRESH_SUBJECT"), env("REFRESH_NAMESPACE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisRefreshFamilyOperation(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), redisRefreshFamilyLogoutRequest(family).or(b""))
+    guard status == 0 || status == 1 else { return 503 }
+    return response(204, headers: {"Cache-Control": "no-store"})
 }
 route "/" { return 404 }

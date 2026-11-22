@@ -78,10 +78,10 @@ def gateway(args, store):
             port = int(match.group(1))
             context = ssl.create_default_context(cafile=str(cert))
 
-            def refresh(value, duplicate=False):
+            def refresh(value, duplicate=False, path="/refresh"):
                 connection = http.client.HTTPSConnection('localhost', port, context=context, timeout=10)
                 try:
-                    connection.putrequest('POST', '/refresh')
+                    connection.putrequest('POST', path)
                     connection.putheader('Authorization', 'Bearer ' + value)
                     if duplicate:
                         connection.putheader('Authorization', 'Bearer ' + value)
@@ -168,6 +168,43 @@ def exercise_gateway(args, store):
         newest = next(result[1] for result in results if result[0] == 200)
         assert refresh(newest)[0] == 401
 
+        logout_path = "/refresh/logout"
+        current = credential(jti="logout")
+        assert store.command(b'SET', FAMILY, b'v1:' + digest(current), b'PX', b'60000') == b'OK'
+        for rejected in (current + 'x', credential(sub='bob'), credential(aud='access')):
+            assert refresh(rejected, path=logout_path)[0] == 401
+        assert refresh(current, duplicate=True, path=logout_path)[0] == 401
+        assert store.command(b'GET', FAMILY) == b'v1:' + digest(current)
+        before = store.command(b'PTTL', FAMILY)
+        assert refresh(current, path=logout_path) == (204, '', 'no-store')
+        assert refresh(current, path=logout_path) == (204, '', 'no-store')
+        assert store.command(b'GET', FAMILY) == b'revoked'
+        assert 0 < store.command(b'PTTL', FAMILY) <= before
+        assert refresh(current)[0] == 401
+
+        store.kill()
+        store.start()
+        authorize_store(store)
+        assert store.command(b'GET', FAMILY) == b'revoked'
+        assert refresh(current)[0] == 401
+        assert store.command(b'DEL', FAMILY) == 1
+        assert refresh(current, path=logout_path) == (204, '', 'no-store')
+        assert store.command(b'GET', FAMILY) is None
+        assert store.command(b'SET', FAMILY, b'bad-record', b'PX', b'60000') == b'OK'
+        assert refresh(current, path=logout_path)[0] == 503
+        assert store.command(b'GET', FAMILY) == b'bad-record'
+
+        assert store.command(b'SET', FAMILY, b'v1:' + digest(current), b'PX', b'60000') == b'OK'
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            rotating = workers.submit(refresh, current)
+            revoking = workers.submit(refresh, current, path=logout_path)
+            rotation = rotating.result()
+            assert revoking.result() == (204, '', 'no-store')
+        assert rotation[0] in (200, 401)
+        assert store.command(b'GET', FAMILY) == b'revoked'
+        if rotation[0] == 200:
+            assert refresh(rotation[1])[0] == 401
+
         replacement = credential(jti='uncertain')
         assert store.command(b'SET', FAMILY, b'v1:' + digest(replacement), b'PX', b'60000') == b'OK'
         assert store.command(b'ACL', b'SETUSER', b'gateway', b'-waitaof') == b'OK'
@@ -175,6 +212,9 @@ def exercise_gateway(args, store):
         assert uncertain[0] == 503 and replacement not in uncertain[1], uncertain
         changed = store.command(b'GET', FAMILY)
         assert changed.startswith(b'v1:') and changed != b'v1:' + digest(replacement)
+        assert refresh(replacement, path=logout_path)[0] == 503
+        assert store.command(b'GET', FAMILY) == b'revoked'
+
 
 
 def main():
