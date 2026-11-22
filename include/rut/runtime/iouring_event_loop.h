@@ -1583,8 +1583,8 @@ private:
                 // boundary, while any retry snapshot/pipeline stash remains in
                 // send_buf until both rendezvous owners drain. A live Send has
                 // not reached that callback and belongs to RetrySendBuf instead.
-                const u32 stored =
-                    static_cast<u32>(c.retry_req_send_len) + static_cast<u32>(c.pipeline_stash_len);
+                const u32 stored = static_cast<u32>(static_cast<i64>(c.retry_req_send_len) +
+                                                    static_cast<i64>(c.pipeline_stash_len));
                 const bool materialized_get =
                     c.http1_prebuilt_deadline_profile ==
                         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1603,7 +1603,8 @@ private:
                                 c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                                     c.http1_prebuilt_deadline_bundle_id)
                             ? c.http1_prebuilt_deadline_config
-                                  ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                  ->policy_bundles
+                                      [static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                                   .response_buffering
                             : ForwardResponseBufferingMode::None,
                         c.http1_prebuilt_deadline_bundle_id,
@@ -1622,7 +1623,9 @@ private:
                                      c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                                          c.http1_prebuilt_deadline_bundle_id)
                                  ? c.http1_prebuilt_deadline_config
-                                       ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                       ->policy_bundles[static_cast<i64>(
+                                                            c.http1_prebuilt_deadline_bundle_id) -
+                                                        1]
                                        .response_buffering
                                  : ForwardResponseBufferingMode::None,
                              c.http1_prebuilt_deadline_bundle_id,
@@ -1650,8 +1653,11 @@ private:
                 if (prefix == 0 || prefix != c.req_initial_send_len || prefix > c.recv_buf.len() ||
                     c.retry_req_send_len != 0 || c.pipeline_stash_len != 0)
                     return false;
-                const u32 late = c.recv_buf.len() - prefix;
-                if (late != 0) __builtin_memmove(c.recv_slice, c.recv_buf.data() + prefix, late);
+                const u32 late =
+                    static_cast<u32>(static_cast<i64>(c.recv_buf.len()) - static_cast<i64>(prefix));
+                if (late != 0)
+                    __builtin_memmove(
+                        c.recv_slice, c.recv_buf.data() + static_cast<i64>(prefix), late);
                 c.clear_raw_request_target_witness();
                 c.recv_buf.set_len(late);
                 return true;
@@ -1986,7 +1992,8 @@ public:
             !c.request_config->policy_bundle_id_is_valid(c.http1_prebuilt_deadline_bundle_id))
             return false;
         const auto& bundle =
-            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1u];
+            c.request_config
+                ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1];
         const u8 expected_wait =
             kHttp1WaitHeaderSend |
             (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
@@ -2096,7 +2103,7 @@ public:
                  c,
                  c.http1_prebuilt_deadline_upload,
                  c.http1_prebuilt_deadline_config
-                     ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                     ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                      .response_buffering,
                  c.http1_prebuilt_deadline_profile));
         const bool tls_read_timeout = c.tls_active && prebuilt_http11_tls_read_timeout_is_stable(c);
@@ -2860,7 +2867,8 @@ public:
                          c,
                          c.http1_prebuilt_deadline_upload,
                          c.http1_prebuilt_deadline_config
-                             ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                             ->policy_bundles
+                                 [static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                              .response_buffering,
                          c.http1_prebuilt_deadline_profile));
                 if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
@@ -4769,7 +4777,7 @@ public:
             c.response_read_deadline_progress_bytes != 0 || cfg == nullptr ||
             !cfg->policy_bundle_id_is_valid(bundle_id))
             return false;
-        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        const auto& bundle = cfg->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
@@ -5128,7 +5136,7 @@ public:
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
             return false;
-        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        const auto& bundle = cfg->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
