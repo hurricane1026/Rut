@@ -795,9 +795,12 @@ public:
                 if (upstream) upstream->drain();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
                 u32 period = drain_period_.load(std::memory_order_relaxed);
+                u64 deadline = 0;
+                const bool deadline_overflow =
+                    __builtin_add_overflow(start, static_cast<u64>(period), &deadline);
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
-                } else if (monotonic_secs() >= start + period) {
+                } else if (deadline_overflow || monotonic_secs() >= deadline) {
                     force_close_all();
                     running_.store(false, std::memory_order_relaxed);
                 }
@@ -8007,7 +8010,9 @@ public:
             timer.remove(&conn);
         else if (conn.yield_timeout_armed)
             return true;  // Reuse the existing kernel timespec owner.
-        u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
+        u64 rounded_ns = 0;
+        if (__builtin_add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
+        u32 ms = static_cast<u32>(rounded_ns / 1'000'000ull);
         if (ms == 0) ms = 1;
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
@@ -8351,7 +8356,10 @@ public:
         u32 counted = ~0u;  // last connection added to idle_trim_conns
         bool hard_failure = false;
         for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
-            const u32 chunk = total - base < kIdleTrimIovChunk ? total - base : kIdleTrimIovChunk;
+            const i64 remaining = static_cast<i64>(total) - static_cast<i64>(base);
+            const u32 chunk = remaining < static_cast<i64>(kIdleTrimIovChunk)
+                                  ? static_cast<u32>(remaining)
+                                  : kIdleTrimIovChunk;
             long r = -1;
             if (!hard_failure) {
                 r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
@@ -8362,9 +8370,10 @@ public:
             // Whole ranges the kernel reports done; a partly advised range is redone.
             const u32 advised =
                 r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
-            for (u32 i = base; i < base + chunk; i++) {
+            const u32 end = static_cast<u32>(static_cast<i64>(base) + static_cast<i64>(chunk));
+            for (u32 i = base; i < end; i++) {
                 while (idle_trim_first[conn + 1] <= i) ++conn;
-                bool ok = i - base < advised;
+                bool ok = static_cast<i64>(i) - static_cast<i64>(base) < static_cast<i64>(advised);
                 if (!ok) {
                     ok = idle_trim_advise_slice(idle_trim_iov[i]);
                     if (ok) ++idle_trim_fallback;
@@ -8408,7 +8417,10 @@ public:
             idle_trim_examined++;
             if (idle_trim_connection(*c)) queued++;
             // The time budget is checked after the node, so every tick makes progress.
-            if (monotonic_ns() + idle_trim_nranges * kIdleTrimFlushNsPerRange >= deadline_ns)
+            const u64 flush_cost = static_cast<u64>(idle_trim_nranges) * kIdleTrimFlushNsPerRange;
+            u64 projected_deadline = 0;
+            if (__builtin_add_overflow(monotonic_ns(), flush_cost, &projected_deadline) ||
+                projected_deadline >= deadline_ns)
                 return false;
             if (at_end) return true;
             node = next;
@@ -8430,7 +8442,9 @@ public:
         if (idle_trim_pidfd < 0) return;
         const auto kWindow = idle_trim_window(static_cast<u32>(timer.cursor), keepalive_timeout);
         if (kWindow.begin == kWindow.end) return;
-        const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
+        u64 deadline_ns = 0;
+        if (__builtin_add_overflow(monotonic_ns(), idle_trim_budget_ns, &deadline_ns))
+            deadline_ns = UINT64_MAX;
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
