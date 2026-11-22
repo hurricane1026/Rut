@@ -12669,7 +12669,7 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                 // physical field, so e.g. `Connection: TE` followed by a
                 // separate `Connection: X-Foo` is the union of both.
                 const char* value_start = header.value.ptr;
-                const char* value_end = value_start + header.value.len;
+                const char* value_end = value_start + static_cast<i64>(header.value.len);
                 const char* tok = value_start;
                 while (tok <= value_end) {
                     const char* tok_end = tok;
@@ -12765,12 +12765,12 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
         if (colon == 0) return false;
         const bool has_port = colon != value.len;
         if (has_port) {
-            if (colon + 1 == value.len) return false;
+            if (static_cast<i64>(colon) + 1 == static_cast<i64>(value.len)) return false;
             u32 port = 0;
-            for (u32 i = colon + 1; i < value.len; i++) {
+            for (u32 i = static_cast<u32>(static_cast<i64>(colon) + 1); i < value.len; i++) {
                 const u8 c = static_cast<u8>(value.ptr[i]);
                 if (c < '0' || c > '9' || port > 6553u || (port == 6553u && c > '5')) return false;
-                port = port * 10u + static_cast<u32>(c - '0');
+                port = static_cast<u32>(static_cast<i64>(port) * 10 + static_cast<i64>(c - '0'));
             }
             if (port == 0) return false;
         }
