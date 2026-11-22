@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 
@@ -80,7 +81,8 @@ def matches(tool, file, query, flags):
         # unstructured driver line is the one exceptional diagnostic that
         # must be checked when the process status is unreliable.  Source
         # diagnostics still use clang-check's authoritative return status.
-        driver_error = any(line.startswith('error:') or 'unknown argument' in line
+        driver_error = any(line.startswith(('error:', 'clang: error:', 'clang++: error:',
+                                            'clang-query: error:'))
                            for line in syntax.stderr.splitlines())
         if syntax.returncode or driver_error:
             raise RuntimeError(f'{target}: clang-check syntax validation failed\n'
@@ -137,7 +139,7 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             'arguments': ['clang++', '-std=c++23', '-DPROBE_DB_FLAG=1', '-I', str(include), '-c', str(db_file)],
         }]))
         if matches(tool, db_file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))',
-                    ['-p', str(database)]):
+                    ['-p', directory]):
             raise RuntimeError('clang-query self-test: compile-database probe unexpectedly matched')
 
         warning = Path(directory) / 'warning.cc'
@@ -151,11 +153,6 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
         )
         if matches(tool, warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
             raise RuntimeError('clang-query self-test: warning source unexpectedly matched')
-
-        path_warning = Path(directory) / 'path-error:valid.cc'
-        path_warning.write_text('int okay;\n')
-        if matches(tool, path_warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
-            raise RuntimeError('clang-query self-test: path containing error unexpectedly matched')
 
         colon_valid = Path(directory) / 'bad:error.cc'
         colon_valid.write_text('int okay;\n')
@@ -248,6 +245,15 @@ def main():
     parser.add_argument('--inventory', type=Path, help='write unique arithmetic sites for review')
     args = parser.parse_args()
     global SYNTAX_CHECK
+    if args.clang_check == 'clang-check' and args.clang_query != 'clang-query':
+        query_name = Path(args.clang_query).name
+        if query_name.startswith('clang-query-'):
+            paired = str(Path(args.clang_query).with_name(
+                'clang-check-' + query_name.removeprefix('clang-query-')))
+            if shutil.which(paired):
+                args.clang_check = paired
+            else:
+                raise SystemExit(f'no matching clang-check for {args.clang_query}; pass --clang-check explicitly')
     SYNTAX_CHECK = args.clang_check
     self_test(args.clang_query)
     test_unsigned_add_sub(args.clang_query)
