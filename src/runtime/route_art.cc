@@ -417,7 +417,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 for (u32 byte = 0; byte < 256; byte++) {
                     const u8 slot1 = n.child_index[byte];
                     if (slot1 == 0) continue;
-                    tail_ref = add_child(tail_ref, static_cast<u8>(byte), n.children[slot1 - 1]);
+                    tail_ref = add_child(tail_ref,
+                                         static_cast<u8>(byte),
+                                         n.children[static_cast<u8>(static_cast<i64>(slot1) - 1)]);
                     if (tail_ref == kArtInvalidChildRef) {
                         rollback();
                         return false;
@@ -484,7 +486,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // bytes after the split point) or ends right here (new path
         // ends at the split). Loop body re-reads `cur` to decide.
         cur = new_child_ref;
-        i += k;
+        i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
         // Re-establish patch site for the new cur (we just rewrote
         // it). Resolve it the same way as the full-match branch.
         {
@@ -564,12 +566,13 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             if (child == kArtInvalidChildRef) return best;
             const ArtNode4& cn = n4_pool_[art_idx(child)];
             const Str e = cn.hdr.edge;
-            if (i + e.len > p.len) return best;
+            if (static_cast<i64>(i) + static_cast<i64>(e.len) > static_cast<i64>(p.len))
+                return best;
             for (u32 k = 0; k < e.len; k++) {
-                if (e.ptr[k] != p.ptr[i + k]) return best;
+                if (e.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
             }
             cur_idx = art_idx(child);
-            i += e.len;
+            i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(e.len));
             const u16 cand =
                 (want_slot != 0 && cn.hdr.route_idx_by_method[want_slot] != TrieNode::kInvalidRoute)
                     ? cn.hdr.route_idx_by_method[want_slot]
@@ -628,7 +631,7 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
                 case kArtN48: {
                     const ArtNode48& n = n48_pool_[ci];
                     const u8 idx1 = n.child_index[b];
-                    if (idx1 != 0) child = n.children[idx1 - 1];
+                    if (idx1 != 0) child = n.children[static_cast<u8>(static_cast<i64>(idx1) - 1)];
                     break;
                 }
                 case kArtN256: {
@@ -672,12 +675,12 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             }
         }
 
-        if (i + child_edge.len > p.len) break;
+        if (static_cast<i64>(i) + static_cast<i64>(child_edge.len) > static_cast<i64>(p.len)) break;
         for (u32 k = 0; k < child_edge.len; k++) {
-            if (child_edge.ptr[k] != p.ptr[i + k]) return best;
+            if (child_edge.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
         }
         cur = child;
-        i += child_edge.len;
+        i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(child_edge.len));
         const u16 candidate =
             (want_slot != 0 && child_terminals[want_slot] != TrieNode::kInvalidRoute)
                 ? child_terminals[want_slot]
