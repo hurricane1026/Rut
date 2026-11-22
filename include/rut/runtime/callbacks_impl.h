@@ -14450,7 +14450,7 @@ inline bool build_redirect_response(const Connection& conn,
     static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
-    if (!add_i64(9 + 3 + 1 + static_cast<i64>(policy.reason.len) + 2) ||
+    if (!add_i64(9 + 3 + 1 + static_cast<i64>(policy.reason.len)) ||
         !add_i64(10 + static_cast<i64>(policy.server.len)) || !add_i64(8 + date_len) ||
         !add_i64(16 + static_cast<i64>(policy.content_type.len)) ||
         !add_i64(18 + body_len_digits) ||
