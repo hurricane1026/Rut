@@ -180,10 +180,7 @@ struct Arena {
             Block* prev = current->prev;
             u64 sz = current->size;
             backend.release(reinterpret_cast<u8*>(current), sz);
-            if (sz > total_allocated)
-                total_allocated = 0;
-            else if (__builtin_sub_overflow(total_allocated, sz, &total_allocated))
-                total_allocated = 0;
+            if (__builtin_sub_overflow(total_allocated, sz, &total_allocated)) total_allocated = 0;
             current = prev;
         }
         current->used = 0;
