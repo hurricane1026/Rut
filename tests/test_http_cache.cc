@@ -116,6 +116,18 @@ TEST(http_cache, cache_control_age_date_and_vary_are_not_ignored) {
     CHECK(lookup(*cache, key(), 3999999) == HttpCache::Result::Hit);
     CHECK(lookup(*cache, key(), 4000000) == HttpCache::Result::Miss);
 }
+TEST(http_cache, cache_control_max_age_saturates_without_narrowing_wrap) {
+    const auto max = key("Cache-Control: max-age=4294967295\r\n");
+    const auto just_over = key("Cache-Control: max-age=4294967296\r\n");
+    const auto long_over = key(
+        "Cache-Control: max-age=999999999999999999999999999999999999999999999999999999\r\n");
+    CHECK(max.eligible);
+    CHECK(just_over.eligible);
+    CHECK(long_over.eligible);
+    CHECK_EQ(max.max_age, UINT32_MAX);
+    CHECK_EQ(just_over.max_age, UINT32_MAX);
+    CHECK_EQ(long_over.max_age, UINT32_MAX);
+}
 TEST(http_cache, variants_hosts_queries_routes_and_configurations_are_isolated) {
     auto cache = std::make_unique<HttpCache>();
     auto first = key("Accept-Language: en\r\n");

@@ -34,14 +34,14 @@ bool decimal(Str text, u32& value) {
         text = {text.ptr + static_cast<i64>(1),
                 static_cast<u32>(static_cast<i64>(text.len) - static_cast<i64>(2))};
     if (!text.len) return false;
-    u64 result = 0;
+    i64 result = 0;
     for (u32 i = 0; i < text.len; ++i) {
         if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
-        const u64 digit = static_cast<u64>(static_cast<i64>(text.ptr[i]) - static_cast<i64>('0'));
-        u64 scaled = 0;
-        if (__builtin_mul_overflow(result, u64{10}, &scaled) ||
-            __builtin_add_overflow(scaled, digit, &result))
+        const i64 digit = static_cast<i64>(text.ptr[i]) - static_cast<i64>('0');
+        if (result > (static_cast<i64>(UINT32_MAX) - digit) / 10)
             result = 0xffffffffu;
+        else
+            result = result * 10 + digit;
     }
     value = static_cast<u32>(result);
     return true;
@@ -423,8 +423,10 @@ bool HttpCachePolicy::read_response(const Key& key,
         now_us < record.expires_us && now_us >= record.stored_us &&
         kAgeUs <= static_cast<u64>(static_cast<i64>(key.max_age) * 1000000) &&
         key.min_fresh <= kMaxTtl &&
-        static_cast<u64>(static_cast<i64>(key.min_fresh) * 1000000) <
-            static_cast<u64>(static_cast<i64>(record.expires_us) - static_cast<i64>(now_us));
+        static_cast<u64>(static_cast<i64>(key.min_fresh) * 1000000) < ([&] {
+            u64 remaining = 0;
+            return __builtin_sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
+        }());
     return kFresh &&
            copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
 }
@@ -448,8 +450,8 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
 bool HttpCachePolicy::prepare_record(
     const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record) {
     if (!response || length > kMaxResponse || now_us < fill.started_us) return false;
-    const u64 kElapsed =
-        static_cast<u64>(static_cast<i64>(now_us) - static_cast<i64>(fill.started_us));
+    u64 kElapsed = 0;
+    if (__builtin_sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
         length != static_cast<u32>(static_cast<i64>(info.header_end) +
@@ -477,7 +479,15 @@ u64 http_cache_wall_us() {
     struct timespec now{};
     return clock_gettime(CLOCK_REALTIME, &now) == 0 && now.tv_sec > 0 && now.tv_nsec >= 0 &&
                    now.tv_nsec < 1000000000 && static_cast<u64>(now.tv_sec) <= ~u64{0} / 1000000
-               ? static_cast<u64>(static_cast<i64>(now.tv_sec) * 1000000 + now.tv_nsec / 1000)
+               ? ([&] {
+                     u64 whole = 0;
+                     u64 fractional = static_cast<u64>(now.tv_nsec) / 1000;
+                     if (__builtin_mul_overflow(
+                             static_cast<u64>(now.tv_sec), u64{1000000}, &whole) ||
+                         __builtin_add_overflow(whole, fractional, &whole))
+                         return u64{0};
+                     return whole;
+                 }())
                : 0;
 }
 }  // namespace rut
