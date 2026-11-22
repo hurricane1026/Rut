@@ -4242,7 +4242,9 @@ public:
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
-            if (relay_budget_calls < 2 || relay_budget_bytes < 2 * 64 * 1024) break;
+            if (relay_budget_calls < 2 ||
+                static_cast<i64>(relay_budget_bytes) < static_cast<i64>(2) * 64 * 1024)
+                break;
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
@@ -4250,7 +4252,9 @@ public:
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
-                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
+                    u64 ordinary_wait_ns = 0;
+                    if (__builtin_sub_overflow(now, ordinary_since_ns, &ordinary_wait_ns)) break;
+                    if (ordinary_wait_ns >= ordinary_cq_wait_limit_ns) {
                         ++study_relay_yields;
                         break;
                     }
@@ -4291,7 +4295,10 @@ public:
                 continue;
             }
             if (study_queue_started[c.id] != 0) {
-                study_record_wait(2, monotonic_ns() - study_queue_started[c.id]);
+                u64 queue_wait_ns = 0;
+                if (!__builtin_sub_overflow(
+                        monotonic_ns(), study_queue_started[c.id], &queue_wait_ns))
+                    study_record_wait(2, queue_wait_ns);
                 study_queue_started[c.id] = 0;
             }
             const IoEvent kReady{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, kEpisode};
@@ -4306,8 +4313,11 @@ public:
                 if (!submit_recv_upstream(c)) close_conn(c);
             }
         }
-        study_relay_calls += start_calls - relay_budget_calls;
-        study_flush_phase_ns += monotonic_ns() - phase_started;
+        study_relay_calls +=
+            static_cast<u64>(static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls));
+        u64 flush_phase_ns = 0;
+        if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
+            __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
     }
 
     void clear_deferred_relay_read(u32 id) {
