@@ -15688,13 +15688,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             config->response_policy_id_is_valid(conn.response_policy_id) &&
             config->failure_policy_id_is_valid(conn.failure_policy_id) &&
             config->timeout_failure_policy_id_is_valid(conn.timeout_failure_policy_id) &&
-            config->policy_bundles[explicit_bundle_id - 1].response_policy_id ==
+            config->policy_bundles[static_cast<i64>(explicit_bundle_id) - 1].response_policy_id ==
                 conn.response_policy_id &&
-            config->policy_bundles[explicit_bundle_id - 1].failure_policy_id ==
+            config->policy_bundles[static_cast<i64>(explicit_bundle_id) - 1].failure_policy_id ==
                 conn.failure_policy_id &&
-            config->policy_bundles[explicit_bundle_id - 1].timeout_failure_policy_id ==
-                conn.timeout_failure_policy_id &&
-            config->policy_bundles[explicit_bundle_id - 1].response_buffering ==
+            config->policy_bundles[static_cast<i64>(explicit_bundle_id) - 1]
+                    .timeout_failure_policy_id == conn.timeout_failure_policy_id &&
+            config->policy_bundles[static_cast<i64>(explicit_bundle_id) - 1].response_buffering ==
                 explicit_buffering &&
             (!forward_response_buffering_uses_content_length_machinery(explicit_buffering) ||
              (complete_content_length_route_method_is_admitted(explicit_route_method) &&
@@ -15706,7 +15706,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) &&
               explicit_upload.request_policy_id == conn.request_policy_id)) &&
             response_read_timeout_seconds_valid(
-                config->policy_bundles[explicit_bundle_id - 1].response_read_timeout_seconds) &&
+                config->policy_bundles[static_cast<i64>(explicit_bundle_id) - 1]
+                    .response_read_timeout_seconds) &&
             explicit_method == conn.req_method &&
             (fixed_upload
                  ? (fixed_upload_head
@@ -15732,15 +15733,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                                   explicit_buffering))
                  : response_read_deadline_non_head_method_admitted(explicit_method)) &&
             response_read_deadline_route_method_matches(explicit_method, explicit_route_method) &&
-            config->response_policies[conn.response_policy_id - 1].head_mode ==
+            config->response_policies[static_cast<i64>(conn.response_policy_id) - 1].head_mode ==
                 (fixed_upload_head ? ResponsePolicyHeadMode::SuppressBody
                                    : ResponsePolicyHeadMode::Reject) &&
-            config->failure_policies[conn.failure_policy_id - 1].head_mode ==
+            config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1].head_mode ==
                 (fixed_upload_head ? FailurePolicyHeadMode::SuppressBody
                                    : FailurePolicyHeadMode::Reject) &&
-            config->failure_policies[conn.timeout_failure_policy_id - 1].head_mode ==
-                (fixed_upload_head ? FailurePolicyHeadMode::SuppressBody
-                                   : FailurePolicyHeadMode::Reject);
+            config->failure_policies[static_cast<i64>(conn.timeout_failure_policy_id) - 1]
+                    .head_mode == (fixed_upload_head ? FailurePolicyHeadMode::SuppressBody
+                                                     : FailurePolicyHeadMode::Reject);
         const bool strict_common =
             owner_exact && resp.version == HttpVersion::Http11 && resp.content_length_count == 1 &&
             resp.has_content_length && !resp.chunked && !resp.headers_truncated &&
