@@ -55,6 +55,20 @@ def queries(scope):
     return ineffective, late_bound, signed, inventory
 
 
+def unsigned_add_sub(scope):
+    # Inspect operands before implicit promotions (u8 + 1 computes an int).
+    # Look through parentheses and implicit casts, but respect an explicit
+    # conversion of the operand to a signed type. Include pointer offsets.
+    value = 'expr(anyOf(declRefExpr(to(varDecl())), memberExpr(), callExpr(), arraySubscriptExpr()))'
+    operand = (f'ignoringParenImpCasts(expr(hasType(isUnsignedInteger()),'
+               f' unless(hasType(booleanType())), unless(unaryExprOrTypeTraitExpr()),'
+               f' anyOf({value}, hasDescendant({value}))))')
+    return (f'expr({scope}, anyOf(binaryOperator(hasAnyOperatorName("+", "-", "+=", "-="),'
+            f' hasEitherOperand({operand})), unaryOperator(hasAnyOperatorName("+", "-"),'
+            f' hasUnaryOperand({operand})), cxxOperatorCallExpr('
+            f' hasAnyOverloadedOperatorName("+", "-", "+=", "-="), hasAnyArgument({operand}))))')
+
+
 def matches(tool, file, query, flags):
     command = [tool, '-c', 'set traversal AsIs', '-c', 'match ' + query, str(file), *flags]
     run = subprocess.run(command, text=True, capture_output=True)
@@ -89,6 +103,39 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
                 raise RuntimeError(f'clang-query self-test: expected lines {expected}, got {found}')
 
 
+def test_unsigned_add_sub(tool):
+    with tempfile.TemporaryDirectory() as directory:
+        file = Path(directory) / 'operands.cc'
+        file.write_text("""using U = unsigned;
+struct S { U n; };
+U next();
+void test(U u, unsigned char small, int i, S s, char *p, U *values) {
+    (void)(i + small);
+    (void)(u - i);
+    i += s.n;
+    u -= 1;
+    (void)(p + u);
+    (void)(-values[i]);
+    (void)(+next());
+    (void)(static_cast<long long>(u) + i);
+    (void)(i - 1u);
+    (void)(p - p);
+    ++i;
+    (void)(i + sizeof(S)); (void)(i + (1u << 3));
+}
+S operator+(S, U);
+S overload(S s, U n) { return s + n; }
+template<class T> T add(T x) { return x + 1; }
+template unsigned add(unsigned);
+#define STEP(x) ((x) - 1)
+int macro(unsigned short n) { return STEP(n); }
+""")
+        query = unsigned_add_sub('isExpansionInMainFile()')
+        hits = matches(tool, file, query, ['--', '-std=c++23'])
+        if sorted(int(loc.rsplit(':', 2)[1]) for loc in hits) != [*range(5, 12), 19, 20, 23]:
+            raise RuntimeError(f'unsigned operand self-test failed: {hits}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
@@ -96,6 +143,7 @@ def main():
     parser.add_argument('--inventory', type=Path, help='write unique arithmetic sites for review')
     args = parser.parse_args()
     self_test(args.clang_query)
+    test_unsigned_add_sub(args.clang_query)
     database = json.loads((args.build / 'compile_commands.json').read_text())
     files = {Path(e['directory']) / e['file'] for e in database}
     units = sorted(p for p in files if p.is_relative_to(ROOT / 'src/runtime'))
@@ -103,28 +151,34 @@ def main():
         raise SystemExit('no runtime translation units in compilation database')
     path = '(^|/)(src/runtime|include/rut/(runtime|common)|include/core)/'
     gate, bound, signed, inventory = queries(f'isExpansionInFileMatching({json.dumps(path)})')
+    unsigned = unsigned_add_sub(f'isExpansionInFileMatching({json.dumps(path)})')
+    operands = set()
     findings = set()
     bounds = set()
     post_checks = set()
     sites = set()
     for file in units:
         flags = ['-p', str(args.build.resolve())]
+        operands.update(matches(args.clang_query, file, unsigned, flags))
         findings.update(matches(args.clang_query, file, gate, flags))
         post_checks.update(matches(args.clang_query, file, signed, flags))
         bounds.update(matches(args.clang_query, file, bound, flags))
         if args.inventory:
             sites.update(matches(args.clang_query, file, inventory, flags))
     if args.inventory:
+        sites.update(operands)
         args.inventory.write_text(''.join(p + '\n' for p in sorted(sites)))
         print(f'{len(sites)} distinct arithmetic locations')
+    for p in sorted(operands):
+        print(f'{p}: unsigned operand in addition or subtraction')
     for p in sorted(findings):
         print(f'{p}: unsigned arithmetic compared against zero with an invariant result')
     for p in sorted(bounds):
         print(f'{p}: unsigned addition occurs before the upper-bound check')
     for p in sorted(post_checks):
         print(f'{p}: check signed arithmetic limits before adding or subtracting one')
-    print(f'{len(units)} runtime translation units, {len(findings) + len(bounds) + len(post_checks)} findings')
-    return bool(findings or bounds or post_checks)
+    print(f'{len(units)} runtime translation units, {len(operands) + len(findings) + len(bounds) + len(post_checks)} findings')
+    return bool(operands or findings or bounds or post_checks)
 
 
 if __name__ == '__main__':
