@@ -594,14 +594,23 @@ inline bool integer(Str s, i64& out) {
         else
             n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
     }
-    u64 magnitude = n;
-    if (negative) (void)__builtin_sub_overflow(u64{0}, n, &magnitude);
-    out = negative ? static_cast<i64>(magnitude) : static_cast<i64>(n);
+    if (!negative) {
+        out = static_cast<i64>(n);
+    } else if (n == (u64{1} << 63)) {
+        out = -9223372036854775807LL - 1;
+    } else {
+        out = -static_cast<i64>(n);
+    }
     return true;
 }
 inline void write_integer(i64 value, Writer& w) {
-    u64 n = static_cast<u64>(value);
-    if (value < 0) (void)__builtin_sub_overflow(u64{0}, n, &n);
+    u64 n = 0;
+    if (value == (-9223372036854775807LL - 1))
+        n = u64{1} << 63;
+    else if (value < 0)
+        n = static_cast<u64>(-value);
+    else
+        n = static_cast<u64>(value);
     char digits[20];
     u32 count = 0;
     do {
