@@ -3631,13 +3631,15 @@ public:
         return send.src == c.tls_out_inflight_src && send.fd == c.tls_out_inflight_fd &&
                send.type == IoEventType::Send && send.generation == c.tls_out_inflight_generation &&
                send.offset <= c.tls_out_inflight_len &&
-               send.remaining <= c.tls_out_inflight_len - send.offset;
+               send.remaining <= static_cast<u32>(static_cast<i64>(c.tls_out_inflight_len) -
+                                                  static_cast<i64>(send.offset));
     }
 
     bool tls_ciphertext_send_is_current(const Connection& c) const {
         if (!tls_ciphertext_send_raw_state_matches(c)) return false;
         const auto& send = backend.send_state[c.id];
-        return send.offset + send.remaining == c.tls_out_inflight_len;
+        return static_cast<i64>(send.offset) + static_cast<i64>(send.remaining) ==
+               static_cast<i64>(c.tls_out_inflight_len);
     }
 
     // Deliver the saved continuation as a logical plaintext completion. Raw
@@ -3838,7 +3840,10 @@ public:
             const auto* next = c.response_body_tail.head->next;
             const u32 first = c.buffered_response_front_size();
             c.response_send_vector.bind(
-                buf, first, ResponseBodyChain::payload(next) + next->offset, len - first);
+                buf,
+                first,
+                ResponseBodyChain::payload(next) + static_cast<i64>(next->offset),
+                static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(first)));
             vector = &c.response_send_vector;
         }
         if (study_direct_body && c.response_read_deadline_upload.downstream_close &&
