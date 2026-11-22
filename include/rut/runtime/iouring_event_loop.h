@@ -4990,7 +4990,8 @@ public:
             return ev.type == IoEventType::UpstreamRecv && ev.result > 0 && ev.aux == 0 &&
                    ev.upstream_episode == c.upstream_episode &&
                    ev.copy_witness == IoEventCopyWitness::Full && ev.copy_end >= ev.copy_begin &&
-                   ev.copy_end - ev.copy_begin == static_cast<u32>(ev.result) &&
+                   static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) ==
+                       static_cast<i64>(ev.result) &&
                    ev.copy_end == c.buffered_response_len() &&
                    ev.copy_deadline_generation == c.response_read_deadline_generation &&
                    ev.copy_deadline_profile == static_cast<u8>(c.response_read_deadline_profile) &&
@@ -5001,7 +5002,8 @@ public:
         if (ev.type != IoEventType::UpstreamRecv || ev.result <= 0 || ev.aux != 0 ||
             ev.upstream_episode != c.upstream_episode ||
             ev.copy_witness != IoEventCopyWitness::Full || ev.copy_end < ev.copy_begin ||
-            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) !=
+                static_cast<i64>(ev.result) ||
             ev.copy_end != c.buffered_response_len() ||
             ev.copy_deadline_generation != c.response_read_deadline_generation ||
             ev.copy_deadline_profile != static_cast<u8>(c.response_read_deadline_profile) ||
@@ -5109,10 +5111,14 @@ public:
                c.on_send ==
                    (header ? &on_response_header_sent<Self> : &on_response_body_sent<Self>) &&
                (header ? submitted == 0 && completed == 0 && inflight == 0
-                       : submitted >= completed && submitted - completed == inflight) &&
+                       : submitted >= completed &&
+                             static_cast<i64>(submitted) - static_cast<i64>(completed) ==
+                                 static_cast<i64>(inflight)) &&
                send.src == source && send.fd == c.fd && send.type == IoEventType::Send &&
                send.generation == c.response_read_deadline_send_owner_generation &&
-               send.offset <= length && send.remaining == length - send.offset;
+               send.offset <= length &&
+               send.remaining ==
+                   static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(send.offset));
     }
 
     [[nodiscard]] bool promote_streaming_response_read_timer(Connection& c) {
