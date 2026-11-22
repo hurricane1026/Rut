@@ -132,7 +132,7 @@ void NetClientWorker::adopt_config(const void* config) {
     pool_config = config;
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
-    const u64 next = epoch == ~u64(0) ? 0 : epoch ? epoch + 1 : 0;
+    const u64 next = epoch == ~u64(0) ? 0 : epoch ? static_cast<u64>(epoch + 1) : 0;
     __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {
@@ -202,7 +202,8 @@ NetReply NetClientWorker::call(u32 owner,
                 return reply;
             }
             reply.status = NetReply::kPending;
-            const auto remaining = static_cast<u64>(s.timeout) - elapsed;
+            const auto remaining =
+                static_cast<u64>(static_cast<i64>(s.timeout) - static_cast<i64>(elapsed));
             reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
             return reply;
         }
@@ -285,11 +286,14 @@ bool NetClientWorker::clean(int fd, SSL* ssl) {
 }
 void NetClientWorker::sweep(u64 now) {
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE);
-    for (auto& p : parked)
+    for (auto& p : parked) {
+        u64 idle = 0;
         if (p.fd >= 0 &&
             (!now || !epoch || p.epoch != epoch || now < p.since ||
-             (now - p.since >= p.endpoint.pool_idle_ms) || (p.dns_expires && now >= p.dns_expires)))
+             (__builtin_sub_overflow(now, p.since, &idle) || idle >= p.endpoint.pool_idle_ms) ||
+             (p.dns_expires && now >= p.dns_expires)))
             close(p);
+    }
 }
 bool NetClientWorker::borrow(Slot& s) {
     if (!s.endpoint.pool_idle_ms || !s.pool_epoch ||
@@ -310,8 +314,9 @@ bool NetClientWorker::borrow(Slot& s) {
              __builtin_strcmp(p.endpoint.tls.key, s.endpoint.tls.key) != 0))
             continue;
         const u64 now = jwt_monotonic_ms();
-        if (!now || now < p.since || now - p.since >= p.endpoint.pool_idle_ms ||
-            !clean(p.fd, p.ssl)) {
+        u64 idle = 0;
+        if (!now || now < p.since || __builtin_sub_overflow(now, p.since, &idle) ||
+            idle >= p.endpoint.pool_idle_ms || !clean(p.fd, p.ssl)) {
             close(p);
             continue;
         }
@@ -499,13 +504,15 @@ bool NetClientWorker::write(Slot& s) {
     ERR_clear_error();
     const int n =
         s.ssl
-            ? SSL_write(s.ssl,
-                        s.pending + static_cast<i64>(s.offset),
-                        static_cast<int>(static_cast<i64>(s.pending_length) - s.offset))
-            : static_cast<int>(send(s.fd,
-                                    s.pending + static_cast<i64>(s.offset),
-                                    static_cast<u32>(static_cast<i64>(s.pending_length) - s.offset),
-                                    platform::kSendFlags));
+            ? SSL_write(
+                  s.ssl,
+                  s.pending + static_cast<i64>(s.offset),
+                  static_cast<int>(static_cast<i64>(s.pending_length) - static_cast<i64>(s.offset)))
+            : static_cast<int>(send(
+                  s.fd,
+                  s.pending + static_cast<i64>(s.offset),
+                  static_cast<u32>(static_cast<i64>(s.pending_length) - static_cast<i64>(s.offset)),
+                  platform::kSendFlags));
     if (n < 0 || (s.ssl && n == 0)) {
         if (s.ssl) {
             const int error = SSL_get_error(s.ssl, n);
