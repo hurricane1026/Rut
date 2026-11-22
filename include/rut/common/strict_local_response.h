@@ -277,7 +277,8 @@ inline bool strict_local_response_policy_table_valid_impl(
             if (static_cast<i64>(field.len) > static_cast<i64>(kMaxStrictLocalResponsePolicyBytes) -
                                                   static_cast<i64>(total_bytes))
                 return false;
-            total_bytes = static_cast<u32>(static_cast<i64>(total_bytes) + field.len);
+            total_bytes =
+                static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(field.len));
         }
     }
 
@@ -350,7 +351,8 @@ inline bool strict_local_response_source_table_valid_impl(
             if (static_cast<i64>(field.len) > static_cast<i64>(kMaxStrictLocalResponsePolicyBytes) -
                                                   static_cast<i64>(total_bytes))
                 return false;
-            total_bytes = static_cast<u32>(static_cast<i64>(total_bytes) + field.len);
+            total_bytes =
+                static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(field.len));
         }
     }
 

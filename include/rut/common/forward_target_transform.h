@@ -122,11 +122,13 @@ inline bool forward_target_transform_table_valid(const ForwardTargetTransformSpe
         if (static_cast<i64>(specs[i].strip_prefix.len) >
             static_cast<i64>(kForwardTargetTransformBytes) - static_cast<i64>(total))
             return false;
-        total = static_cast<u32>(static_cast<i64>(total) + specs[i].strip_prefix.len);
+        total =
+            static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(specs[i].strip_prefix.len));
         if (static_cast<i64>(specs[i].replace_prefix.len) >
             static_cast<i64>(kForwardTargetTransformBytes) - static_cast<i64>(total))
             return false;
-        total = static_cast<u32>(static_cast<i64>(total) + specs[i].replace_prefix.len);
+        total = static_cast<u32>(static_cast<i64>(total) +
+                                 static_cast<i64>(specs[i].replace_prefix.len));
         for (u32 j = 0; j < i; j++) {
             if (forward_target_transform_spec_equal(specs[i], specs[j])) return false;
         }
