@@ -914,7 +914,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 n = http2_write_data(out, x->upstream_stream, output, amount, false);
                 grpc_consume_output(*x, true, amount);
                 stream->send_window -= static_cast<i32>(amount);
-                h.conn_send_window -= amount;
+                h.conn_send_window -= static_cast<i64>(amount);
             } else if ((!x->websocket || x->ws_accepted) && !output_len && !x->upload_len &&
                        x->request_end && !x->request_end_sent) {
                 if (x->request_trailers_len) {
@@ -1438,7 +1438,8 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
         auto& h = *down.h2;
         u32 total = 0;
         for (u32 step = 0; step < 64; step++) {
-            const u32 i = (h.grpc.cursor + step) % 64;
+            const u32 i =
+                static_cast<u32>((static_cast<i32>(h.grpc.cursor) + static_cast<i32>(step)) % 64);
             auto* x = h.grpc.streams[i];
             if (!x) continue;
             if (x->websocket && x->response_end_sent && !x->failure) {
@@ -1454,42 +1455,47 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             const u8* output = grpc_output(*x, false, &output_len);
             u32 n = 0;
             bool done = false;
+            if (total > cap) break;
+            const u32 room = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(total));
             if (x->failure) {
-                n = x->websocket ? h2_websocket_error(out + total,
-                                                      cap - total,
+                n = x->websocket ? h2_websocket_error(out + static_cast<i64>(total),
+                                                      room,
                                                       x->downstream_stream,
                                                       x->failure,
                                                       x->response_headers_sent)
-                                 : grpc_error_headers(out + total,
-                                                      cap - total,
+                                 : grpc_error_headers(out + static_cast<i64>(total),
+                                                      room,
                                                       x->downstream_stream,
                                                       x->failure,
                                                       x->response_headers_sent);
                 done = n != 0;
             } else if (!x->response_headers_sent && x->response_headers_len) {
-                if (x->response_headers_len > cap - total) continue;
+                if (x->response_headers_len > room) continue;
                 n = x->response_headers_len;
-                __builtin_memcpy(out + total, x->response_headers, n);
+                __builtin_memcpy(out + static_cast<i64>(total), x->response_headers, n);
                 x->response_headers_sent = true;
                 done = x->response_end && !x->download_len && !x->response_trailers_len &&
                        (!x->websocket || (x->response_headers[4] & http2_flag::kEndStream));
             } else if (x->response_headers_sent && output_len && stream->send_window > 0 &&
-                       h.conn_send_window > 0 && cap - total > 9) {
+                       h.conn_send_window > 0 && static_cast<i64>(room) > 9) {
                 u32 amount = output_len;
-                if (amount > cap - total - 9) amount = cap - total - 9;
+                if (static_cast<i64>(amount) > static_cast<i64>(room) - 9)
+                    amount = static_cast<u32>(static_cast<i64>(room) - 9);
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
-                n = http2_write_data(out + total, x->downstream_stream, output, amount, false);
-                x->staged_response_bytes += amount;
+                n = http2_write_data(
+                    out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
+                x->staged_response_bytes += static_cast<u64>(amount);
                 grpc_consume_output(*x, false, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
             } else if (x->websocket && x->response_headers_sent && !output_len &&
                        !x->download_len && x->response_end && !x->response_end_sent &&
-                       cap - total >= kFrameHeaderSize) {
-                n = http2_write_data(out + total, x->downstream_stream, nullptr, 0, true);
+                       room >= kFrameHeaderSize) {
+                n = http2_write_data(
+                    out + static_cast<i64>(total), x->downstream_stream, nullptr, 0, true);
                 done = x->request_end_sent || !x->ws_accepted;
                 // Keep the mapping for a peer that has not half-closed yet.
                 if (!done) {
@@ -1497,12 +1503,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     x->response_end_sent = true;
                 }
             } else if (x->response_headers_sent && !x->download_len && x->response_trailers_len) {
-                if (x->response_trailers_len > cap - total) continue;
+                if (x->response_trailers_len > room) continue;
                 n = x->response_trailers_len;
-                __builtin_memcpy(out + total, x->response_trailers, n);
+                __builtin_memcpy(out + static_cast<i64>(total), x->response_trailers, n);
                 done = true;
             }
-            total += n;
+            total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(n));
             Connection* up = x->upstream;
             if (done) {
                 x->response_end_sent = true;
