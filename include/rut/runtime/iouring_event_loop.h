@@ -887,14 +887,10 @@ public:
     }
 
     void epoch_enter() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) epoch->epoch.fetch_add(1, std::memory_order_acq_rel);
     }
     void epoch_leave() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) epoch->epoch.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void shutdown() {
@@ -961,7 +957,9 @@ public:
         }
     }
 
-    u32 active_count() const { return connection_capacity - free_top; }
+    u32 active_count() const {
+        return static_cast<u32>(static_cast<i64>(connection_capacity) - static_cast<i64>(free_top));
+    }
     u32 free_conn_slots() const { return free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
@@ -7679,9 +7677,10 @@ public:
         constexpr u32 kReserve = 16;
         return used<backend.sq_ring_entries&& static_cast<i64>(backend.sq_ring_entries) -
                     static_cast<i64>(used)>
-                       kReserve ? static_cast<u32>(static_cast<i64>(backend.sq_ring_entries) -
-                                                   static_cast<i64>(used) - kReserve)
-                                : 0;
+                       kReserve
+                   ? static_cast<u32>(static_cast<i64>(backend.sq_ring_entries) -
+                                      static_cast<i64>(used) - static_cast<i64>(kReserve))
+                   : 0;
     }
 
     void free_health_probe(Connection& c) {
@@ -8124,7 +8123,9 @@ public:
     static constexpr u32 kIdleTrimMinIdleTicks = IdleTrimWindow::kMinIdleTicks;
     static constexpr u32 kIdleTrimAgeWindow = IdleTrimWindow::kAgeWindow;
     static constexpr u32 kIdleTrimMaxExamined = 2048;
-    static constexpr u32 kIdleTrimMaxTrims = 512;     // connections queued per tick
+    static constexpr u32 kIdleTrimMaxTrims = 512;  // connections queued per tick
+    static_assert(kIdleTrimMaxTrims == 512u);
+    static constexpr u32 kIdleTrimMaxTrimSlots = 513u;
     static constexpr u32 kIdleTrimSlicesPerConn = 3;  // recv, send, upstream recv
     static constexpr u32 kIdleTrimMaxRanges = kIdleTrimMaxTrims * kIdleTrimSlicesPerConn;
     static constexpr u32 kIdleTrimIovChunk = 1024;        // kernel UIO_MAXIOV per call
@@ -8141,7 +8142,7 @@ public:
     // idle_trim_first[k] is the index of the first range of the k-th queued
     // connection (idle_trim_first[idle_trim_queued] == idle_trim_nranges).
     struct iovec idle_trim_iov[kIdleTrimMaxRanges];
-    u16 idle_trim_first[kIdleTrimMaxTrims + 1];
+    u16 idle_trim_first[kIdleTrimMaxTrimSlots];
     u32 idle_trim_nranges = 0;
     u32 idle_trim_queued = 0;
     // Observability / test counters; touched only by the sweep.
@@ -8904,8 +8905,9 @@ public:
                                 conn.upstream_recv_idle_stale_bytes = true;
                             const u32 stale = static_cast<u32>(ev.result);
                             if (conn.upstream_recv_buf.len() >= stale)
-                                conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -
-                                                               stale);
+                                conn.upstream_recv_buf.set_len(static_cast<u32>(
+                                    static_cast<i64>(conn.upstream_recv_buf.len()) -
+                                    static_cast<i64>(stale)));
                         }
                         if (deadline_surplus) {
                             if (!ev.more) {
@@ -9040,7 +9042,8 @@ public:
                         const u16 owner_index =
                             response_read_batch_event_owner[response_read_batch_event_index];
                         if (owner_index != 0 && owner_index <= response_read_batch_owner_count) {
-                            const auto& owner = response_read_batch_owners[owner_index - 1];
+                            const auto& owner =
+                                response_read_batch_owners[static_cast<i64>(owner_index) - 1];
                             if (owner.bounded_terminal_custody) break;
                             if (!owner.valid) break;
                             const bool retained_initial_clean_eof =
@@ -9228,8 +9231,11 @@ public:
                     const u32 wait_kind = ev.type == IoEventType::RelayRead ? 0 : 1;
                     const u64 started = study_poll_started[wait_kind][conn.id];
                     study_poll_started[wait_kind][conn.id] = 0;
-                    if (!cancel && started != 0)
-                        study_record_wait(wait_kind, monotonic_ns() - started);
+                    if (!cancel && started != 0) {
+                        u64 wait_ns = 0;
+                        if (!__builtin_sub_overflow(monotonic_ns(), started, &wait_ns))
+                            study_record_wait(wait_kind, wait_ns);
+                    }
                     --conn.pending_ops;
                     if (ev.type == IoEventType::RelayRead) {
                         if (cancel)
