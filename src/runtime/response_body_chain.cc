@@ -126,25 +126,23 @@ consteval bool direct_write_extent_contract() {
     constexpr u32 kCapacity = 8;
     // Compare to an end-position oracle in a wider integer domain. Include
     // offsets that alias a valid position if narrowed before validation.
-    const u64 kAddresses[] = {kBegin - 1,
-                              kBegin,
-                              kBegin + 3,
-                              kBegin + 7,
-                              kBegin + 8,
-                              kBegin + 9,
-                              kBegin + (1ULL << 32),
-                              UINT64_MAX};
+    const u64 kAddresses[] = {31, 32, 35, 39, 40, 41, 4294967328ULL, UINT64_MAX};
     const u32 kCounts[] = {0, 1, 5, 6, 8, 9, UINT32_MAX};
     for (const u64 kAddress : kAddresses) {
         for (const u32 kCount : kCounts) {
             u32 tail_dirty = 2;
             u32 node_dirty = 6;
-            const bool kValid = kAddress >= kBegin && kAddress <= kBegin + kCapacity &&
-                                kAddress + kCount <= kBegin + kCapacity;
+            u64 kOffset = 0;
+            const bool kValid =
+                kAddress >= kBegin && !__builtin_sub_overflow(kAddress, kBegin, &kOffset) &&
+                kOffset <= kCapacity &&
+                static_cast<i64>(kCount) <= static_cast<i64>(kCapacity) - static_cast<i64>(kOffset);
             if (detail::record_direct_write_extent(
                     kBegin, kAddress, kCapacity, kCount, tail_dirty, node_dirty) != kValid)
                 return false;
-            const u64 kEnd = kValid ? kAddress + kCount - kBegin : 0;
+            u64 kEnd = 0;
+            if (kValid && __builtin_add_overflow(kOffset, static_cast<u64>(kCount), &kEnd))
+                return false;
             if (tail_dirty != (kEnd > 2 ? kEnd : 2) || node_dirty != (kEnd > 6 ? kEnd : 6))
                 return false;
         }
