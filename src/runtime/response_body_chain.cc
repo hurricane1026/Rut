@@ -162,9 +162,13 @@ consteval bool buffered_length_contract() {
             for (const u32 kNew : kSizes)
                 for (const u32 kReceived : kSizes)
                     for (const u32 kCompleted : kSizes) {
-                        const bool kMatches = kBuffered >= kHeader && kBuffered - kHeader >= kNew &&
-                                              kCompleted <= kReceived &&
-                                              kBuffered - kHeader - kNew == kReceived - kCompleted;
+                        const bool kMatches =
+                            kBuffered >= kHeader && kCompleted <= kReceived &&
+                            static_cast<i64>(kBuffered) - static_cast<i64>(kHeader) >=
+                                static_cast<i64>(kNew) &&
+                            static_cast<i64>(kBuffered) - static_cast<i64>(kHeader) -
+                                    static_cast<i64>(kNew) ==
+                                static_cast<i64>(kReceived) - static_cast<i64>(kCompleted);
                         if (ResponseBodyChain::matches_buffered_length(
                                 kBuffered, kHeader, kReceived, kCompleted, kNew) != kMatches)
                             return false;
@@ -177,12 +181,18 @@ static_assert(buffered_length_contract(), "Buffered response violates retained b
 // Use a widened total as the reference for the production remaining-room check.
 consteval bool direct_receive_body_bounds_contract() {
     constexpr u32 kCap = ResponseBodyChain::kMaxBody;
-    constexpr u32 kLengths[] = {0, 1, 2, kCap - 1, kCap, kCap + 1, UINT32_MAX};
+    constexpr u32 kLengths[] = {0,
+                                1,
+                                2,
+                                static_cast<u32>(static_cast<i64>(kCap) - 1),
+                                kCap,
+                                static_cast<u32>(static_cast<i64>(kCap) + 1),
+                                UINT32_MAX};
     constexpr i32 kResults[] = {INT32_MIN, -1, 0, 1, 2, static_cast<i32>(kCap), INT32_MAX};
     for (const u32 kReceived : kLengths)
         for (const u32 kDeclared : kLengths)
             for (const i32 kResult : kResults) {
-                const i64 kTotal = static_cast<i64>(kReceived) + kResult;
+                const i64 kTotal = static_cast<i64>(kReceived) + static_cast<i64>(kResult);
                 const bool kFits = kResult > 0 && kTotal <= kDeclared && kTotal <= kCap;
                 if (ResponseBodyChain::direct_receive_fits_body(kReceived, kDeclared, kResult) !=
                     kFits)
@@ -197,19 +207,28 @@ static_assert(direct_receive_body_bounds_contract(), "Direct receive violates lo
 // That last byte can expose an overrun but must never enter the response.
 consteval bool direct_receive_room_contract() {
     constexpr u32 kCap = ResponseBodyChain::kMaxBody;
-    constexpr u32 kCounts[] = {0, 1, kCap / 2, kCap - 1, kCap, kCap + 1, kCap + 2, UINT32_MAX};
+    constexpr u32 kCounts[] = {0,
+                               1,
+                               kCap / 2,
+                               static_cast<u32>(static_cast<i64>(kCap) - 1),
+                               kCap,
+                               static_cast<u32>(static_cast<i64>(kCap) + 1),
+                               static_cast<u32>(static_cast<i64>(kCap) + 2),
+                               UINT32_MAX};
     for (const u32 kReceived : kCounts) {
         const u32 kRoom = ResponseBodyChain::direct_receive_room(kReceived);
         if (kReceived > kCap) {
             if (kRoom != 0) return false;
             continue;
         }
-        if (static_cast<u64>(kReceived) + kRoom != static_cast<u64>(kCap) + 1 || kRoom > INT32_MAX)
+        if (static_cast<i64>(kReceived) + static_cast<i64>(kRoom) != static_cast<i64>(kCap) + 1 ||
+            kRoom > INT32_MAX)
             return false;
         const i32 kProbe = static_cast<i32>(kRoom);
         if (ResponseBodyChain::direct_receive_fits_body(kReceived, UINT32_MAX, kProbe))
             return false;
-        if (kProbe > 1 && !ResponseBodyChain::direct_receive_fits_body(kReceived, kCap, kProbe - 1))
+        if (kProbe > 1 && !ResponseBodyChain::direct_receive_fits_body(
+                              kReceived, kCap, static_cast<i32>(static_cast<i64>(kProbe) - 1)))
             return false;
     }
     return true;
