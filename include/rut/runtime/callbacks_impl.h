@@ -10718,12 +10718,14 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 // the unencrypted tail and pause the upstream read; the drain (and,
                 // for NeedRead, the next client recv) re-encrypt it via
                 // proxy_tls_parked_drained rather than truncating the download.
-                conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + enc);
+                conn.resp_body_sent =
+                    static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(enc));
                 throttle_advance(conn, enc);
                 conn.upstream_send_len = enc;
                 consume_upstream_sent(conn);  // shift past encrypted; tail now at front
                 conn.tls_send_src = conn.upstream_recv_buf.data();
-                conn.tls_send_len = static_cast<u32>(static_cast<i64>(send_len) - enc);
+                conn.tls_send_len =
+                    static_cast<u32>(static_cast<i64>(send_len) - static_cast<i64>(enc));
                 conn.tls_send_off = 0;
                 // Cancel the multishot recv; the cancel SQE can fail to queue under
                 // SQ pressure, leaving it live — fail closed rather than overflow.
@@ -10737,8 +10739,9 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) +
-                                                   enc);  // enc == send_len on Done
+            conn.resp_body_sent =
+                static_cast<u32>(static_cast<i64>(conn.resp_body_sent) +
+                                 static_cast<i64>(enc));  // enc == send_len on Done
             throttle_advance(conn, enc);
             const bool kBodyDone = proxy_body_complete(conn);
             conn.upstream_send_len = enc;
@@ -10806,7 +10809,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.resp_body_sent += send_len;
+    conn.resp_body_sent =
+        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
     client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
@@ -10904,7 +10908,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
+        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) >
+            static_cast<i64>(conn.recv_buf.capacity())) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
             loop->close_conn(conn);
@@ -10919,7 +10924,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.reset_request_receive_buffer();
-        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len),
+                            kStashLen);
         conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
@@ -10980,12 +10986,16 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             !response_read_deadline_post_commit_is_stable(conn) ||
             conn.upstream_send_len != inflight ||
             !conn.buffered_response_send_range_is_valid(inflight) ||
-            conn.response_read_deadline_post_commit_downstream_completed > 0xFFFFFFFFu - inflight) {
+            static_cast<i64>(conn.response_read_deadline_post_commit_downstream_completed) +
+                    static_cast<i64>(inflight) >
+                static_cast<i64>(UINT32_MAX)) {
             loop->close_conn(conn);
             return;
         }
         conn.clear_response_read_deadline_send_owner();
-        conn.response_read_deadline_post_commit_downstream_completed += inflight;
+        conn.response_read_deadline_post_commit_downstream_completed = static_cast<u32>(
+            static_cast<i64>(conn.response_read_deadline_post_commit_downstream_completed) +
+            static_cast<i64>(inflight));
         if constexpr (requires { loop->study_completed_responses; }) {
             ++loop->study_body_sends;
             if (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
