@@ -298,6 +298,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // Map SQ ring
     sq_ring_sz =
         static_cast<u64>(params.sq_off.array) + static_cast<u64>(params.sq_entries) * sizeof(u32);
+    if (sq_ring_sz > SIZE_MAX) {
+        shutdown();
+        return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
+    }
     sq_ring_ptr = mmap(nullptr,
                        sq_ring_sz,
                        PROT_READ | PROT_WRITE,
@@ -319,7 +323,11 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     sq_array = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.array));
 
     // Map SQEs
-    sqes_sz = params.sq_entries * sizeof(io_uring_sqe);
+    sqes_sz = static_cast<u64>(params.sq_entries) * sizeof(io_uring_sqe);
+    if (sqes_sz > SIZE_MAX) {
+        shutdown();
+        return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
+    }
     sqes_ptr = mmap(nullptr,
                     sqes_sz,
                     PROT_READ | PROT_WRITE,
@@ -337,6 +345,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // Map CQ ring
     cq_ring_sz = static_cast<u64>(params.cq_off.cqes) +
                  static_cast<u64>(params.cq_entries) * sizeof(io_uring_cqe);
+    if (cq_ring_sz > SIZE_MAX) {
+        shutdown();
+        return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
+    }
     cq_ring_ptr = mmap(nullptr,
                        cq_ring_sz,
                        PROT_READ | PROT_WRITE,
