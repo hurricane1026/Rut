@@ -64,9 +64,9 @@ ParseStatus ws_parse_header(
     }
 
     if (masked) {
-        if (len < offset + 4) return ParseStatus::Incomplete;
-        for (u32 i = 0; i < 4; i++) out->mask_key[i] = buf[offset + i];
-        offset += 4;
+        if (static_cast<i64>(len) < static_cast<i64>(offset) + 4) return ParseStatus::Incomplete;
+        for (u32 i = 0; i < 4; i++) out->mask_key[i] = buf[static_cast<i64>(offset) + i];
+        offset = static_cast<u32>(static_cast<i64>(offset) + 4);
     } else {
         for (u32 i = 0; i < 4; i++) out->mask_key[i] = 0;
     }
@@ -129,8 +129,8 @@ u32 ws_write_header(u8* out,
         offset = 10;
     }
     if (masked) {
-        for (u32 i = 0; i < 4; i++) out[offset + i] = mask_key[i];
-        offset += 4;
+        for (u32 i = 0; i < 4; i++) out[static_cast<i64>(offset) + i] = mask_key[i];
+        offset = static_cast<u32>(static_cast<i64>(offset) + 4);
     }
     return offset;
 }
@@ -162,7 +162,8 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
         m.reset();
         return WsMessageStatus::Error;
     }
-    m.accumulated_len += h.payload_len;
+    m.accumulated_len =
+        static_cast<u64>(static_cast<i64>(m.accumulated_len) + static_cast<i64>(h.payload_len));
 
     if (h.fin) {
         *out_opcode = m.message_opcode;
