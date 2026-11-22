@@ -306,17 +306,21 @@ inline u32 select_backend(u16 upstream_id,
     if (backend_count == 1 && !strict) return weights && weights[0] == 0 ? backend_count : 0;
     u32 fallback = backend_count;
     for (u32 step = 0; step < backend_count; step++) {
-        const u32 idx = (rr_cursor[upstream_id] + step) % backend_count;
+        const u32 idx =
+            static_cast<u32>((static_cast<i64>(rr_cursor[upstream_id]) + static_cast<i64>(step)) %
+                             static_cast<i64>(backend_count));
         if ((weights && weights[idx] == 0) || (excluded & (1u << idx))) continue;
         if (fallback == backend_count) fallback = idx;
         if (!backend_ejected(upstream_id, idx, now_us)) {
-            rr_cursor[upstream_id] = static_cast<u16>((idx + 1) % backend_count);
+            rr_cursor[upstream_id] =
+                static_cast<u16>((static_cast<i64>(idx) + 1) % static_cast<i64>(backend_count));
             return idx;
         }
     }
     if (strict) return backend_count;
     if (fallback != backend_count)
-        rr_cursor[upstream_id] = static_cast<u16>((fallback + 1) % backend_count);
+        rr_cursor[upstream_id] =
+            static_cast<u16>((static_cast<i64>(fallback) + 1) % static_cast<i64>(backend_count));
     return fallback;
 }
 
@@ -330,13 +334,14 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
     if (target.minimum_healthy_weight_percent > 100 ||
         target.addr_count > UpstreamTarget::kMaxBackends)
         return false;
-    u64 configured = 0;
-    u64 healthy = 0;
+    i64 configured = 0;
+    i64 healthy = 0;
     for (u32 i = 0; i < target.addr_count; ++i) {
-        configured += target.weights[i];
-        if (!backend_ejected(uid, i, now)) healthy += target.weights[i];
+        configured += static_cast<i64>(target.weights[i]);
+        if (!backend_ejected(uid, i, now)) healthy += static_cast<i64>(target.weights[i]);
     }
-    return configured != 0 && healthy * 100 >= configured * target.minimum_healthy_weight_percent;
+    return configured != 0 &&
+           healthy * 100 >= configured * static_cast<i64>(target.minimum_healthy_weight_percent);
 }
 
 inline u32 select_strict_backend(const UpstreamTarget& target, u16 uid, u64 now, u8 excluded) {
