@@ -1488,9 +1488,12 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
             return false;
         }
     }
-    const u64 total = static_cast<u64>(parser.header_end) + request.content_length;
-    if (host_count != 1 || content_length_count != 1 || total > conn.recv_buf.capacity() ||
-        conn.recv_buf.len() > total)
+    if (request.content_length > static_cast<u64>(INT64_MAX) - parser.header_end) return false;
+    const i64 total =
+        static_cast<i64>(parser.header_end) + static_cast<i64>(request.content_length);
+    if (host_count != 1 || content_length_count != 1 ||
+        total > static_cast<i64>(conn.recv_buf.capacity()) ||
+        static_cast<i64>(conn.recv_buf.len()) > total)
         return false;
     out->header_end = parser.header_end;
     out->content_length = request.content_length;
@@ -1567,7 +1570,9 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
         conn.pipeline_depth != 0 || conn.pipeline_stash_len != 0 ||
         conn.request_body_fully_buffered || conn.req_body_streamed)
         return false;
-    const u32 buffered_body = conn.recv_buf.len() - proof.raw_header_end;
+    if (conn.recv_buf.len() < proof.raw_header_end) return false;
+    const u32 buffered_body = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                               static_cast<i64>(proof.raw_header_end));
     if (buffered_body > proof.raw_content_length ||
         conn.req_body_remaining != proof.raw_content_length - buffered_body)
         return false;
@@ -1611,7 +1616,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             loop->close_conn(conn);
             return false;
         }
-        const auto& bundle = config->policy_bundles[id - 1];
+        const auto& bundle = config->policy_bundles[static_cast<u32>(static_cast<i64>(id) - 1)];
         const bool complete_buffering =
             forward_response_buffering_uses_content_length_machinery(bundle.response_buffering);
         if (!forward_response_buffering_mode_valid(bundle.response_buffering)) {
@@ -1631,9 +1636,12 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             loop->close_conn(conn);
             return false;
         }
-        const auto& response = config->response_policies[bundle.response_policy_id - 1];
-        const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-        const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+        const auto& response = config->response_policies[static_cast<u32>(
+            static_cast<i64>(bundle.response_policy_id) - 1)];
+        const auto& failure = config->failure_policies[static_cast<u32>(
+            static_cast<i64>(bundle.failure_policy_id) - 1)];
+        const auto& timeout = config->failure_policies[static_cast<u32>(
+            static_cast<i64>(bundle.timeout_failure_policy_id) - 1)];
         const ResponseReadDeadlineProfile profile = classify_response_read_deadline_profile(
             conn, response, failure, timeout, bundle.response_buffering, conn.request_policy_id);
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(profile);
