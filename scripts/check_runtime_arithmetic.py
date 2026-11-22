@@ -241,20 +241,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
     parser.add_argument('--clang-query', default='clang-query')
-    parser.add_argument('--clang-check', default='clang-check')
+    parser.add_argument('--clang-check', default=None)
     parser.add_argument('--inventory', type=Path, help='write unique arithmetic sites for review')
     args = parser.parse_args()
     global SYNTAX_CHECK
-    if args.clang_check == 'clang-check' and args.clang_query != 'clang-query':
-        query_name = Path(args.clang_query).name
+    if args.clang_check is None and args.clang_query != 'clang-query':
+        query_location = shutil.which(args.clang_query)
+        if not query_location:
+            raise SystemExit(f'cannot locate clang-query executable: {args.clang_query}')
+        query_name = Path(query_location).name
         if query_name.startswith('clang-query-'):
-            paired = str(Path(args.clang_query).with_name(
+            paired = str(Path(query_location).with_name(
                 'clang-check-' + query_name.removeprefix('clang-query-')))
             if shutil.which(paired):
                 args.clang_check = paired
             else:
                 raise SystemExit(f'no matching clang-check for {args.clang_query}; pass --clang-check explicitly')
-    SYNTAX_CHECK = args.clang_check
+    SYNTAX_CHECK = args.clang_check or 'clang-check'
     self_test(args.clang_query)
     test_unsigned_add_sub(args.clang_query)
     database = json.loads((args.build / 'compile_commands.json').read_text())
