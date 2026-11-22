@@ -32,24 +32,33 @@ struct TimerWheel {
     }
 
     ListNode slots[kSlots];
-    u32 cursor;  // Absolute tick modulo 2^32. Only its low bits select a slot.
+    enum class Tick : u32 {};
+    Tick cursor;  // Absolute tick modulo 2^32. Only its low bits select a slot.
 
-    constexpr u32 tick_after(u32 seconds) const {
-        return static_cast<u32>(static_cast<u64>(cursor) + seconds);
+    constexpr Tick tick_after(u32 seconds) const {
+        u32 result;
+        (void)__builtin_add_overflow(static_cast<u32>(cursor), seconds, &result);
+        return Tick{result};
     }
 
     constexpr u32 slot_after(u32 seconds) const {
-        static_assert(kSlots > 0 && (kSlots & (kSlots - 1)) == 0);
-        return tick_after(seconds) & (kSlots - 1);
+        return static_cast<u32>(tick_after(seconds)) % kSlots;
     }
 
     // Elapsed ticks for intervals shorter than one complete 32-bit cycle.
-    static constexpr u32 elapsed_ticks(u32 start, u32 now) {
-        return static_cast<u32>(static_cast<i64>(now) - start);
+    static constexpr u32 elapsed_ticks(Tick start, Tick now) {
+        u32 result;
+        (void)__builtin_sub_overflow(static_cast<u32>(now), static_cast<u32>(start), &result);
+        return result;
+    }
+
+    static constexpr u32 remaining_ticks(u32 timeout, u32 elapsed) {
+        u32 remaining;
+        return __builtin_sub_overflow(timeout, elapsed, &remaining) ? 0 : remaining;
     }
 
     void init() {
-        cursor = 0;
+        cursor = Tick{};
         for (u32 i = 0; i < kSlots; i++) {
             slots[i].init();
         }

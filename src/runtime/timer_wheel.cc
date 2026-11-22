@@ -8,15 +8,26 @@ namespace rut {
 
 namespace {
 
+template <typename T>
+constexpr bool has_raw_tick_arithmetic =
+    requires(T t) { t + 1; } || requires(T t) { t - 1; } || requires(T t) { t - t; } ||
+    requires(T t) { ++t; } || requires(T t) { t++; } || requires(T t) { --t; } ||
+    requires(T t) { t--; };
+
+static_assert(!has_raw_tick_arithmetic<decltype(TimerWheel::cursor)>);
+
 consteval bool cursor_wrap_contract() {
     TimerWheel wheel{};
-    wheel.cursor = UINT32_MAX;
-    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == 0 &&
-           wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == UINT32_MAX - 1 &&
-           TimerWheel::elapsed_ticks(UINT32_MAX - 1, 1) == 3;
+    using Tick = TimerWheel::Tick;
+    wheel.cursor = Tick{UINT32_MAX};
+    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == Tick{} &&
+           wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
+           TimerWheel::elapsed_ticks(Tick{UINT32_MAX - 1}, Tick{1}) == 3;
 }
 
 static_assert(cursor_wrap_contract());
+static_assert(TimerWheel::remaining_ticks(3, 1) == 2 && TimerWheel::remaining_ticks(3, 3) == 0 &&
+              TimerWheel::remaining_ticks(3, UINT32_MAX) == 0);
 
 // Check both ends of every representable bucket against the wheel geometry.
 consteval bool yield_fallback_contract() {

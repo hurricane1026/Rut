@@ -2229,10 +2229,9 @@ inline constexpr u32 kWsShutdownDrainTimeoutSeconds = 5;
 static_assert(kWsShutdownDrainTimeoutSeconds > 0 &&
               kWsShutdownDrainTimeoutSeconds < TimerWheel::kSlots);
 
-inline u32 ws_shutdown_deadline_remaining(const Connection& conn, u32 cursor) {
+inline u32 ws_shutdown_deadline_remaining(const Connection& conn, TimerWheel::Tick cursor) {
     const u32 kElapsed = TimerWheel::elapsed_ticks(conn.ws_shutdown_started_tick, cursor);
-    return kElapsed >= kWsShutdownDrainTimeoutSeconds ? 0
-                                                      : kWsShutdownDrainTimeoutSeconds - kElapsed;
+    return TimerWheel::remaining_ticks(kWsShutdownDrainTimeoutSeconds, kElapsed);
 }
 
 template <typename Loop>

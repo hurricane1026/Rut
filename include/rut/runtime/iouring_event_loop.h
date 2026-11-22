@@ -8266,13 +8266,13 @@ public:
     // stall, and a longer one only skips nodes that are about to expire anyway.
     void sweep_idle_trim() {
         if (idle_trim_pidfd < 0) return;
-        const auto kWindow = idle_trim_window(timer.cursor, keepalive_timeout);
+        const auto kWindow = idle_trim_window(static_cast<u32>(timer.cursor), keepalive_timeout);
         if (kWindow.begin == kWindow.end) return;
         const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
-            if (!idle_trim_walk_list(expiry, deadline_ns, examined, queued)) break;
+            if (!idle_trim_walk_list(expiry & (TimerWheel::kSlots - 1), deadline_ns, examined, queued)) break;
         }
         idle_trim_flush();
     }

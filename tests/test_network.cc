@@ -60216,8 +60216,7 @@ TEST(response_read_deadline, incomplete_progress_wins_same_batch_timeout_in_both
         CHECK_EQ(conn.response_header_buf.len(), 0u);
         CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
         CHECK_EQ(conn.timer_node.prev,
-                 &loop->timer.slots[(loop->timer.cursor + conn.response_read_deadline_seconds) &
-                                    (TimerWheel::kSlots - 1u)]);
+                 &loop->timer.slots[loop->timer.slot_after(conn.response_read_deadline_seconds)]);
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
@@ -88493,8 +88492,7 @@ TEST(response_read_deadline_fixed_upload_head_batch,
 
                     loop->timer.remove(&conn);
                     loop->timer.add(&conn, 0);
-                    CHECK_EQ(conn.timer_node.prev,
-                             &loop->timer.slots[loop->timer.cursor & (TimerWheel::kSlots - 1u)]);
+                    CHECK_EQ(conn.timer_node.prev, &loop->timer.slots[loop->timer.slot_after(0)]);
                     REQUIRE_EQ(conn.upstream_recv_buf.write(expected.wire, expected.len),
                                expected.len);
                     const IoEvent response = response_read_copy_event(
@@ -88641,9 +88639,9 @@ TEST(response_read_deadline_fixed_upload_head_batch,
                 conn,
                 &on_upstream_response<IoUringEventLoop>,
                 ResponseReadDeadlineOwnerPhase::ArmedForCopy));
-            CHECK_EQ(conn.timer_node.prev,
-                     &loop->timer.slots[(loop->timer.cursor + conn.response_read_deadline_seconds) &
-                                        (TimerWheel::kSlots - 1u)]);
+            CHECK_EQ(
+                conn.timer_node.prev,
+                &loop->timer.slots[loop->timer.slot_after(conn.response_read_deadline_seconds)]);
             CHECK_EQ(health->fails, health_before.fails);
             CHECK_EQ(health->eject_until_us, health_before.eject_until_us);
             CHECK_EQ(health->active_down, health_before.active_down);
@@ -90441,8 +90439,7 @@ TEST(epoll_send, partial_progress_refreshes_timer_without_callback) {
     c->state = ConnState::Sending;
     c->set_slots(nullptr, &on_response_body_sent<EpollEventLoop>, nullptr, nullptr);
     loop->timer.add(c, 1);
-    const u32 expected_slot =
-        (loop->timer.cursor + loop->keepalive_timeout) & (TimerWheel::kSlots - 1u);
+    const u32 expected_slot = loop->timer.slot_after(loop->keepalive_timeout);
 
     loop->dispatch({c->id, 0, 0, 0, IoEventType::Send, 0, kEpollSendProgressAux});
 

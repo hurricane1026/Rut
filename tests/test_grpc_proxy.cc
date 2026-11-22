@@ -2409,8 +2409,7 @@ TEST(grpc_proxy, client_reset_restores_keepalive_after_grpc_release) {
             for (auto* node = loop.timer.slots[i].next; node != &loop.timer.slots[i];
                  node = node->next)
                 if (node == &downstream.timer_node) timer_slot = i;
-        CHECK_EQ(timer_slot,
-                 (loop.timer.cursor + loop.keepalive_timeout) & (TimerWheel::kSlots - 1));
+        CHECK_EQ(timer_slot, loop.timer.slot_after(loop.keepalive_timeout));
         loop.timer.remove(&downstream);
     };
     run(false);

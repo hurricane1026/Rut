@@ -785,7 +785,7 @@ TEST(iouring_idle_trim, wheel_cursor_wraps_and_each_idle_period_trims_once) {
         c->send_slice[0] = 1;
         r.loop->timer.refresh(c, r.loop->keepalive_timeout);  // ...and re-arm
     }
-    CHECK_GT(r.loop->timer.cursor, 2 * TimerWheel::kSlots);
+    CHECK_GT(static_cast<u32>(r.loop->timer.cursor), 2 * TimerWheel::kSlots);
 }
 
 TEST(iouring_idle_trim, clipped_window_scans_oldest_first_across_cursor_wrap) {
@@ -802,10 +802,10 @@ TEST(iouring_idle_trim, clipped_window_scans_oldest_first_across_cursor_wrap) {
         owners[i].fd = -1;
         owners[i].timer_node.init();
         // Expiries at now + [0,4]: already due, three eligible, too young.
-        loop.timer.cursor = kNow - (loop.keepalive_timeout - i);
+        loop.timer.cursor = TimerWheel::Tick{kNow - (loop.keepalive_timeout - i)};
         loop.timer.add(&owners[i], loop.keepalive_timeout);
     }
-    loop.timer.cursor = kNow;
+    loop.timer.cursor = TimerWheel::Tick{kNow};
     for (u32 sweep = 1; sweep <= 4; ++sweep) {
         loop.sweep_idle_trim();
         for (u32 i = 0; i < 5; ++i)
@@ -890,25 +890,26 @@ TEST(iouring_idle_trim, rotation_keeps_expiry_refresh_and_remove_working) {
     };
     // All four were armed at the same cursor, so they share one wheel list.
     REQUIRE_EQ(live(), 4u);
-    const u32 c0 = r.loop->timer.cursor;
+    const auto c0 = r.loop->timer.cursor;
     for (u32 t = 0; t < 8; t++) r.tick();  // rotates and trims all four
     CHECK_EQ(r.loop->idle_trim_conns, 4u);
 
     // Client 0 sends a request on its rotated node (timer.refresh), client 2 hangs
     // up (timer.remove through close_conn); 1 and 3 keep their original deadline.
     REQUIRE(r.exchange(cli[0], kReqA, resp));
-    const u32 c0_refresh = r.loop->timer.cursor;
+    const auto c0_refresh = r.loop->timer.cursor;
     ::close(cli[2]);
     REQUIRE(r.pump([&] { return live() == 3u; }));
     // 60 s keep-alive: alive through tick c0+59, expired by the tick that pops c0+60.
-    while (r.loop->timer.cursor < c0 + r.loop->keepalive_timeout) {
+    while (TimerWheel::elapsed_ticks(c0, r.loop->timer.cursor) < r.loop->keepalive_timeout) {
         r.tick();
         CHECK_EQ(live(), 3u);
     }
     r.tick();  // pops list c0 + 60
     REQUIRE(r.pump([&] { return live() == 1u; }));
     // The refreshed connection expires on its own, later deadline, not before.
-    while (r.loop->timer.cursor < c0_refresh + r.loop->keepalive_timeout) {
+    while (TimerWheel::elapsed_ticks(c0_refresh, r.loop->timer.cursor) <
+           r.loop->keepalive_timeout) {
         r.tick();
         CHECK_EQ(live(), 1u);
     }
@@ -1441,9 +1442,9 @@ TEST(iouring_idle_trim, probe_failure_turns_the_feature_off_entirely) {
         CHECK_EQ(loop.idle_trim_pidfd, -1);  // no fd left open either
         Connection* c = stage_idle(r, 100000);
         REQUIRE(c != nullptr);
-        const u32 cursor = loop.timer.cursor;
+        const auto start_tick = loop.timer.cursor;
         for (u32 t = 0; t < 30; t++) r.tick();
-        CHECK_EQ(loop.timer.cursor, cursor + 30);  // ticks still run
+        CHECK_EQ(TimerWheel::elapsed_ticks(start_tick, loop.timer.cursor), 30u);  // ticks still run
         CHECK_EQ(loop.idle_trim_examined, 0u);
         CHECK_EQ(loop.idle_trim_conns, 0u);
         CHECK_EQ(loop.idle_trim_madvise, 0u);
