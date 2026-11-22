@@ -14236,8 +14236,11 @@ inline bool redirect_connection_close(Str value) {
     u32 start = 0;
     while (start < value.len && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
     u32 end = value.len;
-    while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) end--;
-    return end - start == 5 && http_header_name_eq_ci(value.ptr + start, 5, "close", 5);
+    while (end > start && (value.ptr[static_cast<i64>(end) - 1] == ' ' ||
+                           value.ptr[static_cast<i64>(end) - 1] == '\t'))
+        end--;
+    return static_cast<i64>(end) - static_cast<i64>(start) == 5 &&
+           http_header_name_eq_ci(value.ptr + static_cast<i64>(start), 5, "close", 5);
 }
 
 inline bool redirect_authority_syntax_valid(Str value, RedirectAuthorityView* out) {
@@ -14257,12 +14260,13 @@ inline bool redirect_authority_syntax_valid(Str value, RedirectAuthorityView* ou
     const bool has_port = colon != value.len;
     u32 parsed_port = 0;
     if (has_port) {
-        if (colon + 1 == value.len) return false;
-        for (u32 i = colon + 1; i < value.len; i++) {
+        if (static_cast<i64>(colon) + 1 == static_cast<i64>(value.len)) return false;
+        for (u32 i = static_cast<u32>(static_cast<i64>(colon) + 1); i < value.len; i++) {
             const u8 c = static_cast<u8>(value.ptr[i]);
             if (c < '0' || c > '9') return false;
             if (parsed_port > 6553u || (parsed_port == 6553u && c > '5')) return false;
-            parsed_port = parsed_port * 10u + static_cast<u32>(c - '0');
+            parsed_port =
+                static_cast<u32>(static_cast<i64>(parsed_port) * 10 + static_cast<i64>(c - '0'));
         }
         if (parsed_port == 0) return false;
     }
