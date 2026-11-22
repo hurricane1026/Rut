@@ -2116,7 +2116,8 @@ u32 IoUringBackend::wait(
                     result = -ECANCELED;
                 if (result == 0 && ss.remaining > 0) {
                     constexpr u64 kOffTMax = (u64{1} << (sizeof(off_t) * 8 - 1)) - 1;
-                    const u64 pos_wide = static_cast<u64>(ss.file_base) + ss.offset;
+                    const u64 pos_wide = static_cast<u64>(static_cast<i64>(ss.file_base) +
+                                                          static_cast<i64>(ss.offset));
                     if (pos_wide > kOffTMax) {
                         result = -EOVERFLOW;
                         continue;
@@ -2323,9 +2324,10 @@ void IoUringBackend::shutdown() {
         large_buf_base = nullptr;
     }
     if (large_buf_ring != nullptr) {
-        munmap(large_buf_ring,
-               static_cast<u64>(sizeof(io_uring_buf_ring)) +
-                   static_cast<u64>(kLargeProvidedBufCount) * sizeof(io_uring_buf));
+        munmap(
+            large_buf_ring,
+            static_cast<u64>(sizeof(io_uring_buf_ring)) +
+                static_cast<u64>(kLargeProvidedBufCount) * static_cast<u64>(sizeof(io_uring_buf)));
         large_buf_ring = nullptr;
     }
     if (downstream_recv_terminal_windows != nullptr) {
