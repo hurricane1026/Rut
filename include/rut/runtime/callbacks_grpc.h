@@ -285,7 +285,10 @@ void grpc_connection_closed(void* lp, Connection& conn) {
 template <typename Loop>
 bool grpc_grow_recv(Loop* loop, Connection& conn) {
     return reserve_request_receive_headroom(
-        loop->pool, conn, kDefaultMaxFrameSize + kFrameHeaderSize);
+        loop->pool,
+        conn,
+        static_cast<u32>(static_cast<i64>(kDefaultMaxFrameSize) +
+                         static_cast<i64>(kFrameHeaderSize)));
 }
 
 // Client session callbacks only stage owned bytes. They never close a session
@@ -304,27 +307,34 @@ inline bool grpc_snapshot_response_mutations(const Connection& down, GrpcExchang
     x.response_mutation_bytes = 0;
     for (u32 i = 0; i < x.response_mutation_count; i++) {
         const auto& source = down.resp_header_mutations[i];
-        const u32 needed = source.name.len + source.value.len;
-        if (needed > GrpcExchange::kHeaders - x.response_mutation_bytes) {
+        const i64 needed_wide =
+            static_cast<i64>(source.name.len) + static_cast<i64>(source.value.len);
+        if (needed_wide > static_cast<i64>(GrpcExchange::kHeaders) -
+                              static_cast<i64>(x.response_mutation_bytes)) {
             x.response_mutation_overflow = true;
             return false;
         }
+        const u32 needed = static_cast<u32>(needed_wide);
         auto& target = x.response_mutations[i];
         target.name_offset = static_cast<u16>(x.response_mutation_bytes);
         target.name_len = static_cast<u16>(source.name.len);
         for (u32 j = 0; j < source.name.len; j++) {
             char c = source.name.ptr[j];
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
-            x.response_mutation_storage[x.response_mutation_bytes + j] = static_cast<u8>(c);
+            x.response_mutation_storage[static_cast<i64>(x.response_mutation_bytes) +
+                                        static_cast<i64>(j)] = static_cast<u8>(c);
         }
-        x.response_mutation_bytes += source.name.len;
+        x.response_mutation_bytes = static_cast<u32>(static_cast<i64>(x.response_mutation_bytes) +
+                                                     static_cast<i64>(source.name.len));
         target.value_offset = static_cast<u16>(x.response_mutation_bytes);
         target.value_len = static_cast<u16>(source.value.len);
         if (source.value.len)
-            __builtin_memcpy(x.response_mutation_storage + x.response_mutation_bytes,
-                             source.value.ptr,
-                             source.value.len);
-        x.response_mutation_bytes += source.value.len;
+            __builtin_memcpy(
+                x.response_mutation_storage + static_cast<i64>(x.response_mutation_bytes),
+                source.value.ptr,
+                source.value.len);
+        x.response_mutation_bytes = static_cast<u32>(static_cast<i64>(x.response_mutation_bytes) +
+                                                     static_cast<i64>(source.value.len));
         target.mode = static_cast<u8>(source.mode);
     }
     return true;
@@ -336,10 +346,10 @@ inline bool grpc_apply_response_mutations(GrpcExchange& x,
                                           u32 capacity) {
     for (u32 mi = 0; mi < x.response_mutation_count; mi++) {
         const auto& mutation = x.response_mutations[mi];
-        const char* name =
-            reinterpret_cast<const char*>(x.response_mutation_storage + mutation.name_offset);
-        const char* value =
-            reinterpret_cast<const char*>(x.response_mutation_storage + mutation.value_offset);
+        const char* name = reinterpret_cast<const char*>(x.response_mutation_storage +
+                                                         static_cast<i64>(mutation.name_offset));
+        const char* value = reinterpret_cast<const char*>(x.response_mutation_storage +
+                                                          static_cast<i64>(mutation.value_offset));
         const bool remove =
             mutation.mode == static_cast<u8>(Connection::RespHeaderMutationMode::Remove);
         if (validate_response_header(
@@ -353,8 +363,9 @@ inline bool grpc_apply_response_mutations(GrpcExchange& x,
                     i++;
                     continue;
                 }
-                for (u32 move = i + 1; move < *count; move++) headers[move - 1] = headers[move];
-                (*count)--;
+                for (u32 move = static_cast<u32>(static_cast<i64>(i) + 1); move < *count; move++)
+                    headers[static_cast<u32>(static_cast<i64>(move) - 1)] = headers[move];
+                *count = static_cast<u32>(static_cast<i64>(*count) - 1);
             }
         }
         if (!remove && !h2_is_prohibited_response_header(name, mutation.name_len)) {
@@ -458,7 +469,7 @@ inline bool grpc_parse_content_length(Str value, u32* out) {
     u32 parsed = 0;
     for (u32 i = 0; i < value.len; i++) {
         if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
-        const u32 digit = static_cast<u32>(value.ptr[i] - '0');
+        const u32 digit = static_cast<u32>(static_cast<i64>(value.ptr[i]) - static_cast<i64>('0'));
         if (parsed > (0xffffffffu - digit) / 10u) return false;
         parsed = parsed * 10u + digit;
     }
@@ -476,7 +487,9 @@ inline void grpc_detach_upstream_exchange(Loop* loop, Http2Conn& h, GrpcExchange
 }
 inline bool grpc_idle_upstream_should_close(
     const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
-    return g.active == 0 && (draining || peer_goaway || now_us - g.idle_since_us >= keepalive_us);
+    u64 idle = 0;
+    if (now_us >= g.idle_since_us) (void)__builtin_sub_overflow(now_us, g.idle_since_us, &idle);
+    return g.active == 0 && (draining || peer_goaway || idle >= keepalive_us);
 }
 template <typename Loop>
 void grpc_response_headers(
