@@ -4329,9 +4329,8 @@ public:
         }
         const i64 relay_calls =
             static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
-        u64 relay_total = 0;
-        if (!__builtin_add_overflow(study_relay_calls, static_cast<u64>(relay_calls), &relay_total))
-            study_relay_calls = relay_total;
+        __builtin_add_overflow(
+            study_relay_calls, static_cast<u64>(relay_calls), &study_relay_calls);
         u64 flush_phase_ns = 0;
         if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
             __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
