@@ -34,39 +34,40 @@ static inline u64 neon_movemask(uint8x16_t v) {
 }
 
 u32 find_header_end(const u8* buf, u32 len, u32 from) {
-    u32 start = from > 3 ? from - 3 : 0;
-    u32 pos = start;
+    i64 start = from > 3 ? static_cast<i64>(from) - 3 : 0;
+    i64 pos = start;
     const uint8x16_t vcr = vdupq_n_u8('\r');
 
-    while (pos + 16 <= len) {
+    while (pos + 16 <= static_cast<i64>(len)) {
         uint8x16_t chunk = vld1q_u8(buf + pos);
         uint8x16_t cmp = vceqq_u8(chunk, vcr);
         if (neon_any(cmp)) {
             // Found at least one \r — check each position
-            for (u32 i = 0; i < 16 && pos + i + 3 < len; i++) {
+            for (i64 i = 0; i < 16 && pos + i + 3 < static_cast<i64>(len); i++) {
                 if (buf[pos + i] == '\r' && buf[pos + i + 1] == '\n' && buf[pos + i + 2] == '\r' &&
                     buf[pos + i + 3] == '\n') {
-                    return pos + i + 4;
+                    return static_cast<u32>(pos + i + 4);
                 }
             }
         }
         pos += 16;
     }
-    for (; pos + 3 < len; pos++) {
+    for (; pos + 3 < static_cast<i64>(len); pos++) {
         if (buf[pos] == '\r' && buf[pos + 1] == '\n' && buf[pos + 2] == '\r' &&
             buf[pos + 3] == '\n')
-            return pos + 4;
+            return static_cast<u32>(pos + 4);
     }
     return 0;
 }
 
-u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
+u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
+    i64 pos = pos_in;
     const uint8x16_t vcr = vdupq_n_u8('\r');
     const uint8x16_t v20 = vdupq_n_u8(0x20);
     const uint8x16_t vht = vdupq_n_u8(0x09);
     const uint8x16_t vdel = vdupq_n_u8(0x7F);
 
-    while (pos + 16 <= end) {
+    while (pos + 16 <= static_cast<i64>(end)) {
         uint8x16_t chunk = vld1q_u8(buf + pos);
         uint8x16_t cr_match = vceqq_u8(chunk, vcr);
         // vcltq_u8 is unsigned < (NEON advantage over SSE2)
@@ -81,15 +82,15 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
 
         if (cr_mask) {
             const u32 cr_byte = static_cast<u32>(__builtin_ctzll(cr_mask)) >> 2;
-            const u64 pre_cr_nibbles = cr_byte == 0 ? 0 : ((1ULL << (cr_byte * 4)) - 1);
+            const u64 pre_cr_nibbles = cr_byte == 0 ? 0 : ~(~0ULL << (cr_byte * 4));
             const u64 real_bad = bad_mask & pre_cr_nibbles & ~cr_mask;
             if (real_bad) return static_cast<u32>(-1);
-            return pos + cr_byte;
+            return static_cast<u32>(pos + static_cast<i64>(cr_byte));
         }
         if (bad_mask) return static_cast<u32>(-1);
         pos += 16;
     }
-    while (pos < end) {
+    while (pos < static_cast<i64>(end)) {
         if (buf[pos] == '\r') return pos;
         if (!kHeaderValueTable[buf[pos]]) return static_cast<u32>(-1);
         pos++;
@@ -97,7 +98,8 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
     return end;
 }
 
-u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
+u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
+    i64 pos = pos_in;
     const uint8x16_t vsp = vdupq_n_u8(' ');
     const uint8x16_t v21 = vdupq_n_u8(0x21);
     const uint8x16_t v7f = vdupq_n_u8(0x7F);
@@ -107,7 +109,7 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
 
     u32 canon_end = end;  // sentinel: '?'/'#' not yet found
 
-    while (pos + 16 <= end) {
+    while (pos + 16 <= static_cast<i64>(end)) {
         uint8x16_t chunk = vld1q_u8(buf + pos);
         uint8x16_t sp_match = vceqq_u8(chunk, vsp);
         uint8x16_t high = vcgeq_u8(chunk, v80);
@@ -123,57 +125,59 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
         // first-set-bit (ctzll) and divide by 4 to get the byte index.
         if (sp_mask) {
             const u32 sp_byte = static_cast<u32>(__builtin_ctzll(sp_mask)) >> 2;
-            const u64 pre_sp_nibbles = sp_byte == 0 ? 0 : ((1ULL << (sp_byte * 4)) - 1);
+            const u64 pre_sp_nibbles = sp_byte == 0 ? 0 : ~(~0ULL << (sp_byte * 4));
             const u64 real_bad = bad_mask & pre_sp_nibbles & ~sp_mask;
             if (real_bad) return static_cast<u32>(-1);
             if (canon_end == end) {
                 const u64 qf_before_sp = qf_mask & pre_sp_nibbles;
                 canon_end = qf_before_sp
-                                ? (pos + (static_cast<u32>(__builtin_ctzll(qf_before_sp)) >> 2))
-                                : (pos + sp_byte);
+                                ? static_cast<u32>(
+                                      pos + static_cast<i64>(__builtin_ctzll(qf_before_sp) >> 2))
+                                : static_cast<u32>(pos + static_cast<i64>(sp_byte));
             }
             *canon_end_out = canon_end;
-            return pos + sp_byte;
+            return static_cast<u32>(pos + static_cast<i64>(sp_byte));
         }
         if (bad_mask) return static_cast<u32>(-1);
         if (qf_mask && canon_end == end) {
-            canon_end = pos + (static_cast<u32>(__builtin_ctzll(qf_mask)) >> 2);
+            canon_end = static_cast<u32>(pos + static_cast<i64>(__builtin_ctzll(qf_mask) >> 2));
         }
         pos += 16;
     }
-    while (pos < end) {
+    while (pos < static_cast<i64>(end)) {
         u8 b = buf[pos];
         if (b == ' ') {
             *canon_end_out = (canon_end != end) ? canon_end : pos;
-            return pos;
+            return static_cast<u32>(pos);
         }
         if (!kUriTable[b]) return static_cast<u32>(-1);
-        if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
+        if ((b == '?' || b == '#') && canon_end == end) canon_end = static_cast<u32>(pos);
         pos++;
     }
     *canon_end_out = canon_end;
     return end;
 }
 
-u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
+u32 scan_header_name(const u8* buf, u32 pos_in, u32 end) {
+    i64 pos = pos_in;
     const uint8x16_t vcolon = vdupq_n_u8(':');
 
-    while (pos + 16 <= end) {
+    while (pos + 16 <= static_cast<i64>(end)) {
         uint8x16_t chunk = vld1q_u8(buf + pos);
         uint8x16_t cmp = vceqq_u8(chunk, vcolon);
         if (neon_any(cmp)) {
-            for (u32 i = 0; i < 16 && pos + i < end; i++) {
-                if (buf[pos + i] == ':') return pos + i;
+            for (i64 i = 0; i < 16 && pos + i < static_cast<i64>(end); i++) {
+                if (buf[pos + i] == ':') return static_cast<u32>(pos + i);
                 if (!kTokenTable[buf[pos + i]]) return static_cast<u32>(-1);
             }
         }
-        for (u32 j = pos; j < pos + 16; j++) {
+        for (i64 j = pos; j < pos + 16; j++) {
             if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
         }
         pos += 16;
     }
-    while (pos < end) {
-        if (buf[pos] == ':') return pos;
+    while (pos < static_cast<i64>(end)) {
+        if (buf[pos] == ':') return static_cast<u32>(pos);
         if (!kTokenTable[buf[pos]]) return static_cast<u32>(-1);
         pos++;
     }

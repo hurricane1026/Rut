@@ -14,38 +14,39 @@ namespace rut::simd {
 // from the svuint8_t + scalar argument types.
 
 u32 find_header_end(const u8* buf, u32 len, u32 from) {
-    u32 start = from > 3 ? from - 3 : 0;
-    u32 pos = start;
+    i64 start = from > 3 ? static_cast<i64>(from) - 3 : 0;
+    i64 pos = start;
     u32 vl = static_cast<u32>(svcntb());  // vector length in bytes
 
-    while (pos < len) {
-        svbool_t pred = svwhilelt_b8(pos, len);
+    while (pos < static_cast<i64>(len)) {
+        svbool_t pred = svwhilelt_b8(static_cast<u32>(pos), len);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
         svbool_t cr_match = svcmpeq(pred, chunk, static_cast<u8>('\r'));
 
         if (svptest_any(pred, cr_match)) {
             // Found \r — check each match position
-            u32 remaining = len - pos;
+            u32 remaining = static_cast<u32>(static_cast<i64>(len) - pos);
             u32 check_len = remaining < vl ? remaining : vl;
-            for (u32 i = 0; i < check_len; i++) {
-                u32 idx = pos + i;
-                if (idx + 3 < len && buf[idx] == '\r' && buf[idx + 1] == '\n' &&
+            for (i64 i = 0; i < static_cast<i64>(check_len); i++) {
+                i64 idx = pos + i;
+                if (idx + 3 < static_cast<i64>(len) && buf[idx] == '\r' && buf[idx + 1] == '\n' &&
                     buf[idx + 2] == '\r' && buf[idx + 3] == '\n') {
-                    return idx + 4;
+                    return static_cast<u32>(idx + 4);
                 }
             }
         }
-        pos += vl;
+        pos += static_cast<i64>(vl);
     }
     return 0;
 }
 
-u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
+u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
+    i64 pos = pos_in;
     u32 vl = static_cast<u32>(svcntb());
 
-    while (pos < end) {
-        u32 remaining = end - pos;
-        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
+    while (pos < static_cast<i64>(end)) {
+        u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
+        svbool_t pred = svwhilelt_b8(0, remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t cr_match = svcmpeq(pred, chunk, static_cast<u8>('\r'));
@@ -57,24 +58,25 @@ u32 scan_header_value(const u8* buf, u32 pos, u32 end) {
 
         if (svptest_any(pred, svorr_z(pred, cr_match, bad))) {
             // Scalar fallback for this vector window
-            u32 scan_end = pos + (remaining < vl ? remaining : vl);
-            for (u32 i = pos; i < scan_end; i++) {
+            i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
+            for (i64 i = pos; i < scan_end; i++) {
                 if (buf[i] == '\r') return i;
                 if (!kHeaderValueTable[buf[i]]) return static_cast<u32>(-1);
             }
         }
-        pos += vl;
+        pos += static_cast<i64>(vl);
     }
     return end;
 }
 
-u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
+u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
+    i64 pos = pos_in;
     u32 vl = static_cast<u32>(svcntb());
     u32 canon_end = end;  // sentinel: '?'/'#' not yet found
 
-    while (pos < end) {
-        u32 remaining = end - pos;
-        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
+    while (pos < static_cast<i64>(end)) {
+        u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
+        svbool_t pred = svwhilelt_b8(0, remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t sp_match = svcmpeq(pred, chunk, static_cast<u8>(' '));
@@ -87,46 +89,47 @@ u32 scan_uri(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
                                     svcmpeq(pred, chunk, static_cast<u8>('#')));
 
         if (svptest_any(pred, svorr_z(pred, svorr_z(pred, sp_match, bad), qf_match))) {
-            u32 scan_end = pos + (remaining < vl ? remaining : vl);
-            for (u32 i = pos; i < scan_end; i++) {
+            i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
+            for (i64 i = pos; i < scan_end; i++) {
                 u8 b = buf[i];
                 if (b == ' ') {
                     *canon_end_out = (canon_end != end) ? canon_end : i;
-                    return i;
+                    return static_cast<u32>(i);
                 }
                 if (!kUriTable[b]) return static_cast<u32>(-1);
-                if ((b == '?' || b == '#') && canon_end == end) canon_end = i;
+                if ((b == '?' || b == '#') && canon_end == end) canon_end = static_cast<u32>(i);
             }
         }
-        pos += vl;
+        pos += static_cast<i64>(vl);
     }
     *canon_end_out = canon_end;
     return end;
 }
 
-u32 scan_header_name(const u8* buf, u32 pos, u32 end) {
+u32 scan_header_name(const u8* buf, u32 pos_in, u32 end) {
+    i64 pos = pos_in;
     u32 vl = static_cast<u32>(svcntb());
 
-    while (pos < end) {
-        u32 remaining = end - pos;
-        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
+    while (pos < static_cast<i64>(end)) {
+        u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
+        svbool_t pred = svwhilelt_b8(0, remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t colon_match = svcmpeq(pred, chunk, static_cast<u8>(':'));
 
         if (svptest_any(pred, colon_match)) {
-            u32 scan_end = pos + (remaining < vl ? remaining : vl);
-            for (u32 i = pos; i < scan_end; i++) {
-                if (buf[i] == ':') return i;
+            i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
+            for (i64 i = pos; i < scan_end; i++) {
+                if (buf[i] == ':') return static_cast<u32>(i);
                 if (!kTokenTable[buf[i]]) return static_cast<u32>(-1);
             }
         }
         // No colon — validate all bytes
-        u32 scan_end = pos + (remaining < vl ? remaining : vl);
-        for (u32 j = pos; j < scan_end; j++) {
+        i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
+        for (i64 j = pos; j < scan_end; j++) {
             if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
         }
-        pos += vl;
+        pos += static_cast<i64>(vl);
     }
     return static_cast<u32>(-1);
 }

@@ -4,10 +4,10 @@
 namespace rut::simd {
 
 u32 find_header_end(const u8* buf, u32 len, u32 from) {
-    u32 start = from > 3 ? from - 3 : 0;
-    for (u32 i = start; i + 3 < len; i++) {
+    u32 start = from > 3 ? static_cast<u32>(static_cast<i64>(from) - 3) : 0;
+    for (i64 i = start; i + 3 < static_cast<i64>(len); i++) {
         if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n') {
-            return i + 4;
+            return static_cast<u32>(i + 4);
         }
     }
     return 0;
