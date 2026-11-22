@@ -4275,8 +4275,9 @@ public:
             const u32 kEpisode = deferred_relay_read_episodes[0];
             --deferred_relay_read_count;
             for (u32 j = 0; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[static_cast<i64>(j) + 1];
+                deferred_relay_read_episodes[j] =
+                    deferred_relay_read_episodes[static_cast<i64>(j) + 1];
             }
             if (kId >= slots_initialized) continue;
             Connection& c = conns[kId];
@@ -4322,8 +4323,9 @@ public:
                 if (!submit_recv_upstream(c)) close_conn(c);
             }
         }
-        study_relay_calls +=
-            static_cast<u64>(static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls));
+        const i64 relay_calls =
+            static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
+        study_relay_calls += static_cast<u64>(relay_calls);
         u64 flush_phase_ns = 0;
         if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
             __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
@@ -4337,8 +4339,9 @@ public:
             }
             --deferred_relay_read_count;
             for (u32 j = i; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[static_cast<i64>(j) + 1];
+                deferred_relay_read_episodes[j] =
+                    deferred_relay_read_episodes[static_cast<i64>(j) + 1];
             }
         }
     }
@@ -6211,18 +6214,21 @@ public:
              static_cast<i64>(owner.expected_copy_end) !=
                  static_cast<i64>(c.buffered_response_len())))
             return false;
+        const i64 header_received = static_cast<i64>(header) + static_cast<i64>(received);
+        const i64 first_copy_end =
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes);
         if (owner.post_commit_at_start &&
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0) ||
-             owner.saw_positive &&
-                 (owner.positive_bytes > received ||
-                  owner.first_copy_begin != header + received - owner.positive_bytes ||
-                  owner.expected_copy_end != header + received)))
+             owner.saw_positive && (owner.positive_bytes > received ||
+                                    static_cast<i64>(owner.first_copy_begin) !=
+                                        header_received - static_cast<i64>(owner.positive_bytes) ||
+                                    static_cast<i64>(owner.expected_copy_end) != header_received)))
             return false;
         if (!owner.post_commit_at_start &&
             (!owner.saw_positive || owner.first_copy_begin > header ||
              owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-             owner.first_copy_begin + owner.positive_bytes != header + received))
+             first_copy_end != header_received))
             return false;
         if (c.response_read_timer_last_progress_ns == 0 ||
             response_read_timer_remaining_ms(
