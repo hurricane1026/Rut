@@ -14424,8 +14424,10 @@ inline bool build_redirect_response(const Connection& conn,
     char date[32];
     char body_len[10];
     char actual_port[10];
-    const u32 date_len = strict_response_date(date, realtime_us());
-    const u32 body_len_digits = strict_response_dec(body_len, policy.body.len);
+    const i64 date_len_wide = strict_response_date(date, realtime_us());
+    const i64 body_len_digits_wide = strict_response_dec(body_len, policy.body.len);
+    const u32 date_len = static_cast<u32>(date_len_wide);
+    const u32 body_len_digits = static_cast<u32>(body_len_digits_wide);
     const u32 actual_port_digits =
         legacy_profile ? strict_response_dec(actual_port, conn.listener_context.port) : 0;
     if (date_len == 0 || (legacy_profile && actual_port_digits == 0)) return false;
@@ -14436,8 +14438,8 @@ inline bool build_redirect_response(const Connection& conn,
         static_cast<i64>(location_authority.len) +
         (append_listener_port ? 1 + static_cast<i64>(actual_port_digits) : 0);
     if (authority_len_wide < 0 || authority_len_wide > UINT32_MAX) return false;
-    const u32 authority_len = static_cast<u32>(authority_len_wide);
-    const u32 location_query_len = legacy_profile ? query_len : 0;
+    const i64 authority_len = authority_len_wide;
+    const i64 location_query_len = legacy_profile ? static_cast<i64>(query_len) : 0;
     u64 required = 0;
     auto add = [&](u64 n) {
         u64 next = 0;
@@ -14451,9 +14453,9 @@ inline bool build_redirect_response(const Connection& conn,
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
     if (!add_i64(9 + 3 + 1 + static_cast<i64>(policy.reason.len)) ||
-        !add_i64(10 + static_cast<i64>(policy.server.len)) || !add_i64(8 + date_len) ||
+        !add_i64(10 + static_cast<i64>(policy.server.len)) || !add_i64(8 + date_len_wide) ||
         !add_i64(16 + static_cast<i64>(policy.content_type.len)) ||
-        !add_i64(18 + body_len_digits) ||
+        !add_i64(18 + body_len_digits_wide) ||
         !add_i64(static_cast<i64>(legacy_profile ? sizeof(kLocationPrefix)
                                                  : sizeof(kFixedLocationPrefix)) -
                  1 + authority_len) ||
