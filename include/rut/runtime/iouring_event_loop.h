@@ -4531,11 +4531,13 @@ public:
             close_conn(c);
             return;
         }
-        r.segment_sent += static_cast<u32>(n);
-        relay_budget_bytes -= static_cast<u32>(n);
-        relay_written_bytes += static_cast<u32>(n);
-        if (study_inside_cq) study_cq_splice_bytes += static_cast<u32>(n);
-        c.resp_body_sent += static_cast<u32>(n);
+        r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
+        relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
+        __builtin_add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
+        if (study_inside_cq)
+            __builtin_add_overflow(
+                study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
+        __builtin_add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
