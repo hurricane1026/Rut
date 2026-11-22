@@ -390,7 +390,7 @@ bool RouteConfig::add_proxy(const char* path, u8 method, u16 upstream_id) {
     if (!param_count_fits(path)) return false;
     const u8 method_key = route_method_key_from_legacy_char(method);
     if (route_method_slot(method_key) == kMethodSlotInvalid) return false;
-    auto& r = routes[static_cast<i64>(route_count)];
+    auto& r = routes[route_count];
     r.path_len = 0;
     while (path[r.path_len] && r.path_len < sizeof(r.path) - 1) {
         r.path[r.path_len] = path[r.path_len];

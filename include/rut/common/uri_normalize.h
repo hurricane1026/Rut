@@ -23,16 +23,15 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
                value == '~';
     };
     static constexpr char kHex[] = "0123456789ABCDEF";
-    u32 path_end = 0;
-    while (path_end < input.len && input.ptr[path_end] != '?') path_end++;
-    u32 decoded = 0;
-    for (u32 i = 0; i < path_end; i++) {
+    i64 path_end = 0;
+    while (path_end < static_cast<i64>(input.len) && input.ptr[path_end] != '?') ++path_end;
+    i64 decoded = 0;
+    for (i64 i = 0; i < path_end; ++i) {
         if (input.ptr[i] != '%') {
             output[decoded++] = input.ptr[i];
             continue;
         }
-        const u8 kValue = static_cast<u8>((hex(input.ptr[static_cast<i64>(i) + 1]) << 4) |
-                                          hex(input.ptr[static_cast<i64>(i) + 2]));
+        const u8 kValue = static_cast<u8>((hex(input.ptr[i + 1]) << 4) | hex(input.ptr[i + 2]));
         if (unreserved(kValue))
             output[decoded++] = static_cast<char>(kValue);
         else {
@@ -40,40 +39,36 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
             output[decoded++] = kHex[kValue >> 4];
             output[decoded++] = kHex[kValue & 15];
         }
-        i = static_cast<u32>(static_cast<i64>(i) + 2);
+        i += 2;
     }
-    bool trailing_slash = decoded > 1 && output[static_cast<i64>(decoded) - 1] == '/';
-    u32 write = 1;
-    u32 read = 1;
+    bool trailing_slash = decoded > 1 && output[decoded - 1] == '/';
+    i64 write = 1;
+    i64 read = 1;
     while (read < decoded) {
         while (read < decoded && output[read] == '/') read++;
-        const u32 kBegin = read;
+        const i64 kBegin = read;
         while (read < decoded && output[read] != '/') read++;
-        const u32 kSize = static_cast<u32>(static_cast<i64>(read) - static_cast<i64>(kBegin));
+        const i64 kSize = read - kBegin;
         if (kSize == 0) break;
         const bool kDot = kSize == 1 && output[kBegin] == '.';
-        const bool kParent =
-            kSize == 2 && output[kBegin] == '.' && output[static_cast<i64>(kBegin) + 1] == '.';
+        const bool kParent = kSize == 2 && output[kBegin] == '.' && output[kBegin + 1] == '.';
         if (kDot || kParent) {
             if (read == decoded) trailing_slash = true;
             if (kParent && write > 1) {
-                while (write > 1 && output[static_cast<i64>(write) - 1] != '/') write--;
+                while (write > 1 && output[write - 1] != '/') --write;
                 if (write > 1) write--;
             }
             continue;
         }
-        if (write > 1) output[static_cast<i64>(write++)] = '/';
-        __builtin_memmove(
-            output + static_cast<i64>(write), output + static_cast<i64>(kBegin), kSize);
-        write = static_cast<u32>(static_cast<i64>(write) + static_cast<i64>(kSize));
+        if (write > 1) output[write++] = '/';
+        __builtin_memmove(output + write, output + kBegin, static_cast<u32>(kSize));
+        write += kSize;
     }
-    if (trailing_slash && write > 1) output[static_cast<i64>(write++)] = '/';
-    const u32 kQueryLength =
-        static_cast<u32>(static_cast<i64>(input.len) - static_cast<i64>(path_end));
+    if (trailing_slash && write > 1) output[write++] = '/';
+    const i64 kQueryLength = static_cast<i64>(input.len) - path_end;
     if (kQueryLength != 0)
-        __builtin_memmove(
-            output + static_cast<i64>(write), input.ptr + static_cast<i64>(path_end), kQueryLength);
-    *length = static_cast<u32>(static_cast<i64>(write) + static_cast<i64>(kQueryLength));
+        __builtin_memmove(output + write, input.ptr + path_end, static_cast<u32>(kQueryLength));
+    *length = static_cast<u32>(write + kQueryLength);
     return true;
 }
 }  // namespace rut
