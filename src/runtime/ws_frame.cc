@@ -129,7 +129,8 @@ u32 ws_write_header(u8* out,
         offset = 10;
     }
     if (masked) {
-        for (u32 i = 0; i < 4; i++) out[static_cast<i64>(offset) + i] = mask_key[i];
+        for (u32 i = 0; i < 4; i++)
+            out[static_cast<i64>(offset) + static_cast<i64>(i)] = mask_key[i];
         offset = static_cast<u32>(static_cast<i64>(offset) + 4);
     }
     return offset;
@@ -162,8 +163,12 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
         m.reset();
         return WsMessageStatus::Error;
     }
-    m.accumulated_len =
-        static_cast<u64>(static_cast<i64>(m.accumulated_len) + static_cast<i64>(h.payload_len));
+    u64 total = 0;
+    if (__builtin_add_overflow(m.accumulated_len, h.payload_len, &total)) {
+        m.reset();
+        return WsMessageStatus::Error;
+    }
+    m.accumulated_len = total;
 
     if (h.fin) {
         *out_opcode = m.message_opcode;
