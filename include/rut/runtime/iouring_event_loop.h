@@ -19,6 +19,7 @@
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
 #include "rut/runtime/response_read_deadline.h"
+#include "rut/runtime/response_read_timer.h"
 #include "rut/runtime/send_progress.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
@@ -483,8 +484,7 @@ public:
         bool saw_precise_timer = false;
         bool precise_timer_valid = false;
         u32 precise_timer_generation = 0;
-        bool precise_timer_target_seen = false;
-        bool precise_timer_cancel_seen = false;
+        ResponseReadTimerBatch precise_timer_batch{};
         bool precise_timer_semantic = false;
         bool bounded_terminal_custody = false;
         bool bounded_terminal_prospective = false;
@@ -5527,21 +5527,10 @@ public:
                 continue;
             }
             if (ev.type == IoEventType::ResponseReadTimer) {
-                const bool transport_valid = valid_response_read_timer_transport_event(ev);
-                const bool identity_valid =
-                    owner.precise_timer_valid &&
-                    (ev.non_upstream_generation & kResponseReadTimerGenerationMask) ==
-                        owner.precise_timer_generation;
                 owner.saw_precise_timer = true;
-                const bool cancel = (ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
-                if (cancel) {
-                    if (owner.precise_timer_cancel_seen) owner.valid = false;
-                    owner.precise_timer_cancel_seen = true;
-                } else {
-                    if (owner.precise_timer_target_seen) owner.valid = false;
-                    owner.precise_timer_target_seen = true;
-                }
-                if (!transport_valid || !identity_valid) owner.valid = false;
+                if (!owner.precise_timer_batch.observe(
+                        ev, owner.precise_timer_valid, owner.precise_timer_generation))
+                    owner.valid = false;
                 continue;
             }
             if (ev.type == IoEventType::Recv && ev.result <= 0) {
@@ -6069,7 +6058,7 @@ public:
         }
         if (!current_batch_member || !owner.valid || !owner.saw_precise_timer ||
             !owner.precise_timer_valid || !owner.precise_timer_semantic ||
-            !owner.precise_timer_target_seen || owner.precise_timer_cancel_seen ||
+            !owner.precise_timer_batch.target_seen || owner.precise_timer_batch.cancel_seen ||
             owner.conn_id != c.id || owner.deadline_generation == 0 ||
             owner.deadline_generation != c.response_read_deadline_generation ||
             owner.upstream_episode != c.upstream_episode ||

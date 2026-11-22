@@ -4,6 +4,22 @@
 
 namespace rut {
 
+// Batch evidence records which completions arrived, including rejected ones.
+// Kernel ownership is consumed separately during settlement.
+struct ResponseReadTimerBatch {
+    bool target_seen = false;
+    bool cancel_seen = false;
+
+    [[nodiscard]] constexpr bool observe(const IoEvent& event, bool owner_valid, u32 generation) {
+        const u32 kTag = event.non_upstream_generation;
+        bool& seen = (kTag & kResponseReadTimerCancelBit) ? cancel_seen : target_seen;
+        const bool kFirst = !seen;
+        seen = true;
+        return kFirst && owner_valid && (kTag & kResponseReadTimerGenerationMask) == generation &&
+               valid_response_read_timer_transport_event(event);
+    }
+};
+
 // Kernel ownership for the generic precise response-read timer. CancelPending
 // retains the immutable identity until both the timeout target and the cancel
 // SQE completions have been harvested, in either order.

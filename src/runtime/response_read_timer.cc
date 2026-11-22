@@ -1,5 +1,10 @@
 #include "rut/runtime/response_read_timer.h"
 
+#include "rut/common/types.h"
+#include "rut/runtime/io_event.h"
+
+#include <errno.h>
+
 namespace rut {
 namespace {
 
@@ -43,6 +48,41 @@ consteval bool timer_ownership_conserved() {
 
 static_assert(timer_ownership_conserved(),
               "Response-read timer completion violates ownership contract");
+
+// Check every transition of the two-bit observation set, including the
+// second completion in either order and a replay after both have arrived.
+consteval bool timer_batch_observation_contract() {
+    constexpr u32 kGeneration = 7;
+    constexpr u32 kIncoming[] = {0, kGeneration, kGeneration + (1u << 16)};
+    for (unsigned prior = 0; prior < 4; ++prior) {
+        for (unsigned kind = 1; kind <= 2; ++kind) {
+            for (const u32 kId : kIncoming) {
+                for (unsigned flags = 0; flags < 4; ++flags) {
+                    const bool kOwnerValid = (flags & 1u) != 0;
+                    const bool kCleanPayload = (flags & 2u) == 0;
+                    IoEvent event{};
+                    event.type = IoEventType::ResponseReadTimer;
+                    event.non_upstream_generation =
+                        kId | (kind == 2 ? kResponseReadTimerCancelBit : 0);
+                    event.result = kind == 2 ? 0 : -ETIME;
+                    event.more = !kCleanPayload;
+                    ResponseReadTimerBatch batch{bool(prior & 1u), bool(prior & 2u)};
+                    const bool kExpected =
+                        (prior & kind) == 0 && kOwnerValid && kId == kGeneration && kCleanPayload;
+                    if (batch.observe(event, kOwnerValid, kGeneration) != kExpected) return false;
+                    const unsigned kAfter = prior | kind;
+                    if (batch.target_seen != bool(kAfter & 1u) ||
+                        batch.cancel_seen != bool(kAfter & 2u))
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static_assert(timer_batch_observation_contract(),
+              "Response timer violates batch observation contract");
 
 }  // namespace
 }  // namespace rut

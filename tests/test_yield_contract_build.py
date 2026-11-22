@@ -250,6 +250,16 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
+            ("? cancel_seen : target_seen", "? target_seen : cancel_seen"),
+            ("kFirst && owner_valid &&", "owner_valid &&"),
+            ("kFirst && owner_valid &&", "kFirst &&"),
+            ("(kTag & kResponseReadTimerGenerationMask) == generation", "(kTag & 0xffffu) == generation"),
+            ("valid_response_read_timer_transport_event(event);", "true;"),
+        ]:
+            probe = mutate(root / "include", overlay, header, before, after)
+            check(compiler, root, overlay, "Response timer violates batch observation contract", source=runtime)
+            probe.unlink()
+        for before, after in [
             ("generation == 0 || generation != owner_generation", "generation == 0"),
             ("cancel ? cancel_owned : target_owned", "cancel ? target_owned : cancel_owned"),
             ("target_owned || cancel_owned ?", "target_owned && cancel_owned ?"),
