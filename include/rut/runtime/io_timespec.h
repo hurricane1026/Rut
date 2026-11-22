@@ -19,7 +19,7 @@ using IoTimespec = timespec;
 constexpr IoTimespec io_timespec_from_ms(u32 ms) {
     IoTimespec ts{};
     ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1'000'000;
+    ts.tv_nsec = static_cast<decltype(ts.tv_nsec)>(ms % 1000) * 1'000'000;
     return ts;
 }
 
