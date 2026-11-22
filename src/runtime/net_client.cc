@@ -132,7 +132,9 @@ void NetClientWorker::adopt_config(const void* config) {
     pool_config = config;
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
-    const u64 next = epoch == ~u64(0) ? 0 : epoch ? static_cast<u64>(epoch + 1) : 0;
+    const u64 next = epoch == ~u64(0) ? 0
+                     : epoch          ? static_cast<u64>(static_cast<i64>(epoch) + 1)
+                                      : 0;
     __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {
@@ -564,13 +566,15 @@ bool NetClientWorker::read(Slot& s) {
     if (s.eof || s.buffered == kMaxBytes) return failed(s);
     ERR_clear_error();
     const int n =
-        s.ssl ? SSL_read(s.ssl,
-                         s.buffer + static_cast<i64>(s.buffered),
-                         static_cast<int>(static_cast<i64>(kMaxBytes) - s.buffered))
-              : static_cast<int>(recv(s.fd,
-                                      s.buffer + static_cast<i64>(s.buffered),
-                                      static_cast<u32>(static_cast<i64>(kMaxBytes) - s.buffered),
-                                      0));
+        s.ssl
+            ? SSL_read(s.ssl,
+                       s.buffer + static_cast<i64>(s.buffered),
+                       static_cast<int>(static_cast<i64>(kMaxBytes) - static_cast<i64>(s.buffered)))
+            : static_cast<int>(
+                  recv(s.fd,
+                       s.buffer + static_cast<i64>(s.buffered),
+                       static_cast<u32>(static_cast<i64>(kMaxBytes) - static_cast<i64>(s.buffered)),
+                       0));
     if (n > 0) {
         s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) + n);
         return false;
