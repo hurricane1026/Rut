@@ -12,9 +12,9 @@ constexpr bool record_direct_write_extent(
     u64 raw_offset = 0;
     if (__builtin_sub_overflow(address, begin, &raw_offset) || raw_offset > capacity) return false;
     const u32 kOffset = static_cast<u32>(raw_offset);
-    if (count > capacity - kOffset) return false;
     u32 kEnd = 0;
     if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;
+    if (kEnd > capacity) return false;
     if (kEnd > tail_dirty) tail_dirty = kEnd;
     if (kEnd > node_dirty) node_dirty = kEnd;
     return true;
@@ -36,21 +36,27 @@ struct ResponseBodyChain {
         u32 offset;
         // Physical high-water mark survives private reuse within one response.
         u32 dirty_end;
-        u8 bytes[SlicePool::kSliceSize - sizeof(Node*) - 3 * sizeof(u32)];
+        u8 bytes[static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(sizeof(Node*)) -
+                 static_cast<i64>(3) * static_cast<i64>(sizeof(u32))];
     };
     static_assert(sizeof(Node) == SlicePool::kSliceSize);
     static constexpr u32 kPayload = sizeof(Node::bytes);
     static_assert(kPayload == SlicePool::kResponseBodyPayload);
-    static constexpr u32 kHeader = SlicePool::kSliceSize - kPayload;
+    static constexpr u32 kHeader =
+        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kPayload));
     static constexpr u32 header_size() { return kHeader; }
 
     // Payload of a node, which may extend past Node::bytes for a bulk node.
-    static u8* payload(Node* node) { return reinterpret_cast<u8*>(node) + header_size(); }
+    static u8* payload(Node* node) {
+        return reinterpret_cast<u8*>(node) + static_cast<i64>(header_size());
+    }
     static const u8* payload(const Node* node) {
-        return reinterpret_cast<const u8*>(node) + header_size();
+        return reinterpret_cast<const u8*>(node) + static_cast<i64>(header_size());
     }
     static u32 payload_capacity(const SlicePool& pool, const Node* node) {
-        return pool.capacity_of(reinterpret_cast<const u8*>(node)) - header_size();
+        return static_cast<u32>(
+            static_cast<i64>(pool.capacity_of(reinterpret_cast<const u8*>(node))) -
+            static_cast<i64>(header_size()));
     }
 
     Node* head = nullptr;
@@ -65,8 +71,13 @@ struct ResponseBodyChain {
     // zeroed on release without publishing those bytes to the response.
     u32 tail_dirty_end = 0;
 
-    const u8* data() const { return head ? payload(head) + head->offset : nullptr; }
-    constexpr u32 front_size() const { return head ? head->len - head->offset : 0; }
+    const u8* data() const {
+        return head ? payload(head) + static_cast<i64>(head->offset) : nullptr;
+    }
+    constexpr u32 front_size() const {
+        return head ? static_cast<u32>(static_cast<i64>(head->len) - static_cast<i64>(head->offset))
+                    : 0;
+    }
 
     // Stored bytes after which new nodes prefer bulk buffers. Plaintext
     // switches as soon as the body outgrew one slice. TLS waits until four:
@@ -74,7 +85,8 @@ struct ResponseBodyChain {
     // and a ~48 KiB bulk node for a 64 KiB TLS body measured slower than
     // slices at high concurrency.
     static constexpr u32 kBulkAfterPlaintext = kPayload;
-    static constexpr u32 kBulkAfterTls = 4 * kPayload;
+    static constexpr u32 kBulkAfterTls =
+        static_cast<u32>(static_cast<i64>(4) * static_cast<i64>(kPayload));
 
     // Reserve before publishing: allocation failure leaves the existing bytes
     // and length unchanged, as required by the receive copy witness.
