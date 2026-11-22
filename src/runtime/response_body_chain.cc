@@ -145,6 +145,27 @@ consteval bool direct_write_extent_contract() {
 static_assert(direct_write_extent_contract(),
               "Direct receive violates physical write extent contract");
 
+// Independently peel the header and the new copy off the observed buffer. The
+// remaining suffix must account for every old origin byte not yet sent.
+consteval bool buffered_length_contract() {
+    constexpr u32 kSizes[] = {0, 1, 2, 3, UINT32_MAX - 1, UINT32_MAX};
+    for (const u32 kBuffered : kSizes)
+        for (const u32 kHeader : kSizes)
+            for (const u32 kNew : kSizes)
+                for (const u32 kReceived : kSizes)
+                    for (const u32 kCompleted : kSizes) {
+                        const bool kMatches = kBuffered >= kHeader && kBuffered - kHeader >= kNew &&
+                                              kCompleted <= kReceived &&
+                                              kBuffered - kHeader - kNew == kReceived - kCompleted;
+                        if (ResponseBodyChain::matches_buffered_length(
+                                kBuffered, kHeader, kReceived, kCompleted, kNew) != kMatches)
+                            return false;
+                    }
+    return true;
+}
+
+static_assert(buffered_length_contract(), "Buffered response violates retained byte accounting");
+
 // Use a widened total as the reference for the production remaining-room check.
 consteval bool direct_receive_body_bounds_contract() {
     constexpr u32 kCap = ResponseBodyChain::kMaxBody;
