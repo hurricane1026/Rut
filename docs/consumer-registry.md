@@ -573,6 +573,8 @@ All commands take a validated private input snapshot.
 | `inspect-consumer INPUT CONSUMER_ID` | Print the selected Consumer's metadata as one JSON object. |
 | `inspect-credential INPUT CREDENTIAL_ID` | Print one credential's metadata with secret and verifier fields omitted. |
 | `remove-credential INPUT CREDENTIAL_ID OUTPUT` | Remove exactly one existing credential and publish a private candidate. All Consumers and remaining credentials are preserved. |
+| `remove-consumer INPUT CONSUMER_ID OUTPUT` | Remove a Consumer that owns no credential records. |
+| `remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT` | Explicitly remove a Consumer and all of its credential records in one private snapshot transaction. |
 | `set-credential-groups INPUT CREDENTIAL_ID GROUPS_FILE OUTPUT` | Set one credential's explicit group subset from a private JSON array. An empty array grants no groups. |
 | `inherit-credential-groups INPUT CREDENTIAL_ID OUTPUT` | Remove the explicit subset so the credential inherits its Consumer's groups. |
 

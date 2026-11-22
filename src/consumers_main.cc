@@ -892,7 +892,34 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
-int remove_credential_command(const char* source, const char* id_text, const char* destination) {
+bool write_consumer_removals(json::Document& base,
+                             Str id,
+                             bool include_credentials,
+                             json::Writer& patch) {
+    patch.text(lit_str("{\"consumers\":[],\"credentials\":[],\"removeConsumers\":["));
+    if (!json::quote(id, patch)) return false;
+    patch.text(lit_str("],\"removeCredentials\":["));
+    bool first = true;
+    const u32 kRecords = field(base, 0, lit_str("credentials"));
+    for (u32 record = base.nodes[kRecords].child; record != json::kNone;
+         record = base.nodes[record].next) {
+        if (!field_equals(base, field(base, record, lit_str("consumerId")), id)) continue;
+        if (!include_credentials) return false;
+        if (!first) patch.put(',');
+        first = false;
+        if (!base.write(field(base, record, lit_str("id")), patch)) return false;
+    }
+    patch.text(lit_str("]}"));
+    return patch.ok;
+}
+
+enum class RegistryRemoval { Credential, Consumer, ConsumerWithCredentials };
+
+int remove_registry_record(const char* source,
+                           const char* id_text,
+                           const char* destination,
+                           RegistryRemoval mode) {
+    const bool credential = mode == RegistryRemoval::Credential;
     const Str id{id_text, bounded_argument(id_text, 65)};
     if (!provision_id_valid(id)) return failure("invalid registry record ID\n");
 
@@ -900,21 +927,27 @@ int remove_credential_command(const char* source, const char* id_text, const cha
     SensitiveDocument base;
     if (!read_private(source, input) || !consumer_registry_valid(base, input.view()))
         return failure("cannot read valid private registry snapshot\n");
-    if (record_by_id(base, field(base, 0, lit_str("credentials")), id) == json::kNone)
-        return failure("credential ID does not exist\n");
+    const u32 kRecords = field(base, 0, credential ? lit_str("credentials") : lit_str("consumers"));
+    if (record_by_id(base, kRecords, id) == json::kNone)
+        return failure("registry record ID does not exist\n");
 
-    char changes[256];
-    json::Writer patch_text{changes, sizeof(changes)};
-    patch_text.text(lit_str(
-        "{\"consumers\":[],\"credentials\":[],\"removeConsumers\":[],\"removeCredentials\":["));
-    if (!json::quote(id, patch_text)) return failure("cannot encode credential removal\n");
-    patch_text.text(lit_str("]}"));
+    Buffer changes;
+    json::Writer patch_text{changes.data, json::kMaxBytes};
+    if (credential) {
+        patch_text.text(lit_str(
+            "{\"consumers\":[],\"credentials\":[],\"removeConsumers\":[],\"removeCredentials\":["));
+        if (!json::quote(id, patch_text)) return failure("cannot encode credential removal\n");
+        patch_text.text(lit_str("]}"));
+    } else if (!write_consumer_removals(
+                   base, id, mode == RegistryRemoval::ConsumerWithCredentials, patch_text)) {
+        return failure("cannot remove Consumer with its current credentials\n");
+    }
 
     Buffer result;
     SensitiveDocument patch, checked;
     json::Writer output{result.data, json::kMaxBytes};
-    if (!patch_text.ok || !patch.parse({changes, patch_text.len}) || !apply(base, patch, output) ||
-        !consumer_registry_valid(checked, {result.data, output.len}))
+    if (!patch_text.ok || !patch.parse({changes.data, patch_text.len}) ||
+        !apply(base, patch, output) || !consumer_registry_valid(checked, {result.data, output.len}))
         return failure("invalid updated Consumer registry snapshot\n");
     const char* error = publish(destination, {result.data, output.len});
     return error ? failure(error) : 0;
@@ -1177,6 +1210,8 @@ constexpr char kUsage[] =
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
     "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
+    "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
+    "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
@@ -1220,7 +1255,11 @@ constexpr char kUsage[] =
 
 int main(int argc, char** argv) {
     if (argc == 5 && strcmp(argv[1], "remove-credential") == 0)
-        return remove_credential_command(argv[2], argv[3], argv[4]);
+        return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::Credential);
+    if (argc == 5 && strcmp(argv[1], "remove-consumer") == 0)
+        return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::Consumer);
+    if (argc == 5 && strcmp(argv[1], "remove-consumer-with-credentials") == 0)
+        return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::ConsumerWithCredentials);
     if (argc == 6 && strcmp(argv[1], "set-credential-groups") == 0)
         return credential_groups_command(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 5 && strcmp(argv[1], "inherit-credential-groups") == 0)

@@ -231,6 +231,21 @@ def test_targeted_registry_commands(tool, root):
         assert result.returncode == 2 and not result.stdout
     assert removed.read_bytes() == original_result
     assert not (root / 'not-created.json').exists()
+    removed_consumer = root / 'removed-consumer.json'
+    for consumer in (alice['id'], 'missing'):
+        result = run(tool, 'remove-consumer', source, consumer, removed_consumer)
+        check_output(result)
+        assert result.returncode == 2 and not result.stdout and not removed_consumer.exists()
+    result = run(tool, 'remove-consumer', source, vacant['id'], removed_consumer)
+    check_output(result)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    assert json.loads(removed_consumer.read_bytes()) == dict(snapshot, consumers=[alice, bob])
+    removed_consumer.unlink()
+    result = run(tool, 'remove-consumer-with-credentials', source, alice['id'], removed_consumer)
+    check_output(result)
+    assert result.returncode == 0 and not result.stdout and not result.stderr
+    assert stat.S_IMODE(removed_consumer.stat().st_mode) == 0o600
+    assert json.loads(removed_consumer.read_bytes()) == dict(snapshot, consumers=[bob, vacant], credentials=[])
     assert source.read_bytes() == original
 
 
