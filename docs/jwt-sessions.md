@@ -259,6 +259,13 @@ taken effect before an error, so retry with the same cookie to confirm
 revocation while its token remains valid. The route can be paired with a
 trusted application that enrolls the token and sets the cookie over HTTPS.
 
+The same HTTPS program exposes a read-only `GET /private`. It validates the
+unique cookie's JWT and reads the exact-token permit on every request.
+An active permit and acknowledged cleanup yield the verified subject with
+`Cache-Control: no-store`. A missing or revoked permit returns 401, and an
+authority or cleanup failure returns 503. After confirmed logout, resending
+the old cookie is denied. The read route performs no session mutation.
+
 ## Local-AOF durable logout
 
 `POST /logout-durable` is an opt-in Redis 7.2+ profile for single-instance

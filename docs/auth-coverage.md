@@ -1746,6 +1746,8 @@ requires the fixed cookie, exact Origin and same-origin Fetch Metadata. It
 reuses exact-token durable revocation and sends the clear cookie only after
 the AOF barrier and connection cleanup succeed. HTTPS fixtures on both Linux
 backends cover malformed and ambiguous cookies and retention on storage failure.
+The same profile checks the exact token's permit before returning a private
+response, including denial after logout and after failed store cleanup.
 
 ### Keycloak role claim adapter
 
