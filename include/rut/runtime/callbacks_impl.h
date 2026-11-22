@@ -10508,10 +10508,12 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
-    conn.response_read_deadline_post_commit_downstream_submitted += available;
+    conn.response_read_deadline_post_commit_downstream_submitted = static_cast<u32>(
+        static_cast<i64>(conn.response_read_deadline_post_commit_downstream_submitted) + available);
     conn.response_read_deadline_post_commit_inflight_body = available;
-    conn.resp_body_remaining -= available;
-    conn.resp_body_sent += available;
+    conn.resp_body_remaining =
+        static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) - static_cast<i64>(available));
+    conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + available);
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
@@ -10545,7 +10547,7 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
         conn.upstream_relay_slice = sending;
         conn.upstream_recv_buf.bind(next, loop->relay_buffer_capacity(next));
         conn.upstream_relay_send_len = send_len;
-        conn.resp_body_sent += send_len;
+        conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + send_len);
         conn.state = ConnState::Sending;
         conn.set_slots(
             nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
@@ -10666,7 +10668,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (conn.resp_body_mode == BodyMode::ContentLength) {
         u32 consume = kDataLen;
         if (consume > conn.resp_body_remaining) consume = conn.resp_body_remaining;
-        conn.resp_body_remaining -= consume;
+        conn.resp_body_remaining = static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) -
+                                                    static_cast<i64>(consume));
         send_len = consume;
     } else if (conn.resp_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.upstream_recv_buf.data();
@@ -10674,8 +10677,12 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         while (pos < kDataLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
             const ChunkStatus kChunkStatus = conn.resp_chunk_parser.feed(
-                body_data + pos, kDataLen - pos, &consumed, &out_start, &out_len);
-            pos += consumed;
+                body_data + static_cast<i64>(pos),
+                static_cast<u32>(static_cast<i64>(kDataLen) - static_cast<i64>(pos)),
+                &consumed,
+                &out_start,
+                &out_len);
+            pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
             if (kChunkStatus == ChunkStatus::Done) break;
             if (kChunkStatus == ChunkStatus::Error) {
                 loop->close_conn(conn);
@@ -10711,12 +10718,12 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 // the unencrypted tail and pause the upstream read; the drain (and,
                 // for NeedRead, the next client recv) re-encrypt it via
                 // proxy_tls_parked_drained rather than truncating the download.
-                conn.resp_body_sent += enc;
+                conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + enc);
                 throttle_advance(conn, enc);
                 conn.upstream_send_len = enc;
                 consume_upstream_sent(conn);  // shift past encrypted; tail now at front
                 conn.tls_send_src = conn.upstream_recv_buf.data();
-                conn.tls_send_len = send_len - enc;
+                conn.tls_send_len = static_cast<u32>(static_cast<i64>(send_len) - enc);
                 conn.tls_send_off = 0;
                 // Cancel the multishot recv; the cancel SQE can fail to queue under
                 // SQ pressure, leaving it live — fail closed rather than overflow.
@@ -10730,7 +10737,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            conn.resp_body_sent += enc;  // enc == send_len on Done
+            conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) +
+                                                   enc);  // enc == send_len on Done
             throttle_advance(conn, enc);
             const bool kBodyDone = proxy_body_complete(conn);
             conn.upstream_send_len = enc;
