@@ -138,7 +138,7 @@ u64 monotonic_ns();
 
 struct AccessLogRing {
     static constexpr u32 kCapacity = 512;
-    static constexpr u32 kMask = kCapacity - 1;
+    static constexpr u32 kMask = static_cast<u32>(static_cast<i64>(kCapacity) - 1);
 
     // Cache-line aligned to prevent false sharing between producer and consumer.
     alignas(64) std::atomic<u32> write_pos;  // written by shard thread only
