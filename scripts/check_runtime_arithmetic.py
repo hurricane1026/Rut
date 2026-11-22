@@ -82,14 +82,12 @@ def unsigned_add_sub(scope):
 def matches(tool, file, query, flags):
     command = [tool, '-c', 'set traversal AsIs', '-c', 'match ' + query, str(file), *flags]
     try:
-        separator = command.index('--')
+        command.index('--')
     except ValueError:
-        command.extend(['--', '-fdiagnostics-format=clang', '-fshow-column',
-                        '-fno-color-diagnostics'])
+        command.extend('--extra-arg=' + arg for arg in
+                       ('-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'))
     else:
-        command[separator + 1:separator + 1] = [
-            '-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'
-        ]
+        command.extend(['-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'])
     run = subprocess.run(command, text=True, capture_output=True)
     diagnostics = run.stderr + run.stdout
     locations = re.findall(r'^(.+?:\d+:\d+): note: "root" binds here', run.stdout, re.M)
@@ -133,6 +131,25 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
                 raise RuntimeError(f'clang-query self-test: expected lines {expected}, got {found}')
         if matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
             raise RuntimeError('clang-query self-test: expected a valid zero-match query')
+
+        direct_flags = ['--', '-std=c++23', '-fno-show-column', '-fdiagnostics-format=msvc']
+        if matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', direct_flags):
+            raise RuntimeError('clang-query self-test: direct diagnostic-format flags unexpectedly matched')
+
+        include = Path(directory) / 'include'
+        include.mkdir()
+        (include / 'probe_config.h').write_text('#ifndef PROBE_DB_FLAG\n#error missing database define\n#endif\n')
+        db_file = Path(directory) / 'db_probe.cc'
+        db_file.write_text('#include "probe_config.h"\nint db_probe;\n')
+        database = Path(directory) / 'compile_commands.json'
+        database.write_text(json.dumps([{
+            'directory': directory,
+            'file': str(db_file),
+            'arguments': ['clang++', '-std=c++23', '-DPROBE_DB_FLAG=1', '-I', str(include), '-c', str(db_file)],
+        }]))
+        if matches(tool, db_file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))',
+                    ['-p', str(database)]):
+            raise RuntimeError('clang-query self-test: compile-database probe unexpectedly matched')
 
         warning = Path(directory) / 'warning.cc'
         warning.write_text(
