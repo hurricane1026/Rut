@@ -59,8 +59,7 @@ struct TimerWheel {
         ListNode* node = head->next;
         while (node != head) {
             ListNode* next = node->next;
-            node->remove();
-            node->init();
+            node->detach();
             // container_of: timer_node is at a known offset in Connection
             auto* conn =
                 reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - timer_node_offset());

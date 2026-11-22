@@ -192,6 +192,7 @@ add_library(rut_runtime STATIC
     ${RUT_IO_SOURCES}
     runtime/yield_heap.cc
     runtime/timer_wheel.cc
+    runtime/timer_list_contract.cc
     runtime/io_event.cc
     runtime/socket.cc
     runtime/send_progress.cc

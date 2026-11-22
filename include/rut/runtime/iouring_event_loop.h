@@ -8240,8 +8240,7 @@ public:
             ListNode* const next = node->next;
             const bool at_end = node == last;
             c->idle_trim_examined = true;
-            node->remove();
-            head->prev->insert_after(node);
+            node->move_to_tail(*head);
             examined++;
             idle_trim_examined++;
             if (idle_trim_connection(*c)) queued++;

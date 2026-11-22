@@ -46,14 +46,12 @@ void TimerWheel::add(Connection* c, u32 seconds) {
 }
 
 void TimerWheel::refresh(Connection* c, u32 seconds) {
-    c->timer_node.remove();
-    c->timer_node.init();
+    c->timer_node.detach();
     add(c, seconds);
 }
 
 void TimerWheel::remove(Connection* c) {
-    c->timer_node.remove();
-    c->timer_node.init();
+    c->timer_node.detach();
 }
 
 u64 TimerWheel::timer_node_offset() {
