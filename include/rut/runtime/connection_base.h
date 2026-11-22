@@ -1389,10 +1389,10 @@ struct ConnectionBase {
     // downstream transport. This is transport identity, not request metadata:
     // reset() clears it on slot allocation/reuse, while keep-alive request
     // boundaries deliberately preserve it. Saturates instead of wrapping.
-    u32 downstream_completed_request_count;
+    i64 downstream_completed_request_count;
 
     void record_downstream_request_completion() {
-        if (downstream_completed_request_count != ~u32{0}) downstream_completed_request_count++;
+        if (downstream_completed_request_count < INT64_MAX) ++downstream_completed_request_count;
     }
 
     void copy_downstream_transport_state_from(const ConnectionBase& source) {

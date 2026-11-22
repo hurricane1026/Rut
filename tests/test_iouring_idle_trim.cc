@@ -1197,9 +1197,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // reordering. The bounded TLS server-name and route-host views add 512 bytes
     // total. The active-health configuration identity adds 8 bytes plus 8 bytes
     // of alignment padding. The passive response/timeout episode markers add
-    // another 8 bytes. The measured current 64-bit Connection layout is
-    // 6272 bytes with or without WebSocket support (private Native ABI 23).
-    CHECK_EQ(sizeof(Connection), 6272u);
+    // another 8 bytes. The 64-bit completed-request count and its alignment add
+    // 8 bytes, bringing the 64-bit layout to 6280 bytes with or without WebSocket.
+    CHECK_EQ(sizeof(Connection), 6280u);
 }
 
 TEST(iouring_idle_trim,
