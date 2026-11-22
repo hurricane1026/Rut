@@ -278,6 +278,9 @@ exact-token permit and acknowledged connection cleanup. The example returns
 204 with `Cache-Control: no-store` at the point where the application could
 perform its protected mutation. Missing scope receives 403, a missing or
 revoked permit receives 401, and a storage or cleanup failure receives 503.
+The epoll and io_uring integration tests exercise both HTTPS protocols. Over
+HTTP/2 they also verify that the read route denies duplicate cookies and
+denies the old cookie after confirmed logout.
 
 ## Local-AOF durable logout
 

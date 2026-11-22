@@ -9,14 +9,17 @@ import ssl
 import tempfile
 import time
 
+from auth_h2_fixture import request as h2_request
 from test_browser_session_revoke import exchange, ORIGIN
 from test_jwt_sessions import KEY, NAMESPACE, Peer, permit_key, signed
 from test_mtls_consumers import registry_gateway
 
 
-def exercise(args, peer):
+def exercise(args, peer, http2):
     cert = Path(args.testdata).resolve() / "localhost_cert.pem"
     context = ssl.create_default_context(cafile=str(cert))
+    if http2:
+        context.set_alpn_protocols(["h2"])
     endpoint = dict(address="127.0.0.1", port=peer.port, poolIdleMs=5000, tls=True,
                     caFile=str(cert), serverName="localhost")
     env = dict(os.environ, BROWSER_ORIGIN=ORIGIN, BROWSER_FETCH_SITE="same-origin",
@@ -43,10 +46,16 @@ def exercise(args, peer):
         shutil.copyfile(args.source, source)
         with registry_gateway(args, source, env, "server-tls") as port:
             def check(headers, expected):
-                status, response, _ = exchange(port, context, "POST", "/private/write", headers)
-                assert status == expected, (status, expected)
-                if status == 204:
-                    assert response.get("Cache-Control") == "no-store"
+                if http2:
+                    status, body = h2_request(port, "/private/write", headers, method="POST",
+                                              tls_context=context)
+                    if status == 204:
+                        assert not body
+                else:
+                    status, response, _ = exchange(port, context, "POST", "/private/write", headers)
+                    if status == 204:
+                        assert response.get("Cache-Control") == "no-store"
+                assert status == expected, (status, expected, http2)
 
             with peer.lock:
                 accepted = peer.accepted
@@ -73,11 +82,12 @@ def main():
     parser.add_argument("--testdata", required=True)
     parser.add_argument("--backend", choices=("epoll", "io_uring"), required=True)
     args = parser.parse_args()
-    peer = Peer(Path(args.testdata), True)
-    try:
-        exercise(args, peer)
-    finally:
-        peer.close()
+    for http2 in (False, True):
+        peer = Peer(Path(args.testdata), True)
+        try:
+            exercise(args, peer, http2)
+        finally:
+            peer.close()
 
 
 if __name__ == "__main__":
