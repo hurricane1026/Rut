@@ -16,6 +16,12 @@ UNSIGNED = 'hasType(isUnsignedInteger())'
 ARITH = f'binaryOperator(hasAnyOperatorName("+", "-"), {UNSIGNED})'
 VALUE = f'ignoringParenImpCasts({ARITH})'
 ZERO = 'ignoringParenImpCasts(integerLiteral(equals(0)))'
+# Only accept Clang's diagnostic level in its structured location prefix.  Do
+# not treat source text such as `#warning "error:"` or prose in a note as a
+# compiler failure.
+CLANG_ERROR = re.compile(
+    r'(?m)^(?:error:|(?:[^:\n]+:\d+:\d+:|clang(?:\+\+|-cl)?(?:\.exe)?:)\s*(?:fatal )?error:)'
+)
 
 
 def queries(scope):
@@ -75,8 +81,9 @@ def matches(tool, file, query, flags):
     diagnostics = run.stderr + run.stdout
     locations = re.findall(r'^(.+?:\d+:\d+): note: "root" binds here', run.stdout, re.M)
     count = re.search(r'^(\d+) match(?:es)?\.', run.stdout, re.M)
-    if run.returncode or re.search(r'\berror:', diagnostics) or not count or int(count[1]) != len(locations):
-        raise RuntimeError(f'{file}: clang-query failed\n{run.stderr}\n{run.stdout[-2000:]}')
+    if run.returncode or CLANG_ERROR.search(diagnostics) or not count or int(count[1]) != len(locations):
+        target = f'{file} [{" ".join(flags)}]'
+        raise RuntimeError(f'{target}: clang-query failed\n{run.stderr}\n{run.stdout[-2000:]}')
     return locations
 
 
@@ -105,6 +112,21 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
         if matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
             raise RuntimeError('clang-query self-test: expected a valid zero-match query')
 
+        warning = Path(directory) / 'warning.cc'
+        warning.write_text(
+            '#warning "error: this is source text, not a diagnostic level"\n'
+            '// error: this is a comment\n'
+            'const char *text = "error: normal";\n'
+            'int okay;\n'
+        )
+        if matches(tool, warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
+            raise RuntimeError('clang-query self-test: warning source unexpectedly matched')
+
+        path_warning = Path(directory) / 'path-error:valid.cc'
+        path_warning.write_text('int okay;\n')
+        if matches(tool, path_warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
+            raise RuntimeError('clang-query self-test: path containing error unexpectedly matched')
+
         broken = Path(directory) / 'broken.cc'
         broken.write_text('using U = unsigned; U broken(U x) { return x + ; }\n')
         try:
@@ -113,6 +135,23 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             pass
         else:
             raise RuntimeError('clang-query self-test: compiler diagnostics were not rejected')
+
+        missing = Path(directory) / 'missing.cc'
+        missing.write_text('#include "definitely-missing-header-7f3c.h"\nint broken;\n')
+        try:
+            matches(tool, missing, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError('clang-query self-test: missing-header diagnostic was not rejected')
+
+        try:
+            matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))',
+                    ['--', '-std=c++23', '-target=not-a-target'])
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError('clang-query self-test: invalid driver option was not rejected')
 
 
 def test_unsigned_add_sub(tool):
