@@ -48,7 +48,8 @@ struct CacheTable {
     // capacity == slot count, rounded UP to the next power of two (min 4).
     // Provisioning headroom (e.g. 2× the expected key count) is the
     // declarer's job — the table never grows.
-    static u32 round_capacity(u32 requested) {
+    // Zero means the rounded power of two is not representable in u32.
+    static constexpr u32 round_capacity(u32 requested) {
         u32 c = requested < kWays ? kWays : requested;
         c--;
         c |= c >> 1;
@@ -56,12 +57,14 @@ struct CacheTable {
         c |= c >> 4;
         c |= c >> 8;
         c |= c >> 16;
-        return c + 1;
+        // The low 32 bits of the unrepresentable capacity 2^32 give the zero sentinel.
+        return static_cast<u32>(static_cast<u64>(c) + 1u);
     }
 
     bool init(u32 requested_capacity, u64 mix_seed) {
         destroy();
         const u32 count = round_capacity(requested_capacity);
+        if (count == 0) return false;
         void* mem = ::mmap(nullptr,
                            static_cast<u64>(count) * sizeof(Slot),
                            PROT_READ | PROT_WRITE,

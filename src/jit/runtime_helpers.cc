@@ -1455,7 +1455,9 @@ rut::CacheTable* cache_table_for(rut::u32 instance, rut::u64 expected_identity =
     const rut::u32 cap = snap_caps[instance];
     if (cap == 0) return nullptr;
     rut::CacheTable& t = t_tables[instance];
-    if (t.slot_count != rut::CacheTable::round_capacity(cap)) {
+    const rut::u32 rounded = rut::CacheTable::round_capacity(cap);
+    if (rounded == 0) return nullptr;
+    if (t.slot_count != rounded) {
         if (!t.init(cap, snap_seed)) {
             // Fail VISIBLY (fixed-capacity axiom): a silent nullptr would
             // degrade every cache op on this shard to miss/no-op — for a

@@ -16,6 +16,10 @@ constexpr bool supports_hash_arithmetic =
     requires(T h) { h + h; } || requires(T h) { h - h; };
 static_assert(!supports_hash_arithmetic<decltype(CacheTable::Slot::key_hash)>);
 
+static_assert(CacheTable::round_capacity(1u << 31) == (1u << 31));
+static_assert(CacheTable::round_capacity((1u << 31) + 1u) == 0);
+static_assert(CacheTable::round_capacity(UINT32_MAX) == 0);
+
 TEST(cache_table, capacity_rounds_up_to_pow2_min_4) {
     CHECK_EQ(CacheTable::round_capacity(1), 4u);
     CHECK_EQ(CacheTable::round_capacity(4), 4u);
