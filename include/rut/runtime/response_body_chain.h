@@ -213,7 +213,10 @@ struct ResponseBodyChain {
         if (reuse)
             recycled = nullptr;
         else
-            node->dirty_end = previous_dirty > header_size() ? previous_dirty - header_size() : 0;
+            node->dirty_end = previous_dirty > header_size()
+                                  ? static_cast<u32>(static_cast<i64>(previous_dirty) -
+                                                     static_cast<i64>(header_size()))
+                                  : 0;
         node->next = nullptr;
         node->len = node->offset = 0;
         if (tail)
@@ -230,39 +233,46 @@ struct ResponseBodyChain {
     // append()/reserve_tail() failure or consume() of the tail.
     u8* write_ptr(const SlicePool& pool) const {
         (void)pool;
-        return tail ? payload(tail) + tail->len : nullptr;
+        return tail ? payload(tail) + static_cast<i64>(tail->len) : nullptr;
     }
     u32 write_avail(const SlicePool& pool) const {
-        return tail ? payload_capacity(pool, tail) - tail->len : 0;
+        return tail ? static_cast<u32>(static_cast<i64>(payload_capacity(pool, tail)) -
+                                       static_cast<i64>(tail->len))
+                    : 0;
     }
 
     // Allow one extra byte so a completion can report a body overrun. Once
     // already over the limit, there is no valid receive to arm.
     static constexpr u32 direct_receive_room(u32 received) {
-        return received <= kMaxBody ? kMaxBody - received + 1u : 0u;
+        return received <= kMaxBody
+                   ? static_cast<u32>(static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1)
+                   : 0u;
     }
 
     // Origin byte counts include bytes already sent. The live chain size alone
     // cannot tell whether another completion fits the declared response.
     static constexpr bool direct_receive_fits_body(u32 received, u32 declared, i32 result) {
         const u32 kLimit = declared < kMaxBody ? declared : kMaxBody;
-        return result > 0 && received <= kLimit && static_cast<u32>(result) <= kLimit - received;
+        return result > 0 && received <= kLimit &&
+               static_cast<u32>(result) <=
+                   static_cast<u32>(static_cast<i64>(kLimit) - static_cast<i64>(received));
     }
 
     // The retained header and this batch's newly copied bytes are both in the
     // observed buffer. Only previously accounted origin bytes can have been sent.
     static constexpr bool matches_buffered_length(
         u32 buffered, u32 header, u32 received, u32 completed, u32 newly_copied) {
-        return completed <= received && static_cast<u64>(buffered) + completed ==
-                                            static_cast<u64>(header) + received + newly_copied;
+        return completed <= received && static_cast<i64>(buffered) + static_cast<i64>(completed) ==
+                                            static_cast<i64>(header) + static_cast<i64>(received) +
+                                                static_cast<i64>(newly_copied);
     }
 
     // Record bytes a direct recv wrote straight into write_ptr()'s
     // destination (n <= the write_avail() observed when it was armed).
     constexpr void commit(u32 n) {
-        tail->len += n;
+        tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));
         if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;
-        size += n;
+        size = static_cast<u32>(static_cast<i64>(size) + static_cast<i64>(n));
     }
 
     // Record physical writes before deciding whether their CQE still owns a
@@ -285,7 +295,9 @@ private:
     void release_node(Node* node) {
         u32 dirty = node->dirty_end > node->len ? node->dirty_end : node->len;
         if (node == tail && tail_dirty_end > dirty) dirty = tail_dirty_end;
-        owner->free_response_body_written(reinterpret_cast<u8*>(node), header_size() + dirty);
+        const u32 extent =
+            static_cast<u32>(static_cast<i64>(header_size()) + static_cast<i64>(dirty));
+        owner->free_response_body_written(reinterpret_cast<u8*>(node), extent);
         if (node == tail) tail_dirty_end = 0;
     }
 };
