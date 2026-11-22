@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/io_timespec.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -119,6 +120,29 @@ consteval bool timer_batch_observation_contract() {
 
 static_assert(timer_batch_observation_contract(),
               "Response timer violates batch observation contract");
+
+// Cover each millisecond remainder at the bottom and top of
+// the input range, including the first carry into a whole second.
+consteval bool timer_timespec_contract() {
+    constexpr u32 kBases[] = {0, 1000, UINT32_MAX - 999};
+    for (const u32 kBase : kBases) {
+        for (u32 fraction = 0; fraction < 1000; ++fraction) {
+            const u32 kMs = kBase + fraction;
+            const auto kTime = io_timespec_from_ms(kMs);
+            if (kTime.tv_sec < 0 || kTime.tv_nsec < 0 || kTime.tv_nsec >= 1'000'000'000 ||
+                static_cast<u64>(kTime.tv_sec) * 1'000'000'000 + kTime.tv_nsec !=
+                    static_cast<u64>(kMs) * 1'000'000 ||
+                valid_positive_io_timespec(kTime) != (kMs != 0))
+                return false;
+        }
+    }
+    // Owner validation also handles timespecs not produced by this converter.
+    return valid_positive_io_timespec({0, 1}) && valid_positive_io_timespec({0, 999'999'999}) &&
+           !valid_positive_io_timespec({-1, 1}) && !valid_positive_io_timespec({1, -1}) &&
+           !valid_positive_io_timespec({1, 1'000'000'000});
+}
+
+static_assert(timer_timespec_contract(), "Timer timespec violates duration contract");
 
 }  // namespace
 }  // namespace rut
