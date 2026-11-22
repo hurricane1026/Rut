@@ -14445,18 +14445,21 @@ inline bool build_redirect_response(const Connection& conn,
         required = next;
         return true;
     };
+    auto add_i64 = [&](i64 n) { return n >= 0 && add(static_cast<u64>(n)); };
     static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
     static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
-    if (!add(9 + 3 + 1 + static_cast<u64>(policy.reason.len) + 2) ||
-        !add(10 + static_cast<u64>(policy.server.len)) || !add(8 + date_len) ||
-        !add(16 + static_cast<u64>(policy.content_type.len)) || !add(18 + body_len_digits) ||
-        !add((legacy_profile ? sizeof(kLocationPrefix) : sizeof(kFixedLocationPrefix)) - 1 +
-             authority_len) ||
-        !add(static_cast<u64>(policy.target_path.len) + location_query_len) ||
-        !add((legacy_profile ? sizeof(kLegacyTail) : sizeof(kFixedTail)) - 1) ||
-        !add(policy.body.len) || required > out_cap)
+    if (!add_i64(9 + 3 + 1 + static_cast<i64>(policy.reason.len) + 2) ||
+        !add_i64(10 + static_cast<i64>(policy.server.len)) || !add_i64(8 + date_len) ||
+        !add_i64(16 + static_cast<i64>(policy.content_type.len)) ||
+        !add_i64(18 + body_len_digits) ||
+        !add_i64(static_cast<i64>(legacy_profile ? sizeof(kLocationPrefix)
+                                                 : sizeof(kFixedLocationPrefix)) -
+                 1 + authority_len) ||
+        !add_i64(static_cast<i64>(policy.target_path.len) + location_query_len) ||
+        !add_i64(static_cast<i64>(legacy_profile ? sizeof(kLegacyTail) : sizeof(kFixedTail)) - 1) ||
+        !add_i64(policy.body.len) || required > out_cap)
         return false;
 
     u32 pos = 0;
