@@ -21,8 +21,8 @@ PROGRAM = '\n'.join(
     for name, expression in (
         ('upper', 'req.body.upper()'),
         ('lower', 'req.body | lower(_)'),
-        ('replace', 'replace(req.body, "aa", "X")'),
-        ('regex', 'req.body.replace(re"/+", "X")'),
+        ('replace', 'replace(req.body, req.header("X-Old").or("aa"), req.header("X-New").or("X"))'),
+        ('regex', 'req.body.replace(re"/+", req.header("X-New").or("X"))'),
     )
 ) + '\nroute POST "/trim" { let value = trim(req.body) return response(200, body: value) }\n'
 
@@ -71,16 +71,20 @@ def main():
                 for name in ('upper', 'lower', 'replace', 'regex', 'trim'):
                     for text in cases:
                         scenario = (name, len(text))
+                        old = b'aa' if len(text) % 2 else b'a'
+                        replacement = b'' if len(text) % 3 else b'$1\\'
+                        fields = {'X-Old': old.decode('ascii'),
+                                  'X-New': replacement.decode('ascii')}
                         expected = (text.upper() if name == 'upper' else
                                     text.lower() if name == 'lower' else
-                                    text.replace(b'aa', b'X') if name == 'replace' else
-                                    re.sub(rb'/+', b'X', text) if name == 'regex' else
+                                    text.replace(old, replacement) if name == 'replace' else
+                                    re.sub(rb'/+', lambda _: replacement, text) if name == 'regex' else
                                     text.strip(b' \t\n\r\v\f'))
-                        valid = name == 'trim' or (len(text) <= 8192 and
+                        valid = name == 'trim' or (len(text) <= 8192 and len(expected) <= 16384 and
                             (name != 'regex' or len(re.findall(rb'/+', text)) <= 64))
                         status = 200 if valid else 503
                         path = '/' + name
-                        connection.request('POST', path, body=text)
+                        connection.request('POST', path, body=text, headers=fields)
                         response = connection.getresponse()
                         body = response.read()
                         assert response.status == status, (scenario, response.status, body)
@@ -91,7 +95,7 @@ def main():
                         if previous_socket is not None:
                             assert connection.sock is previous_socket
                         previous_socket = connection.sock
-                        code, body = auth_h2_fixture.request(port, path, [], body=text, method='POST')
+                        code, body = auth_h2_fixture.request(port, path, list(fields.items()), body=text, method='POST')
                         assert code == status, (scenario, 'h2', code, body)
                         if valid:
                             assert body == expected, (scenario, 'h2', body[:100], expected[:100])
