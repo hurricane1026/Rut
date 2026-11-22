@@ -6588,7 +6588,7 @@ public:
             // pinned-header proofs and response accounting retain their
             // existing meaning.
             __builtin_memcpy(c.response_header_buf.write_ptr(),
-                             c.upstream_recv_buf.data() + raw_header_end,
+                             c.upstream_recv_buf.data() + static_cast<i64>(raw_header_end),
                              body_to_send);
             c.response_read_deadline_post_commit_phase =
                 ResponseReadDeadlinePostCommitPhase::CombinedSend;
@@ -6713,7 +6713,8 @@ public:
                 received = static_cast<u32>(static_cast<i64>(received) +
                                             static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_post_commit_origin_received = received;
-            } else if (received != c.buffered_response_len() - header) {
+            } else if (static_cast<i64>(received) !=
+                       static_cast<i64>(c.buffered_response_len()) - static_cast<i64>(header)) {
                 return false;
             }
             c.response_read_deadline_progress_generation = owner.deadline_generation;
@@ -7665,7 +7666,8 @@ public:
                                   static_cast<i64>(c.send_progress);
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
-               send.remaining == remaining - send.offset;
+               send.remaining ==
+                   static_cast<u32>(static_cast<i64>(remaining) - static_cast<i64>(send.offset));
     }
 
     // Leave SQ headroom for ordinary traffic and close-path cancellation.
@@ -8012,7 +8014,8 @@ public:
             return true;  // Reuse the existing kernel timespec owner.
         u64 rounded_ns = 0;
         if (__builtin_add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
-        u32 ms = static_cast<u32>(rounded_ns / 1'000'000ull);
+        const u64 ms_wide = rounded_ns / 1'000'000ull;
+        u32 ms = ms_wide > UINT32_MAX ? UINT32_MAX : static_cast<u32>(ms_wide);
         if (ms == 0) ms = 1;
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
@@ -8355,7 +8358,7 @@ public:
         u32 conn = 0;       // connection owning range `i`
         u32 counted = ~0u;  // last connection added to idle_trim_conns
         bool hard_failure = false;
-        for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
+        for (u32 base = 0; base < total;) {
             const i64 remaining = static_cast<i64>(total) - static_cast<i64>(base);
             const u32 chunk = remaining < static_cast<i64>(kIdleTrimIovChunk)
                                   ? static_cast<u32>(remaining)
@@ -8372,7 +8375,7 @@ public:
                 r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
             const u32 end = static_cast<u32>(static_cast<i64>(base) + static_cast<i64>(chunk));
             for (u32 i = base; i < end; i++) {
-                while (idle_trim_first[conn + 1] <= i) ++conn;
+                while (idle_trim_first[static_cast<i64>(conn) + 1] <= i) ++conn;
                 bool ok = static_cast<i64>(i) - static_cast<i64>(base) < static_cast<i64>(advised);
                 if (!ok) {
                     ok = idle_trim_advise_slice(idle_trim_iov[i]);
@@ -8385,6 +8388,7 @@ public:
                     ++idle_trim_conns;
                 }
             }
+            base = end;
         }
         // The per-slice fallback for this tick is done (nothing queued is left
         // un-advised). A batch that fails hard would otherwise be retried, and its
@@ -8400,14 +8404,16 @@ public:
     // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
     // since they were armed. Returns false once a per-tick budget is exhausted.
     bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
-        ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
+        ListNode* head =
+            &timer.slots[expiry & static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
         if (last == head) return true;
         const u64 node_offset = TimerWheel::timer_node_offset();
         ListNode* node = head->next;
         for (;;) {
             if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
-            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
+            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) -
+                                                    static_cast<i64>(node_offset));
             if (c->idle_trim_examined) return true;  // reached the examined region
             ListNode* const next = node->next;
             const bool at_end = node == last;
@@ -8881,9 +8887,10 @@ public:
                         const bool valid_bounded_terminal_custody =
                             custody_owner_index != 0 &&
                             custody_owner_index <= response_read_batch_owner_count &&
-                            response_read_batch_owners[custody_owner_index - 1u]
+                            response_read_batch_owners[static_cast<i64>(custody_owner_index) - 1]
                                 .bounded_terminal_custody &&
-                            response_read_batch_owners[custody_owner_index - 1u].valid &&
+                            response_read_batch_owners[static_cast<i64>(custody_owner_index) - 1]
+                                .valid &&
                             ev.result > 0 && ev.copy_witness == IoEventCopyWitness::Full;
                         const bool deadline_surplus =
                             ev.result > 0 &&
