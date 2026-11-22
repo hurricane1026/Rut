@@ -42,6 +42,15 @@ MUTATIONS = {
         entries[i] = entries[--size];
         ++kRemoved;
         if (i < size) {
+            u32 sift = i;
+            while (sift > 0) {
+                const u32 parent = (sift - 1) / 2;
+                if (entries[parent].deadline_ns <= entries[sift].deadline_ns) break;
+                const Entry saved = entries[parent];
+                entries[parent] = entries[sift];
+                entries[sift] = saved;
+                sift = parent;
+            }
             sift_down(entries, size, i);
         }
     }
