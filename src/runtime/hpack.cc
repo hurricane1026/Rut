@@ -445,10 +445,11 @@ void dyn_add(DynamicTable& d, Str name, Str value) {
 
 bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     if (i >= d.nent) return false;
-    const DynamicTable::Entry& e = d.ents[d.nent - 1 - i];
-    name->ptr = reinterpret_cast<const char*>(d.buf + e.off);
+    const i64 kEntry = static_cast<i64>(d.nent) - 1 - static_cast<i64>(i);
+    const DynamicTable::Entry& e = d.ents[kEntry];
+    name->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off));
     name->len = e.nlen;
-    value->ptr = reinterpret_cast<const char*>(d.buf + e.off + e.nlen);
+    value->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + e.nlen);
     value->len = e.vlen;
     return true;
 }
@@ -457,27 +458,27 @@ bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
 bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
     if (idx <= kStaticCount) {
-        const StaticEntry& e = kStatic[idx - 1];
+        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
         *name = {e.name, e.nlen};
         *value = {e.value, e.vlen};
         return true;
     }
-    return dyn_get(d, idx - kStaticCount - 1, name, value);
+    return dyn_get(d, static_cast<u32>(static_cast<i64>(idx) - kStaticCount - 1), name, value);
 }
 
 bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     Str value;
     if (idx <= kStaticCount) {
         if (idx == 0) return false;
-        const StaticEntry& e = kStatic[idx - 1];
+        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
         *name = {e.name, e.nlen};
         return true;
     }
-    return dyn_get(d, idx - kStaticCount - 1, name, &value);
+    return dyn_get(d, static_cast<u32>(static_cast<i64>(idx) - kStaticCount - 1), name, &value);
 }
 
 i32 static_find_full(Str name, Str value) {
-    for (u32 i = 0; i < kStaticCount; i++)
+    for (i64 i = 0; i < kStaticCount; i++)
         if (str_eq(name, kStatic[i].name, kStatic[i].nlen) &&
             str_eq(value, kStatic[i].value, kStatic[i].vlen))
             return static_cast<i32>(i + 1);
@@ -485,7 +486,7 @@ i32 static_find_full(Str name, Str value) {
 }
 
 i32 static_find_name(Str name) {
-    for (u32 i = 0; i < kStaticCount; i++)
+    for (i64 i = 0; i < kStaticCount; i++)
         if (str_eq(name, kStatic[i].name, kStatic[i].nlen)) return static_cast<i32>(i + 1);
     return 0;
 }
@@ -494,19 +495,20 @@ i32 static_find_name(Str name) {
 // matching entry (dynamic indices follow the 61 static entries; newest = 62),
 // or 0. j counts from the newest entry, matching the protocol index order.
 i32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
-    for (u32 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
-        const Str kEv{reinterpret_cast<const char*>(d.buf + e.off + e.nlen), e.vlen};
+    for (i64 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
+        const Str kEv{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + e.nlen),
+                      e.vlen};
         if (kEn.eq(name) && kEv.eq(value)) return static_cast<i32>(kStaticCount + 1 + j);
     }
     return 0;
 }
 
 i32 dyn_find_name(const DynamicTable& d, Str name) {
-    for (u32 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
+    for (i64 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
         if (kEn.eq(name)) return static_cast<i32>(kStaticCount + 1 + j);
     }
     return 0;
@@ -680,13 +682,13 @@ u32 Encoder::emit_pending_size_update(u8* out) {
     // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
     // Signal the smallest size reached first (so the decoder evicts identically),
     // then the final size when it differs.
-    u32 n = 0;
+    i64 n = 0;
     if (pending_min_size >= 0 && pending_min_size != pending_size_update)
-        n += encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20);
-    n += encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20);
+        n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20));
+    n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20));
     pending_size_update = -1;
     pending_min_size = -1;
-    return n;
+    return static_cast<u32>(n);
 }
 
 }  // namespace rut::hpack
