@@ -25,7 +25,7 @@ static u64 raw_monotonic_us() {
 #else
     if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) return 1;
 #endif
-    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    u64 now = static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
     return now == 0 ? 1 : now;
 }
 
@@ -34,7 +34,7 @@ static thread_local u64 g_last_monotonic_us = raw_monotonic_us();
 u64 realtime_us() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
-    return static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    return static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
 }
 
 u64 monotonic_us() {
@@ -43,7 +43,7 @@ u64 monotonic_us() {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return g_last_monotonic_us;
     }
-    u64 now = static_cast<u64>(ts.tv_sec) * 1000000ULL + static_cast<u64>(ts.tv_nsec) / 1000ULL;
+    u64 now = static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
     if (now == 0) now = 1;
     const u64 result = now < g_last_monotonic_us ? g_last_monotonic_us : now;
     g_last_monotonic_us = result;
@@ -55,7 +55,7 @@ u64 monotonic_ns() {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return g_last_monotonic_us * 1000ULL;  // best-effort fallback
     }
-    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ULL + static_cast<u64>(ts.tv_nsec);
+    return static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec);
 }
 
 static u32 write_u64_dec(char* buf, u64 val) {
@@ -64,22 +64,22 @@ static u32 write_u64_dec(char* buf, u64 val) {
         return 1;
     }
     char tmp[20];
-    u32 n = 0;
+    i64 n = 0;
     while (val > 0) {
-        tmp[n++] = static_cast<char>('0' + val % 10);
+        tmp[n++] = static_cast<char>('0' + static_cast<i64>(val % 10));
         val /= 10;
     }
-    for (u32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
-    return n;
+    for (i64 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    return static_cast<u32>(n);
 }
 
 static u32 copy_str(char* dst, const char* src) {
-    u32 n = 0;
+    i64 n = 0;
     while (src[n]) {
         dst[n] = src[n];
         n++;
     }
-    return n;
+    return static_cast<u32>(n);
 }
 
 static const char* method_str(u8 m) {
@@ -116,38 +116,38 @@ static u32 format_timestamp(char* buf, u64 timestamp_us) {
     time_t t = static_cast<time_t>(secs);
     gmtime_r(&t, &tm);
 
-    u32 w = 0;
+    i64 w = 0;
     u32 year = static_cast<u32>(tm.tm_year + 1900);
-    buf[w++] = static_cast<char>('0' + year / 1000);
-    buf[w++] = static_cast<char>('0' + (year / 100) % 10);
-    buf[w++] = static_cast<char>('0' + (year / 10) % 10);
-    buf[w++] = static_cast<char>('0' + year % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(year / 1000));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 100) % 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 10) % 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(year % 10));
     buf[w++] = '-';
     u32 mon = static_cast<u32>(tm.tm_mon + 1);
-    buf[w++] = static_cast<char>('0' + mon / 10);
-    buf[w++] = static_cast<char>('0' + mon % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(mon / 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(mon % 10));
     buf[w++] = '-';
     u32 day = static_cast<u32>(tm.tm_mday);
-    buf[w++] = static_cast<char>('0' + day / 10);
-    buf[w++] = static_cast<char>('0' + day % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(day / 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(day % 10));
     buf[w++] = 'T';
     u32 hour = static_cast<u32>(tm.tm_hour);
-    buf[w++] = static_cast<char>('0' + hour / 10);
-    buf[w++] = static_cast<char>('0' + hour % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(hour / 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(hour % 10));
     buf[w++] = ':';
     u32 min = static_cast<u32>(tm.tm_min);
-    buf[w++] = static_cast<char>('0' + min / 10);
-    buf[w++] = static_cast<char>('0' + min % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(min / 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(min % 10));
     buf[w++] = ':';
     u32 sec = static_cast<u32>(tm.tm_sec);
-    buf[w++] = static_cast<char>('0' + sec / 10);
-    buf[w++] = static_cast<char>('0' + sec % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(sec / 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(sec % 10));
     buf[w++] = '.';
-    buf[w++] = static_cast<char>('0' + millis / 100);
-    buf[w++] = static_cast<char>('0' + (millis / 10) % 10);
-    buf[w++] = static_cast<char>('0' + millis % 10);
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(millis / 100));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>((millis / 10) % 10));
+    buf[w++] = static_cast<char>('0' + static_cast<i64>(millis % 10));
     buf[w++] = 'Z';
-    return w;
+    return static_cast<u32>(w);
 }
 
 // Format IPv4 from network byte order.
@@ -155,15 +155,15 @@ static u32 format_timestamp(char* buf, u64 timestamp_us) {
 // Access raw bytes to be endian-safe (works on both LE and BE hosts).
 static u32 format_ipv4(char* buf, u32 addr) {
     const auto* bytes = reinterpret_cast<const u8*>(&addr);
-    u32 w = 0;
-    for (u32 i = 0; i < 4; i++) {
+    i64 w = 0;
+    for (i64 i = 0; i < 4; i++) {
         if (i > 0) buf[w++] = '.';
         u8 octet = bytes[i];
         if (octet >= 100) buf[w++] = static_cast<char>('0' + octet / 100);
         if (octet >= 10) buf[w++] = static_cast<char>('0' + (octet / 10) % 10);
         buf[w++] = static_cast<char>('0' + octet % 10);
     }
-    return w;
+    return static_cast<u32>(w);
 }
 
 // Format: "2026-03-23T15:30:00.123Z GET /path 200 1234us 256 1024 10.0.0.5 s=3\n"
@@ -173,29 +173,29 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     static constexpr char kOverLimitPrefix[] = "<request-target-over-limit:";
     static constexpr char kUnavailable[] = "<request-target-unavailable>";
     static constexpr char kInvalid[] = "<request-target-invalid>";
-    static constexpr u32 kWorstCaseLine = 24u + 1u + 7u + 1u + kAccessLogCompleteTargetMax + 1u +
-                                          5u + 1u + 10u + 3u + 10u + 1u + 10u + 1u + 15u + 1u +
-                                          24u + 1u + 10u + 2u + 3u + 3u + 16u + 1u;
-    static_assert(kWorstCaseLine <= kAccessLogTextLineCapacity);
+    static constexpr i64 kWorstCaseLine =
+        24 + 1 + 7 + 1 + static_cast<i64>(kAccessLogCompleteTargetMax) + 1 + 5u + 1u + 10u + 3u +
+        10u + 1u + 10u + 1u + 15u + 1u + 24u + 1u + 10u + 2u + 3u + 3u + 16u + 1u;
+    static_assert(kWorstCaseLine <= static_cast<i64>(kAccessLogTextLineCapacity));
 
     char line[kAccessLogTextLineCapacity];
-    u32 w = 0;
+    i64 w = 0;
 
-    w += format_timestamp(line + w, entry.timestamp_us);
+    w += static_cast<i64>(format_timestamp(line + w, entry.timestamp_us));
     line[w++] = ' ';
-    w += copy_str(line + w, method_str(entry.method));
+    w += static_cast<i64>(copy_str(line + w, method_str(entry.method)));
     line[w++] = ' ';
 
-    const auto invalid_target = [&] { w += copy_str(line + w, kInvalid); };
+    const auto invalid_target = [&] { w += static_cast<i64>(copy_str(line + w, kInvalid)); };
     switch (entry.target_state) {
         case AccessLogTargetState::LegacyNullTerminated: {
             if (entry.target_length != 0u) {
                 invalid_target();
                 break;
             }
-            u32 path_len = 0;
+            i64 path_len = 0;
             while (path_len < kAccessLogLegacyTargetWidth && entry.path[path_len]) path_len++;
-            for (u32 i = 0; i < path_len; i++) line[w++] = entry.path[i];
+            for (i64 i = 0; i < path_len; i++) line[w++] = entry.path[i];
             break;
         }
         case AccessLogTargetState::Complete:
@@ -203,7 +203,8 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
                 invalid_target();
                 break;
             }
-            for (u32 i = 0; i < entry.target_length; i++) line[w++] = entry.path[i];
+            for (i64 i = 0; i < static_cast<i64>(entry.target_length); i++)
+                line[w++] = entry.path[i];
             break;
         case AccessLogTargetState::OverLimit:
             if (entry.target_length <= kAccessLogCompleteTargetMax ||
@@ -211,15 +212,15 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
                 invalid_target();
                 break;
             }
-            w += copy_str(line + w, kOverLimitPrefix);
-            w += write_u64_dec(line + w, entry.target_length);
+            w += static_cast<i64>(copy_str(line + w, kOverLimitPrefix));
+            w += static_cast<i64>(write_u64_dec(line + w, entry.target_length));
             line[w++] = '>';
             break;
         case AccessLogTargetState::Unavailable:
             if (entry.target_length != 0u)
                 invalid_target();
             else
-                w += copy_str(line + w, kUnavailable);
+                w += static_cast<i64>(copy_str(line + w, kUnavailable));
             break;
         case AccessLogTargetState::Invalid:
         default:
@@ -228,48 +229,50 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     }
     line[w++] = ' ';
 
-    w += write_u64_dec(line + w, entry.status);
+    w += static_cast<i64>(write_u64_dec(line + w, entry.status));
     line[w++] = ' ';
-    w += write_u64_dec(line + w, entry.duration_us);
-    w += copy_str(line + w, "us ");
-    w += write_u64_dec(line + w, entry.req_size);
+    w += static_cast<i64>(write_u64_dec(line + w, entry.duration_us));
+    w += static_cast<i64>(copy_str(line + w, "us "));
+    w += static_cast<i64>(write_u64_dec(line + w, entry.req_size));
     line[w++] = ' ';
-    w += write_u64_dec(line + w, entry.resp_size);
+    w += static_cast<i64>(write_u64_dec(line + w, entry.resp_size));
     line[w++] = ' ';
-    w += format_ipv4(line + w, entry.addr);
+    w += static_cast<i64>(format_ipv4(line + w, entry.addr));
 
     // Upstream (if present)
     if (entry.upstream[0] != '\0') {
         line[w++] = ' ';
-        u32 up_len = 0;
+        i64 up_len = 0;
         while (up_len < sizeof(entry.upstream) && entry.upstream[up_len]) up_len++;
-        for (u32 i = 0; i < up_len; i++) line[w++] = entry.upstream[i];
+        for (i64 i = 0; i < up_len; i++) line[w++] = entry.upstream[i];
         line[w++] = ' ';
-        w += write_u64_dec(line + w, entry.upstream_us);
-        w += copy_str(line + w, "us");
+        w += static_cast<i64>(write_u64_dec(line + w, entry.upstream_us));
+        w += static_cast<i64>(copy_str(line + w, "us"));
     }
 
-    w += copy_str(line + w, " s=");
-    w += write_u64_dec(line + w, entry.shard_id);
+    w += static_cast<i64>(copy_str(line + w, " s="));
+    w += static_cast<i64>(write_u64_dec(line + w, entry.shard_id));
     if (entry.grpc_status_plus_one != 0 && entry.grpc_status_plus_one <= 17) {
-        w += copy_str(line + w, " grpc_status=");
-        w += write_u64_dec(line + w, entry.grpc_status_plus_one - 1u);
+        w += static_cast<i64>(copy_str(line + w, " grpc_status="));
+        w += static_cast<i64>(write_u64_dec(
+            line + w, static_cast<u64>(static_cast<i64>(entry.grpc_status_plus_one) - 1)));
     }
     line[w++] = '\n';
-    if (w > sizeof(line) || buf == nullptr || buf_size < w) return 0;
-    for (u32 i = 0; i < w; i++) buf[i] = line[i];
-    return w;
+    if (w > static_cast<i64>(sizeof(line)) || buf == nullptr || static_cast<i64>(buf_size) < w)
+        return 0;
+    for (i64 i = 0; i < w; i++) buf[i] = line[i];
+    return static_cast<u32>(w);
 }
 
 u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
                                                     char* buf,
                                                     u32 buf_size) {
     char line[kAccessLogDownstreamRequestBytesLineCapacity];
-    u32 w = write_u64_dec(line, entry.req_size);
+    i64 w = write_u64_dec(line, entry.req_size);
     line[w++] = '\n';
-    if (buf == nullptr || buf_size < w) return 0;
-    for (u32 i = 0; i < w; i++) buf[i] = line[i];
-    return w;
+    if (buf == nullptr || static_cast<i64>(buf_size) < w) return 0;
+    for (i64 i = 0; i < w; i++) buf[i] = line[i];
+    return static_cast<u32>(w);
 }
 
 u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
@@ -318,30 +321,33 @@ u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
         for (char byte : host.value)
             if (byte != '\0') return 0u;
     } else {
-        for (u32 i = host.observed_length; i < kAccessLogDownstreamHostMax; i++)
+        for (i64 i = host.observed_length; i < static_cast<i64>(kAccessLogDownstreamHostMax); i++)
             if (host.value[i] != '\0') return 0u;
     }
 
     static constexpr char kHex[] = "0123456789abcdef";
-    static_assert(sizeof("host1 request_bytes=") - 1u + 10u + sizeof(" status=") - 1u + 5u +
-                      sizeof(" host_state=") - 1u + sizeof("unavailable") - 1u +
-                      sizeof(" host_length=") - 1u + 10u + sizeof(" host_hex=") - 1u +
-                      static_cast<u64>(2u) * kAccessLogDownstreamHostMax +
-                      sizeof(" upstream_history=unavailable\n") - 1u <=
-                  kAccessLogDownstreamHostLineCapacity);
+    static_assert(static_cast<i64>(sizeof("host1 request_bytes=")) - 1 + 10 +
+                      static_cast<i64>(sizeof(" status=")) - 1 + 5 +
+                      static_cast<i64>(sizeof(" host_state=")) - 1 +
+                      static_cast<i64>(sizeof("unavailable")) - 1 +
+                      static_cast<i64>(sizeof(" host_length=")) - 1 + 10 +
+                      static_cast<i64>(sizeof(" host_hex=")) - 1 +
+                      2 * static_cast<i64>(kAccessLogDownstreamHostMax) +
+                      static_cast<i64>(sizeof(" upstream_history=unavailable\n")) - 1 <=
+                  static_cast<i64>(kAccessLogDownstreamHostLineCapacity));
     char line[kAccessLogDownstreamHostLineCapacity];
-    u32 w = 0u;
-    w += copy_str(line + w, "host1 request_bytes=");
-    w += write_u64_dec(line + w, entry.req_size);
-    w += copy_str(line + w, " status=");
-    w += write_u64_dec(line + w, entry.status);
-    w += copy_str(line + w, " host_state=");
-    w += copy_str(line + w, state_name);
-    w += copy_str(line + w, " host_length=");
-    w += write_u64_dec(line + w, host.observed_length);
-    w += copy_str(line + w, " host_hex=");
+    i64 w = 0;
+    w += static_cast<i64>(copy_str(line + w, "host1 request_bytes="));
+    w += static_cast<i64>(write_u64_dec(line + w, entry.req_size));
+    w += static_cast<i64>(copy_str(line + w, " status="));
+    w += static_cast<i64>(write_u64_dec(line + w, entry.status));
+    w += static_cast<i64>(copy_str(line + w, " host_state="));
+    w += static_cast<i64>(copy_str(line + w, state_name));
+    w += static_cast<i64>(copy_str(line + w, " host_length="));
+    w += static_cast<i64>(write_u64_dec(line + w, host.observed_length));
+    w += static_cast<i64>(copy_str(line + w, " host_hex="));
     if (host.state == AccessLogDownstreamHostState::Complete) {
-        for (u32 i = 0; i < host.observed_length; i++) {
+        for (i64 i = 0; i < static_cast<i64>(host.observed_length); i++) {
             const u8 byte = static_cast<u8>(host.value[i]);
             line[w++] = kHex[byte >> 4u];
             line[w++] = kHex[byte & 0x0fu];
@@ -349,10 +355,10 @@ u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
     } else {
         line[w++] = '-';
     }
-    w += copy_str(line + w, " upstream_history=unavailable\n");
-    if (w > sizeof(line) || buf_size < w) return 0u;
-    for (u32 i = 0; i < w; i++) buf[i] = line[i];
-    return w;
+    w += static_cast<i64>(copy_str(line + w, " upstream_history=unavailable\n"));
+    if (w > static_cast<i64>(sizeof(line)) || static_cast<i64>(buf_size) < w) return 0u;
+    for (i64 i = 0; i < w; i++) buf[i] = line[i];
+    return static_cast<u32>(w);
 }
 
 // --- write_with_poll ---
@@ -366,9 +372,9 @@ u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
 static bool write_with_poll(
     i32 fd, const u8* buf, u32 len, const std::atomic<bool>* running_flag, u32 max_stall = 50) {
     static constexpr u32 kChunkSize = 4096;  // bounded write size
-    u32 written = 0;
-    u32 stall_polls = 0;
-    while (written < len) {
+    i64 written = 0;
+    i64 stall_polls = 0;
+    while (written < static_cast<i64>(len)) {
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLOUT;
@@ -377,7 +383,7 @@ static bool write_with_poll(
 
         if (rc == 0) {
             if (!running_flag->load(std::memory_order_relaxed)) {
-                if (++stall_polls >= max_stall) return false;
+                if (++stall_polls >= static_cast<i64>(max_stall)) return false;
             }
             continue;
         }
@@ -390,11 +396,11 @@ static bool write_with_poll(
         }
 
         // Write in bounded chunks so we return to poll promptly.
-        u32 to_write = len - written;
-        if (to_write > kChunkSize) to_write = kChunkSize;
+        i64 to_write = static_cast<i64>(len) - written;
+        if (to_write > static_cast<i64>(kChunkSize)) to_write = kChunkSize;
         ssize_t n = ::write(fd, buf + written, to_write);
         if (n > 0) {
-            written += static_cast<u32>(n);
+            written += static_cast<i64>(n);
             stall_polls = 0;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
             continue;  // transient — re-poll
@@ -417,12 +423,14 @@ bool AccessLogRing::push(const AccessLogEntry& entry) {
     u32 wp = write_pos.load(std::memory_order_relaxed);
     u32 rp = read_pos.load(std::memory_order_acquire);
 
-    if (wp - rp >= kCapacity) {
+    const i64 distance =
+        static_cast<i64>(static_cast<u32>(static_cast<i64>(wp) - static_cast<i64>(rp)));
+    if (distance >= static_cast<i64>(kCapacity)) {
         return false;  // full — drop this entry
     }
 
     entries[wp & kMask] = entry;
-    write_pos.store(wp + 1, std::memory_order_release);
+    write_pos.store(static_cast<u32>(static_cast<i64>(wp) + 1), std::memory_order_release);
     return true;
 }
 
@@ -433,14 +441,14 @@ bool AccessLogRing::pop(AccessLogEntry& out) {
     if (rp == wp) return false;  // empty
 
     out = entries[rp & kMask];
-    read_pos.store(rp + 1, std::memory_order_release);
+    read_pos.store(static_cast<u32>(static_cast<i64>(rp) + 1), std::memory_order_release);
     return true;
 }
 
 u32 AccessLogRing::available() const {
     u32 wp = write_pos.load(std::memory_order_acquire);
     u32 rp = read_pos.load(std::memory_order_relaxed);
-    return wp - rp;
+    return static_cast<u32>(static_cast<i64>(wp) - static_cast<i64>(rp));
 }
 
 void AccessLogFlusher::init(i32 fd, bool compress_enabled, i32 level, u32 interval_ms) {
@@ -578,8 +586,8 @@ u32 AccessLogFlusher::flush_once() {
     // Batch buffer: accumulate text lines, then write (or compress+write).
     static constexpr u32 kBatchSize = 65536;  // 64KB text batch
     char batch[kBatchSize];
-    u32 batch_len = 0;
-    u32 total = 0;
+    i64 batch_len = 0;
+    i64 total = 0;
     AccessLogEntry entry;
     char line[kAccessLogTextLineCapacity];
 
@@ -588,14 +596,15 @@ u32 AccessLogFlusher::flush_once() {
             u32 n = format_access_log_text(entry, line, sizeof(line));
             if (n > 0) {
                 // Flush batch if this line won't fit.
-                if (static_cast<u64>(batch_len) + n > kBatchSize) {
-                    if (!flush_batch(reinterpret_cast<const u8*>(batch), batch_len)) {
-                        return total;
+                if (batch_len + static_cast<i64>(n) > static_cast<i64>(kBatchSize)) {
+                    if (!flush_batch(reinterpret_cast<const u8*>(batch),
+                                     static_cast<u32>(batch_len))) {
+                        return static_cast<u32>(total);
                     }
                     batch_len = 0;
                 }
-                for (u32 j = 0; j < n; j++) batch[batch_len + j] = line[j];
-                batch_len += n;
+                for (i64 j = 0; j < static_cast<i64>(n); j++) batch[batch_len + j] = line[j];
+                batch_len += static_cast<i64>(n);
             }
             total++;
         }
@@ -603,11 +612,11 @@ u32 AccessLogFlusher::flush_once() {
 
     // Flush remaining.
     if (batch_len > 0) {
-        if (!flush_batch(reinterpret_cast<const u8*>(batch), batch_len)) {
-            return total;
+        if (!flush_batch(reinterpret_cast<const u8*>(batch), static_cast<u32>(batch_len))) {
+            return static_cast<u32>(total);
         }
     }
-    return total;
+    return static_cast<u32>(total);
 }
 
 void* AccessLogFlusher::thread_entry(void* arg) {

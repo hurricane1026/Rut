@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/ usr / bin / env python3
 """Require concrete timer tests to reject isolated production header mutations.
 
 Uses an existing Ninja build's compile/link commands and pinned libraries.
@@ -18,40 +18,33 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 MUTATIONS = {
     "wheel_off_by_one": ("rut/runtime/timer_wheel.h",
-                         "&slots[cursor & (kSlots - 1)]",
-                         "&slots[(cursor + 1) & (kSlots - 1)]"),
+                         "&slots[slot_after(0)]",
+                         "&slots[slot_after(1)]"),
     "heap_scan_sifts_before_compacting": (
-        "rut/runtime/yield_heap.h",
-        """    u32 kept = 0;
-    for (u32 i = 0; i < size; ++i) {
-        if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
-    }
-    const u32 kRemoved = size - kept;
-    size = kept;
-    if (kRemoved > 0) {
-        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
-    }
-    return kRemoved;""",
-        """    u32 removed = 0;
-    u32 i = 0;
-    while (i < size) {
-        if (entries[i].conn_id != conn_id) { ++i; continue; }
-        entries[i] = entries[--size];
-        ++removed;
-        if (i < size) {
-            u32 j = i;
-            while (j > 0) {
-                u32 parent = (j - 1) / 2;
-                if (entries[parent].deadline_ns <= entries[j].deadline_ns) break;
-                const Entry saved = entries[parent];
-                entries[parent] = entries[j];
-                entries[j] = saved;
-                j = parent;
-            }
-            sift_down(entries, size, i);
+        "rut/runtime/epoll_event_loop.h",
+        """        u32 kept = 0;
+        for (u32 i = 0; i < size; ++i) {
+    if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
         }
+        const u32 removed = size - kept;
+        size = kept;
+        if (removed > 0) {
+    for (u32 i = size / 2; i > 0; --i) sift_down(i - 1);
+        }""",
+        """        u32 removed = 0;
+        u32 i = 0;
+        while (i < size) {
+    if (entries[i].conn_id != conn_id) {
+        ++i;
+        continue;
     }
-    return removed;"""),
+    entries[i] = entries[--size];
+    ++removed;
+    if (i < size) {
+        sift_up(i);
+        sift_down(i);
+    }
+        }"""),
     "stale_uring_disarms_successor": ("rut/runtime/iouring_event_loop.h",
                                       "if (matching_generation) {", "if (true) {"),
 }
@@ -75,7 +68,7 @@ def main() -> int:
     commands = subprocess.check_output([ninja, "-C", str(build), "-t", "commands", "test_timer_model"], text=True)
     link_line = next(line for line in commands.splitlines() if " -o tests/test_timer_model " in line)
     link_base = shlex.split(link_line)
-    # CMake's Ninja link rule wraps one compiler invocation with ': && ... && :'.
+#CMake 's Ninja link rule wraps one compiler invocation with ' : &&...&& :'.
     if link_base[:2] != [":", "&&"] or link_base[-2:] != ["&&", ":"]:
         raise RuntimeError("unrecognized CMake/Ninja link wrapper")
     link_base = link_base[2:-2]
