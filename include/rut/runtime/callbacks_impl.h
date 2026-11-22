@@ -327,6 +327,7 @@ inline u32 select_backend(u16 upstream_id,
 }
 
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us) {
+    if (upstream_id >= RouteConfig::kMaxUpstreams) return 0;
     return select_backend(upstream_id, backend_count, now_us, nullptr);
 }
 
