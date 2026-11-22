@@ -21,7 +21,7 @@ ZERO = 'ignoringParenImpCasts(integerLiteral(equals(0)))'
 # compiler failure.
 CLANG_ERROR = re.compile(
     r'(?m)^(?:'
-    r'.+:\d+:\d+:\s*(?:fatal )?error:'
+    r'(?!\s|//|#|["\']).+:\d+:\d+:\s*(?:fatal )?error:'
     r'|clang[^:\n]*:\s*(?:fatal )?error:'
     r'|fatal error:'
     r'|error:)'
@@ -156,6 +156,8 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             '#warning "error: this is source text, not a diagnostic level"\n'
             '// error: this is a comment\n'
             'const char *text = "error: normal";\n'
+            'const char *nested = "path.cc:42:12: error: nested text";\n'
+            '  // path.cc:42:12: error: indented source excerpt\n'
             'int okay;\n'
         )
         if matches(tool, warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
