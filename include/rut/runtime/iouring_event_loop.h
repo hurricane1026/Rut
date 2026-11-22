@@ -3336,7 +3336,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf =
+                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
         return &conns[id];
     }
 
@@ -3519,7 +3520,10 @@ public:
         if (recv_rearm_count == 0) return;
         const u32 pinned = backend.cq_unharvested();
         if (!force && pinned >= kProvidedBufCount / 2) return;
-        u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
+        u32 budget =
+            pinned < kProvidedBufCount
+                ? static_cast<u32>(static_cast<i64>(kProvidedBufCount) - static_cast<i64>(pinned))
+                : 0;
         if (budget == 0 && force) budget = 1;  // the backstop always makes progress
         const u32 words = static_cast<u32>((static_cast<i64>(slots_initialized) + 63) >> 6);
         if (words == 0) return;
