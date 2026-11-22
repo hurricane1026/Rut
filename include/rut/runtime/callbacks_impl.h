@@ -14803,14 +14803,18 @@ inline bool build_upstream_order_response_headers(
                (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
             start++;
         u32 end = h.raw_value.len;
-        while (end > start && (h.raw_value.ptr[end - 1] == ' ' || h.raw_value.ptr[end - 1] == '\t'))
+        while (end > start && (h.raw_value.ptr[static_cast<i64>(end) - 1] == ' ' ||
+                               h.raw_value.ptr[static_cast<i64>(end) - 1] == '\t'))
             end--;
         for (u32 c = 0; c < name.len; c++) {
             char lower = name.ptr[c];
             if (lower >= 'A' && lower <= 'Z') lower = static_cast<char>(lower + 32);
             if (!put(&lower, 1)) return false;
         }
-        if (!put_lit(": ") || !put(h.raw_value.ptr + start, end - start) || !put_lit("\r\n"))
+        if (!put_lit(": ") ||
+            !put(h.raw_value.ptr + static_cast<i64>(start),
+                 static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))) ||
+            !put_lit("\r\n"))
             return false;
     }
     if (!seen_date) {
@@ -14850,7 +14854,7 @@ inline bool build_strict_response_headers(
     bool draining = false) {
     if (conn.response_policy_id == 0 || conn.response_policy_id > config.response_policy_count)
         return false;
-    const auto& policy = config.response_policies[conn.response_policy_id - 1];
+    const auto& policy = config.response_policies[static_cast<i64>(conn.response_policy_id) - 1];
     if (policy.header_order == ResponsePolicyHeaderOrder::Upstream)
         return build_upstream_order_response_headers(conn, config, resp, purpose, draining);
     const bool strict_no_body_metadata =
@@ -14937,7 +14941,9 @@ inline bool build_strict_response_headers(
         while (start < h.raw_value.len &&
                (h.raw_value.ptr[start] == ' ' || h.raw_value.ptr[start] == '\t'))
             start++;
-        if (!put(h.raw_value.ptr + start, h.raw_value.len - start) || !put_lit("\r\n"))
+        if (!put(h.raw_value.ptr + static_cast<i64>(start),
+                 static_cast<u32>(static_cast<i64>(h.raw_value.len) - static_cast<i64>(start))) ||
+            !put_lit("\r\n"))
             return false;
     }
     return put_lit("\r\n");
