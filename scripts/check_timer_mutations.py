@@ -1,4 +1,4 @@
-#!/ usr / bin / env python3
+#!/usr/bin/env python3
 """Require concrete timer tests to reject isolated production header mutations.
 
 Uses an existing Ninja build's compile/link commands and pinned libraries.
@@ -21,29 +21,28 @@ MUTATIONS = {
                          "&slots[slot_after(0)]",
                          "&slots[slot_after(1)]"),
     "heap_scan_sifts_before_compacting": (
-        "rut/runtime/epoll_event_loop.h",
-        """        u32 kept = 0;
-        for (u32 i = 0; i < size; ++i) {
-    if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
+        "rut/runtime/yield_heap.h",
+        """    u32 kept = 0;
+    for (u32 i = 0; i < size; ++i) {
+        if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
+    }
+    const u32 kRemoved = size - kept;
+    size = kept;
+    if (kRemoved > 0) {
+        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
+    }""",
+        """    u32 removed = 0;
+    u32 i = 0;
+    while (i < size) {
+        if (entries[i].conn_id != conn_id) {
+            ++i;
+            continue;
         }
-        const u32 removed = size - kept;
-        size = kept;
-        if (removed > 0) {
-    for (u32 i = size / 2; i > 0; --i) sift_down(i - 1);
-        }""",
-        """        u32 removed = 0;
-        u32 i = 0;
-        while (i < size) {
-    if (entries[i].conn_id != conn_id) {
-        ++i;
-        continue;
-    }
-    entries[i] = entries[--size];
-    ++removed;
-    if (i < size) {
-        sift_up(i);
-        sift_down(i);
-    }
+        entries[i] = entries[--size];
+        ++removed;
+        if (i < size) {
+            sift_down(entries, size, i);
+        }
         }"""),
     "stale_uring_disarms_successor": ("rut/runtime/iouring_event_loop.h",
                                       "if (matching_generation) {", "if (true) {"),

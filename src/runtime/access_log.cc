@@ -18,6 +18,19 @@ namespace rut {
 
 // --- Text formatting helpers (no stdlib) ---
 
+static u64 timespec_to_units(const timespec& ts, u64 scale) {
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0) return 0;
+    const u64 seconds = static_cast<u64>(ts.tv_sec);
+    const u64 fraction = scale == 1'000'000'000ULL ? static_cast<u64>(ts.tv_nsec)
+                                                   : static_cast<u64>(ts.tv_nsec) / 1000;
+    u64 whole = 0;
+    u64 result = 0;
+    if (__builtin_mul_overflow(seconds, scale, &whole) ||
+        __builtin_add_overflow(whole, fraction, &result))
+        return UINT64_MAX;
+    return result;
+}
+
 static u64 raw_monotonic_us() {
     struct timespec ts;
 #ifdef __APPLE__
@@ -25,7 +38,7 @@ static u64 raw_monotonic_us() {
 #else
     if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) return 1;
 #endif
-    u64 now = static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
+    u64 now = timespec_to_units(ts, 1000000);
     return now == 0 ? 1 : now;
 }
 
@@ -34,7 +47,7 @@ static thread_local u64 g_last_monotonic_us = raw_monotonic_us();
 u64 realtime_us() {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
-    return static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
+    return timespec_to_units(ts, 1000000);
 }
 
 u64 monotonic_us() {
@@ -43,7 +56,7 @@ u64 monotonic_us() {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return g_last_monotonic_us;
     }
-    u64 now = static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000);
+    u64 now = timespec_to_units(ts, 1000000);
     if (now == 0) now = 1;
     const u64 result = now < g_last_monotonic_us ? g_last_monotonic_us : now;
     g_last_monotonic_us = result;
@@ -55,7 +68,7 @@ u64 monotonic_ns() {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         return g_last_monotonic_us * 1000ULL;  // best-effort fallback
     }
-    return static_cast<u64>(static_cast<i64>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec);
+    return timespec_to_units(ts, 1'000'000'000ULL);
 }
 
 static u32 write_u64_dec(char* buf, u64 val) {
