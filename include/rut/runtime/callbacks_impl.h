@@ -16156,8 +16156,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         const u32 kInterimEnd = resp_parser.header_end;
         const u32 kTotal = conn.upstream_recv_buf.len();
         if (kInterimEnd < kTotal) {
-            const u32 kRemaining = kTotal - kInterimEnd;
-            const u8* src = conn.upstream_recv_buf.data() + kInterimEnd;
+            const u32 kRemaining =
+                static_cast<u32>(static_cast<i64>(kTotal) - static_cast<i64>(kInterimEnd));
+            const u8* src = conn.upstream_recv_buf.data() + static_cast<i64>(kInterimEnd);
             conn.upstream_recv_buf.reset();
             u8* dst = conn.upstream_recv_buf.write_ptr();
             __builtin_memmove(dst, src, kRemaining);
@@ -16186,7 +16187,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow ||
             !conn.request_config || !strict_response_upload_ready(conn) ||
             (conn.upstream_recv_buf.len() > resp_parser.header_end &&
-             conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length) ||
+             static_cast<i64>(conn.upstream_recv_buf.len()) -
+                     static_cast<i64>(resp_parser.header_end) >
+                 static_cast<i64>(resp.content_length)) ||
             !build_strict_response_headers(conn,
                                            *conn.request_config,
                                            resp,
@@ -16197,7 +16200,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
         if (conn.response_policy_suppress_body &&
             (conn.upstream_recv_buf.len() < resp_parser.header_end ||
-             conn.upstream_recv_buf.len() - resp_parser.header_end > resp.content_length)) {
+             static_cast<i64>(conn.upstream_recv_buf.len()) -
+                     static_cast<i64>(resp_parser.header_end) >
+                 static_cast<i64>(resp.content_length))) {
             // A coalesced body may be absent or shorter than the advertised
             // representation; it is discarded below. Bytes beyond the exact
             // Content-Length are ambiguous and must fail before any header is
