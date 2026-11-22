@@ -1723,6 +1723,14 @@ dispatch with an existing TLS connection. See
 JWKS initialization is all-or-nothing before refresh admission; native cold-path
 tests cover successful DNS/discovery, denied answers, timeout, cancel and recovery.
 
+### Browser session cookie clearing
+
+A fixed HTTPS response expires the host-bound `__Host-rut_session` cookie
+after exact Origin and same-origin Fetch Metadata guards. Native HTTP/1
+fixtures verify the cookie attributes and rejection of missing, duplicate or
+nonmatching guard headers on both Linux backends. The browser response can be
+composed after acknowledged session revocation. See [the contract](browser-origin.md#clearing-the-host-bound-session-cookie).
+
 ### Single-instance durable session revocation
 
 The free online session profile exposes `POST /logout-durable`: verified exact-token

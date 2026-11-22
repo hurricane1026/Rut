@@ -1,0 +1,13 @@
+import "middleware/browser_origin.rut"
+import "middleware/browser_fetch_metadata.rut"
+import "middleware/browser_session_cookie.rut"
+
+// Demonstrates only the browser response. A real logout must authenticate and
+// revoke its server-side session before issuing this clear response over HTTPS.
+route POST "/clear-cookie" {
+    let origin = browser_origin.requireOrigin(env("BROWSER_ORIGIN"))
+    let site = browser_fetch_metadata.requireSameOrigin(env("BROWSER_FETCH_SITE"))
+    let cleared = browser_session_cookie.cleared()
+    return cleared
+}
+route "/" { return 404 }
