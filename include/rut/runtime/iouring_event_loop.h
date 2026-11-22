@@ -6012,7 +6012,8 @@ public:
             !complete_content_length_raw_origin_matches_pinned(
                 c, raw_header_end, declared_body, &classification))
             return false;
-        const u32 initial_body = c.buffered_response_len() - raw_header_end;
+        const u32 initial_body = static_cast<u32>(static_cast<i64>(c.buffered_response_len()) -
+                                                  static_cast<i64>(raw_header_end));
         if (initial_body > declared_body) return false;
         const bool precise_header_timer = response_read_deadline_uses_precise_timer(c);
         if (precise_header_timer && c.response_read_timer_phase != ResponseReadTimerPhase::Armed)
@@ -6060,7 +6061,7 @@ public:
             const u16 owner_index =
                 response_read_batch_event_owner[response_read_batch_event_index];
             if (owner_index != 0 && owner_index <= response_read_batch_owner_count)
-                batch_owner = &response_read_batch_owners[owner_index - 1u];
+                batch_owner = &response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         }
         const bool same_batch_clean_eof =
             batch_owner != nullptr && batch_owner->valid && batch_owner->conn_id == c.id &&
@@ -6111,8 +6112,9 @@ public:
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.buffered_response_len())
+        if (header == 0 || static_cast<i64>(header) + static_cast<i64>(received) > UINT32_MAX ||
+            static_cast<i64>(header) + static_cast<i64>(received) !=
+                static_cast<i64>(c.buffered_response_len()))
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
