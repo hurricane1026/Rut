@@ -9712,7 +9712,14 @@ void h2_proxy_finish(Loop* loop,
     // only the real-origin parser above records passive health. Keep cache
     // invalidation bookkeeping here for unsafe cache-fill requests.
     http_cache_observe_status(conn, resp.status_code);
-    if (!is_head) http_cache_complete(conn, conn.upstream_recv_buf.data(), hdr_end + body_len);
+    if (!is_head) {
+        const i64 total_len = static_cast<i64>(hdr_end) + static_cast<i64>(body_len);
+        if (total_len < 0 || total_len > static_cast<i64>(conn.upstream_recv_buf.len())) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        http_cache_complete(conn, conn.upstream_recv_buf.data(), static_cast<u32>(total_len));
+    }
     constexpr u32 kMaxForwardHeaders = kMaxHeaders + Connection::kMaxRespHeaderMutations;
     hpack::Header hdrs[kMaxForwardHeaders];
     u32 nhdrs = 0;
@@ -9766,8 +9773,9 @@ void h2_proxy_finish(Loop* loop,
                     i++;
                     continue;
                 }
-                for (u32 move = i + 1; move < nhdrs; move++) hdrs[move - 1] = hdrs[move];
-                nhdrs--;
+                for (u32 move = static_cast<u32>(static_cast<i64>(i) + 1); move < nhdrs; move++)
+                    hdrs[static_cast<i64>(move) - 1] = hdrs[move];
+                nhdrs = static_cast<u32>(static_cast<i64>(nhdrs) - 1);
             }
         }
         if (!remove && !h2_drop_response_header(mutation.name)) {
