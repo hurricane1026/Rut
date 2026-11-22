@@ -314,7 +314,6 @@ inline bool grpc_snapshot_response_mutations(const Connection& down, GrpcExchang
             x.response_mutation_overflow = true;
             return false;
         }
-        const u32 needed = static_cast<u32>(needed_wide);
         auto& target = x.response_mutations[i];
         target.name_offset = static_cast<u16>(x.response_mutation_bytes);
         target.name_len = static_cast<u16>(source.name.len);
