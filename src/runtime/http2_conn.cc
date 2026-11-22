@@ -196,9 +196,10 @@ bool Http2Conn::consume_data(u32 stream_id, u32 len) {
     for (u32 i = 0; i < nstreams; i++)
         if (streams[i].id == stream_id) s = &streams[i];
     if (!s || !s->manual_window || len > s->recv_unconsumed) return false;
-    s->recv_unconsumed -= len;
-    s->recv_credit += len;
-    conn_recv_credit += len;
+    s->recv_unconsumed =
+        static_cast<u32>(static_cast<i64>(s->recv_unconsumed) - static_cast<i64>(len));
+    s->recv_credit = static_cast<u32>(static_cast<i64>(s->recv_credit) + static_cast<i64>(len));
+    conn_recv_credit = static_cast<u32>(static_cast<i64>(conn_recv_credit) + static_cast<i64>(len));
     return true;
 }
 
@@ -262,8 +263,9 @@ u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_s
     h.flags = end_stream ? http2_flag::kEndStream : 0;
     h.stream_id = stream_id;
     write_frame_header(out, h);
-    for (u32 i = 0; i < len; i++) out[kFrameHeaderSize + i] = data[i];
-    return kFrameHeaderSize + len;
+    for (u32 i = 0; i < len; i++)
+        out[static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(i)] = data[i];
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(len));
 }
 
 namespace {
@@ -276,10 +278,11 @@ u32 u32_to_dec(u32 v, char* buf) {
     char tmp[10];
     u32 n = 0;
     while (v > 0) {
-        tmp[n++] = static_cast<char>('0' + v % 10);
+        tmp[n++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(v % 10));
         v /= 10;
     }
-    for (u32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
+    for (u32 i = 0; i < n; i++)
+        buf[i] = tmp[static_cast<u32>(static_cast<i64>(n) - 1 - static_cast<i64>(i))];
     return n;
 }
 }  // namespace
