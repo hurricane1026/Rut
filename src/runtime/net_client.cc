@@ -288,7 +288,7 @@ void NetClientWorker::sweep(u64 now) {
     for (auto& p : parked)
         if (p.fd >= 0 &&
             (!now || !epoch || p.epoch != epoch || now < p.since ||
-             now - p.since >= p.endpoint.pool_idle_ms || (p.dns_expires && now >= p.dns_expires)))
+             (now - p.since >= p.endpoint.pool_idle_ms) || (p.dns_expires && now >= p.dns_expires)))
             close(p);
 }
 bool NetClientWorker::borrow(Slot& s) {
@@ -382,7 +382,9 @@ void NetClientWorker::run() {
             }
             const u64 now = jwt_monotonic_ms();
             bool complete = false;
-            if (!now || now < s.started || now - s.started >= s.timeout) {
+            u64 elapsed = 0;
+            if (!now || now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
+                elapsed >= s.timeout) {
                 s.reply.status = -2;
                 complete = true;
             } else {
@@ -497,9 +499,13 @@ bool NetClientWorker::write(Slot& s) {
     ERR_clear_error();
     const int n =
         s.ssl
-            ? SSL_write(s.ssl, s.pending + s.offset, static_cast<int>(s.pending_length - s.offset))
-            : static_cast<int>(send(
-                  s.fd, s.pending + s.offset, s.pending_length - s.offset, platform::kSendFlags));
+            ? SSL_write(s.ssl,
+                        s.pending + static_cast<i64>(s.offset),
+                        static_cast<int>(static_cast<i64>(s.pending_length) - s.offset))
+            : static_cast<int>(send(s.fd,
+                                    s.pending + static_cast<i64>(s.offset),
+                                    static_cast<u32>(static_cast<i64>(s.pending_length) - s.offset),
+                                    platform::kSendFlags));
     if (n < 0 || (s.ssl && n == 0)) {
         if (s.ssl) {
             const int error = SSL_get_error(s.ssl, n);
@@ -509,7 +515,7 @@ bool NetClientWorker::write(Slot& s) {
         return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ? false : failed(s);
     }
     if (s.datagram && static_cast<u32>(n) != s.pending_length) return failed(s);
-    s.offset += static_cast<u32>(n);
+    s.offset = static_cast<u32>(static_cast<i64>(s.offset) + n);
     return s.offset == s.pending_length ? success(s, s.pending_length) : false;
 }
 bool NetClientWorker::read(Slot& s) {
@@ -531,7 +537,7 @@ bool NetClientWorker::read(Slot& s) {
         wanted = 0;
         for (u32 i = 0; i < s.buffered && i < s.amount; ++i)
             if (s.buffer[i] == '\n') {
-                wanted = i + 1;
+                wanted = static_cast<u32>(static_cast<i64>(i) + 1);
                 break;
             }
         if (!wanted && s.buffered >= s.amount) return failed(s);
@@ -543,17 +549,23 @@ bool NetClientWorker::read(Slot& s) {
         if (s.operation == NetOp::Receive && wanted > s.buffered) wanted = s.buffered;
         if (wanted) __builtin_memcpy(s.reply.bytes, s.buffer, wanted);
         s.reply.length = wanted;
-        s.buffered -= wanted;
-        if (s.buffered) __builtin_memmove(s.buffer, s.buffer + wanted, s.buffered);
+        s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) - static_cast<i64>(wanted));
+        if (s.buffered)
+            __builtin_memmove(s.buffer, s.buffer + static_cast<i64>(wanted), s.buffered);
         return success(s, 0);
     }
     if (s.eof || s.buffered == kMaxBytes) return failed(s);
     ERR_clear_error();
     const int n =
-        s.ssl ? SSL_read(s.ssl, s.buffer + s.buffered, static_cast<int>(kMaxBytes - s.buffered))
-              : static_cast<int>(recv(s.fd, s.buffer + s.buffered, kMaxBytes - s.buffered, 0));
+        s.ssl ? SSL_read(s.ssl,
+                         s.buffer + static_cast<i64>(s.buffered),
+                         static_cast<int>(static_cast<i64>(kMaxBytes) - s.buffered))
+              : static_cast<int>(recv(s.fd,
+                                      s.buffer + static_cast<i64>(s.buffered),
+                                      static_cast<u32>(static_cast<i64>(kMaxBytes) - s.buffered),
+                                      0));
     if (n > 0) {
-        s.buffered += static_cast<u32>(n);
+        s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) + n);
         return false;
     }
     if (s.ssl) {
