@@ -80,13 +80,13 @@ static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
         return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
     u32 val = 0;
     for (u32 i = 0; i < len; i++) {
-        u32 d = p[i] - '0';
-        if (UNLIKELY(d > 9))
+        const i64 d = static_cast<i64>(p[i]) - '0';
+        if (UNLIKELY(d < 0 || d > 9))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
         // Pre-multiply overflow check: val * 10 + d <= 0xFFFFFFFF
-        if (UNLIKELY(val > (0xFFFFFFFFU - d) / 10))
+        if (UNLIKELY(static_cast<i64>(val) > (0xFFFFFFFFLL - d) / 10))
             return core::make_unexpected(Error::make(ERANGE, Error::Source::HttpParser));
-        val = val * 10 + d;
+        val = static_cast<u32>(static_cast<i64>(val) * 10 + d);
     }
     return val;
 }
