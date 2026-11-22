@@ -36,7 +36,7 @@ ArtChildRef find_in_n16(const ArtNode16& n, u8 b) {
 ArtChildRef find_in_n48(const ArtNode48& n, u8 b) {
     const u8 idx_1based = n.child_index[b];
     if (idx_1based == 0) return kArtInvalidChildRef;
-    return n.children[idx_1based - 1];
+    return n.children[static_cast<u8>(static_cast<i64>(idx_1based) - 1)];
 }
 
 ArtChildRef find_in_n256(const ArtNode256& n, u8 b) {
@@ -179,7 +179,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             n48.hdr = n.hdr;
             for (u32 k = 0; k < 16; k++) {
                 n48.children[k] = n.children[k];
-                n48.child_index[n.keys[k]] = static_cast<u8>(k + 1);
+                n48.child_index[n.keys[k]] = static_cast<u8>(static_cast<i64>(k) + 1);
             }
             n48.children[16] = child;
             n48.child_index[b] = 17;
@@ -191,7 +191,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             if (n.child_count < 48) {
                 const u8 slot = n.child_count;
                 n.children[slot] = child;
-                n.child_index[b] = static_cast<u8>(slot + 1);
+                n.child_index[b] = static_cast<u8>(static_cast<i64>(slot) + 1);
                 n.child_count++;
                 return parent;
             }
@@ -202,7 +202,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             for (u32 byte = 0; byte < 256; byte++) {
                 const u8 slot1 = n.child_index[byte];
                 if (slot1 != 0) {
-                    n256.children[byte] = n.children[slot1 - 1];
+                    n256.children[byte] = n.children[static_cast<u8>(static_cast<i64>(slot1) - 1)];
                 }
             }
             n256.children[b] = child;
