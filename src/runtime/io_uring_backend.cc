@@ -447,7 +447,8 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     }
 
     // Allocate the buf_ring structure itself
-    u64 ring_sz = sizeof(io_uring_buf_ring) + kProvidedBufCount * sizeof(io_uring_buf);
+    u64 ring_sz =
+        sizeof(io_uring_buf_ring) + static_cast<u64>(kProvidedBufCount) * sizeof(io_uring_buf);
     void* ring_mem = mmap(nullptr,
                           ring_sz,
                           PROT_READ | PROT_WRITE,
@@ -477,8 +478,8 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
             page_size > 0 && reg.ring_addr != 0 &&
             (reg.ring_addr % static_cast<u64>(page_size)) == 0 &&
             reg.ring_entries == kProvidedBufCount && reg.ring_entries != 0 &&
-            (reg.ring_entries & (reg.ring_entries - 1u)) == 0 && reg.ring_entries < 65536u &&
-            reg.bgid == kBufGroupId && reg.flags == 0;
+            (reg.ring_entries & static_cast<u32>(static_cast<i64>(reg.ring_entries) - 1)) == 0 &&
+            reg.ring_entries < 65536u && reg.bgid == kBufGroupId && reg.flags == 0;
         if (rc == -EINVAL && registration_is_valid)
             last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingUnsupported;
         shutdown();
@@ -514,7 +515,7 @@ void IoUringBackend::setup_extra_buf_ring(
     void* base =
         mmap(nullptr, total_buf_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return;
-    const u64 ring_sz = sizeof(io_uring_buf_ring) + count * sizeof(io_uring_buf);
+    const u64 ring_sz = sizeof(io_uring_buf_ring) + static_cast<u64>(count) * sizeof(io_uring_buf);
     void* ring_mem = mmap(nullptr,
                           ring_sz,
                           PROT_READ | PROT_WRITE,
@@ -541,9 +542,9 @@ void IoUringBackend::setup_extra_buf_ring(
     auto* data = static_cast<u8*>(base);
     for (u32 i = 0; i < count; i++) {
         io_uring_buf* buf = &ring->bufs[i];
-        buf->addr = reinterpret_cast<u64>(data + static_cast<u64>(i) * size);
+        buf->addr = reinterpret_cast<u64>(data + static_cast<i64>(i) * static_cast<i64>(size));
         buf->len = size;
-        buf->bid = static_cast<u16>(id_base + i);
+        buf->bid = static_cast<u16>(static_cast<i64>(id_base) + static_cast<i64>(i));
     }
     __atomic_store_n(&ring->tail, static_cast<u16>(count), __ATOMIC_RELEASE);
     base_out = data;
@@ -554,11 +555,13 @@ void IoUringBackend::return_buffer(u16 buf_id) {
     if (buf_id >= kLargeProvidedBufIdBase) {
         if (!provided_buffer_id_valid(buf_id)) return;
         const u16 tail = __atomic_load_n(&large_buf_ring->tail, __ATOMIC_RELAXED);
-        io_uring_buf* buf = &large_buf_ring->bufs[tail & (kLargeProvidedBufCount - 1)];
+        io_uring_buf* buf =
+            &large_buf_ring->bufs[tail & static_cast<u16>(kLargeProvidedBufCount - 1)];
         buf->addr = reinterpret_cast<u64>(provided_buffer_data(buf_id));
         buf->len = kLargeProvidedBufSize;
         buf->bid = buf_id;
-        __atomic_store_n(&large_buf_ring->tail, static_cast<u16>(tail + 1), __ATOMIC_RELEASE);
+        __atomic_store_n(
+            &large_buf_ring->tail, static_cast<u16>(static_cast<i64>(tail) + 1), __ATOMIC_RELEASE);
         return;
     }
     // Add buffer back to the provided ring
@@ -871,7 +874,7 @@ bool IoUringBackend::add_send_file(i32 fd,
         send_state[conn_id] = {nullptr,
                                fd,
                                written,
-                               len - written,
+                               static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(written)),
                                IoEventType::Send,
                                0,
                                generation,
@@ -939,8 +942,14 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
     if (!sqe) return false;
     // Same send state as add_send, advanced past the bytes the caller already
     // wrote directly; the Send completion still reports the whole length.
-    send_state[conn_id] = {
-        buf, fd, written, len - written, IoEventType::Send, 0, generation, extra_flags};
+    send_state[conn_id] = {buf,
+                           fd,
+                           written,
+                           static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(written)),
+                           IoEventType::Send,
+                           0,
+                           generation,
+                           extra_flags};
     send_state[conn_id].vector = vector;
     memset(sqe, 0, sizeof(*sqe));
     if (written == len) {
