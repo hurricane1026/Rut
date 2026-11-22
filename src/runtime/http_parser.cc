@@ -102,7 +102,7 @@ static inline HttpMethod parse_method_direct(const u8* buf, u32 end, u32& pos) {
     if (UNLIKELY(static_cast<i64>(pos) + 4 > static_cast<i64>(end))) return HttpMethod::Unknown;
 
     // Fast path: load first 4 bytes and dispatch
-    u32 v4 = load_u32(buf + pos);
+    u32 v4 = load_u32(buf + static_cast<i64>(pos));
 
     // 3-byte methods: "GET " or "PUT "
     if (v4 == u32_lit('G', 'E', 'T', ' ')) {
