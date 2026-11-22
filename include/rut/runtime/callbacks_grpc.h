@@ -86,30 +86,30 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
         return;
     }
 }
-inline void grpc_pop(u8* buf, u32& len, u32 n) {
+inline bool grpc_pop(u8* buf, u32& len, u32 n) {
     if (n > len) {
-        len = 0;
-        return;
+        return false;
     }
     len = static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(n));
     if (len) __builtin_memmove(buf, buf + static_cast<i64>(n), len);
+    return true;
 }
 inline bool grpc_timeout(Str value, u64* micros) {
     if (value.len < 2 || value.len > 9) return false;
-    u64 n = 0;
+    i64 n = 0;
     for (u32 i = 0; static_cast<i64>(i) + 1 < static_cast<i64>(value.len); i++) {
         if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
-        n = n * 10 + static_cast<u64>(static_cast<i64>(value.ptr[i]) - static_cast<i64>('0'));
+        n = n * 10 + static_cast<i64>(value.ptr[i]) - static_cast<i64>('0');
     }
-    switch (value.ptr[value.len - 1]) {
+    switch (value.ptr[static_cast<i64>(value.len) - 1]) {
         case 'H':
-            n *= 3600000000ull;
+            n *= 3600000000ll;
             break;
         case 'M':
-            n *= 60000000ull;
+            n *= 60000000ll;
             break;
         case 'S':
-            n *= 1000000ull;
+            n *= 1000000ll;
             break;
         case 'm':
             n *= 1000;
@@ -117,12 +117,13 @@ inline bool grpc_timeout(Str value, u64* micros) {
         case 'u':
             break;
         case 'n':
-            n = static_cast<u64>((static_cast<i64>(n) + 999) / 1000);
+            n = (n + 999) / 1000;
             break;
         default:
             return false;
     }
-    *micros = n;
+    if (n < 0) return false;
+    *micros = static_cast<u64>(n);
     return true;
 }
 inline u32 grpc_error_headers(u8* out, u32 cap, u32 sid, u8 code, bool started) {
@@ -790,9 +791,12 @@ inline void grpc_consume_output(GrpcExchange& x, bool from_client, u32 length) {
         if (!ws_h2_consume_output(x, from_client, length) || !ws_h2_process(x, from_client))
             x.failure = 13;
     } else {
-        grpc_pop(from_client ? x.upload : x.download,
-                 from_client ? x.upload_len : x.download_len,
-                 length);
+        if (!grpc_pop(from_client ? x.upload : x.download,
+                      from_client ? x.upload_len : x.download_len,
+                      length)) {
+            x.failure = 13;
+            return;
+        }
         Connection* owner = from_client ? x.downstream : x.upstream;
         if (owner && owner->h2 && !owner->h2->grpc.websocket_http1)
             owner->h2->consume_data(from_client ? x.downstream_stream : x.upstream_stream, length);
@@ -1157,13 +1161,13 @@ bool grpc_start_impl(Loop* loop,
     if (kWebsocket) {
         u64 seconds = 30;
         if constexpr (requires { loop->upstream_timeout; }) seconds = loop->upstream_timeout;
-        deadline = deadline_base + seconds * 1000000;
+        if (__builtin_add_overflow(deadline_base, seconds * 1000000ULL, &deadline)) return false;
     }
     for (u32 i = 0; i < nh; i++) {
         if (kWebsocket || !hs[i].name.eq({"grpc-timeout", 12})) continue;
         u64 timeout = 0;
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
-        deadline = deadline_base + timeout;
+        if (__builtin_add_overflow(deadline_base, timeout, &deadline)) return false;
     }
     const u32 backend = select_forward_backend(
         cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
@@ -1260,7 +1264,8 @@ bool grpc_start_impl(Loop* loop,
         h2_async_epoch_enter(loop, *up);
         fresh = true;
     }
-    const u32 usid = up->h2->last_stream_id + 2 - (up->h2->last_stream_id == 0 ? 1 : 0);
+    const u32 usid = static_cast<u32>(static_cast<i64>(up->h2->last_stream_id) + 2 -
+                                      static_cast<i64>(up->h2->last_stream_id == 0 ? 1 : 0));
     auto* stream = up->h2->open_stream(usid);
     auto* down_stream = down.h2->find_stream(sid);
     if (!stream || !down_stream) {
@@ -1288,16 +1293,18 @@ bool grpc_start_impl(Loop* loop,
             const auto& header = opening_request->headers[i];
             if (http_header_name_eq_ci(header.name.ptr, header.name.len, "host", 4)) continue;
             if (filtered_n >= Http2Conn::kMaxHeadersPerReq ||
-                header.name.len > sizeof(inspected_names) - inspected_name_bytes) {
+                static_cast<i64>(header.name.len) > static_cast<i64>(sizeof(inspected_names)) -
+                                                        static_cast<i64>(inspected_name_bytes)) {
                 filtered_n = 0;
                 break;
             }
-            char* name = inspected_names + inspected_name_bytes;
+            char* name = inspected_names + static_cast<i64>(inspected_name_bytes);
             for (u32 j = 0; j < header.name.len; ++j) {
                 const char kCh = header.name.ptr[j];
                 name[j] = kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
             }
-            inspected_name_bytes += header.name.len;
+            inspected_name_bytes = static_cast<u32>(static_cast<i64>(inspected_name_bytes) +
+                                                    static_cast<i64>(header.name.len));
             const hpack::Header kNormalized{{name, header.name.len}, header.value};
             if (grpc_request_header_allowed(kNormalized)) filtered[filtered_n++] = kNormalized;
         }
