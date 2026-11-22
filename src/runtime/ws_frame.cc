@@ -157,14 +157,9 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
 
     // Reject integer overflow even with an unbounded size, and enforce the configured
     // cap without underflow if a caller supplies a smaller cap on a later fragment.
-    if (h.payload_len > ~u64{0} - m.accumulated_len ||
-        (max_message_size != 0 && (m.accumulated_len > max_message_size ||
-                                   h.payload_len > max_message_size - m.accumulated_len))) {
-        m.reset();
-        return WsMessageStatus::Error;
-    }
     u64 total = 0;
-    if (__builtin_add_overflow(m.accumulated_len, h.payload_len, &total)) {
+    if (__builtin_add_overflow(m.accumulated_len, h.payload_len, &total) ||
+        (max_message_size != 0 && total > max_message_size)) {
         m.reset();
         return WsMessageStatus::Error;
     }
