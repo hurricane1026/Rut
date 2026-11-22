@@ -187,6 +187,30 @@ def test_targeted_registry_commands(tool, root):
         inspect('inspect-credential', record['id'], expected)
     inspect('inspect-credential', 'missing', None)
     inspect('inspect-credential', alice['id'], None)
+
+    group_file = root / 'targeted-credential-groups.json'
+    output = root / 'targeted-credential-groups-output.json'
+    for requested in (['staff'], []):
+        private(group_file, requested)
+        result = run(tool, 'set-credential-groups', source, raw['id'], group_file, output)
+        check_output(result)
+        assert result.returncode == 0 and not result.stdout, result
+        expected = [dict(raw, groups=requested), parked, inherited]
+        assert json.loads(output.read_bytes())['credentials'] == expected
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+        output.unlink()
+
+    for invalid in (['outsider'], ['readers', 'readers'], [''], 'readers'):
+        private(group_file, invalid)
+        result = run(tool, 'set-credential-groups', source, raw['id'], group_file, output)
+        check_output(result)
+        assert result.returncode == 2 and not result.stdout and not output.exists()
+
+    result = run(tool, 'inherit-credential-groups', source, parked['id'], output)
+    check_output(result)
+    assert result.returncode == 0 and not result.stdout, result
+    expected = {name: value for name, value in parked.items() if name != 'groups'}
+    assert json.loads(output.read_bytes())['credentials'] == [raw, expected, inherited]
     assert source.read_bytes() == original
 
 
