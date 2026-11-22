@@ -20,9 +20,13 @@ Str trim_ows(Str value) {
     if (value.ptr == nullptr) return value;
     u32 start = 0;
     u32 end = value.len;
-    while (start < end && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) start++;
-    while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) end--;
-    return {value.ptr + start, end - start};
+    while (start < end && (value.ptr[start] == ' ' || value.ptr[start] == '\t'))
+        start = static_cast<u32>(static_cast<i64>(start) + 1);
+    while (end > start && (value.ptr[static_cast<u32>(static_cast<i64>(end) - 1)] == ' ' ||
+                           value.ptr[static_cast<u32>(static_cast<i64>(end) - 1)] == '\t'))
+        end = static_cast<u32>(static_cast<i64>(end) - 1);
+    return {value.ptr + static_cast<i64>(start),
+            static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
 }
 
 int base64_value(char value) {
@@ -85,12 +89,14 @@ bool token_was_offered_before(const ParsedRequest& request,
             u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') end++;
             if (i == current_header && start >= current_start) return false;
-            const Str kPrevious = trim_ows({header.value.ptr + start, end - start});
+            const Str kPrevious =
+                trim_ows({header.value.ptr + static_cast<i64>(start),
+                          static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
             if (kPrevious.len == candidate.len &&
                 __builtin_memcmp(kPrevious.ptr, candidate.ptr, candidate.len) == 0)
                 return true;
             if (end == header.value.len) break;
-            start = end + 1;
+            start = static_cast<u32>(static_cast<i64>(end) + 1);
         }
     }
     return false;
@@ -105,15 +111,22 @@ bool request_protocols_valid(const ParsedRequest& request, u32* out_canonical_le
         for (;;) {
             u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') end++;
-            const Str kToken = trim_ows({header.value.ptr + start, end - start});
+            const Str kToken =
+                trim_ows({header.value.ptr + static_cast<i64>(start),
+                          static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
             if (!protocol_token_valid(kToken) ||
                 token_was_offered_before(request, i, start, kToken))
                 return false;
             const u32 kSeparator = canonical_len == 0 ? 0u : 1u;
-            if (kToken.len > 0xffffffffu - canonical_len - kSeparator) return false;
-            canonical_len += kSeparator + kToken.len;
+            if (static_cast<i64>(kToken.len) > static_cast<i64>(UINT32_MAX) -
+                                                   static_cast<i64>(canonical_len) -
+                                                   static_cast<i64>(kSeparator))
+                return false;
+            canonical_len =
+                static_cast<u32>(static_cast<i64>(canonical_len) + static_cast<i64>(kSeparator) +
+                                 static_cast<i64>(kToken.len));
             if (end == header.value.len) break;
-            start = end + 1;
+            start = static_cast<u32>(static_cast<i64>(end) + 1);
         }
     }
     if (out_canonical_len != nullptr) *out_canonical_len = canonical_len;
@@ -125,11 +138,11 @@ bool offered_protocol_exists(const u8* storage, u32 offers_len, Str candidate) {
     while (start < offers_len) {
         u32 end = start;
         while (end < offers_len && storage[kWsHandshakeAcceptLength + end] != ',') end++;
-        if (end - start == candidate.len &&
+        if (static_cast<i64>(end) - static_cast<i64>(start) == static_cast<i64>(candidate.len) &&
             __builtin_memcmp(
                 storage + kWsHandshakeAcceptLength + start, candidate.ptr, candidate.len) == 0)
             return true;
-        start = end + 1;
+        start = static_cast<u32>(static_cast<i64>(end) + 1);
     }
     return false;
 }
@@ -147,17 +160,24 @@ bool append_request_protocols(const ParsedRequest& request,
         for (;;) {
             u32 end = start;
             while (end < kValue.len && kValue.ptr[end] != ',') end++;
-            const Str kToken = trim_ows({kValue.ptr + start, end - start});
+            const Str kToken =
+                trim_ows({kValue.ptr + static_cast<i64>(start),
+                          static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
             if (!protocol_token_valid(kToken)) return false;
             const u32 kSeparator = out == 0 ? 0u : 1u;
             if (out > storage_capacity - kWsHandshakeAcceptLength ||
-                kSeparator + kToken.len > storage_capacity - kWsHandshakeAcceptLength - out)
+                static_cast<i64>(kSeparator) + static_cast<i64>(kToken.len) >
+                    static_cast<i64>(storage_capacity) - kWsHandshakeAcceptLength - out)
                 return false;
-            if (kSeparator) storage[kWsHandshakeAcceptLength + out++] = ',';
-            __builtin_memcpy(storage + kWsHandshakeAcceptLength + out, kToken.ptr, kToken.len);
-            out += kToken.len;
+            if (kSeparator) {
+                storage[kWsHandshakeAcceptLength + out] = ',';
+                out = static_cast<u32>(static_cast<i64>(out) + 1);
+            }
+            __builtin_memcpy(
+                storage + static_cast<i64>(kWsHandshakeAcceptLength) + out, kToken.ptr, kToken.len);
+            out = static_cast<u32>(static_cast<i64>(out) + static_cast<i64>(kToken.len));
             if (end == kValue.len) break;
-            start = end + 1;
+            start = static_cast<u32>(static_cast<i64>(end) + 1);
         }
     }
     *out_offers_len = out;
@@ -183,12 +203,14 @@ bool connection_value_is_valid(Str value, bool* has_upgrade) {
     for (;;) {
         u32 end = start;
         while (end < value.len && value.ptr[end] != ',') end++;
-        const Str kItem = trim_ows({value.ptr + start, end - start});
+        const Str kItem =
+            trim_ows({value.ptr + static_cast<i64>(start),
+                      static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
         if (!protocol_token_valid(kItem)) return false;
         if (kItem.len == 7 && http_header_name_eq_ci(kItem.ptr, kItem.len, "upgrade", 7))
             *has_upgrade = true;
         if (end == value.len) return true;
-        start = end + 1;
+        start = static_cast<u32>(static_cast<i64>(end) + 1);
     }
 }
 
@@ -202,7 +224,9 @@ bool upgrade_protocol_valid(Str protocol, bool* is_websocket) {
     const Str kName = {protocol.ptr, slash};
     if (!protocol_token_valid(kName)) return false;
     if (slash != protocol.len) {
-        const Str kVersion = {protocol.ptr + slash + 1, protocol.len - slash - 1};
+        const Str kVersion = {
+            protocol.ptr + static_cast<i64>(slash) + 1,
+            static_cast<u32>(static_cast<i64>(protocol.len) - static_cast<i64>(slash) - 1)};
         if (!protocol_token_valid(kVersion)) return false;
     } else if (kName.len == 9 && http_header_name_eq_ci(kName.ptr, kName.len, "websocket", 9)) {
         *is_websocket = true;
@@ -215,10 +239,12 @@ bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
     for (;;) {
         u32 end = start;
         while (end < value.len && value.ptr[end] != ',') end++;
-        const Str kItem = trim_ows({value.ptr + start, end - start});
+        const Str kItem =
+            trim_ows({value.ptr + static_cast<i64>(start),
+                      static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
         if (!upgrade_protocol_valid(kItem, offers_websocket)) return false;
         if (end == value.len) return true;
-        start = end + 1;
+        start = static_cast<u32>(static_cast<i64>(end) + 1);
     }
 }
 
@@ -252,7 +278,8 @@ WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
     for (u32 i = 0; i < version.len; ++i) {
         if (version.ptr[i] < '0' || version.ptr[i] > '9')
             return WsHandshakeRequestResult::BadRequest;
-        number = number * 10 + static_cast<u32>(version.ptr[i] - '0');
+        number = static_cast<u32>(static_cast<i64>(number) * 10 + static_cast<i64>(version.ptr[i]) -
+                                  static_cast<i64>('0'));
     }
     if (number > 255) return WsHandshakeRequestResult::BadRequest;
     if (number != 13) return WsHandshakeRequestResult::VersionRequired;
@@ -345,7 +372,9 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
         if (version.ptr[i] < '0' || version.ptr[i] > '9')
             return WsHandshakeRequestResult::BadRequest;
         else
-            version_number = version_number * 10 + static_cast<u32>(version.ptr[i] - '0');
+            version_number =
+                static_cast<u32>(static_cast<i64>(version_number) * 10 +
+                                 static_cast<i64>(version.ptr[i]) - static_cast<i64>('0'));
     if (version_number > 255) return WsHandshakeRequestResult::BadRequest;
     if (version_number != 13) return WsHandshakeRequestResult::VersionRequired;
     if (required_subprotocol.len != 0) {
