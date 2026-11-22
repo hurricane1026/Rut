@@ -110,6 +110,7 @@ def main():
             ("raw_offset > capacity", "static_cast<u32>(raw_offset) > capacity"),
             ("if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;",
              "kEnd = kOffset + count;"),
+            ("if (kEnd > capacity) return false;", "if (kEnd >= capacity) return false;"),
             ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
             ("if (kEnd > tail_dirty) tail_dirty = kEnd;", "tail_dirty = kEnd;"),
         ]:
