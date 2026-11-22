@@ -987,6 +987,17 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_trim_suffix(ValueId str, ValueId suffix, SourceLoc loc = {}) {
+        if (!val_has_type(str, TypeKind::Str) || !val_has_type(suffix, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* ty = TRY(make_type(TypeKind::Str));
+        auto [inst, vid] = TRY(emit(Opcode::StrTrimSuffix, ty, loc));
+        inst->operands[0] = str;
+        inst->operands[1] = suffix;
+        inst->operand_count = 2;
+        return vid;
+    }
+
     Result<ValueId> emit_str_regex_capture(ValueId str,
                                            Str pattern,
                                            u32 group,

@@ -2,6 +2,7 @@
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_trim.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_message.h"
@@ -33214,4 +33215,70 @@ route GET "/least" { wait(1ms) return forward(api, load_balance: .consistentHash
     CHECK(conn.forward_load_balance.hash_grpc);
     engine.shutdown();
     out.destroy();
+}
+
+TEST(helpers, string_trim_borrows_exact_binary_spans) {
+    const char text[] = {'a', 0, 'b', 0, 'a'};
+    const char prefix[] = {'a', 0};
+    const char suffix[] = {0, 'a'};
+    const char* output = nullptr;
+    u32 size = 0;
+    rut_helper_str_trim_prefix(text, sizeof(text), prefix, sizeof(prefix), &output, &size);
+    CHECK(output == text + 2);
+    CHECK_EQ(size, 3u);
+    rut_helper_str_trim_suffix(output, size, suffix, sizeof(suffix), &output, &size);
+    CHECK(output == text + 2);
+    CHECK_EQ(size, 1u);
+    CHECK_EQ(*output, 'b');
+    for (const auto trim : {rut_helper_str_trim_prefix, rut_helper_str_trim_suffix}) {
+        trim(text, sizeof(text), nullptr, 0, &output, &size);
+        CHECK(output == text);
+        CHECK_EQ(size, sizeof(text));
+        trim(text, sizeof(text), text, sizeof(text), &output, &size);
+        CHECK_EQ(size, 0u);
+        trim(nullptr, 0, nullptr, 0, &output, &size);
+        CHECK(output == nullptr);
+        CHECK_EQ(size, 0u);
+        trim(text, sizeof(text), "longer", 6, &output, &size);
+        CHECK(output == text);
+        CHECK_EQ(size, sizeof(text));
+    }
+}
+
+TEST(jit, frontend_string_trim_composes_without_an_arena) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_trim::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        for (const auto& scenario : test::string_trim::kCases) {
+            const std::string request = std::string("GET / HTTP/1.1\r\nHost: local\r\nX-Text: ") +
+                                        scenario.text + "\r\nX-Prefix: " + scenario.prefix +
+                                        "\r\nX-Suffix: " + scenario.suffix +
+                                        "\r\nX-Expected: " + scenario.expected + "\r\n\r\n";
+            const auto result =
+                HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              nullptr));
+            CHECK_EQ(result.status_code, scenario.status);
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
 }

@@ -525,6 +525,13 @@ void rut_helper_str_trim_prefix(const char* s,
                                 rut::u32 pfx_len,
                                 const char** out_ptr,
                                 rut::u32* out_len);
+// Trim one byte-exact suffix; returns a borrowed view into s.
+void rut_helper_str_trim_suffix(const char* s,
+                                rut::u32 s_len,
+                                const char* suffix,
+                                rut::u32 suffix_len,
+                                const char** out_ptr,
+                                rut::u32* out_len);
 
 // forward(set_path:) request mutation — records a request-path override on the
 // connection (a JIT handler calls this before returning forward). `conn` is the

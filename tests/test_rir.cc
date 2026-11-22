@@ -3121,3 +3121,36 @@ TEST(RirVerifier, StringOperationsRejectForgedCarriersArityAndPredicateIds) {
     }
     tc.destroy();
 }
+
+TEST(RirVerifier, StringTrimRequiresTwoUnwrappedStrings) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("trim"), lit("/"), 'G'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    const auto text = V(b.emit_const_str(lit("token")));
+    const auto number = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_str_trim_prefix(number, text));
+    CHECK_FALSE(b.emit_str_trim_suffix(text, number));
+    V(b.emit_str_trim_prefix(text, text));
+    V(b.emit_str_trim_suffix(text, text));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    for (u32 index : {2u, 3u}) {
+        auto& inst = fn->entry()->insts[index];
+        const Instruction saved = inst;
+        for (u32 mode = 0; mode < 4; ++mode) {
+            inst = saved;
+            if (mode == 0) inst.operand_count = 1;
+            if (mode == 1) inst.operands[0] = number;
+            if (mode == 2) inst.operands[1] = number;
+            if (mode == 3) inst.result = number;
+            CHECK_FALSE(verify_function(fn).ok);
+        }
+        inst = saved;
+    }
+    CHECK(verify_function(fn).ok);
+    ctx.destroy();
+}

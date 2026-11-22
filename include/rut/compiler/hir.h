@@ -144,6 +144,7 @@ enum class HirExprKind : u8 {
     RegexCapture,
     StringConcat,
     StringPredicate,
+    StringTrim,  // byte-exact prefix/suffix removal; borrowed result
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
     // arrays and bare empty `[]`; typed empty route locals are currently

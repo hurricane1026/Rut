@@ -102,10 +102,31 @@ Statements end at newline (no semicolons). Blocks need no commas between items.
 Comments: `// line only`.
 
 Unwrapped `str` values also support `+` concatenation, `.hasPrefix(str)`,
-`.hasSuffix(str)`, `.contains(str)` and `.isEmpty`. These operations compare
-bytes; concatenation owns bounded arena storage and stops on allocation failure.
+`.hasSuffix(str)`, `.contains(str)`, `.trimPrefix(str)`, `.trimSuffix(str)`
+and `.isEmpty`. These operations compare bytes; concatenation owns bounded
+arena storage and stops on allocation failure.
 They do not implicitly convert Bytes or optional values. Source interpolation
 remains restricted to the separately documented forms.
+
+`text.trimPrefix(prefix)` and `text.trimSuffix(suffix)` return an unwrapped
+`str` view into `text`, removing exactly one matching prefix/suffix. A nonmatching,
+longer or empty affix leaves the view unchanged; a full match produces an empty
+string. Matching is case-sensitive and byte-exact, including embedded NULs; no
+Unicode normalization, whitespace trimming or repeated removal occurs. Both
+operands must be unwrapped `str`. These methods allocate no storage and retain
+the input's lifetime; compose them with helpers and consistent-hash keys like
+other pure string expressions. Trimming alone does not validate a credential:
+check its scheme and reject an empty token explicitly.
+
+```swift
+route GET "/token" {
+    guard let header = req.uniqueHeader("Authorization") else { return 401 }
+    guard header.hasPrefix("Bearer ") else { return 401 }
+    let token = header.trimPrefix("Bearer ")
+    guard !token.isEmpty else { return 401 }
+    return 204
+}
+```
 
 ## Bindings and control flow
 
@@ -1703,7 +1724,7 @@ string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
          regexCapture(s, re"...", 1) -> str?
          ⏳ s.match(re"")
          s.hasPrefix(str) s.hasSuffix(str)
-         ⏳ s.trimPrefix/trimSuffix
+         s.trimPrefix(str) s.trimSuffix(str)
 hash:    md5/sha1/sha224/sha256/sha384/sha512(data) -> str? (lowercase hex)
          hmacMd5/hmacSha1/hmacSha224/hmacSha256/hmacSha384/hmacSha512(key, data) -> str?
          ⏳ fnv32 fnv64

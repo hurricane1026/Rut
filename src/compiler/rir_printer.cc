@@ -312,6 +312,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
             break;
+        case Opcode::StrTrimSuffix:
+            buf.put_cstr("str.trim_suffix");
+            break;
         case Opcode::StrRegexCapture:
             buf.put_cstr("str.regexCapture");
             break;
@@ -913,6 +916,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::StrConstantTimeEqual:
         case Opcode::StrHasPrefix:
         case Opcode::StrTrimPrefix:
+        case Opcode::StrTrimSuffix:
         case Opcode::CmpEq:
         case Opcode::CmpNe:
         case Opcode::CmpLt:

@@ -4587,6 +4587,17 @@ get /users/:id {
 
 Everything a gateway needs, with zero external dependencies:
 
+**Implemented String affix views:** `text.trimPrefix(prefix)` and
+`text.trimSuffix(suffix)` accept two unwrapped `str` values and return a `str`
+view into the input. They remove one exact byte match only; empty, nonmatching,
+or longer affixes leave the view unchanged, and a full match yields an empty
+view. Matching is case-sensitive and handles embedded NULs, without Unicode
+normalization or whitespace processing. No allocation or ownership transfer
+occurs; the view has the source's lifetime. HIR/MIR preserve both operands and
+lower them to typed RIR operations shared by JIT and native compilation. These
+pure operations also compose in consistent-hash keys. Callers extracting
+credentials must validate the scheme and nonempty token separately.
+
 ```swift
 // --- I/O ---
 get/post/put/delete url { }   // HTTP calls to external services
