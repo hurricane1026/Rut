@@ -10274,18 +10274,20 @@ void on_complete_response_sent(void* lp, Connection& conn, IoEvent ev) {
     const u32 header_len = conn.response_header_buf.len();
     const u32 body_len = conn.response_read_deadline_post_commit_declared_body;
     const u32 raw_header_end = conn.response_read_deadline_post_commit_raw_header_end;
-    if (body_len > 0xFFFFFFFFu - header_len ||
-        static_cast<u32>(ev.result) != header_len + body_len ||
+    const i64 header_body_len = static_cast<i64>(header_len) + static_cast<i64>(body_len);
+    const i64 raw_body_len = static_cast<i64>(raw_header_end) + static_cast<i64>(body_len);
+    if (header_body_len > static_cast<i64>(UINT32_MAX) ||
+        static_cast<u32>(ev.result) != static_cast<u32>(header_body_len) ||
         conn.response_read_deadline_post_commit_origin_received != body_len ||
         conn.response_read_deadline_post_commit_send_body != body_len ||
         conn.response_read_deadline_post_commit_downstream_submitted != body_len ||
         conn.response_read_deadline_post_commit_downstream_completed != 0 ||
         conn.response_read_deadline_post_commit_inflight_body != body_len ||
         conn.resp_body_mode != BodyMode::ContentLength ||
-        conn.resp_body_sent != header_len + body_len || conn.resp_body_remaining != 0 ||
-        raw_header_end > 0xFFFFFFFFu - body_len ||
-        conn.upstream_send_len != raw_header_end + body_len ||
-        conn.upstream_recv_buf.len() != raw_header_end + body_len) {
+        static_cast<i64>(conn.resp_body_sent) != header_body_len || conn.resp_body_remaining != 0 ||
+        raw_body_len > static_cast<i64>(UINT32_MAX) ||
+        static_cast<i64>(conn.upstream_send_len) != raw_body_len ||
+        static_cast<i64>(conn.upstream_recv_buf.len()) != raw_body_len) {
         loop->close_conn(conn);
         return;
     }
@@ -10343,7 +10345,8 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     }
     const u32 received = conn.response_read_deadline_post_commit_origin_received;
     const u32 completed = conn.response_read_deadline_post_commit_downstream_completed;
-    if (completed > received || conn.buffered_response_len() != received - completed) {
+    if (completed > received || static_cast<i64>(conn.buffered_response_len()) !=
+                                    static_cast<i64>(received) - static_cast<i64>(completed)) {
         loop->close_conn(conn);
         return;
     }
@@ -10370,7 +10373,8 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     if (study_gather && !conn.tls_active && conn.response_body_tail.head &&
         conn.response_body_tail.head->next && conn.upstream_recv_buf.len() == 0) {
         const auto* next = conn.response_body_tail.head->next;
-        const u32 next_len = next->len - next->offset;
+        const u32 next_len =
+            static_cast<u32>(static_cast<i64>(next->len) - static_cast<i64>(next->offset));
         if (next_len >= 32 * 1024) {
             const u32 combined = conn.buffered_response_send_span_size();
             if (combined <= remaining && combined <= 512 * 1024) front = combined;
@@ -10388,7 +10392,9 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         const u32 combined_header_len = conn.response_header_buf.len();
         const u32 combined_body_len = conn.response_read_deadline_post_commit_declared_body;
         const bool combined_terminal_valid =
-            combined_body_len != 0 && combined_body_len <= 0xFFFFFFFFu - combined_header_len &&
+            combined_body_len != 0 &&
+            static_cast<i64>(combined_header_len) + static_cast<i64>(combined_body_len) <=
+                static_cast<i64>(UINT32_MAX) &&
             complete_buffering && conn.state == ConnState::Sending && conn.req_start_us != 0 &&
             !conn.epoch_held && conn.on_send == &on_complete_response_sent<Loop> &&
             conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined &&
@@ -10411,9 +10417,11 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
             conn.response_read_deadline_post_commit_inflight_body == 0 &&
             conn.response_read_deadline_post_commit_declared_body == combined_body_len &&
             conn.response_read_deadline_send_src == conn.response_header_buf.data() &&
-            conn.response_read_deadline_send_len == combined_header_len + combined_body_len &&
+            static_cast<i64>(conn.response_read_deadline_send_len) ==
+                static_cast<i64>(combined_header_len) + static_cast<i64>(combined_body_len) &&
             conn.response_read_deadline_send_fd == conn.fd && conn.resp_body_remaining == 0 &&
-            conn.resp_body_sent == combined_header_len + combined_body_len &&
+            static_cast<i64>(conn.resp_body_sent) ==
+                static_cast<i64>(combined_header_len) + static_cast<i64>(combined_body_len) &&
             conn.upstream_send_len == 0 && conn.upstream_recv_buf.len() == 0 && !conn.send_armed &&
             conn.send_progress == 0;
         if (combined_send_marker && !combined_terminal_valid) {
@@ -10432,10 +10440,13 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
                 conn.response_read_deadline_post_commit_inflight_body == 0 && !conn.send_armed &&
                 !conn.response_read_deadline_send_owner_active && conn.send_progress == 0 &&
                 (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
-                     ? conn.resp_body_remaining ==
-                           conn.response_read_deadline_post_commit_declared_body - publish_body
+                     ? static_cast<i64>(conn.resp_body_remaining) ==
+                           static_cast<i64>(conn.response_read_deadline_post_commit_declared_body) -
+                               static_cast<i64>(publish_body)
                      : conn.resp_body_remaining == 0) &&
-                conn.resp_body_sent == conn.response_header_buf.len() + publish_body;
+                static_cast<i64>(conn.resp_body_sent) ==
+                    static_cast<i64>(conn.response_header_buf.len()) +
+                        static_cast<i64>(publish_body);
             const bool combined_completion_valid = combined_terminal_valid;
             const bool completion_callback_valid =
                 publish_body == 0
