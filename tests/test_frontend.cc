@@ -1,6 +1,7 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/ip_parse.h"
 #include "fixtures/query_all.h"
+#include "fixtures/string_find.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -48995,6 +48996,77 @@ TEST(frontend, string_slice_rejects_optional_inputs_and_non_i32_bounds) {
     for (const char* expression : expressions) {
         const std::string source =
             std::string("route GET \"/\" { let value = ") + expression + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+
+TEST(frontend, string_find_preserves_optional_offsets_and_composes_with_slices) {
+    const char* sources[] = {
+        test::string_find::kSource,
+        R"(upstream backend at "127.0.0.1:8080"
+           route GET "/" { return forward(backend, load_balance: .consistentHash,
+               hash_key: req.path.slice(0, req.path.find("?").or(req.path.len)).or("fallback"),
+               hash_seed: "0123456789abcdef0123456789abcdef") })",
+        R"(protocol Finder { func find(_ delta: i32) -> i32 }
+           i32 impl Finder { func find(self: i32, _ delta: i32) -> i32 => self + delta }
+           route POST "/" {
+               guard (3).find(1) == 4 else { return 500 }
+               let position: i32 = req.body.find(":")
+               if let index = position {
+                   guard let field = req.body.slice(0, index) else { return 500 }
+                   guard field == "key" else { return 422 }
+                   return 204
+               } else { return 404 }
+           })",
+        R"(func locate(_ text: str, _ delimiter: str) -> i32 => text.find(delimiter)
+           route POST "/" {
+               guard let index = req.body | locate(_, ":") else { return 404 }
+               guard let field = req.body.slice(0, index) else { return 500 }
+               return response(200, body: field)
+           })",
+#if RUT_ENABLE_WEBSOCKET
+        R"(upstream backend at "127.0.0.1:9999"
+           route GET "/ws" { return websocket(backend) { message in
+               guard let index = message.text.find(":", 1) else { message.drop() }
+               guard index == 3 else { message.drop() }
+               guard index < message.text.len else { message.drop() }
+               message.forward()
+           } })",
+#endif
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        ast.reset();
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, string_find_rejects_mixed_strings_bytes_and_optional_operands) {
+    const char* expressions[] = {
+        R"("x".find())", R"("x".find("x", 0, 1))", R"("x".find(b"x"))", R"("x".find(120))",
+        R"("x".find("x", true))", R"("x".find("x", i64(0)))", R"("x".find("x", "0"))",
+        R"("x".find("x", parseInt("0")))", R"("x".find(req.header("X")))",
+        R"(req.header("X").find("x"))", R"("x".slice(0, 1).find("x"))",
+        R"("x".find("x") + 1)", R"(b"x".find("x"))", R"("x".find("x").len)",
+        R"(req.header("X").len)", R"(b"x".len)", R"("x".len())",
+    };
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string("route POST \"/\" { let value = ") + expression + " return 204 }";
         auto tokens = lex(lit(source.c_str()));
         REQUIRE(tokens);
         auto ast = parse_file_heap(tokens.value());

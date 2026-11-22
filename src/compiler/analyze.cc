@@ -5107,21 +5107,24 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                             ? FrontendResult<HirExpr>(*receiver_override)
                             : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         const bool kSlicing = expr.name.eq(lit_str("slice"));
-        if (receiver && (receiver->type == HirTypeKind::Bytes ||
-                         (kSlicing && receiver->type == HirTypeKind::Str))) {
-            const auto kDetail = receiver->type == HirTypeKind::Str
-                                     ? lit_str("str.slice requires unwrapped str and i32 bounds")
-                                     : lit_str(
-                                           "Bytes fields require unwrapped values: "
-                                           "slice(i32 start, i32 end) or "
-                                           "find(Bytes delimiter[, i32 start])");
+        if (receiver &&
+            (receiver->type == HirTypeKind::Bytes || receiver->type == HirTypeKind::Str)) {
+            const auto kDetail =
+                receiver->type == HirTypeKind::Str
+                    ? (kSlicing ? lit_str("str.slice requires unwrapped str and i32 bounds")
+                                : lit_str("str.find expects find(str delimiter[, i32 start]) "
+                                          "with unwrapped operands"))
+                    : lit_str(
+                          "Bytes fields require unwrapped values: "
+                          "slice(i32 start, i32 end) or "
+                          "find(Bytes delimiter[, i32 start])");
             if (receiver->may_nil || receiver->may_error ||
                 (kSlicing ? expr.args.len != 2 : expr.args.len < 1 || expr.args.len > 2))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             auto first = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
             if (!first) return core::make_unexpected(first.error());
             if (first->may_nil || first->may_error ||
-                first->type != (kSlicing ? HirTypeKind::I32 : HirTypeKind::Bytes))
+                first->type != (kSlicing ? HirTypeKind::I32 : receiver->type))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             HirExpr last{};
             last.kind = HirExprKind::IntLit;
@@ -12117,9 +12120,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             count.lhs = &route->exprs[route->exprs.len - 1];
             return count;
         }
-        if (base->type == HirTypeKind::Bytes) {
+        if (base->type == HirTypeKind::Bytes ||
+            (base->type == HirTypeKind::Str && expr.name.eq(lit_str("len")))) {
             if (base->may_nil || base->may_error ||
-                (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty"))))
+                (base->type == HirTypeKind::Bytes && !expr.name.eq(lit_str("count")) &&
+                 !expr.name.eq(lit_str("isEmpty"))))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             if (!route->exprs.push(base.value()))
                 return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -12128,7 +12133,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             count.type = HirTypeKind::I32;
             count.span = expr.span;
             count.lhs = &route->exprs[route->exprs.len - 1];
-            if (expr.name.eq(lit_str("count"))) return count;
+            if (base->type == HirTypeKind::Str || expr.name.eq(lit_str("count"))) return count;
             if (!route->exprs.push(count))
                 return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.kind = HirExprKind::Eq;
@@ -16371,10 +16376,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringTrim:
                 case HirExprKind::IpParse:
+                case HirExprKind::BytesCount:
                     break;
                 case HirExprKind::JsonOp:
-                    // str.slice is a bounded, allocation-free borrowed view.
-                    if (e.int_value != static_cast<i64>(json::Op::BytesSlice)) return false;
+                    // String/Bytes field extraction is pure and allocation-free.
+                    if (e.int_value != static_cast<i64>(json::Op::BytesSlice) &&
+                        e.int_value != static_cast<i64>(json::Op::BytesFind))
+                        return false;
                     break;
                 default:
                     return false;

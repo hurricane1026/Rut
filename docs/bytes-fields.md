@@ -20,6 +20,13 @@ Its bounds compare against `text.len`, and it can split multibyte characters;
 there is no decoding or Unicode boundary adjustment. See
 [string byte slices](language-card.md#string-byte-slices).
 
+`text.find(delimiter[, start]) -> i32?` exposes the same checked byte search
+for unwrapped `str` receivers and delimiters. It returns an absolute byte offset
+and accepts unwrapped `i32` starts, with the same empty-match and invalid-bound
+rules as Bytes. Search does not decode UTF-8 or percent escapes and does not
+allocate. No implicit Bytes/str conversion is introduced. See
+[string byte search](language-card.md#string-byte-search).
+
 ## Bounds and empty values
 
 Slice succeeds only when `0 <= start <= end <= data.count`. Negative, reversed

@@ -123,6 +123,13 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] `str.find(str delimiter[, i32 start]) -> i32?` exposes allocation-free,
+  exact byte searches through the existing Bytes intrinsic. Absolute offsets,
+  empty/binary/missing/boundary results, dynamic helper composition, slice/hash
+  keys and native WebSocket execution have explicit coverage.
+  The documented `str.len` byte-count property is wired to the existing length
+  instruction for dynamic field bounds.
+
 - [x] `str.slice(i32 start, i32 end) -> str?` exposes checked half-open byte
   ranges through the existing allocation-free Bytes slice intrinsic. Empty,
   binary and invalid ranges, optional typing, helper/native composition and

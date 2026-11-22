@@ -5418,6 +5418,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 LABELS "integration;network" TIMEOUT 120 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(binary_opt 0 2)
+            add_test(NAME test_string_find_${backend}_opt${binary_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_string_find.py
+                    --server $<TARGET_FILE:rut> --backend ${backend} --opt ${binary_opt})
+            set_tests_properties(test_string_find_${backend}_opt${binary_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 120 SKIP_RETURN_CODE 77)
             add_test(NAME test_string_slice_${backend}_opt${binary_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_string_slice.py
                     --server $<TARGET_FILE:rut> --backend ${backend} --opt ${binary_opt})

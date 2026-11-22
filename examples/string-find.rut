@@ -1,0 +1,7 @@
+// Exact byte search plus checked slicing, with no copying or decoding.
+// POST a body such as "key:value"; returns the key and rejects missing ':'.
+route POST "/field" {
+    guard let end = req.body.find(":") else { return 400 }
+    guard let field = req.body.slice(0, end) else { return 400 }
+    return response(200, body: field)
+}

@@ -1811,6 +1811,7 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 ```
 string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
          s.replace/split/slice s.matches(re"")
+         s.find(str[, i32 start]) -> i32? (absolute byte offset)
          regexCapture(s, re"...", 1) -> str?
          ⏳ s.match(re"")
          s.hasPrefix(str) s.hasSuffix(str)
@@ -3580,6 +3581,39 @@ existing bounded byte search; neither operation allocates, performs I/O or chang
 `netError()`. Ordinary helper, HTTP, WebSocket and native execution share the same
 contract. These custom Bytes methods use existing call syntax; Swift collection
 range syntax is not added. See [the full contract](bytes-fields.md).
+
+## String byte search
+
+`text.len -> i32` is the byte count of an unwrapped `str`, including NUL and
+individual bytes of multibyte text. It reads the existing span length without
+allocation or decoding. Optional strings must be unwrapped before reading len.
+
+`text.find(delimiter[, start]) -> i32?` locates the first exact byte match at or
+after `start` (default zero). The result is an absolute byte offset into `text`,
+not an offset relative to `start`. Both text and delimiter must be unwrapped
+`str`; start must be unwrapped `i32`. A missing match or start outside
+`0...text.len` returns nil. An empty delimiter matches at start, including the
+end of the input; a match at byte zero is present zero.
+Spans longer than the representable i32 length return nil.
+
+Search is case-sensitive and binary-safe, with no percent decoding, Unicode
+normalization or character-boundary adjustment. Dynamic delimiters and starts
+are supported. It allocates no storage and shares the checked `Bytes.find`
+intrinsic, including HTTP, WebSocket, helper and native execution. This custom
+Rut method adds no Swift String index API or implicit Bytes conversion. It may
+compose inline with slice in consistent-hash keys. Unwrap the result before
+using it as an integer:
+
+```rut
+route POST "/field" {
+    guard let end = req.body.find(":") else { return 400 }
+    guard let field = req.body.slice(0, end) else { return 400 }
+    return response(200, body: field)
+}
+```
+
+See [byte field extraction](bytes-fields.md) and the
+[runnable example](../examples/string-find.rut).
 
 ## String byte slices
 

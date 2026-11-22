@@ -4,6 +4,7 @@
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_find.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -33562,6 +33563,62 @@ TEST(jit, string_slice_returns_checked_borrowed_text_without_arena_storage) {
                 if (item.expected.len)
                     CHECK(connection->jit_response_body.ptr ==
                           request.data() + body_offset + item.start);
+            } else {
+                CHECK_FALSE(connection->jit_response_body_valid);
+            }
+            CHECK_EQ(connection->json_arena.space_used(), 0u);
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+TEST(jit, string_find_returns_absolute_optional_offsets_without_arena_storage) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_find::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_find::kCases) {
+            std::string request =
+                "POST / HTTP/1.1\r\nHost: local\r\nX-Width: " + std::to_string(item.delimiter.len) +
+                "\r\nX-Start: " + std::to_string(item.start) +
+                "\r\nX-Expected: " + std::to_string(item.expected) +
+                "\r\nContent-Length: " + std::to_string(item.delimiter.len + item.input.len) +
+                "\r\n\r\n";
+            request.append(item.delimiter.ptr, item.delimiter.len);
+            const auto text_offset = request.size();
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto result = HandlerResult::unpack(handler(connection.get(),
+                                                               nullptr,
+                                                               reinterpret_cast<const u8*>(request.data()),
+                                                               request.size(),
+                                                               nullptr));
+            CHECK_EQ(result.status_code, item.expected >= 0 ? 200u : 404u);
+            if (item.expected >= 0) {
+                REQUIRE(connection->jit_response_body_valid);
+                const u32 index = static_cast<u32>(item.expected);
+                CHECK(connection->jit_response_body.eq(
+                    {item.input.ptr + index, item.input.len - index}));
+                if (index < item.input.len)
+                    CHECK(connection->jit_response_body.ptr ==
+                          request.data() + text_offset + index);
             } else {
                 CHECK_FALSE(connection->jit_response_body_valid);
             }

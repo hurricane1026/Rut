@@ -4612,6 +4612,20 @@ get /users/:id {
 
 Everything a gateway needs, with zero external dependencies:
 
+**Implemented String byte search:** `text.find(delimiter[, start]) -> i32?`
+uses the existing allocation-free Bytes search intrinsic with unwrapped `str`
+operands and an unwrapped `i32` start (default zero). It returns the first exact
+match's absolute byte offset at or after start. Missing matches and starts
+outside `0...text.len` produce nil; an empty delimiter matches at start, even
+at end-of-input. Matching is case-sensitive and byte-exact, including NUL and
+non-UTF-8 bytes, without decoding or normalization. Search and slice compose in
+helpers, HTTP/WebSocket handlers, native programs and consistent-hash keys.
+This is a custom Rut method, not Swift String's character/index API; no new
+keyword, dependency, runtime helper or implicit Bytes conversion is added.
+`text.len -> i32` reads an unwrapped string's stored byte length through the
+existing length instruction; it counts NUL and multibyte octets without decoding
+or allocation. Search rejects spans whose lengths cannot be represented by i32.
+
 **Implemented String affix views:** `text.trimPrefix(prefix)` and
 `text.trimSuffix(suffix)` accept two unwrapped `str` values and return a `str`
 view into the input. They remove one exact byte match only; empty, nonmatching,
@@ -4659,6 +4673,7 @@ s.isEmpty                        // bool
 s.hasPrefix(prefix)               // bool
 s.hasSuffix(suffix)               // bool
 s.contains(sub)                   // bool
+s.find(delimiter[, start])         // i32? — absolute byte offset, default start 0
 s.upper()                         // string
 s.lower()                         // string
 s.trim()                          // string

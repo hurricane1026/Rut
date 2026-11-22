@@ -4,6 +4,7 @@
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_find.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -4123,6 +4124,48 @@ TEST(native_program, ip_parse_compares_websocket_text_with_connection_ip) {
     }
 }
 #endif
+
+TEST(native_program, string_find_returns_absolute_optional_offsets_without_arena_storage) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::string_find::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].fn;
+        jit::HandlerCtx ctx{};
+        REQUIRE(handler);
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_find::kCases) {
+            std::string request =
+                "POST / HTTP/1.1\r\nHost: local\r\nX-Width: " + std::to_string(item.delimiter.len) +
+                "\r\nX-Start: " + std::to_string(item.start) +
+                "\r\nX-Expected: " + std::to_string(item.expected) +
+                "\r\nContent-Length: " + std::to_string(item.delimiter.len + item.input.len) +
+                "\r\n\r\n";
+            request.append(item.delimiter.ptr, item.delimiter.len);
+            const auto text_offset = request.size();
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto result = jit::HandlerResult::unpack(
+                handler(connection.get(), &ctx, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+            CHECK_EQ(result.status_code, item.expected >= 0 ? 200u : 404u);
+            if (item.expected >= 0) {
+                REQUIRE(connection->jit_response_body_valid);
+                const u32 index = static_cast<u32>(item.expected);
+                CHECK(connection->jit_response_body.eq(
+                    {item.input.ptr + index, item.input.len - index}));
+                if (index < item.input.len)
+                    CHECK(connection->jit_response_body.ptr ==
+                          request.data() + text_offset + index);
+            } else {
+                CHECK_FALSE(connection->jit_response_body_valid);
+            }
+            CHECK_EQ(connection->json_arena.space_used(), 0u);
+        }
+    }
+}
 TEST(native_program, string_split_executes_owned_dynamic_fields_at_both_optimization_levels) {
     for (u8 opt : {0u, 2u}) {
         Source source;
