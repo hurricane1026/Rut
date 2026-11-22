@@ -55,3 +55,18 @@ storage that honors fsync. The fixture covers local restart, write
 uncertainty, duplicate credentials, Redis expiry and concurrent reuse.
 Replica failover, older snapshot restoration, access-token invalidation and
 browser refresh are outside this profile.
+
+## Explicit family logout
+
+`POST /refresh/logout` accepts the same authenticated TLS Bearer credential.
+Any still-valid refresh credential issued for the configured family can
+revoke it, including one that has already rotated. The operation atomically
+marks an existing family revoked and preserves its absolute expiry. An
+absent family stays absent. Repeating logout for a revoked family rewrites
+the tombstone with the same expiry and confirms the write again.
+
+The endpoint returns 204 with `Cache-Control: no-store` only after the local
+AOF barrier and connection cleanup succeed. Failure returns 503 and a
+remote mutation may have occurred. If rotation races with logout, rotation
+may return a new token before logout takes effect. After confirmed logout,
+the family rejects that token too. Access-token permits are independent.
