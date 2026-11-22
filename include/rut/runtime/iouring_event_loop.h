@@ -595,7 +595,7 @@ public:
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
         for (u32 i = 0; i < capacity; i++) {
-            free_stack[i] = static_cast<u32>(static_cast<i64>(capacity) - 1 - i);
+            free_stack[i] = static_cast<u32>(static_cast<i64>(capacity) - 1 - static_cast<i64>(i));
             pending_free[i] = 0;
         }
         free_top = capacity;
@@ -4329,7 +4329,9 @@ public:
         }
         const i64 relay_calls =
             static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
-        study_relay_calls += static_cast<u64>(relay_calls);
+        u64 relay_total = 0;
+        if (!__builtin_add_overflow(study_relay_calls, static_cast<u64>(relay_calls), &relay_total))
+            study_relay_calls = relay_total;
         u64 flush_phase_ns = 0;
         if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
             __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
@@ -6573,6 +6575,12 @@ public:
         if (combined_send) {
             const u32 header_len = c.response_header_buf.len();
             const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            const i64 combined_len = static_cast<i64>(header_len) + static_cast<i64>(body_to_send);
+            const i64 upstream_send_len =
+                static_cast<i64>(raw_header_end) + static_cast<i64>(body_to_send);
+            if (combined_len > static_cast<i64>(UINT32_MAX) ||
+                upstream_send_len > static_cast<i64>(UINT32_MAX))
+                return false;
             // Use the header buffer's writable tail only as I/O staging. Keep
             // its logical length equal to the pure rewritten header so all
             // pinned-header proofs and response accounting retain their
@@ -6586,10 +6594,10 @@ public:
             c.response_read_deadline_post_commit_downstream_completed = 0;
             c.response_read_deadline_post_commit_inflight_body = body_to_send;
             c.resp_body_remaining = 0;
-            c.resp_body_sent = header_len + body_to_send;
-            c.upstream_send_len = raw_header_end + body_to_send;
+            c.resp_body_sent = static_cast<u32>(combined_len);
+            c.upstream_send_len = static_cast<u32>(upstream_send_len);
             c.transition_to_sending(&on_complete_response_sent<Self>);
-            return submit_send(c, c.response_header_buf.data(), header_len + body_to_send);
+            return submit_send(c, c.response_header_buf.data(), static_cast<u32>(combined_len));
         }
 
         c.response_read_deadline_post_commit_phase =
@@ -6687,15 +6695,21 @@ public:
         u32 received = c.response_read_deadline_post_commit_origin_received;
         if (header == 0 || header > c.buffered_response_len() || received > declared) return false;
         if (owner.saw_positive) {
+            const i64 copy_end =
+                static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes);
+            const i64 header_received = static_cast<i64>(header) + static_cast<i64>(received);
             if (owner.terminal_error || owner.expected_copy_end != c.buffered_response_len() ||
-                owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-                owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)
+                copy_end > static_cast<i64>(UINT32_MAX) ||
+                copy_end != static_cast<i64>(owner.expected_copy_end))
                 return false;
             if (owner.post_commit_at_start) {
-                if (owner.positive_bytes > declared - received || header > 0xFFFFFFFFu - received ||
-                    owner.first_copy_begin != header + received)
+                if (static_cast<i64>(owner.positive_bytes) >
+                        static_cast<i64>(declared) - static_cast<i64>(received) ||
+                    header_received > static_cast<i64>(UINT32_MAX) ||
+                    static_cast<i64>(owner.first_copy_begin) != header_received)
                     return false;
-                received += owner.positive_bytes;
+                received = static_cast<u32>(static_cast<i64>(received) +
+                                            static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_post_commit_origin_received = received;
             } else if (received != c.buffered_response_len() - header) {
                 return false;
