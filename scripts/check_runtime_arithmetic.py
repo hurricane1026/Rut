@@ -16,16 +16,8 @@ UNSIGNED = 'hasType(isUnsignedInteger())'
 ARITH = f'binaryOperator(hasAnyOperatorName("+", "-"), {UNSIGNED})'
 VALUE = f'ignoringParenImpCasts({ARITH})'
 ZERO = 'ignoringParenImpCasts(integerLiteral(equals(0)))'
-# Only accept Clang's diagnostic level in its structured location prefix.  Do
-# not treat source text such as `#warning "error:"` or prose in a note as a
-# compiler failure.
-CLANG_ERROR = re.compile(
-    r'(?m)^(?:'
-    r'(?!\s|//|#|["\']).+:\d+:\d+:\s*(?:fatal )?error:'
-    r'|clang[^:\n]*:\s*(?:fatal )?error:'
-    r'|fatal error:'
-    r'|error:)'
-)
+SYNTAX_CHECK = 'clang-check'
+VALIDATED = set()
 
 
 def queries(scope):
@@ -80,34 +72,31 @@ def unsigned_add_sub(scope):
 
 
 def matches(tool, file, query, flags):
+    target = f'{file} [{" ".join(flags)}]'
+    validation_key = (str(file), tuple(flags))
+    if validation_key not in VALIDATED:
+        syntax = subprocess.run([SYNTAX_CHECK, str(file), *flags], text=True, capture_output=True)
+        # clang-check can return zero for an invalid driver option; its
+        # unstructured driver line is the one exceptional diagnostic that
+        # must be checked when the process status is unreliable.  Source
+        # diagnostics still use clang-check's authoritative return status.
+        driver_error = any(line.startswith('error:') or 'unknown argument' in line
+                           for line in syntax.stderr.splitlines())
+        if syntax.returncode or driver_error:
+            raise RuntimeError(f'{target}: clang-check syntax validation failed\n'
+                               f'{syntax.stderr}\n{syntax.stdout[-2000:]}')
+        VALIDATED.add(validation_key)
+
     command = [tool, '-c', 'set traversal AsIs', '-c', 'match ' + query, str(file), *flags]
-    try:
-        command.index('--')
-    except ValueError:
-        command.extend('--extra-arg=' + arg for arg in
-                       ('-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'))
-    else:
-        command.extend(['-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'])
     run = subprocess.run(command, text=True, capture_output=True)
-    diagnostics = run.stderr + run.stdout
     locations = re.findall(r'^(.+?:\d+:\d+): note: "root" binds here', run.stdout, re.M)
     count = re.search(r'^(\d+) match(?:es)?\.', run.stdout, re.M)
-    if run.returncode or CLANG_ERROR.search(diagnostics) or not count or int(count[1]) != len(locations):
-        target = f'{file} [{" ".join(flags)}]'
+    if run.returncode or not count or int(count[1]) != len(locations):
         raise RuntimeError(f'{target}: clang-query failed\n{run.stderr}\n{run.stdout[-2000:]}')
     return locations
 
 
 def self_test(tool):
-    for diagnostic in (
-        'clang-query-18: error: bad option',
-        'clang++-18: fatal error: no input',
-        'fatal error: missing header',
-        '/tmp/bad:error.cc:4:7: error: expected expression',
-    ):
-        if not CLANG_ERROR.search(diagnostic):
-            raise RuntimeError(f'clang diagnostic self-test did not match: {diagnostic}')
-
     with tempfile.TemporaryDirectory() as directory:
         file = Path(directory) / 'probe.cc'
         file.write_text("""using U = unsigned;
@@ -182,7 +171,7 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
         else:
             raise RuntimeError('clang-query self-test: compiler diagnostics were not rejected')
 
-        colon_broken = Path(directory) / 'bad:error.cc'
+        colon_broken = Path(directory) / 'bad:error-broken.cc'
         colon_broken.write_text('using U = unsigned; U broken(U x) { return x + ; }\n')
         try:
             matches(tool, colon_broken, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags)
@@ -255,8 +244,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('build', type=Path)
     parser.add_argument('--clang-query', default='clang-query')
+    parser.add_argument('--clang-check', default='clang-check')
     parser.add_argument('--inventory', type=Path, help='write unique arithmetic sites for review')
     args = parser.parse_args()
+    global SYNTAX_CHECK
+    SYNTAX_CHECK = args.clang_check
     self_test(args.clang_query)
     test_unsigned_add_sub(args.clang_query)
     database = json.loads((args.build / 'compile_commands.json').read_text())
