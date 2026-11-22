@@ -874,11 +874,14 @@ static Http2Error handle_frame(Http2Conn& c,
             if (kDelta != 0) {
                 for (u32 i = 0; i < c.nstreams; i++) {
                     if (c.streams[i].state == Http2StreamState::Closed) continue;
-                    c.streams[i].send_window += static_cast<i32>(kDelta);
+                    c.streams[i].send_window =
+                        static_cast<i32>(static_cast<i64>(c.streams[i].send_window) + kDelta);
                 }
             }
             c.peer_settings_seen = true;
-            if (w.room(kFrameHeaderSize)) w.len += write_settings_ack(w.out + w.len);
+            if (w.room(kFrameHeaderSize))
+                w.len = static_cast<u32>(static_cast<i64>(w.len) +
+                                         static_cast<i64>(write_settings_ack(w.out + w.len)));
             return Http2Error::NoError;
         }
 
@@ -890,16 +893,16 @@ static Http2Error handle_frame(Http2Conn& c,
             if (h.flags & http2_flag::kPadded) {
                 if (n < 1) return Http2Error::ProtocolError;
                 pad = p[0];
-                p += 1;
-                n -= 1;
+                p += static_cast<i64>(1);
+                n = static_cast<u32>(static_cast<i64>(n) - 1);
             }
             if (h.flags & http2_flag::kPriority) {
                 if (n < 5) return Http2Error::ProtocolError;
-                p += 5;
-                n -= 5;
+                p += static_cast<i64>(5);
+                n = static_cast<u32>(static_cast<i64>(n) - 5);
             }
             if (pad > n) return Http2Error::ProtocolError;
-            n -= pad;
+            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(pad));
 
             Http2Stream* s = c.find_stream(h.stream_id);
             bool new_stream = false;
@@ -925,9 +928,11 @@ static Http2Error handle_frame(Http2Conn& c,
                 c.last_stream_id = h.stream_id;
                 new_stream = true;
                 if (!s) {
-                    if (w.room(kFrameHeaderSize + 4))
-                        w.len +=
-                            write_rst_stream(w.out + w.len, h.stream_id, Http2Error::RefusedStream);
+                    if (w.room(static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4)))
+                        w.len = static_cast<u32>(
+                            static_cast<i64>(w.len) +
+                            static_cast<i64>(write_rst_stream(
+                                w.out + w.len, h.stream_id, Http2Error::RefusedStream)));
                     return Http2Error::NoError;
                 }
             }
