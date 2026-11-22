@@ -1938,12 +1938,13 @@ public:
             ev.copy_deadline_generation != deadline_generation ||
             ev.copy_deadline_profile != static_cast<u8>(profile) ||
             ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
-            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) !=
+                static_cast<i64>(ev.result) ||
             ev.copy_end != c.buffered_response_len() || c.upstream_episode != upstream_episode)
             return false;
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
-        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        const auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         return owner.valid && owner.conn_id == c.id &&
                owner.deadline_generation == deadline_generation && owner.profile == profile &&
                owner.method == method && owner.upstream_episode == upstream_episode &&
@@ -1965,7 +1966,7 @@ public:
             return false;
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
-        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        const auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         return owner.valid && owner.conn_id == c.id &&
                owner.deadline_generation == c.response_read_deadline_generation &&
                owner.profile == c.response_read_deadline_profile &&
