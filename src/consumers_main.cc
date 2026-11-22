@@ -1259,7 +1259,8 @@ int main(int argc, char** argv) {
     if (argc == 5 && strcmp(argv[1], "remove-consumer") == 0)
         return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::Consumer);
     if (argc == 5 && strcmp(argv[1], "remove-consumer-with-credentials") == 0)
-        return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::ConsumerWithCredentials);
+        return remove_registry_record(
+            argv[2], argv[3], argv[4], RegistryRemoval::ConsumerWithCredentials);
     if (argc == 6 && strcmp(argv[1], "set-credential-groups") == 0)
         return credential_groups_command(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 5 && strcmp(argv[1], "inherit-credential-groups") == 0)
