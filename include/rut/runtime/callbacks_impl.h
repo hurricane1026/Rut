@@ -16456,10 +16456,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                         static_cast<u32>(static_cast<i64>(val_end) - static_cast<i64>(val_start));
                     if (kValLen >= 5) {
                         d[val_start] = 'c';
-                        d[val_start + 1] = 'l';
-                        d[val_start + 2] = 'o';
-                        d[val_start + 3] = 's';
-                        d[val_start + 4] = 'e';
+                        d[static_cast<i64>(val_start) + 1] = 'l';
+                        d[static_cast<i64>(val_start) + 2] = 'o';
+                        d[static_cast<i64>(val_start) + 3] = 's';
+                        d[static_cast<i64>(val_start) + 4] = 'e';
                         for (u32 k = static_cast<u32>(static_cast<i64>(val_start) + 5); k < val_end;
                              k++)
                             d[k] = ' ';
