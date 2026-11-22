@@ -16,9 +16,9 @@ constexpr ResponseBodyChain::Node* consume_head(ResponseBodyChain& chain,
     if (!node) return nullptr;
     const u32 kAvailable = chain.front_size();
     const u32 kUsed = pending < kAvailable ? pending : kAvailable;
-    node->offset += kUsed;
-    chain.size -= kUsed;
-    pending -= kUsed;
+    node->offset = static_cast<u32>(static_cast<i64>(node->offset) + static_cast<i64>(kUsed));
+    chain.size = static_cast<u32>(static_cast<i64>(chain.size) - static_cast<i64>(kUsed));
+    pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(kUsed));
     if (node->offset != node->len || (node == chain.tail && tail_pinned)) return nullptr;
     chain.head = node->next;
     return node;
@@ -41,17 +41,24 @@ consteval bool consume_contract(u32 requested, bool pinned) {
     u32 pending = requested;
     const u32 kUsed = requested < 5 ? requested : 5;
     // Nodes end at positions 2, 3 and 5 in the unsent suffix.
-    const u32 kRetired = static_cast<u32>(kUsed >= 2) + static_cast<u32>(kUsed >= 3) +
-                         static_cast<u32>(kUsed == 5 && !pinned);
+    const u32 kRetired =
+        static_cast<u32>(static_cast<i64>(static_cast<u32>(kUsed >= 2)) +
+                         static_cast<i64>(static_cast<u32>(kUsed >= 3)) +
+                         static_cast<i64>(static_cast<u32>(kUsed == 5 && !pinned)));
     for (u32 i = 0; i < kRetired; ++i) {
         if (consume_head(chain, pending, pinned) != &nodes[i]) return false;
     }
-    if (consume_head(chain, pending, pinned) != nullptr || chain.size != 5 - kUsed ||
-        pending != requested - kUsed || chain.tail != &nodes[2])
+    if (consume_head(chain, pending, pinned) != nullptr ||
+        chain.size != static_cast<u32>(static_cast<i64>(5) - static_cast<i64>(kUsed)) ||
+        pending != static_cast<u32>(static_cast<i64>(requested) - static_cast<i64>(kUsed)) ||
+        chain.tail != &nodes[2])
         return false;
     if (chain.head != (kRetired == 3 ? nullptr : &nodes[kRetired])) return false;
-    if (nodes[0].offset != 1 + (kUsed < 2 ? kUsed : 2) ||
-        nodes[1].offset != (kUsed >= 3 ? 1u : 0u) || nodes[2].offset != (kUsed > 3 ? kUsed - 3 : 0))
+    if (nodes[0].offset !=
+            static_cast<u32>(static_cast<i64>(1) + static_cast<i64>(kUsed < 2 ? kUsed : 2)) ||
+        nodes[1].offset != (kUsed >= 3 ? 1u : 0u) ||
+        nodes[2].offset !=
+            (kUsed > 3 ? static_cast<u32>(static_cast<i64>(kUsed) - static_cast<i64>(3)) : 0))
         return false;
     if (pinned && kUsed == 5) {
         u32 zero = 0;
