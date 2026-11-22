@@ -78,9 +78,9 @@ public:
     operator T*() { return ptr_; }
     operator const T*() const { return ptr_; }
     T* begin() { return ptr_; }
-    T* end() { return ptr_ ? ptr_ + count_ : nullptr; }
+    T* end() { return ptr_ ? ptr_ + static_cast<i64>(count_) : nullptr; }
     const T* begin() const { return ptr_; }
-    const T* end() const { return ptr_ ? ptr_ + count_ : nullptr; }
+    const T* end() const { return ptr_ ? ptr_ + static_cast<i64>(count_) : nullptr; }
 
 private:
     T* ptr_ = nullptr;
