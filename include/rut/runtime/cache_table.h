@@ -32,7 +32,12 @@
 namespace rut {
 
 struct CacheTable {
-    enum class KeyHash : u64 { Empty = 0 };
+    struct KeyHash {
+        u64 value;
+
+        friend constexpr bool operator==(KeyHash, KeyHash) = default;
+    };
+    static constexpr KeyHash kEmptyHash{0};
 
     struct Slot {
         KeyHash key_hash;
@@ -96,16 +101,14 @@ struct CacheTable {
         return h == 0 ? 1 : h;
     }
 
-    KeyHash hash_key(u32 key) const { return static_cast<KeyHash>(mix(key, seed)); }
+    KeyHash hash_key(u32 key) const { return KeyHash{mix(key, seed)}; }
 
-    u32 set_index(KeyHash hash) const {
-        return static_cast<u32>(static_cast<u64>(hash) & (set_count - 1));
-    }
+    u32 set_index(KeyHash hash) const { return static_cast<u32>(hash.value & (set_count - 1)); }
 
     bool get(u32 key, i64* out) const {
         if (slots == nullptr) return false;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + set_index(hash) * kWays;
+        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {
                 *out = set[w].value;
@@ -118,14 +121,14 @@ struct CacheTable {
     void set(u32 key, i64 value) {
         if (slots == nullptr) return;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + set_index(hash) * kWays;
+        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
         u32 victim = 0;
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {  // match → update in place
                 set[w].value = value;
                 return;
             }
-            if (set[w].key_hash == KeyHash::Empty) {  // empty → insert
+            if (set[w].key_hash == kEmptyHash) {  // empty → insert
                 set[w].key_hash = hash;
                 set[w].value = value;
                 return;

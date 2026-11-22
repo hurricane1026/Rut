@@ -18,10 +18,14 @@ consteval bool cursor_wrap_contract() {
     TimerWheel wheel{};
     using Tick = TimerWheel::Tick;
     wheel.cursor = Tick{UINT32_MAX};
-    if (wheel.cursor++ != Tick{UINT32_MAX} || wheel.cursor != Tick{}) return false;
-    if (wheel.cursor-- != Tick{} || wheel.cursor != Tick{UINT32_MAX}) return false;
-    if (&++wheel.cursor != &wheel.cursor || wheel.cursor != Tick{}) return false;
-    if (&--wheel.cursor != &wheel.cursor || wheel.cursor != Tick{UINT32_MAX}) return false;
+    const Tick incremented = wheel.cursor++;
+    if (incremented != Tick{UINT32_MAX} || wheel.cursor != Tick{}) return false;
+    const Tick decremented = wheel.cursor--;
+    if (decremented != Tick{} || wheel.cursor != Tick{UINT32_MAX}) return false;
+    Tick* incremented_address = &++wheel.cursor;
+    if (incremented_address != &wheel.cursor || wheel.cursor != Tick{}) return false;
+    Tick* decremented_address = &--wheel.cursor;
+    if (decremented_address != &wheel.cursor || wheel.cursor != Tick{UINT32_MAX}) return false;
     return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == Tick{} &&
            wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
            TimerWheel::elapsed_ticks(Tick{UINT32_MAX - 1}, Tick{1}) == 3;
