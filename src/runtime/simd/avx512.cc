@@ -20,7 +20,7 @@ u32 find_header_end(const u8* buf, u32 len, u32 from) {
                 buf[idx + 3] == '\n') {
                 return static_cast<u32>(idx + 4);
             }
-            mask &= static_cast<u64>(static_cast<i64>(mask) - 1);
+            mask ^= u64{1} << bit;
         }
         pos += 64;
     }

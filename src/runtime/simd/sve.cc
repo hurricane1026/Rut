@@ -46,7 +46,7 @@ u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
 
     while (pos < static_cast<i64>(end)) {
         u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
-        svbool_t pred = svwhilelt_b8(0, remaining);
+        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t cr_match = svcmpeq(pred, chunk, static_cast<u8>('\r'));
@@ -76,7 +76,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
 
     while (pos < static_cast<i64>(end)) {
         u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
-        svbool_t pred = svwhilelt_b8(0, remaining);
+        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t sp_match = svcmpeq(pred, chunk, static_cast<u8>(' '));
@@ -112,7 +112,7 @@ u32 scan_header_name(const u8* buf, u32 pos_in, u32 end) {
 
     while (pos < static_cast<i64>(end)) {
         u32 remaining = static_cast<u32>(static_cast<i64>(end) - pos);
-        svbool_t pred = svwhilelt_b8(0, remaining);
+        svbool_t pred = svwhilelt_b8(static_cast<u32>(0), remaining);
         svuint8_t chunk = svld1_u8(pred, buf + pos);
 
         svbool_t colon_match = svcmpeq(pred, chunk, static_cast<u8>(':'));
