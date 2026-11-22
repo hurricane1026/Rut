@@ -511,7 +511,9 @@ bool emit_json_string_frame(u8* out,
         json::Writer decoded{document.scratch};
         if (document.string(kId, decoded) && decoded.ok &&
             ws_valid_text_payload({document.scratch, decoded.len})) {
-            const u64 kOutputSize = static_cast<u64>(prefix.len) + decoded.len + suffix.len;
+            const u64 kOutputSize =
+                static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(decoded.len) +
+                                 static_cast<i64>(suffix.len));
             if (kOutputSize <= kWsMaxMessageCapacity &&
                 (max_size == 0 || kOutputSize <= max_size)) {
                 emitted = emit_frame(out,
@@ -555,7 +557,9 @@ bool emit_json_number_text_frame(u8* out,
     bool emitted = false;
     if (kId != json::kNone && document.nodes[kId].kind == json::Kind::Number) {
         const Str kLexeme = document.raw(kId);
-        const u64 kOutputSize = static_cast<u64>(prefix.len) + kLexeme.len + suffix.len;
+        const u64 kOutputSize =
+            static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(kLexeme.len) +
+                             static_cast<i64>(suffix.len));
         if (kOutputSize <= kWsMaxMessageCapacity && (max_size == 0 || kOutputSize <= max_size)) {
             emitted = emit_frame(out,
                                  out_cap,
@@ -588,7 +592,9 @@ bool emit_json_stringify_frame(u8* out,
     json::Document& document = ws_json_document();
     u32 serialized_len = 0;
     if (!ws_json_stringify_to_workspace(document, payload, len, path, serialized_len)) return false;
-    const u64 kOutputSize = static_cast<u64>(prefix.len) + serialized_len + suffix.len;
+    const u64 kOutputSize =
+        static_cast<u64>(static_cast<i64>(prefix.len) + static_cast<i64>(serialized_len) +
+                         static_cast<i64>(suffix.len));
     if (kOutputSize > kWsMaxMessageCapacity || (max_size != 0 && kOutputSize > max_size))
         return false;
     return emit_frame(out,
@@ -613,7 +619,8 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     if (rewrite.source == WsTextSource::Dynamic)
         return !rewrite.prefix.ptr && !rewrite.prefix.len && !rewrite.suffix.ptr &&
                !rewrite.suffix.len && !rewrite.source_path.ptr && !rewrite.source_path.len;
-    const u64 literal_size = static_cast<u64>(rewrite.prefix.len) + rewrite.suffix.len;
+    const u64 literal_size = static_cast<u64>(static_cast<i64>(rewrite.prefix.len) +
+                                              static_cast<i64>(rewrite.suffix.len));
     const bool kSourceValid =
         rewrite.source <= WsTextSource::MessageBytes &&
         (rewrite.source != WsTextSource::MessageBytes ||
