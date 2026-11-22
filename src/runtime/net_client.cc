@@ -77,7 +77,7 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
         if (seen & bit) return false;
         seen |= bit;
         if (value) {
-            json::Writer out{value, cap - 1};
+            json::Writer out{value, static_cast<u32>(static_cast<i64>(cap) - 1)};
             if (!doc.string(n, out) || !out.ok || !out.len) return false;
             for (u32 i = 0; i < out.len; ++i)
                 if (static_cast<u8>(value[i]) < 32 || static_cast<u8>(value[i]) == 127)
@@ -99,7 +99,8 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
 }
 core::Expected<void, Error> NetClientWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
-    auto allocated = storage.init(sizeof(Slot) * kCapacity + 64);
+    auto allocated =
+        storage.init(static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity + 64));
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
@@ -121,7 +122,7 @@ void NetClientWorker::stop() {
     if (!started) return;
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     if (pthread_join(thread, nullptr) != 0) __builtin_trap();
-    OPENSSL_cleanse(slots, sizeof(Slot) * kCapacity);
+    OPENSSL_cleanse(slots, static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity));
     storage.destroy();
     slots = nullptr;
     started = false;
@@ -131,7 +132,8 @@ void NetClientWorker::adopt_config(const void* config) {
     pool_config = config;
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
-    __atomic_store_n(&pool_epoch, epoch == ~u64(0) ? 0 : epoch ? epoch + 1 : 0, __ATOMIC_RELEASE);
+    const u64 next = epoch == ~u64(0) ? 0 : epoch ? epoch + 1 : 0;
+    __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {
     if (!started) return;
@@ -182,7 +184,9 @@ NetReply NetClientWorker::call(u32 owner,
                 reply.status = -4;
                 return reply;
             }
-            if (now < s.started || now - s.started >= s.timeout) {
+            u64 elapsed = 0;
+            if (now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
+                elapsed >= s.timeout) {
                 __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
                 reply.status = -2;
                 return reply;
@@ -198,7 +202,7 @@ NetReply NetClientWorker::call(u32 owner,
                 return reply;
             }
             reply.status = NetReply::kPending;
-            const auto remaining = s.timeout - (now - s.started);
+            const auto remaining = static_cast<u64>(s.timeout) - elapsed;
             reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
             return reply;
         }
