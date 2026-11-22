@@ -52,7 +52,7 @@ bool discovery_issuer_valid(const char* value) {
             if (static_cast<i64>(length) - static_cast<i64>(i) < 3 ||
                 !hex(value[static_cast<i64>(i) + 1]) || !hex(value[static_cast<i64>(i) + 2]))
                 return false;
-            i += 2;
+            i = static_cast<u32>(static_cast<i64>(i) + 2);
         } else if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' ||
                      byte == '~' || byte == '!' || byte == '$' || byte == '&' || byte == '\'' ||
@@ -383,7 +383,8 @@ bool jwks_dns_name(
         if (used) out[used++] = '.';
         for (u32 i = 0; i < count; ++i) {
             const u8 byte = packet[static_cast<i64>(at++)];
-            const char value = static_cast<char>(byte >= 'A' && byte <= 'Z' ? byte + 32 : byte);
+            const char value =
+                static_cast<char>(byte >= 'A' && byte <= 'Z' ? static_cast<i64>(byte) + 32 : byte);
             if ((value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '-')
                 return false;
             out[used++] = value;
@@ -479,10 +480,10 @@ bool jwks_dns_answer(Str packet,
         if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
             static_cast<i64>(packet.len) - static_cast<i64>(offset) < 10)
             return false;
-        record.type = read16(bytes + offset);
+        record.type = read16(bytes + static_cast<i64>(offset));
         const u32 ttl = (static_cast<u32>(read16(bytes + static_cast<i64>(offset) + 4)) << 16) |
                         read16(bytes + static_cast<i64>(offset) + 6);
-        const u32 size = read16(bytes + offset + 8);
+        const u32 size = read16(bytes + static_cast<i64>(offset) + 8);
         if (read16(bytes + static_cast<i64>(offset) + 2) != 1 || !ttl || (ttl & 0x80000000u))
             return false;
         if (ttl < min_ttl) min_ttl = ttl;
@@ -497,8 +498,10 @@ bool jwks_dns_answer(Str packet,
         } else if (record.type == kRecordType) {
             const u32 expected_size = kAaaa ? 16 : 4;
             const int family = kAaaa ? AF_INET6 : AF_INET;
-            if (size != expected_size ||
-                !inet_ntop(family, bytes + offset, record.address, sizeof(record.address)))
+            if (size != expected_size || !inet_ntop(family,
+                                                    bytes + static_cast<i64>(offset),
+                                                    record.address,
+                                                    sizeof(record.address)))
                 return false;
             bool allowed = false;
             for (u32 n = 0; n < configuration.allowed_count; ++n)
@@ -632,7 +635,7 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
     }
     u64 elapsed = 0;
     if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) return fail();
-    u32 stage_timeout = static_cast<u32>(static_cast<u64>(timeout_) - elapsed);
+    u32 stage_timeout = static_cast<u32>(static_cast<i64>(timeout_) - static_cast<i64>(elapsed));
     u64 discovery_timeout_wide = 0;
     u32 kDiscoveryTimeout = 0;
     if (__builtin_mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
@@ -683,7 +686,8 @@ bool JwksFetch::start(u64 now,
                 static_cast<i64>(sizeof(query_)))
             return fail();
         query_[query_length_++] = static_cast<u8>(length);
-        __builtin_memcpy(query_ + query_length_, host + begin, length);
+        __builtin_memcpy(
+            query_ + static_cast<i64>(query_length_), host + static_cast<i64>(begin), length);
         query_length_ =
             static_cast<u32>(static_cast<i64>(query_length_) + static_cast<i64>(length));
         if (!host[end]) break;
@@ -750,7 +754,8 @@ void JwksFetch::advance(u64 now) {
         state_ = State::Failed;
         return;
     }
-    if (now - started_ >= timeout_) {
+    u64 elapsed = 0;
+    if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) {
         (void)fail();
         return;
     }
