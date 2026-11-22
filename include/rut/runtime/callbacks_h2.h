@@ -531,7 +531,7 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
 
     u32 o = 0;
     auto put = [&](const char* s, u32 len) -> bool {
-        if (o + len > cap) return false;
+        if (o > cap || len > cap - o) return false;
         for (u32 i = 0; i < len; i++) out[o++] = static_cast<u8>(s[i]);
         return true;
     };

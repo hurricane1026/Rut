@@ -55,7 +55,7 @@ bool name_at(const u8* p, u32 len, u32& offset, char* out) {
             out[used] = 0;
             return true;
         }
-        if (at + kN > len || used + kN + (used ? 1u : 0u) > 253) return false;
+        if (static_cast<u64>(at) + kN > len || used + kN + (used ? 1u : 0u) > 253) return false;
         if (used) out[used++] = '.';
         for (u32 i = 0; i < kN; ++i) {
             const char kC = lower(p[at++]);

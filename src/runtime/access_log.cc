@@ -588,7 +588,7 @@ u32 AccessLogFlusher::flush_once() {
             u32 n = format_access_log_text(entry, line, sizeof(line));
             if (n > 0) {
                 // Flush batch if this line won't fit.
-                if (batch_len + n > kBatchSize) {
+                if (static_cast<u64>(batch_len) + n > kBatchSize) {
                     if (!flush_batch(reinterpret_cast<const u8*>(batch), batch_len)) {
                         return total;
                     }

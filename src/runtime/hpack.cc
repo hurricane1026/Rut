@@ -272,7 +272,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     u32 slen = 0;
     const u32 kHdr = decode_integer(in, len, 7, &slen);
     if (kHdr == 0) return 0;
-    if (kHdr + slen > len) return 0;  // truncated payload
+    if (kHdr > len || slen > len - kHdr) return 0;  // truncated payload
     const u8* data = in + kHdr;
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);

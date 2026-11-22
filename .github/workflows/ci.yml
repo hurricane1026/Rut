@@ -240,6 +240,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel ccache
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang-21
+            if [ "${{ matrix.shard }}" = "1" ]; then sudo apt-get install -y clang-tools-21; fi
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
             sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
           fi
@@ -263,6 +264,16 @@ jobs:
         run: |
           ninja -C build
           ccache --show-stats
+
+      - name: Audit runtime integer arithmetic
+        if: matrix.compiler == 'clang' && matrix.shard == 1
+        run: python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-21 --inventory runtime-arithmetic.txt
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.compiler == 'clang' && matrix.shard == 1
+        with:
+          name: runtime-arithmetic-${{ matrix.build_type }}
+          path: runtime-arithmetic.txt
+          if-no-files-found: ignore
 
       # Publish immediately after building so long-running tests do not delay
       # cache availability. Identical shards share one immutable cache key.

@@ -394,7 +394,7 @@ void capture_request_metadata(Connection& conn) {
             if (canon_off >= copy_len) {
                 canon_off = copy_len;
                 canon_len = 0;
-            } else if (canon_off + canon_len > copy_len) {
+            } else if (canon_len > copy_len - canon_off) {
                 canon_len = copy_len - canon_off;
             }
             conn.req_path_canon = Str{conn.req_path + canon_off, canon_len};

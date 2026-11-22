@@ -9,16 +9,17 @@ namespace {
 // production cursor advances relative to its previous iovec and remaining length.
 consteval bool suffix_matches(
     const BufferedSendVector& v, const u8* first, u32 n, const u8* second, u32 m, u32 sent) {
+    const u64 total = static_cast<u64>(n) + m;
     if (v.first_source != first || v.first_size != n || v.second_source != second ||
-        v.total_size != n + m)
+        v.total_size != total)
         return false;
     if (sent < n)
         return v.message.msg_iov == v.parts && v.message.msg_iovlen == 2 &&
                v.parts[0].iov_base == first + sent && v.parts[0].iov_len == n - sent &&
                v.parts[1].iov_base == second && v.parts[1].iov_len == m;
-    if (sent < n + m)
+    if (sent < total)
         return v.message.msg_iov == v.parts + 1 && v.message.msg_iovlen == 1 &&
-               v.parts[1].iov_base == second + (sent - n) && v.parts[1].iov_len == n + m - sent;
+               v.parts[1].iov_base == second + (sent - n) && v.parts[1].iov_len == total - sent;
     return v.message.msg_iov == v.parts + 2 && v.message.msg_iovlen == 0;
 }
 

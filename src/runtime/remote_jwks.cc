@@ -365,8 +365,8 @@ bool jwks_dns_name(
             out[used] = 0;
             return true;
         }
-        if (at + count > length || used + count + (used ? 1u : 0u) > 253 || packet[at] == '-' ||
-            packet[at + count - 1] == '-')
+        if (static_cast<u64>(at) + count > length || used + count + (used ? 1u : 0u) > 253 ||
+            packet[at] == '-' || packet[at + count - 1] == '-')
             return false;
         if (used) out[used++] = '.';
         for (u32 i = 0; i < count; ++i) {
