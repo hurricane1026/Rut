@@ -645,7 +645,8 @@ public:
         }
         for (u32 i = 0; i < slots_initialized; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf =
+                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
         }
         return true;
     }
@@ -5363,7 +5364,7 @@ public:
     u16 find_or_add_bounded_terminal_custody_owner(u32 cid) {
         if (cid >= slots_initialized) return 0;
         if (const u16 index = find_response_read_batch_owner(cid)) {
-            auto& owner = response_read_batch_owners[index - 1u];
+            auto& owner = response_read_batch_owners[static_cast<i64>(index) - 1];
             if (!owner.bounded_terminal_custody) {
                 const Connection& c = conns[cid];
                 owner.bounded_terminal_custody = true;
@@ -6237,7 +6238,8 @@ public:
             return false;
         if (!owner.post_commit_at_start &&
             (!owner.saw_positive || owner.first_copy_begin > header ||
-             owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+             static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                 static_cast<i64>(UINT32_MAX) ||
              first_copy_end != header_received))
             return false;
         if (c.response_read_timer_last_progress_ns == 0 ||
@@ -6521,9 +6523,11 @@ public:
             if (c.response_header_buf.data() == nullptr || c.upstream_recv_buf.data() == nullptr ||
                 header_len == 0 || header_len > c.response_header_buf.capacity() ||
                 raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
-                declared != c.buffered_response_len() - raw_header_end)
+                static_cast<i64>(declared) !=
+                    static_cast<i64>(c.buffered_response_len()) - static_cast<i64>(raw_header_end))
                 return CombinedSendEligibility::Invalid;
-            if (declared > c.response_header_buf.capacity() - header_len)
+            if (static_cast<i64>(declared) >
+                static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len))
                 return CombinedSendEligibility::Fallback;
             return CombinedSendEligibility::Eligible;
         };
