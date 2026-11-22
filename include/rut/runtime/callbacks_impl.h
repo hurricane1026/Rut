@@ -14289,8 +14289,8 @@ inline bool redirect_authority_syntax_valid(Str value, RedirectAuthorityView* ou
             const u8 c = static_cast<u8>(value.ptr[i]);
             if (c < '0' || c > '9') return false;
             if (parsed_port > 6553u || (parsed_port == 6553u && c > '5')) return false;
-            parsed_port =
-                static_cast<u32>(static_cast<i64>(parsed_port) * 10 + static_cast<i64>(c - '0'));
+            parsed_port = static_cast<u32>(static_cast<i64>(parsed_port) * 10 +
+                                           static_cast<i64>(c) - static_cast<i64>('0'));
         }
         if (parsed_port == 0) return false;
     }
@@ -14337,7 +14337,8 @@ inline bool redirect_origin_request_valid(const Connection& conn,
     uintptr_t path_offset = 0;
     if (path_addr < base || __builtin_sub_overflow(path_addr, base, &path_offset) ||
         path_offset > conn.recv_buf.len() ||
-        out_req->path.len > conn.recv_buf.len() - static_cast<u32>(path_offset))
+        static_cast<i64>(out_req->path.len) >
+            static_cast<i64>(conn.recv_buf.len()) - static_cast<i64>(path_offset))
         return false;
     const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;
@@ -14399,7 +14400,8 @@ inline bool build_redirect_response(const Connection& conn,
         conn.listener_context.transport != ListenerTransport::Cleartext ||
         !config.redirect_policy_id_is_valid(policy_id))
         return false;
-    const auto& policy = config.redirect_policies[static_cast<i64>(policy_id) - 1];
+    const auto& policy =
+        config.redirect_policies[static_cast<u32>(static_cast<i64>(policy_id) - 1)];
     if (!redirect_policy_spec_valid(policy)) return false;
     const bool legacy_profile = policy.authority == RedirectPolicyAuthority::RequestHost;
 
@@ -14451,7 +14453,7 @@ inline bool build_redirect_response(const Connection& conn,
     u32 pos = 0;
     auto put = [&](const void* data, u32 len) {
         if (static_cast<i64>(len) > static_cast<i64>(out_cap) - static_cast<i64>(pos)) return false;
-        if (len != 0) __builtin_memcpy(out + pos, data, len);
+        if (len != 0) __builtin_memcpy(out + static_cast<i64>(pos), data, len);
         pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
