@@ -63,8 +63,8 @@ struct UpstreamPool {
     // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
     // caller must close the fd itself). The fd must have no I/O armed on it.
     bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
-        if (fd < 0 || free_top == 0) return false;
-        const u32 idx = free_stack[--free_top];
+        u32 idx;
+        if (fd < 0 || !pop_free_slot(idx)) return false;
         conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
         link_idle(idx);
         idle_count.fetch_add(1, std::memory_order_release);
@@ -149,6 +149,16 @@ struct UpstreamPool {
     static i32 create_socket() { return platform::stream_socket(); }
 
 private:
+    bool pop_free_slot(u32& slot) {
+        if (free_top == 0) return false;
+        slot = free_stack[--free_top];
+        return true;
+    }
+
+    void push_free_slot(u32 slot) {
+        if (free_top < kMaxConns) free_stack[free_top++] = slot;
+    }
+
     void reset_idle_list() {
         idle_head = kNoSlot;
         for (u32 i = 0; i < kMaxConns; i++) idle_prev[i] = idle_next[i] = kNoSlot;
@@ -175,7 +185,7 @@ private:
     void release_slot(u32 i) {
         unlink_idle(i);
         conns[i] = UpstreamConn{};
-        if (free_top < kMaxConns) free_stack[free_top++] = i;
+        push_free_slot(i);
         u32 count = idle_count.load(std::memory_order_relaxed);
         while (count > 0 &&
                !idle_count.compare_exchange_weak(
