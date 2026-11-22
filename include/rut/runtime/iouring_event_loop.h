@@ -5830,8 +5830,10 @@ public:
 
         const u32 total = c.buffered_response_len();
         if (total == 0 || owner.expected_copy_end != total ||
-            owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-            owner.first_copy_begin + owner.positive_bytes != total)
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                UINT32_MAX ||
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                static_cast<i64>(total))
             return false;
         const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
                                        c.response_read_deadline_progress_episode == 0 &&
