@@ -11435,8 +11435,9 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         send_len = pos;
     }
 
-    conn.downstream_req_size += send_len;
-    conn.req_size += send_len;
+    conn.downstream_req_size =
+        static_cast<u32>(static_cast<i64>(conn.downstream_req_size) + static_cast<i64>(send_len));
+    conn.req_size = static_cast<u32>(static_cast<i64>(conn.req_size) + static_cast<i64>(send_len));
     conn.req_initial_send_len = send_len;
     conn.set_slots(nullptr,
                    nullptr,
@@ -12439,11 +12440,11 @@ inline bool ws_value_has_token(const char* v, u32 vlen, const char* tok, u32 tle
         if (i >= vlen) break;
         const u32 ts = i;
         while (i < vlen && v[i] != ',' && v[i] != ' ' && v[i] != '\t') i++;
-        const u32 n = i - ts;
-        if (n >= tlen && (n == tlen || v[ts + tlen] == '/')) {
+        const u32 n = static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(ts));
+        if (n >= tlen && (n == tlen || v[static_cast<i64>(ts) + static_cast<i64>(tlen)] == '/')) {
             bool eq = true;
             for (u32 k = 0; k < tlen; k++) {
-                if (lc(v[ts + k]) != lc(tok[k])) {
+                if (lc(v[static_cast<i64>(ts) + static_cast<i64>(k)]) != lc(tok[k])) {
                     eq = false;
                     break;
                 }
@@ -12524,14 +12525,16 @@ inline bool forward_policy_head_modes_compatible(const RouteConfig& config,
                                                  u16 failure_policy_id,
                                                  u16 timeout_failure_policy_id) {
     const bool response_suppress =
-        response_policy_id != 0 && config.response_policies[response_policy_id - 1].head_mode ==
-                                       ResponsePolicyHeadMode::SuppressBody;
+        response_policy_id != 0 &&
+        config.response_policies[static_cast<i64>(response_policy_id) - 1].head_mode ==
+            ResponsePolicyHeadMode::SuppressBody;
     const bool failure_suppress =
-        failure_policy_id != 0 && config.failure_policies[failure_policy_id - 1].head_mode ==
-                                      FailurePolicyHeadMode::SuppressBody;
+        failure_policy_id != 0 &&
+        config.failure_policies[static_cast<i64>(failure_policy_id) - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
     const bool timeout_failure_suppress =
         timeout_failure_policy_id != 0 &&
-        config.failure_policies[timeout_failure_policy_id - 1].head_mode ==
+        config.failure_policies[static_cast<i64>(timeout_failure_policy_id) - 1].head_mode ==
             FailurePolicyHeadMode::SuppressBody;
     if (timeout_failure_policy_id != 0 && (response_policy_id == 0 || failure_policy_id == 0 ||
                                            timeout_failure_suppress != failure_suppress))
