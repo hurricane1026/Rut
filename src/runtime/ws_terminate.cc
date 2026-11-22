@@ -123,7 +123,8 @@ bool ws_json_number_text_matches_at_path(
                 break;
             case WsJsonStringMatch::Suffix:
                 matches = expected.len <= kActual.len &&
-                          (expected.len == 0 || memcmp(kActual.ptr + kActual.len - expected.len,
+                          (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
+                                                           static_cast<i64>(expected.len),
                                                        expected.ptr,
                                                        expected.len) == 0);
                 break;
@@ -168,10 +169,11 @@ bool ws_json_stringify_matches_at_path(
                       (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
             break;
         case WsJsonStringMatch::Suffix:
-            matches =
-                expected.len <= kActual.len &&
-                (expected.len == 0 ||
-                 memcmp(kActual.ptr + kActual.len - expected.len, expected.ptr, expected.len) == 0);
+            matches = expected.len <= kActual.len &&
+                      (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
+                                                       static_cast<i64>(expected.len),
+                                                   expected.ptr,
+                                                   expected.len) == 0);
             break;
         case WsJsonStringMatch::Contains:
             matches = expected.len == 0 ||
@@ -214,11 +216,12 @@ bool ws_json_string_matches_at_path(
                                memcmp(document.scratch, expected.ptr, expected.len) == 0);
                     break;
                 case WsJsonStringMatch::Suffix:
-                    matches =
-                        expected.len <= decoded.len &&
-                        (expected.len == 0 || memcmp(document.scratch + decoded.len - expected.len,
-                                                     expected.ptr,
-                                                     expected.len) == 0);
+                    matches = expected.len <= decoded.len &&
+                              (expected.len == 0 ||
+                               memcmp(document.scratch + static_cast<i64>(decoded.len) -
+                                          static_cast<i64>(expected.len),
+                                      expected.ptr,
+                                      expected.len) == 0);
                     break;
                 case WsJsonStringMatch::Contains:
                     matches = expected.len == 0 ||
