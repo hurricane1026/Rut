@@ -2068,6 +2068,11 @@ TEST(http2_conn, header_writers_check_wide_bounds_before_encoding) {
     hpack::Encoder enc_huge;
     enc_huge.init(4096);
     CHECK_EQ(http2_write_response(probe, sizeof(probe), enc_huge, 1, 200, huge, 1, nullptr, 0), 0u);
+    hpack::Encoder enc_headers_only;
+    enc_headers_only.init(4096);
+    CHECK_NE(http2_write_response_headers(
+                 probe, sizeof(probe), enc_headers_only, 1, 200, nullptr, 0, UINT32_MAX, false),
+             0u);
 }
 
 // A header name too long to lowercase in http2_write_response's stack buffer must
