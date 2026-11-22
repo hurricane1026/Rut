@@ -5557,7 +5557,7 @@ public:
             if (response_read_batch_event_owner[i] == 0xffffu) continue;
             const u16 owner_index = find_response_read_batch_owner(ev.conn_id);
             if (owner_index == 0) continue;
-            auto& owner = response_read_batch_owners[owner_index - 1];
+            auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
             if (owner.bounded_terminal_prospective) continue;
             if (owner.bounded_terminal_custody && ev.type != IoEventType::ResponseReadTimer) {
                 response_read_batch_event_owner[i] = owner_index;
@@ -5650,7 +5650,8 @@ public:
                     if (owner.positive_bytes > 0xFFFFFFFFu - positive)
                         owner.valid = false;
                     else
-                        owner.positive_bytes += positive;
+                        owner.positive_bytes = static_cast<u32>(
+                            static_cast<i64>(owner.positive_bytes) + static_cast<i64>(positive));
                     owner.saw_positive = true;
                 }
                 if (!ev.more) {
@@ -5693,10 +5694,12 @@ public:
                     valid_upstream_episode(owner.upstream_episode) && exact_copy_end &&
                     (owner.bounded_terminal_recv_seen || owner.bounded_terminal_cancel_seen ||
                      owner.saw_positive);
-                if (owner.saw_positive &&
-                    (owner.bounded_terminal_buffer_begin > 0xffffffffu - owner.positive_bytes ||
-                     owner.bounded_terminal_buffer_begin + owner.positive_bytes !=
-                         c.buffered_response_len()))
+                if (owner.saw_positive && (static_cast<i64>(owner.bounded_terminal_buffer_begin) +
+                                                   static_cast<i64>(owner.positive_bytes) >
+                                               UINT32_MAX ||
+                                           static_cast<i64>(owner.bounded_terminal_buffer_begin) +
+                                                   static_cast<i64>(owner.positive_bytes) !=
+                                               c.buffered_response_len()))
                     owner.valid = false;
                 continue;
             }
@@ -5725,8 +5728,9 @@ public:
                 c.response_read_deadline_progress_episode == owner.upstream_episode &&
                 c.response_read_deadline_progress_bytes == pre_batch_bytes && pre_batch_bytes != 0;
             if (owner.post_commit_at_start) {
-                const u32 unsent = c.response_read_deadline_post_commit_origin_received -
-                                   c.response_read_deadline_post_commit_downstream_completed;
+                const i64 unsent =
+                    static_cast<i64>(c.response_read_deadline_post_commit_origin_received) -
+                    static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed);
                 const u32 header_prefix =
                     c.response_read_deadline_post_commit_phase ==
                                 ResponseReadDeadlinePostCommitPhase::HeaderSend ||
@@ -5734,8 +5738,8 @@ public:
                                 ResponseReadDeadlinePostCommitPhase::Buffering
                         ? c.response_read_deadline_post_commit_raw_header_end
                         : 0;
-                if (header_prefix > 0xFFFFFFFFu - unsent ||
-                    pre_batch_bytes != header_prefix + unsent ||
+                if (unsent < 0 || static_cast<i64>(header_prefix) + unsent > UINT32_MAX ||
+                    static_cast<i64>(pre_batch_bytes) != static_cast<i64>(header_prefix) + unsent ||
                     c.response_read_deadline_progress_generation != owner.deadline_generation ||
                     c.response_read_deadline_progress_episode != owner.upstream_episode ||
                     c.response_read_deadline_progress_bytes !=
@@ -5746,8 +5750,11 @@ public:
                 owner.valid = false;
             }
             if (owner.saw_positive &&
-                (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-                 owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+                (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                     UINT32_MAX ||
+                 static_cast<i64>(owner.first_copy_begin) +
+                         static_cast<i64>(owner.positive_bytes) !=
+                     owner.expected_copy_end ||
                  owner.expected_copy_end != c.buffered_response_len()))
                 owner.valid = false;
         }
