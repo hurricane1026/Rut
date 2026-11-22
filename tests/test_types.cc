@@ -74,6 +74,20 @@ TEST(str, slice_full) {
     CHECK(sub.eq(s));
 }
 
+TEST(str, slice_invalid_range_is_empty) {
+    Str s = {"abc", 3};
+    Str reversed = s.slice(2, 1);
+    CHECK(reversed.ptr == nullptr);
+    CHECK_EQ(reversed.len, 0u);
+    Str beyond = s.slice(0, 4);
+    CHECK(beyond.ptr == nullptr);
+    CHECK_EQ(beyond.len, 0u);
+    Str empty = {nullptr, 0};
+    Str empty_slice = empty.slice(0, 0);
+    CHECK(empty_slice.ptr == nullptr);
+    CHECK_EQ(empty_slice.len, 0u);
+}
+
 // === FixedVec ===
 
 TEST(fixedvec, push_and_access) {

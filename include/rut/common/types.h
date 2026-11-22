@@ -47,6 +47,9 @@ struct Str {
     [[nodiscard]] bool empty() const { return len == 0; }
 
     [[nodiscard]] Str slice(u32 start, u32 end) const {
+        // Invalid ranges are an empty view; validate before forming the pointer
+        // so a malformed parser span cannot create an out-of-bounds address.
+        if (ptr == nullptr || start > end || end > len) return {nullptr, 0};
         return {ptr + static_cast<i64>(start),
                 static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
     }
