@@ -767,10 +767,30 @@ bool policy_expiry(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+bool policy_quantity(json::Document& doc, u32 node, i64 minimum, i64& value) {
+    return doc.nodes[node].kind == json::Kind::Number && doc.raw(node).ptr[0] != '-' &&
+           json::integer(doc.raw(node), value) && value >= minimum;
+}
+
+bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
+    i64 maximum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, maximum)) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!policy_enabled(doc, record)) continue;
+        const i64 start = policy_time(doc, record, lit_str("notBefore"));
+        const i64 end = policy_time(doc, record, lit_str("expiresAt"));
+        if (!start || !end || end - start > maximum) return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
     {lit_str("requireExpiryForEnabledCredentials"), true, policy_expiry},
+    {lit_str("maxCredentialLifetimeSeconds"), false, policy_max_lifetime},
 };
 
 int evaluate_deployment_policy(json::Document& registry, const char* policy_path, i64 now) {
