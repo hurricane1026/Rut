@@ -2201,21 +2201,26 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     const u32 kResult = static_cast<u32>(ev.result);
-    if (conn.send_progress > kSendLen || kResult > (kSendLen - conn.send_progress)) {
+    if (conn.send_progress > kSendLen ||
+        static_cast<i64>(kResult) >
+            static_cast<i64>(kSendLen) - static_cast<i64>(conn.send_progress)) {
         if (conn.h2) h2_clear_outbound(*conn.h2);
         loop->close_conn(conn);
         return;
     }
-    conn.send_progress += kResult;
+    conn.send_progress =
+        static_cast<u32>(static_cast<i64>(conn.send_progress) + static_cast<i64>(kResult));
     if (conn.send_progress < kSendLen) {
         if (kResult == 0u) {
             if (conn.h2) h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
             return;
         }
-        const u32 kRemaining = kSendLen - conn.send_progress;
+        const u32 kRemaining =
+            static_cast<u32>(static_cast<i64>(kSendLen) - static_cast<i64>(conn.send_progress));
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        if (!loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining)) {
+        if (!loop->submit_send(
+                conn, conn.send_buf.data() + static_cast<i64>(conn.send_progress), kRemaining)) {
             if (conn.h2) h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
         }
@@ -2344,12 +2349,13 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     u32 engine_written = 0;
-    Http2Result r = conn.h2->process(conn.recv_buf.data(),
-                                     conn.recv_buf.len(),
-                                     ctrl + ctrl_len,
-                                     sizeof(ctrl) - ctrl_len,
-                                     &engine_written);
-    ctrl_len += engine_written;
+    Http2Result r = conn.h2->process(
+        conn.recv_buf.data(),
+        conn.recv_buf.len(),
+        ctrl + static_cast<i64>(ctrl_len),
+        static_cast<u32>(static_cast<i64>(sizeof(ctrl)) - static_cast<i64>(ctrl_len)),
+        &engine_written);
+    ctrl_len = static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(engine_written));
 
     if (d.close_after_process) {
         h2_clear_outbound(*conn.h2);
@@ -2361,9 +2367,14 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Compact unconsumed bytes (a partial trailing frame) to the front so the
     // next recv appends after them.
     const u32 kLen = conn.recv_buf.len();
-    const u32 kRemaining = kLen - r.consumed;
+    if (r.consumed > kLen) {
+        h2_clear_outbound(*conn.h2);
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 kRemaining = static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(r.consumed));
     if (kRemaining > 0 && r.consumed > 0)
-        memmove(conn.recv_slice, conn.recv_slice + r.consumed, kRemaining);
+        memmove(conn.recv_slice, conn.recv_slice + static_cast<i64>(r.consumed), kRemaining);
     conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
@@ -2381,11 +2392,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     const bool kClose = r.close || d.overflow;
 
     if (!kClose && conn.h2->grpc.active) {
-        const u32 used = ctrl_len + d.resp_len;
-        const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
-        const u32 storage_room = kRespStorageCap - d.resp_len;
+        const u32 used =
+            static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
+        const u32 wire_room = used < conn.send_buf.capacity()
+                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
+                                                     static_cast<i64>(used))
+                                  : 0;
+        const u32 storage_room =
+            static_cast<u32>(static_cast<i64>(kRespStorageCap) - static_cast<i64>(d.resp_len));
         const u32 room = storage_room < wire_room ? storage_room : wire_room;
-        d.resp_len += grpc_pump_downstream(loop, conn, d.resp + d.resp_len, room);
+        d.resp_len =
+            static_cast<u32>(static_cast<i64>(d.resp_len) +
+                             static_cast<i64>(grpc_pump_downstream(
+                                 loop, conn, d.resp + static_cast<i64>(d.resp_len), room)));
     }
     conn.h2->grpc.busy = false;
     if constexpr (requires {
@@ -2400,21 +2419,27 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (!kClose && conn.h2->outbound_stream != 0) {
-        const u32 kUsed = ctrl_len + d.resp_len;
-        const u32 kWireRoom =
-            kUsed <= conn.send_buf.capacity() ? conn.send_buf.capacity() - kUsed : 0;
+        const u32 kUsed =
+            static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
+        const u32 kWireRoom = kUsed <= conn.send_buf.capacity()
+                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
+                                                     static_cast<i64>(kUsed))
+                                  : 0;
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN = h2_pump_outbound(
-            *conn.h2,
-            d.resp + d.resp_len,
-            kRespStorageCap - d.resp_len < kWireRoom ? kRespStorageCap - d.resp_len : kWireRoom,
-            pump_status);
+        const u32 kStorageRoom =
+            d.resp_len <= kRespStorageCap
+                ? static_cast<u32>(static_cast<i64>(kRespStorageCap) - static_cast<i64>(d.resp_len))
+                : 0;
+        const u32 kN = h2_pump_outbound(*conn.h2,
+                                        d.resp + static_cast<i64>(d.resp_len),
+                                        kStorageRoom < kWireRoom ? kStorageRoom : kWireRoom,
+                                        pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
             return;
         }
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
     }
 
     // A handler suspended on wait() during this batch. Flush whatever queued
