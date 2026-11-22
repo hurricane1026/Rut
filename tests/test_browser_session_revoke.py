@@ -10,6 +10,7 @@ import ssl
 import tempfile
 import time
 
+from auth_h2_fixture import request as h2_request
 from test_jwt_sessions import KEY, NAMESPACE, Peer, permit_key, signed
 from test_mtls_consumers import registry_gateway
 
@@ -35,6 +36,8 @@ def exchange(port, context, method, path, headers):
 def exercise(args, peer):
     cert = Path(args.testdata).resolve() / "localhost_cert.pem"
     context = ssl.create_default_context(cafile=str(cert))
+    h2_context = ssl.create_default_context(cafile=str(cert))
+    h2_context.set_alpn_protocols(["h2"])
     endpoint = dict(address="127.0.0.1", port=peer.port, poolIdleMs=5000, tls=True,
                     caFile=str(cert), serverName="localhost")
     environment = dict(os.environ, BROWSER_ORIGIN=ORIGIN, BROWSER_FETCH_SITE="same-origin",
@@ -95,6 +98,7 @@ def exercise(args, peer):
             status, response, body = exchange(port, context, "GET", "/private", [cookie])
             assert (status, body) == (200, b"alice")
             assert response.get("Cache-Control") == "no-store"
+            assert h2_request(port, "/private", [cookie], tls_context=h2_context) == (200, b"alice")
             same_claims = signed(dict(sub="alice", iss="issuer", aud="gateway", iat=now,
                                       exp=expiry, jti="browser", nonce="other"))
             for headers in [[("Authorization", "Bearer " + token)],
@@ -102,6 +106,8 @@ def exercise(args, peer):
                             [cookie, cookie]]:
                 status, _, body = exchange(port, context, "GET", "/private", headers)
                 assert status == 401 and b"alice" not in body
+                h2_status, h2_body = h2_request(port, "/private", headers, tls_context=h2_context)
+                assert h2_status == 401 and b"alice" not in h2_body
             with peer.lock:
                 peer.mode = "reset-error"
             status, _, body = exchange(port, context, "GET", "/private", [cookie])
@@ -124,6 +130,8 @@ def exercise(args, peer):
 
             status, _, body = exchange(port, context, "GET", "/private", [cookie])
             assert status == 401 and b"alice" not in body
+            h2_status, h2_body = h2_request(port, "/private", [cookie], tls_context=h2_context)
+            assert h2_status == 401 and b"alice" not in h2_body
 
 
 def main():
