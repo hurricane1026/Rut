@@ -398,15 +398,17 @@ void dyn_clear(DynamicTable& d) {
 void dyn_evict_oldest(DynamicTable& d) {
     if (d.nent == 0) return;
     const DynamicTable::Entry kOld = d.ents[0];
-    const u32 kBlen = static_cast<u32>(kOld.nlen) + kOld.vlen;
-    __builtin_memmove(d.buf, d.buf + kBlen, d.byte_used - kBlen);
-    d.byte_used -= kBlen;
-    d.table_size -= (static_cast<u32>(kOld.nlen) + kOld.vlen + 32u);
+    const i64 kBlen = static_cast<i64>(kOld.nlen) + static_cast<i64>(kOld.vlen);
+    __builtin_memmove(d.buf, d.buf + kBlen, static_cast<i64>(d.byte_used) - kBlen);
+    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) - kBlen);
+    const i64 kOldCost = kBlen + 32;
+    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) - kOldCost);
     for (u32 i = 1; i < d.nent; i++) {
-        d.ents[i - 1] = d.ents[i];
-        d.ents[i - 1].off -= kBlen;
+        const i64 kPrevious = static_cast<i64>(i) - 1;
+        d.ents[kPrevious] = d.ents[i];
+        d.ents[kPrevious].off = static_cast<u32>(static_cast<i64>(d.ents[kPrevious].off) - kBlen);
     }
-    d.nent--;
+    d.nent = static_cast<u32>(static_cast<i64>(d.nent) - 1);
 }
 
 void dyn_set_max_size(DynamicTable& d, u32 m) {
