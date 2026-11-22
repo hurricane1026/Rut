@@ -97,12 +97,15 @@ consteval bool pinned_commit_contract(bool receive_first, u32 sent, u32 received
     if (consume_head(chain, pending, true) || pending != 0) return false;
     if (!receive_first) chain.commit(received);
 
-    const u32 kExpectedLen = 2 + received;
+    const u32 kExpectedLen = static_cast<u32>(static_cast<i64>(2) + static_cast<i64>(received));
     return chain.head == (sent < 2 ? &prefix : &tail) && chain.tail == &tail &&
            (sent >= 2 || prefix.next == &tail) && prefix.len == 3 &&
-           prefix.offset == 1 + (sent < 2 ? sent : 2) && tail.next == nullptr &&
-           tail.len == kExpectedLen && tail.offset == (sent > 2 ? sent - 2 : 0) &&
-           chain.size == 4 - sent + received &&
+           prefix.offset ==
+               static_cast<u32>(static_cast<i64>(1) + static_cast<i64>(sent < 2 ? sent : 2)) &&
+           tail.next == nullptr && tail.len == kExpectedLen &&
+           tail.offset == (sent > 2 ? static_cast<u32>(static_cast<i64>(sent) - 2) : 0) &&
+           chain.size == static_cast<u32>(static_cast<i64>(4) - static_cast<i64>(sent) +
+                                          static_cast<i64>(received)) &&
            tail.dirty_end == (dirty > kExpectedLen ? dirty : kExpectedLen);
 }
 
