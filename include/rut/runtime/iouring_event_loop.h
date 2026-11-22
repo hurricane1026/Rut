@@ -6134,9 +6134,14 @@ public:
         // parsed header plus selected body extent.
         if (!owner.post_commit_at_start)
             return owner.saw_positive && owner.first_copy_begin <= header &&
-                   owner.first_copy_begin <= 0xFFFFFFFFu - owner.positive_bytes &&
-                   owner.first_copy_begin + owner.positive_bytes == header + received &&
-                   owner.expected_copy_end == header + received;
+                   static_cast<i64>(owner.first_copy_begin) +
+                           static_cast<i64>(owner.positive_bytes) <=
+                       UINT32_MAX &&
+                   static_cast<i64>(owner.first_copy_begin) +
+                           static_cast<i64>(owner.positive_bytes) ==
+                       static_cast<i64>(header) + static_cast<i64>(received) &&
+                   static_cast<i64>(owner.expected_copy_end) ==
+                       static_cast<i64>(header) + static_cast<i64>(received);
 
         if (c.response_read_deadline_progress_generation != owner.deadline_generation ||
             c.response_read_deadline_progress_episode != owner.upstream_episode ||
@@ -6146,8 +6151,11 @@ public:
             return owner.positive_bytes == 0 && owner.first_copy_begin == 0 &&
                    owner.expected_copy_end == 0;
         return owner.positive_bytes <= received &&
-               owner.first_copy_begin == header + received - owner.positive_bytes &&
-               owner.expected_copy_end == header + received;
+               static_cast<i64>(owner.first_copy_begin) ==
+                   static_cast<i64>(header) + static_cast<i64>(received) -
+                       static_cast<i64>(owner.positive_bytes) &&
+               static_cast<i64>(owner.expected_copy_end) ==
+                   static_cast<i64>(header) + static_cast<i64>(received);
     }
 
     [[nodiscard]] bool complete_content_length_expiry_owner_is_valid(
