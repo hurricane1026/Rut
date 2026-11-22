@@ -608,6 +608,7 @@ continues to adopt snapshots through its existing deployment path.
 | --- | --- |
 | `requireHashedKeys` | Require a SHA-256 verifier for every bearer or header key, including disabled records. |
 | `allowedMethods` | Allow only the named methods among bearer, header, basic and mtls. The array must be nonempty and unique. The rule checks disabled records too. |
+| `requireExpiryForEnabledCredentials` | Require a positive expiry on every enabled credential record, including records staged under disabled Consumers. |
 
 ### Targeted credential validity windows
 

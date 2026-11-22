@@ -76,6 +76,17 @@ def test_deployment_policy(tool, root):
     check({'allowedMethods': ['basic']}, ok=True, records=[basic])
     check({'allowedMethods': ['mtls']}, ok=True, records=[mtls])
     check({'allowedMethods': ['header']}, records=[basic], rule='allowedMethods')
+    expiry = {'requireExpiryForEnabledCredentials': True}
+    check(expiry, ok=True)
+    check(expiry, records=[{k: v for k, v in key.items() if k != 'expiresAt'}],
+          rule=next(iter(expiry)))
+    check(expiry, ok=True, records=[dict(key, expiresAt=101)])
+    check({'requireExpiryForEnabledCredentials': False},
+          ok=True, records=[dict(key, expiresAt=0)])
+    check(expiry, records=[dict(key, expiresAt=0)], rule=next(iter(expiry)))
+    check(expiry, ok=True, records=[dict(key, expiresAt=0, enabled=False)])
+    check(expiry, records=[dict(key, expiresAt=0, consumerId='disabled', groups=[])],
+          rule=next(iter(expiry)))
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
@@ -120,6 +131,12 @@ def test_apply_checked(tool, root):
     policy.chmod(0o600)
     assert not output.exists()
 
+    private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
+                         requireExpiryForEnabledCredentials=True))
+    assert b'requireExpiryForEnabledCredentials' in apply_checked().stderr
+    assert not output.exists()
+    hashed['expiresAt'] = 121
+    private(patch, changes(credentials=[hashed], remove_credentials=[raw['id']]))
     assert not apply_checked(expected=0).stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert json.loads(output.read_bytes()) == dict(version=1, consumers=[consumer],
