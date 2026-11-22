@@ -240,7 +240,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build llvm-21-dev libboost-dev ragel ccache
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             sudo apt-get install -y clang-21
-            if [ "${{ matrix.shard }}" = "1" ]; then sudo apt-get install -y clang-tools-21; fi
+            if [ "${{ matrix.shard }}" = "1" ]; then sudo apt-get install -y clang-tools-21 libclang-21-dev libclang-cpp21-dev; fi
             sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
             sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
           fi
@@ -267,7 +267,11 @@ jobs:
 
       - name: Audit runtime integer arithmetic
         if: matrix.compiler == 'clang' && matrix.shard == 1
-        run: python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-21 --inventory runtime-arithmetic.txt
+        run: |
+          clang++-21 $(llvm-config-21 --cxxflags) -std=c++17 scripts/clang/check_ring_iterator.cc \
+            -lclang-cpp $(llvm-config-21 --ldflags --libs --system-libs) -o build/check_ring_iterator
+          python3 scripts/check_ring_iterators.py build/check_ring_iterator build
+          python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-21 --inventory runtime-arithmetic.txt
       - uses: actions/upload-artifact@v4
         if: always() && matrix.compiler == 'clang' && matrix.shard == 1
         with:
