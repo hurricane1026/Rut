@@ -191,6 +191,7 @@ add_library(rut_runtime STATIC
     runtime/shard.cc
     ${RUT_IO_SOURCES}
     runtime/timer_wheel.cc
+    runtime/timer_list_contract.cc
     runtime/io_event.cc
     runtime/socket.cc
     runtime/send_progress.cc

@@ -78,24 +78,34 @@ struct ListNode {
     ListNode* prev;
     ListNode* next;
 
-    void init() {
+    constexpr void init() {
         prev = this;
         next = this;
     }
 
-    void remove() {
+    constexpr void remove() {
         prev->next = next;
         next->prev = prev;
     }
 
-    void insert_after(ListNode* node) {
+    constexpr void insert_after(ListNode* node) {
         node->prev = this;
         node->next = next;
         next->prev = node;
         next = node;
     }
 
-    [[nodiscard]] bool empty() const { return next == this; }
+    constexpr void detach() {
+        remove();
+        init();
+    }
+
+    constexpr void move_to_tail(ListNode& head) {
+        remove();
+        head.prev->insert_after(this);
+    }
+
+    [[nodiscard]] constexpr bool empty() const { return next == this; }
 };
 
 }  // namespace rut
