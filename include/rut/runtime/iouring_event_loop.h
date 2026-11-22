@@ -6184,8 +6184,9 @@ public:
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.buffered_response_len())
+        if (header == 0 || static_cast<i64>(header) + static_cast<i64>(received) > UINT32_MAX ||
+            static_cast<i64>(header) + static_cast<i64>(received) !=
+                static_cast<i64>(c.buffered_response_len()))
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
@@ -6203,9 +6204,12 @@ public:
             c.response_read_deadline_progress_bytes != received)
             return false;
         if (owner.saw_positive &&
-            (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-             owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
-             owner.expected_copy_end != c.buffered_response_len()))
+            (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                 UINT32_MAX ||
+             static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                 owner.expected_copy_end ||
+             static_cast<i64>(owner.expected_copy_end) !=
+                 static_cast<i64>(c.buffered_response_len())))
             return false;
         if (owner.post_commit_at_start &&
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
