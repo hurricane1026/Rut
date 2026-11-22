@@ -245,7 +245,7 @@ int DnsResolver::resolve(
     };
     if (!kAvailable) return -1;
     u64 attempt_age = 0;
-    if (q.fd >= 0 && !__builtin_sub_overflow(now, q.attempt, &attempt_age) && attempt_age >= 1000)
+    if (q.fd >= 0 && (__builtin_sub_overflow(now, q.attempt, &attempt_age) || attempt_age >= 1000))
         return retry();
     if (q.phase == 1) {
 #if defined(__linux__)
