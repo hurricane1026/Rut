@@ -14310,10 +14310,12 @@ inline bool redirect_origin_request_valid(const Connection& conn,
         return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
-    if (path_addr < base || path_addr - base > conn.recv_buf.len() ||
-        out_req->path.len > conn.recv_buf.len() - static_cast<u32>(path_addr - base))
+    uintptr_t path_offset = 0;
+    if (path_addr < base || __builtin_sub_overflow(path_addr, base, &path_offset) ||
+        path_offset > conn.recv_buf.len() ||
+        out_req->path.len > conn.recv_buf.len() - static_cast<u32>(path_offset))
         return false;
-    const u32 target_start = static_cast<u32>(path_addr - base);
+    const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;
     if (target_len == 0 || out_req->path.ptr[0] != '/') return false;
 
@@ -14357,7 +14359,7 @@ inline bool redirect_origin_request_valid(const Connection& conn,
     if (path_len == 0) return false;
     *out_target_start = target_start;
     *out_path_len = path_len;
-    *out_query_len = target_len - path_len;
+    *out_query_len = static_cast<u32>(static_cast<i64>(target_len) - static_cast<i64>(path_len));
     return true;
 }
 
@@ -14373,7 +14375,7 @@ inline bool build_redirect_response(const Connection& conn,
         conn.listener_context.transport != ListenerTransport::Cleartext ||
         !config.redirect_policy_id_is_valid(policy_id))
         return false;
-    const auto& policy = config.redirect_policies[policy_id - 1];
+    const auto& policy = config.redirect_policies[static_cast<i64>(policy_id) - 1];
     if (!redirect_policy_spec_valid(policy)) return false;
     const bool legacy_profile = policy.authority == RedirectPolicyAuthority::RequestHost;
 
