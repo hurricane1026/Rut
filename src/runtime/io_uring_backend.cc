@@ -296,8 +296,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     cq_ring_entries = params.cq_entries;
 
     // Map SQ ring
-    sq_ring_sz =
-        static_cast<u64>(params.sq_off.array) + static_cast<u64>(params.sq_entries) * sizeof(u32);
+    sq_ring_sz = static_cast<u64>(params.sq_off.array) +
+                 static_cast<u64>(params.sq_entries) * static_cast<u64>(sizeof(u32));
     if (sq_ring_sz > SIZE_MAX) {
         shutdown();
         return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
@@ -344,7 +344,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Map CQ ring
     cq_ring_sz = static_cast<u64>(params.cq_off.cqes) +
-                 static_cast<u64>(params.cq_entries) * sizeof(io_uring_cqe);
+                 static_cast<u64>(params.cq_entries) * static_cast<u64>(sizeof(io_uring_cqe));
     if (cq_ring_sz > SIZE_MAX) {
         shutdown();
         return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
@@ -448,8 +448,8 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     }
 
     // Allocate the buf_ring structure itself
-    u64 ring_sz =
-        sizeof(io_uring_buf_ring) + static_cast<u64>(kProvidedBufCount) * sizeof(io_uring_buf);
+    u64 ring_sz = static_cast<u64>(sizeof(io_uring_buf_ring)) +
+                  static_cast<u64>(kProvidedBufCount) * static_cast<u64>(sizeof(io_uring_buf));
     void* ring_mem = mmap(nullptr,
                           ring_sz,
                           PROT_READ | PROT_WRITE,
@@ -517,7 +517,8 @@ void IoUringBackend::setup_extra_buf_ring(
     void* base =
         mmap(nullptr, total_buf_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return;
-    const u64 ring_sz = sizeof(io_uring_buf_ring) + static_cast<u64>(count) * sizeof(io_uring_buf);
+    const u64 ring_sz = static_cast<u64>(sizeof(io_uring_buf_ring)) +
+                        static_cast<u64>(count) * static_cast<u64>(sizeof(io_uring_buf));
     void* ring_mem = mmap(nullptr,
                           ring_sz,
                           PROT_READ | PROT_WRITE,
@@ -1426,9 +1427,11 @@ u32 IoUringBackend::wait(
         } else {
             downstream_recv_terminal_out_of_range_windows++;
         }
-        downstream_recv_terminal_windows[(downstream_recv_terminal_window_start +
-                                          downstream_recv_terminal_window_count++) &
-                                         ring_mask] = {user_data, tail_exclusive};
+        const u32 window_index =
+            static_cast<u32>((static_cast<i64>(downstream_recv_terminal_window_start) +
+                              static_cast<i64>(downstream_recv_terminal_window_count++)) &
+                             ring_mask);
+        downstream_recv_terminal_windows[window_index] = {user_data, tail_exclusive};
         return true;
     };
 
@@ -1700,11 +1703,12 @@ u32 IoUringBackend::wait(
                     // allocation leaves both buffers and the witness unchanged.
                     prefix_copy =
                         conn.response_body_tail.size == 0 ? (nbytes < avail ? nbytes : avail) : 0;
-                    const u32 overflow = nbytes - prefix_copy;
+                    const u32 overflow =
+                        static_cast<u32>(static_cast<i64>(nbytes) - static_cast<i64>(prefix_copy));
                     deadline_copy_eligible =
                         overflow == 0 ||
                         conn.response_body_tail.append(*response_pool,
-                                                       src + prefix_copy,
+                                                       src + static_cast<i64>(prefix_copy),
                                                        overflow,
                                                        conn.buffered_response_bulk_after());
                     if (deadline_copy_eligible && prefix_copy != 0) {
@@ -2105,11 +2109,11 @@ u32 IoUringBackend::wait(
                      conns[conn_id].fd != ss.fd))
                     result = -ECANCELED;
                 if (result == 0 && ss.remaining > 0) {
-                    off_t pos = static_cast<off_t>(ss.file_base) + ss.offset;
+                    off_t pos = static_cast<off_t>(ss.file_base) + static_cast<off_t>(ss.offset);
                     const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
                     if (n > 0) {
-                        ss.offset += static_cast<u32>(n);
-                        ss.remaining -= static_cast<u32>(n);
+                        ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + n);
+                        ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - n);
                     } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                         result = -errno;
                     }
@@ -2177,8 +2181,9 @@ u32 IoUringBackend::wait(
                         sqe->opcode = ss.vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
                         sqe->msg_flags = MSG_NOSIGNAL | ss.msg_flags;
                         sqe->fd = ss.fd;
-                        sqe->addr = ss.vector ? reinterpret_cast<u64>(&ss.vector->message)
-                                              : reinterpret_cast<u64>(ss.src + ss.offset);
+                        sqe->addr =
+                            ss.vector ? reinterpret_cast<u64>(&ss.vector->message)
+                                      : reinterpret_cast<u64>(ss.src + static_cast<i64>(ss.offset));
                         sqe->len = ss.vector ? 1u : ss.remaining;
                         sqe->user_data =
                             type == IoEventType::UpstreamSend
@@ -2295,7 +2300,8 @@ void IoUringBackend::shutdown() {
         buf_base = nullptr;
     }
     if (buf_ring != nullptr) {
-        u64 ring_sz = sizeof(io_uring_buf_ring) + kProvidedBufCount * sizeof(io_uring_buf);
+        u64 ring_sz =
+            sizeof(io_uring_buf_ring) + static_cast<u64>(kProvidedBufCount) * sizeof(io_uring_buf);
         munmap(buf_ring, ring_sz);
         buf_ring = nullptr;
     }
@@ -2305,7 +2311,8 @@ void IoUringBackend::shutdown() {
     }
     if (large_buf_ring != nullptr) {
         munmap(large_buf_ring,
-               sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf));
+               sizeof(io_uring_buf_ring) +
+                   static_cast<u64>(kLargeProvidedBufCount) * sizeof(io_uring_buf));
         large_buf_ring = nullptr;
     }
     if (downstream_recv_terminal_windows != nullptr) {
