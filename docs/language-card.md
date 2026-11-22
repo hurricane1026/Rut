@@ -2667,9 +2667,12 @@ replace auth.
 
 For chain-after helpers, `resp.set("Name", optionalString)` now replaces when
 present and removes when nil. Present empty strings remain empty header values.
-`add` still requires a non-optional string. Local Response builder restrictions
-are unchanged. This reuses existing optional expression syntax; no `if` statement
-with conditional Response effects is added.
+`add` still requires a non-optional string. In a guarded HTTP route, a local
+Response builder can use dynamic header values after the final guard. The first
+dynamic mutation starts a sequence of up to two runtime mutations immediately
+before returning the builder. Only the builder's return executes this sequence.
+Waits, loops, fallible bindings and chain-after effects are unsupported with
+this guarded form.
 
 The lower-level boolean helpers remain available:
 

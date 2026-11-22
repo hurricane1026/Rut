@@ -38849,8 +38849,45 @@ route GET "/x" {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE_FALSE(hir.has_value());
     CHECK(hir.error().detail.eq(
-        lit("dynamic response header mutations cannot be combined with guards/waits/for loops "
-            "yet")));
+        lit("dynamic response header mutations must follow all guards and cannot be combined "
+            "with waits or loops")));
+}
+
+TEST(frontend, guarded_dynamic_response_mutations_require_a_return_suffix) {
+    const char* sources[] = {
+        R"rut(route GET "/" {
+            guard req.path != "/denied" else { return 403 }
+            let r = response(204)
+            r.set("X-Path", req.path)
+            let observed = r.header("X-Path")
+            return r
+        })rut",
+        R"rut(func decorate(_ req: i32, _ resp: Response) -> i32 {
+            resp.set("X-Stage", "after")
+            0
+        }
+        chain headers { after decorate(req, resp) }
+        route GET "/" use chain headers {
+            guard req.path != "/denied" else { return 403 }
+            let r = response(204)
+            r.set("X-Path", req.path)
+            return r
+        })rut",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+                  lit("dynamic response header mutations in a guarded route must immediately "
+                      "precede the Response return")) ||
+              hir.error().detail.eq(
+                  lit("guarded dynamic response headers cannot be combined with chain-after "
+                      "response effects")));
+    }
 }
 
 TEST(frontend, response_header_lookup_respects_nearest_shadowing_local) {

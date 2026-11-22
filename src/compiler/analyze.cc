@@ -25648,7 +25648,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // Pre-scan for waits: time.nowMicros() anywhere in a wait route is
         // rejected (see kTimeWaitDetail) — the flag must be set before any
         // statement is analyzed so pre-wait bindings are caught too.
-        bool response_runtime_mutation_blocked = seen_guard;
+        bool response_runtime_mutation_blocked = false;
+        bool guarded_response_mutations = false;
+        u32 last_explicit_guard = 0;
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& s = *route_decl.statements[si];
             if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
@@ -25656,13 +25658,21 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.cache_ops_blocked = true;
                 route.time_ops_blocked = true;
             }
-            if (s.kind == AstStmtKind::Guard || s.kind == AstStmtKind::Wait ||
-                s.kind == AstStmtKind::WaitAny || s.kind == AstStmtKind::For ||
+            if (s.kind == AstStmtKind::Guard) last_explicit_guard = si;
+            if (s.kind == AstStmtKind::Wait || s.kind == AstStmtKind::WaitAny ||
+                s.kind == AstStmtKind::For ||
                 (s.kind == AstStmtKind::Let && s.expr.kind == AstExprKind::Wait))
                 response_runtime_mutation_blocked = true;
         }
+        constexpr auto kGuardedResponseSuffix = lit_str(
+            "dynamic response header mutations in a guarded route must immediately precede "
+            "the Response return");
         for (u32 si = 0; si < route_decl.statements.len; si++) {
             const AstStatement& stmt = *route_decl.statements[si];
+            if (guarded_response_mutations && stmt.kind != AstStmtKind::Expr &&
+                stmt.kind != AstStmtKind::ReturnStatus)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, stmt.span, kGuardedResponseSuffix);
             if (stmt.kind == AstStmtKind::Expr) {
                 // Response builder mutation. Literal-only prefixes fold into
                 // the terminator's static header set. At the first dynamic
@@ -25702,6 +25712,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
 
                         HirExpr value{};
                         if (!is_remove) {
+                            const u32 guard_count = route.guards.len;
                             auto analyzed = analyze_expr(*stmt.expr.args[1],
                                                          &route,
                                                          mod,
@@ -25709,6 +25720,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                          route.locals.len,
                                                          nullptr);
                             if (!analyzed) return core::make_unexpected(analyzed.error());
+                            if (route.guards.len != guard_count)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    stmt.expr.args[1]->span,
+                                    lit_str("response header values cannot introduce guards"));
                             if (analyzed->type != HirTypeKind::Str || analyzed->may_nil ||
                                 analyzed->may_error)
                                 return frontend_error(
@@ -25729,12 +25745,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         const bool runtime = response_init.bool_value ||
                                              (!is_remove && value.kind != HirExprKind::StrLit);
                         if (runtime) {
-                            if (response_runtime_mutation_blocked)
+                            const bool after_guard = seen_guard || route.guards.len != 0;
+                            if (response_runtime_mutation_blocked || si < last_explicit_guard ||
+                                (after_guard && response_init.bool_value &&
+                                 !guarded_response_mutations))
                                 return frontend_error(
                                     FrontendError::UnsupportedSyntax,
                                     stmt.span,
-                                    lit_str("dynamic response header mutations cannot be combined "
-                                            "with guards/waits/for loops yet"));
+                                    lit_str("dynamic response header mutations must follow all "
+                                            "guards and cannot be combined with waits or loops"));
                             u32 response_builder_count = 0;
                             for (u32 li = 0; li < route.locals.len; li++) {
                                 if (route.locals[li].init.kind == HirExprKind::ResponseInit)
@@ -25764,7 +25783,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                             carrier.ref_index =
                                 next_local_ref_index(&route, route.locals.data, route.locals.len);
                             carrier.type = HirTypeKind::Str;
+                            carrier.run_at_response_return = after_guard;
                             carrier.init = effect;
+                            guarded_response_mutations = after_guard;
                             if (!route.locals.push(carrier))
                                 return frontend_error(FrontendError::TooManyItems, stmt.span);
                             continue;
@@ -25799,6 +25820,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         continue;
                     }
                 }
+                if (guarded_response_mutations)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, stmt.span, kGuardedResponseSuffix);
                 const bool req_mutation_syntax =
                     stmt.expr.kind == AstExprKind::MethodCall && stmt.expr.lhs != nullptr &&
                     stmt.expr.lhs->kind == AstExprKind::Ident &&
@@ -26216,12 +26240,11 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         stmt.span,
                         lit_str(
                             "a dynamically mutated Response builder must be returned directly"));
-                if (route.guards.len != 0)
+                if (route.guards.len != 0 && !guarded_response_mutations)
                     return frontend_error(
                         FrontendError::UnsupportedSyntax,
                         stmt.span,
-                        lit_str(
-                            "dynamic response header mutations cannot be combined with guards"));
+                        lit_str("dynamic response header mutations must follow all guards"));
                 for (u32 li = 0; li < route.locals.len; li++) {
                     if (route.locals[li].init.may_error)
                         return frontend_error(
@@ -26249,6 +26272,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
             for (u32 si = 0; si < chain->steps.len; si++) {
                 const auto& step = chain->steps[si];
                 if (step.kind != AstChainStepKind::After) continue;
+                if (guarded_response_mutations)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        chain_use.span,
+                        lit_str("guarded dynamic response headers cannot be combined with "
+                                "chain-after response effects"));
                 const u32 before_count = route.locals.len;
                 auto after = analyze_chain_after_response_step(step, chain_use.span, &route, mod);
                 if (!after) return core::make_unexpected(after.error());

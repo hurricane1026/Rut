@@ -2530,6 +2530,62 @@ route GET "/api/users" {
     rir.destroy();
 }
 
+TEST(jit, guarded_response_dynamic_headers_are_success_only) {
+    const auto src = R"rut(
+route GET "/api/users" {
+    guard let value = req.uniqueHeader("X-Verified") else { return 401 }
+    guard value == "allowed" else { return 403 }
+    let resp = response(204)
+    resp.set("X-Verified", value)
+    resp.add("X-Verified", "tail")
+    return resp
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    Connection conn;
+    const auto run = [&](const char* request) {
+        conn.reset();
+        return HandlerResult::unpack(handler(&conn,
+                                             nullptr,
+                                             reinterpret_cast<const u8*>(request),
+                                             static_cast<u32>(strlen(request)),
+                                             nullptr));
+    };
+    CHECK_EQ(run("GET /api/users HTTP/1.1\r\nHost: localhost\r\n\r\n").status_code, 401u);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_EQ(
+        run("GET /api/users HTTP/1.1\r\nHost: localhost\r\nX-Verified: denied\r\n\r\n").status_code,
+        403u);
+    CHECK_EQ(conn.resp_header_mutation_count, 0u);
+    CHECK_EQ(run("GET /api/users HTTP/1.1\r\nHost: localhost\r\nX-Verified: allowed\r\n\r\n")
+                 .status_code,
+             204u);
+    REQUIRE_EQ(conn.resp_header_mutation_count, 2u);
+    CHECK(conn.resp_header_mutations[0].mode == ConnectionBase::RespHeaderMutationMode::Set);
+    CHECK(conn.resp_header_mutations[0].value.eq(lit("allowed")));
+    CHECK(conn.resp_header_mutations[1].mode == ConnectionBase::RespHeaderMutationMode::Add);
+    CHECK(conn.resp_header_mutations[1].value.eq(lit("tail")));
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, chain_after_response_headers_commit_on_guard_rejection) {
     const auto src = R"rut(
 func response_headers(_ req: i32, _ resp: Response) -> i32 {
