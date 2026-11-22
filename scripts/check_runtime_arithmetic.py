@@ -72,9 +72,10 @@ def unsigned_add_sub(scope):
 def matches(tool, file, query, flags):
     command = [tool, '-c', 'set traversal AsIs', '-c', 'match ' + query, str(file), *flags]
     run = subprocess.run(command, text=True, capture_output=True)
+    diagnostics = run.stderr + run.stdout
     locations = re.findall(r'^(.+?:\d+:\d+): note: "root" binds here', run.stdout, re.M)
     count = re.search(r'^(\d+) match(?:es)?\.', run.stdout, re.M)
-    if run.returncode or not count or int(count[1]) != len(locations):
+    if run.returncode or re.search(r'\berror:', diagnostics) or not count or int(count[1]) != len(locations):
         raise RuntimeError(f'{file}: clang-query failed\n{run.stderr}\n{run.stdout[-2000:]}')
     return locations
 
@@ -101,6 +102,17 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             found = sorted(int(p.rsplit(':', 2)[1]) for p in matches(tool, file, query, flags))
             if found != expected:
                 raise RuntimeError(f'clang-query self-test: expected lines {expected}, got {found}')
+        if matches(tool, file, 'isExpansionInMainFile(), integerLiteral(equals(987654321))', flags):
+            raise RuntimeError('clang-query self-test: expected a valid zero-match query')
+
+        broken = Path(directory) / 'broken.cc'
+        broken.write_text('using U = unsigned; U broken(U x) { return x + ; }\n')
+        try:
+            matches(tool, broken, unsigned_add_sub('isExpansionInMainFile()'), flags)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError('clang-query self-test: compiler diagnostics were not rejected')
 
 
 def test_unsigned_add_sub(tool):
