@@ -451,21 +451,26 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         d.overflow = true;
         return;
     }
-    const u32 kN = http2_write_response(d.resp + d.resp_len,
-                                        d.resp_cap - d.resp_len,
-                                        enc,
-                                        stream_id,
-                                        status,
-                                        hdrs,
-                                        nhdrs,
-                                        body,
-                                        body_len);
+    if (d.resp_len > d.resp_cap) {
+        d.overflow = true;
+        return;
+    }
+    const u32 kN = http2_write_response(
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        status,
+        hdrs,
+        nhdrs,
+        body,
+        body_len);
     if (kN != 0) {
         if (d.owned_hpack_pending)
             d.owned_hpack_after = enc;
         else
             d.conn->h2->hpack_enc = enc;
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
         h2_close_stream(d.conn->h2, stream_id);
         return;
     }
@@ -479,7 +484,15 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     // First frame, fallback allowed: a tiny synthetic 500 always fits.
     enc = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
     const u32 kFallback = http2_write_response(
-        d.resp + d.resp_len, d.resp_cap - d.resp_len, enc, stream_id, 500, nullptr, 0, nullptr, 0);
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        500,
+        nullptr,
+        0,
+        nullptr,
+        0);
     if (kFallback == 0)
         d.overflow = true;
     else {
@@ -487,7 +500,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
             d.owned_hpack_after = enc;
         else
             d.conn->h2->hpack_enc = enc;
-        d.resp_len += kFallback;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kFallback));
         h2_close_stream(d.conn->h2, stream_id);
     }
 }
@@ -538,8 +551,12 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
 
     u32 o = 0;
     auto put = [&](const char* s, u32 len) -> bool {
-        if (o > cap || len > cap - o) return false;
-        for (u32 i = 0; i < len; i++) out[o++] = static_cast<u8>(s[i]);
+        if (o > cap || static_cast<i64>(len) > static_cast<i64>(cap) - static_cast<i64>(o))
+            return false;
+        for (u32 i = 0; i < len; i++) {
+            out[static_cast<i64>(o)] = static_cast<u8>(s[i]);
+            o = static_cast<u32>(static_cast<i64>(o) + 1);
+        }
         return true;
     };
     if (!put(method.ptr, method.len) || !put(" ", 1) || !put(path.ptr, path.len) ||
@@ -597,16 +614,20 @@ inline u32 h2_reanchor_route_params(const hpack::Header* headers,
             path = headers[i].value;
     }
     const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-    const u32 kPathStart = method.len + 1;
+    const u32 kPathStart = static_cast<u32>(static_cast<i64>(method.len) + 1);
     u32 stored = 0;
     for (u32 i = 0; i < kCapped; i++) {
         const RouteParam& p = params[i];
         if (path.ptr == nullptr || p.value < path.ptr ||
-            p.value + p.value_len > path.ptr + path.len)
+            p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
             continue;
-        const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
-        out[stored++] = {
-            p.name, p.name_len, reinterpret_cast<const char*>(synth + kOff), p.value_len};
+        const u32 kOff =
+            static_cast<u32>(static_cast<i64>(kPathStart) + static_cast<i64>(p.value - path.ptr));
+        out[stored] = {p.name,
+                       p.name_len,
+                       reinterpret_cast<const char*>(synth + static_cast<i64>(kOff)),
+                       p.value_len};
+        stored = static_cast<u32>(static_cast<i64>(stored) + 1);
     }
     return stored;
 }
