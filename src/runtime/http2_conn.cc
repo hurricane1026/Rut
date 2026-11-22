@@ -208,11 +208,15 @@ u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
     if (out_cap < kFrameHeaderSize) return 0;
     u32 o = kFrameHeaderSize;
+    static constexpr i64 kHpackFieldOverhead = 13;  // 1 prefix + 6 + 6 length octets
     for (u32 i = 0; i < n; i++) {
-        // Worst-case per header: name+value+small prefixes. Bail if it won't fit.
-        if (o + hs[i].name.len + hs[i].value.len + 8 > out_cap) return 0;
+        // A 32-bit length needs at most six octets with a 7-bit prefix. Check
+        // in i64 so huge direct inputs are rejected before any pointer arithmetic.
+        const i64 kWorst =
+            static_cast<i64>(o) + hs[i].name.len + hs[i].value.len + kHpackFieldOverhead;
+        if (kWorst > out_cap) return 0;
         const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
-        if (kEncoded < 0 || kEncoded > static_cast<i64>(out_cap - o)) return 0;
+        // kWorst is a complete write-before bound for encode_header.
         o += static_cast<u32>(kEncoded);
     }
     const u32 kPayload = o - kFrameHeaderSize;
@@ -287,14 +291,14 @@ static u32 http2_write_response_impl(u8* out,
     // supply arbitrary header sizes, so this must bound the write exactly — a header
     // just under the buffer would otherwise encode past hblock instead of returning
     // 0 (→ the caller answers 502).
-    static constexpr u32 kHpackFieldOverhead = 11;  // 1 prefix + 5 + 5 length octets
+    static constexpr i64 kHpackFieldOverhead = 13;  // 1 prefix + 6 + 6 length octets
     // Room the trailing content-length line needs when there's a body, reserved
     // during the loop so the loop can't fill hblock and then overflow on the CL.
-    const u32 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
+    const i64 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
     for (u32 i = 0; i < nhdrs; i++) {
-        if (hb + hdrs[i].name.len + hdrs[i].value.len + kHpackFieldOverhead + kClReserve >
-            sizeof(hblock))
-            return 0;
+        const i64 kWorst = static_cast<i64>(hb) + hdrs[i].name.len + hdrs[i].value.len +
+                           kHpackFieldOverhead + kClReserve;
+        if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
         // config (or a proxied upstream) may hold mixed case (HTTP/1 tolerates it).
         // Lowercase into a small buffer before encoding.
@@ -317,22 +321,22 @@ static u32 http2_write_response_impl(u8* out,
             }
         }
         const i64 kEncoded = enc.encode(hblock + hb, name, hdrs[i].value);
-        if (kEncoded < 0 || kEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
         hb += static_cast<u32>(kEncoded);
     }
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
-        if (hb + 14 + kClLen + kHpackFieldOverhead > sizeof(hblock)) return 0;  // (reserved above)
+        const i64 kWorst = static_cast<i64>(hb) + 14 + kClLen + kHpackFieldOverhead;
+        if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;  // (reserved above)
         const i64 kClEncoded =
             enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
-        if (kClEncoded < 0 || kClEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
         hb += static_cast<u32>(kClEncoded);
     }
 
     const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
-    const u32 kNeed =
-        kFrameHeaderSize + hb + (!headers_only && body_len > 0 ? kFrameHeaderSize + body_len : 0u);
+    const i64 kNeed =
+        static_cast<i64>(kFrameHeaderSize) + hb +
+        (!headers_only && body_len > 0 ? static_cast<i64>(kFrameHeaderSize) + body_len : 0);
     if (kNeed > out_cap) return 0;
 
     Http2FrameHeader h;

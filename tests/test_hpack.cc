@@ -119,7 +119,7 @@ TEST(hpack_huffman, bounded_header_block_length_uses_full_bit_count) {
     constexpr i64 kMaxInput = static_cast<i64>(~u32{0});
     constexpr i64 kMaxBits = kMaxInput * 30;
     static_assert(kMaxBits < 0x7fffffffffffffffLL);
-    static_assert((kMaxBits + 7) / 8 > kMaxInput);
+    static_assert(hpack::huffman_encoded_bytes_from_bits(kMaxBits) > kMaxInput);
     // HTTP/2 header blocks are bounded at 16 KiB. Symbol 0 has a 13-bit code,
     // so this exercises the length calculation across the full production cap.
     u8 input[16384] = {};

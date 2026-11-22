@@ -218,7 +218,7 @@ i64 huffman_encoded_len(const u8* src, u32 len) {
     i64 bits = 0;
     for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
 
-    return (bits + 7) / 8;
+    return huffman_encoded_bytes_from_bits(bits);
 }
 
 i64 huffman_encode(u8* out, const u8* src, u32 len) {
@@ -415,22 +415,28 @@ void dyn_set_max_size(DynamicTable& d, u32 m) {
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
 void dyn_add(DynamicTable& d, Str name, Str value) {
-    const u32 kCost = name.len + value.len + 32u;
-    if (kCost > d.max_size) {  // §4.4: entry larger than the table empties it
+    const i64 kPayload = static_cast<i64>(name.len) + value.len;
+    const i64 kCost = kPayload + 32;
+    if (kCost > d.max_size || kPayload > DynamicTable::kByteCap) {
+        // §4.4: entry larger than the table empties it. The payload check also
+        // keeps the u32 offsets and u16 entry lengths representable.
         dyn_clear(d);
         return;
     }
-    while (d.table_size + kCost > d.max_size || d.nent >= DynamicTable::kMaxEntries)
+    while (static_cast<i64>(d.table_size) + kCost > d.max_size ||
+           d.nent >= DynamicTable::kMaxEntries)
         dyn_evict_oldest(d);
+    const u32 kPayload32 = static_cast<u32>(kPayload);
+    const u32 kCost32 = static_cast<u32>(kCost);
     const u32 kOff = d.byte_used;
     __builtin_memcpy(d.buf + kOff, name.ptr, name.len);
     __builtin_memcpy(d.buf + kOff + name.len, value.ptr, value.len);
-    d.byte_used += name.len + value.len;
+    d.byte_used += kPayload32;
     d.ents[d.nent].off = kOff;
     d.ents[d.nent].nlen = static_cast<u16>(name.len);
     d.ents[d.nent].vlen = static_cast<u16>(value.len);
     d.nent++;
-    d.table_size += kCost;
+    d.table_size += kCost32;
 }
 
 bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
