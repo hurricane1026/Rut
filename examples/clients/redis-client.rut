@@ -645,43 +645,11 @@ func redisReplayClaim(_ connection: TcpConnection, _ username: Bytes, _ password
 // Optional local-AOF replay profile for Redis 7.2+. The SET and same-connection
 // fsync barrier form a finite pipeline, not a MULTI transaction. Four receives
 // preserve the existing sixteen-operation initialization/cleanup budget.
-func redisReplayDurableReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
-    if stream.cursor.status == 0 {
-        let reading = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
-        guard let chunk = reading else { nil }
-        guard chunk.count > 0 else { nil }
-        guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
-        // One SET result, one array and two integer children are the entire
-        // supported response. Do not instantiate a generic 64-node pipeline.
-        guard let steps = collectBytes(bytes, stream.cursor, 4, resp2StreamStep) else { nil }
-        guard let cursor = steps.get(steps.count - 1) else { nil }
-        resp2StreamFinish(bytes, cursor)
-    } else { stream }
-}
-func redisReplayDurableReadTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
-    let readingFirst = redisReplayDurableReceive(connection, stream)
-    guard let first = readingFirst else { nil }
-    let readingSecond = redisReplayDurableReceive(connection, first)
-    guard let second = readingSecond else { nil }
-    second
-}
 func redisReplayDurableRead(_ connection: TcpConnection) -> Bytes {
-    let initial = Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 2, nodes: 0,
-        status: 0, search: 1, bulkEnd: -1, limit: 128))
-    let readingFirst = redisReplayDurableReadTwice(connection, initial)
-    guard let first = readingFirst else { nil }
-    let readingSecond = redisReplayDurableReadTwice(connection, first)
-    guard let stream = readingSecond else { nil }
-    guard resp2Finished(stream) else { nil }
-    stream.bytes
+    resp2ReadLocalAofReply(connection)
 }
 func redisReplayDurableBarrier(_ barrier: Bytes) -> bool {
-    guard let root = resp2Token(barrier, 0) else { false }
-    guard root.kind == 5 && root.children == 2 else { false }
-    guard let local = resp2Token(barrier, root.next) else { false }
-    guard let replicas = resp2Token(barrier, local.next) else { false }
-    local.kind == 3 && local.data == b"1" && replicas.kind == 3 &&
-        parseInt64(replicas.data).or(-1) > -1 && replicas.next == barrier.count
+    resp2LocalAofAcknowledged(barrier)
 }
 func redisReplayDurableReply(_ frame: Bytes) -> RedisSessionResult {
     guard let token = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
@@ -763,4 +731,34 @@ func redisDeleteKeys(_ connection: TcpConnection, _ keys: RedisKeys, _ mode: Red
     guard let request = resp2DeleteKeysRequest(keys, mode) else { RedisResult.requestFailure }
     let result = redisExecuteScalarWire(connection, request)
     redisResultFinish(connection, redisExpectDeletedCount(result, keys.count))
+}
+
+func sessionRevokeReply(_ frame: Bytes) -> RedisSessionResult {
+    guard let reply = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
+    guard let barrier = frame.slice(reply.next, frame.count) else { RedisSessionResult.replyFailure }
+    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    if reply.kind == 2 { RedisSessionResult.serverError(reply.data) } else {
+        if reply.kind == 1 && reply.data == b"OK" { RedisSessionResult.ok } else { RedisSessionResult.replyFailure }
+    }
+}
+
+func sessionRevokeExecute(_ connection: TcpConnection, _ request: Bytes) -> RedisSessionResult {
+    guard request.count > 0 else { RedisSessionResult.requestFailure }
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
+    // Reuse the bounded scalar-plus-barrier reader: 128 bytes, four receives.
+    let reading = redisReplayDurableRead(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    sessionRevokeReply(frame)
+}
+
+func sessionRevokeDurable(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+                         _ database: i32, _ key: Bytes, _ expiry: Bytes) -> RedisSessionResult {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { redisSessionFromInitialize(initialized) }
+    let result = sessionRevokeExecute(connection, sessionRevokeRequest(key, expiry).or(b""))
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        result
+    } else { redisSessionFinish(connection, result) }
 }

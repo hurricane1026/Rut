@@ -1,0 +1,44 @@
+import "clients/redis-client.rut"
+import "middleware/browser_origin.rut"
+import "middleware/browser_session_cookie.rut"
+import "middleware/jwt_session.rut"
+
+struct Revocation { key: Bytes expiry: Bytes }
+
+func revocationArguments(_ document: Json, _ token: str) -> Revocation {
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { nil }
+    guard let expiry = json.get(document, "/exp") else { nil }
+    guard let encoded = json.encode(expiry) else { nil }
+    Revocation(key: key, expiry: Bytes(encoded))
+}
+
+func validBrowserConfig(_ origin: str, _ site: str) -> bool {
+    browser_origin.validOrigin(origin) && site == "same-origin"
+}
+
+func browserHeadersMatch(_ origin: str, _ site: str, _ expected: str) -> bool {
+    origin == expected && site == "same-origin"
+}
+
+chain browserLogout {
+    before validBrowserConfig(env("BROWSER_ORIGIN"), env("BROWSER_FETCH_SITE")) else 503
+    before browserHeadersMatch(req.uniqueHeader("Origin").or(""),
+        req.uniqueHeader("Sec-Fetch-Site").or(""), env("BROWSER_ORIGIN")) else 403
+}
+
+// Serve over HTTPS. This profile accepts the host-bound cookie as its sole
+// session credential and clears it only after durable exact-token revocation.
+route POST "/logout" use chain browserLogout {
+    let token = req.uniqueCookie("__Host-rut_session").or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard let revocation = revocationArguments(document, token) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = sessionRevokeDurable(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), revocation.key, revocation.expiry)
+    guard redisReplayResultStatus(result) == 1 else { return 503 }
+    let cleared = browser_session_cookie.cleared()
+    return cleared
+}
+
+route "/" { return 404 }

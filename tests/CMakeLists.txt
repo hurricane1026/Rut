@@ -4486,6 +4486,15 @@ if(RUT_ENABLE_JIT)
                         LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            foreach(browser_revoke_backend epoll io_uring)
+                add_test(NAME test_browser_session_revoke_${browser_revoke_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_browser_session_revoke.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/browser-session-revoke.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${browser_revoke_backend})
+                set_tests_properties(test_browser_session_revoke_${browser_revoke_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(session_durable_backend epoll io_uring)
                 foreach(session_durable_opt 0 2)
                     add_test(NAME test_jwt_session_durable_${session_durable_backend}_opt${session_durable_opt}
