@@ -212,18 +212,13 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
     return i;
 }
 
-u32 huffman_encoded_len(const u8* src, u32 len) {
+i64 huffman_encoded_len(const u8* src, u32 len) {
     // The longest HPACK code is 30 bits, so the full u32 input range fits in
     // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
     i64 bits = 0;
     for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
 
-    // A u32 cannot represent the encoded size of an arbitrarily large input.
-    // Saturate instead of truncating, so encode_string never mistakes a wrapped
-    // Huffman length for a shorter representation.
-    constexpr i64 kMaxEncodedLength = static_cast<i64>(~u32{0});
-    if (bits > kMaxEncodedLength * 8) return static_cast<u32>(kMaxEncodedLength);
-    return static_cast<u32>((bits + 7) / 8);
+    return (bits + 7) / 8;
 }
 
 u32 huffman_encode(u8* out, const u8* src, u32 len) {
@@ -295,9 +290,10 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
 }
 
 u32 encode_string(u8* out, const u8* src, u32 len) {
-    const u32 kHlen = huffman_encoded_len(src, len);
-    if (kHlen < len) {
-        const u32 kHdr = encode_integer(out, kHlen, 7, 0x80);  // H=1
+    const i64 kHlen = huffman_encoded_len(src, len);
+    if (kHlen < static_cast<i64>(len)) {
+        // kHlen < len <= UINT32_MAX proves this narrowing is representable.
+        const u32 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
         const u32 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }

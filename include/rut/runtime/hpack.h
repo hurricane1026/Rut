@@ -23,9 +23,9 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top);
 
 // --- Huffman (§5.2 / App. B) ---
 
-// Number of octets src[0..len) encodes to. Saturates at UINT32_MAX if the
-// mathematical result is not representable in the return type.
-u32 huffman_encoded_len(const u8* src, u32 len);
+// Number of octets src[0..len) encodes to. The i64 result is exact for every
+// u32 input length; callers must check it before narrowing for a u32 field.
+i64 huffman_encoded_len(const u8* src, u32 len);
 
 // Huffman-encode src[0..len) into out (must hold huffman_encoded_len(src,len)).
 // Pads the final octet with the EOS prefix (1-bits). Returns octets written.
