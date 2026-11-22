@@ -172,7 +172,9 @@ template <typename Loop>
 void grpc_observe(Loop* loop, GrpcExchange& x) {
     if (!x.observed) return;
     x.observed = false;
-    const u64 kElapsed = monotonic_us() - x.started_us;
+    const u64 now = monotonic_us();
+    u64 kElapsed = 0;
+    if (now >= x.started_us) (void)__builtin_sub_overflow(now, x.started_us, &kElapsed);
     const u8 kStatus = x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1;
     if (loop->metrics) loop->metrics->on_grpc_complete(kStatus, kElapsed);
     auto& entry = x.log_entry;
@@ -184,7 +186,7 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
     entry.resp_size = x.staged_response_bytes > 0xffffffffull
                           ? 0xffffffffu
                           : static_cast<u32>(x.staged_response_bytes);
-    entry.grpc_status_plus_one = kStatus + 1;
+    entry.grpc_status_plus_one = static_cast<u8>(static_cast<i64>(kStatus) + 1);
     if (loop->access_log && loop->live_access_log)
         loop->live_access_log->fail_protocol(EINVAL);
     else if (loop->live_access_log && !loop->live_access_log->captures_downstream_host())
@@ -1777,10 +1779,13 @@ void grpc_tick(Loop* loop, Connection& conn) {
         return;
     }
     if (h.grpc.upstream) {
+        u64 connected_age = 0;
+        if (now >= h.grpc.connected_at_us)
+            (void)__builtin_sub_overflow(now, h.grpc.connected_at_us, &connected_age);
         const bool stale_config =
             h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
-             now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
+             connected_age >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
             stale_config ||
             grpc_idle_upstream_should_close(h.grpc,
                                             h.peer_goaway,
@@ -1831,14 +1836,19 @@ bool grpc_start_synth(H2Dispatch<Loop>& d,
             grpc_header_name(header.name, {"te", 2}) ||
             grpc_header_name(header.name, {"connection", 10}))
             continue;
-        if (n >= Http2Conn::kMaxHeadersPerReq || header.name.len > sizeof(names) - used)
+        if (n >= Http2Conn::kMaxHeadersPerReq ||
+            static_cast<i64>(header.name.len) >
+                static_cast<i64>(sizeof(names)) - static_cast<i64>(used))
             return false;
         for (u32 j = 0; j < header.name.len; j++) {
             char c = header.name.ptr[j];
-            names[used + j] = c >= 'A' && c <= 'Z' ? c + 'a' - 'A' : c;
+            names[static_cast<i64>(used) + static_cast<i64>(j)] =
+                c >= 'A' && c <= 'Z' ? c + 'a' - 'A' : c;
         }
-        hs[n++] = {{reinterpret_cast<const char*>(names + used), header.name.len}, header.value};
-        used += header.name.len;
+        hs[n] = {{reinterpret_cast<const char*>(names + static_cast<i64>(used)), header.name.len},
+                 header.value};
+        n = static_cast<u32>(static_cast<i64>(n) + 1);
+        used = static_cast<u32>(static_cast<i64>(used) + static_cast<i64>(header.name.len));
     }
     return grpc_start(d.loop, *d.conn, sid, cfg, uid, hs, n, req, end);
 }
