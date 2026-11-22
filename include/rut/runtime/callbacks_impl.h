@@ -13539,7 +13539,7 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 conn.req_method, conn.response_read_deadline_route_method) ||
             !config->policy_bundle_id_is_valid(bundle_id))
             return false;
-        const auto& bundle = config->policy_bundles[bundle_id - 1];
+        const auto& bundle = config->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_read_timeout_seconds != conn.response_read_deadline_seconds ||
             bundle.response_buffering != conn.response_read_deadline_buffering ||
@@ -13552,9 +13552,12 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
             !complete_content_length_request_policy_owner_is_stable(
                 conn, conn.response_read_deadline_upload))
             return false;
-        const auto& response = config->response_policies[bundle.response_policy_id - 1];
-        const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-        const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+        const auto& response =
+            config->response_policies[static_cast<i64>(bundle.response_policy_id) - 1];
+        const auto& failure =
+            config->failure_policies[static_cast<i64>(bundle.failure_policy_id) - 1];
+        const auto& timeout =
+            config->failure_policies[static_cast<i64>(bundle.timeout_failure_policy_id) - 1];
         if (!admitted_response_policy_valid(response) ||
             !admitted_forward_failure_policy_valid(failure) ||
             !admitted_forward_timeout_failure_policy_valid(timeout) ||
@@ -13643,10 +13646,13 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 proof.upstream_id != conn.upstream_idx ||
                 proof.request_policy_id != conn.request_policy_id || proof.raw_header_end == 0 ||
                 proof.raw_content_length == 0 ||
-                proof.raw_total_length != proof.raw_header_end + proof.raw_content_length ||
+                static_cast<i64>(proof.raw_total_length) !=
+                    static_cast<i64>(proof.raw_header_end) +
+                        static_cast<i64>(proof.raw_content_length) ||
                 proof.rewritten_header_end == 0 ||
-                proof.rewritten_total_length !=
-                    proof.rewritten_header_end + proof.raw_content_length ||
+                static_cast<i64>(proof.rewritten_total_length) !=
+                    static_cast<i64>(proof.rewritten_header_end) +
+                        static_cast<i64>(proof.raw_content_length) ||
                 proof.expected_upload_length != proof.rewritten_total_length ||
                 proof.upload_episode != 0 || proof.downstream_close ||
                 (fixed_upload_head
