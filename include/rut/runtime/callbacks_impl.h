@@ -10380,7 +10380,8 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
-    const u32 remaining = publish_body - completed;
+    const u32 remaining =
+        static_cast<u32>(static_cast<i64>(publish_body) - static_cast<i64>(completed));
     u32 front = conn.buffered_response_front_size();
     // Study: combine complete already-published nodes up to a byte budget.
     // Never wait for a node or clip the next one just to fill a vector.
@@ -10528,11 +10529,13 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         return;
     }
     conn.response_read_deadline_post_commit_downstream_submitted = static_cast<u32>(
-        static_cast<i64>(conn.response_read_deadline_post_commit_downstream_submitted) + available);
+        static_cast<i64>(conn.response_read_deadline_post_commit_downstream_submitted) +
+        static_cast<i64>(available));
     conn.response_read_deadline_post_commit_inflight_body = available;
     conn.resp_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) - static_cast<i64>(available));
-    conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + available);
+    conn.resp_body_sent =
+        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(available));
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
@@ -10566,7 +10569,8 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
         conn.upstream_relay_slice = sending;
         conn.upstream_recv_buf.bind(next, loop->relay_buffer_capacity(next));
         conn.upstream_relay_send_len = send_len;
-        conn.resp_body_sent = static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + send_len);
+        conn.resp_body_sent =
+            static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
         conn.state = ConnState::Sending;
         conn.set_slots(
             nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
