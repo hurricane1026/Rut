@@ -213,8 +213,16 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
 }
 
 u32 huffman_encoded_len(const u8* src, u32 len) {
-    u64 bits = 0;
-    for (u32 i = 0; i < len; i++) bits += kHuff[src[i]].bits;
+    // The longest HPACK code is 30 bits, so the full u32 input range fits in
+    // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
+    i64 bits = 0;
+    for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
+
+    // A u32 cannot represent the encoded size of an arbitrarily large input.
+    // Saturate instead of truncating, so encode_string never mistakes a wrapped
+    // Huffman length for a shorter representation.
+    constexpr i64 kMaxEncodedLength = static_cast<i64>(~u32{0});
+    if (bits > kMaxEncodedLength * 8) return static_cast<u32>(kMaxEncodedLength);
     return static_cast<u32>((bits + 7) / 8);
 }
 
