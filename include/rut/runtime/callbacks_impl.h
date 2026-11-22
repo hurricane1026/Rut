@@ -16519,7 +16519,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         actual_body = resp.content_length;
     else if (conn.resp_body_mode == BodyMode::Chunked)
         actual_body = chunked_consumed;
-    u32 initial_send_len = kHeaderLen + actual_body;
+    u32 initial_send_len =
+        static_cast<u32>(static_cast<i64>(kHeaderLen) + static_cast<i64>(actual_body));
 
     conn.resp_body_sent = initial_send_len;
     conn.upstream_send_len = initial_send_len;
@@ -16578,7 +16579,8 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        if (static_cast<u32>(kStashLen) + kLateLen > conn.recv_buf.capacity()) {
+        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) >
+            static_cast<i64>(conn.recv_buf.capacity())) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
             loop->close_conn(conn);
@@ -16593,7 +16595,8 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
         conn.upstream_recv_buf.reset();
         conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
         conn.reset_request_receive_buffer();
-        conn.recv_buf.write(conn.send_buf.data() + conn.retry_req_send_len, kStashLen);
+        conn.recv_buf.write(conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len),
+                            kStashLen);
         conn.retry_req_send_len = 0;
         conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
