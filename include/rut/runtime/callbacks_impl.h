@@ -11164,8 +11164,9 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
         const u32 kInterimEnd = resp_parser.header_end;
         const u32 kTotal = conn.upstream_recv_buf.len();
         if (kInterimEnd < kTotal) {
-            const u32 kRemaining = kTotal - kInterimEnd;
-            const u8* src = conn.upstream_recv_buf.data() + kInterimEnd;
+            const u32 kRemaining =
+                static_cast<u32>(static_cast<i64>(kTotal) - static_cast<i64>(kInterimEnd));
+            const u8* src = conn.upstream_recv_buf.data() + static_cast<i64>(kInterimEnd);
             conn.upstream_recv_buf.reset();
             u8* dst = conn.upstream_recv_buf.write_ptr();
             __builtin_memmove(dst, src, kRemaining);
@@ -11409,7 +11410,8 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (conn.req_body_mode == BodyMode::ContentLength) {
         u32 consume = kDataLen;
         if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
-        conn.req_body_remaining -= consume;
+        conn.req_body_remaining =
+            static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
         send_len = consume;
     } else if (conn.req_body_mode == BodyMode::Chunked) {
         const u8* body_data = conn.recv_buf.data();
@@ -11417,8 +11419,12 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         while (pos < kDataLen) {
             u32 consumed = 0, out_start = 0, out_len = 0;
             const ChunkStatus kChunkStatus = conn.req_chunk_parser.feed(
-                body_data + pos, kDataLen - pos, &consumed, &out_start, &out_len);
-            pos += consumed;
+                body_data + static_cast<i64>(pos),
+                static_cast<u32>(static_cast<i64>(kDataLen) - static_cast<i64>(pos)),
+                &consumed,
+                &out_start,
+                &out_len);
+            pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
             if (kChunkStatus == ChunkStatus::Done) break;
             if (kChunkStatus == ChunkStatus::Error) {
                 loop->close_conn(conn);
