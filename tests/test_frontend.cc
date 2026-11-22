@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "fixtures/query_all.h"
+#include "fixtures/string_slice.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
@@ -9441,7 +9442,7 @@ TEST(frontend, bytes_fields_reject_wrong_types_and_optional_operands) {
                                  R"(b"x".find(b"x", b"x"[0]))",
                                  R"(b"x".find(b"x", 0, 1))",
                                  R"(b"x".find(b"x".slice(0, 1)))",
-                                 R"("x".slice(0, 1))",
+                                 R"("x".find(b"x"))",
                                  R"(b"x".find(b"x") + 1)"};
     for (const auto* expression : expressions) {
         const std::string source =
@@ -48832,5 +48833,84 @@ TEST(frontend, request_query_all_requires_binding_before_guard_or_if_narrowing) 
         CHECK(
             hir.error().detail.eq(lit("bind req.queryAll() to a let before guard let/if let; fresh "
                                       "collections must be evaluated once")));
+    }
+}
+
+TEST(frontend, string_slice_preserves_optional_text_through_helpers_and_user_methods) {
+    const char* sources[] = {
+        test::string_slice::kSource,
+        R"(upstream backend at "127.0.0.1:8080"
+           route GET "/" { return forward(backend, load_balance: .consistentHash,
+               hash_key: req.path.slice(1, 3).or("fallback"),
+               hash_seed: "0123456789abcdef0123456789abcdef") })",
+#if RUT_ENABLE_WEBSOCKET
+        R"(func field(_ text: str) -> str => text.slice(1, 3)
+           upstream backend at "127.0.0.1:9999"
+           route GET "/ws" { return websocket(backend) { message in
+               guard let value = field(message.text) else { message.drop() }
+               guard value == "12" else { message.drop() }
+               message.forward()
+           } })",
+#endif
+        R"(protocol Slicer { func slice(_ start: i32, _ end: i32) -> i32 }
+           i32 impl Slicer { func slice(self: i32, _ start: i32, _ end: i32) -> i32 => self + start + end }
+           route GET "/" {
+               guard (3).slice(1, 2) == 6 else { return 500 }
+               guard let empty = "".slice(0, 0) else { return 500 }
+               guard empty.isEmpty else { return 500 }
+               let pending: str = "token".slice(1, 4)
+               if let field = pending {
+                   guard field == "oke" else { return 500 }
+                   return 204
+               } else { return 404 }
+           })",
+        R"(func part(_ text: str, _ start: i32, _ end: i32) -> str => text.slice(start, end)
+           route POST "/" {
+               guard let digits = req.body | part(_, 1, 3) else { return 400 }
+               guard parseInt(digits).or(-1) == 12 else { return 422 }
+               return 204
+           })",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        ast.reset();
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, string_slice_rejects_optional_inputs_and_non_i32_bounds) {
+    const char* expressions[] = {
+        R"("x".slice())",
+        R"("x".slice(0))",
+        R"("x".slice(0, 1, 2))",
+        R"("x".slice(true, 1))",
+        R"("x".slice(0, "1"))",
+        R"("x".slice(0, i64(1)))",
+        R"("x".slice(i64(0), 1))",
+        R"("x".slice(parseInt("0"), 1))",
+        R"("x".slice(0, parseInt("1")))",
+        R"(req.header("X").slice(0, 1))",
+        R"("x".slice(0, 1).slice(0, 1))",
+        R"("x".slice(0, 1).len)",
+        R"("x".slice(0, 1) == b"x")",
+    };
+    for (const char* expression : expressions) {
+        const std::string source =
+            std::string("route GET \"/\" { let value = ") + expression + " return 204 }";
+        auto tokens = lex(lit(source.c_str()));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK_FALSE(analyze_file_heap(ast.value()));
     }
 }

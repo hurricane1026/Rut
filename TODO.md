@@ -123,6 +123,11 @@ without presenting lossy or per-shard state as exact shared state.
 
 ## Recently Completed
 
+- [x] `str.slice(i32 start, i32 end) -> str?` exposes checked half-open byte
+  ranges through the existing allocation-free Bytes slice intrinsic. Empty,
+  binary and invalid ranges, optional typing, helper/native composition and
+  HTTP/1/HTTP/2 on both backends are covered; views retain their source lifetime.
+
 - [x] Expose byte-exact `str.trimPrefix(str)` / `str.trimSuffix(str)` as pure,
   allocation-free borrowed views through HIR/MIR/RIR, JIT and native compilation.
   Each removes one match; empty/nonmatching affixes preserve the input. Dynamic

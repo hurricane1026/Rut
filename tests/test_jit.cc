@@ -3,6 +3,7 @@
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_slice.h"
 #include "fixtures/string_trim.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/common/types.h"
@@ -33407,6 +33408,58 @@ TEST(jit, request_query_all_executes_dynamic_matrix_at_both_optimization_levels)
         arena.destroy();
         CHECK_EQ(pool.in_use(), 0u);
         pool.destroy();
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+TEST(jit, string_slice_returns_checked_borrowed_text_without_arena_storage) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_slice::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_slice::kCases) {
+            std::string request =
+                "POST / HTTP/1.1\r\nHost: local\r\nX-Start: " + std::to_string(item.start) +
+                "\r\nX-End: " + std::to_string(item.end) +
+                "\r\nContent-Length: " + std::to_string(item.input.len) + "\r\n\r\n";
+            const auto body_offset = request.size();
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto result =
+                HandlerResult::unpack(handler(connection.get(),
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              nullptr));
+            CHECK_EQ(result.status_code, item.status);
+            if (item.status == 200) {
+                REQUIRE(connection->jit_response_body_valid);
+                CHECK(connection->jit_response_body.eq(item.expected));
+                if (item.expected.len)
+                    CHECK(connection->jit_response_body.ptr ==
+                          request.data() + body_offset + item.start);
+            } else {
+                CHECK_FALSE(connection->jit_response_body_valid);
+            }
+            CHECK_EQ(connection->json_arena.space_used(), 0u);
+        }
         engine.shutdown();
         rir.destroy();
     }
