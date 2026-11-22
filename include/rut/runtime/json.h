@@ -585,14 +585,14 @@ inline bool integer(Str s, i64& out) {
     for (; p < s.len; ++p) {
         if (s.ptr[p] < '0' || s.ptr[p] > '9') return false;
         const u32 d = static_cast<u32>(s.ptr[p] - '0');
-        if (d > limit / 10 || (n > limit / 10) ||
-            (n == limit / 10 && static_cast<u64>(d) > limit % 10))
-            return false;
-        u64 next = 0;
-        if (__builtin_mul_overflow(n, u64{10}, &next) ||
-            __builtin_add_overflow(next, static_cast<u64>(d), &next))
-            return false;
-        n = next;
+        if (n > limit / 10 || (n == limit / 10 && static_cast<u64>(d) > limit % 10)) return false;
+        // The range check above makes the ordinary path fit in i64. Handle
+        // exactly INT64_MIN's magnitude separately, since it has no positive
+        // signed counterpart for the widened multiplication.
+        if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
+            n = limit;
+        else
+            n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
     }
     u64 magnitude = n;
     if (negative) (void)__builtin_sub_overflow(u64{0}, n, &magnitude);
