@@ -886,20 +886,22 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                 path = headers[i].value;
         }
         const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-        const u32 kPathStart = method.len + 1;  // path follows "METHOD " in synth
+        const u32 kPathStart = static_cast<u32>(static_cast<i64>(method.len) + 1);
         for (u32 i = 0; i < kCapped; i++) {
             const RouteParam& p = params[i];
             // Defensive: a trie-matched value is always within the raw path, so
             // this skip is unreachable in practice (no silent truncation).
             if (path.ptr == nullptr || p.value < path.ptr ||
-                p.value + p.value_len > path.ptr + path.len)
+                p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
                 continue;
-            const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
-            h2->pending_route_params[stored++] = {
+            const u32 kOff = static_cast<u32>(static_cast<i64>(kPathStart) +
+                                              static_cast<i64>(p.value - path.ptr));
+            h2->pending_route_params[stored] = {
                 p.name,
                 p.name_len,
-                reinterpret_cast<const char*>(h2->pending_synth + kOff),
+                reinterpret_cast<const char*>(h2->pending_synth + static_cast<i64>(kOff)),
                 p.value_len};
+            stored = static_cast<u32>(static_cast<i64>(stored) + 1);
         }
     }
     h2->pending_route_param_count = stored;
@@ -987,7 +989,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     }
     if (o.response_body_idx != 0 && cfg != nullptr &&
         o.response_body_idx <= cfg->response_body_count) {
-        const auto& b = cfg->response_bodies[o.response_body_idx - 1];
+        const auto& b =
+            cfg->response_bodies[static_cast<u32>(static_cast<i64>(o.response_body_idx) - 1)];
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
@@ -997,10 +1000,13 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
-        const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
+        const auto& ref = cfg->response_header_sets[static_cast<u32>(
+            static_cast<i64>(o.response_headers_idx) - 1)];
         for (u16 i = 0; i < ref.count; i++) {
-            const char* kn = cfg->header_keys[ref.offset + i].data;
-            const u32 kl = cfg->header_keys[ref.offset + i].len;
+            const u32 key_index =
+                static_cast<u32>(static_cast<i64>(ref.offset) + static_cast<i64>(i));
+            const char* kn = cfg->header_keys[key_index].data;
+            const u32 kl = cfg->header_keys[key_index].len;
             // Connection-specific fields are prohibited in HTTP/2 (RFC 7540
             // §8.1.2.2) and make compliant clients treat the response as malformed.
             // validate_response_header only reserves Connection/Transfer-Encoding/
@@ -1008,9 +1014,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             // reach here from a route's response(headers:) set — drop them.
             if (h2_is_prohibited_response_header(kn, kl)) continue;
             hdrs[nhdrs].name = {kn, kl};
-            hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
-                                 cfg->header_values[ref.offset + i].len};
-            nhdrs++;
+            hdrs[nhdrs].value = {cfg->header_values[key_index].data,
+                                 cfg->header_values[key_index].len};
+            nhdrs = static_cast<u32>(static_cast<i64>(nhdrs) + 1);
         }
     }
     if (d.conn->resp_header_mutation_overflow) {
