@@ -87,15 +87,19 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
     }
 }
 inline void grpc_pop(u8* buf, u32& len, u32 n) {
-    len -= n;
-    if (len) __builtin_memmove(buf, buf + n, len);
+    if (n > len) {
+        len = 0;
+        return;
+    }
+    len = static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(n));
+    if (len) __builtin_memmove(buf, buf + static_cast<i64>(n), len);
 }
 inline bool grpc_timeout(Str value, u64* micros) {
     if (value.len < 2 || value.len > 9) return false;
     u64 n = 0;
-    for (u32 i = 0; i + 1 < value.len; i++) {
+    for (u32 i = 0; static_cast<i64>(i) + 1 < static_cast<i64>(value.len); i++) {
         if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
-        n = n * 10 + static_cast<u32>(value.ptr[i] - '0');
+        n = n * 10 + static_cast<u64>(static_cast<i64>(value.ptr[i]) - static_cast<i64>('0'));
     }
     switch (value.ptr[value.len - 1]) {
         case 'H':
@@ -113,7 +117,7 @@ inline bool grpc_timeout(Str value, u64* micros) {
         case 'u':
             break;
         case 'n':
-            n = (n + 999) / 1000;
+            n = static_cast<u64>((static_cast<i64>(n) + 999) / 1000);
             break;
         default:
             return false;
@@ -1002,15 +1006,24 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
             downstreams[downstream_count++] = {
                 x->downstream, x->downstream->h2, x->downstream->handler_gen};
     }
-    const auto result = h.process(conn.recv_buf.data(),
-                                  conn.recv_buf.len(),
-                                  g.control + g.control_len,
-                                  sizeof(g.control) - g.control_len,
-                                  &written);
-    g.control_len += written;
+    const auto result = h.process(
+        conn.recv_buf.data(),
+        conn.recv_buf.len(),
+        g.control + static_cast<i64>(g.control_len),
+        static_cast<u32>(static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len)),
+        &written);
+    g.control_len = static_cast<u32>(static_cast<i64>(g.control_len) + static_cast<i64>(written));
     grpc_flush_pending_cancels(h);
-    const u32 remaining = conn.recv_buf.len() - result.consumed;
-    if (remaining) __builtin_memmove(conn.recv_slice, conn.recv_slice + result.consumed, remaining);
+    if (result.consumed > conn.recv_buf.len()) {
+        g.busy = false;
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 remaining =
+        static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) - static_cast<i64>(result.consumed));
+    if (remaining)
+        __builtin_memmove(
+            conn.recv_slice, conn.recv_slice + static_cast<i64>(result.consumed), remaining);
     conn.reset_request_receive_buffer();
     conn.recv_buf.commit(remaining);
     if (result.close) {
