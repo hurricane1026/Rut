@@ -37,7 +37,7 @@ namespace rut {
 static_assert([] {
     IoUringPosition head{UINT32_MAX};
     if (head.distance_to(0) != 1 || head.advanced_by(2).slot(7) != 1) return false;
-    ++head;
+    head = head.advanced_by(1);
     return head.value == 0 && head.distance_to(0) == 0 &&
            head.distance_to(UINT32_MAX) == UINT32_MAX;
 }());
@@ -198,8 +198,8 @@ io_uring_sqe* IoUringBackend::get_sqe_flushing() {
 }
 
 static void sqe_advance_tail(u32* sq_tail) {
-    IoUringPosition tail{__atomic_load_n(sq_tail, __ATOMIC_RELAXED)};
-    __atomic_store_n(sq_tail, (++tail).value, __ATOMIC_RELEASE);
+    const IoUringPosition tail{__atomic_load_n(sq_tail, __ATOMIC_RELAXED)};
+    __atomic_store_n(sq_tail, tail.advanced_by(1).value, __ATOMIC_RELEASE);
 }
 
 // --- Init ---
@@ -900,13 +900,13 @@ void IoUringBackend::probe_nop_inject_result() {
         return;
     }
     // Accepted: consume its completion here rather than in the first wait().
-    IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_RELAXED)};
+    const IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_RELAXED)};
     while (head.value == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) {
         rc = io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
         if (rc < 0 && rc != -EINTR) return;  // wait() drops the sentinel completion
     }
     nop_inject_result = cq_entries[head.slot(*cq_ring_mask)].res == static_cast<i32>(kProbeResult);
-    __atomic_store_n(cq_head, (++head).value, __ATOMIC_RELEASE);
+    __atomic_store_n(cq_head, head.advanced_by(1).value, __ATOMIC_RELEASE);
 }
 
 bool IoUringBackend::add_send_after_direct_write(i32 fd,
@@ -1472,7 +1472,7 @@ u32 IoUringBackend::wait(
 
         // Cancel CQEs — silently consume, don't emit event
         if (conn_id == kCancelConnId) {
-            ++head;
+            head = head.advanced_by(1);
             continue;
         }
 
@@ -1550,7 +1550,7 @@ u32 IoUringBackend::wait(
                 return_buffer(buf_id);
             }
             if (deferred_downstream_recv.active) deferred_downstream_recv = {};
-            ++head;
+            head = head.advanced_by(1);
             continue;
         }
 
@@ -1582,7 +1582,7 @@ u32 IoUringBackend::wait(
             }
             // Re-submit read on timerfd for next tick
             submit_timer_read();
-            ++head;
+            head = head.advanced_by(1);
             continue;
         }
 
@@ -1753,7 +1753,7 @@ u32 IoUringBackend::wait(
             events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
             events[count].aux = static_cast<u8>(aux);  // 0 for recv data
             events[count].upstream_episode = upstream_episode;
-            ++head;
+            head = head.advanced_by(1);
             count++;
             if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
                 !add_terminal_window(cqe->user_data, tail))
@@ -1855,7 +1855,7 @@ u32 IoUringBackend::wait(
             events[count].more = 0;
             events[count].aux = static_cast<u8>(aux);
             events[count].upstream_episode = upstream_episode;
-            ++head;
+            head = head.advanced_by(1);
             count++;
             continue;
         }
@@ -1981,7 +1981,7 @@ u32 IoUringBackend::wait(
             events[count].more = 0;  // direct recv is always one-shot
             events[count].aux = static_cast<u8>(aux);
             events[count].upstream_episode = upstream_episode;
-            ++head;
+            head = head.advanced_by(1);
             count++;
             continue;
         }
@@ -2000,7 +2000,7 @@ u32 IoUringBackend::wait(
                                     upstream_episode,
                                     /*separate_body_ring=*/true,
                                     /*one_shot=*/true)) {
-            ++head;
+            head = head.advanced_by(1);
             continue;
         }
 
@@ -2044,7 +2044,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    ++head;
+                    head = head.advanced_by(1);
                     count++;
                     continue;
                 }
@@ -2094,7 +2094,7 @@ u32 IoUringBackend::wait(
                         sqe->user_data = encode_user_data(conn_id, type, ss.generation);
                         sqe_advance_tail(sq_tail);
                         pending++;
-                        ++head;
+                        head = head.advanced_by(1);
                         continue;  // don't emit event yet
                     }
                     result = -ENOSPC;  // SQ full: fail rather than stall
@@ -2112,7 +2112,7 @@ u32 IoUringBackend::wait(
                 events[count].aux = 0;
                 events[count].upstream_episode = upstream_episode;
                 events[count].non_upstream_generation = ss.generation;
-                ++head;
+                head = head.advanced_by(1);
                 count++;
                 continue;
             }
@@ -2134,7 +2134,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    ++head;
+                    head = head.advanced_by(1);
                     count++;
                     continue;
                 }
@@ -2156,7 +2156,7 @@ u32 IoUringBackend::wait(
                                 : encode_user_data(conn_id, type, ss.generation);
                         sqe_advance_tail(sq_tail);
                         pending++;
-                        ++head;
+                        head = head.advanced_by(1);
                         continue;  // don't emit event yet
                     }
                     // SQ full — can't re-submit. Emit error to prevent deadlock.
@@ -2171,7 +2171,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    ++head;
+                    head = head.advanced_by(1);
                     count++;
                     continue;
                 }
@@ -2186,7 +2186,7 @@ u32 IoUringBackend::wait(
                 events[count].upstream_episode = upstream_episode;
                 events[count].non_upstream_generation =
                     type == IoEventType::Send ? ss.generation : 0;
-                ++head;
+                head = head.advanced_by(1);
                 count++;
                 continue;
             }
@@ -2234,7 +2234,7 @@ u32 IoUringBackend::wait(
                 events[count].result = -ENOBUFS;
         }
 
-        ++head;
+        head = head.advanced_by(1);
         count++;
         if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
             !add_terminal_window(cqe->user_data, tail))
