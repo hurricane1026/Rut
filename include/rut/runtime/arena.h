@@ -218,7 +218,7 @@ private:
         // Every block embeds its header before the payload. A backend that
         // returns a non-null short block cannot safely be used, even if its
         // acquire call itself succeeded.
-        if (actual_size < Block::kHeaderSize) {
+        if (actual_size < Block::kHeaderSize || actual_size < needed) {
             backend.release(mem, actual_size);
             return nullptr;
         }

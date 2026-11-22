@@ -22,12 +22,34 @@ struct ShortArenaBackend {
     void release(u8*, u64) { released = true; }
 };
 
+struct UndersizedArenaBackend {
+    alignas(16) u8 storage[64]{};
+    bool released = false;
+
+    core::Expected<void, Error> init() { return {}; }
+    u8* acquire(u64, u64* out_size) {
+        *out_size = 40;  // Fits the header, but not a larger requested block.
+        return storage;
+    }
+    void release(u8*, u64) { released = true; }
+};
+
 TEST(block, short_backend_block_is_rejected_before_header_write) {
     Arena<ShortArenaBackend> arena;
     CHECK(!arena.init().has_value());
     CHECK(arena.backend.released);
     CHECK_EQ(arena.current, nullptr);
     CHECK_EQ(arena.total_allocated, 0u);
+}
+
+TEST(block, undersized_backend_block_is_rejected_without_accounting) {
+    Arena<UndersizedArenaBackend> arena;
+    REQUIRE(arena.init().has_value());
+    const u64 allocated = arena.space_allocated();
+    CHECK_EQ(arena.alloc(64), nullptr);
+    CHECK_EQ(arena.space_allocated(), allocated);
+    CHECK(arena.backend.released);
+    arena.destroy();
 }
 
 // ============================================================
