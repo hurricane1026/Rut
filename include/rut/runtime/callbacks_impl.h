@@ -9542,12 +9542,19 @@ inline bool h2_name_in_connection_tokens(Str connection_value, Str name) {
     const u32 kN = connection_value.len;
     u32 i = 0;
     while (i < kN) {
-        while (i < kN && (kV[i] == ' ' || kV[i] == '\t' || kV[i] == ',')) i++;
+        while (i < kN && (kV[i] == ' ' || kV[i] == '\t' || kV[i] == ','))
+            i = static_cast<u32>(static_cast<i64>(i) + 1);
         const u32 kStart = i;
-        while (i < kN && kV[i] != ',') i++;
+        while (i < kN && kV[i] != ',') i = static_cast<u32>(static_cast<i64>(i) + 1);
         u32 end = i;  // trim trailing whitespace
-        while (end > kStart && (kV[end - 1] == ' ' || kV[end - 1] == '\t')) end--;
-        if (end > kStart && http_header_name_eq_ci(kV + kStart, end - kStart, name.ptr, name.len))
+        while (end > kStart &&
+               (kV[static_cast<i64>(end) - 1] == ' ' || kV[static_cast<i64>(end) - 1] == '\t'))
+            end = static_cast<u32>(static_cast<i64>(end) - 1);
+        if (end > kStart && http_header_name_eq_ci(
+                                kV + static_cast<i64>(kStart),
+                                static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(kStart)),
+                                name.ptr,
+                                name.len))
             return true;
     }
     return false;
