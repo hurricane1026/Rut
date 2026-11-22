@@ -19,6 +19,7 @@
 #include "rut/runtime/http_cache.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/io_timespec.h"
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/response_body_chain.h"
 #include "rut/runtime/response_read_timer.h"
@@ -27,22 +28,11 @@
 #include "rut/runtime/ws_extensions.h"
 #include "rut/runtime/ws_terminate.h"
 
-#ifdef __linux__
-#include <linux/time_types.h>
-#else
-#include <time.h>
-#endif
 #include <openssl/types.h>
 
 namespace rut {
 
 struct H1TlsUpstream;
-
-#ifdef __linux__
-using IoTimespec = __kernel_timespec;
-#else
-using IoTimespec = timespec;
-#endif
 
 struct RouteConfig;  // forward for per-request config pin below
 struct Http2Conn;    // forward: per-connection HTTP/2 engine, pool-allocated
@@ -1024,10 +1014,7 @@ struct ConnectionBase {
             response_read_timer_owner_generation == response_read_timer_generation &&
             response_read_timer_deadline_generation != 0 &&
             valid_upstream_episode(response_read_timer_upstream_episode);
-        const bool timespec_valid =
-            response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
-            response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
-            (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+        const bool timespec_valid = valid_positive_io_timespec(response_read_timer_timespec);
         switch (response_read_timer_phase) {
             case ResponseReadTimerPhase::None:
                 return response_read_timer_owner_is_neutral();

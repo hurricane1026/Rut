@@ -246,6 +246,17 @@ def main():
         check(compiler, root, overlay, "UnclassifiedEvent", source=runtime)
         (overlay / "rut/runtime/io_event.h").unlink()
 
+        source = "src/runtime/response_read_timer.cc"
+        for before, after in [
+            ("ms / 1000", "ms / 1001"),
+            ("(ms % 1000) * 1'000'000", "(ms * 1'000'000u) % 1'000'000'000u"),
+            ("ts.tv_nsec < 1'000'000'000", "ts.tv_nsec <= 1'000'000'000"),
+            ("(ts.tv_sec != 0 || ts.tv_nsec != 0)", "true"),
+        ]:
+            probe = mutate(root / "include", overlay, "rut/runtime/io_timespec.h", before, after)
+            check(compiler, root, overlay, "Timer timespec violates duration contract", source=source)
+            probe.unlink()
+
         runtime = "src/runtime/response_read_timer.cc"
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)

@@ -6,6 +6,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/io_timespec.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
 #include "rut/runtime/send_progress.h"
@@ -1001,8 +1002,7 @@ bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
 
     // Relative timeout; kernel reads &conn.yield_timespec asynchronously
     // so the storage must live on the Connection (not on the stack).
-    conn.yield_timespec.tv_sec = ms / 1000;
-    conn.yield_timespec.tv_nsec = static_cast<long long>(ms % 1000) * 1'000'000LL;
+    conn.yield_timespec = io_timespec_from_ms(ms);
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_TIMEOUT;
@@ -1036,9 +1036,7 @@ bool IoUringBackend::add_response_read_timer(u32 conn_id,
     // every operation is infallible and the kernel-stable timespec remains
     // immutable until the target CQE is harvested.
     if (!conn.next_response_read_timer_generation()) return false;
-    conn.response_read_timer_timespec.tv_sec = milliseconds / 1000;
-    conn.response_read_timer_timespec.tv_nsec =
-        static_cast<long long>(milliseconds % 1000) * 1'000'000LL;
+    conn.response_read_timer_timespec = io_timespec_from_ms(milliseconds);
     conn.response_read_timer_deadline_generation = deadline_generation;
     conn.response_read_timer_upstream_episode = upstream_episode;
     conn.response_read_timer_phase = ResponseReadTimerPhase::Armed;
