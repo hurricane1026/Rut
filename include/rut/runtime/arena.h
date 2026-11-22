@@ -32,7 +32,9 @@ struct MmapBackend {
         u64 size = default_block_size > needed ? default_block_size : needed;
         // Page-align
         if (size > static_cast<u64>(-1) - 4095) return nullptr;
-        size = (size + 4095) & ~static_cast<u64>(4095);
+        u64 aligned = 0;
+        if (__builtin_add_overflow(size, static_cast<u64>(4095), &aligned)) return nullptr;
+        size = aligned & ~static_cast<u64>(4095);
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
         *out_size = size;
@@ -84,9 +86,19 @@ struct Arena {
         u64 used;  // bytes allocated after header
 
         static constexpr u64 kHeaderSize = (sizeof(Block) + 15) & ~u64(15);
-        u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
-        u64 capacity() const { return size - kHeaderSize; }
-        u64 remaining() const { return capacity() - used; }
+        u8* data() { return reinterpret_cast<u8*>(this) + static_cast<i64>(kHeaderSize); }
+        u64 capacity() const {
+            u64 result = 0;
+            return size >= kHeaderSize && !__builtin_sub_overflow(size, kHeaderSize, &result)
+                       ? result
+                       : 0;
+        }
+        u64 remaining() const {
+            const u64 available = capacity();
+            u64 result = 0;
+            return used <= available && !__builtin_sub_overflow(available, used, &result) ? result
+                                                                                          : 0;
+        }
     };
 
     Block* current = nullptr;
@@ -109,21 +121,29 @@ struct Arena {
     void* alloc(u64 size) {
         if (!current) return nullptr;
         if (size > static_cast<u64>(-1) - 7) return nullptr;
-        size = (size + 7) & ~static_cast<u64>(7);
+        u64 aligned = 0;
+        if (__builtin_add_overflow(size, static_cast<u64>(7), &aligned)) return nullptr;
+        size = aligned & ~static_cast<u64>(7);
         if (current->remaining() >= size) {
-            void* p = current->data() + current->used;
-            current->used += size;
+            void* p = current->data() + static_cast<i64>(current->used);
+            u64 next_used = 0;
+            if (__builtin_add_overflow(current->used, size, &next_used)) return nullptr;
+            current->used = next_used;
             return p;
         }
         if (size > static_cast<u64>(-1) - Block::kHeaderSize) return nullptr;
-        Block* b = alloc_block(Block::kHeaderSize + size, current);
+        u64 needed = 0;
+        if (__builtin_add_overflow(Block::kHeaderSize, size, &needed)) return nullptr;
+        Block* b = alloc_block(needed, current);
         if (!b || b->capacity() < size) {
             if (b) backend.release(reinterpret_cast<u8*>(b), b->size);
             return nullptr;
         }
         current = b;
-        void* p = current->data() + current->used;
-        current->used += size;
+        void* p = current->data() + static_cast<i64>(current->used);
+        u64 next_used = 0;
+        if (__builtin_add_overflow(current->used, size, &next_used)) return nullptr;
+        current->used = next_used;
         return p;
     }
 
@@ -147,7 +167,7 @@ struct Arena {
         a = static_cast<T*>(p);
         for (u32 i = 0; i < count; i++) {
             // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-            void* slot = static_cast<void*>(a + i);
+            void* slot = static_cast<void*>(a + static_cast<i64>(i));
             ::new (slot) T{};
         }
         return a;
@@ -160,7 +180,10 @@ struct Arena {
             Block* prev = current->prev;
             u64 sz = current->size;
             backend.release(reinterpret_cast<u8*>(current), sz);
-            total_allocated -= sz;
+            if (sz > total_allocated)
+                total_allocated = 0;
+            else if (__builtin_sub_overflow(total_allocated, sz, &total_allocated))
+                total_allocated = 0;
             current = prev;
         }
         current->used = 0;
@@ -179,7 +202,9 @@ struct Arena {
 
     u64 space_used() const {
         u64 t = 0;
-        for (Block* b = current; b; b = b->prev) t += b->used;
+        for (Block* b = current; b; b = b->prev) {
+            if (__builtin_add_overflow(t, b->used, &t)) return UINT64_MAX;
+        }
         return t;
     }
 
@@ -194,7 +219,12 @@ private:
         b->prev = prev;
         b->size = actual_size;
         b->used = 0;
-        total_allocated += actual_size;
+        u64 next_total = 0;
+        if (__builtin_add_overflow(total_allocated, actual_size, &next_total)) {
+            backend.release(mem, actual_size);
+            return nullptr;
+        }
+        total_allocated = next_total;
         return b;
     }
 };
