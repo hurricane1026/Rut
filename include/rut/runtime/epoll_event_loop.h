@@ -25,6 +25,7 @@
 #include "rut/runtime/tls.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/yield_heap.h"
 #include <atomic>
 
 #include <fcntl.h>
@@ -59,11 +60,7 @@ inline u64 monotonic_ns() {
 // resume → yield) push a new entry each time, but the prior entry has
 // already been popped. Sized at kMaxConns + small slack for safety.
 struct YieldHeap {
-    struct Entry {
-        u64 deadline_ns;
-        u32 handler_gen;
-        u32 conn_id;
-    };
+    using Entry = yield_heap::Entry;
     // One live entry per connection at most, plus headroom for stale
     // entries that linger briefly between close and their deadline.
     // Derived from the shared epoll_yield::kMaxConns so the heap and
@@ -105,26 +102,14 @@ struct YieldHeap {
         return true;
     }
 
-    // Remove every entry with this conn_id in O(n). Compact before rebuilding
-    // the heap: sifting during the scan can move another matching tail entry
-    // into an already-scanned prefix and leave a stale timer behind.
     u32 remove_by_conn(u32 conn_id) {
-        u32 kept = 0;
-        for (u32 i = 0; i < size; ++i) {
-            if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
-        }
-        const u32 removed = size - kept;
-        size = kept;
-        if (removed > 0) {
-            for (u32 i = size / 2; i > 0; --i) sift_down(i - 1);
-        }
-        return removed;
+        return yield_heap::remove_by_conn(entries.data(), size, conn_id);
     }
 
     void pop() {
         if (size == 0) return;
         entries[0] = entries[--size];
-        sift_down(0);
+        yield_heap::sift_down(entries.data(), size, 0);
     }
 
 private:
@@ -136,20 +121,6 @@ private:
             entries[parent] = entries[i];
             entries[i] = tmp;
             i = parent;
-        }
-    }
-    void sift_down(u32 i) {
-        while (true) {
-            u32 l = 2 * i + 1;
-            u32 r = 2 * i + 2;
-            u32 smallest = i;
-            if (l < size && entries[l].deadline_ns < entries[smallest].deadline_ns) smallest = l;
-            if (r < size && entries[r].deadline_ns < entries[smallest].deadline_ns) smallest = r;
-            if (smallest == i) break;
-            Entry tmp = entries[smallest];
-            entries[smallest] = entries[i];
-            entries[i] = tmp;
-            i = smallest;
         }
     }
 };

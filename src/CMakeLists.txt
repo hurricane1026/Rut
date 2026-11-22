@@ -190,6 +190,7 @@ add_library(rut_runtime STATIC
     runtime/callbacks.cc
     runtime/shard.cc
     ${RUT_IO_SOURCES}
+    runtime/yield_heap.cc
     runtime/timer_wheel.cc
     runtime/io_event.cc
     runtime/socket.cc
