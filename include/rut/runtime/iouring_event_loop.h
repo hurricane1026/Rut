@@ -4462,7 +4462,11 @@ public:
                                        want,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             const int splice_errno = errno;
-            if (sampled) study_record_syscall(0, monotonic_ns() - syscall_start);
+            if (sampled) {
+                u64 syscall_ns = 0;
+                if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+                    study_record_syscall(0, syscall_ns);
+            }
             errno = splice_errno;
             if (n > 0 && static_cast<u32>(n) < want) ++study_splice_short[0];
             if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -4481,11 +4485,12 @@ public:
                 return;
             }
             r.segment_len = static_cast<u32>(n);
-            relay_budget_bytes -= static_cast<u32>(n);
-            relay_pulled_bytes += static_cast<u32>(n);
+            relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
+            __builtin_add_overflow(relay_pulled_bytes, static_cast<u64>(n), &relay_pulled_bytes);
             r.segment_sent = 0;
-            r.body_bytes += r.segment_len;
-            c.resp_body_remaining -= r.segment_len;
+            __builtin_add_overflow(r.body_bytes, static_cast<u64>(r.segment_len), &r.body_bytes);
+            c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
+                                                     static_cast<i64>(r.segment_len));
             refresh_relay_progress_timer(c);
             r.write_armed = true;
             const IoEvent ready{
@@ -4500,7 +4505,8 @@ public:
             return;
         }
         --relay_budget_calls;
-        const u32 remaining = r.segment_len - r.segment_sent;
+        const u32 remaining =
+            static_cast<u32>(static_cast<i64>(r.segment_len) - static_cast<i64>(r.segment_sent));
         const u32 write_want = remaining < relay_budget_bytes ? remaining : relay_budget_bytes;
         if (study_inside_cq) ++study_cq_splice_calls;
         const bool sampled = (++study_splice_calls[1] & 63u) == 0;
@@ -4508,7 +4514,11 @@ public:
         const ssize_t n = ::splice(
             r.pipe_read, nullptr, c.fd, nullptr, write_want, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         const int splice_errno = errno;
-        if (sampled) study_record_syscall(1, monotonic_ns() - syscall_start);
+        if (sampled) {
+            u64 syscall_ns = 0;
+            if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+                study_record_syscall(1, syscall_ns);
+        }
         errno = splice_errno;
         if (n > 0 && static_cast<u32>(n) < write_want) ++study_splice_short[1];
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -4516,7 +4526,8 @@ public:
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
-        if (n <= 0 || static_cast<u32>(n) > r.segment_len - r.segment_sent) {
+        if (n <= 0 || static_cast<u32>(n) > static_cast<u32>(static_cast<i64>(r.segment_len) -
+                                                             static_cast<i64>(r.segment_sent))) {
             close_conn(c);
             return;
         }
