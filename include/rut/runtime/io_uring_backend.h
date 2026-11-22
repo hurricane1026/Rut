@@ -28,6 +28,13 @@ struct IoUringPosition {
         return {static_cast<u32>(static_cast<u64>(value) + count)};
     }
 
+    constexpr bool operator==(const IoUringPosition&) const = default;
+
+    constexpr IoUringPosition& operator++() {
+        *this = advanced_by(1);
+        return *this;
+    }
+
     constexpr u32 distance_to(u32 end) const {
         return static_cast<u32>(static_cast<i64>(end) - value);
     }
