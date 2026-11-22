@@ -7405,7 +7405,6 @@ private:
                 if (ready == 0) break;
                 const u32 bit = static_cast<u32>(__builtin_ctzll(ready));
                 const i64 id_wide = static_cast<i64>(word_index) * 64 + static_cast<i64>(bit);
-                if (id_wide > static_cast<i64>(UINT32_MAX)) continue;
                 const u32 id = static_cast<u32>(id_wide);
                 const u64 bit_mask = u64{1} << bit;
                 body_pump_ready_words[word_index] &= ~bit_mask;
@@ -7446,8 +7445,9 @@ public:
             response_read_batch_event_index = i;
             const u16 owner_index = response_read_batch_event_owner[i];
             if (owner_index != 0 && owner_index <= response_read_batch_owner_count &&
-                response_read_batch_owners[owner_index - 1u].bounded_terminal_prospective) {
-                auto& owner = response_read_batch_owners[owner_index - 1u];
+                response_read_batch_owners[static_cast<i64>(owner_index) - 1]
+                    .bounded_terminal_prospective) {
+                auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
                 Connection& c = conns[owner.conn_id];
                 const IoEvent& ev = events[i];
                 if (ev.type == IoEventType::ResponseReadTimer) {
@@ -7477,7 +7477,9 @@ public:
             dispatch(events[i]);
         }
         study_inside_cq = false;
-        study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
+        u64 cq_phase_ns = 0;
+        if (!__builtin_sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
+            __builtin_add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {
@@ -7644,18 +7646,20 @@ public:
             c.on_send != &on_response_sent<IoUringEventLoop>)
             return false;
         const auto& send = backend.send_state[c.id];
-        const u32 remaining = c.local_body_send_len - c.send_progress;
+        const u32 remaining = static_cast<u32>(static_cast<i64>(c.local_body_send_len) -
+                                               static_cast<i64>(c.send_progress));
         // A memory send reads the config-owned body bytes; a file send
         // (add_send_file) reads the config-owned sealed memfd, whose POLLOUT
         // continuation calls sendfile again from wait(). Either way the config
         // must outlive the send, or LoadedProgram::destroy could close (and
         // the kernel recycle) the memfd under a pending continuation.
-        const bool memory_send = send.src == c.local_body_cursor + c.send_progress;
+        const bool memory_send =
+            send.src == c.local_body_cursor + static_cast<i64>(c.send_progress);
         const bool file_send =
             send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
             c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
-            send.file_base ==
-                static_cast<u32>(c.local_body_cursor - c.local_body_base) + c.send_progress;
+            send.file_base == static_cast<i64>(c.local_body_cursor - c.local_body_base) +
+                                  static_cast<i64>(c.send_progress);
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
                send.remaining == remaining - send.offset;
@@ -7668,9 +7672,11 @@ public:
         const IoUringPosition head{__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE)};
         const u32 used = head.distance_to(tail);
         constexpr u32 kReserve = 16;
-        return used < backend.sq_ring_entries && backend.sq_ring_entries - used > kReserve
-                   ? backend.sq_ring_entries - used - kReserve
-                   : 0;
+        return used<backend.sq_ring_entries&& static_cast<i64>(backend.sq_ring_entries) -
+                    static_cast<i64>(used)>
+                       kReserve ? static_cast<u32>(static_cast<i64>(backend.sq_ring_entries) -
+                                                   static_cast<i64>(used) - kReserve)
+                                : 0;
     }
 
     void free_health_probe(Connection& c) {
@@ -7850,7 +7856,7 @@ public:
                                                  &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
-            c.pending_ops += submitted;
+            __builtin_add_overflow(c.pending_ops, submitted, &c.pending_ops);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
