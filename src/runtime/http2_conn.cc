@@ -306,9 +306,9 @@ static u32 http2_write_response_impl(u8* out,
     // change) MUST lead the header block, before any field (RFC 7541 §4.2).
     hb += static_cast<i64>(enc.emit_pending_size_update(hblock + hb));
     char sbuf[3];
-    sbuf[0] = static_cast<char>('0' + (status / 100) % 10);
-    sbuf[1] = static_cast<char>('0' + (status / 10) % 10);
-    sbuf[2] = static_cast<char>('0' + status % 10);
+    sbuf[0] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>((status / 100) % 10));
+    sbuf[1] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>((status / 10) % 10));
+    sbuf[2] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(status % 10));
     const i64 kStatusEncoded = enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
     if (kStatusEncoded < 0 || kStatusEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
     hb += kStatusEncoded;
@@ -334,7 +334,10 @@ static u32 http2_write_response_impl(u8* out,
         if (name.len <= sizeof(lname)) {
             for (u32 j = 0; j < name.len; j++) {
                 const char kC = name.ptr[j];
-                lname[j] = (kC >= 'A' && kC <= 'Z') ? static_cast<char>(kC - 'A' + 'a') : kC;
+                lname[j] = (kC >= 'A' && kC <= 'Z')
+                               ? static_cast<char>(static_cast<i64>(kC) - static_cast<i64>('A') +
+                                                   static_cast<i64>('a'))
+                               : kC;
             }
             name = Str{lname, name.len};
         } else {
