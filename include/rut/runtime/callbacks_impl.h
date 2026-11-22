@@ -12966,7 +12966,9 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         fixed_upload_head.header_end == conn.req_header_end &&
         fixed_upload_head.content_length == conn.req_content_length &&
         conn.req_initial_send_len == conn.recv_buf.len() &&
-        conn.req_body_remaining == fixed_upload_head.total_length - conn.recv_buf.len())
+        static_cast<i64>(conn.req_body_remaining) ==
+            static_cast<i64>(fixed_upload_head.total_length) -
+                static_cast<i64>(conn.recv_buf.len()))
         return ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
 
     // A bounded fixed-upload profile keeps the complete request private until
@@ -12997,7 +12999,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         fixed_upload.header_end == conn.req_header_end &&
         fixed_upload.content_length == conn.req_content_length &&
         conn.req_initial_send_len == conn.recv_buf.len() &&
-        conn.req_body_remaining == fixed_upload.total_length - conn.recv_buf.len())
+        static_cast<i64>(conn.req_body_remaining) ==
+            static_cast<i64>(fixed_upload.total_length) - static_cast<i64>(conn.recv_buf.len()))
         return ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero;
 
     // The second admitted profile is deliberately a raw, bodyless HTTP/1.1
@@ -13120,12 +13123,13 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
     if (out == nullptr) return false;
     u32 pos = 0;
     auto put = [&](const u8* data, u32 len) {
-        if ((data == nullptr && len != 0) || len > out_cap - (pos <= out_cap ? pos : out_cap))
+        if ((data == nullptr && len != 0) ||
+            static_cast<i64>(len) > static_cast<i64>(out_cap) - static_cast<i64>(pos))
             return false;
         // Bulk copy (overlap-safe for borrowed views); a byte loop here was
         // the dominant cost of serving ~4 KiB local responses.
         if (len != 0) __builtin_memmove(out + pos, data, len);
-        pos += len;
+        pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
     auto put_lit = [&](const char* text) {
@@ -13221,7 +13225,8 @@ inline bool build_no_content204_response_bytes(const Connection& conn,
     // The fixed portion includes the 29-byte RFC-style Date produced below.
     // Complete-tuple validation caps server.len at 64, so this addition cannot
     // overflow u32.
-    const u32 required = (keep_alive ? 98u : 93u) + policy.server.len;
+    const u32 required = static_cast<u32>(static_cast<i64>(keep_alive ? 98u : 93u) +
+                                          static_cast<i64>(policy.server.len));
     if (out_cap < required) return false;
 
     char date[32];
@@ -13230,10 +13235,12 @@ inline bool build_no_content204_response_bytes(const Connection& conn,
 
     u32 pos = 0;
     auto put = [&](const void* data, u32 len) {
-        if ((data == nullptr && len != 0) || pos > required || len > required - pos) return false;
+        if ((data == nullptr && len != 0) || pos > required ||
+            static_cast<i64>(len) > static_cast<i64>(required) - static_cast<i64>(pos))
+            return false;
         const auto* bytes = static_cast<const u8*>(data);
         if (len != 0) __builtin_memmove(out + pos, bytes, len);
-        pos += len;
+        pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
     auto put_lit = [&](const char* text) {
