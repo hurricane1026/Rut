@@ -5,10 +5,9 @@
 #include "clang/Analysis/CFG.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
-#include <deque>
-#include <optional>
-#include <set>
 
 using namespace clang;
 using namespace clang::ast_matchers;
@@ -21,24 +20,30 @@ const VarDecl* variable(const Expr* e) {
 
 // Return the branch on which this comparison proves the step is legal.
 // C++20 may implement != as !(operator==(...)).
-std::optional<bool> guarded_branch(const Expr* e, const VarDecl* cursor, StringRef boundary) {
-    if (!e) return {};
+struct BranchProof {
+    bool known;
+    bool value;
+};
+
+BranchProof guarded_branch(const Expr* e, const VarDecl* cursor, StringRef boundary) {
+    if (!e) return {false, false};
     e = e->IgnoreParenImpCasts();
     if (const auto* rewrite = dyn_cast<CXXRewrittenBinaryOperator>(e))
         return guarded_branch(rewrite->getSemanticForm(), cursor, boundary);
     if (const auto* unary = dyn_cast<UnaryOperator>(e); unary && unary->getOpcode() == UO_LNot) {
         auto result = guarded_branch(unary->getSubExpr(), cursor, boundary);
-        if (result) return !*result;
-        return {};
+        if (result.known) return {true, !result.value};
+        return {false, false};
     }
     const auto* op = dyn_cast<CXXOperatorCallExpr>(e);
     if (!op || (op->getOperator() != OO_EqualEqual && op->getOperator() != OO_ExclaimEqual))
-        return {};
+        return {false, false};
     const auto* a = variable(op->getArg(0));
     const auto* b = variable(op->getArg(1));
     const auto* limit = a == cursor ? b : b == cursor ? a : nullptr;
-    if (!limit || limit->getName() != boundary || !limit->getType().isConstQualified()) return {};
-    return op->getOperator() == OO_ExclaimEqual;
+    if (!limit || limit->getName() != boundary || !limit->getType().isConstQualified())
+        return {false, false};
+    return {true, op->getOperator() == OO_ExclaimEqual};
 }
 
 // Explicit aliases need interprocedural tracking. Fail closed for cursors whose
@@ -93,14 +98,24 @@ private:
         }
         if (!graph || escapes(fn, cursor, context)) return false;
         // Search both guarded and unguarded paths. A step consumes its proof.
-        using State = std::pair<const CFGBlock*, bool>;
-        std::deque<State> work{{&graph->getEntry(), false}};
-        std::set<State> visited;
+        struct State {
+            const CFGBlock* block;
+            bool safe;
+        };
+        llvm::SmallVector<State, 32> work;
+        llvm::BitVector visited_safe(graph->size());
+        llvm::BitVector visited_unsafe(graph->size());
+        const auto enqueue = [&](const CFGBlock* block, bool safe) {
+            auto& visited = safe ? visited_safe : visited_unsafe;
+            const unsigned id = block->getBlockID();
+            if (visited.test(id)) return;
+            visited.set(id);
+            work.push_back({block, safe});
+        };
+        enqueue(&graph->getEntry(), false);
         bool reached = false;
         while (!work.empty()) {
-            auto [block, safe] = work.front();
-            work.pop_front();
-            if (!visited.emplace(block, safe).second) continue;
+            auto [block, safe] = work.pop_back_val();
             for (const auto& element : *block) {
                 auto stmt = element.getAs<CFGStmt>();
                 if (!stmt) continue;
@@ -130,9 +145,12 @@ private:
             auto guard = guarded_branch(block->getLastCondition(), cursor, boundary);
             unsigned edge = 0;
             for (const auto& successor : block->succs()) {
-                if (const auto* next = successor.getReachableBlock())
-                    work.emplace_back(
-                        next, guard && block->succ_size() == 2 ? (*guard == (edge == 0)) : safe);
+                if (const auto* next = successor.getReachableBlock()) {
+                    const bool next_safe = guard.known && block->succ_size() == 2
+                                               ? (guard.value == (edge == 0))
+                                               : safe;
+                    enqueue(next, next_safe);
+                }
                 ++edge;
             }
         }
