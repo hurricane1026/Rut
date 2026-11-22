@@ -92,7 +92,7 @@ constexpr HuffTrie build_trie() {
         const u32 kCode = kHuff[s].code;
         const u8 kBits = kHuff[s].bits;
         i16 node = 0;
-        for (i32 b = kBits - 1; b >= 0; b--) {
+        for (i32 b = static_cast<i32>(kBits) - 1; b >= 0; b--) {
             const u32 kBit = (kCode >> static_cast<u32>(b)) & 1u;
             if (t.child[node][kBit] < 0) {
                 t.child[node][kBit] = static_cast<i16>(t.node_count);
@@ -172,44 +172,44 @@ constexpr HuffFsm kFsm = build_fsm();
 
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     if (len == 0) return 0;
-    const u32 kMask = (1u << prefix_bits) - 1u;
+    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
         return 1;
     }
     // Continuation octets: 7 bits each, low-order first; high bit = "more".
-    u64 acc = kMask;
-    u32 shift = 0;
+    i64 acc = kMask;
+    i64 shift = 0;
     u32 i = 1;
     while (true) {
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
-        acc += static_cast<u64>(kB & 0x7f) << shift;
-        if (acc > 0xffffffffull) return 0;  // exceeds 32 bits
+        acc += static_cast<i64>(kB & 0x7f) << shift;
+        if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
         shift += 7;
         if (shift > 28) return 0;  // would overflow on next octet
     }
     *out = static_cast<u32>(acc);
-    return i;
+    return static_cast<u32>(i);
 }
 
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
-    const u32 kMask = (1u << prefix_bits) - 1u;
+    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
     if (value < kMask) {
         out[0] = static_cast<u8>(prefix_top | value);
         return 1;
     }
     out[0] = static_cast<u8>(prefix_top | kMask);
-    value -= kMask;
-    u32 i = 1;
-    while (value >= 128) {
-        out[i++] = static_cast<u8>((value & 0x7f) | 0x80);
-        value >>= 7;
+    i64 remainder = static_cast<i64>(value) - static_cast<i64>(kMask);
+    i64 i = 1;
+    while (remainder >= 128) {
+        out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
+        remainder >>= 7;
     }
-    out[i++] = static_cast<u8>(value);
-    return i;
+    out[i++] = static_cast<u8>(remainder);
+    return static_cast<u32>(i);
 }
 
 i64 huffman_encoded_len(const u8* src, u32 len) {
@@ -276,18 +276,20 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     u32 slen = 0;
     const u32 kHdr = decode_integer(in, len, 7, &slen);
     if (kHdr == 0) return 0;
-    if (kHdr > len || slen > len - kHdr) return 0;  // truncated payload
-    const u8* data = in + kHdr;
+    if (static_cast<i64>(kHdr) > static_cast<i64>(len) ||
+        static_cast<i64>(slen) > static_cast<i64>(len) - static_cast<i64>(kHdr))
+        return 0;  // truncated payload
+    const u8* data = in + static_cast<i64>(kHdr);
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
         if (kN < 0) return 0;
         *out_len = static_cast<u32>(kN);
     } else {
         if (slen > cap) return 0;
-        for (u32 i = 0; i < slen; i++) out[i] = data[i];
+        for (i64 i = 0; i < slen; i++) out[i] = data[i];
         *out_len = slen;
     }
-    return kHdr + slen;
+    return static_cast<u32>(static_cast<i64>(kHdr) + static_cast<i64>(slen));
 }
 
 i64 encode_string(u8* out, const u8* src, u32 len) {
@@ -299,8 +301,8 @@ i64 encode_string(u8* out, const u8* src, u32 len) {
         return kHdr + kN;
     }
     const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
-    for (u32 i = 0; i < len; i++) out[kHdr + i] = src[i];
-    return kHdr + len;
+    for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
+    return kHdr + static_cast<i64>(len);
 }
 
 namespace {
@@ -449,7 +451,8 @@ bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     const DynamicTable::Entry& e = d.ents[kEntry];
     name->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off));
     name->len = e.nlen;
-    value->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + e.nlen);
+    value->ptr =
+        reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + static_cast<i64>(e.nlen));
     value->len = e.vlen;
     return true;
 }
@@ -463,7 +466,10 @@ bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
         *value = {e.value, e.vlen};
         return true;
     }
-    return dyn_get(d, static_cast<u32>(static_cast<i64>(idx) - kStaticCount - 1), name, value);
+    return dyn_get(d,
+                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
+                   name,
+                   value);
 }
 
 bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
@@ -474,7 +480,10 @@ bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
         *name = {e.name, e.nlen};
         return true;
     }
-    return dyn_get(d, static_cast<u32>(static_cast<i64>(idx) - kStaticCount - 1), name, &value);
+    return dyn_get(d,
+                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
+                   name,
+                   &value);
 }
 
 i32 static_find_full(Str name, Str value) {
@@ -498,9 +507,11 @@ i32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
     for (i64 j = 0; j < d.nent; j++) {
         const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
         const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
-        const Str kEv{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + e.nlen),
+        const Str kEv{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) +
+                                                    static_cast<i64>(e.nlen)),
                       e.vlen};
-        if (kEn.eq(name) && kEv.eq(value)) return static_cast<i32>(kStaticCount + 1 + j);
+        if (kEn.eq(name) && kEv.eq(value))
+            return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
     }
     return 0;
 }
@@ -509,7 +520,7 @@ i32 dyn_find_name(const DynamicTable& d, Str name) {
     for (i64 j = 0; j < d.nent; j++) {
         const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
         const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
-        if (kEn.eq(name)) return static_cast<i32>(kStaticCount + 1 + j);
+        if (kEn.eq(name)) return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
     }
     return 0;
 }
