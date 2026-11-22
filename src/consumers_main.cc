@@ -892,6 +892,34 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
+int remove_credential_command(const char* source, const char* id_text, const char* destination) {
+    const Str id{id_text, bounded_argument(id_text, 65)};
+    if (!provision_id_valid(id)) return failure("invalid registry record ID\n");
+
+    Buffer input;
+    SensitiveDocument base;
+    if (!read_private(source, input) || !consumer_registry_valid(base, input.view()))
+        return failure("cannot read valid private registry snapshot\n");
+    if (record_by_id(base, field(base, 0, lit_str("credentials")), id) == json::kNone)
+        return failure("credential ID does not exist\n");
+
+    char changes[256];
+    json::Writer patch_text{changes, sizeof(changes)};
+    patch_text.text(lit_str(
+        "{\"consumers\":[],\"credentials\":[],\"removeConsumers\":[],\"removeCredentials\":["));
+    if (!json::quote(id, patch_text)) return failure("cannot encode credential removal\n");
+    patch_text.text(lit_str("]}"));
+
+    Buffer result;
+    SensitiveDocument patch, checked;
+    json::Writer output{result.data, json::kMaxBytes};
+    if (!patch_text.ok || !patch.parse({changes, patch_text.len}) || !apply(base, patch, output) ||
+        !consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* error = publish(destination, {result.data, output.len});
+    return error ? failure(error) : 0;
+}
+
 int inspect_record_command(char** args, bool credential) {
     Buffer input;
     SensitiveDocument doc;
@@ -1148,6 +1176,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
+    "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
@@ -1190,6 +1219,8 @@ constexpr char kUsage[] =
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && strcmp(argv[1], "remove-credential") == 0)
+        return remove_credential_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "set-credential-groups") == 0)
         return credential_groups_command(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 5 && strcmp(argv[1], "inherit-credential-groups") == 0)
