@@ -204,16 +204,33 @@ bool Http2Conn::consume_data(u32 stream_id, u32 len) {
 
 // --- Response serialization ---
 
+namespace {
+constexpr i64 hpack_integer_octets(u32 value, u8 prefix_bits) {
+    const u32 kPrefixMax = (1u << prefix_bits) - 1u;
+    if (value <= kPrefixMax) return 1;
+    i64 n = 1;
+    value -= kPrefixMax;
+    while (value >= 128) {
+        value >>= 7;
+        n++;
+    }
+    return n + 1;
+}
+
+constexpr i64 hpack_field_overhead(u32 name_len, u32 value_len) {
+    return 1 + hpack_integer_octets(name_len, 7) + hpack_integer_octets(value_len, 7);
+}
+}  // namespace
+
 u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
     if (out_cap < kFrameHeaderSize) return 0;
     u32 o = kFrameHeaderSize;
-    static constexpr i64 kHpackFieldOverhead = 13;  // 1 prefix + 6 + 6 length octets
     for (u32 i = 0; i < n; i++) {
-        // A 32-bit length needs at most six octets with a 7-bit prefix. Check
-        // in i64 so huge direct inputs are rejected before any pointer arithmetic.
-        const i64 kWorst =
-            static_cast<i64>(o) + hs[i].name.len + hs[i].value.len + kHpackFieldOverhead;
+        // Prefix width follows the actual 32-bit lengths; check in i64 so huge
+        // direct inputs are rejected before any pointer arithmetic.
+        const i64 kWorst = static_cast<i64>(o) + hs[i].name.len + hs[i].value.len +
+                           hpack_field_overhead(hs[i].name.len, hs[i].value.len);
         if (kWorst > out_cap) return 0;
         const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
         // kWorst is a complete write-before bound for encode_header.
@@ -285,19 +302,18 @@ static u32 http2_write_response_impl(u8* out,
     const i64 kStatusEncoded = enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
     if (kStatusEncoded < 0 || kStatusEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
     hb += static_cast<u32>(kStatusEncoded);
-    // Worst-case HPACK literal overhead beyond the raw name+value bytes: one field-
-    // line prefix octet plus a length-prefix integer for each of name and value (up
-    // to 5 bytes each for 32-bit lengths). The peer (or an upstream we proxy) can
+    // HPACK literal overhead beyond raw name+value bytes: one field-line prefix
+    // octet plus the actual length-prefix width for each name and value. The peer
+    // (or an upstream we proxy) can
     // supply arbitrary header sizes, so this must bound the write exactly — a header
     // just under the buffer would otherwise encode past hblock instead of returning
     // 0 (→ the caller answers 502).
-    static constexpr i64 kHpackFieldOverhead = 13;  // 1 prefix + 6 + 6 length octets
     // Room the trailing content-length line needs when there's a body, reserved
     // during the loop so the loop can't fill hblock and then overflow on the CL.
-    const i64 kClReserve = body_len > 0 ? 14 + 10 + kHpackFieldOverhead : 0;
+    const i64 kClReserve = body_len > 0 ? 14 + 10 + hpack_field_overhead(14, 10) : 0;
     for (u32 i = 0; i < nhdrs; i++) {
         const i64 kWorst = static_cast<i64>(hb) + hdrs[i].name.len + hdrs[i].value.len +
-                           kHpackFieldOverhead + kClReserve;
+                           hpack_field_overhead(hdrs[i].name.len, hdrs[i].value.len) + kClReserve;
         if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
         // config (or a proxied upstream) may hold mixed case (HTTP/1 tolerates it).
@@ -326,7 +342,7 @@ static u32 http2_write_response_impl(u8* out,
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
-        const i64 kWorst = static_cast<i64>(hb) + 14 + kClLen + kHpackFieldOverhead;
+        const i64 kWorst = static_cast<i64>(hb) + 14 + kClLen + hpack_field_overhead(14, kClLen);
         if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;  // (reserved above)
         const i64 kClEncoded =
             enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});

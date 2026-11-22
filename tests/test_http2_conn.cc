@@ -2039,6 +2039,37 @@ TEST(http2_conn, write_response_rejects_oversized_headers) {
     CHECK_EQ(n, 0u);  // refused, not overflowed
 }
 
+TEST(http2_conn, header_writers_check_wide_bounds_before_encoding) {
+    const hpack::Header method_get[] = {{{":method", 7}, {"GET", 3}}};
+    u8 legacy_capacity[27];
+    CHECK_EQ(http2_write_headers(legacy_capacity, sizeof(legacy_capacity), 1, method_get, 1, true),
+             10u);
+    const hpack::Header short_header[] = {{{"x", 1}, {"y", 1}}};
+    u8 probe[128];
+    const u32 needed = http2_write_headers(probe, sizeof(probe), 1, short_header, 1, true);
+    REQUIRE(needed > 0);
+    u8 exact[128];
+    CHECK_EQ(http2_write_headers(exact, needed, 1, short_header, 1, true), needed);
+
+    const char byte = 'x';
+    const hpack::Header huge[] = {{{&byte, UINT32_MAX}, {&byte, 1}}};
+    CHECK_EQ(http2_write_headers(probe, sizeof(probe), 1, huge, 1, true), 0u);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    const u32 response_needed =
+        http2_write_response(probe, sizeof(probe), enc, 1, 200, short_header, 1, nullptr, 0);
+    REQUIRE(response_needed > 0);
+    hpack::Encoder enc_exact;
+    enc_exact.init(4096);
+    CHECK_EQ(http2_write_response(
+                 exact, response_needed, enc_exact, 1, 200, short_header, 1, nullptr, 0),
+             response_needed);
+    hpack::Encoder enc_huge;
+    enc_huge.init(4096);
+    CHECK_EQ(http2_write_response(probe, sizeof(probe), enc_huge, 1, 200, huge, 1, nullptr, 0), 0u);
+}
+
 // A header name too long to lowercase in http2_write_response's stack buffer must
 // be rejected (return 0 → the proxy answers 502) if it contains uppercase, rather
 // than forwarding an invalid uppercase HTTP/2 name. An all-lowercase long name is
