@@ -119,7 +119,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
         nodes.len = saved_nodes_len;
     };
 
-    FixedVec<u16, kMaxPathSegments + 1> visited;
+    FixedVec<u16, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> visited;
     [[maybe_unused]] const bool kRootRecorded = visited.push(0);
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
@@ -172,7 +172,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
         const u16 kChild = parent.children[kLast];
         if (is_param_segment(nodes[kChild].segment)) {
             for (u32 j = kLast; j > parent.children.param_count; --j)
-                parent.children[j] = parent.children[j - 1];
+                parent.children[j] = parent.children[static_cast<i64>(j) - 1];
             parent.children[parent.children.param_count++] = kChild;
         }
         needs_backtracking_ |= parent.children.param_count != 0 && parent.children.len > 1;
@@ -291,7 +291,7 @@ u16 RouteTrie::match_key(Str path,
         u32 static_segments;
         u64 static_mask;
     };
-    FixedVec<Frame, kMaxPathSegments + 1> stack;
+    FixedVec<Frame, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> stack;
     [[maybe_unused]] const bool kPushed = stack.push(Frame{});
 
     struct Candidate {
@@ -321,13 +321,14 @@ u16 RouteTrie::match_key(Str path,
             // Record only node IDs for the winning path. Capture views are
             // materialized once, after the search, and only when requested.
             if (out_params && out_param_count && out_param_cap != 0 && depth != static_segments) {
-                for (u32 i = 1; i < stack.len; ++i) best_path[i - 1] = stack[i].node;
+                for (u32 i = 1; i < stack.len; ++i)
+                    best_path[static_cast<i64>(i) - 1] = stack[i].node;
             }
         }
     };
 
     while (stack.len > 0) {
-        Frame& frame = stack[stack.len - 1];
+        Frame& frame = stack[static_cast<i64>(stack.len) - 1];
         const auto& node = nodes[frame.node];
         if (frame.next_child == 0) {
             consider(pick_terminal(node, want_slot),
@@ -350,7 +351,8 @@ u16 RouteTrie::match_key(Str path,
                 find_child(frame.node, segs[frame.depth], node.children.param_count);
             if (kLiteral != TrieNode::kInvalidNodeIdx) {
                 const u32 kDepth = static_cast<u32>(static_cast<i64>(frame.depth) + 1);
-                const u64 kMask = frame.static_mask | (kDepth < 64 ? 1ull << (63 - kDepth) : 0);
+                const u64 kMask =
+                    frame.static_mask | (kDepth < 64 ? 1ull << (63 - static_cast<i64>(kDepth)) : 0);
                 [[maybe_unused]] const bool kOk =
                     stack.push(Frame{kLiteral,
                                      kDepth,
@@ -362,7 +364,7 @@ u16 RouteTrie::match_key(Str path,
         }
         bool descended = false;
         while (frame.next_child <= node.children.param_count) {
-            const u16 kChild = node.children[frame.next_child++ - 1];
+            const u16 kChild = node.children[static_cast<i64>(frame.next_child++) - 1];
             if ((nodes[kChild].children.method_mask & kEligibleMethods) == 0) continue;
             [[maybe_unused]] const bool kOk =
                 stack.push(Frame{kChild,
