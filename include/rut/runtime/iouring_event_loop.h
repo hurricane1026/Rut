@@ -5371,11 +5371,9 @@ public:
                                                ResponseReadDeadlinePostCommitPhase::Buffering
                                        ? c.response_read_deadline_post_commit_raw_header_end
                                        : 0;
-                const u32 delta =
-                    static_cast<u32>(static_cast<i64>(received) - static_cast<i64>(completed));
+                const i64 delta = static_cast<i64>(received) - static_cast<i64>(completed);
                 owner.bounded_terminal_buffer_begin =
-                    received >= completed &&
-                            static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+                    delta >= 0 && static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
                         ? static_cast<u32>(static_cast<i64>(header) + delta)
                         : UINT32_MAX;
                 owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
@@ -5407,11 +5405,9 @@ public:
                                        ResponseReadDeadlinePostCommitPhase::Buffering
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
-        const u32 delta =
-            static_cast<u32>(static_cast<i64>(received) - static_cast<i64>(completed));
+        const i64 delta = static_cast<i64>(received) - static_cast<i64>(completed);
         owner.bounded_terminal_buffer_begin =
-            received >= completed &&
-                    static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+            delta >= 0 && static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
                 ? static_cast<u32>(static_cast<i64>(header) + delta)
                 : UINT32_MAX;
         owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
