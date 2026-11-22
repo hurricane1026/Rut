@@ -15174,7 +15174,7 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             return false;
         }
 
-        const auto& bundle = config->policy_bundles[bundle_id - 1];
+        const auto& bundle = config->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (bundle.response_buffering != buffering ||
             bundle.response_policy_id != conn.response_policy_id ||
             bundle.failure_policy_id != conn.failure_policy_id ||
@@ -15182,7 +15182,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             !config->failure_policy_id_is_valid(conn.failure_policy_id)) {
             return false;
         }
-        const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
+        const auto& failure =
+            config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1];
         if (failure.version != ForwardFailurePolicyVersion::Http11 ||
             failure.status_code != kStatusBadGateway ||
             failure.connection != ForwardFailurePolicyConnection::Request ||
@@ -15288,8 +15289,10 @@ inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
             !conn.response_header_buf.valid())
             return false;
 
-        const auto& response = conn.request_config->response_policies[conn.response_policy_id - 1];
-        const auto& failure = conn.request_config->failure_policies[conn.failure_policy_id - 1];
+        const auto& response =
+            conn.request_config->response_policies[static_cast<i64>(conn.response_policy_id) - 1];
+        const auto& failure =
+            conn.request_config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1];
         if (response.version != ResponsePolicyVersion::Http11 ||
             response.framing != ResponsePolicyFraming::ContentLength ||
             response.connection != ResponsePolicyConnection::Request ||
