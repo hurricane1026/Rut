@@ -530,17 +530,17 @@ bool decode_header_block(DynamicTable& dyn,
                          Header* headers,
                          u32 max_headers,
                          u32* count) {
-    u32 pos = 0;
-    u32 op = 0;  // out_buf write cursor
+    i64 pos = 0;
+    i64 op = 0;  // out_buf write cursor
     u32 hc = 0;
     while (pos < len) {
         const u8 kByte = in[pos];
         if (kByte & 0x80) {
             // §6.1 Indexed Header Field.
             u32 idx = 0;
-            const u32 kC = decode_integer(in + pos, len - pos, 7, &idx);
+            const u32 kC = decode_integer(in + pos, static_cast<u32>(len - pos), 7, &idx);
             if (kC == 0 || idx == 0) return false;
-            pos += kC;
+            pos += static_cast<i64>(kC);
             Str name, value;
             if (!resolve_full(dyn, idx, &name, &value)) return false;
             if (hc >= max_headers) return false;
@@ -550,9 +550,9 @@ bool decode_header_block(DynamicTable& dyn,
         if (kByte & 0x20 && !(kByte & 0x40)) {
             // §6.3 Dynamic Table Size Update (001xxxxx).
             u32 sz = 0;
-            const u32 kC = decode_integer(in + pos, len - pos, 5, &sz);
+            const u32 kC = decode_integer(in + pos, static_cast<u32>(len - pos), 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
-            pos += kC;
+            pos += static_cast<i64>(kC);
             dyn_set_max_size(dyn, sz);
             continue;
         }
@@ -561,26 +561,34 @@ bool decode_header_block(DynamicTable& dyn,
         const bool kIncremental = (kByte & 0x40) != 0;
         const u8 kPrefix = kIncremental ? 6 : 4;
         u32 nidx = 0;
-        const u32 kNc = decode_integer(in + pos, len - pos, kPrefix, &nidx);
+        const u32 kNc = decode_integer(in + pos, static_cast<u32>(len - pos), kPrefix, &nidx);
         if (kNc == 0) return false;
-        pos += kNc;
+        pos += static_cast<i64>(kNc);
 
         Str name;
         if (nidx == 0) {
             u32 nlen = 0;
-            const u32 kSc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &nlen);
+            const u32 kSc = decode_string(in + pos,
+                                          static_cast<u32>(len - pos),
+                                          out_buf + op,
+                                          static_cast<u32>(out_cap - op),
+                                          &nlen);
             if (kSc == 0) return false;
-            pos += kSc;
+            pos += static_cast<i64>(kSc);
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += nlen;
+            op += static_cast<i64>(nlen);
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
         // Value is always a literal string.
         u32 vlen = 0;
-        const u32 kVc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &vlen);
+        const u32 kVc = decode_string(in + pos,
+                                      static_cast<u32>(len - pos),
+                                      out_buf + op,
+                                      static_cast<u32>(out_cap - op),
+                                      &vlen);
         if (kVc == 0) return false;
-        pos += kVc;
+        pos += static_cast<i64>(kVc);
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
         op += vlen;
 
@@ -588,10 +596,10 @@ bool decode_header_block(DynamicTable& dyn,
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
-                if (op + name.len > out_cap) return false;
+                if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += name.len;
+                op += static_cast<i64>(name.len);
             }
             dyn_add(dyn, name, value);
         }
