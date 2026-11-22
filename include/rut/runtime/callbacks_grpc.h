@@ -1477,20 +1477,24 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                 done = x->response_end && !x->download_len && !x->response_trailers_len &&
                        (!x->websocket || (x->response_headers[4] & http2_flag::kEndStream));
             } else if (x->response_headers_sent && output_len && stream->send_window > 0 &&
-                       h.conn_send_window > 0 && static_cast<i64>(room) > 9) {
+                       h.conn_send_window > 0 &&
+                       static_cast<i64>(room) > static_cast<i64>(kFrameHeaderSize)) {
                 u32 amount = output_len;
-                if (static_cast<i64>(amount) > static_cast<i64>(room) - 9)
-                    amount = static_cast<u32>(static_cast<i64>(room) - 9);
+                if (static_cast<i64>(amount) >
+                    static_cast<i64>(room) - static_cast<i64>(kFrameHeaderSize))
+                    amount = static_cast<u32>(static_cast<i64>(room) -
+                                              static_cast<i64>(kFrameHeaderSize));
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
                 n = http2_write_data(
                     out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
-                x->staged_response_bytes += static_cast<u64>(amount);
+                (void)__builtin_add_overflow(
+                    x->staged_response_bytes, static_cast<u64>(amount), &x->staged_response_bytes);
                 grpc_consume_output(*x, false, amount);
                 stream->send_window -= static_cast<i32>(amount);
-                h.conn_send_window -= amount;
+                h.conn_send_window -= static_cast<i64>(amount);
             } else if (x->websocket && x->response_headers_sent && !output_len &&
                        !x->download_len && x->response_end && !x->response_end_sent &&
                        room >= kFrameHeaderSize) {
