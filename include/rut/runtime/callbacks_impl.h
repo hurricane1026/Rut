@@ -13324,7 +13324,7 @@ bool handle_configured_strict_local_response_in_scope(
         method_key >= kStrictLocalResponseMethodSlots)
         return fail_closed();
 
-    const auto& policy = config->strict_local_response_policies[policy_id - 1];
+    const auto& policy = config->strict_local_response_policies[static_cast<i64>(policy_id) - 1];
     const bool is_head = method == LogHttpMethod::Head;
     if ((is_head && policy.head_mode != StrictLocalResponseHeadMode::SuppressBody) ||
         (!is_head && policy.head_mode != StrictLocalResponseHeadMode::Reject &&
@@ -13382,7 +13382,7 @@ inline bool build_failure_policy_response(const Connection& conn,
         return false;
     return build_failure_policy_response_from_spec(
         conn,
-        config.failure_policies[conn.failure_policy_id - 1],
+        config.failure_policies[static_cast<i64>(conn.failure_policy_id) - 1],
         suppress_body,
         out,
         out_cap,
@@ -13401,7 +13401,7 @@ inline bool build_timeout_failure_policy_response(const Connection& conn,
         return false;
     return build_failure_policy_response_from_spec(
         conn,
-        config.failure_policies[conn.timeout_failure_policy_id - 1],
+        config.failure_policies[static_cast<i64>(conn.timeout_failure_policy_id) - 1],
         suppress_body,
         out,
         out_cap,
@@ -13421,7 +13421,7 @@ inline bool fixed_upload_head_preconnect_failure_response_is_stable(
         response == nullptr || response_len == 0 ||
         !config.failure_policy_id_is_valid(conn.failure_policy_id))
         return false;
-    const auto& policy = config.failure_policies[conn.failure_policy_id - 1];
+    const auto& policy = config.failure_policies[static_cast<i64>(conn.failure_policy_id) - 1];
     HttpResponseParser parser;
     ParsedResponse parsed;
     parser.reset();
