@@ -357,6 +357,12 @@ bool apply(json::Document& base, json::Document& patch, json::Writer& output) {
     return output.ok;
 }
 
+bool write_redacted_credential(json::Document& doc, u32 record, json::Writer& output) {
+    u32 hidden = field(doc, record, lit_str("secret"));
+    if (hidden == json::kNone) hidden = field(doc, record, lit_str("secretSha256"));
+    return hidden != json::kNone && doc.write(record, output, hidden, {}, true);
+}
+
 bool inspect(json::Document& doc, json::Writer& output) {
     output.text(lit_str("{\"version\":1,\"consumers\":"));
     const u32 kConsumers = field(doc, 0, lit_str("consumers"));
@@ -369,9 +375,7 @@ bool inspect(json::Document& doc, json::Writer& output) {
     for (u32 n = doc.nodes[kCredentials].child; n != json::kNone; n = doc.nodes[n].next) {
         if (!first) output.put(',');
         first = false;
-        u32 hidden = field(doc, n, lit_str("secret"));
-        if (hidden == json::kNone) hidden = field(doc, n, lit_str("secretSha256"));
-        if (!doc.write(n, output, hidden, {}, true)) return false;
+        if (!write_redacted_credential(doc, n, output)) return false;
     }
     output.text(lit_str("]}\n"));
     return output.ok;
@@ -868,19 +872,21 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
-int registry_command(char** args) {
+int inspect_record_command(char** args, bool credential) {
     Buffer input;
     SensitiveDocument doc;
     if (!read_private(args[2], input) || !consumer_registry_valid(doc, input.view()))
         return failure("cannot read valid private registry snapshot\n");
     const Str id{args[3], bounded_argument(args[3], 65)};
-    const u32 kConsumers = field(doc, 0, lit_str("consumers"));
-    const u32 kTarget = provision_id_valid(id) ? record_by_id(doc, kConsumers, id) : json::kNone;
+    const u32 kRecords = field(doc, 0, credential ? lit_str("credentials") : lit_str("consumers"));
+    const u32 kTarget = provision_id_valid(id) ? record_by_id(doc, kRecords, id) : json::kNone;
     if (kTarget == json::kNone) return failure("registry record not found\n");
 
     Buffer result;
     json::Writer output{result.data, json::kMaxBytes};
-    if (!doc.write(kTarget, output)) return failure("cannot encode redacted registry record\n");
+    const bool written =
+        credential ? write_redacted_credential(doc, kTarget, output) : doc.write(kTarget, output);
+    if (!written) return failure("cannot encode redacted registry record\n");
     output.put('\n');
     return output.ok && write_all(STDOUT_FILENO, {result.data, output.len}) ? 0 : 2;
 }
@@ -1071,6 +1077,7 @@ constexpr char kUsage[] =
     "       rut-consumers check-policy INPUT POLICY NOW_UNIX_SECONDS\n"
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
+    "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
     "       rut-consumers diff BEFORE AFTER\n"
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
@@ -1117,7 +1124,10 @@ int main(int argc, char** argv) {
         return check_policy_command(argv[2], argv[3], argv[4]);
     if (argc == 2 && strcmp(argv[1], "--help") == 0)
         return write_all(STDOUT_FILENO, {kUsage, sizeof(kUsage) - 1}) ? 0 : 2;
-    if (argc == 4 && strcmp(argv[1], "inspect-consumer") == 0) return registry_command(argv);
+    if (argc == 4 && strcmp(argv[1], "inspect-consumer") == 0)
+        return inspect_record_command(argv, false);
+    if (argc == 4 && strcmp(argv[1], "inspect-credential") == 0)
+        return inspect_record_command(argv, true);
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
         return prune_credentials_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)

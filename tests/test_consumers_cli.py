@@ -182,6 +182,11 @@ def test_targeted_registry_commands(tool, root):
 
     inspect('inspect-consumer', alice['id'], alice)
     inspect('inspect-consumer', 'missing', None)
+    for record in records:
+        expected = {key: value for key, value in record.items() if key not in ('secret', 'secretSha256')}
+        inspect('inspect-credential', record['id'], expected)
+    inspect('inspect-credential', 'missing', None)
+    inspect('inspect-credential', alice['id'], None)
     assert source.read_bytes() == original
 
 
