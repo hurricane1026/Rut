@@ -215,6 +215,13 @@ private:
         u64 actual_size = 0;
         u8* mem = backend.acquire(needed, &actual_size);
         if (!mem) return nullptr;
+        // Every block embeds its header before the payload. A backend that
+        // returns a non-null short block cannot safely be used, even if its
+        // acquire call itself succeeded.
+        if (actual_size < Block::kHeaderSize) {
+            backend.release(mem, actual_size);
+            return nullptr;
+        }
         auto* b = reinterpret_cast<Block*>(mem);
         b->prev = prev;
         b->size = actual_size;

@@ -10,6 +10,26 @@
 using namespace rut;
 using rut::test_fault::ScopedMemoryFault;
 
+struct ShortArenaBackend {
+    alignas(16) u8 storage[64]{};
+    bool released = false;
+
+    core::Expected<void, Error> init() { return {}; }
+    u8* acquire(u64, u64* out_size) {
+        *out_size = 1;  // Deliberately shorter than Arena::Block::kHeaderSize.
+        return storage;
+    }
+    void release(u8*, u64) { released = true; }
+};
+
+TEST(block, short_backend_block_is_rejected_before_header_write) {
+    Arena<ShortArenaBackend> arena;
+    CHECK(!arena.init().has_value());
+    CHECK(arena.backend.released);
+    CHECK_EQ(arena.current, nullptr);
+    CHECK_EQ(arena.total_allocated, 0u);
+}
+
 // ============================================================
 // Block internals
 // ============================================================
