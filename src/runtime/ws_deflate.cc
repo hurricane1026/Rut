@@ -38,7 +38,7 @@ voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
         return nullptr;
     const u32 kStart = static_cast<u32>((static_cast<i64>(codec.used) + 15) & ~15ll);
     if (kStart > SlicePool::kBulkSliceSize ||
-        kBytes > static_cast<u64>(SlicePool::kBulkSliceSize) - kStart)
+        kBytes > static_cast<u64>(SlicePool::kBulkSliceSize) - static_cast<u64>(kStart))
         return nullptr;
     u8* const kResult = reinterpret_cast<u8*>(&codec) + kStart;
     memset(kResult, 0, kBytes);
@@ -172,7 +172,10 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
         const u8* source = input ? input + static_cast<i64>(offset) : nullptr;
         if (mask_key && kTake) {
             memcpy(codec.scratch, source, kTake);
-            ws_unmask_chunk(codec.scratch, kTake, mask_key, mask_offset + static_cast<u64>(offset));
+            ws_unmask_chunk(codec.scratch,
+                            kTake,
+                            mask_key,
+                            static_cast<u64>((mask_offset & 3) + (static_cast<u64>(offset) & 3)));
             source = codec.scratch;
         }
         const auto kStatus = inflate_bytes(codec, source, kTake, output, boundary);
