@@ -102,8 +102,8 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     if (h->fails >= kBackendFailThreshold) {
         u64 eject_until = 0;
         h->eject_until_us = __builtin_add_overflow(now_us, kBackendEjectCooldownUs, &eject_until)
-                                 ? ~u64{0}
-                                 : eject_until;
+                                ? ~u64{0}
+                                : eject_until;
     }
 }
 
@@ -14432,9 +14432,11 @@ inline bool build_redirect_response(const Connection& conn,
 
     const Str location_authority = legacy_profile ? authority.value : policy.static_authority;
     const bool append_listener_port = legacy_profile && !authority.has_port;
-    const u32 authority_len =
-        static_cast<u32>(static_cast<i64>(location_authority.len) +
-                         (append_listener_port ? 1 + static_cast<i64>(actual_port_digits) : 0));
+    const i64 authority_len_wide =
+        static_cast<i64>(location_authority.len) +
+        (append_listener_port ? 1 + static_cast<i64>(actual_port_digits) : 0);
+    if (authority_len_wide < 0 || authority_len_wide > UINT32_MAX) return false;
+    const u32 authority_len = static_cast<u32>(authority_len_wide);
     const u32 location_query_len = legacy_profile ? query_len : 0;
     u64 required = 0;
     auto add = [&](u64 n) {
@@ -14447,11 +14449,12 @@ inline bool build_redirect_response(const Connection& conn,
     static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
-    if (!add(9 + 3 + 1 + policy.reason.len + 2) || !add(10 + policy.server.len) ||
-        !add(8 + date_len) || !add(16 + policy.content_type.len) || !add(18 + body_len_digits) ||
+    if (!add(9 + 3 + 1 + static_cast<u64>(policy.reason.len) + 2) ||
+        !add(10 + static_cast<u64>(policy.server.len)) || !add(8 + date_len) ||
+        !add(16 + static_cast<u64>(policy.content_type.len)) || !add(18 + body_len_digits) ||
         !add((legacy_profile ? sizeof(kLocationPrefix) : sizeof(kFixedLocationPrefix)) - 1 +
              authority_len) ||
-        !add(policy.target_path.len + location_query_len) ||
+        !add(static_cast<u64>(policy.target_path.len) + location_query_len) ||
         !add((legacy_profile ? sizeof(kLegacyTail) : sizeof(kFixedTail)) - 1) ||
         !add(policy.body.len) || required > out_cap)
         return false;
