@@ -2120,15 +2120,15 @@ u32 IoUringBackend::wait(
                                                           static_cast<i64>(ss.offset));
                     if (pos_wide > kOffTMax) {
                         result = -EOVERFLOW;
-                        continue;
-                    }
-                    off_t pos = static_cast<off_t>(pos_wide);
-                    const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
-                    if (n > 0) {
-                        ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + n);
-                        ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - n);
-                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        result = -errno;
+                    } else {
+                        off_t pos = static_cast<off_t>(pos_wide);
+                        const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
+                        if (n > 0) {
+                            ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + n);
+                            ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - n);
+                        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                            result = -errno;
+                        }
                     }
                 }
                 if (result == 0 && ss.remaining > 0) {
