@@ -3528,3 +3528,22 @@ TEST(h2_serving, partial_frame_promotion_failure_preserves_owned_slice) {
     CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), partial, sizeof(partial)), 0);
     loop.pool.free(conn.recv_slice);
 }
+
+TEST(grpc_contract, invalid_output_consumption_preserves_buffer) {
+    GrpcExchange exchange{};
+    exchange.init();
+    exchange.upload[0] = 0x11;
+    exchange.upload[1] = 0x22;
+    exchange.upload[2] = 0x33;
+    exchange.upload[3] = 0x44;
+    exchange.upload_len = 4;
+
+    grpc_consume_output(exchange, true, 5);
+
+    CHECK_EQ(exchange.failure, 13u);
+    CHECK_EQ(exchange.upload_len, 4u);
+    CHECK_EQ(exchange.upload[0], 0x11u);
+    CHECK_EQ(exchange.upload[1], 0x22u);
+    CHECK_EQ(exchange.upload[2], 0x33u);
+    CHECK_EQ(exchange.upload[3], 0x44u);
+}
