@@ -266,6 +266,19 @@ An active permit and acknowledged cleanup yield the verified subject with
 authority or cleanup failure returns 503. After confirmed logout, resending
 the old cookie is denied. The read route performs no session mutation.
 
+## Scoped browser writes
+
+[The browser write example](../examples/browser-session-write.rut) exposes
+`POST /private/write`. Configure `BROWSER_ORIGIN` to the exact HTTPS origin.
+The route requires TLS, a matching singleton Origin, and a singleton
+`Sec-Fetch-Site: same-origin` before authentication. It then verifies the
+unique session cookie and the exact signed `orders:write` scope before
+contacting the Redis authority. A successful request also needs an active
+exact-token permit and acknowledged connection cleanup. The example returns
+204 with `Cache-Control: no-store` at the point where the application could
+perform its protected mutation. Missing scope receives 403, a missing or
+revoked permit receives 401, and a storage or cleanup failure receives 503.
+
 ## Local-AOF durable logout
 
 `POST /logout-durable` is an opt-in Redis 7.2+ profile for single-instance
