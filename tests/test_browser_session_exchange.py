@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise an enrolled bearer session's exchange for a host-bound HTTPS cookie."""
+"""Exercise exchange, authorization and durable logout on one HTTPS origin."""
 import argparse
 import http.client
 import json
@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from auth_h2_fixture import request as h2_request
-from test_browser_session_revoke import ORIGIN, exchange
+from test_browser_session_revoke import CLEAR_COOKIE, ORIGIN, exchange
 from test_jwt_sessions import KEY, NAMESPACE, Peer, permit_key, signed
 from test_mtls_consumers import registry_gateway
 
@@ -30,7 +30,7 @@ def exercise(args, peer):
                        REDIS_DATABASE="1")
     now = int(time.time())
     claims = dict(sub="alice", iss="issuer", aud="gateway", iat=now - 60, exp=now + 300,
-                  jti="browser-exchange")
+                  jti="browser-exchange", scope="orders:read orders:write")
     token = signed(claims)
     different = signed(dict(claims, nonce="different"))
     expired = signed(dict(claims, exp=now - 1))
@@ -54,10 +54,14 @@ def exercise(args, peer):
         with registry_gateway(args, source, environment, "clear") as port:
             clear = http.client.HTTPConnection("localhost", port, timeout=5)
             try:
-                clear.request("POST", path, headers=dict([origin, fetch, bearer]))
-                response = clear.getresponse()
-                assert response.status == 403 and response.getheader("Set-Cookie") is None
-                response.read()
+                for method, route in (("POST", path), ("GET", "/private"),
+                                      ("POST", "/private/write"), ("POST", "/logout")):
+                    headers = [origin, fetch, bearer, ("Cookie", "__Host-rut_session=" + token)]
+                    clear.request(method, route, headers=dict(headers))
+                    response = clear.getresponse()
+                    assert response.status == (503 if method == "GET" else 403)
+                    assert response.getheader("Set-Cookie") is None
+                    response.read()
             finally:
                 clear.close()
 
@@ -72,6 +76,7 @@ def exercise(args, peer):
                     assert response.get("Cache-Control") == "no-store" and body == b""
                 else:
                     assert response.get_all("Set-Cookie") is None
+                return response
 
             with peer.lock:
                 assert not peer.commands
@@ -87,7 +92,8 @@ def exercise(args, peer):
             with peer.lock:
                 assert not peer.commands
             check([origin, fetch, ("Authorization", "Bearer " + different)], 401)
-            check([origin, fetch, bearer], 204)
+            response = check([origin, fetch, bearer], 204)
+            cookie = ("Cookie", response["Set-Cookie"].split(";", 1)[0])
             assert h2_request(port, path, [origin, fetch, bearer], method="POST",
                               tls_context=h2_context) == (204, b"")
             with peer.lock:
@@ -95,14 +101,62 @@ def exercise(args, peer):
             check([origin, fetch, bearer], 503)
             with peer.lock:
                 peer.mode = "normal"
-                peer.store[key] = b"revoked"
+                assert all(command[0] in (b"AUTH", b"SELECT", b"GET", b"RESET")
+                           for command in peer.commands)
+                reader = signed(dict(claims, scope="orders:read"))
+                reader_key = permit_key(reader)
+                peer.store[reader_key] = b"active"
+            status, response, body = exchange(port, context, "POST", path, [
+                origin, fetch, ("Authorization", "Bearer " + reader)])
+            assert status == 204 and body == b""
+            reader_cookie = ("Cookie", response["Set-Cookie"].split(";", 1)[0])
+
+            status, response, body = exchange(port, context, "GET", "/private", [cookie])
+            assert status == 200 and body == b"alice"
+            assert response.get("Cache-Control") == "no-store"
+            assert h2_request(port, "/private", [reader_cookie], tls_context=h2_context) == (
+                200, b"alice")
+            assert h2_request(port, "/private/write", [origin, fetch, cookie], method="POST",
+                              tls_context=h2_context) == (204, b"")
+            status, _ = h2_request(port, "/private/write", [origin, fetch, reader_cookie],
+                                   method="POST", tls_context=h2_context)
+            assert status == 403
+            status, _, _ = exchange(port, context, "POST", "/private/write",
+                                     [origin, fetch, bearer])
+            assert status == 401
+
+            with peer.lock:
+                previous_commands = len(peer.commands)
+            status, response, _ = exchange(port, context, "POST", "/logout", [
+                origin, ("Sec-Fetch-Site", "cross-site"), cookie])
+            assert status == 403 and response.get_all("Set-Cookie") is None
+            with peer.lock:
+                assert len(peer.commands) == previous_commands and peer.store[key] == b"active"
+                peer.mode = "aof-timeout"
+            status, response, _ = exchange(port, context, "POST", "/logout",
+                                           [origin, fetch, cookie])
+            assert status == 503 and response.get_all("Set-Cookie") is None
+            with peer.lock:
+                peer.mode = "normal"
+            status, response, body = exchange(port, context, "POST", "/logout",
+                                              [origin, fetch, cookie])
+            assert status == 204 and body == b""
+            assert response.get("Cache-Control") == "no-store"
+            assert response.get_all("Set-Cookie") == [CLEAR_COOKIE]
+            with peer.lock:
+                assert peer.store[key] == b"revoked" and peer.expiries[key] == claims["exp"]
+                assert peer.store[reader_key] == b"active"
+            for method, route, headers in (("GET", "/private", [cookie]),
+                                           ("POST", "/private/write", [origin, fetch, cookie])):
+                status, body = h2_request(port, route, headers, method=method,
+                                          tls_context=h2_context)
+                assert status == 401 and b"alice" not in body
+            assert h2_request(port, "/private", [reader_cookie], tls_context=h2_context) == (
+                200, b"alice")
             check([origin, fetch, bearer], 401)
             status, _ = h2_request(port, path, [origin, fetch, bearer], method="POST",
                                    tls_context=h2_context)
             assert status == 401
-            with peer.lock:
-                assert all(command[0] in (b"AUTH", b"SELECT", b"GET", b"RESET")
-                           for command in peer.commands)
 
 
 def main():

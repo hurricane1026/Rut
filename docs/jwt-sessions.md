@@ -299,8 +299,22 @@ return 503. Failed requests emit no cookie. The cookie has browser-session
 lifetime and does not extend the signed token expiry or Redis permit.
 
 This route exchanges an existing credential. The trusted session issuer still
-creates and enrolls the token through its usual authentication workflow. Serve
-this route on the same host as the protected cookie routes and durable logout.
+creates and enrolls the token through its usual authentication workflow. The
+same example serves all four routes on one HTTPS origin:
+
+| Route | Session behavior |
+| --- | --- |
+| `POST /session/cookie` | Exchange an enrolled Bearer token for the browser cookie. |
+| `GET /private` | Read the verified subject using the cookie and an active permit. |
+| `POST /private/write` | Require the cookie, matching browser headers, an active permit and the signed `orders:write` scope. |
+| `POST /logout` | Require the cookie and matching browser headers. Clear the cookie after local-AOF revocation and connection cleanup succeed. |
+
+The logout route requires the Redis local-AOF configuration below. It revokes
+the exact token through its signed expiry. A different token with the same
+subject and token ID keeps its own permit.
+
+The native regression uses the cookie issued by the exchange and exercises
+authorization and revocation across HTTP/1.1 and HTTP/2 on epoll and io_uring.
 
 ## Local-AOF durable logout
 
