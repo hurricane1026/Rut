@@ -4502,6 +4502,15 @@ if(RUT_ENABLE_JIT)
                 set_tests_properties(test_browser_session_write_${browser_write_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
             endforeach()
+            foreach(browser_exchange_backend epoll io_uring)
+                add_test(NAME test_browser_session_exchange_${browser_exchange_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_browser_session_exchange.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/browser-session-exchange.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${browser_exchange_backend})
+                set_tests_properties(test_browser_session_exchange_${browser_exchange_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+            endforeach()
             foreach(browser_revoke_backend epoll io_uring)
                 add_test(NAME test_browser_session_revoke_${browser_revoke_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_browser_session_revoke.py

@@ -1742,6 +1742,11 @@ failure-closed behavior and TLS. The existing acknowledged-DEL logout remains
 available. See [the durability boundary](jwt-sessions.md#local-aof-durable-logout);
 replica/failover consensus and cancellation of admitted work remain outside it.
 
+The [browser session exchange](jwt-sessions.md#exchange-an-enrolled-bearer-session-for-a-browser-cookie)
+converts an already enrolled Bearer session into a host-bound HTTPS cookie.
+It checks the same-origin browser headers, JWT and exact-token Redis permit
+before emitting the cookie. Redis errors and rejected requests emit no cookie.
+
 The [browser logout profile](jwt-sessions.md#browser-logout-with-durable-revocation)
 requires the fixed cookie, exact Origin and same-origin Fetch Metadata. It
 reuses exact-token durable revocation and sends the clear cookie only after

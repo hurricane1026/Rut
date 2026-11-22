@@ -282,6 +282,26 @@ The epoll and io_uring integration tests exercise both HTTPS protocols. Over
 HTTP/2 they also verify that the read route denies duplicate cookies and
 denies the old cookie after confirmed logout.
 
+## Exchange an enrolled bearer session for a browser cookie
+
+[The browser session exchange](../examples/browser-session-exchange.rut) accepts
+`POST /session/cookie` over HTTPS. A caller holding an enrolled token sends it
+in a singleton Authorization Bearer header. Configure `BROWSER_ORIGIN` to the
+exact trusted HTTPS origin. The route requires a matching singleton Origin and
+`Sec-Fetch-Site: same-origin` before verifying the token or contacting Redis.
+
+The existing issuer, audience, signature, expiry and exact-token permit rules
+apply. A confirmed active permit and connection cleanup yield 204,
+`Cache-Control: no-store` and one `__Host-rut_session` cookie with `Path=/`,
+`Secure`, `HttpOnly` and `SameSite=Strict`. The token appears only in that cookie.
+Missing, expired or revoked tokens receive 401. Authority or cleanup errors
+return 503. Failed requests emit no cookie. The cookie has browser-session
+lifetime and does not extend the signed token expiry or Redis permit.
+
+This route exchanges an existing credential. The trusted session issuer still
+creates and enrolls the token through its usual authentication workflow. Serve
+this route on the same host as the protected cookie routes and durable logout.
+
 ## Local-AOF durable logout
 
 `POST /logout-durable` is an opt-in Redis 7.2+ profile for single-instance
