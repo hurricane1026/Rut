@@ -14401,12 +14401,14 @@ inline bool build_redirect_response(const Connection& conn,
     const Str location_authority = legacy_profile ? authority.value : policy.static_authority;
     const bool append_listener_port = legacy_profile && !authority.has_port;
     const u32 authority_len =
-        location_authority.len + (append_listener_port ? 1u + actual_port_digits : 0u);
+        static_cast<u32>(static_cast<i64>(location_authority.len) +
+                         (append_listener_port ? 1 + static_cast<i64>(actual_port_digits) : 0));
     const u32 location_query_len = legacy_profile ? query_len : 0;
     u64 required = 0;
     auto add = [&](u64 n) {
-        if (n > 0xffffffffu - required) return false;
-        required += n;
+        u64 next = 0;
+        if (__builtin_add_overflow(required, n, &next) || next > UINT32_MAX) return false;
+        required = next;
         return true;
     };
     static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
@@ -14424,9 +14426,9 @@ inline bool build_redirect_response(const Connection& conn,
 
     u32 pos = 0;
     auto put = [&](const void* data, u32 len) {
-        if (len > out_cap - pos) return false;
+        if (static_cast<i64>(len) > static_cast<i64>(out_cap) - static_cast<i64>(pos)) return false;
         if (len != 0) __builtin_memcpy(out + pos, data, len);
-        pos += len;
+        pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
     auto put_lit = [&](const char* value) {
@@ -14443,7 +14445,8 @@ inline bool build_redirect_response(const Connection& conn,
         !put(location_authority.ptr, location_authority.len) ||
         (append_listener_port && (!put_lit(":") || !put(actual_port, actual_port_digits))) ||
         !put(policy.target_path.ptr, policy.target_path.len) ||
-        !put(conn.recv_buf.data() + target_start + path_len, location_query_len) ||
+        !put(conn.recv_buf.data() + static_cast<i64>(target_start) + static_cast<i64>(path_len),
+             location_query_len) ||
         !(legacy_profile ? put(kLegacyTail, sizeof(kLegacyTail) - 1)
                          : put(kFixedTail, sizeof(kFixedTail) - 1)) ||
         !put(policy.body.ptr, policy.body.len))
