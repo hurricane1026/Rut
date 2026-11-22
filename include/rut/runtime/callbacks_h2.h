@@ -310,8 +310,7 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
                      n);
     h2.outbound_body_offset =
         static_cast<u32>(static_cast<i64>(h2.outbound_body_offset) + static_cast<i64>(n));
-    h2.conn_send_window =
-        static_cast<i32>(static_cast<i64>(h2.conn_send_window) - static_cast<i64>(n));
+    h2.conn_send_window -= static_cast<i64>(n);
     stream->send_window =
         static_cast<i32>(static_cast<i64>(stream->send_window) - static_cast<i64>(n));
     h2.outbound_final_staged = n == kRemaining;
@@ -387,7 +386,6 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     }
     if (!d.owned_hpack_pending) d.owned_hpack_after = h2.hpack_enc;
     auto& enc = d.owned_hpack_after;
-    if (d.resp_len > d.resp_cap) return false;
     const u32 n = http2_write_response_headers(
         d.resp + static_cast<i64>(d.resp_len),
         static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
@@ -2577,7 +2575,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                 return;
             }
             kOutcome.response_read_timeout_seconds =
-                h2->async_cfg->policy_bundles[kOutcome.policy_bundle_id - 1]
+                h2->async_cfg
+                    ->policy_bundles[static_cast<u32>(static_cast<i64>(kOutcome.policy_bundle_id) -
+                                                      1)]
                     .response_read_timeout_seconds;
         }
         if (kOutcome.response_read_timeout_seconds != 0) {
@@ -2589,8 +2589,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     if (conn.target_transform_recorded &&
         (kOutcome.kind != JitDispatchOutcome::Kind::Forward || h2->async_cfg == nullptr ||
          !h2->async_cfg->target_transform_id_is_valid(conn.target_transform_id) ||
-         h2->async_cfg->target_transforms[conn.target_transform_id - 1].mode ==
-             ForwardTargetTransformMode::CleanPrefix)) {
+         h2->async_cfg
+                 ->target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) -
+                                                      1)]
+                 .mode == ForwardTargetTransformMode::CleanPrefix)) {
         u8 resp[8192];
         H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
         h2_emit_status(d, kStreamId, 400);
@@ -2861,14 +2863,22 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     if (h2->outbound_stream != 0) {
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN =
-            h2_pump_outbound(*h2, resp + d.resp_len, sizeof(resp) - d.resp_len, pump_status);
+        if (d.resp_len > sizeof(resp)) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+            return;
+        }
+        const u32 kN = h2_pump_outbound(
+            *h2,
+            resp + static_cast<i64>(d.resp_len),
+            static_cast<u32>(static_cast<i64>(sizeof(resp)) - static_cast<i64>(d.resp_len)),
+            pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*h2);
             loop->close_conn(conn);
             return;
         }
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
     }
     h2_commit_owned_hpack(d);
 
