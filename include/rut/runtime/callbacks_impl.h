@@ -302,25 +302,27 @@ inline u32 select_backend(u16 upstream_id,
                           bool strict = false,
                           u8 excluded = 0) {
     static thread_local u16 rr_cursor[RouteConfig::kMaxUpstreams] = {};
-    if (backend_count == 0 || upstream_id >= RouteConfig::kMaxUpstreams) return 0;
+    if (backend_count == 0 || backend_count > UpstreamTarget::kMaxBackends ||
+        upstream_id >= RouteConfig::kMaxUpstreams)
+        return backend_count;
     if (backend_count == 1 && !strict) return weights && weights[0] == 0 ? backend_count : 0;
     u32 fallback = backend_count;
     for (u32 step = 0; step < backend_count; step++) {
         const u32 idx =
-            static_cast<u32>((static_cast<i64>(rr_cursor[upstream_id]) + static_cast<i64>(step)) %
-                             static_cast<i64>(backend_count));
+            static_cast<u32>((static_cast<i32>(rr_cursor[upstream_id]) + static_cast<i32>(step)) %
+                             static_cast<i32>(backend_count));
         if ((weights && weights[idx] == 0) || (excluded & (1u << idx))) continue;
         if (fallback == backend_count) fallback = idx;
         if (!backend_ejected(upstream_id, idx, now_us)) {
             rr_cursor[upstream_id] =
-                static_cast<u16>((static_cast<i64>(idx) + 1) % static_cast<i64>(backend_count));
+                static_cast<u16>((static_cast<i32>(idx) + 1) % static_cast<i32>(backend_count));
             return idx;
         }
     }
     if (strict) return backend_count;
     if (fallback != backend_count)
         rr_cursor[upstream_id] =
-            static_cast<u16>((static_cast<i64>(fallback) + 1) % static_cast<i64>(backend_count));
+            static_cast<u16>((static_cast<i32>(fallback) + 1) % static_cast<i32>(backend_count));
     return fallback;
 }
 
@@ -374,7 +376,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     }
     if (strict && !upstream_capacity_available(target, uid, now)) return count;
     auto& state = cfg->backend_selection[shard];
-    auto& cursor = state.cursor[spec.site - 1];
+    const u32 site_index = static_cast<u32>(static_cast<i64>(spec.site) - 1);
+    auto& cursor = state.cursor[site_index];
     const auto& weights = cfg->upstreams[uid].weights;
     bool any_healthy = false;
     for (u32 i = 0; i < count; ++i) {
@@ -384,7 +387,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     u8 eligible = 0;
     u32 best = count;
     for (u32 step = 0; step < count; ++step) {
-        const u32 i = (cursor + step) % count;
+        const u32 i = static_cast<u32>((static_cast<i32>(cursor) + static_cast<i32>(step)) %
+                                       static_cast<i32>(count));
         if (weights[i] == 0 || (excluded_backends & (1u << i)) != 0) continue;
         if ((strict || any_healthy) && backend_ejected(uid, i, now)) continue;
         // Compare exact active/weight ratios without division or narrowing.
@@ -400,23 +404,26 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
     if (eligible == 0) return count;  // No fallback can reactivate weight zero.
     if (spec.policy == LoadBalancePolicy::ConsistentHash)
         return select_consistent_hash(spec, target.addrs, weights, count, eligible);
-    auto& previous = state.weighted_eligible[spec.site - 1];
-    auto& current = state.weighted_current[spec.site - 1];
+    auto& previous = state.weighted_eligible[site_index];
+    auto& current = state.weighted_current[site_index];
     if (previous != eligible) {
         for (u32 i = 0; i < count; ++i) current[i] = 0;
         previous = eligible;
     }
-    i32 total = 0;
+    i64 total = 0;
     best = count;
     for (u32 step = 0; step < count; ++step) {
-        const u32 i = (cursor + step) % count;
+        const u32 i = static_cast<u32>((static_cast<i32>(cursor) + static_cast<i32>(step)) %
+                                       static_cast<i32>(count));
         if ((eligible & (1u << i)) == 0) continue;
-        current[i] += weights[i];
-        total += weights[i];
+        // Eight u16 weights total at most 524280; the maintained i32 credits
+        // therefore remain representable after each bounded update.
+        current[i] = static_cast<i32>(static_cast<i64>(current[i]) + static_cast<i64>(weights[i]));
+        total += static_cast<i64>(weights[i]);
         if (best == count || current[i] > current[best]) best = i;
     }
-    current[best] -= total;
-    cursor = static_cast<u16>((best + 1) % count);
+    current[best] = static_cast<i32>(static_cast<i64>(current[best]) - total);
+    cursor = static_cast<u16>((static_cast<i32>(best) + 1) % static_cast<i32>(count));
     return best;
 }
 inline void hold_backend_active(Connection& conn, const RouteConfig* cfg = nullptr) {
