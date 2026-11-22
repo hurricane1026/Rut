@@ -4162,16 +4162,17 @@ public:
     bool has_ordinary_cq_work() {
         ++study_cq_probes;
         if (!backend.cq_head || !backend.cq_tail) return false;
-        const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+        const IoUringPosition head{__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE)};
         const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
-        if (head == tail) return false;
-        if (!backend.cq_entries || !backend.cq_ring_mask || tail - head > backend.cq_ring_entries)
+        const u32 available = head.distance_to(tail);
+        if (available == 0) return false;
+        if (!backend.cq_entries || !backend.cq_ring_mask || available > backend.cq_ring_entries)
             return true;
         // Peek only; wait() retains sole ownership of CQ consumption and all
         // cancellation/proactor accounting. Bound the scheduler hint's cost.
-        const u32 count = tail - head < 32u ? tail - head : 32u;
+        const u32 count = available < 32u ? available : 32u;
         for (u32 i = 0; i < count; ++i) {
-            const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
+            const auto& cqe = backend.cq_entries[head.advanced_by(i).slot(*backend.cq_ring_mask)];
             ++study_cq_entries;
             const u32 tag = static_cast<u32>(cqe.user_data & 0xFFu);
             const u32 type_count = static_cast<u32>(IoEventType::Count);
@@ -4191,7 +4192,7 @@ public:
                 return true;
         }
         // Uninspected work is conservatively serviced before the extra quantum.
-        return tail - head > count;
+        return available > count;
     }
 
     void flush_deferred_relay_reads() {
@@ -7509,8 +7510,9 @@ public:
     // Leave SQ headroom for ordinary traffic and close-path cancellation.
     u32 health_probe_issue_budget() const {
         if (!backend.sq_head || !backend.sq_tail) return 0;
-        const u32 used = __atomic_load_n(backend.sq_tail, __ATOMIC_RELAXED) -
-                         __atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(backend.sq_tail, __ATOMIC_RELAXED);
+        const IoUringPosition head{__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE)};
+        const u32 used = head.distance_to(tail);
         constexpr u32 kReserve = 16;
         return used < backend.sq_ring_entries && backend.sq_ring_entries - used > kReserve
                    ? backend.sq_ring_entries - used - kReserve

@@ -34,6 +34,14 @@
 
 namespace rut {
 
+static_assert([] {
+    IoUringPosition head{UINT32_MAX};
+    if (head.distance_to(0) != 1 || head.advanced_by(2).slot(7) != 1) return false;
+    ++head;
+    return head.value == 0 && head.distance_to(0) == 0 &&
+           head.distance_to(UINT32_MAX) == UINT32_MAX;
+}());
+
 static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_episode, u32 aux) {
     const bool post_commit =
         conn.response_read_deadline_post_commit_phase != ResponseReadDeadlinePostCommitPhase::None;
@@ -149,17 +157,17 @@ void IoUringBackend::decode_user_data(
 // --- SQE helpers ---
 
 io_uring_sqe* IoUringBackend::get_sqe() {
-    u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
-    u32 head = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
+    const IoUringPosition tail{__atomic_load_n(sq_tail, __ATOMIC_RELAXED)};
+    const IoUringPosition head{__atomic_load_n(sq_head, __ATOMIC_ACQUIRE)};
     u32 mask = *sq_ring_mask;
 
-    if (tail - head >= sq_ring_entries) {
+    if (head.distance_to(tail.value) >= sq_ring_entries) {
         return nullptr;  // SQ is full
     }
 
-    io_uring_sqe* sqe = &sq_entries[tail & mask];
-    sq_array[tail & mask] = tail & mask;
-    return sqe;
+    const u32 slot = tail.slot(mask);
+    sq_array[slot] = slot;
+    return &sq_entries[slot];
 }
 
 // get_sqe() for submitters that cannot park the request: when the SQ is full,
@@ -190,8 +198,8 @@ io_uring_sqe* IoUringBackend::get_sqe_flushing() {
 }
 
 static void sqe_advance_tail(u32* sq_tail) {
-    u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
-    __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
+    IoUringPosition tail{__atomic_load_n(sq_tail, __ATOMIC_RELAXED)};
+    __atomic_store_n(sq_tail, (++tail).value, __ATOMIC_RELEASE);
 }
 
 // --- Init ---
@@ -349,7 +357,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // Terminal-recv quarantine inventory (see the header): a FIFO ring sized for
     // the worst case of one window per CQ slot, plus an 8-byte-per-connection
     // side table.  Both are demand-paged so an idle shard pays nothing.
-    if ((cq_ring_entries & (cq_ring_entries - 1u)) != 0 || cq_ring_entries == 0) {
+    if (cq_ring_entries == 0 || (cq_ring_entries & (cq_ring_entries - 1u)) != 0) {
         last_init_failure_detail = IoUringInitFailureDetail::RingSizeInvariant;
         shutdown();
         return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
@@ -892,13 +900,13 @@ void IoUringBackend::probe_nop_inject_result() {
         return;
     }
     // Accepted: consume its completion here rather than in the first wait().
-    u32 head = __atomic_load_n(cq_head, __ATOMIC_RELAXED);
-    while (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) {
+    IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_RELAXED)};
+    while (head.value == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) {
         rc = io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
         if (rc < 0 && rc != -EINTR) return;  // wait() drops the sentinel completion
     }
-    nop_inject_result = cq_entries[head & *cq_ring_mask].res == static_cast<i32>(kProbeResult);
-    __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
+    nop_inject_result = cq_entries[head.slot(*cq_ring_mask)].res == static_cast<i32>(kProbeResult);
+    __atomic_store_n(cq_head, (++head).value, __ATOMIC_RELEASE);
 }
 
 bool IoUringBackend::add_send_after_direct_write(i32 fd,
@@ -1284,17 +1292,17 @@ u32 IoUringBackend::wait(
     }
 
     // Harvest CQEs
-    u32 head = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+    IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_ACQUIRE)};
     u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     u32 mask = *cq_ring_mask;
     u32 count = 0;
     u64 last_read_owner_token = 0;
-    u32 last_read_owner_head = 0;
+    IoUringPosition last_read_owner_head{};
     bool last_read_owner_valid = false;
 
     auto protocol_failure = [&]() { fatal_error.store(EPROTO, std::memory_order_release); };
-    if (tail - head > cq_ring_entries ||
-        (downstream_recv_progress_valid && downstream_recv_progress_head != head) ||
+    if (head.distance_to(tail) > cq_ring_entries ||
+        (downstream_recv_progress_valid && downstream_recv_progress_head != head.value) ||
         (!downstream_recv_progress_valid &&
          (deferred_downstream_recv.active || downstream_recv_terminal_window_count != 0))) {
         protocol_failure();
@@ -1306,14 +1314,15 @@ u32 IoUringBackend::wait(
     // Only an aux-0 downstream Recv token can own a window, so every other CQE
     // skips the table.  A window whose tail equals head has reached its
     // boundary and no longer quarantines anything.
-    const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
+    const u32 ring_mask = downstream_recv_terminal_window_capacity == 0
+                              ? 0
+                              : downstream_recv_terminal_window_capacity - 1u;
     auto terminal_window_lookup = [&](CompletionUserData user_data, u32& window_tail) -> i32 {
         // Steady state: no live window, so never touch the side table.
         if (downstream_recv_terminal_window_count == 0) return -1;
         if (downstream_recv_terminal_window_count != 0 &&
-            downstream_recv_terminal_windows[downstream_recv_terminal_window_start].tail_exclusive -
-                    head >
-                cq_ring_entries)
+            head.distance_to(downstream_recv_terminal_windows[downstream_recv_terminal_window_start]
+                                 .tail_exclusive) > cq_ring_entries)
             return -2;
         u32 token_conn = 0;
         IoEventType token_type = IoEventType::Count;
@@ -1322,7 +1331,7 @@ u32 IoUringBackend::wait(
         if (token_type != IoEventType::Recv || token_aux != 0) return -1;
         if (token_conn < downstream_recv_terminal_slot_capacity) {
             const auto& slot = downstream_recv_terminal_slots[token_conn];
-            if (slot.live == 0 || slot.tail_exclusive == head) return -1;
+            if (slot.live == 0 || slot.tail_exclusive == head.value) return -1;
             window_tail = slot.tail_exclusive;
             return 0;
         }
@@ -1331,7 +1340,7 @@ u32 IoUringBackend::wait(
             const auto& window =
                 downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
                                                  ring_mask];
-            if (window.user_data == user_data && window.tail_exclusive != head) {
+            if (window.user_data == user_data && window.tail_exclusive != head.value) {
                 window_tail = window.tail_exclusive;
                 return 0;
             }
@@ -1342,11 +1351,11 @@ u32 IoUringBackend::wait(
         bool expired = false;
         while (downstream_recv_terminal_window_count != 0) {
             auto& window = downstream_recv_terminal_windows[downstream_recv_terminal_window_start];
-            if (window.tail_exclusive - head > cq_ring_entries) {
+            if (head.distance_to(window.tail_exclusive) > cq_ring_entries) {
                 protocol_failure();
                 return false;
             }
-            if (window.tail_exclusive != head) break;
+            if (window.tail_exclusive != head.value) break;
             const u32 conn_id = terminal_window_conn_id(window.user_data);
             if (conn_id < downstream_recv_terminal_slot_capacity)
                 downstream_recv_terminal_slots[conn_id] = {};
@@ -1369,7 +1378,7 @@ u32 IoUringBackend::wait(
         return buf_id < kProvidedBufCount;
     };
     auto add_terminal_window = [&](CompletionUserData user_data, u32 tail_exclusive) {
-        if (tail_exclusive - head > cq_ring_entries ||
+        if (head.distance_to(tail_exclusive) > cq_ring_entries ||
             downstream_recv_terminal_window_count >= downstream_recv_terminal_window_capacity) {
             protocol_failure();
             return false;
@@ -1400,11 +1409,11 @@ u32 IoUringBackend::wait(
     u32 positive_downstream_token_count = 0;
 
     if (deferred_downstream_recv.active) {
-        if (head == tail || deferred_downstream_recv.head != head ||
-            deferred_downstream_recv.frozen_tail - head > cq_ring_entries) {
+        if (head.value == tail || deferred_downstream_recv.head != head.value ||
+            head.distance_to(deferred_downstream_recv.frozen_tail) > cq_ring_entries) {
             protocol_failure();
         } else {
-            const io_uring_cqe& deferred = cq_entries[head & mask];
+            const io_uring_cqe& deferred = cq_entries[head.slot(mask)];
             u32 deferred_conn = 0;
             u32 deferred_aux = 0;
             u32 deferred_episode = 0;
@@ -1423,9 +1432,9 @@ u32 IoUringBackend::wait(
         }
     }
 
-    while (failure_code() == 0 && head != tail && count < max_events) {
+    while (failure_code() == 0 && head.value != tail && count < max_events) {
         if (!expire_terminal_windows()) break;
-        io_uring_cqe* cqe = &cq_entries[head & mask];
+        io_uring_cqe* cqe = &cq_entries[head.slot(mask)];
 
         // The destination array is reused across waits.  Clear the complete
         // slot before decoding so metadata from a prior CQE can never become
@@ -1463,7 +1472,7 @@ u32 IoUringBackend::wait(
 
         // Cancel CQEs — silently consume, don't emit event
         if (conn_id == kCancelConnId) {
-            head++;
+            ++head;
             continue;
         }
 
@@ -1521,7 +1530,7 @@ u32 IoUringBackend::wait(
                 positive_downstream_already_seen |= positive_downstream_tokens[i] == cqe->user_data;
             if (positive_downstream_already_seen) {
                 deferred_downstream_recv = {cqe->user_data,
-                                            head,
+                                            head.value,
                                             quarantined_window >= 0 ? quarantined_tail : tail,
                                             true,
                                             quarantined_window >= 0};
@@ -1541,7 +1550,7 @@ u32 IoUringBackend::wait(
                 return_buffer(buf_id);
             }
             if (deferred_downstream_recv.active) deferred_downstream_recv = {};
-            head++;
+            ++head;
             continue;
         }
 
@@ -1573,7 +1582,7 @@ u32 IoUringBackend::wait(
             }
             // Re-submit read on timerfd for next tick
             submit_timer_read();
-            head++;
+            ++head;
             continue;
         }
 
@@ -1649,7 +1658,7 @@ u32 IoUringBackend::wait(
                     type == IoEventType::UpstreamRecv && deadline_owner &&
                     nbytes <= provided_buffer_size(buf_id) &&
                     (nbytes <= avail || buffered_overflow) &&
-                    ((last_read_owner_valid && head == last_read_owner_head + 1u &&
+                    ((last_read_owner_valid && last_read_owner_head.distance_to(head.value) == 1 &&
                       cqe->user_data == last_read_owner_token) ||
                      response_deadline_copy_owner(conn, upstream_episode, aux));
                 const u32 copy_begin =
@@ -1744,7 +1753,7 @@ u32 IoUringBackend::wait(
             events[count].more = (cqe->flags & IORING_CQE_F_MORE) ? 1 : 0;
             events[count].aux = static_cast<u8>(aux);  // 0 for recv data
             events[count].upstream_episode = upstream_episode;
-            head++;
+            ++head;
             count++;
             if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
                 !add_terminal_window(cqe->user_data, tail))
@@ -1801,9 +1810,10 @@ u32 IoUringBackend::wait(
             const bool deadline_owner =
                 deadline_active && conn.response_read_deadline_upstream_episode == target.episode;
             const bool deadline_copy_eligible =
-                deadline_owner && ((last_read_owner_valid && head == last_read_owner_head + 1u &&
-                                    cqe->user_data == last_read_owner_token) ||
-                                   response_deadline_copy_owner(conn, target.episode, aux));
+                deadline_owner &&
+                ((last_read_owner_valid && last_read_owner_head.distance_to(head.value) == 1 &&
+                  cqe->user_data == last_read_owner_token) ||
+                 response_deadline_copy_owner(conn, target.episode, aux));
             i32 direct_result = cqe->res;
             if (logical_commit) {
                 const u32 copy_begin = conn.buffered_response_len();
@@ -1845,7 +1855,7 @@ u32 IoUringBackend::wait(
             events[count].more = 0;
             events[count].aux = static_cast<u8>(aux);
             events[count].upstream_episode = upstream_episode;
-            head++;
+            ++head;
             count++;
             continue;
         }
@@ -1902,9 +1912,10 @@ u32 IoUringBackend::wait(
             // buffer-size/overflow terms that never apply to a direct recv (its
             // SQE length is always <= write_avail() at arm time, enforced below).
             const bool deadline_copy_eligible =
-                deadline_owner && ((last_read_owner_valid && head == last_read_owner_head + 1u &&
-                                    cqe->user_data == last_read_owner_token) ||
-                                   response_deadline_copy_owner(conn, upstream_episode, aux));
+                deadline_owner &&
+                ((last_read_owner_valid && last_read_owner_head.distance_to(head.value) == 1 &&
+                  cqe->user_data == last_read_owner_token) ||
+                 response_deadline_copy_owner(conn, upstream_episode, aux));
 
             i32 direct_result = cqe->res;
             if (cqe->res > 0 && !stale_direct) {
@@ -1970,7 +1981,7 @@ u32 IoUringBackend::wait(
             events[count].more = 0;  // direct recv is always one-shot
             events[count].aux = static_cast<u8>(aux);
             events[count].upstream_episode = upstream_episode;
-            head++;
+            ++head;
             count++;
             continue;
         }
@@ -1989,7 +2000,7 @@ u32 IoUringBackend::wait(
                                     upstream_episode,
                                     /*separate_body_ring=*/true,
                                     /*one_shot=*/true)) {
-            head++;
+            ++head;
             continue;
         }
 
@@ -2033,7 +2044,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    head++;
+                    ++head;
                     count++;
                     continue;
                 }
@@ -2083,7 +2094,7 @@ u32 IoUringBackend::wait(
                         sqe->user_data = encode_user_data(conn_id, type, ss.generation);
                         sqe_advance_tail(sq_tail);
                         pending++;
-                        head++;
+                        ++head;
                         continue;  // don't emit event yet
                     }
                     result = -ENOSPC;  // SQ full: fail rather than stall
@@ -2101,7 +2112,7 @@ u32 IoUringBackend::wait(
                 events[count].aux = 0;
                 events[count].upstream_episode = upstream_episode;
                 events[count].non_upstream_generation = ss.generation;
-                head++;
+                ++head;
                 count++;
                 continue;
             }
@@ -2123,7 +2134,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    head++;
+                    ++head;
                     count++;
                     continue;
                 }
@@ -2145,7 +2156,7 @@ u32 IoUringBackend::wait(
                                 : encode_user_data(conn_id, type, ss.generation);
                         sqe_advance_tail(sq_tail);
                         pending++;
-                        head++;
+                        ++head;
                         continue;  // don't emit event yet
                     }
                     // SQ full — can't re-submit. Emit error to prevent deadlock.
@@ -2160,7 +2171,7 @@ u32 IoUringBackend::wait(
                     events[count].upstream_episode = upstream_episode;
                     events[count].non_upstream_generation =
                         type == IoEventType::Send ? ss.generation : 0;
-                    head++;
+                    ++head;
                     count++;
                     continue;
                 }
@@ -2175,7 +2186,7 @@ u32 IoUringBackend::wait(
                 events[count].upstream_episode = upstream_episode;
                 events[count].non_upstream_generation =
                     type == IoEventType::Send ? ss.generation : 0;
-                head++;
+                ++head;
                 count++;
                 continue;
             }
@@ -2223,16 +2234,16 @@ u32 IoUringBackend::wait(
                 events[count].result = -ENOBUFS;
         }
 
-        head++;
+        ++head;
         count++;
         if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
             !add_terminal_window(cqe->user_data, tail))
             break;
     }
 
-    __atomic_store_n(cq_head, head, __ATOMIC_RELEASE);
+    __atomic_store_n(cq_head, head.value, __ATOMIC_RELEASE);
     if (deferred_downstream_recv.active || downstream_recv_terminal_window_count != 0) {
-        downstream_recv_progress_head = head;
+        downstream_recv_progress_head = head.value;
         downstream_recv_progress_valid = true;
     } else {
         downstream_recv_progress_head = 0;

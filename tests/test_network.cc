@@ -46648,6 +46648,35 @@ TEST(iouring_downstream_recv_barrier, recv_aux_and_cancel_metadata_mutations_fai
     }
 }
 
+// In-memory SQ/CQ snapshots exercise the real producer path without entering the kernel.
+TEST(iouring_ring_positions, publish_and_measure_across_rollover) {
+    IoUringBackend backend{};
+    u32 head = UINT32_MAX - 1u;
+    u32 tail = UINT32_MAX;
+    u32 mask = 1;
+    u32 indices[2]{};
+    io_uring_sqe entries[2]{};
+    backend.sq_head = &head;
+    backend.sq_tail = &tail;
+    backend.sq_ring_mask = &mask;
+    backend.sq_ring_entries = 2;
+    backend.sq_array = indices;
+    backend.sq_entries = entries;
+    backend.ring_fd = backend.listen_fd = 1;
+    REQUIRE(backend.sq_has_room());
+    REQUIRE(backend.add_accept());
+    CHECK_EQ(tail, 0u);
+    CHECK_EQ(indices[1], 1u);
+    CHECK_EQ(entries[1].opcode, IORING_OP_ACCEPT);
+    CHECK_FALSE(backend.sq_has_room());
+
+    backend.cq_head = &head;
+    backend.cq_tail = &tail;
+    CHECK_EQ(backend.cq_unharvested(), 2u);
+    head = tail;
+    CHECK_EQ(backend.cq_unharvested(), 0u);
+}
+
 TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_clears_state) {
     RawDownstreamRecvBatch fixture;
     constexpr u32 kCapacity = 2;

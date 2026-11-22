@@ -18,6 +18,28 @@
 
 namespace rut {
 
+// A snapshot of an SQ/CQ sequence number, distinct from a bounded entry count.
+// The kernel ABI advances these positions modulo 2^32. Shared loads and stores
+// remain at the call sites so their memory ordering is visible.
+struct IoUringPosition {
+    u32 value;
+
+    constexpr IoUringPosition advanced_by(u32 count) const {
+        return {static_cast<u32>(static_cast<u64>(value) + count)};
+    }
+
+    constexpr IoUringPosition& operator++() {
+        *this = advanced_by(1);
+        return *this;
+    }
+
+    constexpr u32 distance_to(u32 end) const {
+        return static_cast<u32>(static_cast<i64>(end) - value);
+    }
+
+    constexpr u32 slot(u32 mask) const { return value & mask; }
+};
+
 struct SlicePool;
 struct ConnectionBase;              // forward declaration for wait() signature
 using Connection = ConnectionBase;  // alias (matches connection.h)
@@ -357,8 +379,9 @@ struct IoUringBackend {
         return flush_pending_nonblocking_impl([&](i32, u32 to_submit, u32, u32) {
             const i32 result = enter_result();
             if (result > 0 && static_cast<u32>(result) <= to_submit) {
-                const u32 head = __atomic_load_n(sq_head, __ATOMIC_RELAXED);
-                __atomic_store_n(sq_head, head + static_cast<u32>(result), __ATOMIC_RELEASE);
+                const IoUringPosition head{__atomic_load_n(sq_head, __ATOMIC_RELAXED)};
+                __atomic_store_n(
+                    sq_head, head.advanced_by(static_cast<u32>(result)).value, __ATOMIC_RELEASE);
             }
             return result;
         });
@@ -368,9 +391,9 @@ struct IoUringBackend {
     // Same as add_send but encodes UpstreamSend in user_data.
     // True when get_sqe() can hand out at least one more SQE.
     bool sq_has_room() const {
-        return __atomic_load_n(sq_tail, __ATOMIC_RELAXED) -
-                   __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <
-               sq_ring_entries;
+        const u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+        const IoUringPosition head{__atomic_load_n(sq_head, __ATOMIC_ACQUIRE)};
+        return head.distance_to(tail) < sq_ring_entries;
     }
 
     // Complete a downstream send the caller already started with a direct
@@ -450,8 +473,9 @@ struct IoUringBackend {
     // with more than cq_ring_entries outstanding CQEs).
     u32 cq_unharvested() const {
         if (cq_head == nullptr || cq_tail == nullptr) return 0;
-        return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
-               __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        const IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_ACQUIRE)};
+        return head.distance_to(tail);
     }
 
     // Shutdown and unmap all resources.
