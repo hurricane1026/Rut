@@ -137,10 +137,14 @@ bool offered_protocol_exists(const u8* storage, u32 offers_len, Str candidate) {
     u32 start = 0;
     while (start < offers_len) {
         u32 end = start;
-        while (end < offers_len && storage[kWsHandshakeAcceptLength + end] != ',') end++;
+        while (end < offers_len &&
+               storage[static_cast<i64>(kWsHandshakeAcceptLength) + static_cast<i64>(end)] != ',')
+            end = static_cast<u32>(static_cast<i64>(end) + 1);
         if (static_cast<i64>(end) - static_cast<i64>(start) == static_cast<i64>(candidate.len) &&
             __builtin_memcmp(
-                storage + kWsHandshakeAcceptLength + start, candidate.ptr, candidate.len) == 0)
+                storage + static_cast<i64>(kWsHandshakeAcceptLength) + static_cast<i64>(start),
+                candidate.ptr,
+                candidate.len) == 0)
             return true;
         start = static_cast<u32>(static_cast<i64>(end) + 1);
     }
@@ -165,16 +169,20 @@ bool append_request_protocols(const ParsedRequest& request,
                           static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))});
             if (!protocol_token_valid(kToken)) return false;
             const u32 kSeparator = out == 0 ? 0u : 1u;
-            if (out > storage_capacity - kWsHandshakeAcceptLength ||
+            if (static_cast<i64>(out) > static_cast<i64>(storage_capacity) -
+                                            static_cast<i64>(kWsHandshakeAcceptLength) ||
                 static_cast<i64>(kSeparator) + static_cast<i64>(kToken.len) >
-                    static_cast<i64>(storage_capacity) - kWsHandshakeAcceptLength - out)
+                    static_cast<i64>(storage_capacity) -
+                        static_cast<i64>(kWsHandshakeAcceptLength) - static_cast<i64>(out))
                 return false;
             if (kSeparator) {
-                storage[kWsHandshakeAcceptLength + out] = ',';
+                storage[static_cast<i64>(kWsHandshakeAcceptLength) + static_cast<i64>(out)] = ',';
                 out = static_cast<u32>(static_cast<i64>(out) + 1);
             }
             __builtin_memcpy(
-                storage + static_cast<i64>(kWsHandshakeAcceptLength) + out, kToken.ptr, kToken.len);
+                storage + static_cast<i64>(kWsHandshakeAcceptLength) + static_cast<i64>(out),
+                kToken.ptr,
+                kToken.len);
             out = static_cast<u32>(static_cast<i64>(out) + static_cast<i64>(kToken.len));
             if (end == kValue.len) break;
             start = static_cast<u32>(static_cast<i64>(end) + 1);
@@ -193,7 +201,8 @@ bool encode_accept(Str key, u8* out, u32 out_capacity) {
     u32 encoded_len = 0;
     return rut_crypto_digest_parts_v1(
                RUT_CRYPTO_SHA1_V1, kParts, 2, nullptr, 0, 0, digest, sizeof(digest), &digest_len) &&
-           digest_len == sizeof(digest) && out_capacity >= kWsHandshakeAcceptLength + 1 &&
+           digest_len == sizeof(digest) &&
+           static_cast<i64>(out_capacity) >= static_cast<i64>(kWsHandshakeAcceptLength) + 1 &&
            rut_crypto_base64_encode_v1(digest, sizeof(digest), out, out_capacity, &encoded_len) &&
            encoded_len == kWsHandshakeAcceptLength;
 }
@@ -254,7 +263,8 @@ WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
                                                  u8* storage,
                                                  u32 capacity,
                                                  u32* offers_len) {
-    if (!offers_len || (storage && capacity < kWsHandshakeAcceptLength + 1))
+    if (!offers_len ||
+        (storage && static_cast<i64>(capacity) < static_cast<i64>(kWsHandshakeAcceptLength) + 1))
         return WsHandshakeRequestResult::BadRequest;
     *offers_len = 0;
     u32 versions = 0;
@@ -316,7 +326,8 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
     if (downstream_deflate) *downstream_deflate = {};
     if (request == nullptr || header_len == 0 || header_len > SlicePool::kSliceSize ||
         out_offers_len == nullptr ||
-        (storage != nullptr && storage_capacity < kWsHandshakeAcceptLength + 1))
+        (storage != nullptr &&
+         static_cast<i64>(storage_capacity) < static_cast<i64>(kWsHandshakeAcceptLength) + 1))
         return WsHandshakeRequestResult::BadRequest;
     *out_offers_len = 0;
     HttpParser parser{};
@@ -389,9 +400,11 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                 u32 end = start;
                 while (end < header.value.len && header.value.ptr[end] != ',') end++;
                 offered |=
-                    trim_ows({header.value.ptr + start, end - start}).eq(required_subprotocol);
+                    trim_ows({header.value.ptr + static_cast<i64>(start),
+                              static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))})
+                        .eq(required_subprotocol);
                 if (end == header.value.len) break;
-                start = end + 1;
+                start = static_cast<u32>(static_cast<i64>(end) + 1);
             }
         }
         if (!offered) return WsHandshakeRequestResult::BadRequest;
@@ -415,7 +428,9 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    WsDeflateAgreement* upstream_deflate,
                                    bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
-    if (storage == nullptr || offers_len > SlicePool::kSliceSize - kWsHandshakeAcceptLength ||
+    if (storage == nullptr ||
+        static_cast<i64>(offers_len) >
+            static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kWsHandshakeAcceptLength) ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)
@@ -480,9 +495,10 @@ u32 ws_build_h1_handshake(const ParsedRequest& request,
         return 0;
     u32 used = 0;
     auto put = [&](Str text) {
-        if (text.len > capacity - used) return false;
-        __builtin_memcpy(output + used, text.ptr, text.len);
-        used += text.len;
+        if (static_cast<i64>(text.len) > static_cast<i64>(capacity) - static_cast<i64>(used))
+            return false;
+        __builtin_memcpy(output + static_cast<i64>(used), text.ptr, text.len);
+        used = static_cast<u32>(static_cast<i64>(used) + static_cast<i64>(text.len));
         return true;
     };
     if (!put(lit_str("GET ")) || !put(request.path) ||
@@ -513,47 +529,66 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
     bool selected = false;
     while (read < header_len) {
         u32 end = read;
-        while (end + 1 < header_len && (request[end] != '\r' || request[end + 1] != '\n')) end++;
-        if (end + 1 >= header_len) return 0;
-        const u32 kNext = end + 2;
+        while (
+            static_cast<i64>(end) + 1 < static_cast<i64>(header_len) &&
+            (request[end] != '\r' || request[static_cast<u32>(static_cast<i64>(end) + 1)] != '\n'))
+            end = static_cast<u32>(static_cast<i64>(end) + 1);
+        if (static_cast<i64>(end) + 1 >= static_cast<i64>(header_len)) return 0;
+        const u32 kNext = static_cast<u32>(static_cast<i64>(end) + 2);
         u32 colon = read;
         while (colon < end && request[colon] != ':') colon++;
         const bool kIsProtocol =
-            colon < end && http_header_name_eq_ci(reinterpret_cast<const char*>(request + read),
-                                                  colon - read,
-                                                  "sec-websocket-protocol",
-                                                  22);
+            colon < end && http_header_name_eq_ci(
+                               reinterpret_cast<const char*>(request + static_cast<i64>(read)),
+                               static_cast<u32>(static_cast<i64>(colon) - static_cast<i64>(read)),
+                               "sec-websocket-protocol",
+                               22);
         if (kIsProtocol) {
             bool contains = false;
-            u32 start = colon + 1;
+            u32 start = static_cast<u32>(static_cast<i64>(colon) + 1);
             while (start < end) {
                 u32 stop = start;
                 while (stop < end && request[stop] != ',') stop++;
-                contains |= trim_ows({reinterpret_cast<const char*>(request + start), stop - start})
-                                .eq(required_subprotocol);
-                start = stop + 1;
+                contains |=
+                    trim_ows({reinterpret_cast<const char*>(request + static_cast<i64>(start)),
+                              static_cast<u32>(static_cast<i64>(stop) - static_cast<i64>(start))})
+                        .eq(required_subprotocol);
+                start = static_cast<u32>(static_cast<i64>(stop) + 1);
             }
             if (!selected && contains) {
                 static constexpr char kHeader[] = "Sec-WebSocket-Protocol:";
-                const u32 kLength = sizeof(kHeader) - 1 + required_subprotocol.len + 2;
-                if (kLength > kNext - read) return 0;
-                __builtin_memcpy(request + write, kHeader, sizeof(kHeader) - 1);
-                write += sizeof(kHeader) - 1;
-                __builtin_memcpy(
-                    request + write, required_subprotocol.ptr, required_subprotocol.len);
-                write += required_subprotocol.len;
-                request[write++] = '\r';
-                request[write++] = '\n';
+                const u32 kLength =
+                    static_cast<u32>(static_cast<i64>(sizeof(kHeader) - 1) +
+                                     static_cast<i64>(required_subprotocol.len) + 2);
+                if (static_cast<i64>(kLength) > static_cast<i64>(kNext) - static_cast<i64>(read))
+                    return 0;
+                __builtin_memcpy(request + static_cast<i64>(write), kHeader, sizeof(kHeader) - 1);
+                write = static_cast<u32>(static_cast<i64>(write) +
+                                         static_cast<i64>(sizeof(kHeader) - 1));
+                __builtin_memcpy(request + static_cast<i64>(write),
+                                 required_subprotocol.ptr,
+                                 required_subprotocol.len);
+                write = static_cast<u32>(static_cast<i64>(write) +
+                                         static_cast<i64>(required_subprotocol.len));
+                request[write] = '\r';
+                write = static_cast<u32>(static_cast<i64>(write) + 1);
+                request[write] = '\n';
+                write = static_cast<u32>(static_cast<i64>(write) + 1);
                 selected = true;
             }
         } else {
-            __builtin_memmove(request + write, request + read, kNext - read);
-            write += kNext - read;
+            __builtin_memmove(request + static_cast<i64>(write),
+                              request + static_cast<i64>(read),
+                              static_cast<u32>(static_cast<i64>(kNext) - static_cast<i64>(read)));
+            write = static_cast<u32>(static_cast<i64>(write) + static_cast<i64>(kNext) -
+                                     static_cast<i64>(read));
         }
         read = kNext;
     }
     if (!selected) return 0;
-    __builtin_memmove(request + write, request + header_len, total_len - header_len);
+    __builtin_memmove(request + static_cast<i64>(write),
+                      request + static_cast<i64>(header_len),
+                      static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
     return write;
 }
 
