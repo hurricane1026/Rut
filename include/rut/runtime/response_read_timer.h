@@ -2,7 +2,20 @@
 
 #include "rut/runtime/io_event.h"
 
+#include <stdint.h>
+
 namespace rut {
+
+// An early completion rearms for the remaining interval, rounded up to a
+// millisecond. Missing, unrepresentable or elapsed deadlines cannot rearm.
+constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
+    if (last_progress_ns == 0 || timeout_ns > UINT64_MAX - last_progress_ns ||
+        now_ns >= last_progress_ns + timeout_ns)
+        return 0;
+    const u64 kRemaining = last_progress_ns + timeout_ns - now_ns;
+    const u64 kMillis = 1 + (kRemaining - 1) / 1'000'000;
+    return kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis);
+}
 
 // Batch evidence records which completions arrived, including rejected ones.
 // Kernel ownership is consumed separately during settlement.

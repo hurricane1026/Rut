@@ -250,6 +250,16 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
+            ("1 + (kRemaining - 1) / 1'000'000", "(kRemaining + 999'999) / 1'000'000"),
+            ("1 + (kRemaining - 1) / 1'000'000", "kRemaining / 1'000'000"),
+            ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
+            ("now_ns >= last_progress_ns + timeout_ns", "now_ns > last_progress_ns + timeout_ns"),
+            ("last_progress_ns == 0 || ", ""),
+        ]:
+            probe = mutate(root / "include", overlay, header, before, after)
+            check(compiler, root, overlay, "Response timer violates rearm interval contract", source=runtime)
+            probe.unlink()
+        for before, after in [
             ("? cancel_seen : target_seen", "? target_seen : cancel_seen"),
             ("kFirst && owner_valid &&", "owner_valid &&"),
             ("kFirst && owner_valid &&", "kFirst &&"),

@@ -4,6 +4,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/response_read_timer.h"
 #include "rut/runtime/route_table.h"
 
 #include <netinet/in.h>
@@ -28,18 +29,6 @@ inline bool bounded_get_upstream_reuse_is_admitted(const Connection& c) {
 
 inline bool response_read_deadline_upstream_reuse_is_stable(const Connection& c) {
     return !c.upstream_reused || bounded_get_upstream_reuse_is_admitted(c);
-}
-
-// Pure millisecond rounding used when a precise timeout CQE arrives before
-// its logical deadline. A zero result means the deadline is due now.
-inline u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
-    if (last_progress_ns == 0 || timeout_ns > UINT64_MAX - last_progress_ns ||
-        now_ns >= last_progress_ns + timeout_ns)
-        return 0;
-    const u64 remaining_ns = last_progress_ns + timeout_ns - now_ns;
-    u64 remaining_ms = (remaining_ns + 999'999ull) / 1'000'000ull;
-    if (remaining_ms == 0) remaining_ms = 1;
-    return remaining_ms > UINT32_MAX ? UINT32_MAX : static_cast<u32>(remaining_ms);
 }
 
 inline bool response_read_deadline_http_date_is_normalized(Str value) {
