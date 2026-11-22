@@ -30,8 +30,9 @@ MUTATIONS = {
     size = kept;
     if (kRemoved > 0) {
         for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
-    }""",
-        """    u32 removed = 0;
+    }
+    return kRemoved;""",
+        """    u32 kRemoved = 0;
     u32 i = 0;
     while (i < size) {
         if (entries[i].conn_id != conn_id) {
@@ -39,11 +40,12 @@ MUTATIONS = {
             continue;
         }
         entries[i] = entries[--size];
-        ++removed;
+        ++kRemoved;
         if (i < size) {
             sift_down(entries, size, i);
         }
-        }"""),
+    }
+    return kRemoved;"""),
     "stale_uring_disarms_successor": ("rut/runtime/iouring_event_loop.h",
                                       "if (matching_generation) {", "if (true) {"),
 }
@@ -67,7 +69,7 @@ def main() -> int:
     commands = subprocess.check_output([ninja, "-C", str(build), "-t", "commands", "test_timer_model"], text=True)
     link_line = next(line for line in commands.splitlines() if " -o tests/test_timer_model " in line)
     link_base = shlex.split(link_line)
-#CMake 's Ninja link rule wraps one compiler invocation with ' : &&...&& :'.
+    # CMake's Ninja link rule wraps one compiler invocation with ': && ... && :'.
     if link_base[:2] != [":", "&&"] or link_base[-2:] != ["&&", ":"]:
         raise RuntimeError("unrecognized CMake/Ninja link wrapper")
     link_base = link_base[2:-2]
