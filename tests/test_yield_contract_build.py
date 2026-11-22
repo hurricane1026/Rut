@@ -72,7 +72,8 @@ def main():
         check(compiler, root, overlay, source=source)
         for before, after in [
             ("(node == chain.tail && tail_pinned)", "false"),
-            ("chain.size -= kUsed;", "chain.size = 0;"),
+            ("chain.size = static_cast<u32>(static_cast<i64>(chain.size) - static_cast<i64>(kUsed));",
+             "chain.size = 0;"),
             ("chain.head = node->next;", "chain.head = nullptr;"),
         ]:
             probe = mutate(root, overlay, source, before, after)
@@ -81,19 +82,24 @@ def main():
             probe.unlink()
         for before, after in [
             ("completed <= received &&", ""),
-            ("static_cast<u64>(buffered) + completed", "static_cast<u64>(buffered + completed)"),
-            ("static_cast<u64>(header) + received", "static_cast<u64>(header + received)"),
-            ("+ received + newly_copied", "+ received"),
+            ("static_cast<i64>(buffered) + static_cast<i64>(completed)",
+             "static_cast<i64>(buffered + completed)"),
+            ("static_cast<i64>(header) + static_cast<i64>(received)",
+             "static_cast<i64>(header + received)"),
+            ("+\n                                                static_cast<i64>(newly_copied)", ""),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Buffered response violates retained byte accounting", source=source)
             probe.unlink()
         for before, after in [
-            ("tail->len += n;", "tail->len = n;"),
-            ("size += n;", "size = tail->len - tail->offset;"),
+            ("tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));",
+             "tail->len = n;"),
+            ("size = static_cast<u32>(static_cast<i64>(size) + static_cast<i64>(n));",
+             "size = tail->len - tail->offset;"),
             ("if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;",
              "tail->dirty_end = tail->len;"),
-            ("tail->len += n;", "tail->offset = 0; tail->len += n;"),
+            ("tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));",
+             "tail->offset = 0; tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h",
                            before, after)
@@ -101,9 +107,9 @@ def main():
                   source=source)
             probe.unlink()
         for before, after in [
-            ("address - begin > capacity", "static_cast<u32>(address - begin) > capacity"),
-            ("count > capacity - kOffset", "count >= capacity - kOffset"),
-            ("count > capacity - kOffset", "kOffset + count > capacity"),
+            ("raw_offset > capacity", "static_cast<u32>(raw_offset) > capacity"),
+            ("if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;",
+             "kEnd = kOffset + count;"),
             ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
             ("if (kEnd > tail_dirty) tail_dirty = kEnd;", "tail_dirty = kEnd;"),
         ]:
@@ -112,21 +118,24 @@ def main():
                   source=source)
             probe.unlink()
         for before, after in [
-            ("result > 0 && received <= kLimit", "result >= 0 && received <= kLimit"),
-            ("received <= kLimit && ", ""),
+            ("return result > 0 && received <= kLimit", "return result >= 0 && received <= kLimit"),
+            ("received <= kLimit &&\n               ", ""),
             ("declared < kMaxBody ? declared : kMaxBody", "declared"),
             ("declared < kMaxBody ? declared : kMaxBody", "kMaxBody"),
-            ("static_cast<u32>(result) <= kLimit - received",
-             "static_cast<u32>(result) < kLimit - received"),
+            ("static_cast<u32>(result) <=\n                   static_cast<u32>(static_cast<i64>(kLimit) - static_cast<i64>(received))",
+             "static_cast<u32>(result) <\n                   static_cast<u32>(static_cast<i64>(kLimit) - static_cast<i64>(received))"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Direct receive violates logical body bounds", source=source)
             probe.unlink()
         for before, after in [
-            ("received <= kMaxBody ? kMaxBody - received + 1u : 0u", "kMaxBody - received + 1u"),
-            ("received <= kMaxBody ?", "received < kMaxBody ?"),
-            ("kMaxBody - received + 1u", "kMaxBody - received"),
-            ("kMaxBody - received + 1u", "kMaxBody - received + 2u"),
+            ("received <= kMaxBody\n                   ? static_cast<u32>(static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1)",
+             "static_cast<u32>(static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1)"),
+            ("received <= kMaxBody", "received < kMaxBody"),
+            ("static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1",
+             "static_cast<i64>(kMaxBody) - static_cast<i64>(received)"),
+            ("static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1",
+             "static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 2"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Direct receive reservation violates body limit", source=source)
