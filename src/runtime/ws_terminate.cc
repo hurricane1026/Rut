@@ -407,18 +407,23 @@ bool emit_frame(u8* out,
     (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
-    const u64 output_len = len + prefix.len + suffix.len;
+    const u64 output_len = static_cast<u64>(static_cast<i64>(len) + static_cast<i64>(prefix.len) +
+                                            static_cast<i64>(suffix.len));
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
-    if (*produced + kHeaderLength + output_len > out_cap) return false;
-    for (u32 i = 0; i < kHeaderLength; i++) out[*produced + i] = hdr[i];
-    u8* dst = out + *produced + kHeaderLength;
+    if (static_cast<u64>(*produced) + kHeaderLength + output_len > out_cap) return false;
+    for (u32 i = 0; i < kHeaderLength; i++)
+        out[static_cast<i64>(*produced) + static_cast<i64>(i)] = hdr[i];
+    u8* dst = out + static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength);
     for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
-    for (u64 i = 0; i < len; i++) dst[prefix.len + i] = payload[i];
-    for (u32 i = 0; i < suffix.len; i++) dst[prefix.len + len + i] = static_cast<u8>(suffix.ptr[i]);
+    for (u64 i = 0; i < len; i++)
+        dst[static_cast<i64>(prefix.len) + static_cast<i64>(i)] = payload[i];
+    for (u32 i = 0; i < suffix.len; i++)
+        dst[static_cast<i64>(prefix.len) + static_cast<i64>(len) + static_cast<i64>(i)] =
+            static_cast<u8>(suffix.ptr[i]);
     if (masked) ws_unmask(dst, output_len, key);
-    *produced += kHeaderLength + static_cast<u32>(output_len);
+    *produced = static_cast<u32>(static_cast<u64>(*produced) + kHeaderLength + output_len);
     return true;
 }
 
@@ -438,9 +443,10 @@ bool compress_emitted_message(WsInspector& st,
     if (ws_parse_header(out + begin, *produced - begin, st.masked, &header) !=
             ParseStatus::Complete ||
         (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary) ||
-        header.header_len + header.payload_len != *produced - begin)
+        static_cast<u64>(header.header_len) + header.payload_len !=
+            static_cast<u64>(*produced) - begin)
         return false;
-    u8* const kPayload = out + begin + header.header_len;
+    u8* const kPayload = out + static_cast<i64>(begin) + static_cast<i64>(header.header_len);
     if (st.masked) ws_unmask(kPayload, header.payload_len, header.mask_key);
     u32 length = 0;
     const auto kStatus = ws_deflate_payload(*st.encoder,
@@ -475,7 +481,8 @@ bool decode_close_payload(const u8* payload, u32 len, u16& code, Str& reason) {
     reason = {};
     if (len == 0) return true;
     code = static_cast<u16>((static_cast<u16>(payload[0]) << 8) | payload[1]);
-    reason = {reinterpret_cast<const char*>(payload + 2), len - 2};
+    reason = {reinterpret_cast<const char*>(payload + 2),
+              static_cast<u32>(static_cast<i64>(len) - 2)};
     return ws_valid_close_code(code) && ws_valid_close_reason(reason);
 }
 
