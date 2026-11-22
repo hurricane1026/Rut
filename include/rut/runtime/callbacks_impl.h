@@ -13818,7 +13818,8 @@ inline void respond_validated_preconnect_failure(Loop* loop,
     // Envoy 503 connect-failure layout), so bookkeeping must match it rather
     // than assume the legacy 502 shape.
     const u16 policy_status =
-        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
+        conn.request_config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1]
+            .status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -13924,7 +13925,8 @@ inline void respond_validated_connect_completion_failure(Loop* loop,
     // Envoy 503 connect-failure layout), so bookkeeping must match it rather
     // than assume the legacy 502 shape.
     const u16 policy_status =
-        conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
+        conn.request_config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1]
+            .status_code;
     conn.clear_slots();
     conn.upstream_abandoned = true;
     conn.upstream_keep_alive = false;
@@ -14048,7 +14050,8 @@ inline void respond_upstream_connect_failure(Loop* loop,
             // serialized (e.g. a 503 Envoy connect-failure layout); bookkeeping
             // must match the wire response, not the legacy 502 fallback.
             policy_status =
-                conn.request_config->failure_policies[conn.failure_policy_id - 1].status_code;
+                conn.request_config->failure_policies[static_cast<i64>(conn.failure_policy_id) - 1]
+                    .status_code;
         }
     }
     if (!serialized) {
@@ -14158,7 +14161,7 @@ inline u32 strict_response_dec(char* out, u32 value) {
         tmp[n++] = static_cast<char>('0' + (value % 10));
         value /= 10;
     } while (value != 0);
-    for (u32 i = 0; i < n; i++) out[i] = tmp[n - i - 1];
+    for (u32 i = 0; i < n; i++) out[i] = tmp[static_cast<i64>(n) - static_cast<i64>(i) - 1];
     return n;
 }
 
