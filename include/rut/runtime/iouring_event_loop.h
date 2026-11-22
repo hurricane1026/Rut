@@ -8230,8 +8230,8 @@ public:
 
     // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
     // since they were armed. Returns false once a per-tick budget is exhausted.
-    bool idle_trim_walk_list(u32 slot, u64 deadline_ns, u32& examined, u32& queued) {
-        ListNode* head = &timer.slots[slot];
+    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
+        ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
         if (last == head) return true;
         const u64 node_offset = TimerWheel::timer_node_offset();
@@ -8274,7 +8274,7 @@ public:
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
-            if (!idle_trim_walk_list(expiry & (TimerWheel::kSlots - 1), deadline_ns, examined, queued)) break;
+            if (!idle_trim_walk_list(expiry, deadline_ns, examined, queued)) break;
         }
         idle_trim_flush();
     }
