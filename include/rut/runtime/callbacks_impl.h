@@ -15016,12 +15016,16 @@ inline bool configured_forward_failure_status_line_witness(const u8* data,
         return false;
     const u8 d0 = data[9], d1 = data[10], d2 = data[11];
     if (d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9') return false;
-    const u16 status = static_cast<u16>((d0 - '0') * 100u + (d1 - '0') * 10u + (d2 - '0'));
+    const u16 status =
+        static_cast<u16>((static_cast<i64>(d0 - '0') * 100) + (static_cast<i64>(d1 - '0') * 10) +
+                         static_cast<i64>(d2 - '0'));
     if (status < 100u || status > 599u) return false;
     u32 pos = 12u;
     if (pos >= len || (data[pos] != ' ' && data[pos] != '\r')) return false;
     while (pos < len && data[pos] != '\r') pos++;
-    if (pos + 1u >= len || data[pos + 1u] != '\n') return false;
+    if (static_cast<i64>(pos) + 1 >= static_cast<i64>(len) ||
+        data[static_cast<i64>(pos) + 1] != '\n')
+        return false;
     if (status_out != nullptr) *status_out = status;
     return true;
 }
@@ -15086,7 +15090,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
             ev.copy_deadline_generation != generation ||
             ev.copy_deadline_profile != static_cast<u8>(profile) ||
             ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
-            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) !=
+                static_cast<i64>(static_cast<u32>(ev.result)) ||
             ev.copy_end != conn.upstream_recv_buf.len() ||
             (!terminal_event &&
              ev.copy_begin != (progress_batch ? conn.response_read_deadline_progress_bytes : 0u)) ||
@@ -15112,7 +15117,8 @@ inline bool try_prebuilt_fixed_upload_head_configured_failure(
                 terminal_response.content_length_count == 1 &&
                 terminal_response.has_content_length && !terminal_response.chunked &&
                 terminal_parser.header_end <= conn.upstream_recv_buf.len() &&
-                conn.upstream_recv_buf.len() - terminal_parser.header_end >
+                static_cast<i64>(conn.upstream_recv_buf.len()) -
+                        static_cast<i64>(terminal_parser.header_end) >
                     terminal_response.content_length)
                 return false;
         }
