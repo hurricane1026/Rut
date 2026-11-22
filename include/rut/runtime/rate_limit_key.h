@@ -82,6 +82,10 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
             const u32 nlen = static_cast<u32>(colon - line_start);
             if (ci_eq(p + line_start, nlen, name, name_len)) {
                 i64 vs = colon + 1;
+                if (vs > line_end) {
+                    i = line_end + 2;
+                    continue;
+                }
                 while (vs < line_end && (p[vs] == ' ' || p[vs] == '\t')) vs++;
                 i64 ve = line_end;
                 while (ve > vs && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) ve--;
