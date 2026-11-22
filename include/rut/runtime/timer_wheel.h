@@ -7,6 +7,10 @@ namespace rut {
 struct ConnectionBase;              // forward decl
 using Connection = ConnectionBase;  // alias (matches connection.h)
 
+constexpr u32 timer_seconds_from_ms(u32 ms) {
+    return static_cast<u32>((static_cast<u64>(ms) + 999u) / 1000u);
+}
+
 // Timer wheel — O(1) add, refresh, tick.
 // 64 slots (power of 2 for fast modulo), 1-second resolution, driven by single timerfd per shard.
 // Note: timeouts > 63s wrap via modulo (e.g., 1000s → slot 40). For keepalive timeouts <= 60s
@@ -19,6 +23,13 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 
 struct TimerWheel {
     static constexpr u32 kSlots = 64;  // power of 2 for fast modulo
+
+    // Zero is the rejection sentinel. An immediate yield uses the next slot.
+    static constexpr u32 yield_fallback_seconds(u32 ms) {
+        const u32 seconds = timer_seconds_from_ms(ms);
+        if (seconds >= kSlots) return 0;
+        return seconds == 0 ? 1 : seconds;
+    }
 
     ListNode slots[kSlots];
     u32 cursor;
