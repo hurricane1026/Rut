@@ -62,8 +62,11 @@ inline bool grpc_attach(Http2Conn& h, GrpcExchange* x) {
 inline void grpc_queue_cancel(Http2Conn& h, u32 stream_id) {
     if (h.grpc.websocket_http1) return;  // the dedicated HTTP/1 socket closes on detach
     auto& g = h.grpc;
-    if (g.control_len + 13 <= sizeof(g.control)) {
-        g.control_len += write_rst_stream(g.control + g.control_len, stream_id, Http2Error::Cancel);
+    if (static_cast<i64>(g.control_len) + 13 <= static_cast<i64>(sizeof(g.control))) {
+        const u32 written = write_rst_stream(
+            g.control + static_cast<i64>(g.control_len), stream_id, Http2Error::Cancel);
+        g.control_len =
+            static_cast<u32>(static_cast<i64>(g.control_len) + static_cast<i64>(written));
         return;
     }
     for (u32 i = 0; i < g.pending_cancel_count; i++)
@@ -72,9 +75,13 @@ inline void grpc_queue_cancel(Http2Conn& h, u32 stream_id) {
 }
 inline void grpc_flush_pending_cancels(Http2Conn& h) {
     auto& g = h.grpc;
-    while (g.pending_cancel_count && sizeof(g.control) - g.control_len >= 13) {
+    while (g.pending_cancel_count &&
+           static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len) >= 13) {
         const u32 stream_id = g.pending_cancels[--g.pending_cancel_count];
-        g.control_len += write_rst_stream(g.control + g.control_len, stream_id, Http2Error::Cancel);
+        const u32 written = write_rst_stream(
+            g.control + static_cast<i64>(g.control_len), stream_id, Http2Error::Cancel);
+        g.control_len =
+            static_cast<u32>(static_cast<i64>(g.control_len) + static_cast<i64>(written));
     }
 }
 inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
@@ -393,10 +400,10 @@ inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
         seen = true;
         const Str kValue = hs[i].value;
         if (!kValue.len) return 2;
-        u32 parsed = 0;
+        i64 parsed = 0;
         for (u32 j = 0; j < kValue.len; j++) {
             if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return 2;
-            parsed = parsed * 10 + static_cast<u32>(kValue.ptr[j] - '0');
+            parsed = parsed * 10 + static_cast<i64>(kValue.ptr[j] - '0');
             if (parsed > 16) return 2;
         }
         status = static_cast<u8>(parsed);
@@ -465,14 +472,14 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
 }
 inline bool grpc_parse_content_length(Str value, u32* out) {
     if (value.len == 0) return false;
-    u32 parsed = 0;
+    i64 parsed = 0;
     for (u32 i = 0; i < value.len; i++) {
         if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
         const u32 digit = static_cast<u32>(static_cast<i64>(value.ptr[i]) - static_cast<i64>('0'));
-        if (parsed > (0xffffffffu - digit) / 10u) return false;
-        parsed = parsed * 10u + digit;
+        if (parsed > (static_cast<i64>(UINT32_MAX) - static_cast<i64>(digit)) / 10) return false;
+        parsed = parsed * 10 + static_cast<i64>(digit);
     }
-    *out = parsed;
+    *out = static_cast<u32>(parsed);
     return true;
 }
 template <typename Loop>
@@ -549,8 +556,9 @@ void grpc_response_headers(
                     ++i;
                     continue;
                 }
-                for (u32 j = i + 1; j < filtered_n; ++j) filtered[j - 1] = filtered[j];
-                --filtered_n;
+                for (i64 j = static_cast<i64>(i) + 1; j < static_cast<i64>(filtered_n); ++j)
+                    filtered[j - 1] = filtered[j];
+                filtered_n = static_cast<u32>(static_cast<i64>(filtered_n) - 1);
             }
             if (x->ws->callback.ws_downstream_deflate.enabled) {
                 if (filtered_n == Http2Conn::kMaxHeadersPerReq)
@@ -728,15 +736,16 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         h.consume_data(sid, len);
         return;
     }
-    if (len > sizeof(x->download) - x->download_len) {
+    if (static_cast<i64>(len) >
+        static_cast<i64>(sizeof(x->download)) - static_cast<i64>(x->download_len)) {
         x->failure = 8;
         x->response_end = true;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
-    if (len) __builtin_memcpy(x->download + x->download_len, data, len);
-    x->download_len += len;
-    x->response_bytes += len;
+    if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
+    x->download_len = static_cast<u32>(static_cast<i64>(x->download_len) + static_cast<i64>(len));
+    (void)__builtin_add_overflow(x->response_bytes, static_cast<u64>(len), &x->response_bytes);
     if (x->has_response_length && x->response_bytes > x->expected_response_bytes) x->failure = 13;
     if (x->failure == 13) {
         x->response_end = true;
@@ -820,7 +829,8 @@ inline void grpc_consume_output(GrpcExchange& x, bool from_client, u32 length) {
 template <typename Loop>
 void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    if (ev.result <= 0 || static_cast<u32>(ev.result) > conn.send_buf.len() - conn.send_progress) {
+    if (ev.result <= 0 || static_cast<i64>(ev.result) > static_cast<i64>(conn.send_buf.len()) -
+                                                            static_cast<i64>(conn.send_progress)) {
         if (conn.h2) grpc_record_session_failure(loop, conn, monotonic_us());
         loop->close_conn(conn);
         return;
@@ -834,11 +844,12 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.h2->grpc.tls_verified = true;
     }
-    conn.send_progress += static_cast<u32>(ev.result);
+    conn.send_progress = static_cast<u32>(static_cast<i64>(conn.send_progress) + ev.result);
     if (conn.send_progress < conn.send_buf.len()) {
         if (!loop->submit_send(conn,
-                               conn.send_buf.data() + conn.send_progress,
-                               conn.send_buf.len() - conn.send_progress))
+                               conn.send_buf.data() + static_cast<i64>(conn.send_progress),
+                               static_cast<u32>(static_cast<i64>(conn.send_buf.len()) -
+                                                static_cast<i64>(conn.send_progress))))
             loop->close_conn(conn);
         return;
     }
@@ -864,17 +875,25 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     if (g.client_tls.ssl_ctx && !g.tls_verified && g.preface_sent) return;
     g.busy = true;
     grpc_flush_pending_cancels(h);
-    if (h.conn_recv_credit && sizeof(g.control) - g.control_len >= 26) {
+    if (h.conn_recv_credit &&
+        static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len) >= 26) {
         u32 written = 0;
         h.process(
-            nullptr, 0, g.control + g.control_len, sizeof(g.control) - g.control_len, &written);
-        g.control_len += written;
+            nullptr,
+            0,
+            g.control + static_cast<i64>(g.control_len),
+            static_cast<u32>(static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len)),
+            &written);
+        g.control_len =
+            static_cast<u32>(static_cast<i64>(g.control_len) + static_cast<i64>(written));
     }
     u8* out = conn.send_buf.write_ptr();
     u32 n = 0;
     if (!g.preface_sent) {
         __builtin_memcpy(out, kClientPreface, kClientPrefaceLen);
-        n = kClientPrefaceLen + write_settings_frame(out + kClientPrefaceLen, h.our_settings);
+        n = static_cast<u32>(static_cast<i64>(kClientPrefaceLen) +
+                             static_cast<i64>(write_settings_frame(
+                                 out + static_cast<i64>(kClientPrefaceLen), h.our_settings)));
         g.preface_sent = true;
     } else if (g.control_len) {
         n = g.control_len;
@@ -894,7 +913,8 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
             if (x->upstream_stream < next_header) next_header = x->upstream_stream;
         }
         for (u32 step = 0; step < 64; step++) {
-            const u32 i = (g.cursor + step) % 64;
+            const u32 i =
+                static_cast<u32>((static_cast<i64>(g.cursor) + static_cast<i64>(step)) % 64);
             auto* x = g.streams[i];
             if (!x || x->failure || (x->response_end && !x->ws_accepted)) continue;
             auto* stream = h.find_stream(x->upstream_stream);
@@ -919,12 +939,16 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
             } else if ((!x->websocket || x->ws_accepted) && output_len && stream->send_window > 0 &&
                        h.conn_send_window > 0) {
                 u32 amount = output_len;
-                const u32 cap = conn.send_buf.write_avail() - kFrameHeaderSize;
+                const i64 cap_wide = static_cast<i64>(conn.send_buf.write_avail()) -
+                                     static_cast<i64>(kFrameHeaderSize);
+                if (cap_wide <= 0) continue;
+                const u32 cap = static_cast<u32>(cap_wide);
                 if (amount > cap) amount = cap;
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
-                if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
+                if (static_cast<i64>(amount) > h.conn_send_window)
+                    amount = static_cast<u32>(h.conn_send_window);
                 n = http2_write_data(out, x->upstream_stream, output, amount, false);
                 grpc_consume_output(*x, true, amount);
                 stream->send_window -= static_cast<i32>(amount);
@@ -942,7 +966,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                                     : Http2StreamState::HalfClosedLocal;
             }
             if (n) {
-                g.cursor = (i + 1) % 64;
+                g.cursor = static_cast<u32>((static_cast<i64>(i) + 1) % 64);
                 break;
             }
         }
@@ -1381,7 +1405,9 @@ bool grpc_start_impl(Loop* loop,
         grpc_log_target(entry, kPath, loop->access_log && loop->access_log->path_only);
         break;
     }
-    for (u32 i = 0; i + 1 < sizeof(entry.upstream) && i < sizeof(target.name); i++) {
+    for (i64 i = 0; i + 1 < static_cast<i64>(sizeof(entry.upstream)) &&
+                    i < static_cast<i64>(sizeof(target.name));
+         i++) {
         entry.upstream[i] = target.name[i];
         if (!target.name[i]) break;
     }
@@ -1542,7 +1568,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     static_cast<void*>(loop), *up, {up->id, 1, 0, 0, IoEventType::Recv, 0});
             }
             if (n) {
-                h.grpc.cursor = (i + 1) % 64;
+                h.grpc.cursor = static_cast<u32>((static_cast<i64>(i) + 1) % 64);
                 break;
             }
         }
