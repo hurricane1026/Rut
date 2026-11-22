@@ -151,8 +151,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_small_phase_max_us[4]{};
 
     void study_note_first_response(const Connection& c, u64 now_us) {
-        if (c.req_start_us == 0 || now_us < c.req_start_us ||
-            now_us - c.req_start_us > 60ull * 1000000u)
+        u64 request_age = 0;
+        if (c.req_start_us == 0 || __builtin_sub_overflow(now_us, c.req_start_us, &request_age) ||
+            request_age > 60ull * 1000000u)
             return;
         u32 rng = study_phase_rng;
         rng ^= rng << 13;
@@ -161,10 +162,12 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         study_phase_rng = rng;
         if ((rng & 63u) != 0) return;
         auto& slot = study_request_slots[c.id & 127u];
-        if (slot.req_us != 0 && slot.conn_id != c.id && now_us >= slot.req_us &&
-            now_us - slot.req_us < 1000000u) {
-            ++study_small_phase_drops;
-            return;
+        if (slot.req_us != 0 && slot.conn_id != c.id) {
+            u64 slot_age = 0;
+            if (!__builtin_sub_overflow(now_us, slot.req_us, &slot_age) && slot_age < 1000000u) {
+                ++study_small_phase_drops;
+                return;
+            }
         }
         slot.conn_id = c.id;
         slot.req_us = c.req_start_us;
@@ -187,13 +190,17 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         // Filter by actual completed payload, never by a predicted URL size.
         if (snapshot.payload_len != 4096 || c.resp_body_mode != BodyMode::ContentLength) return;
         const u64 now = monotonic_us();
-        if (now < snapshot.first_us || snapshot.first_us < snapshot.req_us ||
-            snapshot.first_us - snapshot.req_us < snapshot.upstream_us)
+        u64 total_us = 0;
+        u64 first_phase_us = 0;
+        u64 final_phase_us = 0;
+        u64 queue_phase_us = 0;
+        if (__builtin_sub_overflow(now, snapshot.first_us, &final_phase_us) ||
+            __builtin_sub_overflow(snapshot.first_us, snapshot.req_us, &first_phase_us) ||
+            first_phase_us < snapshot.upstream_us ||
+            __builtin_sub_overflow(first_phase_us, snapshot.upstream_us, &queue_phase_us) ||
+            __builtin_sub_overflow(now, snapshot.req_us, &total_us))
             return;
-        const u64 phases[4] = {now - snapshot.req_us,
-                               snapshot.first_us - snapshot.req_us - snapshot.upstream_us,
-                               snapshot.upstream_us,
-                               now - snapshot.first_us};
+        const u64 phases[4] = {total_us, queue_phase_us, snapshot.upstream_us, final_phase_us};
         ++study_small_phase_samples;
         for (u32 k = 0; k < 4; ++k) {
             u64 value = phases[k];
