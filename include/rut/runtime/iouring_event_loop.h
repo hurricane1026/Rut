@@ -1173,7 +1173,8 @@ private:
             c.http1_prebuilt_header_end > c.http1_prebuilt_total_len ||
             (!header_only_representation
                  ? c.http1_prebuilt_body_len !=
-                       c.http1_prebuilt_total_len - c.http1_prebuilt_header_end
+                       static_cast<u32>(static_cast<i64>(c.http1_prebuilt_total_len) -
+                                        static_cast<i64>(c.http1_prebuilt_header_end))
                  : c.http1_prebuilt_body_len == 0 ||
                        c.http1_prebuilt_total_len != c.http1_prebuilt_header_end) ||
             c.http1_prebuilt_status != c.resp_status)
@@ -1529,7 +1530,8 @@ private:
         }
         if (c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout)
             return false;
-        const u8* body = c.response_header_buf.data() + c.http1_prebuilt_header_end;
+        const u8* body =
+            c.response_header_buf.data() + static_cast<i64>(c.http1_prebuilt_header_end);
         return parsed.status_code == timeout.status_code &&
                parsed.reason.len == timeout.reason.len &&
                __builtin_memcmp(parsed.reason.ptr, timeout.reason.ptr, timeout.reason.len) == 0 &&
@@ -1551,8 +1553,9 @@ private:
         auto exact_send_source = [&](const u8* expected, u32 total) {
             return !retiring_send ||
                    (expected != nullptr && send.src == expected && send.offset <= total &&
-                    send.remaining == total - send.offset && send.fd == c.upstream_fd &&
-                    send.type == IoEventType::UpstreamSend &&
+                    send.remaining ==
+                        static_cast<u32>(static_cast<i64>(total) - static_cast<i64>(send.offset)) &&
+                    send.fd == c.upstream_fd && send.type == IoEventType::UpstreamSend &&
                     send.upstream_episode == c.upstream_episode);
         };
 
