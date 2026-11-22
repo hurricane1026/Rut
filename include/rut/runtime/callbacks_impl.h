@@ -12793,7 +12793,8 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
             for (u32 i = static_cast<u32>(static_cast<i64>(colon) + 1); i < value.len; i++) {
                 const u8 c = static_cast<u8>(value.ptr[i]);
                 if (c < '0' || c > '9' || port > 6553u || (port == 6553u && c > '5')) return false;
-                port = static_cast<u32>(static_cast<i64>(port) * 10 + static_cast<i64>(c - '0'));
+                port = static_cast<u32>(static_cast<i64>(port) * 10 + static_cast<i64>(c) -
+                                        static_cast<i64>('0'));
             }
             if (port == 0) return false;
         }
@@ -13151,7 +13152,7 @@ inline bool build_bounded_local_response_bytes(const Connection& conn,
             return false;
         // Bulk copy (overlap-safe for borrowed views); a byte loop here was
         // the dominant cost of serving ~4 KiB local responses.
-        if (len != 0) __builtin_memmove(out + pos, data, len);
+        if (len != 0) __builtin_memmove(out + static_cast<i64>(pos), data, len);
         pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
@@ -13262,7 +13263,7 @@ inline bool build_no_content204_response_bytes(const Connection& conn,
             static_cast<i64>(len) > static_cast<i64>(required) - static_cast<i64>(pos))
             return false;
         const auto* bytes = static_cast<const u8*>(data);
-        if (len != 0) __builtin_memmove(out + pos, bytes, len);
+        if (len != 0) __builtin_memmove(out + static_cast<i64>(pos), bytes, len);
         pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(len));
         return true;
     };
