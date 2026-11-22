@@ -509,7 +509,8 @@ public:
     // Batch-local owner index: at most 256 owners in 512 slots. No Connection
     // state or allocation is retained across dispatch/reclamation boundaries.
     static constexpr u32 kResponseReadOwnerIndexSize = 2u * kMaxEventsPerWait;
-    static_assert((kResponseReadOwnerIndexSize & (kResponseReadOwnerIndexSize - 1u)) == 0);
+    static constexpr u32 kResponseReadOwnerIndexMask = 511u;
+    static_assert((kResponseReadOwnerIndexSize & kResponseReadOwnerIndexMask) == 0);
     u16 response_read_batch_owner_index[kResponseReadOwnerIndexSize]{};
     bool response_read_batch_owner_index_active = false;
     // Counters default to empty so a loop whose slots are used before init()
@@ -569,7 +570,8 @@ public:
             conns.destroy();
             return core::make_unexpected(b.error());
         }
-        auto ready_words = body_pump_ready_words.init((capacity + 63u) / 64u);
+        auto ready_words =
+            body_pump_ready_words.init(static_cast<u32>((static_cast<i64>(capacity) + 63) / 64));
         if (!ready_words) {
             backend.destroy_send_state_storage();
             pending_free.destroy();
@@ -577,7 +579,8 @@ public:
             conns.destroy();
             return core::make_unexpected(ready_words.error());
         }
-        auto rearm_words = recv_rearm_words.init((capacity + 63u) / 64u);
+        auto rearm_words =
+            recv_rearm_words.init(static_cast<u32>((static_cast<i64>(capacity) + 63) / 64));
         if (!rearm_words) {
             body_pump_ready_words.destroy();
             backend.destroy_send_state_storage();
@@ -592,7 +595,7 @@ public:
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
         for (u32 i = 0; i < capacity; i++) {
-            free_stack[i] = capacity - 1 - i;
+            free_stack[i] = static_cast<u32>(static_cast<i64>(capacity) - 1 - i);
             pending_free[i] = 0;
         }
         free_top = capacity;
@@ -5600,7 +5603,15 @@ public:
                     } else {
                         if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
                         owner.expected_copy_end = ev.copy_end;
-                        owner.positive_bytes += static_cast<u32>(ev.result);
+                        const u64 positive = static_cast<u64>(ev.result);
+                        u64 total_positive = 0;
+                        if (__builtin_add_overflow(static_cast<u64>(owner.positive_bytes),
+                                                   positive,
+                                                   &total_positive) ||
+                            total_positive > UINT32_MAX)
+                            owner.bounded_terminal_custody_invalid = true;
+                        else
+                            owner.positive_bytes = static_cast<u32>(total_positive);
                         owner.saw_positive = true;
                     }
                     continue;
@@ -5650,7 +5661,8 @@ public:
                     if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
                     owner.expected_copy_end = ev.copy_end;
                     const u32 positive = static_cast<u32>(ev.result);
-                    if (owner.positive_bytes > 0xFFFFFFFFu - positive)
+                    if (static_cast<i64>(owner.positive_bytes) + static_cast<i64>(positive) >
+                        static_cast<i64>(UINT32_MAX))
                         owner.valid = false;
                     else
                         owner.positive_bytes = static_cast<u32>(
