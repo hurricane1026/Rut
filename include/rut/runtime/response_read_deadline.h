@@ -1008,7 +1008,8 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     bool allow_retired_episode = false) {
     const RouteConfig* cfg = c.request_config;
     if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
-        cfg->policy_bundles[bundle_id - 1].response_buffering != buffering ||
+        cfg->policy_bundles[static_cast<u16>(static_cast<i64>(bundle_id) - 1)].response_buffering !=
+            buffering ||
         !response_read_deadline_fixed_upload_profile_method_admitted(
             profile, c.req_method, buffering) ||
         proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
@@ -1019,10 +1020,13 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
         proof.request_policy_id != c.request_policy_id || proof.route_fn == nullptr ||
         proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
         proof.raw_total_length <= proof.raw_header_end ||
-        proof.raw_content_length != proof.raw_total_length - proof.raw_header_end ||
+        proof.raw_content_length != static_cast<u64>(static_cast<i64>(proof.raw_total_length) -
+                                                     static_cast<i64>(proof.raw_header_end)) ||
         proof.rewritten_header_end == 0 ||
         proof.rewritten_total_length <= proof.rewritten_header_end ||
-        proof.rewritten_total_length - proof.rewritten_header_end != proof.raw_content_length ||
+        static_cast<u64>(static_cast<i64>(proof.rewritten_total_length) -
+                         static_cast<i64>(proof.rewritten_header_end)) !=
+            proof.raw_content_length ||
         proof.expected_upload_length != proof.rewritten_total_length ||
         !valid_upstream_episode(proof.upload_episode) ||
         (proof.upload_episode != c.upstream_episode &&
@@ -1108,7 +1112,7 @@ inline bool fixed_upload_head_success_proof_is_stable(
         !response_read_deadline_fixed_upload_materialization_is_stable(
             c, proof, profile, true, bundle_id, route_method, buffering, allow_retired_episode))
         return false;
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle = config->policy_bundles[static_cast<u16>(static_cast<i64>(bundle_id) - 1)];
     if (bundle.response_buffering != buffering ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -1118,9 +1122,13 @@ inline bool fixed_upload_head_success_proof_is_stable(
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    const auto& response = config->response_policies[bundle.response_policy_id - 1];
-    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    const auto& response =
+        config
+            ->response_policies[static_cast<u16>(static_cast<i64>(bundle.response_policy_id) - 1)];
+    const auto& failure =
+        config->failure_policies[static_cast<u16>(static_cast<i64>(bundle.failure_policy_id) - 1)];
+    const auto& timeout = config->failure_policies[static_cast<u16>(
+        static_cast<i64>(bundle.timeout_failure_policy_id) - 1)];
     if (!admitted_response_policy_valid(response) ||
         !admitted_forward_failure_policy_valid(failure) ||
         !admitted_forward_timeout_failure_policy_valid(timeout) ||
