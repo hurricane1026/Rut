@@ -36,7 +36,12 @@ u64 jwt_monotonic_ms() {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0 ||
         now.tv_nsec >= 1000000000 || static_cast<u64>(now.tv_sec) > (~u64{0} - 999) / 1000)
         return 0;
-    return static_cast<u64>(now.tv_sec) * 1000 + static_cast<u64>(now.tv_nsec) / 1000000;
+    u64 seconds_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(now.tv_sec), u64{1000}, &seconds_ms)) return 0;
+    u64 result = 0;
+    return __builtin_add_overflow(seconds_ms, static_cast<u64>(now.tv_nsec) / 1000000, &result)
+               ? 0
+               : result;
 }
 
 bool HttpsEndpoint::valid() const {
@@ -162,11 +167,12 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         // A zero-input step is needed to recognize a just-finished data region.
         for (u32 steps = 0; steps <= kMaxWire; ++steps) {
             u32 consumed = 0, start = 0, length = 0;
-            const auto kStatus = chunks_.feed(reinterpret_cast<const u8*>(wire_ + offset_),
-                                              wire_len_ - offset_,
-                                              &consumed,
-                                              &start,
-                                              &length);
+            const auto kStatus = chunks_.feed(
+                reinterpret_cast<const u8*>(wire_ + static_cast<i64>(offset_)),
+                static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_)),
+                &consumed,
+                &start,
+                &length);
             if (static_cast<i64>(length) > static_cast<i64>(kMaxBody) - static_cast<i64>(body_len_))
                 return Result::Error;
             if (length)
@@ -345,7 +351,9 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
 }
 void HttpsFetch::advance(u64 monotonic_ms) {
     if (state_ != State::Busy) return;
-    if (!monotonic_ms || monotonic_ms < started_ || monotonic_ms - started_ >= timeout_ms_) {
+    u64 elapsed = 0;
+    if (!monotonic_ms || monotonic_ms < started_ ||
+        __builtin_sub_overflow(monotonic_ms, started_, &elapsed) || elapsed >= timeout_ms_) {
         (void)fail();
         return;
     }
@@ -386,7 +394,9 @@ bool HttpsFetch::handshake(HttpsFetch& self) {
 bool HttpsFetch::write(HttpsFetch& self) {
     ERR_clear_error();
     const int kResult = SSL_write(
-        self.ssl_, self.request_ + self.sent_, static_cast<int>(self.request_len_ - self.sent_));
+        self.ssl_,
+        self.request_ + static_cast<i64>(self.sent_),
+        static_cast<int>(static_cast<i64>(self.request_len_) - static_cast<i64>(self.sent_)));
     if (kResult <= 0) return retry_ssl(self.ssl_, kResult) ? false : self.fail();
     self.sent_ += static_cast<u32>(kResult);
     if (self.sent_ == self.request_len_) self.step_ = read;
