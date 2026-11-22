@@ -210,7 +210,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
                 ++bin;
             }
             ++study_small_phase_hist[k][bin];
-            study_small_phase_sum_us[k] += phases[k];
+            __builtin_add_overflow(
+                study_small_phase_sum_us[k], phases[k], &study_small_phase_sum_us[k]);
             if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
         }
     }
@@ -242,7 +243,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
             ++bin;
         }
         ++study_wait_hist[kind][bin];
-        study_wait_sum_ns[kind] += ns;
+        __builtin_add_overflow(study_wait_sum_ns[kind], ns, &study_wait_sum_ns[kind]);
         if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
     }
     void study_record_syscall(u32 kind, u64 ns) {
@@ -390,15 +391,16 @@ public:
     // Probe cancellation uses the same exact-episode retirement as requests.
     static constexpr bool kSupportsHealthProbe = true;
     static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
-    static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
+    static constexpr u32 kTlsInputSize =
+        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) + 1024);
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
     static constexpr u32 kTlsRecordMax =
-        SlicePool::kSliceSize + 256;  // 1 chunk's worst-case ciphertext
+        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) + 256);
     static constexpr u32 kTlsOutBufCap =
-        4 * SlicePool::kSliceSize;  // 64 KiB — bounded throughput knob
+        static_cast<u32>(static_cast<i64>(4) * static_cast<i64>(SlicePool::kSliceSize));
     static constexpr u32 kTlsOutHigh =
-        kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
+        static_cast<u32>(static_cast<i64>(kTlsOutBufCap) - static_cast<i64>(kTlsRecordMax));
     static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
     static constexpr u32 kTlsDrainChunk = kTlsRecordMax;  // keep one TLS record within a raw send
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
@@ -1583,8 +1585,8 @@ private:
                 // boundary, while any retry snapshot/pipeline stash remains in
                 // send_buf until both rendezvous owners drain. A live Send has
                 // not reached that callback and belongs to RetrySendBuf instead.
-                const u32 stored = static_cast<u32>(static_cast<i64>(c.retry_req_send_len) +
-                                                    static_cast<i64>(c.pipeline_stash_len));
+                const i64 stored =
+                    static_cast<i64>(c.retry_req_send_len) + static_cast<i64>(c.pipeline_stash_len);
                 const bool materialized_get =
                     c.http1_prebuilt_deadline_profile ==
                         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1612,7 +1614,8 @@ private:
                         c.http1_prebuilt_deadline_route_method);
                 return c.request_upload_complete && !c.upstream_request_incomplete &&
                        !retiring_connect && !retiring_send &&
-                       request_prefix_len == c.retry_req_send_len && stored <= c.send_buf.len() &&
+                       request_prefix_len == c.retry_req_send_len &&
+                       stored <= static_cast<i64>(c.send_buf.len()) &&
                        (!materialized_get || exact_get_stable ||
                         (coalesced_get &&
                          response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
@@ -1671,8 +1674,8 @@ private:
                 return true;
             case Http1RequestBufferDisposition::ExistingPipeline:
                 return prefix == c.retry_req_send_len &&
-                       static_cast<u32>(c.retry_req_send_len) +
-                               static_cast<u32>(c.pipeline_stash_len) <=
+                       static_cast<i64>(c.retry_req_send_len) +
+                               static_cast<i64>(c.pipeline_stash_len) <=
                            c.send_buf.len();
             case Http1RequestBufferDisposition::None:
                 return false;
@@ -1737,8 +1740,8 @@ private:
         }
 
         // Exact equality excludes every unrepresented target or cancel CQE.
-        const u32 expected_pending =
-            static_cast<u32>(c.recv_armed) + upstream_op_count(selected_targets);
+        const u32 expected_pending = static_cast<u32>(
+            static_cast<i64>(c.recv_armed) + static_cast<i64>(upstream_op_count(selected_targets)));
         if (c.pending_ops != expected_pending) return false;
 
         // Replace a fully-drained older tombstone directly with the exact
