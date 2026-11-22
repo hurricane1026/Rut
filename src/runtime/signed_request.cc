@@ -148,7 +148,8 @@ bool parse_http_date(Str value, u64& seconds) {
     auto leap_years = [](u32 y) -> i64 {
         return static_cast<i64>(y / 4) - static_cast<i64>(y / 100) + static_cast<i64>(y / 400);
     };
-    i64 days = (static_cast<i64>(year) - 1970) * 365 + leap_years(year - 1) - leap_years(1969);
+    i64 days = (static_cast<i64>(year) - 1970) * 365 +
+               leap_years(static_cast<u32>(static_cast<i64>(year) - 1)) - leap_years(1969);
     for (u32 i = 0; i < month; ++i) days += static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0);
     days += static_cast<i64>(day) - 1;
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
