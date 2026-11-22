@@ -998,9 +998,9 @@ public:
     }
 
     static constexpr u32 upstream_op_count(u8 mask) {
-        return static_cast<u32>((mask & kUpstreamOpConnect) != 0) +
-               static_cast<u32>((mask & kUpstreamOpRecv) != 0) +
-               static_cast<u32>((mask & kUpstreamOpSend) != 0);
+        return static_cast<u32>(static_cast<i64>((mask & kUpstreamOpConnect) != 0) +
+                                static_cast<i64>((mask & kUpstreamOpRecv) != 0) +
+                                static_cast<i64>((mask & kUpstreamOpSend) != 0));
     }
 
     // Park only the post-response request-boundary tail. Every request-1 side
