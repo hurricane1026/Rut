@@ -20,7 +20,11 @@ ZERO = 'ignoringParenImpCasts(integerLiteral(equals(0)))'
 # not treat source text such as `#warning "error:"` or prose in a note as a
 # compiler failure.
 CLANG_ERROR = re.compile(
-    r'(?m)^(?:error:|(?:[^:\n]+:\d+:\d+:|clang(?:\+\+|-cl)?(?:\.exe)?:)\s*(?:fatal )?error:)'
+    r'(?m)^(?:'
+    r'.+:\d+:\d+:\s*(?:fatal )?error:'
+    r'|clang[^:\n]*:\s*(?:fatal )?error:'
+    r'|fatal error:'
+    r'|error:)'
 )
 
 
@@ -77,6 +81,15 @@ def unsigned_add_sub(scope):
 
 def matches(tool, file, query, flags):
     command = [tool, '-c', 'set traversal AsIs', '-c', 'match ' + query, str(file), *flags]
+    try:
+        separator = command.index('--')
+    except ValueError:
+        command.extend(['--', '-fdiagnostics-format=clang', '-fshow-column',
+                        '-fno-color-diagnostics'])
+    else:
+        command[separator + 1:separator + 1] = [
+            '-fdiagnostics-format=clang', '-fshow-column', '-fno-color-diagnostics'
+        ]
     run = subprocess.run(command, text=True, capture_output=True)
     diagnostics = run.stderr + run.stdout
     locations = re.findall(r'^(.+?:\d+:\d+): note: "root" binds here', run.stdout, re.M)
@@ -88,6 +101,15 @@ def matches(tool, file, query, flags):
 
 
 def self_test(tool):
+    for diagnostic in (
+        'clang-query-18: error: bad option',
+        'clang++-18: fatal error: no input',
+        'fatal error: missing header',
+        '/tmp/bad:error.cc:4:7: error: expected expression',
+    ):
+        if not CLANG_ERROR.search(diagnostic):
+            raise RuntimeError(f'clang diagnostic self-test did not match: {diagnostic}')
+
     with tempfile.TemporaryDirectory() as directory:
         file = Path(directory) / 'probe.cc'
         file.write_text("""using U = unsigned;
@@ -127,6 +149,11 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
         if matches(tool, path_warning, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
             raise RuntimeError('clang-query self-test: path containing error unexpectedly matched')
 
+        colon_valid = Path(directory) / 'bad:error.cc'
+        colon_valid.write_text('int okay;\n')
+        if matches(tool, colon_valid, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
+            raise RuntimeError('clang-query self-test: valid colon path unexpectedly matched')
+
         broken = Path(directory) / 'broken.cc'
         broken.write_text('using U = unsigned; U broken(U x) { return x + ; }\n')
         try:
@@ -136,6 +163,15 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
         else:
             raise RuntimeError('clang-query self-test: compiler diagnostics were not rejected')
 
+        colon_broken = Path(directory) / 'bad:error.cc'
+        colon_broken.write_text('using U = unsigned; U broken(U x) { return x + ; }\n')
+        try:
+            matches(tool, colon_broken, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError('clang-query self-test: colon-path compiler diagnostic was not rejected')
+
         missing = Path(directory) / 'missing.cc'
         missing.write_text('#include "definitely-missing-header-7f3c.h"\nint broken;\n')
         try:
@@ -144,6 +180,15 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             pass
         else:
             raise RuntimeError('clang-query self-test: missing-header diagnostic was not rejected')
+
+        colon_missing = Path(directory) / 'fatal:error.cc'
+        colon_missing.write_text('#include "definitely-missing-header-7f3c.h"\nint broken;\n')
+        try:
+            matches(tool, colon_missing, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError('clang-query self-test: colon-path fatal diagnostic was not rejected')
 
         try:
             matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))',
