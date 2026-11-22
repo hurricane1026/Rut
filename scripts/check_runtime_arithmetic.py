@@ -102,7 +102,7 @@ bool volatile_reads(volatile int &n) { return n + 1 < n; }
             found = sorted(int(p.rsplit(':', 2)[1]) for p in matches(tool, file, query, flags))
             if found != expected:
                 raise RuntimeError(f'clang-query self-test: expected lines {expected}, got {found}')
-        if matches(tool, file, 'isExpansionInMainFile(), integerLiteral(equals(987654321))', flags):
+        if matches(tool, file, 'expr(isExpansionInMainFile(), integerLiteral(equals(987654321)))', flags):
             raise RuntimeError('clang-query self-test: expected a valid zero-match query')
 
         broken = Path(directory) / 'broken.cc'
