@@ -82,9 +82,10 @@ inline bool h2_prepare_forward_request(Connection& conn,
     if (synth_len > out_cap) return false;
     __builtin_memmove(out, synth, synth_len);
     u32 header_end = 0;
-    for (u32 i = 0; i + 3 < synth_len; i++) {
-        if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
-            header_end = i + 4;
+    for (u32 i = 0; static_cast<i64>(i) + 3 < static_cast<i64>(synth_len); i++) {
+        if (out[i] == '\r' && out[static_cast<i64>(i) + 1] == '\n' &&
+            out[static_cast<i64>(i) + 2] == '\r' && out[static_cast<i64>(i) + 3] == '\n') {
+            header_end = static_cast<u32>(static_cast<i64>(i) + 4);
             break;
         }
     }
@@ -798,7 +799,8 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     } else {
         char tmp[10];
         u32 t = 0;
-        for (u32 v = body_len; v > 0; v /= 10) tmp[t++] = static_cast<char>('0' + (v % 10));
+        for (u32 v = body_len; v > 0; v /= 10)
+            tmp[t++] = static_cast<char>('0' + static_cast<i64>(v % 10));
         while (t > 0) digits[nd++] = tmp[--t];
     }
     static const char kKey[] = "content-length: ";
@@ -995,7 +997,8 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+        static_cast<u32>(static_cast<i64>(RouteConfig::kMaxHeadersPerSet) +
+                         static_cast<i64>(Connection::kMaxRespHeaderMutations));
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
