@@ -1488,7 +1488,6 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
             return false;
         }
     }
-    if (request.content_length > static_cast<u64>(INT64_MAX) - parser.header_end) return false;
     const i64 total =
         static_cast<i64>(parser.header_end) + static_cast<i64>(request.content_length);
     if (host_count != 1 || content_length_count != 1 ||
@@ -15780,6 +15779,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             strict_response_upload_ready(conn);
         const u32 raw_header_end = resp_parser.header_end;
         const u32 raw_total = conn.buffered_response_len();
+        const i64 raw_body_len = raw_total >= raw_header_end ? static_cast<i64>(raw_total) -
+                                                                   static_cast<i64>(raw_header_end)
+                                                             : -1;
         const CompleteContentLengthResponseClassification complete_content_length_classification =
             classify_complete_content_length_response(resp);
         const bool strict_cl0 = strict_common && !fixed_upload_head && resp.status_code == 200 &&
@@ -15803,20 +15805,22 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                        response_read_deadline_route_method_matches(explicit_method,
                                                                    explicit_route_method)) &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            resp.content_length <= ResponseBodyChain::kMaxBody &&
-            raw_total - raw_header_end <= resp.content_length;
+            resp.content_length <= ResponseBodyChain::kMaxBody && raw_body_len >= 0 &&
+            raw_body_len <= static_cast<i64>(resp.content_length);
         const bool strict_positive_streaming_get =
             strict_common && resp.status_code == 200 && !fixed_upload &&
             explicit_buffering == ForwardResponseBufferingMode::None &&
             explicit_method == static_cast<u8>(LogHttpMethod::Get) && resp.content_length > 0 &&
             raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            resp.content_length <= conn.upstream_recv_buf.capacity() - raw_header_end &&
-            raw_total - raw_header_end <= resp.content_length;
+            static_cast<i64>(resp.content_length) <=
+                static_cast<i64>(conn.upstream_recv_buf.capacity()) -
+                    static_cast<i64>(raw_header_end) &&
+            raw_body_len >= 0 && raw_body_len <= static_cast<i64>(resp.content_length);
         const bool strict_positive_head =
             strict_common && fixed_upload_head &&
             explicit_buffering == ForwardResponseBufferingMode::None && resp.status_code == 200 &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            raw_total - raw_header_end <= resp.content_length;
+            raw_body_len >= 0 && raw_body_len <= static_cast<i64>(resp.content_length);
         // This runtime seam proves only the 304 response shape and transport
         // owners. Conditional request/ETag correlation remains origin-owned.
         const bool strict_no_body_metadata_shape =
