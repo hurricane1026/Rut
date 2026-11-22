@@ -887,10 +887,18 @@ public:
     }
 
     void epoch_enter() {
-        if (epoch) epoch->epoch.fetch_add(1, std::memory_order_acq_rel);
+        if (epoch) {
+            u64 next = 0;
+            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
     void epoch_leave() {
-        if (epoch) epoch->epoch.fetch_add(1, std::memory_order_acq_rel);
+        if (epoch) {
+            u64 next = 0;
+            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
 
     void shutdown() {
