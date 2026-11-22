@@ -289,7 +289,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            n4_pool_[art_idx(leaf)].hdr.edge = Str{p.ptr + i, p.len - i};
+            n4_pool_[art_idx(leaf)].hdr.edge =
+                Str{p.ptr + static_cast<i64>(i),
+                    static_cast<u32>(static_cast<i64>(p.len) - static_cast<i64>(i))};
 
             const ArtChildRef new_parent = add_child(cur, b, leaf);
             if (new_parent == kArtInvalidChildRef) {
@@ -309,7 +311,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // Match as many bytes of the existing edge as possible.
         const Str e = header(child).edge;
         u32 k = 0;
-        while (k < e.len && i + k < p.len && e.ptr[k] == p.ptr[i + k]) k++;
+        while (k < e.len && static_cast<i64>(i) + static_cast<i64>(k) < static_cast<i64>(p.len) &&
+               e.ptr[k] == p.ptr[static_cast<i64>(i) + static_cast<i64>(k)])
+            k++;
         if (k == e.len) {
             // Full edge match — descend. Capture the slot in cur that
             // holds `child` so a future upgrade of child's children can
@@ -342,7 +346,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 }
                 case kArtN48: {
                     ArtNode48& n = n48_pool_[ci];
-                    site = &n.children[n.child_index[b] - 1];
+                    site = &n.children[static_cast<u8>(static_cast<i64>(n.child_index[b]) - 1)];
                     break;
                 }
                 case kArtN256: {
@@ -353,7 +357,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
             }
             cur_patch_site = site;
             cur = child;
-            i += k;
+            i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
             continue;
         }
         // Partial match — split the existing child's edge at byte k.
@@ -374,7 +378,8 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // tail a Node4 at first and `add_child` the original's
         // children onto it; this auto-upgrades as needed.
         ArtNode4& tail_node = n4_pool_[art_idx(tail)];
-        tail_node.hdr.edge = Str{e.ptr + k, e.len - k};
+        tail_node.hdr.edge = Str{e.ptr + static_cast<i64>(k),
+                                 static_cast<u32>(static_cast<i64>(e.len) - static_cast<i64>(k))};
         // Copy header fields (terminals) from original's header.
         for (u32 m = 0; m < kMethodSlots; m++) {
             tail_node.hdr.route_idx_by_method[m] = header(child).route_idx_by_method[m];
