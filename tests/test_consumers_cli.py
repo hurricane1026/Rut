@@ -1189,6 +1189,72 @@ def test_provision_key_verifier(tool, root):
         assert run(tool, 'provision-key-verifier', *args).returncode == 2
 
 
+def test_create_credential(tool, root):
+    alice = dict(id='alice', enabled=True, groups=['staff', 'owners'])
+    previous = dict(id='previous', consumerId='alice', method='bearer',
+                    enabled=False, secret='previous-fixture-key')
+    snapshot = dict(version=1, consumers=[alice], credentials=[previous])
+    source = private(root / 'create-credential-source.json', snapshot)
+    original = source.read_bytes()
+    profile = root / 'create-credential-profile.json'
+    output = root / 'create-credential-output.json'
+    header_digest = hashlib.sha256(b'external-fixture-key').hexdigest()
+    common = dict(id='new', consumerId='alice', enabled=True, groups=['staff'],
+                  notBefore=100, expiresAt=200)
+    profiles = [
+        dict(common, method='bearer', secret='external-fixture-key'),
+        dict(common, method='header', secretSha256=header_digest),
+        dict(common, method='basic', secret='operator:fixture-password'),
+        dict(common, method='mtls', secret='b' * 64),
+    ]
+    hidden_values = [previous['secret']] + [
+        value for credential in profiles for key, value in credential.items()
+        if key in ('secret', 'secretSha256')
+    ]
+
+    def create():
+        result = run(tool, 'create-credential', source, profile, output)
+        assert not result.stdout
+        assert all(value.encode() not in result.stderr for value in hidden_values)
+        return result
+
+    for credential in profiles:
+        private(profile, credential)
+        result = create()
+        assert result.returncode == 0 and not result.stderr, result
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
+        assert json.loads(output.read_bytes()) == dict(snapshot, credentials=[previous, credential])
+        assert run(tool, 'validate', output).returncode == 0
+        published = output.read_bytes()
+        assert create().returncode == 2 and output.read_bytes() == published
+        output.unlink()
+
+    valid = profiles[0]
+    invalid_records = [
+        dict(valid, id='previous'), dict(valid, consumerId='missing'),
+        dict(valid, secret=previous['secret']),
+        dict(common, method='bearer',
+             secretSha256=hashlib.sha256(previous['secret'].encode()).hexdigest()),
+        dict(valid, groups=['other']), dict(valid, expiresAt=100),
+        dict(valid, secretSha256=header_digest),
+        json.dumps(valid).replace('"new"', r'"previ\u006fus"').encode(),
+        json.dumps(valid).replace('"id": "new"', r'"id":"new","\u0069d":"other"').encode(),
+        [valid],
+    ]
+    for credential in invalid_records:
+        private(profile, credential)
+        assert create().returncode == 2 and not output.exists()
+    private(profile, valid).chmod(0o644)
+    assert create().returncode == 2 and not output.exists()
+    assert source.read_bytes() == original
+
+    existing = [dict(previous, id=f'key-{i}', secret=f'fixture-key-{i}') for i in range(64)]
+    private(source, dict(snapshot, credentials=existing))
+    assert run(tool, 'validate', source).returncode == 0
+    private(profile, valid)
+    assert create().returncode == 2 and not output.exists()
+
+
 def test_targeted_metadata(tool, root):
     work = root / 'targeted-metadata'
     work.mkdir(mode=0o700)
@@ -1400,6 +1466,7 @@ def main(tool):
         test_hash_keys(tool, root)
         test_generated_key_verifier(tool, root)
         test_provision_key_verifier(tool, root)
+        test_create_credential(tool, root)
         test_targeted_metadata(tool, root)
         test_rotated_key_verifier(tool, root)
         test_credential_groups_preserve_and_reject_parent_removal(tool, root)
