@@ -39,9 +39,11 @@ u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out)
         const bool at_sep = (i == path.len) || (path.ptr[i] == '/');
         if (!at_sep) continue;
         if (i > start) {
-            if (!out.push(Str{path.ptr + start, i - start})) return kMaxPathSegments + 1;
+            if (!out.push(Str{path.ptr + static_cast<i64>(start),
+                              static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}))
+                return static_cast<u32>(static_cast<i64>(kMaxPathSegments) + 1);
         }
-        start = i + 1;
+        start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
     return out.len;
 }
@@ -111,7 +113,8 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
 
     auto rollback = [&]() {
         for (u32 r = pushed_parents.len; r > 0; r--) {
-            nodes[pushed_parents[r - 1]].children.len--;
+            nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len = static_cast<u32>(
+                static_cast<i64>(nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len) - 1);
         }
         nodes.len = saved_nodes_len;
     };
@@ -136,7 +139,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            child = static_cast<u16>(nodes.len - 1);
+            child = static_cast<u16>(static_cast<i64>(nodes.len) - 1);
             if (!nodes[cur].children.push(child)) {
                 // Pre-flight above rules this out, but if a future
                 // FixedVec invariant change makes it reachable, fall
@@ -165,7 +168,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // a simple pop and cannot corrupt an existing parameter prefix.
     for (u32 i = 0; i < pushed_parents.len; ++i) {
         auto& parent = nodes[pushed_parents[i]];
-        const u32 kLast = parent.children.len - 1;
+        const u32 kLast = static_cast<u32>(static_cast<i64>(parent.children.len) - 1);
         const u16 kChild = parent.children[kLast];
         if (is_param_segment(nodes[kChild].segment)) {
             for (u32 j = kLast; j > parent.children.param_count; --j)
