@@ -3319,7 +3319,8 @@ public:
         // Fresh ids pop in ascending order, so a never-used slot is exactly
         // the next one past the watermark; initialize_slots_to also covers any
         // gap so the prefix invariant does not depend on hand-out order.
-        if (id >= slots_initialized) initialize_slots_to(id + 1);
+        if (id >= slots_initialized)
+            initialize_slots_to(static_cast<u32>(static_cast<i64>(id) + 1));
         // A free slot has drained every target and cancel completion. Failed
         // sends can leave unsent bytes in the backend proactor even after the
         // connection's close ledger drains; those bytes belong to the old fd.
@@ -3520,11 +3521,12 @@ public:
         if (!force && pinned >= kProvidedBufCount / 2) return;
         u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
         if (budget == 0 && force) budget = 1;  // the backstop always makes progress
-        const u32 words = (slots_initialized + 63u) >> 6;
+        const u32 words = static_cast<u32>((static_cast<i64>(slots_initialized) + 63) >> 6);
         if (words == 0) return;
         const u32 start = recv_rearm_cursor < words ? recv_rearm_cursor : 0;
         for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
-            const u32 w = (start + n) % words;
+            const u32 w = static_cast<u32>((static_cast<i64>(start) + static_cast<i64>(n)) %
+                                           static_cast<i64>(words));
             u64 bits = recv_rearm_words[w];
             u64 retained = 0;
             while (bits != 0) {
@@ -3532,7 +3534,7 @@ public:
                     recv_rearm_cursor = w;  // resume inside this word
                     return;
                 }
-                const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
+                const u32 cid = static_cast<u32>(static_cast<i64>(w) * 64 + __builtin_ctzll(bits));
                 const u64 bit = u64{1} << (cid & 63u);
                 bits &= ~bit;
                 if (cid >= slots_initialized) {
@@ -3559,7 +3561,8 @@ public:
                 clear_deferred_recv(cid);
             }
             recv_rearm_words[w] |= retained;
-            recv_rearm_cursor = (w + 1u) % words;
+            recv_rearm_cursor =
+                static_cast<u32>((static_cast<i64>(w) + 1) % static_cast<i64>(words));
         }
     }
 
