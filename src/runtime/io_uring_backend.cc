@@ -2324,10 +2324,10 @@ void IoUringBackend::shutdown() {
         large_buf_base = nullptr;
     }
     if (large_buf_ring != nullptr) {
-        munmap(
-            large_buf_ring,
-            static_cast<u64>(sizeof(io_uring_buf_ring)) +
-                static_cast<u64>(kLargeProvidedBufCount) * static_cast<u64>(sizeof(io_uring_buf)));
+        const u64 ring_bytes = static_cast<u64>(kLargeProvidedBufCount) * sizeof(io_uring_buf);
+        u64 ring_sz = 0;
+        __builtin_add_overflow(static_cast<u64>(sizeof(io_uring_buf_ring)), ring_bytes, &ring_sz);
+        munmap(large_buf_ring, ring_sz);
         large_buf_ring = nullptr;
     }
     if (downstream_recv_terminal_windows != nullptr) {
