@@ -125,7 +125,7 @@ bool parse_http_date(Str value, u64& seconds) {
     auto number = [&](u32 start, u32 count, u32& result) {
         result = 0;
         for (u32 i = 0; i < count; ++i) {
-            const char kC = p[start + i];
+            const char kC = p[static_cast<i64>(start) + static_cast<i64>(i)];
             if (kC < '0' || kC > '9') return false;
             result = static_cast<u32>(static_cast<i64>(result) * 10 + static_cast<i64>(kC - '0'));
         }
@@ -145,26 +145,34 @@ bool parse_http_date(Str value, u64& seconds) {
     if (day == 0 ||
         static_cast<i64>(day) > static_cast<i64>(kDays[month]) + (month == 1 && kLeap ? 1 : 0))
         return false;
-    auto leap_years = [](u32 y) -> u64 { return y / 4 - y / 100 + y / 400; };
-    u64 days = static_cast<u64>(static_cast<i64>(year) - 1970) * 365 + leap_years(year - 1) -
-               leap_years(1969);
-    for (u32 i = 0; i < month; ++i)
-        days += static_cast<u64>(static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0));
-    days += static_cast<u64>(static_cast<i64>(day) - 1);
+    auto leap_years = [](u32 y) -> i64 {
+        return static_cast<i64>(y / 4) - static_cast<i64>(y / 100) + static_cast<i64>(y / 400);
+    };
+    i64 days = (static_cast<i64>(year) - 1970) * 365 + leap_years(year - 1) - leap_years(1969);
+    for (u32 i = 0; i < month; ++i) days += static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0);
+    days += static_cast<i64>(day) - 1;
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
     if (!equal({p, 3}, kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3)) return false;
-    seconds = days * 86400 + static_cast<u64>(hour) * 3600 + static_cast<u64>(minute) * 60 + second;
+    const i64 seconds_wide = days * 86400 + static_cast<i64>(hour) * 3600 +
+                             static_cast<i64>(minute) * 60 + static_cast<i64>(second);
+    seconds = static_cast<u64>(seconds_wide);
     return true;
 }
 
 bool fresh_enough(u64 timestamp, i64 now) {
     if (now <= 0) return false;
     const u64 kCurrent = static_cast<u64>(now);
-    return timestamp > kCurrent ? timestamp - kCurrent <= 300 : kCurrent - timestamp <= 300;
+    u64 delta = 0;
+    if (timestamp > kCurrent) {
+        (void)__builtin_sub_overflow(timestamp, kCurrent, &delta);
+    } else {
+        (void)__builtin_sub_overflow(kCurrent, timestamp, &delta);
+    }
+    return delta <= 300;
 }
 
 bool matches_canonical_base64(Str value, const u8* bytes, u32 length) {
-    u8 expected[kBase64Size + 1]{};
+    u8 expected[static_cast<size_t>(static_cast<i64>(kBase64Size) + 1)]{};
     u32 expected_len = 0;
     const bool kEncoded =
         rut_crypto_base64_encode_v1(bytes, length, expected, sizeof(expected), &expected_len) != 0;
@@ -215,7 +223,7 @@ bool signed_request_hmac_sha256_valid(Str method,
                               &body_hash_len) ||
         body_hash_len != sizeof(body_hash))
         return false;
-    u8 expected_digest[kBase64Size + 1]{};
+    u8 expected_digest[static_cast<size_t>(static_cast<i64>(kBase64Size) + 1)]{};
     u32 expected_digest_len = 0;
     const bool kDigestEncoded = rut_crypto_base64_encode_v1(body_hash,
                                                             sizeof(body_hash),
@@ -225,11 +233,13 @@ bool signed_request_hmac_sha256_valid(Str method,
     static constexpr char kDigestPrefix[] = "SHA-256=";
     const bool kDigestMatches =
         digest.ptr && kDigestEncoded && expected_digest_len == kBase64Size &&
-        digest.len == sizeof(kDigestPrefix) - 1 + kBase64Size &&
+        digest.len == static_cast<u32>(static_cast<i64>(sizeof(kDigestPrefix) - 1) +
+                                       static_cast<i64>(kBase64Size)) &&
         __builtin_memcmp(digest.ptr, kDigestPrefix, sizeof(kDigestPrefix) - 1) == 0 &&
-        rut_crypto_equal_v1(reinterpret_cast<const u8*>(digest.ptr + sizeof(kDigestPrefix) - 1),
-                            expected_digest,
-                            kBase64Size);
+        rut_crypto_equal_v1(
+            reinterpret_cast<const u8*>(digest.ptr + static_cast<i64>(sizeof(kDigestPrefix) - 1)),
+            expected_digest,
+            kBase64Size);
     rut_crypto_clear_v1(body_hash, sizeof(body_hash));
     rut_crypto_clear_v1(expected_digest, sizeof(expected_digest));
     if (!kDigestMatches) return false;
