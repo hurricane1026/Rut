@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -19,6 +20,18 @@ VALUE = f'ignoringParenImpCasts({ARITH})'
 ZERO = 'ignoringParenImpCasts(integerLiteral(equals(0)))'
 SYNTAX_CHECK = 'clang-check'
 VALIDATED = set()
+
+
+def paired_checker(query):
+    location = shutil.which(query)
+    if not location:
+        return None
+    name = Path(location).name
+    if not name.startswith('clang-query-'):
+        return None
+    paired = Path(location).absolute().with_name(
+        'clang-check-' + name.removeprefix('clang-query-'))
+    return str(paired) if shutil.which(str(paired)) else None
 
 
 def queries(scope):
@@ -100,6 +113,29 @@ def matches(tool, file, query, flags):
 
 def self_test(tool):
     with tempfile.TemporaryDirectory() as directory:
+        path_bin = Path(directory) / 'path-bin'
+        local_bin = Path(directory) / 'local-bin'
+        path_bin.mkdir()
+        local_bin.mkdir()
+        for candidate in (path_bin / 'clang-query-22', path_bin / 'clang-check-22',
+                          local_bin / 'clang-query-22', local_bin / 'clang-check-22'):
+            candidate.write_text('#!/bin/sh\nexit 0\n')
+            candidate.chmod(0o755)
+        old_path = os.environ.get('PATH', '')
+        old_cwd = os.getcwd()
+        try:
+            os.environ['PATH'] = str(path_bin) + os.pathsep + old_path
+            os.chdir(local_bin)
+            local_pair = paired_checker('./clang-query-22')
+            path_pair = paired_checker('clang-query-22')
+        finally:
+            os.chdir(old_cwd)
+            os.environ['PATH'] = old_path
+        if local_pair != str((local_bin / 'clang-check-22').absolute()):
+            raise RuntimeError(f'clang checker self-test: local pair mismatch: {local_pair}')
+        if path_pair != str(path_bin / 'clang-check-22'):
+            raise RuntimeError(f'clang checker self-test: PATH pair mismatch: {path_pair}')
+
         file = Path(directory) / 'probe.cc'
         file.write_text("""using U = unsigned;
 bool bad(U a, U b) { return a - b < 0; }
@@ -246,17 +282,10 @@ def main():
     args = parser.parse_args()
     global SYNTAX_CHECK
     if args.clang_check is None and args.clang_query != 'clang-query':
-        query_location = shutil.which(args.clang_query)
-        if not query_location:
+        paired = paired_checker(args.clang_query)
+        if not paired:
             raise SystemExit(f'cannot locate clang-query executable: {args.clang_query}')
-        query_name = Path(query_location).name
-        if query_name.startswith('clang-query-'):
-            paired = str(Path(query_location).with_name(
-                'clang-check-' + query_name.removeprefix('clang-query-')))
-            if shutil.which(paired):
-                args.clang_check = paired
-            else:
-                raise SystemExit(f'no matching clang-check for {args.clang_query}; pass --clang-check explicitly')
+        args.clang_check = paired
     SYNTAX_CHECK = args.clang_check or 'clang-check'
     self_test(args.clang_query)
     test_unsigned_add_sub(args.clang_query)
