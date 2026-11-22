@@ -38,9 +38,10 @@ voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
         return nullptr;
     const u32 kStart = static_cast<u32>((static_cast<i64>(codec.used) + 15) & ~15ll);
     if (kStart > SlicePool::kBulkSliceSize ||
-        kBytes > static_cast<u64>(SlicePool::kBulkSliceSize) - static_cast<u64>(kStart))
+        kBytes > static_cast<u64>(static_cast<i64>(SlicePool::kBulkSliceSize) -
+                                  static_cast<i64>(kStart)))
         return nullptr;
-    u8* const kResult = reinterpret_cast<u8*>(&codec) + kStart;
+    u8* const kResult = reinterpret_cast<u8*>(&codec) + static_cast<i64>(kStart);
     memset(kResult, 0, kBytes);
     codec.used = static_cast<u32>(static_cast<i64>(kStart) + static_cast<i64>(kBytes));
     return kResult;
@@ -55,15 +56,18 @@ WsDeflateStatus inflate_bytes(
     for (;;) {
         u8 excess = 0;
         const bool kAtLimit = codec.decoded == codec.decoded_limit;
-        stream.next_out = kAtLimit ? &excess : output + codec.decoded;
-        stream.avail_out = kAtLimit ? 1u : codec.decoded_limit - codec.decoded;
+        stream.next_out = kAtLimit ? &excess : output + static_cast<i64>(codec.decoded);
+        stream.avail_out = kAtLimit ? 1u
+                                    : static_cast<u32>(static_cast<i64>(codec.decoded_limit) -
+                                                       static_cast<i64>(codec.decoded));
         const u32 kBeforeInput = stream.avail_in;
         const u32 kBeforeOutput = stream.avail_out;
         const int kStatus = inflate(&stream, Z_BLOCK);
         const u32 kProduced =
             static_cast<u32>(static_cast<i64>(kBeforeOutput) - static_cast<i64>(stream.avail_out));
         if (kAtLimit && kProduced) return WsDeflateStatus::Limit;
-        codec.decoded += kProduced;
+        codec.decoded =
+            static_cast<u32>(static_cast<i64>(codec.decoded) + static_cast<i64>(kProduced));
         boundary = (stream.data_type & 128) != 0 && (stream.data_type & 63) == 0;
         if (kStatus == Z_STREAM_END) {
             // RFC 7692 permits BFINAL=1 followed by further blocks. Keep the
@@ -95,7 +99,7 @@ WsDeflateCodec* ws_deflate_create(SlicePool& pool, WsDeflateOptions options) {
     codec->encoder.zalloc = codec_alloc;
     codec->encoder.zfree = codec_free;
     codec->encoder.opaque = codec;
-    const int kDecode = inflateInit2(&codec->decoder, -options.receive_window);
+    const int kDecode = inflateInit2(&codec->decoder, -static_cast<int>(options.receive_window));
     if (kDecode != Z_OK) {
         pool.free(kStorage);
         return nullptr;
@@ -175,7 +179,8 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
             ws_unmask_chunk(codec.scratch,
                             kTake,
                             mask_key,
-                            static_cast<u64>((mask_offset & 3) + (static_cast<u64>(offset) & 3)));
+                            static_cast<u64>(static_cast<i64>(mask_offset & 3) +
+                                             static_cast<i64>(static_cast<u64>(offset) & 3)));
             source = codec.scratch;
         }
         const auto kStatus = inflate_bytes(codec, source, kTake, output, boundary);
@@ -215,12 +220,15 @@ WsDeflateStatus ws_deflate_payload(
     const int kStatus = deflate(&stream, Z_SYNC_FLUSH);
     if (kStatus != Z_OK) return WsDeflateStatus::Error;
     if (stream.avail_in || stream.avail_out == 0) return WsDeflateStatus::Limit;
-    const u32 kWritten = capacity - stream.avail_out;
+    const u32 kWritten =
+        static_cast<u32>(static_cast<i64>(capacity) - static_cast<i64>(stream.avail_out));
     static constexpr u8 kTail[] = {0, 0, 0xff, 0xff};
     if (kWritten < sizeof(kTail) ||
-        memcmp(output + kWritten - sizeof(kTail), kTail, sizeof(kTail)) != 0)
+        memcmp(output + static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)),
+               kTail,
+               sizeof(kTail)) != 0)
         return WsDeflateStatus::Error;
-    *output_len = kWritten - sizeof(kTail);
+    *output_len = static_cast<u32>(static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)));
     return WsDeflateStatus::Ok;
 }
 }  // namespace rut
