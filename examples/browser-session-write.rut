@@ -1,0 +1,39 @@
+import "clients/redis-client.rut"
+import "middleware/browser_origin.rut"
+import "middleware/jwt_session.rut"
+
+func allowBrowserMutation(_ tls: bool, _ origin: str, _ site: str, _ expected: str) -> bool {
+    tls && browser_origin.validOrigin(expected) && origin == expected && site == "same-origin"
+}
+
+chain browserMutation {
+    before allowBrowserMutation(req.isTls, req.uniqueHeader("Origin").or(""),
+        req.uniqueHeader("Sec-Fetch-Site").or(""), env("BROWSER_ORIGIN")) else 403
+}
+
+func permitStatus(_ result: RedisSessionResult) -> i32 {
+    match result {
+        .value(data) => if data == b"active" { 1 } else { 0 }
+        .missing => 0
+        _ => -1
+    }
+}
+
+// An example protected mutation. Read scope alone grants no write access.
+route POST "/private/write" use chain browserMutation {
+    let token = req.uniqueCookie("__Host-rut_session").or("")
+    let document = jwt_session.documentHs256(token, env("JWT_SECRET"), env("JWT_PREVIOUS_SECRET"), env("JWT_ISSUER"), env("JWT_AUDIENCE"))
+    guard jwtHasScope(document, "orders:write") else { return 403 }
+    guard let key = jwt_session.key(token, env("JWT_SESSION_NAMESPACE")) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let result = redisSessionGet(connection, Bytes(env("REDIS_USERNAME")), Bytes(env("REDIS_PASSWORD")),
+        parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let status = permitStatus(result)
+    guard status >= 0 else { return 503 }
+    if status == 1 {
+        return response(204, headers: {"Cache-Control": "no-store"})
+    } else { return 401 }
+}
+
+route "/" { return 404 }
