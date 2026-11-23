@@ -9325,10 +9325,18 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             loop->close_conn(conn);
             return;
         }
-        conn.recv_buf.set_len(kOldTotal - kOldHeader + kNewHeader);
+        const i64 new_total = static_cast<i64>(kOldTotal) - static_cast<i64>(kOldHeader) +
+                              static_cast<i64>(kNewHeader);
+        if (new_total < 0 || new_total > static_cast<i64>(conn.recv_buf.capacity())) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.recv_buf.set_len(static_cast<u32>(new_total));
         conn.req_header_end = kNewHeader;
         if (conn.req_initial_send_len >= kOldHeader)
-            conn.req_initial_send_len = conn.req_initial_send_len - kOldHeader + kNewHeader;
+            conn.req_initial_send_len =
+                static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) -
+                                 static_cast<i64>(kOldHeader) + static_cast<i64>(kNewHeader));
     }
 #endif
     // Pick the request source. A retried fresh connect (after a reused socket died
@@ -10209,9 +10217,16 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     // would be reframed as the body of a :status 1xx (or stall waiting on it).
     // (101 is handled above; this range covers 100/102/103/...)
     if (resp.status_code >= 100 && resp.status_code < 200) {
-        const u32 kRem = conn.upstream_recv_buf.len() - kHdrEnd;
+        if (kHdrEnd > conn.upstream_recv_buf.len()) {
+            h2_proxy_fail(loop, conn, 502);
+            return;
+        }
+        const u32 kRem = static_cast<u32>(static_cast<i64>(conn.upstream_recv_buf.len()) -
+                                          static_cast<i64>(kHdrEnd));
         if (kRem > 0 && conn.upstream_recv_slice)
-            __builtin_memmove(conn.upstream_recv_slice, conn.upstream_recv_slice + kHdrEnd, kRem);
+            __builtin_memmove(conn.upstream_recv_slice,
+                              conn.upstream_recv_slice + static_cast<i64>(kHdrEnd),
+                              kRem);
         conn.upstream_recv_buf.reset();
         if (kRem > 0) {
             conn.upstream_recv_buf.commit(kRem);
@@ -10243,7 +10258,12 @@ void h2_on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     // Is the body fully buffered?
-    const u32 kHaveBody = conn.upstream_recv_buf.len() - kHdrEnd;
+    if (kHdrEnd > conn.upstream_recv_buf.len()) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    const u32 kHaveBody = static_cast<u32>(static_cast<i64>(conn.upstream_recv_buf.len()) -
+                                           static_cast<i64>(kHdrEnd));
     u32 body_len = 0;
     bool complete = false;
     if (resp.chunked) {
@@ -10303,7 +10323,13 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // or parse a truncated request → the stream times out. Resubmit the remainder
     // until the full request is written, then read the response.
     Http2Conn* h2 = conn.h2;
-    h2->async_synth_sent += static_cast<u32>(ev.result);
+    u32 next_sent = 0;
+    if (ev.result < 0 ||
+        __builtin_add_overflow(h2->async_synth_sent, static_cast<u32>(ev.result), &next_sent)) {
+        h2_proxy_fail(loop, conn, 502);
+        return;
+    }
+    h2->async_synth_sent = next_sent;
     if (h2->async_synth_sent < h2->async_synth_len) {
         // Slot is still h2_on_upstream_request_sent, so the next send CQE re-enters.
         if (!loop->submit_send_upstream(conn,
