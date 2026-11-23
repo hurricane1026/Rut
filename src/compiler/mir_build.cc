@@ -622,7 +622,7 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             expr.rhs->may_nil || expr.rhs->may_error || expr.may_nil || expr.may_error ||
             expr.type != (kPredicate ? HirTypeKind::Bool : HirTypeKind::Str) ||
             (kPredicate && (expr.int_value < 0 || expr.int_value > 3)) ||
-            (kTrim && (expr.int_value < 0 || expr.int_value > 1)))
+            (kTrim && (expr.int_value < 0 || expr.int_value > 2)))
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
@@ -775,6 +775,28 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         v.error_struct_index = expr.error_struct_index;
         v.error_variant_index = expr.error_variant_index;
+        return v;
+    }
+    if (expr.kind == HirExprKind::StringTransform || expr.kind == HirExprKind::RegexReplace) {
+        if (expr.args.len != 3 || expr.type != HirTypeKind::Str || !expr.may_nil ||
+            expr.may_error || expr.int_value < 0 || expr.int_value > 3 ||
+            ((expr.kind == HirExprKind::RegexReplace) != (expr.int_value == 3)))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        v.kind = expr.kind == HirExprKind::RegexReplace ? MirValueKind::RegexReplace
+                                                        : MirValueKind::StringTransform;
+        v.type = MirTypeKind::Str;
+        v.may_nil = true;
+        v.int_value = expr.int_value;
+        v.str_value = expr.str_value;
+        for (u32 i = 0; i < 3; ++i) {
+            if (!expr.args[i] || expr.args[i]->type != HirTypeKind::Str || expr.args[i]->may_nil ||
+                expr.args[i]->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            auto item = mir_value(*expr.args[i], module, fn, ctx);
+            if (!item) return core::make_unexpected(item.error());
+            if (!fn->values.push(item.value()) || !v.args.push(&fn->values[fn->values.len - 1]))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+        }
         return v;
     }
     if (expr.kind == HirExprKind::StringSplit) {

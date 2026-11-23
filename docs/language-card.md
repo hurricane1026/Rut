@@ -112,7 +112,7 @@ remains restricted to the separately documented forms.
 `str` view into `text`, removing exactly one matching prefix/suffix. A nonmatching,
 longer or empty affix leaves the view unchanged; a full match produces an empty
 string. Matching is case-sensitive and byte-exact, including embedded NULs; no
-Unicode normalization, whitespace trimming or repeated removal occurs. Both
+Unicode normalization or repeated removal occurs in these affix methods. Both
 operands must be unwrapped `str`. These methods allocate no storage and retain
 the input's lifetime; compose them with helpers and consistent-hash keys like
 other pure string expressions. Trimming alone does not validate a credential:
@@ -127,6 +127,58 @@ route GET "/token" {
     return 204
 }
 ```
+
+
+### Byte-string core
+
+`str` operations count and preserve bytes, including NUL and non-UTF-8 data.
+They do not provide Unicode case folding, normalization or grapheme indexing.
+`trim()` removes only ASCII whitespace (space and bytes 0x09...0x0d) from both
+ends and returns a borrowed view without allocating. Interior bytes remain
+unchanged; empty/all-whitespace input yields an empty string.
+
+`upper()` and `lower()` map only ASCII a...z/A...Z. They return request-owned
+`str?`, including a present empty string for empty input. `replace(old, new)`
+replaces every nonoverlapping literal byte sequence, left to right. Both
+arguments may be dynamic strings; an empty `old` is invalid. The free forms
+`upper(text)`, `lower(text)`, `trim(text)`, `replace(text, old, new)` and pipeline
+forms such as `text | lower(_)` have the same behavior. User bindings shadow
+these free builtin names.
+
+`replace(re"pattern", new)` uses the existing pinned RE2 byte engine (Latin-1),
+with a compile/load-time literal pattern of 1...1024 bytes and at most 8 capture
+groups. Backreferences and lookaround are rejected. Replacement bytes are
+literal: `$1` and backslashes do not expand captures. Every match is replaced,
+with anchors/boundaries evaluated against the original subject. Empty matches
+insert the replacement and advance the search by one byte, preserving that
+byte; an empty match at end-of-input is processed once. At most 64 matches are
+allowed; exceeding that bound returns `nil`, never partial output.
+
+Owned operations accept input/replacement up to 8192 bytes, literal needles of
+1...256 bytes and output up to 16384 bytes, subject also to available contiguous
+arena storage and a shared 256 KiB request construction budget.
+Missing/exhausted request storage, invalid limits or excessive
+output return `nil`. Even unchanged output owns a copy. Bind an owned result
+(including a helper returning it) to `let` before `guard let`/`if let` so the
+allocation executes once. Owned operations currently require HTTP routes
+without explicit `wait`; timers and WebSocket callbacks are rejected. Borrowed
+`trim`, `slice` and prefix/suffix trimming retain the source lifetime.
+
+```swift
+route POST "/normalize" {
+    let pending = req.body.trim().lower()
+    guard let text = pending else { return 503 }
+    let replaced = text.replace(re"/+", "/")
+    guard let clean = replaced else { return 503 }
+    return response(200, body: clean)
+}
+```
+
+The core also includes concatenation, predicates, checked `slice`, optional
+byte-offset `find`, `len`/`isEmpty`, bounded owned `split`, Vectorscan full-match
+`matches`, and borrowed `regexCapture`. Swift's `Regex.Match` carrier and
+`s.match(re"")` remain absent; use `regexCapture` for participating groups.
+Runnable example: [string-core.rut](../examples/string-core.rut).
 
 ## Bindings and control flow
 
@@ -1809,8 +1861,10 @@ not provided. Runnable example: [math.rut](../examples/math.rut).
 ## Built-ins (call them, never reimplement)
 
 ```
-string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
+string:  s.len s.isEmpty s.contains s.trim()
+         s.upper()/lower() -> str? (ASCII, owned)
          s.replace/split/slice s.matches(re"")
+         s.find(str[, i32 start]) -> i32? (absolute byte offset)
          regexCapture(s, re"...", 1) -> str?
          ⏳ s.match(re"")
          s.hasPrefix(str) s.hasSuffix(str)
@@ -3580,6 +3634,39 @@ existing bounded byte search; neither operation allocates, performs I/O or chang
 `netError()`. Ordinary helper, HTTP, WebSocket and native execution share the same
 contract. These custom Bytes methods use existing call syntax; Swift collection
 range syntax is not added. See [the full contract](bytes-fields.md).
+
+## String byte search
+
+`text.len -> i32` is the byte count of an unwrapped `str`, including NUL and
+individual bytes of multibyte text. It reads the existing span length without
+allocation or decoding. Optional strings must be unwrapped before reading len.
+
+`text.find(delimiter[, start]) -> i32?` locates the first exact byte match at or
+after `start` (default zero). The result is an absolute byte offset into `text`,
+not an offset relative to `start`. Both text and delimiter must be unwrapped
+`str`; start must be unwrapped `i32`. A missing match or start outside
+`0...text.len` returns nil. An empty delimiter matches at start, including the
+end of the input; a match at byte zero is present zero.
+Spans longer than the representable i32 length return nil.
+
+Search is case-sensitive and binary-safe, with no percent decoding, Unicode
+normalization or character-boundary adjustment. Dynamic delimiters and starts
+are supported. It allocates no storage and shares the checked `Bytes.find`
+intrinsic, including HTTP, WebSocket, helper and native execution. This custom
+Rut method adds no Swift String index API or implicit Bytes conversion. It may
+compose inline with slice in consistent-hash keys. Unwrap the result before
+using it as an integer:
+
+```rut
+route POST "/field" {
+    guard let end = req.body.find(":") else { return 400 }
+    guard let field = req.body.slice(0, end) else { return 400 }
+    return response(200, body: field)
+}
+```
+
+See [byte field extraction](bytes-fields.md) and the
+[runnable example](../examples/string-find.rut).
 
 ## String byte slices
 

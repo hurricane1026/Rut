@@ -318,11 +318,20 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::StrTrimPrefix:
             buf.put_cstr("str.trim_prefix");
             break;
+        case Opcode::StrTransform:
+            buf.put_cstr("str.transform");
+            break;
+        case Opcode::StrRegexReplace:
+            buf.put_cstr("str.regex_replace");
+            break;
         case Opcode::StrSplit:
             buf.put_cstr("str.split");
             break;
         case Opcode::StrTrimSuffix:
             buf.put_cstr("str.trim_suffix");
+            break;
+        case Opcode::StrTrimAscii:
+            buf.put_cstr("str.trim_ascii");
             break;
         case Opcode::StrRegexCapture:
             buf.put_cstr("str.regexCapture");
@@ -951,6 +960,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[1]);
             break;
+        case Opcode::StrRegexReplace:
         case Opcode::StrRegexCapture:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
@@ -964,6 +974,15 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[0]);
             buf.put_cstr(", ");
             print_quoted_str(buf, inst.imm.str_val);
+            break;
+        case Opcode::StrTransform:
+            buf.put(' ');
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                if (i) buf.put_cstr(", ");
+                print_value_ref(buf, inst.operand(i));
+            }
+            buf.put_cstr(", mode=");
+            buf.put_u32(static_cast<u32>(inst.imm.i32_val));
             break;
         case Opcode::StrInterpolate:
             buf.put_cstr(" [");
@@ -979,6 +998,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_quoted_str(buf, inst.imm.str_val);
             break;
+        case Opcode::StrTrimAscii:
         case Opcode::OptWrap:
         case Opcode::OptIsNil:
         case Opcode::OptUnwrap:

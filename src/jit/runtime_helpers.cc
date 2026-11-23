@@ -38,6 +38,7 @@
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
+#include "rut/runtime/string_ops.h"
 #include "rut/runtime/string_split.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
@@ -1062,6 +1063,34 @@ void rut_helper_req_query(const u8* req_data,
             return;
         }
     }
+}
+
+u8 rut_helper_str_transform(void* conn,
+                            void* arena,
+                            u32 mode,
+                            const char* text,
+                            u32 length,
+                            const char* needle,
+                            u32 needle_length,
+                            const char* replacement,
+                            u32 replacement_length,
+                            const char** output,
+                            u32* output_length) {
+    *output = nullptr;
+    *output_length = 0;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    Str result;
+    if (!transform_string(storage,
+                          {text, length},
+                          {needle, needle_length},
+                          {replacement, replacement_length},
+                          mode,
+                          &result))
+        return 0;
+    *output = result.ptr;
+    *output_length = result.len;
+    return 1;
 }
 
 void* rut_helper_str_split(void* conn,
@@ -2499,6 +2528,40 @@ u8 rut_helper_regex_capture(void* connection,
     return state;
 }
 
+u8 rut_helper_regex_replace(void* conn,
+                            void* arena,
+                            const char* text,
+                            u32 length,
+                            void* db,
+                            const char* replacement,
+                            u32 replacement_length,
+                            const char** output,
+                            u32* output_length) {
+    *output = nullptr;
+    *output_length = 0;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (!storage || !db) return 0;
+    auto& handle = *static_cast<RegexHandle*>(db);
+    pthread_mutex_lock(&handle.mutex);
+    if (handle.closing || !handle.capture_program) {
+        pthread_mutex_unlock(&handle.mutex);
+        return 0;
+    }
+    ++handle.active_scans;
+    void* program = handle.capture_program;
+    pthread_mutex_unlock(&handle.mutex);
+    Str result;
+    const u8 state = capture_regex_replace(
+        program, *storage, {text, length}, {replacement, replacement_length}, &result);
+    end_regex_scan(&handle);
+    if (state) {
+        *output = result.ptr;
+        *output_length = result.len;
+    }
+    return state;
+}
+
 void rut_helper_regex_serialized_free(void* db, char* bytes, u64 length) {
     if (!bytes) return;
     if (db && static_cast<RegexHandle*>(db)->capture_program)
@@ -2658,6 +2721,12 @@ extern "C" u32 rut_helper_regex_scratch_cache_count_for_test() {
     for (RegexScratchCache* cache = g_regex_caches; cache != nullptr; cache = cache->next) count++;
     pthread_mutex_unlock(&g_regex_cache_list_mutex);
     return count;
+}
+
+void rut_helper_str_trim_ascii(const char* s, u32 size, const char** out_ptr, u32* out_size) {
+    const Str result = trim_ascii_string({s, size});
+    *out_ptr = result.ptr;
+    *out_size = result.len;
 }
 
 void rut_helper_str_trim_prefix(

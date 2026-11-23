@@ -1,0 +1,18 @@
+// Byte-string core: normalize a body and extract its first field.
+route POST "/normalize" {
+    let pending = req.body.trim().lower()
+    guard let text = pending else { return 503 }
+    let replaced = text.replace(re"/+", "/")
+    guard let clean = replaced else { return 503 }
+    let splitResult = clean.split(",")
+    guard let fields = splitResult else { return 503 }
+    guard let first = fields.get(0) else { return 500 }
+    guard !first.isEmpty else { return 400 }
+    return response(200, body: first)
+}
+route POST "/field" {
+    let text = req.body.trim()
+    guard let offset = text.find(":") else { return 400 }
+    guard let field = text.slice(offset + 1, text.len) else { return 400 }
+    return response(200, body: field)
+}

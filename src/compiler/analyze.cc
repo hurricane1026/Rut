@@ -184,10 +184,12 @@ constexpr Str kUuidWaitDetail = lit_str(
 constexpr Str kHeaderAllWaitDetail = lit_str("req.getAll() requires a route without explicit wait");
 constexpr Str kQueryAllWaitDetail =
     lit_str("req.queryAll() requires a route without explicit wait");
+constexpr Str kStringOwnedWaitDetail =
+    lit_str("owned string operations require an HTTP route without explicit wait");
+constexpr Str kStringOwnedBindDetail =
+    lit_str("bind owned string results to a let before guard let/if let");
 constexpr Str kStringSplitWaitDetail =
     lit_str("split() requires an HTTP route without explicit wait");
-constexpr Str kStringSplitBindDetail = lit_str(
-    "bind split() to a let before guard let/if let; fresh collections must be evaluated once");
 constexpr Str kQueryAllBindDetail = lit_str(
     "bind req.queryAll() to a let before guard let/if let; fresh collections must be evaluated "
     "once");
@@ -4691,6 +4693,36 @@ static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
         FrontendError::UnsupportedSyntax, expr.span, lit_str("unknown json operation"));
 }
 
+static FrontendResult<HirExpr> make_string_transform(const HirExpr& text,
+                                                     const HirExpr& needle,
+                                                     const HirExpr& replacement,
+                                                     u32 mode,
+                                                     Str pattern,
+                                                     Span span,
+                                                     HirRoute* route) {
+    if (!route || route->is_timer || route->is_ws_callback || route->time_ops_blocked)
+        return frontend_error(FrontendError::UnsupportedSyntax, span, kStringOwnedWaitDetail);
+    for (const auto* value : {&text, &needle, &replacement})
+        if (value->type != HirTypeKind::Str || value->may_nil || value->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span,
+                                  lit_str("string conversion/replacement expects unwrapped str"));
+    HirExpr result{};
+    result.kind = mode == 3 ? HirExprKind::RegexReplace : HirExprKind::StringTransform;
+    result.type = HirTypeKind::Str;
+    result.may_nil = true;
+    result.span = span;
+    result.int_value = mode;
+    result.str_value = pattern;
+    for (const auto* value : {&text, &needle, &replacement}) {
+        if (!route->exprs.push(*value)) return frontend_error(FrontendError::OutOfMemory, span);
+        if (!result.args.push(&route->exprs[route->exprs.len - 1]))
+            return frontend_error(FrontendError::OutOfMemory, span);
+    }
+    route->uses_http_values = true;
+    return result;
+}
+
 static FrontendResult<HirExpr> make_string_split(const HirExpr& text,
                                                  const HirExpr& separator,
                                                  Span span,
@@ -4747,7 +4779,8 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     const HirLocal* locals,
     u32 local_count,
     const MatchPayloadBinding* binding,
-    const HirExpr* receiver_override = nullptr) {
+    const HirExpr* receiver_override = nullptr,
+    const HirExpr* pipe_placeholder_source = nullptr) {
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         expr.lhs->name.eq(lit_str("req")) && expr.name.eq(lit_str("body")) &&
@@ -5107,21 +5140,24 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                             ? FrontendResult<HirExpr>(*receiver_override)
                             : analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
         const bool kSlicing = expr.name.eq(lit_str("slice"));
-        if (receiver && (receiver->type == HirTypeKind::Bytes ||
-                         (kSlicing && receiver->type == HirTypeKind::Str))) {
-            const auto kDetail = receiver->type == HirTypeKind::Str
-                                     ? lit_str("str.slice requires unwrapped str and i32 bounds")
-                                     : lit_str(
-                                           "Bytes fields require unwrapped values: "
-                                           "slice(i32 start, i32 end) or "
-                                           "find(Bytes delimiter[, i32 start])");
+        if (receiver &&
+            (receiver->type == HirTypeKind::Bytes || receiver->type == HirTypeKind::Str)) {
+            const auto kDetail =
+                receiver->type == HirTypeKind::Str
+                    ? (kSlicing ? lit_str("str.slice requires unwrapped str and i32 bounds")
+                                : lit_str("str.find expects find(str delimiter[, i32 start]) "
+                                          "with unwrapped operands"))
+                    : lit_str(
+                          "Bytes fields require unwrapped values: "
+                          "slice(i32 start, i32 end) or "
+                          "find(Bytes delimiter[, i32 start])");
             if (receiver->may_nil || receiver->may_error ||
                 (kSlicing ? expr.args.len != 2 : expr.args.len < 1 || expr.args.len > 2))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             auto first = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
             if (!first) return core::make_unexpected(first.error());
             if (first->may_nil || first->may_error ||
-                first->type != (kSlicing ? HirTypeKind::I32 : HirTypeKind::Bytes))
+                first->type != (kSlicing ? HirTypeKind::I32 : receiver->type))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
             HirExpr last{};
             last.kind = HirExprKind::IntLit;
@@ -5497,6 +5533,99 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
 
+    if (recv.type == HirTypeKind::Str &&
+        (expr.name.eq(lit_str("upper")) || expr.name.eq(lit_str("lower")) ||
+         expr.name.eq(lit_str("replace")))) {
+        const bool replace = expr.name.eq(lit_str("replace"));
+        if (expr.args.len != (replace ? 2u : 0u))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("upper/lower take no arguments; replace takes two"));
+        HirExpr empty{};
+        empty.kind = HirExprKind::StrLit;
+        empty.type = HirTypeKind::Str;
+        empty.str_value = lit_str("");
+        HirExpr needle = empty;
+        HirExpr replacement = empty;
+        Str pattern{};
+        u32 mode = expr.name.eq(lit_str("upper")) ? 0 : replace ? 2 : 1;
+        const auto kAnalyzeStringArg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
+            if (arg.kind != AstExprKind::Placeholder)
+                return analyze_expr(arg, route, mod, locals, local_count, binding);
+            if (pipe_placeholder_source == nullptr)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg.span,
+                                      lit_str("placeholder outside pipe"));
+            const i64 kSlot = arg.int_value;
+            if (kSlot <= 0 || kSlot > static_cast<i64>(kMaxTupleSlots))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg.span,
+                                      lit_str("placeholder slot out of range"));
+            if (pipe_placeholder_source->type != HirTypeKind::Tuple) {
+                if (kSlot != 1)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          arg.span,
+                                          lit_str("non-tuple source with non-unit placeholder"));
+                return *pipe_placeholder_source;
+            }
+            if (kSlot > static_cast<i64>(pipe_placeholder_source->tuple_len))
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      arg.span,
+                                      lit_str("placeholder slot exceeds tuple arity"));
+            if (!route->exprs.push(*pipe_placeholder_source))
+                return frontend_error(FrontendError::OutOfMemory, arg.span);
+            HirExpr* source = &route->exprs[route->exprs.len - 1];
+            const u32 kSlotIndex = static_cast<u32>(kSlot - 1);
+            if (source->args.len == source->tuple_len && source->args[kSlotIndex] != nullptr)
+                return *source->args[kSlotIndex];
+            HirExpr out{};
+            out.kind = HirExprKind::TupleSlot;
+            out.type = source->tuple_types[kSlotIndex];
+            if (out.type == HirTypeKind::Generic)
+                out.generic_index = source->tuple_struct_indices[kSlotIndex];
+            else if (out.type == HirTypeKind::Struct)
+                out.struct_index = source->tuple_struct_indices[kSlotIndex];
+            else if (out.type == HirTypeKind::Variant)
+                out.variant_index = source->tuple_variant_indices[kSlotIndex];
+            auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                               out.type,
+                                               out.generic_index,
+                                               out.variant_index,
+                                               out.struct_index,
+                                               out.tuple_len,
+                                               out.tuple_types,
+                                               out.tuple_variant_indices,
+                                               out.tuple_struct_indices,
+                                               arg.span);
+            if (!shape) return core::make_unexpected(shape.error());
+            out.shape_index = shape.value();
+            out.span = arg.span;
+            out.int_value = static_cast<i32>(kSlotIndex);
+            out.lhs = source;
+            return out;
+        };
+        if (replace) {
+            if (expr.args[0]->kind == AstExprKind::RegexLit) {
+                pattern = expr.args[0]->str_value;
+                void* compiled = capture_regex_compile(pattern);
+                if (!compiled)
+                    return frontend_error(FrontendError::InvalidRegex,
+                                          expr.args[0]->span,
+                                          lit_str("replace requires a bounded RE2 regex literal"));
+                capture_regex_destroy(compiled);
+                mode = 3;
+            } else {
+                auto value = kAnalyzeStringArg(*expr.args[0]);
+                if (!value) return value;
+                needle = value.value();
+            }
+            auto value = kAnalyzeStringArg(*expr.args[1]);
+            if (!value) return value;
+            replacement = value.value();
+        }
+        return make_string_transform(recv, needle, replacement, mode, pattern, expr.span, route);
+    }
+
     if (recv.type == HirTypeKind::Str && expr.name.eq(lit_str("split"))) {
         if (expr.args.len != 1 || !expr.args[0])
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -5508,11 +5637,21 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
 
     if (recv.type == HirTypeKind::Str &&
-        (expr.name.eq(lit_str("trimPrefix")) || expr.name.eq(lit_str("trimSuffix")))) {
-        constexpr auto kDetail = lit_str("trimPrefix/trimSuffix expects one unwrapped str");
-        if (expr.args.len != 1 || !expr.args[0])
+        (expr.name.eq(lit_str("trimPrefix")) || expr.name.eq(lit_str("trimSuffix")) ||
+         expr.name.eq(lit_str("trim")))) {
+        const bool kWhitespace = expr.name.eq(lit_str("trim"));
+        const auto kDetail = kWhitespace
+                                 ? lit_str("str.trim expects no arguments")
+                                 : lit_str("trimPrefix/trimSuffix expects one unwrapped str");
+        if (kWhitespace ? expr.args.len != 0 : expr.args.len != 1 || !expr.args[0])
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
-        auto needle = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        HirExpr empty{};
+        empty.kind = HirExprKind::StrLit;
+        empty.type = HirTypeKind::Str;
+        empty.str_value = lit_str("");
+        auto needle = kWhitespace
+                          ? FrontendResult<HirExpr>(empty)
+                          : analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
         if (!needle) return core::make_unexpected(needle.error());
         if (needle->type != HirTypeKind::Str || needle->may_nil || needle->may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
@@ -5520,7 +5659,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         out.kind = HirExprKind::StringTrim;
         out.type = HirTypeKind::Str;
         out.span = expr.span;
-        out.int_value = expr.name.eq(lit_str("trimSuffix")) ? 1 : 0;
+        out.int_value = kWhitespace ? 2 : expr.name.eq(lit_str("trimSuffix")) ? 1 : 0;
         if (!route->exprs.push(recv)) return frontend_error(FrontendError::OutOfMemory, expr.span);
         out.lhs = &route->exprs[route->exprs.len - 1];
         if (!route->exprs.push(needle.value()))
@@ -12117,9 +12256,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             count.lhs = &route->exprs[route->exprs.len - 1];
             return count;
         }
-        if (base->type == HirTypeKind::Bytes) {
+        if (base->type == HirTypeKind::Bytes ||
+            (base->type == HirTypeKind::Str && expr.name.eq(lit_str("len")))) {
             if (base->may_nil || base->may_error ||
-                (!expr.name.eq(lit_str("count")) && !expr.name.eq(lit_str("isEmpty"))))
+                (base->type == HirTypeKind::Bytes && !expr.name.eq(lit_str("count")) &&
+                 !expr.name.eq(lit_str("isEmpty"))))
                 return frontend_error(FrontendError::UnsupportedSyntax, expr.span, expr.name);
             if (!route->exprs.push(base.value()))
                 return frontend_error(FrontendError::OutOfMemory, expr.span);
@@ -12128,7 +12269,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             count.type = HirTypeKind::I32;
             count.span = expr.span;
             count.lhs = &route->exprs[route->exprs.len - 1];
-            if (expr.name.eq(lit_str("count"))) return count;
+            if (base->type == HirTypeKind::Str || expr.name.eq(lit_str("count"))) return count;
             if (!route->exprs.push(count))
                 return frontend_error(FrontendError::OutOfMemory, expr.span);
             out.kind = HirExprKind::Eq;
@@ -12970,7 +13111,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 const bool saved_allow_respond_effects = route->allow_respond_effects;
                 route->allow_respond_effects = false;
                 auto result = analyze_method_call_expr(
-                    method_stage, route, mod, locals, local_count, binding, &recv);
+                    method_stage, route, mod, locals, local_count, binding, &recv, &recv);
                 route->allow_respond_effects = saved_allow_respond_effects;
                 return result;
             };
@@ -13129,10 +13270,10 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             if (magic_req_receiver(*expr.lhs, mod, locals, local_count, binding)) {
                 method_stage.lhs = expr.lhs;
                 return analyze_method_call_expr(
-                    method_stage, route, mod, locals, local_count, binding);
+                    method_stage, route, mod, locals, local_count, binding, nullptr, &lhs.value());
             }
             return analyze_method_call_expr(
-                method_stage, route, mod, locals, local_count, binding, &lhs.value());
+                method_stage, route, mod, locals, local_count, binding, &lhs.value(), &lhs.value());
         }
         if (expr.rhs->kind == AstExprKind::Call)
             return analyze_call_expr(
@@ -15193,6 +15334,25 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return result;
     }
 
+    if ((expr.name.eq(lit_str("upper")) || expr.name.eq(lit_str("lower")) ||
+         expr.name.eq(lit_str("trim")) || expr.name.eq(lit_str("replace"))) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len == 0 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto text = first_arg_override ? FrontendResult<HirExpr>(*first_arg_override)
+                                       : analyze_builtin_arg(*expr.args[0]);
+        if (!text) return text;
+        AstExpr method{};
+        method.lhs = expr.args[0];
+        method.name = expr.name;
+        method.span = expr.span;
+        for (u32 i = 1; i < expr.args.len; ++i)
+            if (!method.args.push(expr.args[i]))
+                return frontend_error(FrontendError::OutOfMemory, expr.span);
+        return analyze_method_call_expr(
+            method, route, mod, locals, local_count, binding, &text.value(), pipe_lhs);
+    }
+
     if (expr.name.eq(lit_str("split")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         if (expr.args.len != 2 || !expr.args[0] || !expr.args[1])
@@ -16371,10 +16531,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringTrim:
                 case HirExprKind::IpParse:
+                case HirExprKind::BytesCount:
                     break;
                 case HirExprKind::JsonOp:
-                    // str.slice is a bounded, allocation-free borrowed view.
-                    if (e.int_value != static_cast<i64>(json::Op::BytesSlice)) return false;
+                    // String/Bytes field extraction is pure and allocation-free.
+                    if (e.int_value != static_cast<i64>(json::Op::BytesSlice) &&
+                        e.int_value != static_cast<i64>(json::Op::BytesFind))
+                        return false;
                     break;
                 default:
                     return false;
@@ -16830,6 +16993,9 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
             if (++split_visits > 4096 || depth > 128) return true;
             if (value.kind == HirExprKind::LocalRef || value.kind == HirExprKind::BoundValue)
                 return false;
+            if (value.kind == HirExprKind::StringTransform ||
+                value.kind == HirExprKind::RegexReplace)
+                return true;
             if (value.kind == HirExprKind::StringSplit) return true;
             if (value.lhs && self(self, *value.lhs, depth + 1)) return true;
             if (value.rhs && self(self, *value.rhs, depth + 1)) return true;
@@ -16842,7 +17008,7 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
             return false;
         };
         if (kFreshSplit(kFreshSplit, analyzed, 0))
-            return frontend_error(FrontendError::UnsupportedSyntax, span, kStringSplitBindDetail);
+            return frontend_error(FrontendError::UnsupportedSyntax, span, kStringOwnedBindDetail);
         if (analyzed.type == HirTypeKind::Collected) {
             // Guard narrowing currently materializes a fresh initializer twice.
             // Existing lexical/route bindings already own their evaluated carrier.
@@ -21510,6 +21676,8 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::Uuid:
         case HirExprKind::ReqHeaderAll:
         case HirExprKind::ReqQueryAll:
+        case HirExprKind::StringTransform:
+        case HirExprKind::RegexReplace:
         case HirExprKind::StringSplit:
         case HirExprKind::ReqHeaderCount:
         case HirExprKind::ReqUniqueHeader:
@@ -26792,6 +26960,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
                 if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
+                if (e.kind == HirExprKind::StringTransform || e.kind == HirExprKind::RegexReplace)
+                    return kStringOwnedWaitDetail;
                 if (e.kind == HirExprKind::StringSplit) return kStringSplitWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
@@ -27392,6 +27562,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto blocked_detail = [](const HirExpr& e) -> Str {
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
                 if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
+                if (e.kind == HirExprKind::StringTransform || e.kind == HirExprKind::RegexReplace)
+                    return kStringOwnedWaitDetail;
                 if (e.kind == HirExprKind::StringSplit) return kStringSplitWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;

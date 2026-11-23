@@ -2,6 +2,13 @@
 
 Outstanding work items, prioritized for the next implementation passes.
 
+Completed string core: byte length/search/slice, predicates and affix/ASCII trim,
+ASCII upper/lower, bounded owned literal/RE2 replacement and splitting, plus
+existing full-match and capture APIs. All are consolidated into one feature PR;
+see [language card](docs/language-card.md#byte-string-core) for bounds/lifetimes.
+Unicode semantics and Swift Regex.Match remain absent, with existing explicit
+byte/capture APIs available.
+
 ## P0: Front-End Migration to the Revised Syntax Spec (branch design_syntax)
 
 **Goal**: Migrate lexer/parser/checker to the 2026-07 DESIGN.md §3 revision
@@ -122,6 +129,13 @@ without presenting lossy or per-shard state as exact shared state.
   shard ownership, and read freshness before parser/runtime implementation.
 
 ## Recently Completed
+
+- [x] `str.find(str delimiter[, i32 start]) -> i32?` exposes allocation-free,
+  exact byte searches through the existing Bytes intrinsic. Absolute offsets,
+  empty/binary/missing/boundary results, dynamic helper composition, slice/hash
+  keys and native WebSocket execution have explicit coverage.
+  The documented `str.len` byte-count property is wired to the existing length
+  instruction for dynamic field bounds.
 
 - [x] `str.slice(i32 start, i32 end) -> str?` exposes checked half-open byte
   ranges through the existing allocation-free Bytes slice intrinsic. Empty,

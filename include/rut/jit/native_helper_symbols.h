@@ -8,6 +8,8 @@
 #define RUT_NATIVE_HELPER_SYMBOLS(X)                  \
     X(rut_helper_req_path)                            \
     X(rut_helper_req_path_only)                       \
+    X(rut_helper_str_transform)                       \
+    X(rut_helper_regex_replace)                       \
     X(rut_helper_regex_capture)                       \
     X(rut_helper_req_connection_scalar)               \
     X(rut_helper_req_routing_string)                  \
@@ -143,6 +145,7 @@
     X(rut_helper_str_has_suffix)                      \
     X(rut_helper_str_concat)                          \
     X(rut_helper_str_trim_suffix)                     \
+    X(rut_helper_str_trim_ascii)                      \
     X(rut_helper_str_trim_prefix)                     \
     X(rut_helper_resp_body)                           \
     X(rut_helper_json)                                \

@@ -144,9 +144,11 @@ enum class HirExprKind : u8 {
     RegexCapture,
     StringConcat,
     StringPredicate,
-    StringTrim,   // byte-exact prefix/suffix removal; borrowed result
-    IpParse,      // strict IPv4 text -> optional IP
-    StringSplit,  // request-owned bounded string fields
+    StringTrim,       // byte-exact prefix/suffix removal; borrowed result
+    IpParse,          // strict IPv4 text -> optional IP
+    StringSplit,      // request-owned bounded string fields
+    StringTransform,  // owned upper/lower/literal replacement, optional str
+    RegexReplace,     // owned bounded RE2 replacement, optional str
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
     // arrays and bare empty `[]`; typed empty route locals are currently
@@ -600,6 +602,7 @@ inline bool hir_has_string_construction(const HirExpr& value, u32 depth = 0) {
     if (depth > 128) return true;
     if (value.kind == HirExprKind::StringConcat || value.kind == HirExprKind::ReqHeaderAll ||
         value.kind == HirExprKind::ReqQueryAll || value.kind == HirExprKind::StringSplit ||
+        value.kind == HirExprKind::StringTransform || value.kind == HirExprKind::RegexReplace ||
         value.kind == HirExprKind::CollectBytes || value.kind == HirExprKind::CollectedCount ||
         value.kind == HirExprKind::CollectedGet)
         return true;

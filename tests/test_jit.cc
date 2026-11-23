@@ -4,6 +4,8 @@
 #include "fixtures/jwt_secret_rotation.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
+#include "fixtures/string_find.h"
+#include "fixtures/string_ops.h"
 #include "fixtures/string_slice.h"
 #include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
@@ -30419,6 +30421,119 @@ TEST(jit, frontend_string_helpers_preserve_lazy_branches_and_actual_argument_eva
     }
 }
 
+TEST(jit, frontend_string_replace_pipeline_resolves_all_argument_slots) {
+    const auto src = R"rut(
+func pair() -> (str, str) => ("old", "new")
+route GET "/" {
+    let receiver = "old-old" | replace(_, "old", "new")
+    let tuple_slots = pair() | replace("old-old", _1, _2)
+    let replacement = "new" | replace("old-old", "old", _)
+    let regex = "new" | replace("old-old", re"old", _)
+    let method = "template" | _.replace("template", _)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE(hir->routes[0].locals.len >= 5u);
+    const auto& receiver = hir->routes[0].locals[0].init;
+    const auto& tuple_slots = hir->routes[0].locals[1].init;
+    const auto& replacement = hir->routes[0].locals[2].init;
+    const auto& regex = hir->routes[0].locals[3].init;
+    const auto& method = hir->routes[0].locals[4].init;
+    CHECK(receiver.kind == HirExprKind::StringTransform);
+    CHECK(receiver.args.len == 3u);
+    CHECK(receiver.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(receiver.args[1]->str_value.eq(lit_str("old")));
+    CHECK(receiver.args[2]->str_value.eq(lit_str("new")));
+    CHECK(tuple_slots.kind == HirExprKind::StringTransform);
+    CHECK(tuple_slots.args.len == 3u);
+    CHECK(tuple_slots.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(tuple_slots.args[1]->str_value.eq(lit_str("old")));
+    CHECK(tuple_slots.args[2]->str_value.eq(lit_str("new")));
+    CHECK(replacement.kind == HirExprKind::StringTransform);
+    CHECK(replacement.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(replacement.args[2]->str_value.eq(lit_str("new")));
+    CHECK(regex.kind == HirExprKind::RegexReplace);
+    CHECK(regex.str_value.eq(lit_str("old")));
+    CHECK(regex.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(regex.args[2]->str_value.eq(lit_str("new")));
+    CHECK(method.kind == HirExprKind::StringTransform);
+    CHECK(method.args[1]->str_value.eq(lit_str("template")));
+    CHECK(method.args[2]->str_value.eq(lit_str("template")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    constexpr char request[] = "GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_string_replace_pipeline_rejects_invalid_placeholder_slots) {
+    const auto src = R"rut(
+route GET "/" {
+    let invalid = "template" | replace("template", _2, "new")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
+TEST(jit, frontend_string_replace_pipeline_validates_wide_ast_placeholder_slots) {
+    constexpr i64 kSlots[] = {0, -1, 1, 2, 11, 2147483648ll, 4294967297ll};
+    const auto src = R"rut(
+route GET "/" {
+    let value = "old-old" | replace("old-old", "old", _)
+    return 200
+}
+)rut";
+    for (const i64 slot : kSlots) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+        auto* pipeline = &ast->items[0].route.statements[0]->expr;
+        REQUIRE(pipeline->rhs != nullptr);
+        REQUIRE_EQ(pipeline->rhs->args.len, 3u);
+        REQUIRE(pipeline->rhs->args[2] != nullptr);
+        pipeline->rhs->args[2]->int_value = slot;
+        auto hir = analyze_file_heap(ast.value());
+        if (slot == 1)
+            REQUIRE(hir);
+        else
+            CHECK_FALSE(hir);
+    }
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(jit, websocket_nominal_domains_match_in_ordinary_http_helpers_and_routes) {
     const char* source = R"rut(
@@ -33571,6 +33686,63 @@ TEST(jit, string_slice_returns_checked_borrowed_text_without_arena_storage) {
         rir.destroy();
     }
 }
+
+TEST(jit, string_find_returns_absolute_optional_offsets_without_arena_storage) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_find::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_find::kCases) {
+            std::string request =
+                "POST / HTTP/1.1\r\nHost: local\r\nX-Width: " + std::to_string(item.delimiter.len) +
+                "\r\nX-Start: " + std::to_string(item.start) +
+                "\r\nX-Expected: " + std::to_string(item.expected) +
+                "\r\nContent-Length: " + std::to_string(item.delimiter.len + item.input.len) +
+                "\r\n\r\n";
+            request.append(item.delimiter.ptr, item.delimiter.len);
+            const auto text_offset = request.size();
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto result =
+                HandlerResult::unpack(handler(connection.get(),
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              nullptr));
+            CHECK_EQ(result.status_code, item.expected >= 0 ? 200u : 404u);
+            if (item.expected >= 0) {
+                REQUIRE(connection->jit_response_body_valid);
+                const u32 index = static_cast<u32>(item.expected);
+                CHECK(connection->jit_response_body.eq(
+                    {item.input.ptr + index, item.input.len - index}));
+                if (index < item.input.len)
+                    CHECK(connection->jit_response_body.ptr ==
+                          request.data() + text_offset + index);
+            } else {
+                CHECK_FALSE(connection->jit_response_body_valid);
+            }
+            CHECK_EQ(connection->json_arena.space_used(), 0u);
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
+}
 TEST(jit, string_split_executes_owned_dynamic_fields_at_both_optimization_levels) {
     for (u8 opt : {0u, 2u}) {
         auto tokens = lex(lit(test::string_split::kSource));
@@ -33631,3 +33803,101 @@ TEST(jit, string_split_executes_owned_dynamic_fields_at_both_optimization_levels
         rir.destroy();
     }
 }
+
+TEST(jit, string_core_executes_owned_and_borrowed_results_at_both_optimization_levels) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_ops::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        HandlerFn handlers[5]{};
+        for (u32 i = 0; i < 5; ++i) {
+            const std::string name = "handler_route_" + std::to_string(i);
+            handlers[i] = reinterpret_cast<HandlerFn>(engine.lookup(name.c_str()));
+            REQUIRE(handlers[i]);
+        }
+
+        SlicePool pool;
+        REQUIRE(pool.init(16));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::string_ops::kCases) {
+            arena.reset();
+            std::string request = "POST / HTTP/1.1\r\nHost: local\r\nContent-Length: " +
+                                  std::to_string(item.input.len) + "\r\n\r\n";
+            request.append(item.input.ptr, item.input.len);
+            connection->jit_response_body_valid = false;
+            const auto handler = handlers[item.route];
+            const auto result =
+                HandlerResult::unpack(handler(connection.get(),
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              &arena));
+            REQUIRE_EQ(result.status_code, 200u);
+            REQUIRE(connection->jit_response_body_valid);
+            CHECK(connection->jit_response_body.eq(item.output));
+            if (item.route != 4 && item.output.len) {
+                memset(request.data(), 'z', request.size());
+                CHECK(connection->jit_response_body.eq(item.output));
+                const u64 expected_storage =
+                    item.route == 4
+                        ? 0
+                        : ((static_cast<u64>(item.output.len ? item.output.len : 1) + 7) & ~u64{7});
+                CHECK_EQ(arena.space_used(), expected_storage);
+            }
+        }
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(jit, string_core_codegen_rejects_owned_ops_in_direct_websocket_rir) {
+    for (u32 operation = 0; operation < 5; ++operation) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder b;
+        b.init(&tc.mod);
+        auto* fn = V(b.create_function(lit("strings"), lit("/"), 'P'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto text = V(b.emit_const_str(lit("a")));
+        if (operation == 0) V(b.emit_str_split(text, text));
+        if (operation == 1) V(b.emit_str_transform(text, text, text, 0));
+        if (operation == 2) V(b.emit_str_regex_replace(text, text, lit("a")));
+        if (operation == 3) V(b.emit_str_trim_ascii(text));
+        if (operation == 4) V(b.emit_str_regex_capture(text, lit("a"), 0));
+        VOK(b.emit_ret_status(0));
+        REQUIRE(verify_function(fn).ok);
+        auto http = codegen(tc.mod);
+        REQUIRE(http.ok);
+        LLVMDisposeModule(http.mod);
+        LLVMContextDispose(http.ctx);
+        auto ws = codegen_ws_body(tc.mod);
+        CHECK_EQ(ws.ok, operation == 3);
+        if (ws.ok) {
+            LLVMDisposeModule(ws.mod);
+            LLVMContextDispose(ws.ctx);
+        }
+        tc.destroy();
+    }
+}
+#endif

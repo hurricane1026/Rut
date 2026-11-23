@@ -3263,3 +3263,49 @@ TEST(RirVerifier, StringSplitRejectsForgedOperandAndResultCarriers) {
     CHECK(verify_function(fn).ok);
     tc.destroy();
 }
+
+TEST(RirVerifier, StringCoreRejectsForgedShapesAndModes) {
+    for (u32 op = 0; op < 3; ++op) {
+        TestContext tc;
+        REQUIRE(tc.init());
+        Builder b;
+        b.init(&tc.mod);
+        auto* fn = V(b.create_function(lit("strings"), lit("/"), 'P'));
+        auto entry = V(b.create_block(fn, lit("entry")));
+        b.set_insert_point(fn, entry);
+        auto text = V(b.emit_const_str(lit("text")));
+        auto number = V(b.emit_const_i32(0));
+        CHECK_FALSE(b.emit_str_transform(number, text, text, 0));
+        CHECK_FALSE(b.emit_str_transform(text, number, text, 1));
+        CHECK_FALSE(b.emit_str_transform(text, text, number, 2));
+        CHECK_FALSE(b.emit_str_transform(text, text, text, 3));
+        CHECK_FALSE(b.emit_str_regex_replace(number, text, lit("a")));
+        CHECK_FALSE(b.emit_str_regex_replace(text, number, lit("a")));
+        CHECK_FALSE(b.emit_str_regex_replace(text, text, {}));
+        CHECK_FALSE(b.emit_str_trim_ascii(number));
+        if (op == 0) V(b.emit_str_trim_ascii(text));
+        if (op == 1) V(b.emit_str_transform(text, text, text, 2));
+        if (op == 2) V(b.emit_str_regex_replace(text, text, lit("a")));
+        VOK(b.emit_ret_status(204));
+        REQUIRE(verify_function(fn).ok);
+        auto& inst = fn->entry()->insts[2];
+        const auto saved = inst;
+        for (u32 forgery = 0; forgery < 6; ++forgery) {
+            inst = saved;
+            if (forgery == 0) inst.operand_count = 0;
+            if (forgery == 1) inst.operands[0] = number;
+            if (forgery == 2) inst.operands[0] = kNoValue;
+            if (forgery == 3) inst.result = number;
+            if (forgery == 4) inst.extra_operands = inst.operands;
+            if (forgery == 5) {
+                if (op == 0) inst.operand_count = 2;
+                if (op == 1) inst.imm.i32_val = 3;
+                if (op == 2) inst.imm.str_val = {};
+            }
+            CHECK_FALSE(verify_function(fn).ok);
+        }
+        inst = saved;
+        CHECK(verify_function(fn).ok);
+        tc.destroy();
+    }
+}

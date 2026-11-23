@@ -103,3 +103,64 @@ TEST(regex_capture, ambiguous_failure_is_an_ordinary_nonmatch) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(regex_capture, replacement_preserves_anchor_context_and_literal_bytes) {
+    MatchArena memory;
+    REQUIRE(memory.init());
+    struct Case {
+        Str pattern, input, replacement, expected;
+    };
+    const Case cases[] = {
+        {lit_str("/+"), lit_str("//a///b/"), lit_str("$1\\"), lit_str("$1\\a$1\\b$1\\")},
+        {lit_str("^a"), lit_str("aaa"), lit_str("X"), lit_str("Xaa")},
+        {lit_str("a$"), lit_str("aaa"), lit_str("X"), lit_str("aaX")},
+        {lit_str("\\ba"), lit_str("aaa a"), lit_str("X"), lit_str("Xaa X")},
+        {lit_str("(?:)"), lit_str("ab"), lit_str("X"), lit_str("XaXbX")},
+        {lit_str("a*"), lit_str("ba"), lit_str("X"), lit_str("XbXX")},
+        {lit_str("(?:)"), lit_str(""), lit_str("X"), lit_str("X")},
+        {lit_str("z+"), lit_str("ab"), lit_str("X"), lit_str("ab")},
+        {lit_str("a"), lit_str("a\0a"), lit_str("\0"), lit_str("\0\0\0")},
+        {lit_str("(a|b)+"), lit_str("caabbc"), lit_str(""), lit_str("cc")},
+    };
+    for (const auto& item : cases) {
+        Program program(item.pattern);
+        REQUIRE(program.value);
+        Str output;
+        REQUIRE_EQ(capture_regex_replace(
+                       program.value, memory.arena, item.input, item.replacement, &output),
+                   1);
+        CHECK(output.eq(item.expected));
+        CHECK(output.ptr != item.input.ptr);
+        memory.arena.reset();
+    }
+}
+
+TEST(regex_capture, replacement_limits_are_atomic_and_storage_is_owned) {
+    MatchArena memory;
+    REQUIRE(memory.init(2));
+    Program program(lit_str("a"));
+    REQUIRE(program.value);
+    char input[8193];
+    for (auto& c : input) c = 'a';
+    Str output;
+    const auto failure = [&](Str subject, Str replacement) {
+        CHECK_EQ(capture_regex_replace(program.value, memory.arena, subject, replacement, &output),
+                 0);
+        CHECK(output.ptr == nullptr);
+        CHECK_EQ(output.len, 0u);
+        CHECK_EQ(memory.arena.space_used(), 0u);
+    };
+    failure({input, 65}, lit_str("x"));
+    failure({input, 8193}, lit_str("x"));
+    failure({nullptr, 1}, lit_str("x"));
+    failure(lit_str("a"), {input, 8193});
+    failure(lit_str("aaa"), {input, 8192});
+    REQUIRE_EQ(
+        capture_regex_replace(program.value, memory.arena, {input, 64}, lit_str("b"), &output), 1);
+    CHECK_EQ(output.len, 64u);
+    for (auto& c : input) c = 'z';
+    for (u32 i = 0; i < output.len; ++i) CHECK_EQ(output.ptr[i], 'b');
+    SliceArena absent;
+    CHECK_EQ(capture_regex_replace(program.value, absent, lit_str("a"), {}, &output), 0);
+    CHECK(output.ptr == nullptr);
+}
