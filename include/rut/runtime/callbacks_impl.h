@@ -4499,7 +4499,8 @@ void handle_jit_outcome(Loop* loop,
             const RouteConfig* cfg = conn.request_config;
             if (outcome.response_body_idx == 0xffffu) {
                 constexpr u32 kMaxHeaders =
-                    RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                    static_cast<u32>(static_cast<i64>(RouteConfig::kMaxHeadersPerSet) +
+                                     static_cast<i64>(Connection::kMaxRespHeaderMutations));
                 ResponseHeaderKV headers[kMaxHeaders];
                 u32 count = 0;
                 bool suppress_type = false;
@@ -4537,11 +4538,11 @@ void handle_jit_outcome(Loop* loop,
             }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
-            const bool segmented_body = has_body && outcome.status_code >= 200 &&
-                                        outcome.status_code != 204 && outcome.status_code != 205 &&
-                                        outcome.status_code != 304 &&
-                                        cfg->response_bodies[outcome.response_body_idx - 1].len >
-                                            RouteConfig::kResponseBodyPoolBytes;
+            const bool segmented_body =
+                has_body && outcome.status_code >= 200 && outcome.status_code != 204 &&
+                outcome.status_code != 205 && outcome.status_code != 304 &&
+                cfg->response_bodies[static_cast<i64>(outcome.response_body_idx) - 1].len >
+                    RouteConfig::kResponseBodyPoolBytes;
             bool direct_file_body = false;
             // io_uring can send a sealed memfd after the header completes. Keep
             // the segmented formatter header-only for every large body; this
@@ -4550,7 +4551,8 @@ void handle_jit_outcome(Loop* loop,
                               candidate->submit_send_file(c, 0, 0u, 0u);
                           }) {
                 if (segmented_body && !is_head && !conn.tls_active) {
-                    const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                    const auto& body =
+                        cfg->response_bodies[static_cast<i64>(outcome.response_body_idx) - 1];
                     direct_file_body = body.data != nullptr && body.file_fd() >= 0;
                 }
             }
@@ -4558,7 +4560,8 @@ void handle_jit_outcome(Loop* loop,
                 outcome.response_headers_idx != 0 && cfg != nullptr &&
                 outcome.response_headers_idx <= cfg->response_header_set_count;
             constexpr u32 kMaxEffectiveHeaders =
-                RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                static_cast<u32>(static_cast<i64>(RouteConfig::kMaxHeadersPerSet) +
+                                 static_cast<i64>(Connection::kMaxRespHeaderMutations));
             ResponseHeaderKV kvs[kMaxEffectiveHeaders];
             u32 header_count = 0;
             bool suppress_default_content_type = false;
@@ -4591,7 +4594,8 @@ void handle_jit_outcome(Loop* loop,
                 u32 body_len = 0;
                 bool body_is_fallback = false;
                 if (has_body) {
-                    const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                    const auto& body =
+                        cfg->response_bodies[static_cast<i64>(outcome.response_body_idx) - 1];
                     body_data = body.data;
                     body_len = body.len;
                 } else if (body_idx_invalid || !has_header_set) {
@@ -4622,7 +4626,8 @@ void handle_jit_outcome(Loop* loop,
                                                           is_head,
                                                           ordinary_local_response_version(conn));
             } else if (has_body) {
-                const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                const auto& body =
+                    cfg->response_bodies[static_cast<i64>(outcome.response_body_idx) - 1];
                 format_response_with_body(conn,
                                           outcome.status_code,
                                           body.data,
@@ -4638,15 +4643,19 @@ void handle_jit_outcome(Loop* loop,
                                        ordinary_local_response_version(conn));
             }
             if (segmented_body && response_formatted && !is_head) {
-                const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                const auto& body =
+                    cfg->response_bodies[static_cast<i64>(outcome.response_body_idx) - 1];
                 const u32 n = direct_file_body ? 0
                                                : (body.len < conn.send_buf.write_avail()
                                                       ? body.len
                                                       : conn.send_buf.write_avail());
-                conn.local_response_size = conn.send_buf.len() + body.len;
+                conn.local_response_size = static_cast<u32>(static_cast<i64>(conn.send_buf.len()) +
+                                                            static_cast<i64>(body.len));
                 conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
-                conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;
-                conn.local_body_remaining = body.len - n;
+                conn.local_body_cursor =
+                    reinterpret_cast<const u8*>(body.data) + static_cast<i64>(n);
+                conn.local_body_remaining =
+                    static_cast<u32>(static_cast<i64>(body.len) - static_cast<i64>(n));
                 conn.local_body_base = reinterpret_cast<const u8*>(body.data);
                 conn.local_body_file_fd = body.file_fd();
             }
@@ -4672,7 +4681,8 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             conn.resp_status =
-                config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
+                config->redirect_policies[static_cast<i64>(outcome.redirect_policy_id) - 1]
+                    .status_code;
             conn.keep_alive = false;
             release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
@@ -4752,7 +4762,8 @@ void handle_jit_outcome(Loop* loop,
             auto upstream_target_matches = [&]() {
                 if (conn.upstream_fd < 0) return false;
                 if (outcome.timer_ms == 0) return true;
-                return conn.upstream_idx == static_cast<u16>(outcome.timer_ms - 1);
+                return conn.upstream_idx ==
+                       static_cast<u16>(static_cast<i64>(outcome.timer_ms) - 1);
             };
             if constexpr (requires { Loop::kSupportsEventYieldResume; }) {
                 if (!Loop::kSupportsEventYieldResume) {
@@ -4800,7 +4811,7 @@ void handle_jit_outcome(Loop* loop,
             } else if (contract.primary == jit::YieldArm::UpstreamConnect &&
                        outcome.timer_ms != 0) {
                 const RouteConfig* config = conn.request_config;
-                const u32 upstream_id = outcome.timer_ms - 1;
+                const u32 upstream_id = static_cast<u32>(static_cast<i64>(outcome.timer_ms) - 1);
                 if (!config || upstream_id >= config->upstream_count) {
                     send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
@@ -4970,7 +4981,8 @@ void handle_jit_outcome(Loop* loop,
                     loop->close_conn(conn);
                     return;
                 }
-                const auto& bundle = config->policy_bundles[outcome.policy_bundle_id - 1];
+                const auto& bundle =
+                    config->policy_bundles[static_cast<i64>(outcome.policy_bundle_id) - 1];
                 forward_response_policy_id = bundle.response_policy_id;
                 forward_failure_policy_id = bundle.failure_policy_id;
                 forward_timeout_failure_policy_id = bundle.timeout_failure_policy_id;
@@ -5006,9 +5018,11 @@ void handle_jit_outcome(Loop* loop,
                     config->timeout_failure_policy_id_is_valid(forward_timeout_failure_policy_id)) {
                     outcome_profile = classify_response_read_deadline_profile(
                         conn,
-                        config->response_policies[forward_response_policy_id - 1],
-                        config->failure_policies[forward_failure_policy_id - 1],
-                        config->failure_policies[forward_timeout_failure_policy_id - 1],
+                        config->response_policies[static_cast<i64>(forward_response_policy_id) - 1],
+                        config->failure_policies[static_cast<i64>(forward_failure_policy_id) - 1],
+                        config
+                            ->failure_policies[static_cast<i64>(forward_timeout_failure_policy_id) -
+                                               1],
                         forward_response_buffering,
                         outcome.request_policy_id);
                 }
