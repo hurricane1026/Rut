@@ -2427,7 +2427,13 @@ inline bool http_cache_cors_mutations_admitted(const Connection& conn) {
         const u64 begin = reinterpret_cast<u64>(value.ptr);
         const u64 base = reinterpret_cast<u64>(buffer.data());
         // Reject even a zero-length view pointing into a buffer we will rewrite.
-        return begin >= base ? begin - base < buffer.capacity() : value.len > base - begin;
+        u64 distance = 0;
+        if (begin >= base) {
+            (void)__builtin_sub_overflow(begin, base, &distance);
+            return distance < buffer.capacity();
+        }
+        (void)__builtin_sub_overflow(base, begin, &distance);
+        return value.len > distance;
     };
     for (u32 i = 0; i < conn.resp_header_mutation_count; ++i) {
         const auto& m = conn.resp_header_mutations[i];
