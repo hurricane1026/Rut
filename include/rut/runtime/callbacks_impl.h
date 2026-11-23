@@ -6916,20 +6916,28 @@ inline bool apply_request_header_overrides(Connection& conn) {
     auto splice =
         [&](u32 pos, u32 old_span, const Str& name, const Str& val, bool write_line) -> bool {
         const u32 total = conn.recv_buf.len();
-        const u32 ins_len = write_line ? name.len + 2 + val.len + 2 : 0;  // ": " + CRLF
+        const u32 ins_len =
+            write_line
+                ? static_cast<u32>(static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2)
+                : 0;  // ": " + CRLF
         const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
-        if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return false;
-        const u32 tail_src = pos + old_span;
+        if (delta > 0 &&
+            static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
+            return false;
+        const u32 tail_src = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(old_span));
         if (delta != 0)
-            __builtin_memmove(buf + (static_cast<i64>(tail_src) + delta),
-                              buf + tail_src,
-                              static_cast<size_t>(total - tail_src));
+            __builtin_memmove(
+                buf + (static_cast<i64>(tail_src) + delta),
+                buf + static_cast<i64>(tail_src),
+                static_cast<size_t>(static_cast<i64>(total) - static_cast<i64>(tail_src)));
         if (write_line) {
             u32 p = pos;
-            for (u32 i = 0; i < name.len; i++) buf[p++] = static_cast<u8>(name.ptr[i]);
+            for (u32 i = 0; i < name.len; i++)
+                buf[static_cast<i64>(p++)] = static_cast<u8>(name.ptr[i]);
             buf[p++] = ':';
             buf[p++] = ' ';
-            for (u32 i = 0; i < val.len; i++) buf[p++] = static_cast<u8>(val.ptr[i]);
+            for (u32 i = 0; i < val.len; i++)
+                buf[static_cast<i64>(p++)] = static_cast<u8>(val.ptr[i]);
             buf[p++] = '\r';
             buf[p++] = '\n';
         }
@@ -6955,17 +6963,20 @@ inline bool apply_request_header_overrides(Connection& conn) {
         while (hstart < hend && buf[hstart] != '\n') hstart++;  // past the request line
         if (hstart >= hend) return false;
         hstart++;
-        const u32 hbody = hend - 2;  // header fields occupy [hstart, hbody)
+        const u32 hbody = static_cast<u32>(static_cast<i64>(hend) - 2);
         for (u32 i = from < hstart ? hstart : from; i < hbody;) {
             const u32 ls = i;
             u32 colon = ls;
             while (colon < hbody && buf[colon] != ':' && buf[colon] != '\n') colon++;
             u32 le = ls;
             while (le < hbody && buf[le] != '\n') le++;
-            le = le < hbody ? le + 1 : hbody;  // include LF
+            le = le < hbody ? static_cast<u32>(static_cast<i64>(le) + 1) : hbody;
             if (colon < hbody && buf[colon] == ':' &&
                 http_header_name_eq_ci(
-                    reinterpret_cast<const char*>(buf + ls), colon - ls, name.ptr, name.len)) {
+                    reinterpret_cast<const char*>(buf + static_cast<i64>(ls)),
+                    static_cast<u32>(static_cast<i64>(colon) - static_cast<i64>(ls)),
+                    name.ptr,
+                    name.len)) {
                 *fs = ls;
                 *fe = le;
                 return true;
@@ -6982,11 +6993,15 @@ inline bool apply_request_header_overrides(Connection& conn) {
     // header. (DSL set_header values are string literals in stable JIT constant
     // memory, so they never alias recv_buf and this never trips for compiled .rut.)
     const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
-    const uintptr_t kBufHi = kBufLo + conn.recv_buf.capacity();
+    uintptr_t kBufHi = 0;
+    if (__builtin_add_overflow(kBufLo, static_cast<uintptr_t>(conn.recv_buf.capacity()), &kBufHi))
+        return false;
     auto aliases_recv_buf = [&](const Str& s) {
         if (s.ptr == nullptr) return false;
         const uintptr_t p = reinterpret_cast<uintptr_t>(s.ptr);
-        return p < kBufHi && p + s.len > kBufLo;
+        uintptr_t end = 0;
+        if (__builtin_add_overflow(p, static_cast<uintptr_t>(s.len), &end)) return true;
+        return p < kBufHi && end > kBufLo;
     };
 
     for (u32 oi = 0; oi < conn.req_header_override_count; oi++) {
@@ -7014,29 +7029,35 @@ inline bool apply_request_header_overrides(Connection& conn) {
         // can't place it, so fail closed instead of forwarding without it.
         if (hend < 4 || hend > total) return false;
 
-        const u32 line_len = name.len + 2 + val.len + 2;
+        const u32 line_len =
+            static_cast<u32>(static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2);
         u32 fs = 0, fe = 0, search_from = 0;
         if (remove) {
             // Search again at the deletion point after every splice so adjacent
             // duplicates (including mixed case) cannot survive a removal.
             while (find_field(name, search_from, &fs, &fe)) {
-                if (!splice(fs, fe - fs, name, val, /*write_line=*/false)) return false;
+                if (!splice(fs,
+                            static_cast<u32>(static_cast<i64>(fe) - static_cast<i64>(fs)),
+                            name,
+                            val,
+                            /*write_line=*/false))
+                    return false;
                 search_from = fs;
             }
             continue;
         }
         if (append) {
-            const u32 hbody = conn.req_header_end - 2;
+            const u32 hbody = static_cast<u32>(static_cast<i64>(conn.req_header_end) - 2);
             if (!splice(hbody, 0, name, val, /*write_line=*/true)) return false;
             continue;
         }
         if (find_field(name, 0, &fs, &fe)) {
             if (!splice(fs, fe - fs, name, val, /*write_line=*/true)) return false;
-            search_from = fs + line_len;  // skip the line we just wrote
+            search_from = static_cast<u32>(static_cast<i64>(fs) + static_cast<i64>(line_len));
         } else {
-            const u32 hbody = conn.req_header_end - 2;  // insert before the blank line
+            const u32 hbody = static_cast<u32>(static_cast<i64>(conn.req_header_end) - 2);
             if (!splice(hbody, 0, name, val, /*write_line=*/true)) return false;
-            search_from = hbody + line_len;
+            search_from = static_cast<u32>(static_cast<i64>(hbody) + static_cast<i64>(line_len));
         }
         // Drop any remaining same-named fields (deletion never grows → never fails).
         while (find_field(name, search_from, &fs, &fe)) splice(fs, fe - fs, name, val, false);
