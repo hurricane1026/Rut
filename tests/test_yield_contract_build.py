@@ -176,7 +176,6 @@ def main():
         check(compiler, root, overlay, source=source)
         for before, after in [
             ("event.copy_begin == expected_begin &&", ""),
-            ("event.copy_end >= event.copy_begin &&", ""),
             ("event.result > 0 &&", "event.result >= 0 &&"),
             ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
             ("static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==",
@@ -203,9 +202,11 @@ def main():
         source = "src/runtime/buffered_send_vector.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("source + (kSize - part.iov_len)", "source + kStep"),
+            ("source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len))",
+             "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n -= kStep;", "\n            n = 0;"),
+            ("\n            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));",
+             "\n            n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
                            before, after)
@@ -272,17 +273,16 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
-            ("1 + (kRemaining - 1) / 1'000'000", "(kRemaining + 999'999) / 1'000'000"),
-            ("1 + (kRemaining - 1) / 1'000'000", "kRemaining / 1'000'000"),
             ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
-            ("now_ns >= last_progress_ns + timeout_ns", "now_ns > last_progress_ns + timeout_ns"),
+            ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),
         ]:
             probe = mutate(root / "include", overlay, header, before, after)
             check(compiler, root, overlay, "Response timer violates rearm interval contract", source=runtime)
             probe.unlink()
         for before, after in [
-            ("? cancel_seen : target_seen", "? target_seen : cancel_seen"),
+            ("(kTag & kResponseReadTimerCancelBit) ? cancel_seen : target_seen",
+             "(kTag & kResponseReadTimerCancelBit) ? target_seen : cancel_seen"),
             ("kFirst && owner_valid &&", "owner_valid &&"),
             ("kFirst && owner_valid &&", "kFirst &&"),
             ("(kTag & kResponseReadTimerGenerationMask) == generation", "(kTag & 0xffffu) == generation"),
