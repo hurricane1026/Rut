@@ -204,9 +204,9 @@ json({ users: [], total: 0 })
 
 // Number literals
 42                              // i32
-3.14                            // f64
-0xFF                            // hex integer
-1_000_000                       // underscores for readability
+3.14                            // ⏳ floating-point literals
+0b101010  0o52  0x2A            // binary / octal / hexadecimal integers
+1_000_000  0xFF_FF              // integer digit separators
 
 // Duration / ByteSize literals (domain types)
 500ms    1s    5m    1h    1d   // Duration
@@ -242,6 +242,19 @@ true   false   nil
 bitwise.and(a, b)    bitwise.or(a, b)    bitwise.xor(a, b)    bitwise.flip(a)
 bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 ```
+
+Source integers follow Swift's radix-prefix and digit-separator lexical grammar:
+`0b`, `0o`, `0x` require a first radix digit; subsequent digits may include
+repeated or trailing underscores. Hex digits accept either case; prefixes are
+lowercase. Decimal leading zeros remain decimal. All spellings use Rut's
+existing signed `i32`/`i64` magnitude inference, including fused negative
+`i64` minimum; overflow is rejected before accumulation can wrap. Positive hex
+values do not reinterpret unsigned bit patterns. Integer configuration fields
+share this decoder with their existing bounds; numeric listener endpoints stay
+strictly decimal. Duration literals still require plain decimal digits plus
+`ms/s/m/h`; radix ByteSize amounts require whitespace before their unit.
+Runtime decimal text parsing is unchanged. See
+[source integer literals](docs/language-card.md#source-integer-literals).
 
 Arithmetic is total over `i32` and `i64`: overflow wraps two's-complement, and
 `x / 0` / `x % 0` evaluate to `0` — no traps, no undefined behavior (a SIGFPE

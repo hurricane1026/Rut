@@ -8790,7 +8790,7 @@ TEST(frontend, websocket_max_message_size_rejects_values_over_bulk_capacity) {
                  static_cast<u32>(value_start - source.c_str() + strlen(value)));
     }
     const char* zero_source =
-        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 0b) { message "
+        "upstream ws\nroute GET \"/ws\" { return websocket(ws, maxMessageSize: 0 b) { message "
         "in message.forward() } }\n";
     auto zero_tokens = lex(lit(zero_source));
     REQUIRE(zero_tokens);
@@ -49277,4 +49277,165 @@ route POST "/" {
     REQUIRE(lower_to_rir(mir.value(), rir));
     CHECK_FALSE(function_has_op(rir.module.functions[0], rir::Opcode::StrTransform));
     rir.destroy();
+}
+
+TEST(frontend, integer_literal_lexemes_preserve_spans_and_swift_separators) {
+    const Str source = lit_str("0b1010 0o17 0xAb_CD 1__000_ 0xF__ 0009");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    const Str spellings[] = {lit_str("0b1010"),
+                             lit_str("0o17"),
+                             lit_str("0xAb_CD"),
+                             lit_str("1__000_"),
+                             lit_str("0xF__"),
+                             lit_str("0009")};
+    REQUIRE_EQ(tokens->tokens.len, 7u);
+    for (u32 i = 0; i < 6; ++i) {
+        const auto& token = tokens->tokens[i];
+        CHECK_EQ(token.type, TokenType::IntLit);
+        CHECK(token.text.eq(spellings[i]));
+        CHECK(source.slice(token.start, token.end).eq(spellings[i]));
+        CHECK_EQ(token.line, 1u);
+        CHECK_EQ(token.col, token.start + 1);
+    }
+    for (const char* text : {"0b",
+                             "0o",
+                             "0x",
+                             "0b_1",
+                             "0o_7",
+                             "0x_F",
+                             "0b2",
+                             "0b102",
+                             "0o8",
+                             "0o78",
+                             "0xG",
+                             "0x1G",
+                             "1_000ms",
+                             "1_s"}) {
+        auto bad = lex(lit(text));
+        REQUIRE_FALSE(bad.has_value());
+        CHECK_EQ(bad.error().code, FrontendError::InvalidInteger);
+        CHECK_EQ(bad.error().span.start, 0u);
+        CHECK_EQ(bad.error().span.end, lit(text).len);
+    }
+}
+
+TEST(frontend, integer_literal_radices_and_signed_width_boundaries) {
+    struct Case {
+        const char* text;
+        i64 value;
+        HirTypeKind type;
+    };
+    const Case cases[] = {
+        {"0b10__10_", 10, HirTypeKind::I32},
+        {"0o00017", 15, HirTypeKind::I32},
+        {"0xAb_cD_", 43981, HirTypeKind::I32},
+        {"0009", 9, HirTypeKind::I32},
+        {"1__000_000_", 1000000, HirTypeKind::I32},
+        {"0x7fff_ffff", 2147483647, HirTypeKind::I32},
+        {"0x8000_0000", 2147483648LL, HirTypeKind::I64},
+        {"-0x8000_0000", -2147483648LL, HirTypeKind::I32},
+        {"-0x8000_0001", -2147483649LL, HirTypeKind::I64},
+        {"0o17777777777", 2147483647, HirTypeKind::I32},
+        {"0o20000000000", 2147483648LL, HirTypeKind::I64},
+        {"0x7fff_ffff_ffff_ffff", 9223372036854775807LL, HirTypeKind::I64},
+        {"0o777777777777777777777", 9223372036854775807LL, HirTypeKind::I64},
+        {"-0x8000_0000_0000_0000", static_cast<i64>(0x8000000000000000ull), HirTypeKind::I64},
+        {"-0o1000000000000000000000", static_cast<i64>(0x8000000000000000ull), HirTypeKind::I64},
+        {"0b1111111111111111111111111111111", 2147483647, HirTypeKind::I32},
+        {"0b10000000000000000000000000000000", 2147483648LL, HirTypeKind::I64},
+        {"-0b10000000000000000000000000000000", -2147483648LL, HirTypeKind::I32},
+    };
+    for (const auto& item : cases) {
+        const std::string source =
+            std::string("route GET \"/\" { let x = ") + item.text + " return 200 }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+        CHECK_EQ(hir->routes[0].locals[0].init.type, item.type);
+        CHECK_EQ(hir->routes[0].locals[0].init.int_value, item.value);
+    }
+}
+
+TEST(frontend, integer_literal_overflow_and_invalid_source_spellings) {
+    for (const char* text : {"0x8000000000000000",
+                             "-0x8000000000000001",
+                             "0xffffffffffffffff",
+                             "0o1000000000000000000000",
+                             "-0o1000000000000000000001",
+                             "0b1000000000000000000000000000000000000000000000000000000000000000",
+                             "-0b1000000000000000000000000000000000000000000000000000000000000001",
+                             "0x10000000000000000000000000000000000000000000000000000000000000000",
+                             "18_446_744_073_709_551_616_000"}) {
+        const std::string source =
+            std::string("route GET \"/\" { let x = ") + text + " return 200 }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+    }
+}
+
+TEST(frontend, integer_literal_configuration_fields_use_checked_magnitudes) {
+    const char* sources[] = {
+        ("upstream api { host: \"127.0.0.1\", port: 0x2329 } route GET \"/\" { return forward(api, "
+         "load_balance: .roundRobin) "
+         "}"),
+        ("upstream api { backends: [\"127.0.0.1:9001\": 0xff_ff], minimum_healthy_weight_percent: "
+         "0b110010 } route GET \"/\" { return forward(api, load_balance: .roundRobin) }"),
+        "@rateLimit(limit: 1_000, window: 1s, burst: 0x400) route GET \"/\" { return 0o310 }",
+        "route GET \"/\" { wait(0x10) return response(0b11001000, body: \"ok\") }",
+        "timer tick, every: 1s, shard: 0x0 { }",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        if (!ast) fprintf(stderr, "configuration source: %s\n", source);
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "configuration type check source: %s\n", source);
+        REQUIRE(hir);
+        if (ast->items[0].kind == AstItemKind::Upstream) {
+            const auto& upstream = ast->items[0].upstream;
+            if (upstream.port_is_set) CHECK_EQ(upstream.port_lit, 9001u);
+            if (upstream.weight_count) {
+                CHECK_EQ(upstream.backend_weights[0], 65535u);
+                CHECK_EQ(upstream.minimum_healthy_weight_percent, 50u);
+            }
+        }
+    }
+    for (const char* field : {"port: 0x1_0000_0000",
+                              "minimum_healthy_weight_percent: 0x65",
+                              "backends: [\"127.0.0.1:9001\": 0x1_0000]",
+                              "port: 0x100000000000000000000000000002329"}) {
+        const std::string source = std::string("upstream api { ") + field + " }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE_FALSE(ast.has_value());
+        CHECK_EQ(ast.error().code, FrontendError::InvalidInteger);
+    }
+}
+
+TEST(frontend, integer_literals_do_not_change_listener_wire_decimal_grammar) {
+    for (const char* source : {"listen :0x1f90",
+                               "listen :8_080",
+                               "listen 0x7f.0.0.1:8080",
+                               "listen 127.0.0.1:0o17620",
+                               "listen 12_7.0.0.1:8080"}) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto tokens = lex(lit("listen 127.0.0.1:8080 route GET \"/\" { return 0xC8 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
 }
