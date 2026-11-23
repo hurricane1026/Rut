@@ -145,8 +145,7 @@ TEST(kqueue, grpc_io_completion_keeps_one_second_timer) {
     IoEvent event{0, 1, 0, 0, IoEventType::Recv, 0};
     loop->dispatch(event);
 
-    CHECK_EQ(loop->timer.slots[(loop->timer.cursor + 1u) & (TimerWheel::kSlots - 1u)].next,
-             &conn.timer_node);
+    CHECK_EQ(loop->timer.slots[loop->timer.slot_after(1u)].next, &conn.timer_node);
     loop->timer.remove(&conn);
     loop->force_close_all();
     loop->shutdown();

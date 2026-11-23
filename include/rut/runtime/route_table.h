@@ -201,7 +201,7 @@ inline u64 rate_limit_id_mix_u32(u64 hash, u32 value) {
 }
 
 inline u8 rate_limit_header_name_lower(u8 c) {
-    return (c >= 'A' && c <= 'Z') ? static_cast<u8>(c + ('a' - 'A')) : c;
+    return (c >= 'A' && c <= 'Z') ? static_cast<u8>(static_cast<i64>(c) + ('a' - 'A')) : c;
 }
 
 inline bool rate_limit_rule_identity_equal(const RateLimitRule& lhs, const RateLimitRule& rhs) {
@@ -285,7 +285,8 @@ inline bool rate_limit_route_shape_valid(const RouteEntry& route) {
                 return false;
             const u64 emit = rate_limit_emit_interval_us(rule.max, rule.window_sec);
             const u32 burst = rule.burst;
-            if (rule.emit_interval_us != emit || rule.tau_us != static_cast<u64>(burst - 1u) * emit)
+            if (rule.emit_interval_us != emit ||
+                rule.tau_us != static_cast<u64>(static_cast<i64>(burst) - 1) * emit)
                 return false;
         }
         if (rule.key.count > kMaxRateLimitKeyComponents) return false;
@@ -766,10 +767,12 @@ public:
     static bool pool_bytes_owned(const char* pool, u32 used, Str value) {
         const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        if (value.len == 0) return value.ptr != nullptr && ptr >= begin && ptr - begin <= used;
+        uintptr_t offset = 0;
+        if (__builtin_sub_overflow(ptr, begin, &offset)) return false;
+        if (value.len == 0) return value.ptr != nullptr && ptr >= begin && offset <= used;
         if (value.ptr == nullptr || value.len > used) return false;
-        if (ptr < begin || ptr - begin >= used) return false;
-        return value.len <= used - static_cast<u32>(ptr - begin);
+        if (ptr < begin || offset >= used) return false;
+        return static_cast<i64>(value.len) <= static_cast<i64>(used) - static_cast<i64>(offset);
     }
 
     bool strict_local_response_bytes_owned(Str value) const {
@@ -807,24 +810,26 @@ public:
             const u16 id = pre_route_policy_ids[slot];
             if (id == 0) continue;
             if (id > strict_local_response_policy_count) return false;
-            if (slot == kRouteMethodHead && strict_local_response_policies[id - 1].head_mode !=
-                                                StrictLocalResponseHeadMode::SuppressBody)
+            if (slot == kRouteMethodHead &&
+                strict_local_response_policies[static_cast<i64>(id) - 1].head_mode !=
+                    StrictLocalResponseHeadMode::SuppressBody)
                 return false;
-            referenced[id - 1] = true;
+            referenced[static_cast<i64>(id) - 1] = true;
         }
         for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
             const u16 id = unmatched_policy_ids[slot];
             if (id == 0) continue;
             if (id > strict_local_response_policy_count) return false;
-            referenced[id - 1] = true;
+            referenced[static_cast<i64>(id) - 1] = true;
         }
         const u16 any_id = unmatched_policy_ids[kRouteMethodAny];
-        if (any_id != 0 && strict_local_response_policies[any_id - 1].head_mode !=
+        if (any_id != 0 && strict_local_response_policies[static_cast<i64>(any_id) - 1].head_mode !=
                                StrictLocalResponseHeadMode::SuppressBody)
             return false;
         const u16 head_id = unmatched_policy_ids[kRouteMethodHead];
-        if (head_id != 0 && strict_local_response_policies[head_id - 1].head_mode !=
-                                StrictLocalResponseHeadMode::SuppressBody)
+        if (head_id != 0 &&
+            strict_local_response_policies[static_cast<i64>(head_id) - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
             return false;
         for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
             const auto& binding = exact_strict_local_response_bindings[i];
@@ -838,7 +843,7 @@ public:
             const u32 slot = route_method_slot_from_key(binding.method);
             if (slot == kRouteMethodSlotInvalid) return false;
             if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-                strict_local_response_policies[binding.policy_id - 1].head_mode !=
+                strict_local_response_policies[static_cast<i64>(binding.policy_id) - 1].head_mode !=
                     StrictLocalResponseHeadMode::SuppressBody)
                 return false;
             for (u32 prior = 0; prior < i; prior++) {
@@ -848,7 +853,7 @@ public:
                     __builtin_memcmp(binding.path, other.path, binding.path_len) == 0)
                     return false;
             }
-            referenced[binding.policy_id - 1] = true;
+            referenced[static_cast<i64>(binding.policy_id) - 1] = true;
         }
         for (u32 i = 0; i < strict_local_response_policy_count; i++)
             if (!referenced[i]) return false;
@@ -973,8 +978,12 @@ private:
             return invalid;
         const uintptr_t raw_address = reinterpret_cast<uintptr_t>(raw_target.ptr);
         const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
-        if (raw_target.len > UINTPTR_MAX - raw_address ||
-            slash_normalized_path.len > UINTPTR_MAX - normalized_address)
+        uintptr_t raw_end = 0;
+        uintptr_t normalized_end = 0;
+        if (__builtin_add_overflow(raw_address, static_cast<uintptr_t>(raw_target.len), &raw_end) ||
+            __builtin_add_overflow(normalized_address,
+                                   static_cast<uintptr_t>(slash_normalized_path.len),
+                                   &normalized_end))
             return invalid;
         if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
         bool previous_slash = false;
@@ -1024,7 +1033,7 @@ public:
             strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
             return false;
-        const auto& policy = strict_local_response_policies[id - 1];
+        const auto& policy = strict_local_response_policies[static_cast<i64>(id) - 1];
         return strict_local_response_bytes_owned(policy.reason) &&
                strict_local_response_bytes_owned(policy.content_type) &&
                strict_local_response_bytes_owned(policy.server) &&
@@ -1084,19 +1093,21 @@ private:
             for (u32 slot = 1; slot < kStrictLocalResponseMethodSlots; slot++) {
                 const u16 source_id = pre_route_ids[slot];
                 if (source_id != 0 &&
-                    !target.set_pre_route_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    !target.set_pre_route_policy_id(static_cast<u8>(slot),
+                                                    remap[static_cast<i64>(source_id) - 1]))
                     return false;
             }
             for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
                 const u16 source_id = method_policy_ids[slot];
                 if (source_id != 0 &&
-                    !target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                    !target.set_unmatched_policy_id(static_cast<u8>(slot),
+                                                    remap[static_cast<i64>(source_id) - 1]))
                     return false;
             }
             for (u32 i = 0; i < exact_binding_count; i++) {
                 const u16 source_id = exact_bindings[i].policy_id;
-                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
-                                                                       remap[source_id - 1]))
+                if (!target.append_exact_strict_local_response_binding(
+                        exact_bindings[i], remap[static_cast<i64>(source_id) - 1]))
                     return false;
             }
             return target.strict_local_response_table_is_valid();
@@ -1179,13 +1190,14 @@ public:
             for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
                 const u16 source_id = method_policy_ids[slot];
                 if (source_id == 0) continue;
-                if (!target.set_unmatched_policy_id(static_cast<u8>(slot), remap[source_id - 1]))
+                if (!target.set_unmatched_policy_id(static_cast<u8>(slot),
+                                                    remap[static_cast<i64>(source_id) - 1]))
                     return false;
             }
             for (u32 i = 0; i < exact_binding_count; i++) {
                 const u16 source_id = exact_bindings[i].policy_id;
-                if (!target.append_exact_strict_local_response_binding(exact_bindings[i],
-                                                                       remap[source_id - 1]))
+                if (!target.append_exact_strict_local_response_binding(
+                        exact_bindings[i], remap[static_cast<i64>(source_id) - 1]))
                     return false;
             }
             return target.strict_local_response_table_is_valid();
@@ -1511,7 +1523,7 @@ public:
 
     bool response_policy_id_is_valid(u16 id) const {
         return id != 0 && id <= response_policy_count &&
-               admitted_response_policy_valid(response_policies[id - 1]);
+               admitted_response_policy_valid(response_policies[static_cast<i64>(id) - 1]);
     }
 
     u16 add_failure_policy(const ForwardFailurePolicySpec& policy);
@@ -1526,13 +1538,14 @@ public:
     bool failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               admitted_forward_failure_policy_valid(failure_policies[id - 1]);
+               admitted_forward_failure_policy_valid(failure_policies[static_cast<i64>(id) - 1]);
     }
 
     bool timeout_failure_policy_id_is_valid(u16 id) const {
         return failure_policy_count <= kMaxForwardFailurePolicies && id != 0 &&
                id <= failure_policy_count &&
-               admitted_forward_timeout_failure_policy_valid(failure_policies[id - 1]);
+               admitted_forward_timeout_failure_policy_valid(
+                   failure_policies[static_cast<i64>(id) - 1]);
     }
 
     // Full validation of every forward policy table, run once when a config is
@@ -1547,7 +1560,7 @@ public:
     bool policy_bundle_id_is_valid(u16 id) const {
         if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
             return false;
-        const auto& b = policy_bundles[id - 1];
+        const auto& b = policy_bundles[static_cast<i64>(id) - 1];
         if ((b.response_policy_id != 0 && !response_policy_id_is_valid(b.response_policy_id)) ||
             (b.failure_policy_id != 0 && !failure_policy_id_is_valid(b.failure_policy_id)) ||
             (b.response_read_timeout_seconds != 0 &&
@@ -1563,7 +1576,7 @@ public:
         // violated, but a config should never publish one in the first
         // place.
         if (b.response_policy_id != 0 &&
-            response_policies[b.response_policy_id - 1].header_order ==
+            response_policies[static_cast<i64>(b.response_policy_id) - 1].header_order ==
                 ResponsePolicyHeaderOrder::Upstream &&
             (b.response_read_timeout_seconds != 0 ||
              b.response_buffering != ForwardResponseBufferingMode::None ||
@@ -1576,7 +1589,7 @@ public:
         // policy's status to be 502 and closes the downstream connection on
         // mismatch, so this trust boundary must reject the same combination.
         if (b.failure_policy_id != 0 &&
-            failure_policies[b.failure_policy_id - 1].header_order ==
+            failure_policies[static_cast<i64>(b.failure_policy_id) - 1].header_order ==
                 FailurePolicyHeaderOrder::LengthTypeDateServer &&
             b.response_read_timeout_seconds != 0)
             return false;
@@ -1587,9 +1600,10 @@ public:
                 b.timeout_failure_policy_id == 0 ||
                 !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
                 return false;
-            const auto& response = response_policies[b.response_policy_id - 1];
-            const auto& failure = failure_policies[b.failure_policy_id - 1];
-            const auto& timeout = failure_policies[b.timeout_failure_policy_id - 1];
+            const auto& response = response_policies[static_cast<i64>(b.response_policy_id) - 1];
+            const auto& failure = failure_policies[static_cast<i64>(b.failure_policy_id) - 1];
+            const auto& timeout =
+                failure_policies[static_cast<i64>(b.timeout_failure_policy_id) - 1];
             // The entry checks above already validated all three complete policy shapes.
             // The buffering role only needs these tuple fields; all Reject modes also satisfy
             // the suppress-body equality check in the legacy None path below.
@@ -1604,12 +1618,15 @@ public:
         if (b.response_policy_id == 0 || b.failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(b.timeout_failure_policy_id))
             return false;
-        const bool response_suppress = response_policies[b.response_policy_id - 1].head_mode ==
-                                       ResponsePolicyHeadMode::SuppressBody;
-        const bool failure_suppress = failure_policies[b.failure_policy_id - 1].head_mode ==
-                                      FailurePolicyHeadMode::SuppressBody;
-        const bool timeout_suppress = failure_policies[b.timeout_failure_policy_id - 1].head_mode ==
-                                      FailurePolicyHeadMode::SuppressBody;
+        const bool response_suppress =
+            response_policies[static_cast<i64>(b.response_policy_id) - 1].head_mode ==
+            ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress =
+            failure_policies[static_cast<i64>(b.failure_policy_id) - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+        const bool timeout_suppress =
+            failure_policies[static_cast<i64>(b.timeout_failure_policy_id) - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
         return response_suppress == failure_suppress && failure_suppress == timeout_suppress;
     }
 
@@ -1619,7 +1636,7 @@ public:
 
     bool target_transform_id_is_valid(u16 id) const {
         return forward_target_transform_id_is_valid(id, target_transform_count) &&
-               forward_target_transform_spec_valid(target_transforms[id - 1]);
+               forward_target_transform_spec_valid(target_transforms[static_cast<i64>(id) - 1]);
     }
 
     // Register foundation-only redirect metadata. Strings are copied into
@@ -1630,9 +1647,13 @@ public:
             value.len > redirect_policy_bytes_used)
             return false;
         const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
-        const uintptr_t end = begin + redirect_policy_bytes_used;
+        uintptr_t end = 0;
+        if (__builtin_add_overflow(begin, static_cast<uintptr_t>(redirect_policy_bytes_used), &end))
+            return false;
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        return ptr >= begin && ptr <= end && value.len <= end - ptr;
+        uintptr_t remaining = 0;
+        if (__builtin_sub_overflow(end, ptr, &remaining)) return false;
+        return ptr >= begin && ptr <= end && value.len <= remaining;
     }
 
     bool redirect_policy_strings_are_owned(const RedirectPolicySpec& policy) const {
@@ -1658,8 +1679,8 @@ public:
         return redirect_policy_count <= kMaxRedirectPolicies &&
                redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes && id != 0 &&
                id <= redirect_policy_count &&
-               redirect_policy_strings_are_owned(redirect_policies[id - 1]) &&
-               redirect_policy_spec_valid(redirect_policies[id - 1]);
+               redirect_policy_strings_are_owned(redirect_policies[static_cast<i64>(id) - 1]) &&
+               redirect_policy_spec_valid(redirect_policies[static_cast<i64>(id) - 1]);
     }
 
     // Add an upstream target. Returns its index, or error if at capacity.
@@ -1699,9 +1720,9 @@ public:
     bool remove_firewall_allow_ip(u32 ip) {
         for (u32 i = 0; i < firewall_allow_count; i++) {
             if (firewall_allow_ips[i] != ip) continue;
-            for (u32 j = i + 1; j < firewall_allow_count; j++)
-                firewall_allow_ips[j - 1] = firewall_allow_ips[j];
-            firewall_allow_ips[firewall_allow_count - 1] = 0;
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_count; j++)
+                firewall_allow_ips[static_cast<i64>(j) - 1] = firewall_allow_ips[j];
+            firewall_allow_ips[static_cast<i64>(firewall_allow_count) - 1] = 0;
             firewall_allow_count--;
             return true;
         }
@@ -1742,9 +1763,9 @@ public:
     bool remove_firewall_deny_ip(u32 ip) {
         for (u32 i = 0; i < firewall_deny_count; i++) {
             if (firewall_deny_ips[i] != ip) continue;
-            for (u32 j = i + 1; j < firewall_deny_count; j++)
-                firewall_deny_ips[j - 1] = firewall_deny_ips[j];
-            firewall_deny_ips[firewall_deny_count - 1] = 0;
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_count; j++)
+                firewall_deny_ips[static_cast<i64>(j) - 1] = firewall_deny_ips[j];
+            firewall_deny_ips[static_cast<i64>(firewall_deny_count) - 1] = 0;
             firewall_deny_count--;
             return true;
         }
@@ -1774,9 +1795,9 @@ public:
     bool remove_firewall_allow_port(u16 port) {
         for (u32 i = 0; i < firewall_allow_port_count; i++) {
             if (firewall_allow_ports[i] != port) continue;
-            for (u32 j = i + 1; j < firewall_allow_port_count; j++)
-                firewall_allow_ports[j - 1] = firewall_allow_ports[j];
-            firewall_allow_ports[firewall_allow_port_count - 1] = 0;
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_port_count; j++)
+                firewall_allow_ports[static_cast<i64>(j) - 1] = firewall_allow_ports[j];
+            firewall_allow_ports[static_cast<i64>(firewall_allow_port_count) - 1] = 0;
             firewall_allow_port_count--;
             return true;
         }
@@ -1794,9 +1815,9 @@ public:
     bool remove_firewall_deny_port(u16 port) {
         for (u32 i = 0; i < firewall_deny_port_count; i++) {
             if (firewall_deny_ports[i] != port) continue;
-            for (u32 j = i + 1; j < firewall_deny_port_count; j++)
-                firewall_deny_ports[j - 1] = firewall_deny_ports[j];
-            firewall_deny_ports[firewall_deny_port_count - 1] = 0;
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_port_count; j++)
+                firewall_deny_ports[static_cast<i64>(j) - 1] = firewall_deny_ports[j];
+            firewall_deny_ports[static_cast<i64>(firewall_deny_port_count) - 1] = 0;
             firewall_deny_port_count--;
             return true;
         }
@@ -1804,7 +1825,8 @@ public:
     }
     bool add_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
-        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 mask =
+            prefix_len == 0 ? 0u : (0xffffffffu << (32 - static_cast<i64>(prefix_len)));
         const u32 net_addr = ip & mask;
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
@@ -1856,9 +1878,9 @@ public:
         for (u32 i = 0; i < firewall_allow_range_count; i++) {
             const auto& r = firewall_allow_ranges[i];
             if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
-            for (u32 j = i + 1; j < firewall_allow_range_count; j++)
-                firewall_allow_ranges[j - 1] = firewall_allow_ranges[j];
-            firewall_allow_ranges[firewall_allow_range_count - 1] = {0, 0};
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_range_count; j++)
+                firewall_allow_ranges[static_cast<i64>(j) - 1] = firewall_allow_ranges[j];
+            firewall_allow_ranges[static_cast<i64>(firewall_allow_range_count) - 1] = {0, 0};
             firewall_allow_range_count--;
             return true;
         }
@@ -1881,14 +1903,15 @@ public:
     }
     bool remove_firewall_allow_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
-        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 mask =
+            prefix_len == 0 ? 0u : (0xffffffffu << (32 - static_cast<i64>(prefix_len)));
         const u32 net_addr = ip & mask;
         for (u32 i = 0; i < firewall_allow_cidr_count; i++) {
             const auto& r = firewall_allow_cidrs[i];
             if (r.net_addr != net_addr || r.mask != mask) continue;
-            for (u32 j = i + 1; j < firewall_allow_cidr_count; j++)
-                firewall_allow_cidrs[j - 1] = firewall_allow_cidrs[j];
-            firewall_allow_cidrs[firewall_allow_cidr_count - 1] = {0, 0};
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_allow_cidr_count; j++)
+                firewall_allow_cidrs[static_cast<i64>(j) - 1] = firewall_allow_cidrs[j];
+            firewall_allow_cidrs[static_cast<i64>(firewall_allow_cidr_count) - 1] = {0, 0};
             firewall_allow_cidr_count--;
             return true;
         }
@@ -1909,7 +1932,8 @@ public:
     }
     bool add_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
-        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 mask =
+            prefix_len == 0 ? 0u : (0xffffffffu << (32 - static_cast<i64>(prefix_len)));
         const u32 net_addr = ip & mask;
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
             const auto& r = firewall_deny_cidrs[i];
@@ -1961,9 +1985,9 @@ public:
         for (u32 i = 0; i < firewall_deny_range_count; i++) {
             const auto& r = firewall_deny_ranges[i];
             if (r.start_ip != start_ip || r.end_ip != end_ip) continue;
-            for (u32 j = i + 1; j < firewall_deny_range_count; j++)
-                firewall_deny_ranges[j - 1] = firewall_deny_ranges[j];
-            firewall_deny_ranges[firewall_deny_range_count - 1] = {0, 0};
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_range_count; j++)
+                firewall_deny_ranges[static_cast<i64>(j) - 1] = firewall_deny_ranges[j];
+            firewall_deny_ranges[static_cast<i64>(firewall_deny_range_count) - 1] = {0, 0};
             firewall_deny_range_count--;
             return true;
         }
@@ -1986,14 +2010,15 @@ public:
     }
     bool remove_firewall_deny_cidr(u32 ip, u8 prefix_len) {
         if (prefix_len > 32) return false;
-        const u32 mask = prefix_len == 0 ? 0u : (0xffffffffu << (32u - prefix_len));
+        const u32 mask =
+            prefix_len == 0 ? 0u : (0xffffffffu << (32 - static_cast<i64>(prefix_len)));
         const u32 net_addr = ip & mask;
         for (u32 i = 0; i < firewall_deny_cidr_count; i++) {
             const auto& r = firewall_deny_cidrs[i];
             if (r.net_addr != net_addr || r.mask != mask) continue;
-            for (u32 j = i + 1; j < firewall_deny_cidr_count; j++)
-                firewall_deny_cidrs[j - 1] = firewall_deny_cidrs[j];
-            firewall_deny_cidrs[firewall_deny_cidr_count - 1] = {0, 0};
+            for (u32 j = static_cast<i64>(i) + 1; j < firewall_deny_cidr_count; j++)
+                firewall_deny_cidrs[static_cast<i64>(j) - 1] = firewall_deny_cidrs[j];
+            firewall_deny_cidrs[static_cast<i64>(firewall_deny_cidr_count) - 1] = {0, 0};
             firewall_deny_cidr_count--;
             return true;
         }
@@ -2142,7 +2167,7 @@ private:
                 continue;
             }
             if (c < '0' || c > '9') return false;
-            cur = cur * 10 + static_cast<u32>(c - '0');
+            cur = static_cast<u32>(static_cast<i64>(cur) * 10 + (static_cast<i64>(c) - '0'));
             if (cur > 255 || ++digit_count > 3) return false;
         }
         if (digit_count == 0 || octet_idx != 3) return false;
@@ -2159,13 +2184,15 @@ private:
                 slash_idx = i;
             }
         }
-        if (slash_idx == 0xffffffffu || slash_idx == 0 || slash_idx + 1 >= s.len) return false;
+        if (slash_idx == 0xffffffffu || slash_idx == 0 ||
+            static_cast<i64>(slash_idx) + 1 >= static_cast<i64>(s.len))
+            return false;
         if (!parse_ipv4_dotted({s.ptr, slash_idx}, out_ip)) return false;
         u32 prefix = 0;
-        for (u32 i = slash_idx + 1; i < s.len; i++) {
+        for (u32 i = static_cast<i64>(slash_idx) + 1; i < s.len; i++) {
             const char c = s.ptr[i];
             if (c < '0' || c > '9') return false;
-            prefix = prefix * 10 + static_cast<u32>(c - '0');
+            prefix = static_cast<u32>(static_cast<i64>(prefix) * 10 + (static_cast<i64>(c) - '0'));
             if (prefix > 32) return false;
         }
         out_prefix_len = static_cast<u8>(prefix);
@@ -2179,9 +2206,14 @@ private:
                 dash_idx = i;
             }
         }
-        if (dash_idx == 0xffffffffu || dash_idx == 0 || dash_idx + 1 >= s.len) return false;
+        if (dash_idx == 0xffffffffu || dash_idx == 0 ||
+            static_cast<i64>(dash_idx) + 1 >= static_cast<i64>(s.len))
+            return false;
         if (!parse_ipv4_dotted({s.ptr, dash_idx}, out_start_ip)) return false;
-        if (!parse_ipv4_dotted({s.ptr + dash_idx + 1, s.len - dash_idx - 1}, out_end_ip))
+        if (!parse_ipv4_dotted(
+                {s.ptr + static_cast<i64>(dash_idx) + 1,
+                 static_cast<u32>(static_cast<i64>(s.len) - static_cast<i64>(dash_idx) - 1)},
+                out_end_ip))
             return false;
         return out_start_ip <= out_end_ip;
     }
@@ -2330,7 +2362,7 @@ inline bool route_requires_response_read_timeout_preflight_close(const RouteEntr
         return true;
     const u16 id = route->preflight_forward_policy_bundle_id;
     if (config == nullptr || !config->policy_bundle_id_is_valid(id)) return true;
-    const auto& bundle = config->policy_bundles[id - 1];
+    const auto& bundle = config->policy_bundles[static_cast<i64>(id) - 1];
     // A forged route marker that points at a legacy zero-duration bundle is
     // invalid too. Both valid metadata and every invalid shape use the same
     // zero-byte close boundary.

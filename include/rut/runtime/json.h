@@ -151,7 +151,7 @@ struct Writer {
         data[len++] = c;
     }
     void text(Str s) {
-        if (s.len > cap - len) {
+        if (static_cast<i64>(s.len) > static_cast<i64>(cap) - static_cast<i64>(len)) {
             ok = false;
             return;
         }
@@ -270,11 +270,14 @@ inline bool decode(Str s, u32& p, Writer& out) {
                 case 'u': {
                     if (!hex4(s, p, cp)) return false;
                     if (cp >= 0xd800 && cp <= 0xdbff) {
-                        if (s.len - p < 2 || s.ptr[p] != '\\' || s.ptr[p + 1] != 'u') return false;
-                        p += 2;
+                        if (static_cast<i64>(s.len) - static_cast<i64>(p) < 2 || s.ptr[p] != '\\' ||
+                            s.ptr[static_cast<i64>(p) + 1] != 'u')
+                            return false;
+                        p = static_cast<u32>(static_cast<i64>(p) + 2);
                         u32 lo;
                         if (!hex4(s, p, lo) || lo < 0xdc00 || lo > 0xdfff) return false;
-                        cp = 0x10000 + ((cp - 0xd800) << 10) + lo - 0xdc00;
+                        cp = static_cast<u32>(0x10000 + ((static_cast<i64>(cp) - 0xd800) << 10) +
+                                              static_cast<i64>(lo) - 0xdc00);
                     } else if (cp >= 0xdc00 && cp <= 0xdfff)
                         return false;
                     break;
@@ -381,7 +384,7 @@ struct Document {
                             valid = false;
                             break;
                         }
-                        key = parse_value(depth + 1);
+                        key = parse_value(static_cast<u32>(static_cast<i64>(depth) + 1));
                         whitespace();
                         if (!valid || !take(':')) {
                             valid = false;
@@ -396,7 +399,7 @@ struct Document {
                         }
                     }
                     if (!valid) break;
-                    const u32 child = parse_value(depth + 1);
+                    const u32 child = parse_value(static_cast<u32>(static_cast<i64>(depth) + 1));
                     if (!valid) break;
                     nodes[child].key = key;
                     if (last == kNone)
@@ -416,10 +419,13 @@ struct Document {
             const Str token = c == 'n'   ? lit_str("null")
                               : c == 't' ? lit_str("true")
                                          : lit_str("false");
-            if (source.len - p < token.len || !source.slice(p, p + token.len).eq(token))
+            if (static_cast<i64>(source.len) - static_cast<i64>(p) < token.len ||
+                !source
+                     .slice(p, static_cast<u32>(static_cast<i64>(p) + static_cast<i64>(token.len)))
+                     .eq(token))
                 valid = false;
             else
-                p += token.len;
+                p = static_cast<u32>(static_cast<i64>(p) + static_cast<i64>(token.len));
             nodes[id].kind = c == 'n' ? Kind::Null : Kind::Boolean;
         } else {
             nodes[id].kind = Kind::Number;
@@ -474,7 +480,11 @@ struct Document {
             if (s.ptr[i] < '0' || s.ptr[i] > '9' || n > 429496729u) return false;
             const u32 digit = static_cast<u32>(s.ptr[i] - '0');
             if (n == 429496729u && digit > 5) return false;
-            n = n * 10 + digit;
+            u64 next = 0;
+            if (__builtin_mul_overflow(n, u64{10}, &next) ||
+                __builtin_add_overflow(next, static_cast<u64>(digit), &next))
+                return false;
+            n = next;
         }
         return true;
     }
@@ -575,18 +585,36 @@ inline bool integer(Str s, i64& out) {
     for (; p < s.len; ++p) {
         if (s.ptr[p] < '0' || s.ptr[p] > '9') return false;
         const u32 d = static_cast<u32>(s.ptr[p] - '0');
-        if (n > (limit - d) / 10) return false;
-        n = n * 10 + d;
+        if (n > limit / 10 || (n == limit / 10 && static_cast<u64>(d) > limit % 10)) return false;
+        // The range check above makes the ordinary path fit in i64. Handle
+        // exactly INT64_MIN's magnitude separately, since it has no positive
+        // signed counterpart for the widened multiplication.
+        if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
+            n = limit;
+        else
+            n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
     }
-    out = negative ? static_cast<i64>(u64(0) - n) : static_cast<i64>(n);
+    if (!negative) {
+        out = static_cast<i64>(n);
+    } else if (n == (u64{1} << 63)) {
+        out = -9223372036854775807LL - 1;
+    } else {
+        out = -static_cast<i64>(n);
+    }
     return true;
 }
 inline void write_integer(i64 value, Writer& w) {
-    u64 n = value < 0 ? u64(0) - static_cast<u64>(value) : static_cast<u64>(value);
+    u64 n = 0;
+    if (value == (-9223372036854775807LL - 1))
+        n = u64{1} << 63;
+    else if (value < 0)
+        n = static_cast<u64>(-value);
+    else
+        n = static_cast<u64>(value);
     char digits[20];
     u32 count = 0;
     do {
-        digits[count++] = static_cast<char>('0' + n % 10);
+        digits[count++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(n % 10));
         n /= 10;
     } while (n);
     if (value < 0) w.put('-');

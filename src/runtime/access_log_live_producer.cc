@@ -108,7 +108,8 @@ SourceLiveAccessLogPublishResult SourceLiveAccessLogProducer::publish_host(
 
     const u64 position = ring_->published_pos.load(std::memory_order_relaxed);
     const u64 committed = ring_->committed_pos.load(std::memory_order_acquire);
-    const u64 pending = position - committed;
+    u64 pending = 0;
+    (void)__builtin_sub_overflow(position, committed, &pending);
     if (pending > LiveAccessLogRing::kCapacity) {
         session_->report_producer_fatal(
             SourceLiveAccessLogFatalKind::Protocol, ring_index_, EPROTO);

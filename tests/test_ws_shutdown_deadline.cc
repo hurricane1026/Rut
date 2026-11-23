@@ -532,7 +532,7 @@ TEST(websocket, acknowledgement_wait_deadline_is_not_refreshed_by_closing_contro
     REQUIRE(f.start());
     f.sent(true);
     f.sent(false);
-    const u32 kStarted = f.conn->ws_shutdown_started_tick;
+    const auto kStarted = f.conn->ws_shutdown_started_tick;
     const u8 ping[] = {0x89, 0x81, 1, 2, 3, 4, static_cast<u8>('p' ^ 1)};
     for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds; ++tick) {
         REQUIRE(f.receive(true, ping, sizeof(ping)));
@@ -864,9 +864,9 @@ TEST(legacy_loop, shutdown_deadline_uses_unsigned_elapsed_ticks_across_wrap) {
     REQUIRE(conn != nullptr);
     conn->fd = -1;
     conn->is_ws_tunnel = true;
-    loop->timer.cursor = UINT32_MAX - 2;
+    loop->timer.cursor = TimerWheel::Tick{UINT32_MAX - 2};
     ws_arm_shutdown_deadline(loop, *conn);
-    CHECK_EQ(conn->ws_shutdown_started_tick, UINT32_MAX - 2);
+    CHECK_EQ(conn->ws_shutdown_started_tick, TimerWheel::Tick{UINT32_MAX - 2});
 
     for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds + 1; tick++)
         loop->dispatch(make_ev(0, IoEventType::Timeout, 1));

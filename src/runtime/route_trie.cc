@@ -39,9 +39,11 @@ u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out)
         const bool at_sep = (i == path.len) || (path.ptr[i] == '/');
         if (!at_sep) continue;
         if (i > start) {
-            if (!out.push(Str{path.ptr + start, i - start})) return kMaxPathSegments + 1;
+            if (!out.push(Str{path.ptr + static_cast<i64>(start),
+                              static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}))
+                return static_cast<u32>(static_cast<i64>(kMaxPathSegments) + 1);
         }
-        start = i + 1;
+        start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
     return out.len;
 }
@@ -111,12 +113,13 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
 
     auto rollback = [&]() {
         for (u32 r = pushed_parents.len; r > 0; r--) {
-            nodes[pushed_parents[r - 1]].children.len--;
+            nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len = static_cast<u32>(
+                static_cast<i64>(nodes[pushed_parents[static_cast<i64>(r) - 1]].children.len) - 1);
         }
         nodes.len = saved_nodes_len;
     };
 
-    FixedVec<u16, kMaxPathSegments + 1> visited;
+    FixedVec<u16, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> visited;
     [[maybe_unused]] const bool kRootRecorded = visited.push(0);
     u16 cur = 0;  // root
     for (u32 i = 0; i < n; i++) {
@@ -136,7 +139,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            child = static_cast<u16>(nodes.len - 1);
+            child = static_cast<u16>(static_cast<i64>(nodes.len) - 1);
             if (!nodes[cur].children.push(child)) {
                 // Pre-flight above rules this out, but if a future
                 // FixedVec invariant change makes it reachable, fall
@@ -165,11 +168,11 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     // a simple pop and cannot corrupt an existing parameter prefix.
     for (u32 i = 0; i < pushed_parents.len; ++i) {
         auto& parent = nodes[pushed_parents[i]];
-        const u32 kLast = parent.children.len - 1;
+        const u32 kLast = static_cast<u32>(static_cast<i64>(parent.children.len) - 1);
         const u16 kChild = parent.children[kLast];
         if (is_param_segment(nodes[kChild].segment)) {
             for (u32 j = kLast; j > parent.children.param_count; --j)
-                parent.children[j] = parent.children[j - 1];
+                parent.children[j] = parent.children[static_cast<i64>(j) - 1];
             parent.children[parent.children.param_count++] = kChild;
         }
         needs_backtracking_ |= parent.children.param_count != 0 && parent.children.len > 1;
@@ -245,7 +248,9 @@ u16 RouteTrie::match_key(Str path,
             if (position == path.len) break;
             const u32 kStart = position;
             while (position < path.len && path.ptr[position] != '/') ++position;
-            const Str kValue{path.ptr + kStart, position - kStart};
+            const Str kValue{
+                path.ptr + static_cast<i64>(kStart),
+                static_cast<u32>(static_cast<i64>(position) - static_cast<i64>(kStart))};
             const u16 kChild =
                 node.children.len == 1 ? node.children[0] : find_child(current, kValue);
             if (kChild == TrieNode::kInvalidNodeIdx) break;
@@ -253,7 +258,10 @@ u16 RouteTrie::match_key(Str path,
             if (is_param_segment(kName)) {
                 if (captured < kCap) {
                     out_params[captured++] =
-                        RouteParam{kName.ptr + 1, kName.len - 1, kValue.ptr, kValue.len};
+                        RouteParam{kName.ptr + 1,
+                                   static_cast<u32>(static_cast<i64>(kName.len) - 1),
+                                   kValue.ptr,
+                                   kValue.len};
                 }
             } else if (!kName.eq(kValue)) {
                 break;
@@ -283,7 +291,7 @@ u16 RouteTrie::match_key(Str path,
         u32 static_segments;
         u64 static_mask;
     };
-    FixedVec<Frame, kMaxPathSegments + 1> stack;
+    FixedVec<Frame, static_cast<size_t>(static_cast<i64>(kMaxPathSegments) + 1)> stack;
     [[maybe_unused]] const bool kPushed = stack.push(Frame{});
 
     struct Candidate {
@@ -313,13 +321,14 @@ u16 RouteTrie::match_key(Str path,
             // Record only node IDs for the winning path. Capture views are
             // materialized once, after the search, and only when requested.
             if (out_params && out_param_count && out_param_cap != 0 && depth != static_segments) {
-                for (u32 i = 1; i < stack.len; ++i) best_path[i - 1] = stack[i].node;
+                for (u32 i = 1; i < stack.len; ++i)
+                    best_path[static_cast<i64>(i) - 1] = stack[i].node;
             }
         }
     };
 
     while (stack.len > 0) {
-        Frame& frame = stack[stack.len - 1];
+        Frame& frame = stack[static_cast<i64>(stack.len) - 1];
         const auto& node = nodes[frame.node];
         if (frame.next_child == 0) {
             consider(pick_terminal(node, want_slot),
@@ -332,7 +341,7 @@ u16 RouteTrie::match_key(Str path,
                 best.static_segments == best.depth)
                 return best.route_idx;
             if (frame.depth >= segs.len) {
-                --stack.len;
+                stack.len = static_cast<u32>(static_cast<i64>(stack.len) - 1);
                 continue;
             }
             // Visit the literal first, then parameter children in insertion
@@ -341,23 +350,32 @@ u16 RouteTrie::match_key(Str path,
             const u16 kLiteral =
                 find_child(frame.node, segs[frame.depth], node.children.param_count);
             if (kLiteral != TrieNode::kInvalidNodeIdx) {
-                const u32 kDepth = frame.depth + 1;
-                const u64 kMask = frame.static_mask | (kDepth < 64 ? 1ull << (63 - kDepth) : 0);
+                const u32 kDepth = static_cast<u32>(static_cast<i64>(frame.depth) + 1);
+                const u64 kMask =
+                    frame.static_mask | (kDepth < 64 ? 1ull << (63 - static_cast<i64>(kDepth)) : 0);
                 [[maybe_unused]] const bool kOk =
-                    stack.push(Frame{kLiteral, kDepth, 0, frame.static_segments + 1, kMask});
+                    stack.push(Frame{kLiteral,
+                                     kDepth,
+                                     0,
+                                     static_cast<u32>(static_cast<i64>(frame.static_segments) + 1),
+                                     kMask});
                 continue;
             }
         }
         bool descended = false;
         while (frame.next_child <= node.children.param_count) {
-            const u16 kChild = node.children[frame.next_child++ - 1];
+            const u16 kChild = node.children[static_cast<i64>(frame.next_child++) - 1];
             if ((nodes[kChild].children.method_mask & kEligibleMethods) == 0) continue;
-            [[maybe_unused]] const bool kOk = stack.push(
-                Frame{kChild, frame.depth + 1, 0, frame.static_segments, frame.static_mask});
+            [[maybe_unused]] const bool kOk =
+                stack.push(Frame{kChild,
+                                 static_cast<u32>(static_cast<i64>(frame.depth) + 1),
+                                 0,
+                                 frame.static_segments,
+                                 frame.static_mask});
             descended = true;
             break;
         }
-        if (!descended) --stack.len;
+        if (!descended) stack.len = static_cast<u32>(static_cast<i64>(stack.len) - 1);
     }
     if (out_params && out_param_count && best.route_idx != TrieNode::kInvalidRoute &&
         best.static_segments != best.depth) {
@@ -367,7 +385,10 @@ u16 RouteTrie::match_key(Str path,
             if (!is_param_segment(kName)) continue;
             const Str kValue = segs[i];
             out_params[(*out_param_count)++] =
-                RouteParam{kName.ptr + 1, kName.len - 1, kValue.ptr, kValue.len};
+                RouteParam{kName.ptr + 1,
+                           static_cast<u32>(static_cast<i64>(kName.len) - 1),
+                           kValue.ptr,
+                           kValue.len};
         }
     }
     return best.route_idx;

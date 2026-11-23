@@ -18,40 +18,44 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 MUTATIONS = {
     "wheel_off_by_one": ("rut/runtime/timer_wheel.h",
-                         "&slots[cursor & (kSlots - 1)]",
-                         "&slots[(cursor + 1) & (kSlots - 1)]"),
+                         "&slots[slot_after(0)]",
+                         "&slots[slot_after(1)]"),
     "heap_scan_sifts_before_compacting": (
         "rut/runtime/yield_heap.h",
         """    u32 kept = 0;
     for (u32 i = 0; i < size; ++i) {
         if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
     }
-    const u32 kRemoved = size - kept;
+    const u32 kRemoved = static_cast<u32>(static_cast<i64>(size) - static_cast<i64>(kept));
     size = kept;
     if (kRemoved > 0) {
-        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
+        for (u32 i = size / 2; i > 0; i = static_cast<u32>(static_cast<i64>(i) - 1))
+            sift_down(entries, size, static_cast<u32>(static_cast<i64>(i) - 1));
     }
     return kRemoved;""",
-        """    u32 removed = 0;
+        """    u32 kRemoved = 0;
     u32 i = 0;
     while (i < size) {
-        if (entries[i].conn_id != conn_id) { ++i; continue; }
+        if (entries[i].conn_id != conn_id) {
+            ++i;
+            continue;
+        }
         entries[i] = entries[--size];
-        ++removed;
+        ++kRemoved;
         if (i < size) {
-            u32 j = i;
-            while (j > 0) {
-                u32 parent = (j - 1) / 2;
-                if (entries[parent].deadline_ns <= entries[j].deadline_ns) break;
+            u32 sift = i;
+            while (sift > 0) {
+                const u32 parent = (sift - 1) / 2;
+                if (entries[parent].deadline_ns <= entries[sift].deadline_ns) break;
                 const Entry saved = entries[parent];
-                entries[parent] = entries[j];
-                entries[j] = saved;
-                j = parent;
+                entries[parent] = entries[sift];
+                entries[sift] = saved;
+                sift = parent;
             }
             sift_down(entries, size, i);
         }
     }
-    return removed;"""),
+    return kRemoved;"""),
     "stale_uring_disarms_successor": ("rut/runtime/iouring_event_loop.h",
                                       "if (matching_generation) {", "if (true) {"),
 }

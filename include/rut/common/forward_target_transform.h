@@ -26,21 +26,22 @@ inline bool forward_target_transform_clean_prefix(Str value) {
     if (value.ptr == nullptr || value.len == 0 || value.len > kMaxForwardTargetTransformPrefixLen ||
         value.ptr[0] != '/')
         return false;
-    if (value.len > 1 && value.ptr[value.len - 1] != '/') return false;
+    if (value.len > 1 && value.ptr[static_cast<i64>(value.len) - 1] != '/') return false;
     for (u32 i = 0; i < value.len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
         if (c < 0x21 || c == 0x7f || c == '%' || c == '?' || c == '#') return false;
-        if (i > 0 && value.ptr[i] == '/' && value.ptr[i - 1] == '/') return false;
+        if (i > 0 && value.ptr[i] == '/' && value.ptr[static_cast<i64>(i) - 1] == '/') return false;
     }
     u32 segment_start = 1;
     for (u32 i = 1; i <= value.len; i++) {
         if (i != value.len && value.ptr[i] != '/') continue;
-        const u32 segment_len = i - segment_start;
+        const u32 segment_len =
+            static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(segment_start));
         if (segment_len == 1 && value.ptr[segment_start] == '.') return false;
         if (segment_len == 2 && value.ptr[segment_start] == '.' &&
-            value.ptr[segment_start + 1] == '.')
+            value.ptr[static_cast<i64>(segment_start) + 1] == '.')
             return false;
-        segment_start = i + 1;
+        segment_start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
     return true;
 }
@@ -60,7 +61,7 @@ inline bool forward_target_transform_replacement_prefix(Str value) {
         !forward_target_transform_clean_prefix({value.ptr, query_delimiter}))
         return false;
 
-    for (u32 i = query_delimiter + 1; i < value.len; i++) {
+    for (u32 i = static_cast<i64>(query_delimiter) + 1; i < value.len; i++) {
         const u8 c = static_cast<u8>(value.ptr[i]);
         const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
         const bool digit = c >= '0' && c <= '9';
@@ -118,10 +119,16 @@ inline bool forward_target_transform_table_valid(const ForwardTargetTransformSpe
     u32 total = 0;
     for (u32 i = 0; i < count; i++) {
         if (!forward_target_transform_spec_valid(specs[i])) return false;
-        if (specs[i].strip_prefix.len > kForwardTargetTransformBytes - total) return false;
-        total += specs[i].strip_prefix.len;
-        if (specs[i].replace_prefix.len > kForwardTargetTransformBytes - total) return false;
-        total += specs[i].replace_prefix.len;
+        if (static_cast<i64>(specs[i].strip_prefix.len) >
+            static_cast<i64>(kForwardTargetTransformBytes) - static_cast<i64>(total))
+            return false;
+        total =
+            static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(specs[i].strip_prefix.len));
+        if (static_cast<i64>(specs[i].replace_prefix.len) >
+            static_cast<i64>(kForwardTargetTransformBytes) - static_cast<i64>(total))
+            return false;
+        total = static_cast<u32>(static_cast<i64>(total) +
+                                 static_cast<i64>(specs[i].replace_prefix.len));
         for (u32 j = 0; j < i; j++) {
             if (forward_target_transform_spec_equal(specs[i], specs[j])) return false;
         }

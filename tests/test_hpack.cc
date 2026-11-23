@@ -115,6 +115,17 @@ TEST(hpack_huffman, all_bytes_stream_roundtrips) {
     CHECK(bytes_eq(dec, all, 256));
 }
 
+TEST(hpack_huffman, bounded_header_block_length_uses_full_bit_count) {
+    constexpr i64 kMaxInput = static_cast<i64>(~u32{0});
+    constexpr i64 kMaxBits = kMaxInput * 30;
+    static_assert(kMaxBits < 0x7fffffffffffffffLL);
+    static_assert(hpack::huffman_encoded_bytes_from_bits(kMaxBits) > kMaxInput);
+    // HTTP/2 header blocks are bounded at 16 KiB. Symbol 0 has a 13-bit code,
+    // so this exercises the length calculation across the full production cap.
+    u8 input[16384] = {};
+    CHECK_EQ(hpack::huffman_encoded_len(input, sizeof(input)), 26624);
+}
+
 TEST(hpack_huffman, rfc_c4_1_www_example_com) {
     const char* s = "www.example.com";
     const u8 want[] = {0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff};
@@ -176,6 +187,16 @@ TEST(hpack_string, plain_roundtrip) {
     CHECK_EQ(consumed, n);
     CHECK_EQ(out_len, 10u);
     CHECK(bytes_eq(out, reinterpret_cast<const u8*>(s), 10));
+}
+
+TEST(hpack_string, length_prefix_sentinel_and_continuation_boundaries) {
+    u8 input[128] = {};
+    u8 enc[256];
+    CHECK_EQ(hpack::encode_string(enc, input, 126), 127);
+    CHECK_EQ(hpack::encode_string(enc, input, 127), 129);
+    CHECK_EQ(hpack::encode_string(enc, input, 128), 130);
+    CHECK_EQ(enc[0], 0x7f);
+    CHECK_EQ(enc[1], 0x01);
 }
 
 TEST(hpack_string, chooses_huffman_when_shorter) {

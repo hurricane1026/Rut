@@ -62,12 +62,16 @@ struct SlicePool {
     // the remaining bounded body in whole SlicePool nodes. Keep this reserve
     // with the pool sizing contract so every backend accounts for it equally.
     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
-    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 3 * sizeof(u32);
-    static constexpr u32 kMaxBufferedResponseSlices =
-        (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
+    static constexpr u32 kResponseBodyPayload =
+        static_cast<u32>(static_cast<i64>(kSliceSize) - static_cast<i64>(sizeof(void*)) -
+                         3 * static_cast<i64>(sizeof(u32)));
+    static constexpr u32 kMaxBufferedResponseSlices = static_cast<u32>(
+        (static_cast<i64>(kMaxBufferedResponseBody) + static_cast<i64>(kResponseBodyPayload) - 1) /
+        static_cast<i64>(kResponseBodyPayload));
     static constexpr u32 kOrdinarySlicesPerConnection = 6;
     static constexpr u32 kSlicesPerConnection =
-        kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
+        static_cast<u32>(static_cast<i64>(kOrdinarySlicesPerConnection) +
+                         static_cast<i64>(kMaxBufferedResponseSlices));
 
     // Bulk relay buffers: large buffers a connection borrows only while it
     // relays a large proxied body, so the body moves in 256 KiB steps.
@@ -220,7 +224,7 @@ struct SlicePool {
             }
             bulk_free = static_cast<u32*>(bulk_free_mem);
 
-            const u32 words = (bulk_max_count + 63u) / 64u;
+            const u32 words = static_cast<u32>((static_cast<i64>(bulk_max_count) + 63) / 64);
             bulk_in_use_size = static_cast<u64>(words) * sizeof(u64);
             void* bulk_in_use_mem = mmap(nullptr,
                                          bulk_in_use_size,
@@ -247,7 +251,9 @@ struct SlicePool {
         if (prealloc > 0) {
             if (prealloc > n) prealloc = n;
             // Round up to kGrowStep for mprotect alignment.
-            u32 steps = (prealloc + kGrowStep - 1) / kGrowStep;
+            u32 steps =
+                static_cast<u32>((static_cast<i64>(prealloc) + static_cast<i64>(kGrowStep) - 1) /
+                                 static_cast<i64>(kGrowStep));
             for (u32 s = 0; s < steps && count < max_count; s++) {
                 if (!grow()) {
                     destroy();
@@ -264,7 +270,7 @@ struct SlicePool {
     u8* alloc() {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
-        u8* ptr = base + static_cast<u64>(idx) * kSliceSize;
+        u8* ptr = base + static_cast<i64>(idx) * kSliceSize;
         if (cached_count != 0) --cached_count;
         if (in_use_map) in_use_map[idx] = 1;
         return ptr;
@@ -293,7 +299,7 @@ struct SlicePool {
 
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
         return bulk_base != nullptr && ptr >= bulk_base &&
-               ptr < bulk_base + static_cast<u64>(bulk_max_count) * kBulkSliceSize;
+               ptr < bulk_base + static_cast<i64>(bulk_max_count) * kBulkSliceSize;
     }
 
     // Byte capacity of a buffer handed out by alloc() or alloc_bulk().
@@ -315,8 +321,12 @@ struct SlicePool {
             return;
         }
         if (!ptr || !base || !free_stack || count == 0) return;
-        if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return;
-        u64 offset = static_cast<u64>(ptr - base);
+        if (ptr < base || ptr >= base + static_cast<i64>(count) * kSliceSize) return;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+        uintptr_t raw_offset = 0;
+        if (__builtin_sub_overflow(address, begin, &raw_offset)) return;
+        u64 offset = raw_offset;
         if (offset % kSliceSize != 0) return;  // not slice-aligned
         if (free_top >= max_count) return;     // overflow guard
         u32 idx = static_cast<u32>(offset / kSliceSize);
@@ -340,7 +350,8 @@ struct SlicePool {
 #endif
         // Insert below the cached suffix in O(1). Pushing discarded slices on
         // top would strand the cache after a burst and keep faulting cold pages.
-        const u32 boundary = free_top - cached_count;
+        const u32 boundary =
+            static_cast<u32>(static_cast<i64>(free_top) - static_cast<i64>(cached_count));
         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
         free_stack[boundary] = idx;
         ++free_top;
@@ -354,8 +365,12 @@ struct SlicePool {
     bool bound_slice_valid(const u8* ptr) const {
 #ifdef __linux__
         if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
-        if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return false;
-        const u64 offset = static_cast<u64>(ptr - base);
+        if (ptr < base || ptr >= base + static_cast<i64>(count) * kSliceSize) return false;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+        uintptr_t raw_offset = 0;
+        if (__builtin_sub_overflow(address, begin, &raw_offset)) return false;
+        const u64 offset = raw_offset;
         if (offset % kSliceSize != 0) return false;
         return in_use_map[offset / kSliceSize];
 #else
@@ -390,7 +405,11 @@ struct SlicePool {
     u32 available() const { return free_top; }
 
     // Number of in-use slices.
-    u32 in_use() const { return count - free_top; }
+    u32 in_use() const {
+        return count >= free_top
+                   ? static_cast<u32>(static_cast<i64>(count) - static_cast<i64>(free_top))
+                   : 0;
+    }
 
     // Release all mmap'd memory.
     void destroy() {
@@ -434,9 +453,10 @@ struct SlicePool {
     void study_trim_bulk_idle_cache() {
         if (!study_adaptive_cache || study_bulk_borrowed != 0) return;
         for (u32 n = 0; n != 8 && bulk_cached_count > study_bulk_cache_limit; ++n) {
-            const u32 position = bulk_free_top - bulk_cached_count;
+            const u32 position = static_cast<u32>(static_cast<i64>(bulk_free_top) -
+                                                  static_cast<i64>(bulk_cached_count));
             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
-            u8* ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+            u8* ptr = bulk_base + static_cast<i64>(idx) * kBulkSliceSize;
 #ifdef __linux__
             if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
                 clear_bulk_bytes(ptr, kBulkSliceSize);
@@ -457,7 +477,9 @@ private:
     static_assert(kMaxBulkSlices < kDeferredBodyClear);
 
     void clear_bulk_bytes(u8* ptr, u32 dirty) {
-        study_body_bulk_clear_bytes += dirty;
+        if (__builtin_add_overflow(
+                study_body_bulk_clear_bytes, static_cast<u64>(dirty), &study_body_bulk_clear_bytes))
+            study_body_bulk_clear_bytes = UINT64_MAX;
         __builtin_memset(ptr, 0, dirty);
     }
 
@@ -473,7 +495,7 @@ private:
         if (study_bulk_borrowed > study_bulk_peak_borrowed)
             study_bulk_peak_borrowed = study_bulk_borrowed;
         if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
-        u8* const ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+        u8* const ptr = bulk_base + static_cast<i64>(idx) * kBulkSliceSize;
         if ((entry & kDeferredBodyClear) != 0) {
             u32 dirty = 0;
             __builtin_memcpy(&dirty, ptr, sizeof(dirty));
@@ -526,12 +548,17 @@ private:
         bulk_base = static_cast<u8*>(mem);
         bulk_free_top = 0;
         bulk_cached_count = 0;
-        for (u32 i = bulk_max_count; i > 0; --i) bulk_free[bulk_free_top++] = i - 1;
+        for (u32 i = bulk_max_count; i > 0; --i)
+            bulk_free[bulk_free_top++] = static_cast<u32>(static_cast<i64>(i) - 1);
         return true;
     }
 
     void free_bulk(u8* ptr, u32 dirty, bool defer_body_clear = false) {
-        const u64 offset = static_cast<u64>(ptr - bulk_base);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(bulk_base);
+        uintptr_t raw_offset = 0;
+        if (__builtin_sub_overflow(address, begin, &raw_offset)) return;
+        const u64 offset = raw_offset;
         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
         if (idx >= bulk_max_count) return;
@@ -570,7 +597,8 @@ private:
 #endif
         // Below the cached suffix, as free() does for slices, so reuse keeps
         // preferring the resident buffers.
-        const u32 boundary = bulk_free_top - bulk_cached_count;
+        const u32 boundary =
+            static_cast<u32>(static_cast<i64>(bulk_free_top) - static_cast<i64>(bulk_cached_count));
         if (bulk_cached_count != 0) bulk_free[bulk_free_top] = bulk_free[boundary];
         bulk_free[boundary] = idx;
         ++bulk_free_top;
@@ -582,18 +610,20 @@ private:
         if (count >= max_count) return false;
 
         u32 step = kGrowStep;
-        if (count + step > max_count) step = max_count - count;
+        if (static_cast<i64>(count) + static_cast<i64>(step) > static_cast<i64>(max_count))
+            step = static_cast<u32>(static_cast<i64>(max_count) - static_cast<i64>(count));
 
         // mprotect the next chunk of the reserved VA region
-        u8* chunk = base + static_cast<u64>(count) * kSliceSize;
+        u8* chunk = base + static_cast<i64>(count) * kSliceSize;
         u64 chunk_size = static_cast<u64>(step) * kSliceSize;
         if (mprotect(chunk, chunk_size, PROT_READ | PROT_WRITE) != 0) return false;
 
         // Add new slices to free stack
-        for (u32 i = count; i < count + step; i++) {
+        for (u32 i = count; static_cast<i64>(i) < static_cast<i64>(count) + static_cast<i64>(step);
+             i++) {
             free_stack[free_top++] = i;
         }
-        count += step;
+        count = static_cast<u32>(static_cast<i64>(count) + static_cast<i64>(step));
         return true;
     }
 };

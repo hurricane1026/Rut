@@ -462,8 +462,7 @@ public:
                 const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
                                                                          : RouteConfig::kMaxTimers;
                 for (u32 i = 0; i < m; i++)
-                    timer_deadline_ns[i] =
-                        now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+                    timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
             }
             return;
         }
@@ -483,15 +482,13 @@ public:
                 (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, &scratch);
                 scratch.destroy();
             } else {
-                timer_deadline_ns[i] =
-                    now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+                timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
                 continue;
             }
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up
             // burst after a long stall.
-            timer_deadline_ns[i] =
-                now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+            timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
         }
     }
 
@@ -500,6 +497,14 @@ public:
     // activation) whenever the active config changes. Each backend bounds issue
     // by its submission capacity and reclaims probes using its own I/O lifetime.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
+    static u64 deadline_after(u64 now, u32 interval_ms) {
+        u64 delay = 0;
+        if (__builtin_mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay))
+            return UINT64_MAX;
+        u64 deadline = 0;
+        if (__builtin_add_overflow(now, delay, &deadline)) return UINT64_MAX;
+        return deadline;
+    }
     const RouteConfig* health_armed_config = nullptr;
     u64 health_armed_identity = 0;
     u32 health_probe_sweep_cursor = 0;
@@ -540,8 +545,7 @@ public:
                               ? cfg->upstream_count
                               : RouteConfig::kMaxUpstreams;
             for (u32 u = 0; u < m; u++)
-                health_probe_deadline_ns[u] =
-                    now + static_cast<u64>(cfg->upstreams[u].hc_interval_ms) * 1'000'000ull;
+                health_probe_deadline_ns[u] = deadline_after(now, cfg->upstreams[u].hc_interval_ms);
         }
         return true;
     }
@@ -591,15 +595,18 @@ public:
             } else {
                 const u32 ring = self().backend.kPendingCap;
                 const u32 pend = self().backend.pending_count;
-                const u32 avail =
-                    (pend + kProbePendingReserve < ring) ? (ring - kProbePendingReserve - pend) : 0;
+                const i64 available = static_cast<i64>(ring) -
+                                      static_cast<i64>(kProbePendingReserve) -
+                                      static_cast<i64>(pend);
+                const u32 avail = available > 0 ? static_cast<u32>(available) : 0;
                 if (avail < budget) budget = avail;
             }
             const u32 start = (n == 0) ? 0 : (health_probe_sweep_cursor % n);
             u32 next_cursor = start;
             bool cursor_advanced = false;
             for (u32 scanned = 0; scanned < n; scanned++) {
-                const u32 u = (start + scanned) % n;
+                const u32 u = static_cast<u32>(
+                    (static_cast<i64>(start) + static_cast<i64>(scanned)) % static_cast<i64>(n));
                 const UpstreamTarget& up = cfg->upstreams[u];
                 if (!up.hc_enabled) continue;
                 if (now < health_probe_deadline_ns[u]) continue;
@@ -626,10 +633,9 @@ public:
                 // this upstream is fully covered. If budget ran out mid-upstream,
                 // leave the (past) deadline so the next tick re-probes the rest.
                 if (all_issued)
-                    health_probe_deadline_ns[u] =
-                        now + static_cast<u64>(up.hc_interval_ms) * 1'000'000ull;
+                    health_probe_deadline_ns[u] = deadline_after(now, up.hc_interval_ms);
                 if (all_issued) {
-                    next_cursor = (u + 1) % n;
+                    next_cursor = static_cast<u32>((static_cast<i64>(u) + 1) % static_cast<i64>(n));
                     cursor_advanced = true;
                 } else if (budget == 0) {
                     health_probe_sweep_cursor = u;
@@ -789,7 +795,8 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf =
+                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
         }
         return true;
     }
@@ -886,7 +893,11 @@ public:
                 u32 period = drain_period_.load(std::memory_order_relaxed);
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
-                } else if (monotonic_secs() >= start + period) {
+                } else {
+                    u64 deadline = 0;
+                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                        deadline = UINT64_MAX;
+                    if (monotonic_secs() < deadline) continue;
                     force_close_all();
                     running_.store(false, std::memory_order_relaxed);
                 }
@@ -935,14 +946,20 @@ public:
     // plane can snapshot before a swap and wait for advancement.
     // Zero-cost when epoch pointer is null (no control plane wired).
     void epoch_enter() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            (void)__builtin_add_overflow(
+                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
     void epoch_leave() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            (void)__builtin_add_overflow(
+                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
 
     void shutdown() {
@@ -1107,7 +1124,9 @@ public:
     // Number of connections not yet fully reclaimed.
     // Includes pending_free slots: they're closed but still waiting for
     // CQEs, so drain must keep running until they're reclaimed too.
-    u32 active_count() const { return connection_capacity - free_top; }
+    u32 active_count() const {
+        return static_cast<u32>(static_cast<i64>(connection_capacity) - static_cast<i64>(free_top));
+    }
 
     // Allocatable Connection slots remaining (free_stack depth). Used by
     // start_health_probe to keep a reserve for real client accepts.
@@ -1136,7 +1155,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf =
+                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
         return &conns[id];
     }
 
@@ -1357,7 +1377,8 @@ public:
                                               c.upstream_fd >= 0);
                     }
                 }();
-                c.pending_ops += cancelled;
+                c.pending_ops =
+                    static_cast<u32>(static_cast<i64>(c.pending_ops) + static_cast<i64>(cancelled));
             }
         }
         if (c.fd >= 0) {

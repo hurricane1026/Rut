@@ -78,7 +78,7 @@ struct RateLimiter {
             if (s.tat > now_us) {
                 out.allowed = false;
                 out.reject_reason = RateLimitRejectReason::ShardCollision;
-                out.next_wait_us = s.tat - now_us;
+                (void)__builtin_sub_overflow(s.tat, now_us, &out.next_wait_us);
                 return out;
             }
             s.key = key;
@@ -86,22 +86,29 @@ struct RateLimiter {
         }
         // Avoid now+tau overflow: a future TAT conforms iff its distance from
         // now fits within the burst tolerance.
-        if (s.tat > now_us && s.tat - now_us > tau_us) {
+        u64 distance = 0;
+        if (s.tat > now_us && !__builtin_sub_overflow(s.tat, now_us, &distance) &&
+            distance > tau_us) {
             out.allowed = false;
             out.reject_reason = RateLimitRejectReason::Budget;
-            out.next_wait_us = (s.tat - now_us) - tau_us;
+            (void)__builtin_sub_overflow(distance, tau_us, &out.next_wait_us);
             return out;
         }
         const u64 kBase = (now_us > s.tat) ? now_us : s.tat;
-        if (kBase > 0xffffffffffffffffull - emit_us) {
+        u64 max_base = 0;
+        (void)__builtin_sub_overflow(~u64{0}, emit_us, &max_base);
+        if (kBase > max_base) {
             out.allowed = false;
             out.retry_known = false;
             out.reject_reason = RateLimitRejectReason::StateOverflow;
             return out;
         }
-        s.tat = kBase + emit_us;
-        out.next_wait_us =
-            s.tat > now_us && s.tat - now_us > tau_us ? (s.tat - now_us) - tau_us : 0;
+        (void)__builtin_add_overflow(kBase, emit_us, &s.tat);
+        distance = 0;
+        out.next_wait_us = 0;
+        if (s.tat > now_us && !__builtin_sub_overflow(s.tat, now_us, &distance) &&
+            distance > tau_us)
+            (void)__builtin_sub_overflow(distance, tau_us, &out.next_wait_us);
         return out;
     }
 
@@ -136,24 +143,32 @@ struct GlobalRateLimiter {
         std::atomic<u64>& slot = slots[h % kSlots];
         u64 tat = slot.load(std::memory_order_relaxed);
         for (;;) {
-            if (tat > now_us && tat - now_us > tau_us) {
+            u64 distance = 0;
+            if (tat > now_us && !__builtin_sub_overflow(tat, now_us, &distance) &&
+                distance > tau_us) {
                 out.allowed = false;
                 out.reject_reason = RateLimitRejectReason::Budget;
-                out.next_wait_us = (tat - now_us) - tau_us;
+                (void)__builtin_sub_overflow(distance, tau_us, &out.next_wait_us);
                 return out;
             }
             const u64 kBase = (now_us > tat) ? now_us : tat;
-            if (kBase > 0xffffffffffffffffull - emit_us) {
+            u64 max_base = 0;
+            (void)__builtin_sub_overflow(~u64{0}, emit_us, &max_base);
+            if (kBase > max_base) {
                 out.allowed = false;
                 out.retry_known = false;
                 out.reject_reason = RateLimitRejectReason::StateOverflow;
                 return out;
             }
-            const u64 kNext = kBase + emit_us;
+            u64 kNext = 0;
+            (void)__builtin_add_overflow(kBase, emit_us, &kNext);
             if (slot.compare_exchange_weak(
                     tat, kNext, std::memory_order_relaxed, std::memory_order_relaxed)) {
-                out.next_wait_us =
-                    kNext > now_us && kNext - now_us > tau_us ? (kNext - now_us) - tau_us : 0;
+                distance = 0;
+                out.next_wait_us = 0;
+                if (kNext > now_us && !__builtin_sub_overflow(kNext, now_us, &distance) &&
+                    distance > tau_us)
+                    (void)__builtin_sub_overflow(distance, tau_us, &out.next_wait_us);
                 return out;
             }
             // CAS failed: `tat` reloaded with the current value — retry.

@@ -47,8 +47,9 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
         return ExactPathNormalizationResult::InvalidInput;
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
-    if (raw.len > UINTPTR_MAX - raw_begin) return ExactPathNormalizationResult::InvalidInput;
-    const uintptr_t raw_end = raw_begin + raw.len;
+    uintptr_t raw_end = 0;
+    if (__builtin_add_overflow(raw_begin, static_cast<uintptr_t>(raw.len), &raw_end))
+        return ExactPathNormalizationResult::InvalidInput;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
 
@@ -75,11 +76,12 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
     // preserved even when a caller accidentally supplies an in-place range.
     const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output);
     const uintptr_t output_len_begin = reinterpret_cast<uintptr_t>(output_len);
-    if (normalized_len > UINTPTR_MAX - output_begin ||
-        sizeof(*output_len) > UINTPTR_MAX - output_len_begin)
+    uintptr_t output_end = 0;
+    uintptr_t output_len_end = 0;
+    if (__builtin_add_overflow(output_begin, static_cast<uintptr_t>(normalized_len), &output_end) ||
+        __builtin_add_overflow(
+            output_len_begin, static_cast<uintptr_t>(sizeof(*output_len)), &output_len_end))
         return ExactPathNormalizationResult::InvalidInput;
-    const uintptr_t output_end = output_begin + normalized_len;
-    const uintptr_t output_len_end = output_len_begin + sizeof(*output_len);
     const auto ranges_overlap = [](uintptr_t first_begin,
                                    uintptr_t first_end,
                                    uintptr_t second_begin,

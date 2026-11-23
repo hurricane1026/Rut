@@ -56,8 +56,9 @@ inline Str finalize_path_canonical(const char* ptr, u32 len) {
     u32 lo = 0;
     while (lo < len && ptr[lo] == '/') lo++;
     u32 hi = len;
-    while (hi > lo && ptr[hi - 1] == '/') hi--;
-    return Str{ptr + lo, hi - lo};
+    while (hi > lo && ptr[static_cast<i64>(hi) - 1] == '/') --hi;
+    return Str{ptr + static_cast<i64>(lo),
+               static_cast<u32>(static_cast<i64>(hi) - static_cast<i64>(lo))};
 }
 
 // Canonicalize a raw URI: scan for first '?'/'#' to find the canon-end

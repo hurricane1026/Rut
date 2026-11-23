@@ -11,6 +11,11 @@
 
 namespace rut {
 
+// Callers validate these identifiers before indexing the corresponding table.
+inline u16 response_read_deadline_prevalidated_index(u16 value) {
+    return static_cast<u16>(static_cast<i64>(value) - static_cast<i64>(1));
+}
+
 // Reuse is admitted only for the bodyless plaintext GET buffering profile.
 // The existing generation/upload/transport predicates still prove this request;
 // a pooled fd is not evidence for any earlier upload or pipelined successor.
@@ -146,9 +151,11 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
     while (cursor < value.len) {
         const u8 byte = static_cast<u8>(value.ptr[cursor]);
         if (byte < '0' || byte > '9') break;
-        const u64 digit = byte - '0';
-        if (parsed > (UINT64_MAX - digit) / 10u) return false;
-        parsed = parsed * 10u + digit;
+        const u64 digit = static_cast<u64>(static_cast<i64>(byte) - static_cast<i64>('0'));
+        u64 scaled = 0;
+        if (__builtin_mul_overflow(parsed, u64{10}, &scaled) ||
+            __builtin_add_overflow(scaled, digit, &parsed))
+            return false;
         ++cursor;
     }
     if (cursor == first_digit) return false;
@@ -200,9 +207,13 @@ inline CompleteContentLengthResponseClassification classify_complete_content_len
     ++position;
     if (!complete_content_length_parse_u64(content_range, &position, &classification.total) ||
         position != content_range.len || classification.first > classification.last ||
-        classification.last >= classification.total ||
-        classification.last - classification.first !=
-            static_cast<u64>(response.content_length) - 1u)
+        classification.last >= classification.total)
+        return {};
+    u64 range_length = 0;
+    u64 expected_length = static_cast<u64>(response.content_length);
+    if (__builtin_sub_overflow(classification.last, classification.first, &range_length) ||
+        __builtin_sub_overflow(expected_length, u64{1}, &expected_length) ||
+        range_length != expected_length)
         return {};
     classification.response_class = CompleteContentLengthResponseClass::CoherentSingleRange206;
     return classification;
@@ -234,7 +245,9 @@ inline bool complete_content_length_content_type_view(const ParsedResponse& resp
         if (require_canonical &&
             (header.name.len != sizeof(kName) - 1u ||
              __builtin_memcmp(header.name.ptr, kName, sizeof(kName) - 1u) != 0 ||
-             header.raw_value.len != header.value.len + 1u || header.raw_value.ptr[0] != ' ' ||
+             header.raw_value.len !=
+                 static_cast<u32>(static_cast<i64>(header.value.len) + static_cast<i64>(1)) ||
+             header.raw_value.ptr[0] != ' ' ||
              __builtin_memcmp(header.raw_value.ptr + 1, header.value.ptr, header.value.len) != 0))
             return false;
         out->value = header.value;
@@ -256,7 +269,9 @@ inline bool complete_content_length_parsed_header_matches(
         parsed.status_code != c.resp_status || parsed.content_length_count != 1 || parsed.chunked ||
         parsed.headers_truncated || parsed.content_length != declared_body)
         return false;
-    const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    const auto& policy =
+        c.request_config
+            ->response_policies[response_read_deadline_prevalidated_index(c.response_policy_id)];
     // This profile assumes the fixed-order `Synthesized` layout (exactly one
     // Server/Connection field, in the positions checked below). The Envoy
     // `Upstream` header-order layout is never admitted into a bundle that
@@ -361,7 +376,9 @@ inline bool complete_content_length_raw_origin_matches_pinned(
     if (!complete_content_length_content_type_view(raw, false, &raw_content_type) ||
         !complete_content_length_content_type_view(pinned, true, &pinned_content_type))
         return false;
-    const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+    const auto& policy =
+        c.request_config
+            ->response_policies[response_read_deadline_prevalidated_index(c.response_policy_id)];
     static constexpr Str kContentTypeName{"Content-Type", 12};
     const bool content_type_matches =
         response_policy_hides_header(policy, kContentTypeName)
@@ -530,7 +547,8 @@ inline bool header_only_head_explicit_close_arm_is_stable(
         if (!state_ok || !c.upstream_recv_armed || c.on_upstream_recv != expected_upstream_recv)
             return false;
     }
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle =
+        config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -539,9 +557,13 @@ inline bool header_only_head_explicit_close_arm_is_stable(
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    const auto& response = config->response_policies[bundle.response_policy_id - 1];
-    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    const auto& response = config->response_policies[response_read_deadline_prevalidated_index(
+        bundle.response_policy_id)];
+    const auto& failure =
+        config
+            ->failure_policies[response_read_deadline_prevalidated_index(bundle.failure_policy_id)];
+    const auto& timeout = config->failure_policies[response_read_deadline_prevalidated_index(
+        bundle.timeout_failure_policy_id)];
     if (!admitted_response_policy_valid(response) ||
         !admitted_forward_failure_policy_valid(failure) ||
         !admitted_forward_timeout_failure_policy_valid(timeout) ||
@@ -601,7 +623,8 @@ inline bool response_read_timeout_header_only_head_explicit_close_is_stable(
         c.http1_prebuilt_deadline_upload.request_policy_id != c.request_policy_id ||
         !c.http1_prebuilt_deadline_upload.downstream_close)
         return false;
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle =
+        config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -610,12 +633,15 @@ inline bool response_read_timeout_header_only_head_explicit_close_is_stable(
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    return config->response_policies[bundle.response_policy_id - 1].head_mode ==
-               ResponsePolicyHeadMode::SuppressBody &&
-           config->failure_policies[bundle.failure_policy_id - 1].head_mode ==
-               FailurePolicyHeadMode::SuppressBody &&
-           config->failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
-               FailurePolicyHeadMode::SuppressBody;
+    return config->response_policies[response_read_deadline_prevalidated_index(
+                                         bundle.response_policy_id)]
+                   .head_mode == ResponsePolicyHeadMode::SuppressBody &&
+           config->failure_policies[response_read_deadline_prevalidated_index(
+                                        bundle.failure_policy_id)]
+                   .head_mode == FailurePolicyHeadMode::SuppressBody &&
+           config->failure_policies[response_read_deadline_prevalidated_index(
+                                        bundle.timeout_failure_policy_id)]
+                   .head_mode == FailurePolicyHeadMode::SuppressBody;
 }
 
 inline bool response_read_timeout_header_only_head_is_stable(const Connection& c,
@@ -640,7 +666,8 @@ inline bool response_read_timeout_header_only_head_is_stable(const Connection& c
         c.http1_prebuilt_deadline_upload.downstream_close ||
         !response_read_deadline_default_persistence_is_stable(c))
         return false;
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle =
+        config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -649,12 +676,15 @@ inline bool response_read_timeout_header_only_head_is_stable(const Connection& c
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    return config->response_policies[bundle.response_policy_id - 1].head_mode ==
-               ResponsePolicyHeadMode::SuppressBody &&
-           config->failure_policies[bundle.failure_policy_id - 1].head_mode ==
-               FailurePolicyHeadMode::SuppressBody &&
-           config->failure_policies[bundle.timeout_failure_policy_id - 1].head_mode ==
-               FailurePolicyHeadMode::SuppressBody;
+    return config->response_policies[response_read_deadline_prevalidated_index(
+                                         bundle.response_policy_id)]
+                   .head_mode == ResponsePolicyHeadMode::SuppressBody &&
+           config->failure_policies[response_read_deadline_prevalidated_index(
+                                        bundle.failure_policy_id)]
+                   .head_mode == FailurePolicyHeadMode::SuppressBody &&
+           config->failure_policies[response_read_deadline_prevalidated_index(
+                                        bundle.timeout_failure_policy_id)]
+                   .head_mode == FailurePolicyHeadMode::SuppressBody;
 }
 
 inline bool response_read_timeout_header_only_head_response_is_stable(
@@ -747,7 +777,8 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
             c.upstream_retirement_cancel_owned == 0 && c.upstream_retirement_cancel_retry == 0;
         if (!ledger_active && !ledger_drained) return false;
     }
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle =
+        config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     if (bundle.response_buffering != ForwardResponseBufferingMode::None ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -757,9 +788,13 @@ inline bool response_read_timeout_header_only_head_response_is_stable(
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    const auto& response = config->response_policies[bundle.response_policy_id - 1];
-    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    const auto& response = config->response_policies[response_read_deadline_prevalidated_index(
+        bundle.response_policy_id)];
+    const auto& failure =
+        config
+            ->failure_policies[response_read_deadline_prevalidated_index(bundle.failure_policy_id)];
+    const auto& timeout = config->failure_policies[response_read_deadline_prevalidated_index(
+        bundle.timeout_failure_policy_id)];
     if (!admitted_response_policy_valid(response) ||
         !admitted_forward_failure_policy_valid(failure) ||
         !admitted_forward_timeout_failure_policy_valid(timeout) ||
@@ -927,8 +962,8 @@ inline bool response_read_timeout_header_only_head_live_proof_is_stable(
                bundle_id,
                c.response_read_deadline_generation,
                ResponseReadTimeoutHeaderOnlyHeadPhase::PreBegin) &&
-           config->policy_bundles[bundle_id - 1].response_read_timeout_seconds ==
-               c.response_read_deadline_seconds &&
+           config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)]
+                   .response_read_timeout_seconds == c.response_read_deadline_seconds &&
            copied_proof.upload_episode == c.upstream_episode;
 }
 
@@ -1002,7 +1037,8 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
     bool allow_retired_episode = false) {
     const RouteConfig* cfg = c.request_config;
     if (cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id) ||
-        cfg->policy_bundles[bundle_id - 1].response_buffering != buffering ||
+        cfg->policy_bundles[static_cast<u16>(static_cast<i64>(bundle_id) - 1)].response_buffering !=
+            buffering ||
         !response_read_deadline_fixed_upload_profile_method_admitted(
             profile, c.req_method, buffering) ||
         proof.handler_generation == 0 || proof.handler_generation != c.handler_gen ||
@@ -1013,10 +1049,13 @@ inline bool response_read_deadline_fixed_upload_materialization_is_stable(
         proof.request_policy_id != c.request_policy_id || proof.route_fn == nullptr ||
         proof.raw_header_end == 0 || proof.raw_content_length == 0 ||
         proof.raw_total_length <= proof.raw_header_end ||
-        proof.raw_content_length != proof.raw_total_length - proof.raw_header_end ||
+        proof.raw_content_length != static_cast<u64>(static_cast<i64>(proof.raw_total_length) -
+                                                     static_cast<i64>(proof.raw_header_end)) ||
         proof.rewritten_header_end == 0 ||
         proof.rewritten_total_length <= proof.rewritten_header_end ||
-        proof.rewritten_total_length - proof.rewritten_header_end != proof.raw_content_length ||
+        static_cast<u64>(static_cast<i64>(proof.rewritten_total_length) -
+                         static_cast<i64>(proof.rewritten_header_end)) !=
+            proof.raw_content_length ||
         proof.expected_upload_length != proof.rewritten_total_length ||
         !valid_upstream_episode(proof.upload_episode) ||
         (proof.upload_episode != c.upstream_episode &&
@@ -1102,7 +1141,7 @@ inline bool fixed_upload_head_success_proof_is_stable(
         !response_read_deadline_fixed_upload_materialization_is_stable(
             c, proof, profile, true, bundle_id, route_method, buffering, allow_retired_episode))
         return false;
-    const auto& bundle = config->policy_bundles[bundle_id - 1];
+    const auto& bundle = config->policy_bundles[static_cast<u16>(static_cast<i64>(bundle_id) - 1)];
     if (bundle.response_buffering != buffering ||
         bundle.response_policy_id != c.response_policy_id ||
         bundle.failure_policy_id != c.failure_policy_id ||
@@ -1112,9 +1151,13 @@ inline bool fixed_upload_head_success_proof_is_stable(
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
         !config->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
         return false;
-    const auto& response = config->response_policies[bundle.response_policy_id - 1];
-    const auto& failure = config->failure_policies[bundle.failure_policy_id - 1];
-    const auto& timeout = config->failure_policies[bundle.timeout_failure_policy_id - 1];
+    const auto& response =
+        config
+            ->response_policies[static_cast<u16>(static_cast<i64>(bundle.response_policy_id) - 1)];
+    const auto& failure =
+        config->failure_policies[static_cast<u16>(static_cast<i64>(bundle.failure_policy_id) - 1)];
+    const auto& timeout = config->failure_policies[static_cast<u16>(
+        static_cast<i64>(bundle.timeout_failure_policy_id) - 1)];
     if (!admitted_response_policy_valid(response) ||
         !admitted_forward_failure_policy_valid(failure) ||
         !admitted_forward_timeout_failure_policy_valid(timeout) ||
@@ -1326,7 +1369,8 @@ inline bool response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable
                method,
                route_method) &&
            c.pipeline_stash_len != 0 && c.send_buf.len() == c.pipeline_stash_len &&
-           c.recv_buf.len() <= c.recv_buf.capacity() - c.pipeline_stash_len;
+           static_cast<i64>(c.recv_buf.len()) <=
+               static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len);
 }
 
 inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
@@ -1336,7 +1380,8 @@ inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
     if (!response_read_deadline_coalesced_get_phase1_proof_is_stable(
             c, proof, allow_retired_episode) ||
         c.pipeline_stash_len == 0 || c.send_buf.len() != c.pipeline_stash_len ||
-        c.recv_buf.len() > c.recv_buf.capacity() - c.pipeline_stash_len)
+        static_cast<i64>(c.recv_buf.len()) >
+            static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len))
         return false;
     return true;
 }
@@ -1405,7 +1450,8 @@ inline bool response_read_deadline_tls_complete_get_profile_is_stable(const Conn
     return response_read_deadline_tls_http11_engine_is_stable(c) && config != nullptr &&
            config->policy_bundle_id_is_valid(bundle_id) &&
            forward_response_buffering_uses_content_length_machinery(
-               config->policy_bundles[bundle_id - 1u].response_buffering) &&
+               config->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)]
+                   .response_buffering) &&
            c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
            forward_response_buffering_uses_content_length_machinery(
@@ -1537,7 +1583,9 @@ inline bool http1_pipeline_successor_materialization_is_stable(const Connection&
         c.response_read_deadline_bundle_id == 0 || c.request_config == nullptr ||
         !c.request_config->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) ||
         !forward_response_buffering_uses_content_length_machinery(
-            c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1]
+            c.request_config
+                ->policy_bundles[response_read_deadline_prevalidated_index(
+                    c.response_read_deadline_bundle_id)]
                 .response_buffering) ||
         c.pipeline_stash_len != 0 || c.recv_buf.data() == nullptr || c.req_header_end == 0 ||
         c.req_header_end != c.req_initial_send_len || c.req_initial_send_len != c.recv_buf.len() ||
@@ -1733,7 +1781,8 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
         !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
         !http1_pipeline_successor_tombstone_is_safe(c))
         return false;
-    const auto& bundle = copied_config->policy_bundles[copied_bundle_id - 1];
+    const auto& bundle =
+        copied_config->policy_bundles[response_read_deadline_prevalidated_index(copied_bundle_id)];
     const RouteEntry& route = copied_config->routes[copied_proof.route_index];
     const UpstreamTarget& target = copied_config->upstreams[copied_proof.upstream_id];
     return bundle.response_buffering == copied_buffering &&
@@ -1770,7 +1819,7 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         !response_read_deadline_route_method_matches(c.response_read_deadline_method,
                                                      c.response_read_deadline_route_method))
         return false;
-    const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+    const auto& bundle = cfg->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
         bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
         bundle.response_buffering != c.response_read_deadline_buffering ||
@@ -1810,9 +1859,12 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_method,
             c.response_read_deadline_route_method))
         return false;
-    const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
-    const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
-    const auto& timeout = cfg->failure_policies[bundle.timeout_failure_policy_id - 1];
+    const auto& response = cfg->response_policies[response_read_deadline_prevalidated_index(
+        bundle.response_policy_id)];
+    const auto& failure =
+        cfg->failure_policies[response_read_deadline_prevalidated_index(bundle.failure_policy_id)];
+    const auto& timeout = cfg->failure_policies[response_read_deadline_prevalidated_index(
+        bundle.timeout_failure_policy_id)];
     if (!admitted_response_policy_valid(response) ||
         !admitted_forward_failure_policy_valid(failure) ||
         !admitted_forward_timeout_failure_policy_valid(timeout) ||
@@ -1944,9 +1996,9 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
             c.response_read_deadline_post_commit_downstream_submitted &&
         c.response_read_deadline_post_commit_downstream_submitted <=
             c.response_read_deadline_post_commit_origin_received &&
-        c.response_read_deadline_post_commit_inflight_body <=
-            c.response_read_deadline_post_commit_downstream_submitted -
-                c.response_read_deadline_post_commit_downstream_completed;
+        static_cast<i64>(c.response_read_deadline_post_commit_inflight_body) <=
+            static_cast<i64>(c.response_read_deadline_post_commit_downstream_submitted) -
+                static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed);
     if (post_commit && !post_commit_owner) return false;
     if (complete_buffering && !bodyless_post_commit && !fixed_upload_post_commit) return false;
     if (complete_buffering) {
@@ -2244,13 +2296,17 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
             CompleteContentLengthResponseClass::BoundedPositiveBody ||
         header_len == 0 || body_len == 0 || c.response_header_buf.data() == nullptr ||
         c.upstream_recv_buf.data() == nullptr || header_len > c.response_header_buf.capacity() ||
-        body_len > c.response_header_buf.capacity() - header_len || raw_header_end == 0 ||
-        raw_header_end > c.upstream_recv_buf.capacity() ||
-        body_len > c.upstream_recv_buf.capacity() - raw_header_end)
+        static_cast<i64>(body_len) >
+            static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len) ||
+        raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.capacity() ||
+        static_cast<i64>(body_len) >
+            static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
         return false;
 
-    const u32 send_len = header_len + body_len;
-    const u32 retained_len = raw_header_end + body_len;
+    const u32 send_len =
+        static_cast<u32>(static_cast<i64>(header_len) + static_cast<i64>(body_len));
+    const u32 retained_len =
+        static_cast<u32>(static_cast<i64>(raw_header_end) + static_cast<i64>(body_len));
     return c.response_read_deadline_post_commit_origin_received == body_len &&
            c.response_read_deadline_post_commit_send_body == body_len &&
            c.response_read_deadline_post_commit_downstream_submitted == body_len &&
@@ -2268,8 +2324,8 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
            c.response_read_deadline_send_upstream_episode ==
                c.response_read_deadline_post_commit_episode &&
            c.response_read_deadline_send_owner_generation != 0 &&
-           __builtin_memcmp(c.response_header_buf.data() + header_len,
-                            c.upstream_recv_buf.data() + raw_header_end,
+           __builtin_memcmp(c.response_header_buf.data() + static_cast<i64>(header_len),
+                            c.upstream_recv_buf.data() + static_cast<i64>(raw_header_end),
                             body_len) == 0;
 }
 
@@ -2328,18 +2384,20 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_declared_body == 0 ||
         c.response_read_deadline_post_commit_raw_header_end > c.upstream_recv_buf.capacity() ||
         c.response_read_deadline_post_commit_declared_body >
-            (complete_buffering ? ResponseBodyChain::kMaxBody
-                                : c.upstream_recv_buf.capacity() -
-                                      c.response_read_deadline_post_commit_raw_header_end) ||
+            (complete_buffering
+                 ? ResponseBodyChain::kMaxBody
+                 : static_cast<u32>(
+                       static_cast<i64>(c.upstream_recv_buf.capacity()) -
+                       static_cast<i64>(c.response_read_deadline_post_commit_raw_header_end))) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||
         c.response_read_deadline_post_commit_downstream_completed >
             c.response_read_deadline_post_commit_downstream_submitted ||
         c.response_read_deadline_post_commit_downstream_submitted >
             c.response_read_deadline_post_commit_origin_received ||
-        c.response_read_deadline_post_commit_inflight_body >
-            c.response_read_deadline_post_commit_downstream_submitted -
-                c.response_read_deadline_post_commit_downstream_completed ||
+        static_cast<i64>(c.response_read_deadline_post_commit_inflight_body) >
+            static_cast<i64>(c.response_read_deadline_post_commit_downstream_submitted) -
+                static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed) ||
         c.protocol != ConnProtocol::Http11 ||
         (c.tls_active && !response_read_deadline_tls_complete_get_profile_is_stable(c)) ||
         c.h2 != nullptr || c.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
@@ -2388,7 +2446,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             c.response_read_deadline_method,
             c.response_read_deadline_route_method))
         return false;
-    const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+    const auto& bundle = cfg->policy_bundles[response_read_deadline_prevalidated_index(bundle_id)];
     const bool collecting = c.response_read_deadline_post_commit_phase ==
                             ResponseReadDeadlinePostCommitPhase::Buffering;
     const bool explicit_close =
@@ -2468,14 +2526,18 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
         const u32 inflight = c.response_read_deadline_post_commit_inflight_body;
         const u32 header_len = c.response_header_buf.len();
-        if (submitted > selected || completed > submitted || inflight > submitted - completed ||
+        if (submitted > selected || completed > submitted ||
+            static_cast<i64>(inflight) >
+                static_cast<i64>(submitted) - static_cast<i64>(completed) ||
             selected > c.response_read_deadline_post_commit_origin_received ||
             c.resp_body_mode != BodyMode::ContentLength || c.resp_body_sent < header_len ||
-            c.resp_body_sent - header_len != submitted ||
+            static_cast<i64>(c.resp_body_sent) - static_cast<i64>(header_len) != submitted ||
             c.resp_body_remaining !=
                 (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
-                     ? c.response_read_deadline_post_commit_declared_body - submitted
-                     : selected - submitted))
+                     ? static_cast<u32>(
+                           static_cast<i64>(c.response_read_deadline_post_commit_declared_body) -
+                           static_cast<i64>(submitted))
+                     : static_cast<u32>(static_cast<i64>(selected) - static_cast<i64>(submitted))))
             return false;
         if (selected == 0 &&
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded) {

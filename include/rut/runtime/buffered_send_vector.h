@@ -16,7 +16,18 @@ struct BufferedSendVector {
         first_source = first;
         second_source = second;
         first_size = first_len;
-        total_size = first_len + second_len;
+        const i64 total = static_cast<i64>(first_len) + static_cast<i64>(second_len);
+        if (total > static_cast<i64>(UINT32_MAX)) {
+            first_source = nullptr;
+            second_source = nullptr;
+            first_size = 0;
+            total_size = 0;
+            message = {};
+            parts[0] = {};
+            parts[1] = {};
+            return;
+        }
+        total_size = static_cast<u32>(total);
         message = {};
         parts[0] = {const_cast<u8*>(first), first_len};
         parts[1] = {const_cast<u8*>(second), second_len};
@@ -28,18 +39,25 @@ struct BufferedSendVector {
                second_source == parts[1].iov_base && total_size == total &&
                message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
                parts[0].iov_len != 0 && parts[1].iov_base != nullptr && parts[1].iov_len != 0 &&
-               parts[0].iov_len <= total && parts[1].iov_len == total - parts[0].iov_len;
+               parts[0].iov_len <= total &&
+               parts[1].iov_len ==
+                   static_cast<u64>(static_cast<i64>(total) - static_cast<i64>(parts[0].iov_len));
     }
     constexpr void advance(u32 n) {
         while (n && message.msg_iovlen) {
             auto& part = *message.msg_iov;
             const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
-            part.iov_len -= kStep;
+            part.iov_len =
+                static_cast<u64>(static_cast<i64>(part.iov_len) - static_cast<i64>(kStep));
             const bool kFirst = &part == parts;
             const u8* source = kFirst ? first_source : second_source;
-            const u32 kSize = kFirst ? first_size : total_size - first_size;
-            part.iov_base = const_cast<u8*>(source + (kSize - part.iov_len));
-            n -= kStep;
+            const u32 kSize =
+                kFirst
+                    ? first_size
+                    : static_cast<u32>(static_cast<i64>(total_size) - static_cast<i64>(first_size));
+            part.iov_base = const_cast<u8*>(
+                source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len)));
+            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));
             if (part.iov_len == 0) {
                 ++message.msg_iov;
                 --message.msg_iovlen;

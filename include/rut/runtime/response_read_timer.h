@@ -9,11 +9,16 @@ namespace rut {
 // An early completion rearms for the remaining interval, rounded up to a
 // millisecond. Missing, unrepresentable or elapsed deadlines cannot rearm.
 constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
-    if (last_progress_ns == 0 || timeout_ns > UINT64_MAX - last_progress_ns ||
-        now_ns >= last_progress_ns + timeout_ns)
+    u64 deadline = 0;
+    if (last_progress_ns == 0 || __builtin_add_overflow(last_progress_ns, timeout_ns, &deadline) ||
+        now_ns >= deadline)
         return 0;
-    const u64 kRemaining = last_progress_ns + timeout_ns - now_ns;
-    const u64 kMillis = 1 + (kRemaining - 1) / 1'000'000;
+    u64 remaining = 0;
+    (void)__builtin_sub_overflow(deadline, now_ns, &remaining);
+    u64 rounded = 0;
+    (void)__builtin_sub_overflow(remaining, 1, &rounded);
+    (void)__builtin_add_overflow(rounded / 1'000'000, 1, &rounded);
+    const u64 kMillis = rounded;
     return kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis);
 }
 

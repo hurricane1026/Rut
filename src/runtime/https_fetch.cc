@@ -36,7 +36,12 @@ u64 jwt_monotonic_ms() {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0 ||
         now.tv_nsec >= 1000000000 || static_cast<u64>(now.tv_sec) > (~u64{0} - 999) / 1000)
         return 0;
-    return static_cast<u64>(now.tv_sec) * 1000 + static_cast<u64>(now.tv_nsec) / 1000000;
+    u64 seconds_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(now.tv_sec), u64{1000}, &seconds_ms)) return 0;
+    u64 result = 0;
+    return __builtin_add_overflow(seconds_ms, static_cast<u64>(now.tv_nsec) / 1000000, &result)
+               ? 0
+               : result;
 }
 
 bool HttpsEndpoint::valid() const {
@@ -77,9 +82,9 @@ void BoundedJsonResponse::reset_jwks(bool conditional, bool retry_after) {
 
 bool strong_etag_valid(Str value) {
     if (!value.ptr || value.len < 2 || value.len > 128 || value.ptr[0] != '"' ||
-        value.ptr[value.len - 1] != '"')
+        value.ptr[static_cast<i64>(value.len) - 1] != '"')
         return false;
-    for (u32 i = 1; i + 1 < value.len; ++i) {
+    for (u32 i = 1; static_cast<i64>(i) + 1 < static_cast<i64>(value.len); ++i) {
         const auto kByte = static_cast<u8>(value.ptr[i]);
         if (kByte != 0x21 && (kByte < 0x23 || kByte > 0x7e)) return false;
     }
@@ -87,10 +92,11 @@ bool strong_etag_valid(Str value) {
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
-    if (result_ != Result::More || (bytes.len && !bytes.ptr) || bytes.len > kMaxWire - wire_len_)
+    if (result_ != Result::More || (bytes.len && !bytes.ptr) ||
+        static_cast<i64>(bytes.len) > static_cast<i64>(kMaxWire) - static_cast<i64>(wire_len_))
         return result_ = Result::Error;
-    if (bytes.len) __builtin_memcpy(wire_ + wire_len_, bytes.ptr, bytes.len);
-    wire_len_ += bytes.len;
+    if (bytes.len) __builtin_memcpy(wire_ + static_cast<i64>(wire_len_), bytes.ptr, bytes.len);
+    wire_len_ = static_cast<u32>(static_cast<i64>(wire_len_) + static_cast<i64>(bytes.len));
     return result_ = consume();
 }
 
@@ -132,9 +138,9 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                 if (++type_count != 1) return Result::Error;
                 u32 end = 0;
                 while (end < header.value.len && header.value.ptr[end] != ';') ++end;
-                while (end &&
-                       (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
-                    --end;
+                while (end && (header.value.ptr[static_cast<i64>(end) - 1] == ' ' ||
+                               header.value.ptr[static_cast<i64>(end) - 1] == '\t'))
+                    end = static_cast<u32>(static_cast<i64>(end) - 1);
                 const Str kType{header.value.ptr, end};
                 if (kNeedsJson && !equal_ci(kType, lit_str("application/json")) &&
                     !equal_ci(kType, lit_str("application/jwk-set+json")))
@@ -161,15 +167,20 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         // A zero-input step is needed to recognize a just-finished data region.
         for (u32 steps = 0; steps <= kMaxWire; ++steps) {
             u32 consumed = 0, start = 0, length = 0;
-            const auto kStatus = chunks_.feed(reinterpret_cast<const u8*>(wire_ + offset_),
-                                              wire_len_ - offset_,
-                                              &consumed,
-                                              &start,
-                                              &length);
-            if (length > kMaxBody - body_len_) return Result::Error;
-            if (length) __builtin_memcpy(body_ + body_len_, wire_ + offset_ + start, length);
-            body_len_ += length;
-            offset_ += consumed;
+            const auto kStatus = chunks_.feed(
+                reinterpret_cast<const u8*>(wire_ + static_cast<i64>(offset_)),
+                static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_)),
+                &consumed,
+                &start,
+                &length);
+            if (static_cast<i64>(length) > static_cast<i64>(kMaxBody) - static_cast<i64>(body_len_))
+                return Result::Error;
+            if (length)
+                __builtin_memcpy(body_ + static_cast<i64>(body_len_),
+                                 wire_ + static_cast<i64>(offset_) + static_cast<i64>(start),
+                                 length);
+            body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(length));
+            offset_ = static_cast<u32>(static_cast<i64>(offset_) + static_cast<i64>(consumed));
             if (kStatus == ChunkStatus::Error) return Result::Error;
             if (kStatus == ChunkStatus::Done)
                 return offset_ == wire_len_ ? Result::Complete : Result::Error;
@@ -178,11 +189,16 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         }
         return Result::Error;
     }
-    const u32 kAvailable = wire_len_ - offset_;
-    if (kAvailable > kMaxBody - body_len_ || (sized_ && kAvailable > expected_ - body_len_))
+    const u32 kAvailable =
+        static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_));
+    if (static_cast<i64>(kAvailable) > static_cast<i64>(kMaxBody) - static_cast<i64>(body_len_) ||
+        (sized_ &&
+         static_cast<i64>(kAvailable) > static_cast<i64>(expected_) - static_cast<i64>(body_len_)))
         return Result::Error;
-    if (kAvailable) __builtin_memcpy(body_ + body_len_, wire_ + offset_, kAvailable);
-    body_len_ += kAvailable;
+    if (kAvailable)
+        __builtin_memcpy(
+            body_ + static_cast<i64>(body_len_), wire_ + static_cast<i64>(offset_), kAvailable);
+    body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(kAvailable));
     offset_ = wire_len_;
     return sized_ && body_len_ == expected_ ? Result::Complete : Result::More;
 }
@@ -335,7 +351,9 @@ bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
 }
 void HttpsFetch::advance(u64 monotonic_ms) {
     if (state_ != State::Busy) return;
-    if (!monotonic_ms || monotonic_ms < started_ || monotonic_ms - started_ >= timeout_ms_) {
+    u64 elapsed = 0;
+    if (!monotonic_ms || monotonic_ms < started_ ||
+        __builtin_sub_overflow(monotonic_ms, started_, &elapsed) || elapsed >= timeout_ms_) {
         (void)fail();
         return;
     }
@@ -376,9 +394,11 @@ bool HttpsFetch::handshake(HttpsFetch& self) {
 bool HttpsFetch::write(HttpsFetch& self) {
     ERR_clear_error();
     const int kResult = SSL_write(
-        self.ssl_, self.request_ + self.sent_, static_cast<int>(self.request_len_ - self.sent_));
+        self.ssl_,
+        self.request_ + static_cast<i64>(self.sent_),
+        static_cast<int>(static_cast<i64>(self.request_len_) - static_cast<i64>(self.sent_)));
     if (kResult <= 0) return retry_ssl(self.ssl_, kResult) ? false : self.fail();
-    self.sent_ += static_cast<u32>(kResult);
+    self.sent_ = static_cast<u32>(static_cast<i64>(self.sent_) + kResult);
     if (self.sent_ == self.request_len_) self.step_ = read;
     return true;
 }

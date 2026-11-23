@@ -80,8 +80,9 @@ using ArtChildRef = u16;
 constexpr ArtChildRef kArtInvalidChildRef = 0xffffu;
 
 constexpr u32 kArtTypeBits = 2;
-constexpr u32 kArtIdxBits = 16 - kArtTypeBits;
-constexpr ArtChildRef kArtIdxMask = static_cast<ArtChildRef>((1u << kArtIdxBits) - 1u);
+constexpr u32 kArtIdxBits = static_cast<u32>(static_cast<i64>(16) - static_cast<i64>(kArtTypeBits));
+constexpr ArtChildRef kArtIdxMask =
+    static_cast<ArtChildRef>(static_cast<ArtChildRef>(static_cast<i64>(1u << kArtIdxBits) - 1));
 
 enum ArtNodeType : u8 {
     kArtN4 = 0,
@@ -243,7 +244,10 @@ public:
 
     // Introspection (tests / bench). node_count returns the sum
     // across pools (root included).
-    u32 node_count() const { return n4_pool_len_ + n16_pool_len_ + n48_pool_len_ + n256_pool_len_; }
+    u32 node_count() const {
+        return static_cast<u32>(static_cast<i64>(n4_pool_len_) + static_cast<i64>(n16_pool_len_) +
+                                static_cast<i64>(n48_pool_len_) + static_cast<i64>(n256_pool_len_));
+    }
     u32 n4_count() const { return n4_pool_len_; }
     u32 n16_count() const { return n16_pool_len_; }
     u32 n48_count() const { return n48_pool_len_; }

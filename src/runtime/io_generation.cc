@@ -9,29 +9,32 @@ namespace {
 consteval bool allocation_matches(u32 initial, u32 maximum) {
     u32 counter = initial;
     u32 owner = 73;
-    const u64 kNext = u64{initial} + 1;
+    const i64 kNext = static_cast<i64>(initial) + 1;
     const bool kFits = kNext <= maximum;
     const bool kIssued = allocate_io_generation(counter, owner, maximum);
-    return kIssued == kFits && counter == (kFits ? kNext : initial) &&
-           owner == (kFits ? kNext : 73);
+    return kIssued == kFits && counter == (kFits ? static_cast<u32>(kNext) : initial) &&
+           owner == (kFits ? static_cast<u32>(kNext) : 73);
 }
 
 consteval bool allocation_contract(u32 maximum) {
-    if (!allocation_matches(maximum - 1, maximum) || !allocation_matches(maximum, maximum) ||
-        !allocation_matches(0xffffffffu, maximum))
+    if (!allocation_matches(static_cast<u32>(static_cast<i64>(maximum) - 1), maximum) ||
+        !allocation_matches(maximum, maximum) || !allocation_matches(0xffffffffu, maximum))
         return false;
     // Exercise every carry length, and both sides of every power of two.
     for (u32 bit = 0; bit < 32; ++bit) {
         const u32 kPivot = 1u << bit;
-        if (!allocation_matches(kPivot - 1, maximum) || !allocation_matches(kPivot, maximum) ||
-            !allocation_matches(kPivot + 1, maximum))
+        if (!allocation_matches(static_cast<u32>(static_cast<i64>(kPivot) - 1), maximum) ||
+            !allocation_matches(kPivot, maximum) ||
+            !allocation_matches(static_cast<u32>(static_cast<i64>(kPivot) + 1), maximum))
             return false;
     }
     return true;
 }
 
-static_assert(kNonUpstreamSendGenerationMask == kNonUpstreamSendCancelBit - 1 &&
-                  kResponseReadTimerGenerationMask == kResponseReadTimerCancelBit - 1 &&
+static_assert(kNonUpstreamSendGenerationMask ==
+                      static_cast<u32>(static_cast<i64>(kNonUpstreamSendCancelBit) - 1) &&
+                  kResponseReadTimerGenerationMask ==
+                      static_cast<u32>(static_cast<i64>(kResponseReadTimerCancelBit) - 1) &&
                   kNonUpstreamSendCancelBit == (1u << 31) &&
                   kResponseReadTimerCancelBit == (1u << 31),
               "Cancellation marker must remain outside the generation range");

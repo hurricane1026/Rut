@@ -14,7 +14,7 @@ namespace {
 void replay(rut::test::TestCase* _tc, u32 sequence, u32 depth, u32 start) {
     TimerWheel wheel;
     wheel.init();
-    wheel.cursor = start;
+    wheel.cursor = TimerWheel::Tick{start};
     Connection owners[2];
     bool armed[2]{};
     u64 due[2]{};
@@ -39,7 +39,7 @@ void replay(rut::test::TestCase* _tc, u32 sequence, u32 depth, u32 start) {
         }
         CHECK_EQ(count, expected_count);
         ++now;
-        CHECK_EQ(wheel.cursor, static_cast<u32>(now));
+        CHECK_EQ(wheel.cursor, TimerWheel::Tick{static_cast<u32>(now)});
     };
     // 9 actions: tick; remove either owner; arm/refresh either owner at
     // offsets 0, 1, 63. Repeated remove and re-arm exercise intrusive links.

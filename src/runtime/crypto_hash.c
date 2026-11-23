@@ -177,9 +177,10 @@ uint32_t rut_crypto_digest_parts_v1(uint32_t algorithm,
         return 0;
     uint32_t total = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        if ((!parts[i].data && parts[i].len) || parts[i].len > (1024u * 1024u + 4096u) - total)
+        if ((!parts[i].data && parts[i].len) ||
+            (int64_t)parts[i].len > (int64_t)(1024u * 1024u + 4096u) - (int64_t)total)
             return 0;
-        total += parts[i].len;
+        total = (uint32_t)((int64_t)total + (int64_t)parts[i].len);
     }
     return rut_crypto_digest_unbounded_internal(
         algorithm, parts, count, key, key_len, keyed, output, capacity, output_len);

@@ -14,9 +14,11 @@ bool ranges_overlap(const void* left, u32 left_length, const void* right, u32 ri
     if (!left || !right || left_length == 0 || right_length == 0) return false;
     const auto kLeftStart = reinterpret_cast<uintptr_t>(left);
     const auto kRightStart = reinterpret_cast<uintptr_t>(right);
-    constexpr auto kMax = static_cast<uintptr_t>(-1);
-    if (kLeftStart > kMax - left_length || kRightStart > kMax - right_length) return true;
-    return kLeftStart < kRightStart + right_length && kRightStart < kLeftStart + left_length;
+    uintptr_t left_end = 0, right_end = 0;
+    if (__builtin_add_overflow(kLeftStart, static_cast<uintptr_t>(left_length), &left_end) ||
+        __builtin_add_overflow(kRightStart, static_cast<uintptr_t>(right_length), &right_end))
+        return true;
+    return kLeftStart < right_end && kRightStart < left_end;
 }
 
 bool valid_claim_string(Str value) {
@@ -54,7 +56,8 @@ bool base64url_encode(const u8* input, u32 input_length, char* output, u32 capac
         else if (output[i] == '/')
             output[i] = '_';
     }
-    while (encoded_length > 0 && output[encoded_length - 1] == '=') --encoded_length;
+    while (encoded_length > 0 && output[static_cast<i64>(encoded_length) - 1] == '=')
+        --encoded_length;
     length = encoded_length;
     return true;
 }
@@ -122,7 +125,8 @@ bool issue(Str key,
     if (!claims.ok || claims.len == 0) return false;
 
     static constexpr char kHeader[] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
-    constexpr u32 kMaxEncodedPayloadBytes = ((kMaxJwtHs256PayloadBytes + 2) / 3) * 4 + 1;
+    constexpr u32 kMaxEncodedPayloadBytes =
+        static_cast<u32>(((static_cast<i64>(kMaxJwtHs256PayloadBytes) + 2) / 3) * 4 + 1);
     char encoded_payload[kMaxEncodedPayloadBytes];
     u32 encoded_payload_length = 0;
     if (!base64url_encode(reinterpret_cast<const u8*>(payload),
@@ -137,8 +141,10 @@ bool issue(Str key,
         capacity < kMaxJwtHs256TokenBytes ? capacity : kMaxJwtHs256TokenBytes;
     constexpr u32 kHeaderB64Length = sizeof(kHeader) - 1;
     constexpr u32 kEncodedMacLength = 43;
-    const u32 kSigningInputLength = kHeaderB64Length + 1 + encoded_payload_length;
-    const u32 kFinalTokenLength = kSigningInputLength + 1 + kEncodedMacLength;
+    const u32 kSigningInputLength = static_cast<u32>(static_cast<i64>(kHeaderB64Length) + 1 +
+                                                     static_cast<i64>(encoded_payload_length));
+    const u32 kFinalTokenLength = static_cast<u32>(static_cast<i64>(kSigningInputLength) + 1 +
+                                                   static_cast<i64>(kEncodedMacLength));
     if (kFinalTokenLength > kTokenCapacity) return false;
 
     static constexpr char kSeparator[] = ".";

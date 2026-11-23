@@ -13,7 +13,7 @@ EVP_PKEY* rut_crypto_ec_load_der_internal(const uint8_t* der, uint32_t length) {
     const uint8_t* cursor = der;
     EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
     if (!candidate) return 0;
-    if (cursor != der + length || EVP_PKEY_id(candidate) != EVP_PKEY_EC) goto fail;
+    if (cursor != der + (int64_t)length || EVP_PKEY_id(candidate) != EVP_PKEY_EC) goto fail;
     const EC_KEY* ec = EVP_PKEY_get0_EC_KEY(candidate);
     const EC_GROUP* group = ec ? EC_KEY_get0_group(ec) : 0;
     const EC_POINT* point = ec ? EC_KEY_get0_public_key(ec) : 0;
@@ -44,8 +44,8 @@ EVP_PKEY* rut_crypto_ec_from_coordinates_internal(const uint8_t x[32], const uin
     uint8_t der[91];
     for (uint32_t i = 0; i < sizeof(kPrefix); ++i) der[i] = kPrefix[i];
     for (uint32_t i = 0; i < 32; ++i) {
-        der[sizeof(kPrefix) + i] = x[i];
-        der[sizeof(kPrefix) + 32 + i] = y[i];
+        der[(int64_t)sizeof(kPrefix) + (int64_t)i] = x[i];
+        der[(int64_t)sizeof(kPrefix) + 32 + (int64_t)i] = y[i];
     }
     return rut_crypto_ec_load_der_internal(der, sizeof(der));
 }

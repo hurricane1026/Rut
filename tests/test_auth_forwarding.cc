@@ -103,6 +103,21 @@ TEST(remove_header, invalid_or_conflicting_direct_ir_effects_fail_closed) {
     }
 }
 
+TEST(remove_header, override_line_length_rejects_wide_sum_without_allocating) {
+    u32 line_len = 0;
+    CHECK(request_header_override_line_length(100u, 200u, &line_len));
+    CHECK_EQ(line_len, 304u);
+    CHECK(!request_header_override_line_length(UINT32_MAX, 0u, &line_len));
+    CHECK(!request_header_override_line_length(UINT32_MAX, UINT32_MAX, &line_len));
+}
+
+TEST(remove_header, request_completion_duration_preserves_missing_and_clock_edges) {
+    CHECK_EQ(request_completion_duration_us(100u, 0u, false), 0u);
+    CHECK_EQ(request_completion_duration_us(99u, 100u, true), 0u);
+    CHECK_EQ(request_completion_duration_us(150u, 100u, true), 50u);
+    CHECK_EQ(request_completion_duration_us(UINT64_MAX, 0u, true), UINT32_MAX);
+}
+
 TEST(http2, forward_request_removes_credentials_and_reset_clears_removal_modes) {
     Connection conn;
     conn.reset();

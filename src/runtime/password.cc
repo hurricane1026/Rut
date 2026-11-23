@@ -18,7 +18,8 @@ namespace rut {
 namespace {
 constexpr auto kPrefix = lit_str("$rut-pbkdf2-sha256$600000$");
 constexpr char kHex[] = "0123456789abcdef";
-static_assert(kPasswordRecordBytes == kPrefix.len + 32 + 1 + 64);
+static_assert(kPasswordRecordBytes ==
+              static_cast<u32>(static_cast<i64>(kPrefix.len) + 32 + 1 + 64));
 
 bool valid_password(Str password) {
     return password.ptr && password.len && password.len <= kPasswordMaxBytes;
@@ -56,8 +57,9 @@ bool derive(Str password, Str salt, u8 (&result)[32]) {
 
 void hex(const u8* bytes, u32 count, char* output) {
     for (u32 i = 0; i < count; ++i) {
-        output[2 * static_cast<size_t>(i)] = kHex[bytes[i] >> 4];
-        output[2 * static_cast<size_t>(i) + 1] = kHex[bytes[i] & 15];
+        const i64 offset = static_cast<i64>(i) * 2;
+        output[offset] = kHex[bytes[i] >> 4];
+        output[offset + 1] = kHex[bytes[i] & 15];
     }
 }
 
@@ -69,8 +71,9 @@ int nibble(char c) {
 
 bool unhex(const char* input, u32 count, u8* output) {
     for (u32 i = 0; i < count; ++i) {
-        const int kA = nibble(input[2 * static_cast<size_t>(i)]);
-        const int kB = nibble(input[2 * static_cast<size_t>(i) + 1]);
+        const i64 offset = static_cast<i64>(i) * 2;
+        const int kA = nibble(input[offset]);
+        const int kB = nibble(input[offset + 1]);
         if (kA < 0 || kB < 0) return false;
         output[i] = static_cast<u8>((kA << 4) | kB);
     }
@@ -89,9 +92,11 @@ bool password_hash(Str password, Str salt, char* output, u32 capacity, u32& outp
     const bool kOk = derive(password, salt, key);
     if (kOk) {
         for (u32 i = 0; i < kPrefix.len; ++i) record[i] = kPrefix.ptr[i];
-        hex(reinterpret_cast<const u8*>(salt.ptr), kPasswordSaltBytes, record + kPrefix.len);
-        record[kPrefix.len + 32] = '$';
-        hex(key, 32, record + kPrefix.len + 33);
+        hex(reinterpret_cast<const u8*>(salt.ptr),
+            kPasswordSaltBytes,
+            record + static_cast<i64>(kPrefix.len));
+        record[static_cast<i64>(kPrefix.len) + 32] = '$';
+        hex(key, 32, record + static_cast<i64>(kPrefix.len) + 33);
         for (u32 i = 0; i < kPasswordRecordBytes; ++i) output[i] = record[i];
         output_len = kPasswordRecordBytes;
     }
@@ -112,12 +117,13 @@ bool password_hash(Str password, char* output, u32 capacity, u32& output_len) {
 
 bool password_verify(Str password, Str record) {
     if (!valid_password(password) || !record.ptr || record.len != kPasswordRecordBytes ||
-        !Str{record.ptr, kPrefix.len}.eq(kPrefix) || record.ptr[kPrefix.len + 32] != '$')
+        !Str{record.ptr, kPrefix.len}.eq(kPrefix) ||
+        record.ptr[static_cast<i64>(kPrefix.len) + 32] != '$')
         return false;
     u8 salt[kPasswordSaltBytes]{};
     u8 expected[32]{};
-    if (!unhex(record.ptr + kPrefix.len, kPasswordSaltBytes, salt) ||
-        !unhex(record.ptr + kPrefix.len + 33, 32, expected))
+    if (!unhex(record.ptr + static_cast<i64>(kPrefix.len), kPasswordSaltBytes, salt) ||
+        !unhex(record.ptr + static_cast<i64>(kPrefix.len) + 33, 32, expected))
         return false;
     u8 key[32]{};
     const bool kOk = derive(password, {reinterpret_cast<const char*>(salt), sizeof(salt)}, key) &&

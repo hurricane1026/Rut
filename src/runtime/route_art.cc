@@ -36,7 +36,7 @@ ArtChildRef find_in_n16(const ArtNode16& n, u8 b) {
 ArtChildRef find_in_n48(const ArtNode48& n, u8 b) {
     const u8 idx_1based = n.child_index[b];
     if (idx_1based == 0) return kArtInvalidChildRef;
-    return n.children[idx_1based - 1];
+    return n.children[static_cast<u8>(static_cast<i64>(idx_1based) - 1)];
 }
 
 ArtChildRef find_in_n256(const ArtNode256& n, u8 b) {
@@ -179,7 +179,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             n48.hdr = n.hdr;
             for (u32 k = 0; k < 16; k++) {
                 n48.children[k] = n.children[k];
-                n48.child_index[n.keys[k]] = static_cast<u8>(k + 1);
+                n48.child_index[n.keys[k]] = static_cast<u8>(static_cast<i64>(k) + 1);
             }
             n48.children[16] = child;
             n48.child_index[b] = 17;
@@ -191,7 +191,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             if (n.child_count < 48) {
                 const u8 slot = n.child_count;
                 n.children[slot] = child;
-                n.child_index[b] = static_cast<u8>(slot + 1);
+                n.child_index[b] = static_cast<u8>(static_cast<i64>(slot) + 1);
                 n.child_count++;
                 return parent;
             }
@@ -202,7 +202,7 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             for (u32 byte = 0; byte < 256; byte++) {
                 const u8 slot1 = n.child_index[byte];
                 if (slot1 != 0) {
-                    n256.children[byte] = n.children[slot1 - 1];
+                    n256.children[byte] = n.children[static_cast<u8>(static_cast<i64>(slot1) - 1)];
                 }
             }
             n256.children[b] = child;
@@ -289,7 +289,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 rollback();
                 return false;
             }
-            n4_pool_[art_idx(leaf)].hdr.edge = Str{p.ptr + i, p.len - i};
+            n4_pool_[art_idx(leaf)].hdr.edge =
+                Str{p.ptr + static_cast<i64>(i),
+                    static_cast<u32>(static_cast<i64>(p.len) - static_cast<i64>(i))};
 
             const ArtChildRef new_parent = add_child(cur, b, leaf);
             if (new_parent == kArtInvalidChildRef) {
@@ -309,7 +311,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // Match as many bytes of the existing edge as possible.
         const Str e = header(child).edge;
         u32 k = 0;
-        while (k < e.len && i + k < p.len && e.ptr[k] == p.ptr[i + k]) k++;
+        while (k < e.len && static_cast<i64>(i) + static_cast<i64>(k) < static_cast<i64>(p.len) &&
+               e.ptr[k] == p.ptr[static_cast<i64>(i) + static_cast<i64>(k)])
+            k++;
         if (k == e.len) {
             // Full edge match — descend. Capture the slot in cur that
             // holds `child` so a future upgrade of child's children can
@@ -342,7 +346,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 }
                 case kArtN48: {
                     ArtNode48& n = n48_pool_[ci];
-                    site = &n.children[n.child_index[b] - 1];
+                    site = &n.children[static_cast<u8>(static_cast<i64>(n.child_index[b]) - 1)];
                     break;
                 }
                 case kArtN256: {
@@ -353,7 +357,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
             }
             cur_patch_site = site;
             cur = child;
-            i += k;
+            i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
             continue;
         }
         // Partial match — split the existing child's edge at byte k.
@@ -374,7 +378,8 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // tail a Node4 at first and `add_child` the original's
         // children onto it; this auto-upgrades as needed.
         ArtNode4& tail_node = n4_pool_[art_idx(tail)];
-        tail_node.hdr.edge = Str{e.ptr + k, e.len - k};
+        tail_node.hdr.edge = Str{e.ptr + static_cast<i64>(k),
+                                 static_cast<u32>(static_cast<i64>(e.len) - static_cast<i64>(k))};
         // Copy header fields (terminals) from original's header.
         for (u32 m = 0; m < kMethodSlots; m++) {
             tail_node.hdr.route_idx_by_method[m] = header(child).route_idx_by_method[m];
@@ -412,7 +417,9 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
                 for (u32 byte = 0; byte < 256; byte++) {
                     const u8 slot1 = n.child_index[byte];
                     if (slot1 == 0) continue;
-                    tail_ref = add_child(tail_ref, static_cast<u8>(byte), n.children[slot1 - 1]);
+                    tail_ref = add_child(tail_ref,
+                                         static_cast<u8>(byte),
+                                         n.children[static_cast<u8>(static_cast<i64>(slot1) - 1)]);
                     if (tail_ref == kArtInvalidChildRef) {
                         rollback();
                         return false;
@@ -479,7 +486,7 @@ bool ArtTrie::insert(Str path, u8 method_char, u16 route_idx) {
         // bytes after the split point) or ends right here (new path
         // ends at the split). Loop body re-reads `cur` to decide.
         cur = new_child_ref;
-        i += k;
+        i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(k));
         // Re-establish patch site for the new cur (we just rewrote
         // it). Resolve it the same way as the full-match branch.
         {
@@ -559,12 +566,13 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             if (child == kArtInvalidChildRef) return best;
             const ArtNode4& cn = n4_pool_[art_idx(child)];
             const Str e = cn.hdr.edge;
-            if (i + e.len > p.len) return best;
+            if (static_cast<i64>(i) + static_cast<i64>(e.len) > static_cast<i64>(p.len))
+                return best;
             for (u32 k = 0; k < e.len; k++) {
-                if (e.ptr[k] != p.ptr[i + k]) return best;
+                if (e.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
             }
             cur_idx = art_idx(child);
-            i += e.len;
+            i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(e.len));
             const u16 cand =
                 (want_slot != 0 && cn.hdr.route_idx_by_method[want_slot] != TrieNode::kInvalidRoute)
                     ? cn.hdr.route_idx_by_method[want_slot]
@@ -623,7 +631,7 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
                 case kArtN48: {
                     const ArtNode48& n = n48_pool_[ci];
                     const u8 idx1 = n.child_index[b];
-                    if (idx1 != 0) child = n.children[idx1 - 1];
+                    if (idx1 != 0) child = n.children[static_cast<u8>(static_cast<i64>(idx1) - 1)];
                     break;
                 }
                 case kArtN256: {
@@ -667,12 +675,12 @@ u16 ArtTrie::match_canonical_key(Str path, u8 method_key) const {
             }
         }
 
-        if (i + child_edge.len > p.len) break;
+        if (static_cast<i64>(i) + static_cast<i64>(child_edge.len) > static_cast<i64>(p.len)) break;
         for (u32 k = 0; k < child_edge.len; k++) {
-            if (child_edge.ptr[k] != p.ptr[i + k]) return best;
+            if (child_edge.ptr[k] != p.ptr[static_cast<i64>(i) + static_cast<i64>(k)]) return best;
         }
         cur = child;
-        i += child_edge.len;
+        i = static_cast<u32>(static_cast<i64>(i) + static_cast<i64>(child_edge.len));
         const u16 candidate =
             (want_slot != 0 && child_terminals[want_slot] != TrieNode::kInvalidRoute)
                 ? child_terminals[want_slot]

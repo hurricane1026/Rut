@@ -151,8 +151,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_small_phase_max_us[4]{};
 
     void study_note_first_response(const Connection& c, u64 now_us) {
-        if (c.req_start_us == 0 || now_us < c.req_start_us ||
-            now_us - c.req_start_us > 60ull * 1000000u)
+        u64 request_age = 0;
+        if (c.req_start_us == 0 || __builtin_sub_overflow(now_us, c.req_start_us, &request_age) ||
+            request_age > 60ull * 1000000u)
             return;
         u32 rng = study_phase_rng;
         rng ^= rng << 13;
@@ -161,10 +162,12 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         study_phase_rng = rng;
         if ((rng & 63u) != 0) return;
         auto& slot = study_request_slots[c.id & 127u];
-        if (slot.req_us != 0 && slot.conn_id != c.id && now_us >= slot.req_us &&
-            now_us - slot.req_us < 1000000u) {
-            ++study_small_phase_drops;
-            return;
+        if (slot.req_us != 0 && slot.conn_id != c.id) {
+            u64 slot_age = 0;
+            if (!__builtin_sub_overflow(now_us, slot.req_us, &slot_age) && slot_age < 1000000u) {
+                ++study_small_phase_drops;
+                return;
+            }
         }
         slot.conn_id = c.id;
         slot.req_us = c.req_start_us;
@@ -187,13 +190,17 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         // Filter by actual completed payload, never by a predicted URL size.
         if (snapshot.payload_len != 4096 || c.resp_body_mode != BodyMode::ContentLength) return;
         const u64 now = monotonic_us();
-        if (now < snapshot.first_us || snapshot.first_us < snapshot.req_us ||
-            snapshot.first_us - snapshot.req_us < snapshot.upstream_us)
+        u64 total_us = 0;
+        u64 first_phase_us = 0;
+        u64 final_phase_us = 0;
+        u64 queue_phase_us = 0;
+        if (__builtin_sub_overflow(now, snapshot.first_us, &final_phase_us) ||
+            __builtin_sub_overflow(snapshot.first_us, snapshot.req_us, &first_phase_us) ||
+            first_phase_us < snapshot.upstream_us ||
+            __builtin_sub_overflow(first_phase_us, snapshot.upstream_us, &queue_phase_us) ||
+            __builtin_sub_overflow(now, snapshot.req_us, &total_us))
             return;
-        const u64 phases[4] = {now - snapshot.req_us,
-                               snapshot.first_us - snapshot.req_us - snapshot.upstream_us,
-                               snapshot.upstream_us,
-                               now - snapshot.first_us};
+        const u64 phases[4] = {total_us, queue_phase_us, snapshot.upstream_us, final_phase_us};
         ++study_small_phase_samples;
         for (u32 k = 0; k < 4; ++k) {
             u64 value = phases[k];
@@ -203,7 +210,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
                 ++bin;
             }
             ++study_small_phase_hist[k][bin];
-            study_small_phase_sum_us[k] += phases[k];
+            __builtin_add_overflow(
+                study_small_phase_sum_us[k], phases[k], &study_small_phase_sum_us[k]);
             if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
         }
     }
@@ -235,7 +243,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
             ++bin;
         }
         ++study_wait_hist[kind][bin];
-        study_wait_sum_ns[kind] += ns;
+        __builtin_add_overflow(study_wait_sum_ns[kind], ns, &study_wait_sum_ns[kind]);
         if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
     }
     void study_record_syscall(u32 kind, u64 ns) {
@@ -383,15 +391,16 @@ public:
     // Probe cancellation uses the same exact-episode retirement as requests.
     static constexpr bool kSupportsHealthProbe = true;
     static constexpr bool kSupportsExplicitFirstResponseDeadline = true;
-    static constexpr u32 kTlsInputSize = SlicePool::kSliceSize + 1024;
+    static constexpr u32 kTlsInputSize =
+        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) + 1024);
     // Owned ciphertext output buffer + watermark backpressure for proxy-over-TLS
     // streaming on io_uring. See docs/iouring-tls-output-buffer.md.
     static constexpr u32 kTlsRecordMax =
-        SlicePool::kSliceSize + 256;  // 1 chunk's worst-case ciphertext
+        static_cast<u32>(static_cast<i64>(SlicePool::kSliceSize) + 256);
     static constexpr u32 kTlsOutBufCap =
-        4 * SlicePool::kSliceSize;  // 64 KiB — bounded throughput knob
+        static_cast<u32>(static_cast<i64>(4) * static_cast<i64>(SlicePool::kSliceSize));
     static constexpr u32 kTlsOutHigh =
-        kTlsOutBufCap - kTlsRecordMax;                    // pause upstream recv above this
+        static_cast<u32>(static_cast<i64>(kTlsOutBufCap) - static_cast<i64>(kTlsRecordMax));
     static constexpr u32 kTlsOutLow = kTlsOutBufCap / 4;  // resume below this
     static constexpr u32 kTlsDrainChunk = kTlsRecordMax;  // keep one TLS record within a raw send
     static constexpr u32 kDefaultKeepaliveTimeout = 60;
@@ -500,7 +509,8 @@ public:
     // Batch-local owner index: at most 256 owners in 512 slots. No Connection
     // state or allocation is retained across dispatch/reclamation boundaries.
     static constexpr u32 kResponseReadOwnerIndexSize = 2u * kMaxEventsPerWait;
-    static_assert((kResponseReadOwnerIndexSize & (kResponseReadOwnerIndexSize - 1u)) == 0);
+    static_assert(kResponseReadOwnerIndexSize == 512u);
+    static constexpr u32 kResponseReadOwnerIndexMask = 511u;
     u16 response_read_batch_owner_index[kResponseReadOwnerIndexSize]{};
     bool response_read_batch_owner_index_active = false;
     // Counters default to empty so a loop whose slots are used before init()
@@ -560,7 +570,8 @@ public:
             conns.destroy();
             return core::make_unexpected(b.error());
         }
-        auto ready_words = body_pump_ready_words.init((capacity + 63u) / 64u);
+        auto ready_words =
+            body_pump_ready_words.init(static_cast<u32>((static_cast<i64>(capacity) + 63) / 64));
         if (!ready_words) {
             backend.destroy_send_state_storage();
             pending_free.destroy();
@@ -568,7 +579,8 @@ public:
             conns.destroy();
             return core::make_unexpected(ready_words.error());
         }
-        auto rearm_words = recv_rearm_words.init((capacity + 63u) / 64u);
+        auto rearm_words =
+            recv_rearm_words.init(static_cast<u32>((static_cast<i64>(capacity) + 63) / 64));
         if (!rearm_words) {
             body_pump_ready_words.destroy();
             backend.destroy_send_state_storage();
@@ -583,7 +595,7 @@ public:
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
         for (u32 i = 0; i < capacity; i++) {
-            free_stack[i] = capacity - 1 - i;
+            free_stack[i] = static_cast<u32>(static_cast<i64>(capacity) - 1 - static_cast<i64>(i));
             pending_free[i] = 0;
         }
         free_top = capacity;
@@ -633,7 +645,8 @@ public:
         }
         for (u32 i = 0; i < slots_initialized; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf =
+                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
         }
         return true;
     }
@@ -782,9 +795,12 @@ public:
                 if (upstream) upstream->drain();
                 u64 start = drain_start_.load(std::memory_order_relaxed);
                 u32 period = drain_period_.load(std::memory_order_relaxed);
+                u64 deadline = 0;
+                const bool deadline_overflow =
+                    __builtin_add_overflow(start, static_cast<u64>(period), &deadline);
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
-                } else if (monotonic_secs() >= start + period) {
+                } else if (deadline_overflow || monotonic_secs() >= deadline) {
                     force_close_all();
                     running_.store(false, std::memory_order_relaxed);
                 }
@@ -871,14 +887,18 @@ public:
     }
 
     void epoch_enter() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
     void epoch_leave() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
 
     void shutdown() {
@@ -945,7 +965,9 @@ public:
         }
     }
 
-    u32 active_count() const { return connection_capacity - free_top; }
+    u32 active_count() const {
+        return static_cast<u32>(static_cast<i64>(connection_capacity) - static_cast<i64>(free_top));
+    }
     u32 free_conn_slots() const { return free_top; }
 
     // Lazy-allocate upstream recv buffer for proxy connections.
@@ -998,9 +1020,9 @@ public:
     }
 
     static constexpr u32 upstream_op_count(u8 mask) {
-        return static_cast<u32>((mask & kUpstreamOpConnect) != 0) +
-               static_cast<u32>((mask & kUpstreamOpRecv) != 0) +
-               static_cast<u32>((mask & kUpstreamOpSend) != 0);
+        return static_cast<u32>(static_cast<i64>((mask & kUpstreamOpConnect) != 0) +
+                                static_cast<i64>((mask & kUpstreamOpRecv) != 0) +
+                                static_cast<i64>((mask & kUpstreamOpSend) != 0));
     }
 
     // Park only the post-response request-boundary tail. Every request-1 side
@@ -1074,11 +1096,13 @@ private:
         const u8* data = c.response_header_buf.data();
         if (data == nullptr || len < 16u || __builtin_memcmp(data, "HTTP/1.1 ", 9) != 0 ||
             data[9] < '1' || data[9] > '5' || data[10] < '0' || data[10] > '9' || data[11] < '0' ||
-            data[11] > '9' || data[12] != ' ' || data[len - 4] != '\r' || data[len - 3] != '\n' ||
-            data[len - 2] != '\r' || data[len - 1] != '\n')
+            data[11] > '9' || data[12] != ' ' || data[static_cast<i64>(len) - 4] != '\r' ||
+            data[static_cast<i64>(len) - 3] != '\n' || data[static_cast<i64>(len) - 2] != '\r' ||
+            data[static_cast<i64>(len) - 1] != '\n')
             return false;
-        const u16 status =
-            static_cast<u16>((data[9] - '0') * 100u + (data[10] - '0') * 10u + (data[11] - '0'));
+        const u16 status = static_cast<u16>((static_cast<i64>(data[9]) - '0') * 100 +
+                                            (static_cast<i64>(data[10]) - '0') * 10 +
+                                            static_cast<i64>(data[11]) - '0');
         return status == c.resp_status;
     }
 
@@ -1113,9 +1137,11 @@ private:
                 if (c.http1_prebuilt_deadline_config != nullptr &&
                     c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                         c.http1_prebuilt_deadline_bundle_id)) {
-                    copied_buffering = c.http1_prebuilt_deadline_config
-                                           ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                                           .response_buffering;
+                    copied_buffering =
+                        c.http1_prebuilt_deadline_config
+                            ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) -
+                                             1]
+                            .response_buffering;
                 }
                 if (!http1_pipeline_request_generation_prebuilt_is_stable(
                         c,
@@ -1160,13 +1186,15 @@ private:
             c.http1_prebuilt_header_end > c.http1_prebuilt_total_len ||
             (!header_only_representation
                  ? c.http1_prebuilt_body_len !=
-                       c.http1_prebuilt_total_len - c.http1_prebuilt_header_end
+                       static_cast<u32>(static_cast<i64>(c.http1_prebuilt_total_len) -
+                                        static_cast<i64>(c.http1_prebuilt_header_end))
                  : c.http1_prebuilt_body_len == 0 ||
                        c.http1_prebuilt_total_len != c.http1_prebuilt_header_end) ||
             c.http1_prebuilt_status != c.resp_status)
             return false;
         const auto& bundle =
-            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1];
+            c.request_config
+                ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1];
         const bool bodyless_get_retained_policy =
             c.http1_prebuilt_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1202,9 +1230,12 @@ private:
             !c.request_config->failure_policy_id_is_valid(c.failure_policy_id) ||
             !c.request_config->timeout_failure_policy_id_is_valid(c.timeout_failure_policy_id))
             return false;
-        const auto& response = c.request_config->response_policies[c.response_policy_id - 1];
-        const auto& failure = c.request_config->failure_policies[c.failure_policy_id - 1];
-        const auto& timeout = c.request_config->failure_policies[c.timeout_failure_policy_id - 1];
+        const auto& response =
+            c.request_config->response_policies[static_cast<i64>(c.response_policy_id) - 1];
+        const auto& failure =
+            c.request_config->failure_policies[static_cast<i64>(c.failure_policy_id) - 1];
+        const auto& timeout =
+            c.request_config->failure_policies[static_cast<i64>(c.timeout_failure_policy_id) - 1];
         if (c.http1_prebuilt_response_layout == Http1PrebuiltResponseLayout::HeaderOnlyHead) {
             if (!response_read_deadline_profile_suppresses_head(
                     c.http1_prebuilt_deadline_profile) ||
@@ -1512,7 +1543,8 @@ private:
         }
         if (c.http1_prebuilt_response_purpose != Http1PrebuiltResponsePurpose::ResponseReadTimeout)
             return false;
-        const u8* body = c.response_header_buf.data() + c.http1_prebuilt_header_end;
+        const u8* body =
+            c.response_header_buf.data() + static_cast<i64>(c.http1_prebuilt_header_end);
         return parsed.status_code == timeout.status_code &&
                parsed.reason.len == timeout.reason.len &&
                __builtin_memcmp(parsed.reason.ptr, timeout.reason.ptr, timeout.reason.len) == 0 &&
@@ -1534,8 +1566,9 @@ private:
         auto exact_send_source = [&](const u8* expected, u32 total) {
             return !retiring_send ||
                    (expected != nullptr && send.src == expected && send.offset <= total &&
-                    send.remaining == total - send.offset && send.fd == c.upstream_fd &&
-                    send.type == IoEventType::UpstreamSend &&
+                    send.remaining ==
+                        static_cast<u32>(static_cast<i64>(total) - static_cast<i64>(send.offset)) &&
+                    send.fd == c.upstream_fd && send.type == IoEventType::UpstreamSend &&
                     send.upstream_episode == c.upstream_episode);
         };
 
@@ -1568,8 +1601,8 @@ private:
                 // boundary, while any retry snapshot/pipeline stash remains in
                 // send_buf until both rendezvous owners drain. A live Send has
                 // not reached that callback and belongs to RetrySendBuf instead.
-                const u32 stored =
-                    static_cast<u32>(c.retry_req_send_len) + static_cast<u32>(c.pipeline_stash_len);
+                const i64 stored =
+                    static_cast<i64>(c.retry_req_send_len) + static_cast<i64>(c.pipeline_stash_len);
                 const bool materialized_get =
                     c.http1_prebuilt_deadline_profile ==
                         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1588,7 +1621,8 @@ private:
                                 c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                                     c.http1_prebuilt_deadline_bundle_id)
                             ? c.http1_prebuilt_deadline_config
-                                  ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                  ->policy_bundles
+                                      [static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                                   .response_buffering
                             : ForwardResponseBufferingMode::None,
                         c.http1_prebuilt_deadline_bundle_id,
@@ -1596,7 +1630,8 @@ private:
                         c.http1_prebuilt_deadline_route_method);
                 return c.request_upload_complete && !c.upstream_request_incomplete &&
                        !retiring_connect && !retiring_send &&
-                       request_prefix_len == c.retry_req_send_len && stored <= c.send_buf.len() &&
+                       request_prefix_len == c.retry_req_send_len &&
+                       stored <= static_cast<i64>(c.send_buf.len()) &&
                        (!materialized_get || exact_get_stable ||
                         (coalesced_get &&
                          response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
@@ -1607,7 +1642,9 @@ private:
                                      c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
                                          c.http1_prebuilt_deadline_bundle_id)
                                  ? c.http1_prebuilt_deadline_config
-                                       ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                                       ->policy_bundles[static_cast<i64>(
+                                                            c.http1_prebuilt_deadline_bundle_id) -
+                                                        1]
                                        .response_buffering
                                  : ForwardResponseBufferingMode::None,
                              c.http1_prebuilt_deadline_bundle_id,
@@ -1635,8 +1672,11 @@ private:
                 if (prefix == 0 || prefix != c.req_initial_send_len || prefix > c.recv_buf.len() ||
                     c.retry_req_send_len != 0 || c.pipeline_stash_len != 0)
                     return false;
-                const u32 late = c.recv_buf.len() - prefix;
-                if (late != 0) __builtin_memmove(c.recv_slice, c.recv_buf.data() + prefix, late);
+                const u32 late =
+                    static_cast<u32>(static_cast<i64>(c.recv_buf.len()) - static_cast<i64>(prefix));
+                if (late != 0)
+                    __builtin_memmove(
+                        c.recv_slice, c.recv_buf.data() + static_cast<i64>(prefix), late);
                 c.clear_raw_request_target_witness();
                 c.recv_buf.set_len(late);
                 return true;
@@ -1650,8 +1690,8 @@ private:
                 return true;
             case Http1RequestBufferDisposition::ExistingPipeline:
                 return prefix == c.retry_req_send_len &&
-                       static_cast<u32>(c.retry_req_send_len) +
-                               static_cast<u32>(c.pipeline_stash_len) <=
+                       static_cast<i64>(c.retry_req_send_len) +
+                               static_cast<i64>(c.pipeline_stash_len) <=
                            c.send_buf.len();
             case Http1RequestBufferDisposition::None:
                 return false;
@@ -1716,8 +1756,8 @@ private:
         }
 
         // Exact equality excludes every unrepresented target or cancel CQE.
-        const u32 expected_pending =
-            static_cast<u32>(c.recv_armed) + upstream_op_count(selected_targets);
+        const u32 expected_pending = static_cast<u32>(
+            static_cast<i64>(c.recv_armed) + static_cast<i64>(upstream_op_count(selected_targets)));
         if (c.pending_ops != expected_pending) return false;
 
         // Replace a fully-drained older tombstone directly with the exact
@@ -1917,12 +1957,13 @@ public:
             ev.copy_deadline_generation != deadline_generation ||
             ev.copy_deadline_profile != static_cast<u8>(profile) ||
             ev.copy_deadline_method != method || ev.copy_end < ev.copy_begin ||
-            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) !=
+                static_cast<i64>(ev.result) ||
             ev.copy_end != c.buffered_response_len() || c.upstream_episode != upstream_episode)
             return false;
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
-        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        const auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         return owner.valid && owner.conn_id == c.id &&
                owner.deadline_generation == deadline_generation && owner.profile == profile &&
                owner.method == method && owner.upstream_episode == upstream_episode &&
@@ -1944,7 +1985,7 @@ public:
             return false;
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
-        const auto& owner = response_read_batch_owners[owner_index - 1u];
+        const auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         return owner.valid && owner.conn_id == c.id &&
                owner.deadline_generation == c.response_read_deadline_generation &&
                owner.profile == c.response_read_deadline_profile &&
@@ -1971,7 +2012,8 @@ public:
             !c.request_config->policy_bundle_id_is_valid(c.http1_prebuilt_deadline_bundle_id))
             return false;
         const auto& bundle =
-            c.request_config->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1u];
+            c.request_config
+                ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1];
         const u8 expected_wait =
             kHttp1WaitHeaderSend |
             (c.upstream_retirement_active ? kHttp1WaitUpstreamRetirement : static_cast<u8>(0));
@@ -2081,7 +2123,7 @@ public:
                  c,
                  c.http1_prebuilt_deadline_upload,
                  c.http1_prebuilt_deadline_config
-                     ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                     ->policy_bundles[static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                      .response_buffering,
                  c.http1_prebuilt_deadline_profile));
         const bool tls_read_timeout = c.tls_active && prebuilt_http11_tls_read_timeout_is_stable(c);
@@ -2597,11 +2639,13 @@ public:
         const u8 cancel = c.upstream_retirement_cancel_owned;
         const u8 retry = c.upstream_retirement_cancel_retry;
         const bool has_owner = target != 0 || cancel != 0 || retry != 0;
-        const u32 counted_owners = static_cast<u32>(target != 0) + static_cast<u32>(cancel != 0);
+        const u32 counted_owners =
+            static_cast<u32>(static_cast<i64>(target != 0) + static_cast<i64>(cancel != 0));
         const bool exact_normal_successor =
             !c.upstream_episode_quarantined &&
             c.upstream_retiring_episode < kIoUserDataMaxUpstreamEpisode &&
-            c.upstream_episode == c.upstream_retiring_episode + 1u;
+            c.upstream_episode ==
+                static_cast<u32>(static_cast<i64>(c.upstream_retiring_episode) + 1);
         const bool exact_quarantined_successor =
             c.upstream_episode_quarantined &&
             c.upstream_retiring_episode == kIoUserDataMaxUpstreamEpisode &&
@@ -2845,7 +2889,8 @@ public:
                          c,
                          c.http1_prebuilt_deadline_upload,
                          c.http1_prebuilt_deadline_config
-                             ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                             ->policy_bundles
+                                 [static_cast<i64>(c.http1_prebuilt_deadline_bundle_id) - 1]
                              .response_buffering,
                          c.http1_prebuilt_deadline_profile));
                 if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
@@ -3287,7 +3332,8 @@ public:
         // Fresh ids pop in ascending order, so a never-used slot is exactly
         // the next one past the watermark; initialize_slots_to also covers any
         // gap so the prefix invariant does not depend on hand-out order.
-        if (id >= slots_initialized) initialize_slots_to(id + 1);
+        if (id >= slots_initialized)
+            initialize_slots_to(static_cast<u32>(static_cast<i64>(id) + 1));
         // A free slot has drained every target and cancel completion. Failed
         // sends can leave unsent bytes in the backend proactor even after the
         // connection's close ledger drains; those bytes belong to the old fd.
@@ -3303,7 +3349,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf =
+                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
         return &conns[id];
     }
 
@@ -3486,13 +3533,17 @@ public:
         if (recv_rearm_count == 0) return;
         const u32 pinned = backend.cq_unharvested();
         if (!force && pinned >= kProvidedBufCount / 2) return;
-        u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
+        u32 budget =
+            pinned < kProvidedBufCount
+                ? static_cast<u32>(static_cast<i64>(kProvidedBufCount) - static_cast<i64>(pinned))
+                : 0;
         if (budget == 0 && force) budget = 1;  // the backstop always makes progress
-        const u32 words = (slots_initialized + 63u) >> 6;
+        const u32 words = static_cast<u32>((static_cast<i64>(slots_initialized) + 63) >> 6);
         if (words == 0) return;
         const u32 start = recv_rearm_cursor < words ? recv_rearm_cursor : 0;
         for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
-            const u32 w = (start + n) % words;
+            const u32 w = static_cast<u32>((static_cast<i64>(start) + static_cast<i64>(n)) %
+                                           static_cast<i64>(words));
             u64 bits = recv_rearm_words[w];
             u64 retained = 0;
             while (bits != 0) {
@@ -3500,7 +3551,7 @@ public:
                     recv_rearm_cursor = w;  // resume inside this word
                     return;
                 }
-                const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
+                const u32 cid = static_cast<u32>(static_cast<i64>(w) * 64 + __builtin_ctzll(bits));
                 const u64 bit = u64{1} << (cid & 63u);
                 bits &= ~bit;
                 if (cid >= slots_initialized) {
@@ -3527,7 +3578,8 @@ public:
                 clear_deferred_recv(cid);
             }
             recv_rearm_words[w] |= retained;
-            recv_rearm_cursor = (w + 1u) % words;
+            recv_rearm_cursor =
+                static_cast<u32>((static_cast<i64>(w) + 1) % static_cast<i64>(words));
         }
     }
 
@@ -3592,13 +3644,15 @@ public:
         return send.src == c.tls_out_inflight_src && send.fd == c.tls_out_inflight_fd &&
                send.type == IoEventType::Send && send.generation == c.tls_out_inflight_generation &&
                send.offset <= c.tls_out_inflight_len &&
-               send.remaining <= c.tls_out_inflight_len - send.offset;
+               send.remaining <= static_cast<u32>(static_cast<i64>(c.tls_out_inflight_len) -
+                                                  static_cast<i64>(send.offset));
     }
 
     bool tls_ciphertext_send_is_current(const Connection& c) const {
         if (!tls_ciphertext_send_raw_state_matches(c)) return false;
         const auto& send = backend.send_state[c.id];
-        return send.offset + send.remaining == c.tls_out_inflight_len;
+        return static_cast<i64>(send.offset) + static_cast<i64>(send.remaining) ==
+               static_cast<i64>(c.tls_out_inflight_len);
     }
 
     // Deliver the saved continuation as a logical plaintext completion. Raw
@@ -3799,7 +3853,10 @@ public:
             const auto* next = c.response_body_tail.head->next;
             const u32 first = c.buffered_response_front_size();
             c.response_send_vector.bind(
-                buf, first, ResponseBodyChain::payload(next) + next->offset, len - first);
+                buf,
+                first,
+                ResponseBodyChain::payload(next) + static_cast<i64>(next->offset),
+                static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(first)));
             vector = &c.response_send_vector;
         }
         if (study_direct_body && c.response_read_deadline_upload.downstream_close &&
@@ -4162,16 +4219,17 @@ public:
     bool has_ordinary_cq_work() {
         ++study_cq_probes;
         if (!backend.cq_head || !backend.cq_tail) return false;
-        const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+        const IoUringPosition head{__atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE)};
         const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
-        if (head == tail) return false;
-        if (!backend.cq_entries || !backend.cq_ring_mask || tail - head > backend.cq_ring_entries)
+        const u32 available = head.distance_to(tail);
+        if (available == 0) return false;
+        if (!backend.cq_entries || !backend.cq_ring_mask || available > backend.cq_ring_entries)
             return true;
         // Peek only; wait() retains sole ownership of CQ consumption and all
         // cancellation/proactor accounting. Bound the scheduler hint's cost.
-        const u32 count = tail - head < 32u ? tail - head : 32u;
+        const u32 count = available < 32u ? available : 32u;
         for (u32 i = 0; i < count; ++i) {
-            const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
+            const auto& cqe = backend.cq_entries[head.advanced_by(i).slot(*backend.cq_ring_mask)];
             ++study_cq_entries;
             const u32 tag = static_cast<u32>(cqe.user_data & 0xFFu);
             const u32 type_count = static_cast<u32>(IoEventType::Count);
@@ -4191,7 +4249,7 @@ public:
                 return true;
         }
         // Uninspected work is conservatively serviced before the extra quantum.
-        return tail - head > count;
+        return available > count;
     }
 
     void flush_deferred_relay_reads() {
@@ -4206,7 +4264,9 @@ public:
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
-            if (relay_budget_calls < 2 || relay_budget_bytes < 2 * 64 * 1024) break;
+            if (relay_budget_calls < 2 ||
+                static_cast<i64>(relay_budget_bytes) < static_cast<i64>(2) * 64 * 1024)
+                break;
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
@@ -4214,7 +4274,9 @@ public:
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
-                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
+                    u64 ordinary_wait_ns = 0;
+                    if (__builtin_sub_overflow(now, ordinary_since_ns, &ordinary_wait_ns)) break;
+                    if (ordinary_wait_ns >= ordinary_cq_wait_limit_ns) {
                         ++study_relay_yields;
                         break;
                     }
@@ -4226,8 +4288,9 @@ public:
             const u32 kEpisode = deferred_relay_read_episodes[0];
             --deferred_relay_read_count;
             for (u32 j = 0; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[static_cast<i64>(j) + 1];
+                deferred_relay_read_episodes[j] =
+                    deferred_relay_read_episodes[static_cast<i64>(j) + 1];
             }
             if (kId >= slots_initialized) continue;
             Connection& c = conns[kId];
@@ -4255,7 +4318,10 @@ public:
                 continue;
             }
             if (study_queue_started[c.id] != 0) {
-                study_record_wait(2, monotonic_ns() - study_queue_started[c.id]);
+                u64 queue_wait_ns = 0;
+                if (!__builtin_sub_overflow(
+                        monotonic_ns(), study_queue_started[c.id], &queue_wait_ns))
+                    study_record_wait(2, queue_wait_ns);
                 study_queue_started[c.id] = 0;
             }
             const IoEvent kReady{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, kEpisode};
@@ -4270,8 +4336,13 @@ public:
                 if (!submit_recv_upstream(c)) close_conn(c);
             }
         }
-        study_relay_calls += start_calls - relay_budget_calls;
-        study_flush_phase_ns += monotonic_ns() - phase_started;
+        const i64 relay_calls =
+            static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
+        __builtin_add_overflow(
+            study_relay_calls, static_cast<u64>(relay_calls), &study_relay_calls);
+        u64 flush_phase_ns = 0;
+        if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
+            __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
     }
 
     void clear_deferred_relay_read(u32 id) {
@@ -4282,8 +4353,9 @@ public:
             }
             --deferred_relay_read_count;
             for (u32 j = i; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[static_cast<i64>(j) + 1];
+                deferred_relay_read_episodes[j] =
+                    deferred_relay_read_episodes[static_cast<i64>(j) + 1];
             }
         }
     }
@@ -4416,7 +4488,11 @@ public:
                                        want,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             const int splice_errno = errno;
-            if (sampled) study_record_syscall(0, monotonic_ns() - syscall_start);
+            if (sampled) {
+                u64 syscall_ns = 0;
+                if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+                    study_record_syscall(0, syscall_ns);
+            }
             errno = splice_errno;
             if (n > 0 && static_cast<u32>(n) < want) ++study_splice_short[0];
             if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -4435,11 +4511,12 @@ public:
                 return;
             }
             r.segment_len = static_cast<u32>(n);
-            relay_budget_bytes -= static_cast<u32>(n);
-            relay_pulled_bytes += static_cast<u32>(n);
+            relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
+            __builtin_add_overflow(relay_pulled_bytes, static_cast<u64>(n), &relay_pulled_bytes);
             r.segment_sent = 0;
-            r.body_bytes += r.segment_len;
-            c.resp_body_remaining -= r.segment_len;
+            __builtin_add_overflow(r.body_bytes, static_cast<u64>(r.segment_len), &r.body_bytes);
+            c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
+                                                     static_cast<i64>(r.segment_len));
             refresh_relay_progress_timer(c);
             r.write_armed = true;
             const IoEvent ready{
@@ -4454,7 +4531,8 @@ public:
             return;
         }
         --relay_budget_calls;
-        const u32 remaining = r.segment_len - r.segment_sent;
+        const u32 remaining =
+            static_cast<u32>(static_cast<i64>(r.segment_len) - static_cast<i64>(r.segment_sent));
         const u32 write_want = remaining < relay_budget_bytes ? remaining : relay_budget_bytes;
         if (study_inside_cq) ++study_cq_splice_calls;
         const bool sampled = (++study_splice_calls[1] & 63u) == 0;
@@ -4462,7 +4540,11 @@ public:
         const ssize_t n = ::splice(
             r.pipe_read, nullptr, c.fd, nullptr, write_want, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         const int splice_errno = errno;
-        if (sampled) study_record_syscall(1, monotonic_ns() - syscall_start);
+        if (sampled) {
+            u64 syscall_ns = 0;
+            if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+                study_record_syscall(1, syscall_ns);
+        }
         errno = splice_errno;
         if (n > 0 && static_cast<u32>(n) < write_want) ++study_splice_short[1];
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -4470,15 +4552,18 @@ public:
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
-        if (n <= 0 || static_cast<u32>(n) > r.segment_len - r.segment_sent) {
+        if (n <= 0 || static_cast<u32>(n) > static_cast<u32>(static_cast<i64>(r.segment_len) -
+                                                             static_cast<i64>(r.segment_sent))) {
             close_conn(c);
             return;
         }
-        r.segment_sent += static_cast<u32>(n);
-        relay_budget_bytes -= static_cast<u32>(n);
-        relay_written_bytes += static_cast<u32>(n);
-        if (study_inside_cq) study_cq_splice_bytes += static_cast<u32>(n);
-        c.resp_body_sent += static_cast<u32>(n);
+        r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
+        relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
+        __builtin_add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
+        if (study_inside_cq)
+            __builtin_add_overflow(
+                study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
+        __builtin_add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
@@ -4753,7 +4838,7 @@ public:
             c.response_read_deadline_progress_bytes != 0 || cfg == nullptr ||
             !cfg->policy_bundle_id_is_valid(bundle_id))
             return false;
-        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        const auto& bundle = cfg->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
@@ -4931,7 +5016,8 @@ public:
             return ev.type == IoEventType::UpstreamRecv && ev.result > 0 && ev.aux == 0 &&
                    ev.upstream_episode == c.upstream_episode &&
                    ev.copy_witness == IoEventCopyWitness::Full && ev.copy_end >= ev.copy_begin &&
-                   ev.copy_end - ev.copy_begin == static_cast<u32>(ev.result) &&
+                   static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) ==
+                       static_cast<i64>(ev.result) &&
                    ev.copy_end == c.buffered_response_len() &&
                    ev.copy_deadline_generation == c.response_read_deadline_generation &&
                    ev.copy_deadline_profile == static_cast<u8>(c.response_read_deadline_profile) &&
@@ -4942,7 +5028,8 @@ public:
         if (ev.type != IoEventType::UpstreamRecv || ev.result <= 0 || ev.aux != 0 ||
             ev.upstream_episode != c.upstream_episode ||
             ev.copy_witness != IoEventCopyWitness::Full || ev.copy_end < ev.copy_begin ||
-            ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+            static_cast<i64>(ev.copy_end) - static_cast<i64>(ev.copy_begin) !=
+                static_cast<i64>(ev.result) ||
             ev.copy_end != c.buffered_response_len() ||
             ev.copy_deadline_generation != c.response_read_deadline_generation ||
             ev.copy_deadline_profile != static_cast<u8>(c.response_read_deadline_profile) ||
@@ -5050,10 +5137,14 @@ public:
                c.on_send ==
                    (header ? &on_response_header_sent<Self> : &on_response_body_sent<Self>) &&
                (header ? submitted == 0 && completed == 0 && inflight == 0
-                       : submitted >= completed && submitted - completed == inflight) &&
+                       : submitted >= completed &&
+                             static_cast<i64>(submitted) - static_cast<i64>(completed) ==
+                                 static_cast<i64>(inflight)) &&
                send.src == source && send.fd == c.fd && send.type == IoEventType::Send &&
                send.generation == c.response_read_deadline_send_owner_generation &&
-               send.offset <= length && send.remaining == length - send.offset;
+               send.offset <= length &&
+               send.remaining ==
+                   static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(send.offset));
     }
 
     [[nodiscard]] bool promote_streaming_response_read_timer(Connection& c) {
@@ -5112,7 +5203,7 @@ public:
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             cfg == nullptr || !cfg->policy_bundle_id_is_valid(bundle_id))
             return false;
-        const auto& bundle = cfg->policy_bundles[bundle_id - 1];
+        const auto& bundle = cfg->policy_bundles[static_cast<i64>(bundle_id) - 1];
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
             bundle.response_read_timeout_seconds != c.response_read_deadline_seconds ||
             bundle.response_policy_id != c.response_policy_id ||
@@ -5184,15 +5275,19 @@ public:
     u16 find_response_read_batch_owner(u32 cid) const {
         if (!response_read_batch_owner_index_active) {
             for (u32 i = 0; i < response_read_batch_owner_count; ++i)
-                if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
+                if (response_read_batch_owners[i].conn_id == cid)
+                    return static_cast<u16>(static_cast<i64>(i) + 1);
             return 0;
         }
-        u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+        u32 hash = 0;
+        __builtin_mul_overflow(cid, 2654435761u, &hash);
+        u32 slot = hash & kResponseReadOwnerIndexMask;
         for (u32 probes = 0; probes < kResponseReadOwnerIndexSize; ++probes) {
             const u16 index = response_read_batch_owner_index[slot];
             if (index == 0) return 0;
-            if (response_read_batch_owners[index - 1u].conn_id == cid) return index;
-            slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+            if (response_read_batch_owners[static_cast<i64>(index) - 1].conn_id == cid)
+                return index;
+            slot = static_cast<u32>((static_cast<i64>(slot) + 1) & kResponseReadOwnerIndexMask);
         }
         return 0;
     }
@@ -5200,10 +5295,12 @@ public:
     u16 publish_response_read_batch_owner() {
         const u16 index = static_cast<u16>(++response_read_batch_owner_count);
         if (response_read_batch_owner_index_active) {
-            const u32 cid = response_read_batch_owners[index - 1u].conn_id;
-            u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+            const u32 cid = response_read_batch_owners[static_cast<i64>(index) - 1].conn_id;
+            u32 hash = 0;
+            __builtin_mul_overflow(cid, 2654435761u, &hash);
+            u32 slot = hash & kResponseReadOwnerIndexMask;
             while (response_read_batch_owner_index[slot] != 0)
-                slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+                slot = static_cast<u32>((static_cast<i64>(slot) + 1) & kResponseReadOwnerIndexMask);
             response_read_batch_owner_index[slot] = index;
         }
         return index;
@@ -5235,7 +5332,7 @@ public:
 
     u16 find_or_add_precise_timer_batch_owner(u32 cid) {
         if (const u16 index = find_response_read_batch_owner(cid)) {
-            auto& owner = response_read_batch_owners[index - 1u];
+            auto& owner = response_read_batch_owners[static_cast<i64>(index) - 1];
             const Connection& c = conns[cid];
             if (!c.response_read_timer_owner_is_valid()) {
                 owner.valid = false;
@@ -5277,7 +5374,7 @@ public:
     u16 find_or_add_bounded_terminal_custody_owner(u32 cid) {
         if (cid >= slots_initialized) return 0;
         if (const u16 index = find_response_read_batch_owner(cid)) {
-            auto& owner = response_read_batch_owners[index - 1u];
+            auto& owner = response_read_batch_owners[static_cast<i64>(index) - 1];
             if (!owner.bounded_terminal_custody) {
                 const Connection& c = conns[cid];
                 owner.bounded_terminal_custody = true;
@@ -5289,10 +5386,11 @@ public:
                                                ResponseReadDeadlinePostCommitPhase::Buffering
                                        ? c.response_read_deadline_post_commit_raw_header_end
                                        : 0;
+                const i64 delta = static_cast<i64>(received) - static_cast<i64>(completed);
                 owner.bounded_terminal_buffer_begin =
-                    received >= completed && header <= 0xffffffffu - (received - completed)
-                        ? header + received - completed
-                        : 0xffffffffu;
+                    delta >= 0 && static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+                        ? static_cast<u32>(static_cast<i64>(header) + delta)
+                        : UINT32_MAX;
                 owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
                 owner.post_commit_at_start = true;
                 owner.valid =
@@ -5322,10 +5420,11 @@ public:
                                        ResponseReadDeadlinePostCommitPhase::Buffering
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
+        const i64 delta = static_cast<i64>(received) - static_cast<i64>(completed);
         owner.bounded_terminal_buffer_begin =
-            received >= completed && header <= 0xffffffffu - (received - completed)
-                ? header + received - completed
-                : 0xffffffffu;
+            delta >= 0 && static_cast<i64>(header) <= static_cast<i64>(UINT32_MAX) - delta
+                ? static_cast<u32>(static_cast<i64>(header) + delta)
+                : UINT32_MAX;
         owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
         owner.valid =
             c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
@@ -5473,7 +5572,7 @@ public:
             if (response_read_batch_event_owner[i] == 0xffffu) continue;
             const u16 owner_index = find_response_read_batch_owner(ev.conn_id);
             if (owner_index == 0) continue;
-            auto& owner = response_read_batch_owners[owner_index - 1];
+            auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
             if (owner.bounded_terminal_prospective) continue;
             if (owner.bounded_terminal_custody && ev.type != IoEventType::ResponseReadTimer) {
                 response_read_batch_event_owner[i] = owner_index;
@@ -5513,7 +5612,15 @@ public:
                     } else {
                         if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
                         owner.expected_copy_end = ev.copy_end;
-                        owner.positive_bytes += static_cast<u32>(ev.result);
+                        const u64 positive = static_cast<u64>(ev.result);
+                        u64 total_positive = 0;
+                        if (__builtin_add_overflow(static_cast<u64>(owner.positive_bytes),
+                                                   positive,
+                                                   &total_positive) ||
+                            total_positive > UINT32_MAX)
+                            owner.bounded_terminal_custody_invalid = true;
+                        else
+                            owner.positive_bytes = static_cast<u32>(total_positive);
                         owner.saw_positive = true;
                     }
                     continue;
@@ -5563,10 +5670,12 @@ public:
                     if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
                     owner.expected_copy_end = ev.copy_end;
                     const u32 positive = static_cast<u32>(ev.result);
-                    if (owner.positive_bytes > 0xFFFFFFFFu - positive)
+                    if (static_cast<i64>(owner.positive_bytes) + static_cast<i64>(positive) >
+                        static_cast<i64>(UINT32_MAX))
                         owner.valid = false;
                     else
-                        owner.positive_bytes += positive;
+                        owner.positive_bytes = static_cast<u32>(
+                            static_cast<i64>(owner.positive_bytes) + static_cast<i64>(positive));
                     owner.saw_positive = true;
                 }
                 if (!ev.more) {
@@ -5609,10 +5718,12 @@ public:
                     valid_upstream_episode(owner.upstream_episode) && exact_copy_end &&
                     (owner.bounded_terminal_recv_seen || owner.bounded_terminal_cancel_seen ||
                      owner.saw_positive);
-                if (owner.saw_positive &&
-                    (owner.bounded_terminal_buffer_begin > 0xffffffffu - owner.positive_bytes ||
-                     owner.bounded_terminal_buffer_begin + owner.positive_bytes !=
-                         c.buffered_response_len()))
+                if (owner.saw_positive && (static_cast<i64>(owner.bounded_terminal_buffer_begin) +
+                                                   static_cast<i64>(owner.positive_bytes) >
+                                               UINT32_MAX ||
+                                           static_cast<i64>(owner.bounded_terminal_buffer_begin) +
+                                                   static_cast<i64>(owner.positive_bytes) !=
+                                               c.buffered_response_len()))
                     owner.valid = false;
                 continue;
             }
@@ -5641,8 +5752,9 @@ public:
                 c.response_read_deadline_progress_episode == owner.upstream_episode &&
                 c.response_read_deadline_progress_bytes == pre_batch_bytes && pre_batch_bytes != 0;
             if (owner.post_commit_at_start) {
-                const u32 unsent = c.response_read_deadline_post_commit_origin_received -
-                                   c.response_read_deadline_post_commit_downstream_completed;
+                const i64 unsent =
+                    static_cast<i64>(c.response_read_deadline_post_commit_origin_received) -
+                    static_cast<i64>(c.response_read_deadline_post_commit_downstream_completed);
                 const u32 header_prefix =
                     c.response_read_deadline_post_commit_phase ==
                                 ResponseReadDeadlinePostCommitPhase::HeaderSend ||
@@ -5650,8 +5762,8 @@ public:
                                 ResponseReadDeadlinePostCommitPhase::Buffering
                         ? c.response_read_deadline_post_commit_raw_header_end
                         : 0;
-                if (header_prefix > 0xFFFFFFFFu - unsent ||
-                    pre_batch_bytes != header_prefix + unsent ||
+                if (unsent < 0 || static_cast<i64>(header_prefix) + unsent > UINT32_MAX ||
+                    static_cast<i64>(pre_batch_bytes) != static_cast<i64>(header_prefix) + unsent ||
                     c.response_read_deadline_progress_generation != owner.deadline_generation ||
                     c.response_read_deadline_progress_episode != owner.upstream_episode ||
                     c.response_read_deadline_progress_bytes !=
@@ -5662,8 +5774,11 @@ public:
                 owner.valid = false;
             }
             if (owner.saw_positive &&
-                (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-                 owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+                (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                     UINT32_MAX ||
+                 static_cast<i64>(owner.first_copy_begin) +
+                         static_cast<i64>(owner.positive_bytes) !=
+                     owner.expected_copy_end ||
                  owner.expected_copy_end != c.buffered_response_len()))
                 owner.valid = false;
         }
@@ -5739,8 +5854,10 @@ public:
 
         const u32 total = c.buffered_response_len();
         if (total == 0 || owner.expected_copy_end != total ||
-            owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-            owner.first_copy_begin + owner.positive_bytes != total)
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                UINT32_MAX ||
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                static_cast<i64>(total))
             return false;
         const bool no_prior_progress = c.response_read_deadline_progress_generation == 0 &&
                                        c.response_read_deadline_progress_episode == 0 &&
@@ -5792,12 +5909,17 @@ public:
                                    ResponseReadDeadlinePostCommitPhase::HeaderSend
                                ? c.response_read_deadline_post_commit_raw_header_end
                                : 0;
-        if (received > declared || owner.positive_bytes > declared - received ||
+        if (received > declared ||
+            static_cast<i64>(owner.positive_bytes) >
+                static_cast<i64>(declared) - static_cast<i64>(received) ||
             (owner.terminal_fault && !bounded_clean_eof &&
-             owner.positive_bytes != declared - received) ||
+             owner.positive_bytes !=
+                 static_cast<u32>(static_cast<i64>(declared) - static_cast<i64>(received))) ||
             (owner.saw_positive &&
-             (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-              owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)) ||
+             (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                  UINT32_MAX ||
+              static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                  owner.expected_copy_end)) ||
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0)) ||
             !ResponseBodyChain::matches_buffered_length(
@@ -5809,10 +5931,12 @@ public:
         // prepare validated the pre-batch copy range. A valid Send CQE in this
         // batch may already have consumed header/body bytes; the retained range
         // above is checked against the current completed count, not offset zero.
-        c.response_read_deadline_post_commit_origin_received = received + owner.positive_bytes;
+        c.response_read_deadline_post_commit_origin_received =
+            static_cast<u32>(static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
         c.response_read_deadline_progress_generation = owner.deadline_generation;
         c.response_read_deadline_progress_episode = owner.upstream_episode;
-        c.response_read_deadline_progress_bytes = received + owner.positive_bytes;
+        c.response_read_deadline_progress_bytes =
+            static_cast<u32>(static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
         c.response_read_timer_last_progress_ns = monotonic_ns();
         return true;
     }
@@ -5829,9 +5953,11 @@ public:
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
             c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
             raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
-            declared_body > c.upstream_recv_buf.capacity() - raw_header_end)
+            static_cast<i64>(declared_body) >
+                static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
             return false;
-        const u32 initial_body = c.buffered_response_len() - raw_header_end;
+        const u32 initial_body = static_cast<u32>(static_cast<i64>(c.buffered_response_len()) -
+                                                  static_cast<i64>(raw_header_end));
         if (initial_body > declared_body) return false;
         const bool fragmented_header_transition =
             c.response_read_deadline_progress_generation == c.response_read_deadline_generation &&
@@ -5910,7 +6036,8 @@ public:
             !complete_content_length_raw_origin_matches_pinned(
                 c, raw_header_end, declared_body, &classification))
             return false;
-        const u32 initial_body = c.buffered_response_len() - raw_header_end;
+        const u32 initial_body = static_cast<u32>(static_cast<i64>(c.buffered_response_len()) -
+                                                  static_cast<i64>(raw_header_end));
         if (initial_body > declared_body) return false;
         const bool precise_header_timer = response_read_deadline_uses_precise_timer(c);
         if (precise_header_timer && c.response_read_timer_phase != ResponseReadTimerPhase::Armed)
@@ -5958,7 +6085,7 @@ public:
             const u16 owner_index =
                 response_read_batch_event_owner[response_read_batch_event_index];
             if (owner_index != 0 && owner_index <= response_read_batch_owner_count)
-                batch_owner = &response_read_batch_owners[owner_index - 1u];
+                batch_owner = &response_read_batch_owners[static_cast<i64>(owner_index) - 1];
         }
         const bool same_batch_clean_eof =
             batch_owner != nullptr && batch_owner->valid && batch_owner->conn_id == c.id &&
@@ -6009,8 +6136,9 @@ public:
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.buffered_response_len())
+        if (header == 0 || static_cast<i64>(header) + static_cast<i64>(received) > UINT32_MAX ||
+            static_cast<i64>(header) + static_cast<i64>(received) !=
+                static_cast<i64>(c.buffered_response_len()))
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
@@ -6030,9 +6158,14 @@ public:
         // parsed header plus selected body extent.
         if (!owner.post_commit_at_start)
             return owner.saw_positive && owner.first_copy_begin <= header &&
-                   owner.first_copy_begin <= 0xFFFFFFFFu - owner.positive_bytes &&
-                   owner.first_copy_begin + owner.positive_bytes == header + received &&
-                   owner.expected_copy_end == header + received;
+                   static_cast<i64>(owner.first_copy_begin) +
+                           static_cast<i64>(owner.positive_bytes) <=
+                       UINT32_MAX &&
+                   static_cast<i64>(owner.first_copy_begin) +
+                           static_cast<i64>(owner.positive_bytes) ==
+                       static_cast<i64>(header) + static_cast<i64>(received) &&
+                   static_cast<i64>(owner.expected_copy_end) ==
+                       static_cast<i64>(header) + static_cast<i64>(received);
 
         if (c.response_read_deadline_progress_generation != owner.deadline_generation ||
             c.response_read_deadline_progress_episode != owner.upstream_episode ||
@@ -6042,8 +6175,11 @@ public:
             return owner.positive_bytes == 0 && owner.first_copy_begin == 0 &&
                    owner.expected_copy_end == 0;
         return owner.positive_bytes <= received &&
-               owner.first_copy_begin == header + received - owner.positive_bytes &&
-               owner.expected_copy_end == header + received;
+               static_cast<i64>(owner.first_copy_begin) ==
+                   static_cast<i64>(header) + static_cast<i64>(received) -
+                       static_cast<i64>(owner.positive_bytes) &&
+               static_cast<i64>(owner.expected_copy_end) ==
+                   static_cast<i64>(header) + static_cast<i64>(received);
     }
 
     [[nodiscard]] bool complete_content_length_expiry_owner_is_valid(
@@ -6072,8 +6208,9 @@ public:
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.buffered_response_len())
+        if (header == 0 || static_cast<i64>(header) + static_cast<i64>(received) > UINT32_MAX ||
+            static_cast<i64>(header) + static_cast<i64>(received) !=
+                static_cast<i64>(c.buffered_response_len()))
             return false;
         CompleteContentLengthResponseClassification raw_classification{};
         if (!complete_content_length_raw_origin_matches_pinned(
@@ -6091,22 +6228,29 @@ public:
             c.response_read_deadline_progress_bytes != received)
             return false;
         if (owner.saw_positive &&
-            (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-             owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
-             owner.expected_copy_end != c.buffered_response_len()))
+            (static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                 UINT32_MAX ||
+             static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) !=
+                 owner.expected_copy_end ||
+             static_cast<i64>(owner.expected_copy_end) !=
+                 static_cast<i64>(c.buffered_response_len())))
             return false;
+        const i64 header_received = static_cast<i64>(header) + static_cast<i64>(received);
+        const i64 first_copy_end =
+            static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes);
         if (owner.post_commit_at_start &&
             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
                                      owner.expected_copy_end != 0) ||
-             owner.saw_positive &&
-                 (owner.positive_bytes > received ||
-                  owner.first_copy_begin != header + received - owner.positive_bytes ||
-                  owner.expected_copy_end != header + received)))
+             owner.saw_positive && (owner.positive_bytes > received ||
+                                    static_cast<i64>(owner.first_copy_begin) !=
+                                        header_received - static_cast<i64>(owner.positive_bytes) ||
+                                    static_cast<i64>(owner.expected_copy_end) != header_received)))
             return false;
         if (!owner.post_commit_at_start &&
             (!owner.saw_positive || owner.first_copy_begin > header ||
-             owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-             owner.first_copy_begin + owner.positive_bytes != header + received))
+             static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes) >
+                 static_cast<i64>(UINT32_MAX) ||
+             first_copy_end != header_received))
             return false;
         if (c.response_read_timer_last_progress_ns == 0 ||
             response_read_timer_remaining_ms(
@@ -6389,9 +6533,11 @@ public:
             if (c.response_header_buf.data() == nullptr || c.upstream_recv_buf.data() == nullptr ||
                 header_len == 0 || header_len > c.response_header_buf.capacity() ||
                 raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
-                declared != c.buffered_response_len() - raw_header_end)
+                static_cast<i64>(declared) !=
+                    static_cast<i64>(c.buffered_response_len()) - static_cast<i64>(raw_header_end))
                 return CombinedSendEligibility::Invalid;
-            if (declared > c.response_header_buf.capacity() - header_len)
+            if (static_cast<i64>(declared) >
+                static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len))
                 return CombinedSendEligibility::Fallback;
             return CombinedSendEligibility::Eligible;
         };
@@ -6437,12 +6583,18 @@ public:
         if (combined_send) {
             const u32 header_len = c.response_header_buf.len();
             const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+            const i64 combined_len = static_cast<i64>(header_len) + static_cast<i64>(body_to_send);
+            const i64 upstream_send_len =
+                static_cast<i64>(raw_header_end) + static_cast<i64>(body_to_send);
+            if (combined_len > static_cast<i64>(UINT32_MAX) ||
+                upstream_send_len > static_cast<i64>(UINT32_MAX))
+                return false;
             // Use the header buffer's writable tail only as I/O staging. Keep
             // its logical length equal to the pure rewritten header so all
             // pinned-header proofs and response accounting retain their
             // existing meaning.
             __builtin_memcpy(c.response_header_buf.write_ptr(),
-                             c.upstream_recv_buf.data() + raw_header_end,
+                             c.upstream_recv_buf.data() + static_cast<i64>(raw_header_end),
                              body_to_send);
             c.response_read_deadline_post_commit_phase =
                 ResponseReadDeadlinePostCommitPhase::CombinedSend;
@@ -6450,10 +6602,10 @@ public:
             c.response_read_deadline_post_commit_downstream_completed = 0;
             c.response_read_deadline_post_commit_inflight_body = body_to_send;
             c.resp_body_remaining = 0;
-            c.resp_body_sent = header_len + body_to_send;
-            c.upstream_send_len = raw_header_end + body_to_send;
+            c.resp_body_sent = static_cast<u32>(combined_len);
+            c.upstream_send_len = static_cast<u32>(upstream_send_len);
             c.transition_to_sending(&on_complete_response_sent<Self>);
-            return submit_send(c, c.response_header_buf.data(), header_len + body_to_send);
+            return submit_send(c, c.response_header_buf.data(), static_cast<u32>(combined_len));
         }
 
         c.response_read_deadline_post_commit_phase =
@@ -6551,17 +6703,24 @@ public:
         u32 received = c.response_read_deadline_post_commit_origin_received;
         if (header == 0 || header > c.buffered_response_len() || received > declared) return false;
         if (owner.saw_positive) {
+            const i64 copy_end =
+                static_cast<i64>(owner.first_copy_begin) + static_cast<i64>(owner.positive_bytes);
+            const i64 header_received = static_cast<i64>(header) + static_cast<i64>(received);
             if (owner.terminal_error || owner.expected_copy_end != c.buffered_response_len() ||
-                owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-                owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)
+                copy_end > static_cast<i64>(UINT32_MAX) ||
+                copy_end != static_cast<i64>(owner.expected_copy_end))
                 return false;
             if (owner.post_commit_at_start) {
-                if (owner.positive_bytes > declared - received || header > 0xFFFFFFFFu - received ||
-                    owner.first_copy_begin != header + received)
+                if (static_cast<i64>(owner.positive_bytes) >
+                        static_cast<i64>(declared) - static_cast<i64>(received) ||
+                    header_received > static_cast<i64>(UINT32_MAX) ||
+                    static_cast<i64>(owner.first_copy_begin) != header_received)
                     return false;
-                received += owner.positive_bytes;
+                received = static_cast<u32>(static_cast<i64>(received) +
+                                            static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_post_commit_origin_received = received;
-            } else if (received != c.buffered_response_len() - header) {
+            } else if (static_cast<i64>(received) !=
+                       static_cast<i64>(c.buffered_response_len()) - static_cast<i64>(header)) {
                 return false;
             }
             c.response_read_deadline_progress_generation = owner.deadline_generation;
@@ -6926,12 +7085,13 @@ public:
                             ResponseReadDeadlineState::RefreshPending)) {
                 const u32 received = c.response_read_deadline_post_commit_origin_received;
                 const u32 declared = c.response_read_deadline_post_commit_declared_body;
-                if (owner.positive_bytes > declared - received) {
+                if (static_cast<i64>(owner.positive_bytes) >
+                    static_cast<i64>(declared) - static_cast<i64>(received)) {
                     close_conn(c);
                     continue;
                 }
-                c.response_read_deadline_post_commit_origin_received =
-                    received + owner.positive_bytes;
+                c.response_read_deadline_post_commit_origin_received = static_cast<u32>(
+                    static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
                 c.response_read_deadline_progress_bytes =
@@ -6987,12 +7147,13 @@ public:
                             ResponseReadDeadlineState::RefreshPending)) {
                 const u32 received = c.response_read_deadline_post_commit_origin_received;
                 const u32 declared = c.response_read_deadline_post_commit_declared_body;
-                if (owner.positive_bytes > declared - received) {
+                if (static_cast<i64>(owner.positive_bytes) >
+                    static_cast<i64>(declared) - static_cast<i64>(received)) {
                     close_conn(c);
                     continue;
                 }
-                c.response_read_deadline_post_commit_origin_received =
-                    received + owner.positive_bytes;
+                c.response_read_deadline_post_commit_origin_received = static_cast<u32>(
+                    static_cast<i64>(received) + static_cast<i64>(owner.positive_bytes));
                 c.response_read_deadline_progress_generation = owner.deadline_generation;
                 c.response_read_deadline_progress_episode = owner.upstream_episode;
                 c.response_read_deadline_progress_bytes =
@@ -7174,10 +7335,12 @@ public:
                 c.buffered_response_len() != 0 || c.send_armed ||
                 c.response_read_deadline_send_owner_active || c.send_progress != 0 ||
                 c.resp_body_mode != BodyMode::ContentLength ||
-                c.resp_body_remaining != c.response_read_deadline_post_commit_declared_body -
-                                             c.response_read_deadline_post_commit_origin_received ||
-                c.resp_body_sent != c.response_header_buf.len() +
-                                        c.response_read_deadline_post_commit_origin_received ||
+                static_cast<i64>(c.resp_body_remaining) !=
+                    static_cast<i64>(c.response_read_deadline_post_commit_declared_body) -
+                        static_cast<i64>(c.response_read_deadline_post_commit_origin_received) ||
+                static_cast<i64>(c.resp_body_sent) !=
+                    static_cast<i64>(c.response_header_buf.len()) +
+                        static_cast<i64>(c.response_read_deadline_post_commit_origin_received) ||
                 c.on_send != &on_response_body_sent<Self>)
                 return false;
             // ExpiryPending is the single timer-side entry point. Completion consumes
@@ -7251,10 +7414,11 @@ private:
                 const u64 ready = body_pump_ready_words[word_index] & remaining_mask;
                 if (ready == 0) break;
                 const u32 bit = static_cast<u32>(__builtin_ctzll(ready));
-                const u32 id = word_index * 64u + bit;
+                const i64 id_wide = static_cast<i64>(word_index) * 64 + static_cast<i64>(bit);
+                const u32 id = static_cast<u32>(id_wide);
                 const u64 bit_mask = u64{1} << bit;
                 body_pump_ready_words[word_index] &= ~bit_mask;
-                remaining_mask = bit == 63u ? 0 : (~u64{0} << (bit + 1u));
+                remaining_mask = bit == 63u ? 0 : (~u64{0} << (static_cast<i64>(bit) + 1));
 
                 if (id >= slots_initialized) continue;
                 Connection& c = conns[id];
@@ -7291,8 +7455,9 @@ public:
             response_read_batch_event_index = i;
             const u16 owner_index = response_read_batch_event_owner[i];
             if (owner_index != 0 && owner_index <= response_read_batch_owner_count &&
-                response_read_batch_owners[owner_index - 1u].bounded_terminal_prospective) {
-                auto& owner = response_read_batch_owners[owner_index - 1u];
+                response_read_batch_owners[static_cast<i64>(owner_index) - 1]
+                    .bounded_terminal_prospective) {
+                auto& owner = response_read_batch_owners[static_cast<i64>(owner_index) - 1];
                 Connection& c = conns[owner.conn_id];
                 const IoEvent& ev = events[i];
                 if (ev.type == IoEventType::ResponseReadTimer) {
@@ -7322,7 +7487,9 @@ public:
             dispatch(events[i]);
         }
         study_inside_cq = false;
-        study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
+        u64 cq_phase_ns = 0;
+        if (!__builtin_sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
+            __builtin_add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {
@@ -7489,31 +7656,38 @@ public:
             c.on_send != &on_response_sent<IoUringEventLoop>)
             return false;
         const auto& send = backend.send_state[c.id];
-        const u32 remaining = c.local_body_send_len - c.send_progress;
+        const u32 remaining = static_cast<u32>(static_cast<i64>(c.local_body_send_len) -
+                                               static_cast<i64>(c.send_progress));
         // A memory send reads the config-owned body bytes; a file send
         // (add_send_file) reads the config-owned sealed memfd, whose POLLOUT
         // continuation calls sendfile again from wait(). Either way the config
         // must outlive the send, or LoadedProgram::destroy could close (and
         // the kernel recycle) the memfd under a pending continuation.
-        const bool memory_send = send.src == c.local_body_cursor + c.send_progress;
+        const bool memory_send =
+            send.src == c.local_body_cursor + static_cast<i64>(c.send_progress);
         const bool file_send =
             send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
             c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
-            send.file_base ==
-                static_cast<u32>(c.local_body_cursor - c.local_body_base) + c.send_progress;
+            send.file_base == static_cast<i64>(c.local_body_cursor - c.local_body_base) +
+                                  static_cast<i64>(c.send_progress);
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
-               send.remaining == remaining - send.offset;
+               send.remaining ==
+                   static_cast<u32>(static_cast<i64>(remaining) - static_cast<i64>(send.offset));
     }
 
     // Leave SQ headroom for ordinary traffic and close-path cancellation.
     u32 health_probe_issue_budget() const {
         if (!backend.sq_head || !backend.sq_tail) return 0;
-        const u32 used = __atomic_load_n(backend.sq_tail, __ATOMIC_RELAXED) -
-                         __atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(backend.sq_tail, __ATOMIC_RELAXED);
+        const IoUringPosition head{__atomic_load_n(backend.sq_head, __ATOMIC_ACQUIRE)};
+        const u32 used = head.distance_to(tail);
         constexpr u32 kReserve = 16;
-        return used < backend.sq_ring_entries && backend.sq_ring_entries - used > kReserve
-                   ? backend.sq_ring_entries - used - kReserve
+        return used<backend.sq_ring_entries&& static_cast<i64>(backend.sq_ring_entries) -
+                    static_cast<i64>(used)>
+                       kReserve
+                   ? static_cast<u32>(static_cast<i64>(backend.sq_ring_entries) -
+                                      static_cast<i64>(used) - static_cast<i64>(kReserve))
                    : 0;
     }
 
@@ -7694,7 +7868,7 @@ public:
                                                  &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
-            c.pending_ops += submitted;
+            __builtin_add_overflow(c.pending_ops, submitted, &c.pending_ops);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -7845,7 +8019,10 @@ public:
             timer.remove(&conn);
         else if (conn.yield_timeout_armed)
             return true;  // Reuse the existing kernel timespec owner.
-        u32 ms = static_cast<u32>((delay_ns + 999'999ull) / 1'000'000ull);
+        u64 rounded_ns = 0;
+        if (__builtin_add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
+        const u64 ms_wide = rounded_ns / 1'000'000ull;
+        u32 ms = ms_wide > UINT32_MAX ? UINT32_MAX : static_cast<u32>(ms_wide);
         if (ms == 0) ms = 1;
         if (backend.add_yield_timeout(conn.id, conn, ms)) {
             conn.yield_armed = true;
@@ -7954,7 +8131,9 @@ public:
     static constexpr u32 kIdleTrimMinIdleTicks = IdleTrimWindow::kMinIdleTicks;
     static constexpr u32 kIdleTrimAgeWindow = IdleTrimWindow::kAgeWindow;
     static constexpr u32 kIdleTrimMaxExamined = 2048;
-    static constexpr u32 kIdleTrimMaxTrims = 512;     // connections queued per tick
+    static constexpr u32 kIdleTrimMaxTrims = 512;  // connections queued per tick
+    static_assert(kIdleTrimMaxTrims == 512u);
+    static constexpr u32 kIdleTrimMaxTrimSlots = 513u;
     static constexpr u32 kIdleTrimSlicesPerConn = 3;  // recv, send, upstream recv
     static constexpr u32 kIdleTrimMaxRanges = kIdleTrimMaxTrims * kIdleTrimSlicesPerConn;
     static constexpr u32 kIdleTrimIovChunk = 1024;        // kernel UIO_MAXIOV per call
@@ -7971,7 +8150,7 @@ public:
     // idle_trim_first[k] is the index of the first range of the k-th queued
     // connection (idle_trim_first[idle_trim_queued] == idle_trim_nranges).
     struct iovec idle_trim_iov[kIdleTrimMaxRanges];
-    u16 idle_trim_first[kIdleTrimMaxTrims + 1];
+    u16 idle_trim_first[kIdleTrimMaxTrimSlots];
     u32 idle_trim_nranges = 0;
     u32 idle_trim_queued = 0;
     // Observability / test counters; touched only by the sweep.
@@ -8188,8 +8367,11 @@ public:
         u32 conn = 0;       // connection owning range `i`
         u32 counted = ~0u;  // last connection added to idle_trim_conns
         bool hard_failure = false;
-        for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
-            const u32 chunk = total - base < kIdleTrimIovChunk ? total - base : kIdleTrimIovChunk;
+        for (u32 base = 0; base < total;) {
+            const i64 remaining = static_cast<i64>(total) - static_cast<i64>(base);
+            const u32 chunk = remaining < static_cast<i64>(kIdleTrimIovChunk)
+                                  ? static_cast<u32>(remaining)
+                                  : kIdleTrimIovChunk;
             long r = -1;
             if (!hard_failure) {
                 r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
@@ -8200,9 +8382,10 @@ public:
             // Whole ranges the kernel reports done; a partly advised range is redone.
             const u32 advised =
                 r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
-            for (u32 i = base; i < base + chunk; i++) {
-                while (idle_trim_first[conn + 1] <= i) ++conn;
-                bool ok = i - base < advised;
+            const u32 end = static_cast<u32>(static_cast<i64>(base) + static_cast<i64>(chunk));
+            for (u32 i = base; i < end; i++) {
+                while (idle_trim_first[static_cast<i64>(conn) + 1] <= i) ++conn;
+                bool ok = static_cast<i64>(i) - static_cast<i64>(base) < static_cast<i64>(advised);
                 if (!ok) {
                     ok = idle_trim_advise_slice(idle_trim_iov[i]);
                     if (ok) ++idle_trim_fallback;
@@ -8214,6 +8397,7 @@ public:
                     ++idle_trim_conns;
                 }
             }
+            base = end;
         }
         // The per-slice fallback for this tick is done (nothing queued is left
         // un-advised). A batch that fails hard would otherwise be retried, and its
@@ -8229,14 +8413,16 @@ public:
     // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
     // since they were armed. Returns false once a per-tick budget is exhausted.
     bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
-        ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
+        ListNode* head =
+            &timer.slots[expiry & static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
         if (last == head) return true;
         const u64 node_offset = TimerWheel::timer_node_offset();
         ListNode* node = head->next;
         for (;;) {
             if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
-            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
+            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) -
+                                                    static_cast<i64>(node_offset));
             if (c->idle_trim_examined) return true;  // reached the examined region
             ListNode* const next = node->next;
             const bool at_end = node == last;
@@ -8246,7 +8432,10 @@ public:
             idle_trim_examined++;
             if (idle_trim_connection(*c)) queued++;
             // The time budget is checked after the node, so every tick makes progress.
-            if (monotonic_ns() + idle_trim_nranges * kIdleTrimFlushNsPerRange >= deadline_ns)
+            const u64 flush_cost = static_cast<u64>(idle_trim_nranges) * kIdleTrimFlushNsPerRange;
+            u64 projected_deadline = 0;
+            if (__builtin_add_overflow(monotonic_ns(), flush_cost, &projected_deadline) ||
+                projected_deadline >= deadline_ns)
                 return false;
             if (at_end) return true;
             node = next;
@@ -8266,9 +8455,11 @@ public:
     // stall, and a longer one only skips nodes that are about to expire anyway.
     void sweep_idle_trim() {
         if (idle_trim_pidfd < 0) return;
-        const auto kWindow = idle_trim_window(timer.cursor, keepalive_timeout);
+        const auto kWindow = idle_trim_window(static_cast<u32>(timer.cursor), keepalive_timeout);
         if (kWindow.begin == kWindow.end) return;
-        const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
+        u64 deadline_ns = 0;
+        if (__builtin_add_overflow(monotonic_ns(), idle_trim_budget_ns, &deadline_ns))
+            deadline_ns = UINT64_MAX;
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
@@ -8705,9 +8896,10 @@ public:
                         const bool valid_bounded_terminal_custody =
                             custody_owner_index != 0 &&
                             custody_owner_index <= response_read_batch_owner_count &&
-                            response_read_batch_owners[custody_owner_index - 1u]
+                            response_read_batch_owners[static_cast<i64>(custody_owner_index) - 1]
                                 .bounded_terminal_custody &&
-                            response_read_batch_owners[custody_owner_index - 1u].valid &&
+                            response_read_batch_owners[static_cast<i64>(custody_owner_index) - 1]
+                                .valid &&
                             ev.result > 0 && ev.copy_witness == IoEventCopyWitness::Full;
                         const bool deadline_surplus =
                             ev.result > 0 &&
@@ -8721,8 +8913,9 @@ public:
                                 conn.upstream_recv_idle_stale_bytes = true;
                             const u32 stale = static_cast<u32>(ev.result);
                             if (conn.upstream_recv_buf.len() >= stale)
-                                conn.upstream_recv_buf.set_len(conn.upstream_recv_buf.len() -
-                                                               stale);
+                                conn.upstream_recv_buf.set_len(static_cast<u32>(
+                                    static_cast<i64>(conn.upstream_recv_buf.len()) -
+                                    static_cast<i64>(stale)));
                         }
                         if (deadline_surplus) {
                             if (!ev.more) {
@@ -8857,7 +9050,8 @@ public:
                         const u16 owner_index =
                             response_read_batch_event_owner[response_read_batch_event_index];
                         if (owner_index != 0 && owner_index <= response_read_batch_owner_count) {
-                            const auto& owner = response_read_batch_owners[owner_index - 1];
+                            const auto& owner =
+                                response_read_batch_owners[static_cast<i64>(owner_index) - 1];
                             if (owner.bounded_terminal_custody) break;
                             if (!owner.valid) break;
                             const bool retained_initial_clean_eof =
@@ -9045,8 +9239,11 @@ public:
                     const u32 wait_kind = ev.type == IoEventType::RelayRead ? 0 : 1;
                     const u64 started = study_poll_started[wait_kind][conn.id];
                     study_poll_started[wait_kind][conn.id] = 0;
-                    if (!cancel && started != 0)
-                        study_record_wait(wait_kind, monotonic_ns() - started);
+                    if (!cancel && started != 0) {
+                        u64 wait_ns = 0;
+                        if (!__builtin_sub_overflow(monotonic_ns(), started, &wait_ns))
+                            study_record_wait(wait_kind, wait_ns);
+                    }
                     --conn.pending_ops;
                     if (ev.type == IoEventType::RelayRead) {
                         if (cancel)

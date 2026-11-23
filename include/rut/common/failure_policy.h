@@ -45,10 +45,16 @@ inline u32 bounded_response_release_target(u32 raw_header_bytes,
                                            bool terminal) {
     if (body_received > declared_body) return 0;
     if (terminal) return body_received;
-    if (raw_header_bytes > 0xFFFFFFFFu - body_received) return 0;
-    const u32 raw_total = raw_header_bytes + body_received;
-    const u32 released_raw = raw_total - raw_total % kBoundedResponseBufferBytes;
-    return released_raw > raw_header_bytes ? released_raw - raw_header_bytes : 0;
+    if (static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received) > UINT32_MAX) return 0;
+    const u32 raw_total =
+        static_cast<u32>(static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received));
+    const u32 released_raw = static_cast<u32>(static_cast<i64>(raw_total) %
+                                              static_cast<i64>(kBoundedResponseBufferBytes));
+    const u32 aligned =
+        static_cast<u32>(static_cast<i64>(raw_total) - static_cast<i64>(released_raw));
+    return aligned > raw_header_bytes
+               ? static_cast<u32>(static_cast<i64>(aligned) - static_cast<i64>(raw_header_bytes))
+               : 0;
 }
 
 inline bool forward_response_buffering_mode_valid(ForwardResponseBufferingMode mode) {

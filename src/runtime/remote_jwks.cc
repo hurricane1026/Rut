@@ -17,12 +17,12 @@ bool discovery_issuer_valid(const char* value) {
     while (authority_end < length && value[authority_end] != '/') ++authority_end;
     u32 host_end = 8;
     while (host_end < authority_end && value[host_end] != ':') ++host_end;
-    if (host_end == 8 || host_end - 8 > 253) return false;
+    if (host_end == 8 || static_cast<i64>(host_end) - 8 > 253) return false;
     u32 label = 0;
     for (u32 i = 8; i < host_end; ++i) {
         const char byte = value[i];
         if (byte == '.') {
-            if (!label || value[i - 1] == '-') return false;
+            if (!label || value[static_cast<i64>(i) - 1] == '-') return false;
             label = 0;
         } else {
             if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
@@ -32,13 +32,13 @@ bool discovery_issuer_valid(const char* value) {
             if (++label > 63) return false;
         }
     }
-    if (!label || value[host_end - 1] == '-') return false;
+    if (!label || value[static_cast<i64>(host_end) - 1] == '-') return false;
     if (host_end < authority_end) {
         u32 port = 0;
-        if (host_end + 1 == authority_end) return false;
-        for (u32 i = host_end + 1; i < authority_end; ++i) {
+        if (static_cast<i64>(host_end) + 1 == static_cast<i64>(authority_end)) return false;
+        for (u32 i = static_cast<u32>(static_cast<i64>(host_end) + 1); i < authority_end; ++i) {
             if (value[i] < '0' || value[i] > '9' || port > 6553) return false;
-            port = port * 10 + static_cast<u32>(value[i] - '0');
+            port = static_cast<u32>(static_cast<i64>(port) * 10 + static_cast<i64>(value[i] - '0'));
         }
         if (!port || port > 65535) return false;
     }
@@ -49,8 +49,10 @@ bool discovery_issuer_valid(const char* value) {
     for (u32 i = authority_end; i < length; ++i) {
         const char byte = value[i];
         if (byte == '%') {
-            if (length - i < 3 || !hex(value[i + 1]) || !hex(value[i + 2])) return false;
-            i += 2;
+            if (static_cast<i64>(length) - static_cast<i64>(i) < 3 ||
+                !hex(value[static_cast<i64>(i) + 1]) || !hex(value[static_cast<i64>(i) + 2]))
+                return false;
+            i = static_cast<u32>(static_cast<i64>(i) + 2);
         } else if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
                      (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' || byte == '_' ||
                      byte == '~' || byte == '!' || byte == '$' || byte == '&' || byte == '\'' ||
@@ -144,7 +146,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             fields |= 2048;
         }
         if (target) {
-            json::Writer value{target, capacity - 1};
+            json::Writer value{target, static_cast<u32>(static_cast<i64>(capacity) - 1)};
             if (!document.string(entry, value) || !value.ok || !value.len) return false;
             for (u32 i = 0; i < value.len; ++i)
                 if (!target[i]) return false;
@@ -255,8 +257,11 @@ bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
 }
 
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
-    const u64 interval_ms = static_cast<u64>(interval_seconds) * 1000;
-    return interval_ms > ~u64{0} - completed_ms ? ~u64{0} : completed_ms + interval_ms;
+    u64 interval_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(interval_seconds), u64{1000}, &interval_ms))
+        return ~u64{0};
+    u64 deadline = 0;
+    return __builtin_add_overflow(completed_ms, interval_ms, &deadline) ? ~u64{0} : deadline;
 }
 
 u32 JwksRetry::failure(const RemoteJwks& policy, u32 server_hint) {
@@ -319,15 +324,21 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
             const char kDigit = kValue.ptr[j];
             if (kDigit < '0' || kDigit > '9') return 0;
             const u32 kNumber = static_cast<u32>(kDigit - '0');
-            if (delay > (~u32{0} - kNumber) / 10) return 0;
-            delay = delay * 10 + kNumber;
+            if (static_cast<i64>(delay) >
+                (static_cast<i64>(UINT32_MAX) - static_cast<i64>(kNumber)) / 10)
+                return 0;
+            delay = static_cast<u32>(static_cast<i64>(delay) * 10 + static_cast<i64>(kNumber));
         }
     }
     return delay < cap_seconds ? delay : cap_seconds;
 }
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
-    return now && last_success && now >= last_success &&
-           now - last_success < static_cast<u64>(max_age_seconds) * 1000;
+    if (!now || !last_success || now < last_success) return false;
+    u64 max_age_ms = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(max_age_seconds), u64{1000}, &max_age_ms))
+        return false;
+    u64 age = 0;
+    return !__builtin_sub_overflow(now, last_success, &age) && age < max_age_ms;
 }
 
 namespace {
@@ -365,13 +376,15 @@ bool jwks_dns_name(
             out[used] = 0;
             return true;
         }
-        if (at + count > length || used + count + (used ? 1u : 0u) > 253 || packet[at] == '-' ||
-            packet[at + count - 1] == '-')
+        if (static_cast<i64>(at) + static_cast<i64>(count) > static_cast<i64>(length) ||
+            static_cast<i64>(used) + static_cast<i64>(count) + (used ? 1 : 0) > 253 ||
+            packet[at] == '-' || packet[static_cast<i64>(at) + static_cast<i64>(count) - 1] == '-')
             return false;
         if (used) out[used++] = '.';
         for (u32 i = 0; i < count; ++i) {
-            const u8 byte = packet[at++];
-            const char value = static_cast<char>(byte >= 'A' && byte <= 'Z' ? byte + 32 : byte);
+            const u8 byte = packet[static_cast<i64>(at++)];
+            const char value =
+                static_cast<char>(byte >= 'A' && byte <= 'Z' ? static_cast<i64>(byte) + 32 : byte);
             if ((value < 'a' || value > 'z') && (value < '0' || value > '9') && value != '-')
                 return false;
             out[used++] = value;
@@ -431,14 +444,16 @@ bool jwks_dns_answer(Str packet,
     const auto* bytes = reinterpret_cast<const u8*>(packet.ptr);
     if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa4f) != 0x8000 ||
         read16(bytes + 4) != 1 || read16(bytes + 8) || read16(bytes + 10) ||
-        memcmp(packet.ptr + 12, query.ptr + 12, query.len - 12) != 0)
+        memcmp(packet.ptr + 12,
+               query.ptr + 12,
+               static_cast<u32>(static_cast<i64>(query.len) - 12)) != 0)
         return false;
     const u32 answers = read16(bytes + 6);
     constexpr u32 kMaxAnswers = 8;
     if (!answers || answers > kMaxAnswers ||
         configuration.allowed_count > RemoteJwks::kMaxDnsAddresses)
         return false;
-    const u16 kRecordType = read16(bytes + query.len - 4);
+    const u16 kRecordType = read16(bytes + static_cast<i64>(query.len) - 4);
     if (kRecordType != 1 && kRecordType != 28) return false;
     const bool kAaaa = kRecordType == 28;
     if (!configuration.dns_dual_stack && kAaaa != configuration.dns_aaaa) return false;
@@ -446,8 +461,9 @@ bool jwks_dns_answer(Str packet,
     char current[254]{};
     u32 question_end = 12;
     if (!jwks_dns_name(bytes, packet.len, question_end, boundaries, current) ||
-        question_end + 4 != query.len || read16(bytes + question_end) != kRecordType ||
-        read16(bytes + question_end + 2) != 1)
+        static_cast<i64>(question_end) + 4 != static_cast<i64>(query.len) ||
+        read16(bytes + static_cast<i64>(question_end)) != kRecordType ||
+        read16(bytes + static_cast<i64>(question_end) + 2) != 1)
         return false;
     struct Record {
         char owner[254]{};
@@ -462,17 +478,19 @@ bool jwks_dns_answer(Str packet,
     for (u32 i = 0; i < answers; ++i) {
         auto& record = records[i];
         if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.owner) ||
-            packet.len - offset < 10)
+            static_cast<i64>(packet.len) - static_cast<i64>(offset) < 10)
             return false;
-        record.type = read16(bytes + offset);
-        const u32 ttl =
-            (static_cast<u32>(read16(bytes + offset + 4)) << 16) | read16(bytes + offset + 6);
-        const u32 size = read16(bytes + offset + 8);
-        if (read16(bytes + offset + 2) != 1 || !ttl || (ttl & 0x80000000u)) return false;
+        record.type = read16(bytes + static_cast<i64>(offset));
+        const u32 ttl = (static_cast<u32>(read16(bytes + static_cast<i64>(offset) + 4)) << 16) |
+                        read16(bytes + static_cast<i64>(offset) + 6);
+        const u32 size = read16(bytes + static_cast<i64>(offset) + 8);
+        if (read16(bytes + static_cast<i64>(offset) + 2) != 1 || !ttl || (ttl & 0x80000000u))
+            return false;
         if (ttl < min_ttl) min_ttl = ttl;
-        offset += 10;
-        if (size > packet.len - offset) return false;
-        const u32 end = offset + size;
+        offset = static_cast<u32>(static_cast<i64>(offset) + 10);
+        if (static_cast<i64>(size) > static_cast<i64>(packet.len) - static_cast<i64>(offset))
+            return false;
+        const u32 end = static_cast<u32>(static_cast<i64>(offset) + static_cast<i64>(size));
         if (record.type == 5) {
             if (!jwks_dns_name(bytes, packet.len, offset, boundaries, record.target) ||
                 offset != end)
@@ -480,8 +498,10 @@ bool jwks_dns_answer(Str packet,
         } else if (record.type == kRecordType) {
             const u32 expected_size = kAaaa ? 16 : 4;
             const int family = kAaaa ? AF_INET6 : AF_INET;
-            if (size != expected_size ||
-                !inet_ntop(family, bytes + offset, record.address, sizeof(record.address)))
+            if (size != expected_size || !inet_ntop(family,
+                                                    bytes + static_cast<i64>(offset),
+                                                    record.address,
+                                                    sizeof(record.address)))
                 return false;
             bool allowed = false;
             for (u32 n = 0; n < configuration.allowed_count; ++n)
@@ -590,7 +610,8 @@ bool JwksFetch::begin_http(u64 now) {
     return start_http(fetch, now);
 }
 bool JwksFetch::can_try_next_address(const HttpsFetch& fetch) const {
-    return fetch.connect_failed() && address_index_ + 1 < addresses_.count;
+    return fetch.connect_failed() &&
+           static_cast<i64>(address_index_) + 1 < static_cast<i64>(addresses_.count);
 }
 Str JwksFetch::selected_address() const {
     return addresses_.count ? ctext(addresses_.values[address_index_])
@@ -612,8 +633,18 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         if (!discovery_.set_jwks_condition(kTag)) return fail();
         sent_discovery_validator_ = kTag.len != 0;
     }
-    u32 stage_timeout = timeout_ - static_cast<u32>(now - started_);
-    const u32 kDiscoveryTimeout = configuration_.discovery_timeout_seconds * 1000;
+    u64 elapsed = 0;
+    if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) return fail();
+    u32 stage_timeout = static_cast<u32>(static_cast<i64>(timeout_) - static_cast<i64>(elapsed));
+    u64 discovery_timeout_wide = 0;
+    u32 kDiscoveryTimeout = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
+                               u64{1000},
+                               &discovery_timeout_wide) ||
+        discovery_timeout_wide > UINT32_MAX)
+        kDiscoveryTimeout = UINT32_MAX;
+    else
+        kDiscoveryTimeout = static_cast<u32>(discovery_timeout_wide);
     if (&fetch == &discovery_ && kDiscoveryTimeout && kDiscoveryTimeout < stage_timeout)
         stage_timeout = kDiscoveryTimeout;
     // A synchronous connect error uses the same next-address path as SO_ERROR.
@@ -649,13 +680,18 @@ bool JwksFetch::start(u64 now,
     u32 begin = 0;
     for (u32 end = 0;; ++end) {
         if (host[end] && host[end] != '.') continue;
-        const u32 length = end - begin;
-        if (!length || length > 63 || query_length_ + length + 6 > sizeof(query_)) return fail();
+        const u32 length = static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin));
+        if (!length || length > 63 ||
+            static_cast<i64>(query_length_) + static_cast<i64>(length) + 6 >
+                static_cast<i64>(sizeof(query_)))
+            return fail();
         query_[query_length_++] = static_cast<u8>(length);
-        __builtin_memcpy(query_ + query_length_, host + begin, length);
-        query_length_ += length;
+        __builtin_memcpy(
+            query_ + static_cast<i64>(query_length_), host + static_cast<i64>(begin), length);
+        query_length_ =
+            static_cast<u32>(static_cast<i64>(query_length_) + static_cast<i64>(length));
         if (!host[end]) break;
-        begin = end + 1;
+        begin = static_cast<u32>(static_cast<i64>(end) + 1);
     }
     query_[query_length_++] = 0;
     query_[query_length_++] = 0;
@@ -674,7 +710,7 @@ bool JwksFetch::start(u64 now,
 }
 bool JwksFetch::send_dns_query(bool aaaa) {
     if (RAND_bytes(query_, 2) != 1) return fail();
-    query_[query_length_ - 3] = aaaa ? 28 : 1;
+    query_[static_cast<i64>(query_length_) - 3] = aaaa ? 28 : 1;
     if (::send(dns_fd_, query_, query_length_, platform::kSendFlags) != query_length_)
         return fail();
     return true;
@@ -718,13 +754,27 @@ void JwksFetch::advance(u64 now) {
         state_ = State::Failed;
         return;
     }
-    if (now - started_ >= timeout_) {
+    u64 elapsed = 0;
+    if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) {
         (void)fail();
         return;
     }
     if (dns_fd_ >= 0) {
-        const u32 kDnsTimeout = configuration_.dns_timeout_seconds * 1000;
-        if (kDnsTimeout && now - started_ >= kDnsTimeout) {
+        u64 elapsed = 0;
+        if (__builtin_sub_overflow(now, started_, &elapsed)) {
+            (void)fail();
+            return;
+        }
+        u64 dns_timeout_wide = 0;
+        u32 kDnsTimeout = 0;
+        if (__builtin_mul_overflow(static_cast<u64>(configuration_.dns_timeout_seconds),
+                                   u64{1000},
+                                   &dns_timeout_wide) ||
+            dns_timeout_wide > UINT32_MAX)
+            kDnsTimeout = UINT32_MAX;
+        else
+            kDnsTimeout = static_cast<u32>(dns_timeout_wide);
+        if (kDnsTimeout && elapsed >= kDnsTimeout) {
             (void)fail();
             return;
         }
@@ -739,12 +789,13 @@ void JwksFetch::advance(u64 now) {
             (void)fail();
             return;
         }
-        if (configuration_.dns_dual_stack && query_[query_length_ - 3] == 28) {
+        if (configuration_.dns_dual_stack && query_[static_cast<i64>(query_length_) - 3] == 28) {
             addresses_ = result;
             (void)send_dns_query(false);
             return;
         }
-        if (result.count > RemoteJwks::kMaxDnsAddresses - addresses_.count) {
+        if (static_cast<i64>(result.count) >
+            static_cast<i64>(RemoteJwks::kMaxDnsAddresses) - static_cast<i64>(addresses_.count)) {
             (void)fail();
             return;
         }

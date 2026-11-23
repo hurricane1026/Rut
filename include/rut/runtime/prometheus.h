@@ -38,7 +38,7 @@ struct Writer {
             return;
         }
         while (v > 0) {
-            tmp[n++] = static_cast<char>('0' + v % 10);
+            tmp[n++] = static_cast<char>('0' + static_cast<i64>(v % 10));
             v /= 10;
         }
         while (n > 0) ch(tmp[--n]);
@@ -51,7 +51,7 @@ struct Writer {
         // Zero-pad to 6 digits.
         char d[6];
         for (i32 i = 5; i >= 0; i--) {
-            d[i] = static_cast<char>('0' + frac % 10);
+            d[i] = static_cast<char>('0' + static_cast<i64>(frac % 10));
             frac /= 10;
         }
         for (u32 i = 0; i < 6; i++) ch(d[i]);
@@ -162,7 +162,7 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     w.str("# TYPE rut_grpc_duration_seconds histogram\n");
     u64 grpc_cumulative = 0;
     for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
-        grpc_cumulative += m.grpc_latency.buckets[i];
+        (void)__builtin_add_overflow(grpc_cumulative, m.grpc_latency.buckets[i], &grpc_cumulative);
         w.str("rut_grpc_duration_seconds_bucket{le=\"");
         w.str(kPromLatencyLe[i]);
         w.str("\"} ");
@@ -180,7 +180,7 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     w.str("# TYPE rut_request_duration_seconds histogram\n");
     u64 cumulative = 0;
     for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
-        cumulative += m.request_latency.buckets[i];
+        (void)__builtin_add_overflow(cumulative, m.request_latency.buckets[i], &cumulative);
         w.str("rut_request_duration_seconds_bucket{le=\"");
         w.str(kPromLatencyLe[i]);
         w.str("\"} ");

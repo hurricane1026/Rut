@@ -139,7 +139,8 @@ PasswordGatewayReply PasswordGateway::verify(
     if (!found) return {};
     const auto kStatus = found->request.poll(now_ms);
     if (kStatus == PasswordRequestStatus::Pending) {
-        const u64 kRemaining = found->request.deadline_ms() - now_ms;
+        u64 kRemaining = 0;
+        if (__builtin_sub_overflow(found->request.deadline_ms(), now_ms, &kRemaining)) return {};
         return {kStatus, static_cast<u32>(kRemaining < 10 ? kRemaining : 10)};
     }
     const auto kResult = found->request.take();

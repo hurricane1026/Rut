@@ -141,7 +141,9 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
         }
         const u64 published = bindings[i].ring->published_pos.load(std::memory_order_acquire);
         const u64 committed = bindings[i].ring->committed_pos.load(std::memory_order_acquire);
-        if (published - committed > LiveAccessLogRing::kCapacity)
+        u64 pending = 0;
+        (void)__builtin_sub_overflow(published, committed, &pending);
+        if (pending > LiveAccessLogRing::kCapacity)
             return core::make_unexpected(SourceLiveAccessLogStartError{
                 SourceLiveAccessLogStartErrorKind::InvalidRingState, static_cast<u8>(i), 0});
     }
@@ -340,7 +342,8 @@ bool SourceLiveAccessLogSession::service_round() {
     bool progressed = false;
     const u32 start = next_ring_;
     for (u32 offset = 0; offset < ring_count_; offset++) {
-        const u32 ring_index = (start + offset) % ring_count_;
+        const u32 ring_index = static_cast<u32>(
+            (static_cast<i64>(start) + static_cast<i64>(offset)) % static_cast<i64>(ring_count_));
         LiveAccessLogPeek peek = rings_[ring_index]->peek();
         if (!peek.valid) continue;
         if (peek.entry == nullptr) {
@@ -383,7 +386,7 @@ bool SourceLiveAccessLogSession::service_round() {
         if (!write_record(ring_index, position, line, line_length)) return progressed;
         progressed = true;
     }
-    next_ring_ = (start + 1u) % ring_count_;
+    next_ring_ = static_cast<u32>((static_cast<i64>(start) + 1) % static_cast<i64>(ring_count_));
     return progressed;
 }
 
@@ -402,9 +405,12 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
 
     u32 written = 0u;
     while (written < line_length) {
-        const ssize_t result = ::write(output_.get(), line + written, line_length - written);
+        const ssize_t result =
+            ::write(output_.get(),
+                    line + static_cast<i64>(written),
+                    static_cast<size_t>(static_cast<i64>(line_length) - static_cast<i64>(written)));
         if (result > 0) {
-            written += static_cast<u32>(result);
+            written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(result));
             continue;
         }
         if (result < 0 && errno == EINTR) continue;

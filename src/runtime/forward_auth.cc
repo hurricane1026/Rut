@@ -89,7 +89,7 @@ bool ForwardAuthPolicy::load(Str configuration) {
         } else
             return false;
         if (seen & bit) return false;
-        json::Writer value{out, cap - 1};
+        json::Writer value{out, static_cast<u32>(static_cast<i64>(cap) - 1)};
         if (!document.string(n, value) || !value.ok || !value.len) return false;
         for (u32 i = 0; i < value.len; ++i)
             if (out[i] == 0) return false;
@@ -170,8 +170,12 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
         else
             cancel(connection, slot.generation);
     }
+    u64 elapsed = 0;
     if (found) {
-        if (now < found->started_ms || now - found->started_ms >= found->timeout_ms) {
+        const bool elapsed_invalid = now < found->started_ms ||
+                                     __builtin_sub_overflow(now, found->started_ms, &elapsed) ||
+                                     elapsed >= static_cast<u64>(found->timeout_ms);
+        if (elapsed_invalid) {
             cancel(connection, generation);
             ForwardAuthReply reply;
             reply.status = -2;
@@ -232,8 +236,9 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     if (!found) return {};
     ForwardAuthReply reply;
     reply.status = static_cast<i32>(0x80000000u);
-    const auto kRemaining = found->timeout_ms - (now - found->started_ms);
-    reply.retry_ms = static_cast<u32>(kRemaining < 10 ? kRemaining : 10);
+    u64 remaining = 0;
+    (void)__builtin_sub_overflow(static_cast<u64>(found->timeout_ms), elapsed, &remaining);
+    reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
     return reply;
 }
 void* ForwardAuthWorker::entry(void* self) {

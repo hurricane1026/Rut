@@ -29,7 +29,7 @@ EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) 
     const uint8_t* cursor = der;
     EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
     if (!candidate) return 0;
-    if (cursor != der + length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
+    if (cursor != der + (int64_t)length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
     const int bits = EVP_PKEY_bits(candidate);
     if (bits < 2048 || bits > 4096) goto fail;
     const RSA* rsa = EVP_PKEY_get0_RSA(candidate);
@@ -178,13 +178,13 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                                           0x04,
                                           0x20};
     uint8_t expected[512];
-    const uint32_t padding_end = bytes - sizeof(digest_info) - 32 - 1;
+    const int64_t padding_end = (int64_t)bytes - (int64_t)sizeof(digest_info) - 32 - 1;
     expected[0] = 0;
     expected[1] = 1;
     for (uint32_t i = 2; i < padding_end; ++i) expected[i] = 0xff;
     expected[padding_end] = 0;
     for (uint32_t i = 0; i < sizeof(digest_info); ++i)
-        expected[padding_end + 1 + i] = digest_info[i];
+        expected[padding_end + 1 + (int64_t)i] = digest_info[i];
     uint32_t digest_len = 0;
     if (!rut_crypto_digest_v1(RUT_CRYPTO_SHA256_V1,
                               message,
@@ -192,7 +192,7 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                               0,
                               0,
                               0,
-                              expected + bytes - 32,
+                              expected + ((int64_t)bytes - 32),
                               32,
                               &digest_len) ||
         digest_len != 32)

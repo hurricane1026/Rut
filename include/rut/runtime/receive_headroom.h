@@ -11,7 +11,9 @@ template <typename Pool>
 bool reserve_request_receive_headroom(Pool& pool, Connection& conn, u32 minimum) {
     if (conn.recv_buf.write_avail() >= minimum) return true;
     const u32 used = conn.recv_buf.len();
-    if (minimum > SlicePool::kBulkSliceSize || used > SlicePool::kBulkSliceSize - minimum)
+    if (minimum > SlicePool::kBulkSliceSize ||
+        static_cast<i64>(used) >
+            static_cast<i64>(SlicePool::kBulkSliceSize) - static_cast<i64>(minimum))
         return false;
     u8* storage = pool.alloc_bulk();
     if (!storage) return false;

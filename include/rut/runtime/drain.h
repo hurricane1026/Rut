@@ -27,7 +27,8 @@ inline u64 monotonic_secs() {
 // needing a PRNG — cheap and good enough for drain distribution.
 inline bool should_drain_close(u32 conn_id, u64 drain_start, u64 now, u32 period_secs) {
     if (period_secs == 0) return true;
-    u64 elapsed = now - drain_start;
+    u64 elapsed = 0;
+    (void)__builtin_sub_overflow(now, drain_start, &elapsed);
     if (elapsed >= period_secs) return true;
 
     // Hash conn_id to get a pseudo-random threshold in [0, period_secs).

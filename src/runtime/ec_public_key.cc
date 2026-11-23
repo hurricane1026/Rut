@@ -39,9 +39,9 @@ bool coordinate(Str input, u8 (&output)[32]) {
         else
             return false;
         accumulator = (accumulator << 6) | value;
-        bits += 6;
+        bits = static_cast<u32>(static_cast<i64>(bits) + 6);
         if (bits >= 8) {
-            bits -= 8;
+            bits = static_cast<u32>(static_cast<i64>(bits) - 8);
             if (length == sizeof(output)) return false;
             output[length++] = static_cast<u8>((accumulator >> bits) & 255);
         }

@@ -18,6 +18,32 @@
 
 namespace rut {
 
+// A snapshot of an SQ/CQ sequence number, distinct from a bounded entry count.
+// The kernel ABI advances these positions modulo 2^32. Shared loads and stores
+// remain at the call sites so their memory ordering is visible.
+struct IoUringPosition {
+    u32 value;
+
+    constexpr IoUringPosition advanced_by(u32 count) const {
+        u32 next = 0;
+        (void)__builtin_add_overflow(value, count, &next);
+        return {next};
+    }
+
+    constexpr bool operator==(const IoUringPosition&) const = default;
+
+    constexpr IoUringPosition& operator++() {
+        *this = advanced_by(1);
+        return *this;
+    }
+
+    constexpr u32 distance_to(u32 end) const {
+        return static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(value));
+    }
+
+    constexpr u32 slot(u32 mask) const { return value & mask; }
+};
+
 struct SlicePool;
 struct ConnectionBase;              // forward declaration for wait() signature
 using Connection = ConnectionBase;  // alias (matches connection.h)
@@ -54,6 +80,8 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // shard = one ring = one submitting thread already holds by construction.
 //
 struct IoUringBackend {
+    using CompletionUserData = decltype(io_uring_cqe::user_data);
+
     IoUringInitFailureDetail last_init_failure_detail = IoUringInitFailureDetail::None;
     SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
@@ -156,7 +184,7 @@ struct IoUringBackend {
     // first callback observe bytes that are ordered after it.  Keep the exact
     // unadvanced CQ head here so the next wait can validate and resume it.
     struct DeferredDownstreamRecv {
-        u64 user_data = 0;
+        CompletionUserData user_data = 0;
         u32 head = 0;
         u32 frozen_tail = 0;
         bool active = false;
@@ -199,7 +227,7 @@ struct IoUringBackend {
     //    `out_of_range_windows` counts such live windows and lookups for those
     //    tokens scan the ring only while that counter is nonzero.
     struct DownstreamRecvTerminalWindow {
-        u64 user_data = 0;
+        CompletionUserData user_data = 0;
         u32 tail_exclusive = 0;
     }* downstream_recv_terminal_windows = nullptr;
     struct DownstreamRecvTerminalSlot {
@@ -355,8 +383,9 @@ struct IoUringBackend {
         return flush_pending_nonblocking_impl([&](i32, u32 to_submit, u32, u32) {
             const i32 result = enter_result();
             if (result > 0 && static_cast<u32>(result) <= to_submit) {
-                const u32 head = __atomic_load_n(sq_head, __ATOMIC_RELAXED);
-                __atomic_store_n(sq_head, head + static_cast<u32>(result), __ATOMIC_RELEASE);
+                const IoUringPosition head{__atomic_load_n(sq_head, __ATOMIC_RELAXED)};
+                __atomic_store_n(
+                    sq_head, head.advanced_by(static_cast<u32>(result)).value, __ATOMIC_RELEASE);
             }
             return result;
         });
@@ -366,9 +395,9 @@ struct IoUringBackend {
     // Same as add_send but encodes UpstreamSend in user_data.
     // True when get_sqe() can hand out at least one more SQE.
     bool sq_has_room() const {
-        return __atomic_load_n(sq_tail, __ATOMIC_RELAXED) -
-                   __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <
-               sq_ring_entries;
+        const u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+        const IoUringPosition head{__atomic_load_n(sq_head, __ATOMIC_ACQUIRE)};
+        return head.distance_to(tail) < sq_ring_entries;
     }
 
     // Complete a downstream send the caller already started with a direct
@@ -448,8 +477,9 @@ struct IoUringBackend {
     // with more than cq_ring_entries outstanding CQEs).
     u32 cq_unharvested() const {
         if (cq_head == nullptr || cq_tail == nullptr) return 0;
-        return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
-               __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        const IoUringPosition head{__atomic_load_n(cq_head, __ATOMIC_ACQUIRE)};
+        return head.distance_to(tail);
     }
 
     // Shutdown and unmap all resources.
@@ -464,16 +494,18 @@ struct IoUringBackend {
     bool provided_buffer_id_valid(u16 buf_id) const {
         if (buf_id < kProvidedBufCount) return true;
         return large_buf_ring != nullptr && buf_id >= kLargeProvidedBufIdBase &&
-               buf_id - kLargeProvidedBufIdBase < kLargeProvidedBufCount;
+               static_cast<u32>(static_cast<i64>(buf_id) -
+                                static_cast<i64>(kLargeProvidedBufIdBase)) < kLargeProvidedBufCount;
     }
     u32 provided_buffer_size(u16 buf_id) const {
         return buf_id < kProvidedBufCount ? kProvidedBufSize : kLargeProvidedBufSize;
     }
     const u8* provided_buffer_data(u16 buf_id) const {
         if (buf_id < kProvidedBufCount)
-            return buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
-        return large_buf_base +
-               static_cast<u64>(buf_id - kLargeProvidedBufIdBase) * kLargeProvidedBufSize;
+            return buf_base + static_cast<i64>(buf_id) * kProvidedBufSize;
+        return large_buf_base + static_cast<i64>(static_cast<i64>(buf_id) -
+                                                 static_cast<i64>(kLargeProvidedBufIdBase)) *
+                                    kLargeProvidedBufSize;
     }
     // Largest length a bounded one-shot *provided-buffer* upstream recv may
     // request. A bulk-sized target instead uses add_recv_upstream_direct,
@@ -514,7 +546,7 @@ private:
             fatal_error.store(EPROTO, std::memory_order_release);
             return false;
         }
-        pending -= static_cast<u32>(flushed);
+        pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(flushed));
         return true;
     }
 
@@ -548,7 +580,7 @@ private:
     }
 
     // conn_id of a window's token, via the same decode the CQE path uses.
-    static u32 terminal_window_conn_id(u64 user_data) {
+    static u32 terminal_window_conn_id(CompletionUserData user_data) {
         u32 conn_id = 0;
         IoEventType type = IoEventType::Count;
         decode_user_data(user_data, conn_id, type);
@@ -562,11 +594,13 @@ private:
         // table right after).  It exists so a future caller that resets without
         // unmapping stays correct.  Walks only the live windows, never the table.
         if (downstream_recv_terminal_windows != nullptr) {
-            const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
+            const u32 ring_mask =
+                static_cast<u32>(static_cast<i64>(downstream_recv_terminal_window_capacity) - 1);
             for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
-                auto& window =
-                    downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
-                                                     ring_mask];
+                auto& window = downstream_recv_terminal_windows
+                    [static_cast<u32>(static_cast<i64>(downstream_recv_terminal_window_start) +
+                                      static_cast<i64>(i)) &
+                     ring_mask];
                 const u32 conn_id = terminal_window_conn_id(window.user_data);
                 if (downstream_recv_terminal_slots != nullptr &&
                     conn_id < downstream_recv_terminal_slot_capacity)

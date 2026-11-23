@@ -33,13 +33,14 @@ struct AccessLogSinkSpec {
     AccessLogFormatProfile format = AccessLogFormatProfile::None;
     AccessLogPublicationProfile publication = AccessLogPublicationProfile::None;
     u16 path_len = 0;
-    char path[kAccessLogSinkPathMax + 1u]{};
+    char path[static_cast<u32>(static_cast<i64>(kAccessLogSinkPathMax) + 1)]{};
 };
 static_assert(sizeof(AccessLogSinkSpec::path) == 256u);
 
 inline bool access_log_sink_path_valid(Str path) {
+    u32 last = 0;
     if (path.ptr == nullptr || path.len < 2u || path.len > kAccessLogSinkPathMax ||
-        path.ptr[0] != '/' || path.ptr[path.len - 1u] == '/')
+        path.ptr[0] != '/' || __builtin_sub_overflow(path.len, 1u, &last) || path.ptr[last] == '/')
         return false;
     if (path.eq({"/dev/stderr", 11u})) return false;
 
@@ -54,12 +55,13 @@ inline bool access_log_sink_path_valid(Str path) {
             if (c != '/') continue;
         }
 
-        const u32 segment_len = i - segment_start;
+        u32 segment_len = 0;
+        (void)__builtin_sub_overflow(i, segment_start, &segment_len);
         if (segment_len == 0u || (segment_len == 1u && path.ptr[segment_start] == '.') ||
             (segment_len == 2u && path.ptr[segment_start] == '.' &&
-             path.ptr[segment_start + 1u] == '.'))
+             path.ptr[static_cast<i64>(segment_start) + 1] == '.'))
             return false;
-        segment_start = i + 1u;
+        (void)__builtin_add_overflow(i, 1u, &segment_start);
     }
     return true;
 }
@@ -79,7 +81,9 @@ inline bool access_log_sink_spec_valid(const AccessLogSinkSpec& spec) {
         spec.path_len > kAccessLogSinkPathMax || spec.path[spec.path_len] != '\0')
         return false;
     if (!access_log_sink_path_valid({spec.path, spec.path_len})) return false;
-    for (u32 i = spec.path_len + 1u; i < sizeof(spec.path); i++)
+    u32 tail = 0;
+    (void)__builtin_add_overflow(spec.path_len, 1u, &tail);
+    for (u32 i = tail; i < sizeof(spec.path); i++)
         if (spec.path[i] != '\0') return false;
     return true;
 }

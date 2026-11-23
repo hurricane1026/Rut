@@ -12,8 +12,8 @@ struct Entry {
 
 constexpr void sift_down(Entry* entries, u32 size, u32 i) {
     while (true) {
-        const u32 kLeft = 2 * i + 1;
-        const u32 kRight = 2 * i + 2;
+        const u32 kLeft = static_cast<u32>(static_cast<i64>(i) * 2 + 1);
+        const u32 kRight = static_cast<u32>(static_cast<i64>(i) * 2 + 2);
         u32 smallest = i;
         if (kLeft < size && entries[kLeft].deadline_ns < entries[smallest].deadline_ns)
             smallest = kLeft;
@@ -35,10 +35,11 @@ constexpr u32 remove_by_conn(Entry* entries, u32& size, u32 conn_id) {
     for (u32 i = 0; i < size; ++i) {
         if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
     }
-    const u32 kRemoved = size - kept;
+    const u32 kRemoved = static_cast<u32>(static_cast<i64>(size) - static_cast<i64>(kept));
     size = kept;
     if (kRemoved > 0) {
-        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
+        for (u32 i = size / 2; i > 0; i = static_cast<u32>(static_cast<i64>(i) - 1))
+            sift_down(entries, size, static_cast<u32>(static_cast<i64>(i) - 1));
     }
     return kRemoved;
 }

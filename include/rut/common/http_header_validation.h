@@ -38,8 +38,8 @@ inline bool http_header_name_eq_ci(const char* a, u32 a_len, const char* b, u32 
     for (u32 i = 0; i < a_len; i++) {
         u8 ca = static_cast<u8>(a[i]);
         u8 cb = static_cast<u8>(b[i]);
-        if (ca >= 'A' && ca <= 'Z') ca = static_cast<u8>(ca + ('a' - 'A'));
-        if (cb >= 'A' && cb <= 'Z') cb = static_cast<u8>(cb + ('a' - 'A'));
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<u8>(static_cast<i64>(ca) + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<u8>(static_cast<i64>(cb) + ('a' - 'A'));
         if (ca != cb) return false;
     }
     return true;

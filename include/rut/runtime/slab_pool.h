@@ -113,7 +113,9 @@ struct SlabPool {
 
     u32 capacity() const { return Cap; }
     u32 available() const { return free_top; }
-    u32 in_use() const { return Cap - free_top; }
+    u32 in_use() const {
+        return static_cast<u32>(static_cast<i64>(Cap) - static_cast<i64>(free_top));
+    }
 
     void destroy() {
         if (in_use_map) {

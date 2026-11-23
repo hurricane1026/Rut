@@ -87,14 +87,17 @@ struct RateLimitRule {
 inline u64 rate_limit_emit_interval_us(u32 max, u32 window_sec) {
     if (max == 0 || window_sec == 0) return 0;
     const u64 numerator = static_cast<u64>(window_sec) * 1000000ull;
-    return (numerator + static_cast<u64>(max) - 1ull) / max;
+    u64 rounded = 0;
+    if (__builtin_add_overflow(numerator, static_cast<u64>(static_cast<i64>(max) - 1), &rounded))
+        return UINT64_MAX;
+    return rounded / max;
 }
 
 inline bool rate_limit_params_representable(u32 max, u32 window_sec, u32 burst) {
     if (max == 0 || window_sec == 0) return true;  // disabled rule
     if (burst == 0) burst = max;
     const u64 emit = rate_limit_emit_interval_us(max, window_sec);
-    return static_cast<u64>(burst - 1u) <= 0xffffffffffffffffull / emit;
+    return static_cast<u64>(static_cast<i64>(burst) - 1) <= UINT64_MAX / emit;
 }
 
 static constexpr u32 kMaxRateLimitRules = 4;
@@ -123,7 +126,7 @@ struct RateLimitRuleSet {
         if (max > 0 && window_sec > 0) {
             const u64 emit = rate_limit_emit_interval_us(max, window_sec);
             r.emit_interval_us = emit;
-            r.tau_us = (r.burst > 0 ? static_cast<u64>(r.burst - 1) : 0) * emit;
+            r.tau_us = (r.burst > 0 ? static_cast<u64>(static_cast<i64>(r.burst) - 1) : 0) * emit;
         } else {
             r.emit_interval_us = 0;  // disabled
             r.tau_us = 0;

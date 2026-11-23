@@ -72,7 +72,8 @@ def main():
         check(compiler, root, overlay, source=source)
         for before, after in [
             ("(node == chain.tail && tail_pinned)", "false"),
-            ("chain.size -= kUsed;", "chain.size = 0;"),
+            ("chain.size = static_cast<u32>(static_cast<i64>(chain.size) - static_cast<i64>(kUsed));",
+             "chain.size = 0;"),
             ("chain.head = node->next;", "chain.head = nullptr;"),
         ]:
             probe = mutate(root, overlay, source, before, after)
@@ -81,19 +82,24 @@ def main():
             probe.unlink()
         for before, after in [
             ("completed <= received &&", ""),
-            ("static_cast<u64>(buffered) + completed", "static_cast<u64>(buffered + completed)"),
-            ("static_cast<u64>(header) + received", "static_cast<u64>(header + received)"),
-            ("+ received + newly_copied", "+ received"),
+            ("static_cast<i64>(buffered) + static_cast<i64>(completed)",
+             "static_cast<i64>(buffered + completed)"),
+            ("static_cast<i64>(header) + static_cast<i64>(received)",
+             "static_cast<i64>(header + received)"),
+            ("+\n                                                static_cast<i64>(newly_copied)", ""),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Buffered response violates retained byte accounting", source=source)
             probe.unlink()
         for before, after in [
-            ("tail->len += n;", "tail->len = n;"),
-            ("size += n;", "size = tail->len - tail->offset;"),
+            ("tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));",
+             "tail->len = n;"),
+            ("size = static_cast<u32>(static_cast<i64>(size) + static_cast<i64>(n));",
+             "size = tail->len - tail->offset;"),
             ("if (tail->dirty_end < tail->len) tail->dirty_end = tail->len;",
              "tail->dirty_end = tail->len;"),
-            ("tail->len += n;", "tail->offset = 0; tail->len += n;"),
+            ("tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));",
+             "tail->offset = 0; tail->len = static_cast<u32>(static_cast<i64>(tail->len) + static_cast<i64>(n));"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h",
                            before, after)
@@ -101,9 +107,10 @@ def main():
                   source=source)
             probe.unlink()
         for before, after in [
-            ("address - begin > capacity", "static_cast<u32>(address - begin) > capacity"),
-            ("count > capacity - kOffset", "count >= capacity - kOffset"),
-            ("count > capacity - kOffset", "kOffset + count > capacity"),
+            ("raw_offset > capacity", "static_cast<u32>(raw_offset) > capacity"),
+            ("if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;",
+             "kEnd = kOffset + count;"),
+            ("if (kEnd > capacity) return false;", "if (kEnd >= capacity) return false;"),
             ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
             ("if (kEnd > tail_dirty) tail_dirty = kEnd;", "tail_dirty = kEnd;"),
         ]:
@@ -112,21 +119,24 @@ def main():
                   source=source)
             probe.unlink()
         for before, after in [
-            ("result > 0 && received <= kLimit", "result >= 0 && received <= kLimit"),
-            ("received <= kLimit && ", ""),
+            ("return result > 0 && received <= kLimit", "return result >= 0 && received <= kLimit"),
+            ("received <= kLimit &&\n               ", ""),
             ("declared < kMaxBody ? declared : kMaxBody", "declared"),
             ("declared < kMaxBody ? declared : kMaxBody", "kMaxBody"),
-            ("static_cast<u32>(result) <= kLimit - received",
-             "static_cast<u32>(result) < kLimit - received"),
+            ("static_cast<u32>(result) <=\n                   static_cast<u32>(static_cast<i64>(kLimit) - static_cast<i64>(received))",
+             "static_cast<u32>(result) <\n                   static_cast<u32>(static_cast<i64>(kLimit) - static_cast<i64>(received))"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Direct receive violates logical body bounds", source=source)
             probe.unlink()
         for before, after in [
-            ("received <= kMaxBody ? kMaxBody - received + 1u : 0u", "kMaxBody - received + 1u"),
-            ("received <= kMaxBody ?", "received < kMaxBody ?"),
-            ("kMaxBody - received + 1u", "kMaxBody - received"),
-            ("kMaxBody - received + 1u", "kMaxBody - received + 2u"),
+            ("received <= kMaxBody\n                   ? static_cast<u32>(static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1)",
+             "static_cast<u32>(static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1)"),
+            ("received <= kMaxBody", "received < kMaxBody"),
+            ("static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1",
+             "static_cast<i64>(kMaxBody) - static_cast<i64>(received)"),
+            ("static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 1",
+             "static_cast<i64>(kMaxBody) - static_cast<i64>(received) + 2"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Direct receive reservation violates body limit", source=source)
@@ -137,7 +147,8 @@ def main():
         for before, after in [
             ("completed > remaining", "completed >= remaining"),
             ("total <= INT32_MAX", "total <= UINT32_MAX"),
-            ("remaining -= completed;", "remaining = 0;"),
+            ("remaining = static_cast<u32>(static_cast<i64>(remaining) - "
+             "static_cast<i64>(completed));", "remaining = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/send_progress.h", before, after)
             check(compiler, root, overlay, "Partial send violates byte accounting contract",
@@ -166,10 +177,10 @@ def main():
         check(compiler, root, overlay, source=source)
         for before, after in [
             ("event.copy_begin == expected_begin &&", ""),
-            ("event.copy_end >= event.copy_begin &&", ""),
             ("event.result > 0 &&", "event.result >= 0 &&"),
             ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
-            ("event.copy_end - event.copy_begin ==", "event.copy_end - event.copy_begin >="),
+            ("static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==",
+             "static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) >="),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
             check(compiler, root, overlay, "Response copy violates positive span contract", source=source)
@@ -192,9 +203,11 @@ def main():
         source = "src/runtime/buffered_send_vector.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("source + (kSize - part.iov_len)", "source + kStep"),
+            ("source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len))",
+             "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n -= kStep;", "\n            n = 0;"),
+            ("\n            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));",
+             "\n            n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
                            before, after)
@@ -261,17 +274,19 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
-            ("1 + (kRemaining - 1) / 1'000'000", "(kRemaining + 999'999) / 1'000'000"),
-            ("1 + (kRemaining - 1) / 1'000'000", "kRemaining / 1'000'000"),
+            ("const u64 kMillis = rounded;",
+             "const u64 kMillis = (remaining + 999'999) / 1'000'000;"),
+            ("const u64 kMillis = rounded;", "const u64 kMillis = remaining / 1'000'000;"),
             ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
-            ("now_ns >= last_progress_ns + timeout_ns", "now_ns > last_progress_ns + timeout_ns"),
+            ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),
         ]:
             probe = mutate(root / "include", overlay, header, before, after)
             check(compiler, root, overlay, "Response timer violates rearm interval contract", source=runtime)
             probe.unlink()
         for before, after in [
-            ("? cancel_seen : target_seen", "? target_seen : cancel_seen"),
+            ("(kTag & kResponseReadTimerCancelBit) ? cancel_seen : target_seen",
+             "(kTag & kResponseReadTimerCancelBit) ? target_seen : cancel_seen"),
             ("kFirst && owner_valid &&", "owner_valid &&"),
             ("kFirst && owner_valid &&", "kFirst &&"),
             ("(kTag & kResponseReadTimerGenerationMask) == generation", "(kTag & 0xffffu) == generation"),

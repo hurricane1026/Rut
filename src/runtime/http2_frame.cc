@@ -39,7 +39,7 @@ u8* emit_header(u8* out, u32 length, Http2FrameType type, u8 flags, u32 stream_i
     h.flags = flags;
     h.stream_id = stream_id;
     write_frame_header(out, h);
-    return out + kFrameHeaderSize;
+    return out + static_cast<i64>(kFrameHeaderSize);
 }
 
 }  // namespace
@@ -78,9 +78,9 @@ ParseStatus match_client_preface(const u8* buf, u32 len) {
 
 Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s) {
     if (len % 6u != 0u) return Http2Error::FrameSizeError;
-    for (u32 i = 0; i < len; i += 6u) {
-        const u16 kId = read_u16(payload + i);
-        const u32 kVal = read_u32(payload + i + 2);
+    for (u32 i = 0; i < len; i = static_cast<u32>(static_cast<i64>(i) + 6)) {
+        const u16 kId = read_u16(payload + static_cast<i64>(i));
+        const u32 kVal = read_u32(payload + static_cast<i64>(i) + 2);
         switch (static_cast<Http2SettingId>(kId)) {
             case Http2SettingId::HeaderTableSize:
                 s->header_table_size = kVal;
@@ -120,7 +120,7 @@ Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s) {
 }
 
 u32 write_settings_frame(u8* out, const Http2Settings& s) {
-    u8* p = out + kFrameHeaderSize;
+    u8* p = out + static_cast<i64>(kFrameHeaderSize);
     if (s.enable_connect_protocol) {
         write_u16(p, static_cast<u16>(Http2SettingId::EnableConnectProtocol));
         write_u32(p + 2, s.enable_connect_protocol);
@@ -152,9 +152,9 @@ u32 write_settings_frame(u8* out, const Http2Settings& s) {
         write_u32(p + 2, s.max_frame_size);
         p += 6;
     }
-    const u32 kPayloadLen = static_cast<u32>(p - (out + kFrameHeaderSize));
+    const u32 kPayloadLen = static_cast<u32>(p - (out + static_cast<i64>(kFrameHeaderSize)));
     emit_header(out, kPayloadLen, Http2FrameType::Settings, 0, 0);
-    return kFrameHeaderSize + kPayloadLen;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(kPayloadLen));
 }
 
 u32 write_settings_ack(u8* out) {
@@ -166,19 +166,19 @@ u32 write_goaway(u8* out, u32 last_stream_id, Http2Error error) {
     u8* p = emit_header(out, 8, Http2FrameType::Goaway, 0, 0);
     write_u32(p, last_stream_id & 0x7fffffffu);
     write_u32(p + 4, static_cast<u32>(error));
-    return kFrameHeaderSize + 8;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 8);
 }
 
 u32 write_window_update(u8* out, u32 stream_id, u32 increment) {
     u8* p = emit_header(out, 4, Http2FrameType::WindowUpdate, 0, stream_id);
     write_u32(p, increment & 0x7fffffffu);
-    return kFrameHeaderSize + 4;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4);
 }
 
 u32 write_rst_stream(u8* out, u32 stream_id, Http2Error error) {
     u8* p = emit_header(out, 4, Http2FrameType::RstStream, 0, stream_id);
     write_u32(p, static_cast<u32>(error));
-    return kFrameHeaderSize + 4;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4);
 }
 
 }  // namespace rut

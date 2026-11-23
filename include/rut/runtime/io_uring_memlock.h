@@ -80,13 +80,13 @@ constexpr IoUringRingSizes io_uring_ring_sizes(u32 capacity) {
 
 namespace iouring_memlock_detail {
 constexpr u64 saturating_add(u64 a, u64 b) {
-    const u64 max = ~u64(0);
-    return b > max - a ? max : a + b;
+    u64 result = 0;
+    return __builtin_add_overflow(a, b, &result) ? ~u64(0) : result;
 }
 
 constexpr u64 saturating_mul(u64 a, u64 b) {
-    const u64 max = ~u64(0);
-    return a != 0 && b > max / a ? max : a * b;
+    u64 result = 0;
+    return __builtin_mul_overflow(a, b, &result) ? ~u64(0) : result;
 }
 
 // Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
@@ -97,7 +97,12 @@ constexpr u64 saturating_mul(u64 a, u64 b) {
 // to the same result.
 static constexpr u64 kRingsHeaderBytes = 320;
 constexpr u64 round_up_page(u64 n, u64 page_bytes) {
-    return (n + page_bytes - 1) / page_bytes * page_bytes;
+    if (page_bytes == 0) return 0;
+    const u64 remainder = n % page_bytes;
+    if (remainder == 0) return n;
+    u64 increment = 0;
+    (void)__builtin_sub_overflow(page_bytes, remainder, &increment);
+    return iouring_memlock_detail::saturating_add(n, increment);
 }
 }  // namespace iouring_memlock_detail
 
@@ -105,17 +110,21 @@ constexpr u64 round_up_page(u64 n, u64 page_bytes) {
 // rounded up to pages as the kernel maps them.
 constexpr u64 io_uring_ring_locked_bytes(u32 sq_entries, u32 cq_entries, u64 page_bytes) {
     using namespace iouring_memlock_detail;
-    const u64 sqes = round_up_page(static_cast<u64>(sq_entries) * sizeof(io_uring_sqe), page_bytes);
-    const u64 rings =
-        round_up_page(kRingsHeaderBytes + static_cast<u64>(cq_entries) * sizeof(io_uring_cqe) +
-                          static_cast<u64>(sq_entries) * sizeof(u32),
-                      page_bytes);
-    return sqes + rings;
+    const u64 sqes = round_up_page(
+        saturating_mul(static_cast<u64>(sq_entries), sizeof(io_uring_sqe)), page_bytes);
+    const u64 rings = round_up_page(
+        saturating_add(
+            kRingsHeaderBytes,
+            saturating_add(saturating_mul(static_cast<u64>(cq_entries), sizeof(io_uring_cqe)),
+                           saturating_mul(static_cast<u64>(sq_entries), sizeof(u32)))),
+        page_bytes);
+    return saturating_add(sqes, rings);
 }
 
 // One registered provided-buffer ring: `entries` 16-byte io_uring_buf slots.
 constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries, u64 page_bytes) {
-    return iouring_memlock_detail::round_up_page(static_cast<u64>(entries) * 16, page_bytes);
+    return iouring_memlock_detail::round_up_page(
+        iouring_memlock_detail::saturating_mul(static_cast<u64>(entries), 16), page_bytes);
 }
 
 // Per-shard charge a shard cannot start without: the ring plus the primary
@@ -129,8 +138,9 @@ constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
                                                    u32 cq_entries,
                                                    u32 pbuf_entries,
                                                    u64 page_bytes) {
-    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
-           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes);
+    return iouring_memlock_detail::saturating_add(
+        io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes),
+        io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes));
 }
 
 // Total per-shard charge with every ring registered: the required charge plus
@@ -142,8 +152,9 @@ constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
 // will say so.
 constexpr u64 io_uring_shard_locked_bytes(
     u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
-    return io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes) +
-           io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes);
+    return iouring_memlock_detail::saturating_add(
+        io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes),
+        io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes));
 }
 
 // Minimum locked memory for sequential startup of all shards. Every shard
@@ -158,7 +169,8 @@ constexpr u64 io_uring_startup_min_locked_bytes(u32 shard_count,
     using namespace iouring_memlock_detail;
     const u64 required = saturating_mul(required_per_shard, shard_count);
     const u64 earlier_optional =
-        saturating_mul(optional_per_shard, shard_count == 0 ? 0 : shard_count - 1);
+        saturating_mul(optional_per_shard,
+                       shard_count == 0 ? 0 : static_cast<u64>(static_cast<i64>(shard_count) - 1));
     return saturating_add(required, earlier_optional);
 }
 

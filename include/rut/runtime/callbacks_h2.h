@@ -82,9 +82,10 @@ inline bool h2_prepare_forward_request(Connection& conn,
     if (synth_len > out_cap) return false;
     __builtin_memmove(out, synth, synth_len);
     u32 header_end = 0;
-    for (u32 i = 0; i + 3 < synth_len; i++) {
-        if (out[i] == '\r' && out[i + 1] == '\n' && out[i + 2] == '\r' && out[i + 3] == '\n') {
-            header_end = i + 4;
+    for (u32 i = 0; static_cast<i64>(i) + 3 < static_cast<i64>(synth_len); i++) {
+        if (out[i] == '\r' && out[static_cast<i64>(i) + 1] == '\n' &&
+            out[static_cast<i64>(i) + 2] == '\r' && out[static_cast<i64>(i) + 3] == '\n') {
+            header_end = static_cast<u32>(static_cast<i64>(i) + 4);
             break;
         }
     }
@@ -289,13 +290,15 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         return 0;
     }
     if (h2.conn_send_window <= 0 || stream->send_window <= 0) return 0;
-    if (cap < kFrameHeaderSize + 1) return 0;
-    const u32 kRemaining = h2.outbound_body_len - h2.outbound_body_offset;
+    if (static_cast<i64>(cap) < static_cast<i64>(kFrameHeaderSize) + 1) return 0;
+    const u32 kRemaining = static_cast<u32>(static_cast<i64>(h2.outbound_body_len) -
+                                            static_cast<i64>(h2.outbound_body_offset));
     u32 n = kRemaining;
     if (n > h2.peer_settings.max_frame_size) n = h2.peer_settings.max_frame_size;
     if (static_cast<i64>(n) > h2.conn_send_window) n = static_cast<u32>(h2.conn_send_window);
     if (static_cast<i64>(n) > stream->send_window) n = static_cast<u32>(stream->send_window);
-    if (n > cap - kFrameHeaderSize) n = cap - kFrameHeaderSize;
+    if (static_cast<i64>(n) > static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize))
+        n = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize));
     if (n == 0) return 0;
     Http2FrameHeader frame{};
     frame.length = n;
@@ -303,13 +306,17 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
     frame.flags = (n == kRemaining) ? http2_flag::kEndStream : 0;
     frame.stream_id = h2.outbound_stream;
     write_frame_header(out, frame);
-    __builtin_memcpy(out + kFrameHeaderSize, h2.outbound_body + h2.outbound_body_offset, n);
-    h2.outbound_body_offset += n;
-    h2.conn_send_window -= n;
-    stream->send_window -= static_cast<i32>(n);
+    __builtin_memcpy(out + static_cast<i64>(kFrameHeaderSize),
+                     h2.outbound_body + static_cast<i64>(h2.outbound_body_offset),
+                     n);
+    h2.outbound_body_offset =
+        static_cast<u32>(static_cast<i64>(h2.outbound_body_offset) + static_cast<i64>(n));
+    h2.conn_send_window -= static_cast<i64>(n);
+    stream->send_window =
+        static_cast<i32>(static_cast<i64>(stream->send_window) - static_cast<i64>(n));
     h2.outbound_final_staged = n == kRemaining;
     status = H2PumpStatus::Produced;
-    return kFrameHeaderSize + n;
+    return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(n));
 }
 
 // Connection-specific (hop-by-hop) header names that MUST NOT appear in an HTTP/2
@@ -380,21 +387,22 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     }
     if (!d.owned_hpack_pending) d.owned_hpack_after = h2.hpack_enc;
     auto& enc = d.owned_hpack_after;
-    const u32 n = http2_write_response_headers(d.resp + d.resp_len,
-                                               d.resp_cap - d.resp_len,
-                                               enc,
-                                               stream_id,
-                                               status,
-                                               hdrs,
-                                               nhdrs,
-                                               body_len,
-                                               false);
+    const u32 n = http2_write_response_headers(
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        status,
+        hdrs,
+        nhdrs,
+        body_len,
+        false);
     if (n == 0) {
         if (body_slice != nullptr) body_pool->free(body_slice);
         if (d.resp_len != 0) d.overflow = true;
         return false;
     }
-    d.resp_len += n;
+    d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(n));
     if (queued) {
         d.queued_resp_end = d.resp_len;
         h2.queued_stream = stream_id;
@@ -444,21 +452,26 @@ void h2_emit_response(H2Dispatch<Loop>& d,
         d.overflow = true;
         return;
     }
-    const u32 kN = http2_write_response(d.resp + d.resp_len,
-                                        d.resp_cap - d.resp_len,
-                                        enc,
-                                        stream_id,
-                                        status,
-                                        hdrs,
-                                        nhdrs,
-                                        body,
-                                        body_len);
+    if (d.resp_len > d.resp_cap) {
+        d.overflow = true;
+        return;
+    }
+    const u32 kN = http2_write_response(
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        status,
+        hdrs,
+        nhdrs,
+        body,
+        body_len);
     if (kN != 0) {
         if (d.owned_hpack_pending)
             d.owned_hpack_after = enc;
         else
             d.conn->h2->hpack_enc = enc;
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
         h2_close_stream(d.conn->h2, stream_id);
         return;
     }
@@ -472,7 +485,15 @@ void h2_emit_response(H2Dispatch<Loop>& d,
     // First frame, fallback allowed: a tiny synthetic 500 always fits.
     enc = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
     const u32 kFallback = http2_write_response(
-        d.resp + d.resp_len, d.resp_cap - d.resp_len, enc, stream_id, 500, nullptr, 0, nullptr, 0);
+        d.resp + static_cast<i64>(d.resp_len),
+        static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+        enc,
+        stream_id,
+        500,
+        nullptr,
+        0,
+        nullptr,
+        0);
     if (kFallback == 0)
         d.overflow = true;
     else {
@@ -480,7 +501,7 @@ void h2_emit_response(H2Dispatch<Loop>& d,
             d.owned_hpack_after = enc;
         else
             d.conn->h2->hpack_enc = enc;
-        d.resp_len += kFallback;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kFallback));
         h2_close_stream(d.conn->h2, stream_id);
     }
 }
@@ -531,8 +552,12 @@ inline u32 h2_synth_h1_request(const hpack::Header* hs, u32 n, u8* out, u32 cap)
 
     u32 o = 0;
     auto put = [&](const char* s, u32 len) -> bool {
-        if (o + len > cap) return false;
-        for (u32 i = 0; i < len; i++) out[o++] = static_cast<u8>(s[i]);
+        if (o > cap || static_cast<i64>(len) > static_cast<i64>(cap) - static_cast<i64>(o))
+            return false;
+        for (u32 i = 0; i < len; i++) {
+            out[static_cast<i64>(o)] = static_cast<u8>(s[i]);
+            o = static_cast<u32>(static_cast<i64>(o) + 1);
+        }
         return true;
     };
     if (!put(method.ptr, method.len) || !put(" ", 1) || !put(path.ptr, path.len) ||
@@ -590,16 +615,20 @@ inline u32 h2_reanchor_route_params(const hpack::Header* headers,
             path = headers[i].value;
     }
     const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-    const u32 kPathStart = method.len + 1;
+    const u32 kPathStart = static_cast<u32>(static_cast<i64>(method.len) + 1);
     u32 stored = 0;
     for (u32 i = 0; i < kCapped; i++) {
         const RouteParam& p = params[i];
         if (path.ptr == nullptr || p.value < path.ptr ||
-            p.value + p.value_len > path.ptr + path.len)
+            p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
             continue;
-        const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
-        out[stored++] = {
-            p.name, p.name_len, reinterpret_cast<const char*>(synth + kOff), p.value_len};
+        const u32 kOff =
+            static_cast<u32>(static_cast<i64>(kPathStart) + static_cast<i64>(p.value - path.ptr));
+        out[stored] = {p.name,
+                       p.name_len,
+                       reinterpret_cast<const char*>(synth + static_cast<i64>(kOff)),
+                       p.value_len};
+        stored = static_cast<u32>(static_cast<i64>(stored) + 1);
     }
     return stored;
 }
@@ -723,21 +752,25 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
             break;
         }
         const auto& src = d.conn->resp_header_mutations[i];
-        const u32 need = src.name.len + src.value.len;
-        if (need > Http2Conn::kBodySynthCap - h2.pending_local_mutation_bytes) {
+        const i64 need_wide = static_cast<i64>(src.name.len) + static_cast<i64>(src.value.len);
+        if (need_wide > static_cast<i64>(Http2Conn::kBodySynthCap) -
+                            static_cast<i64>(h2.pending_local_mutation_bytes)) {
             h2.pending_local_mutation_overflow = true;
             break;
         }
+        const u32 need = static_cast<u32>(need_wide);
         auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
-        u8* storage = h2.pending_synth + h2.pending_local_mutation_bytes;
+        u8* storage = h2.pending_synth + static_cast<i64>(h2.pending_local_mutation_bytes);
         dst.name_offset = static_cast<u16>(h2.pending_local_mutation_bytes);
         dst.name_len = static_cast<u16>(src.name.len);
         for (u32 j = 0; j < src.name.len; j++) storage[j] = static_cast<u8>(src.name.ptr[j]);
-        storage += src.name.len;
-        dst.value_offset = static_cast<u16>(h2.pending_local_mutation_bytes + src.name.len);
+        storage += static_cast<i64>(src.name.len);
+        dst.value_offset = static_cast<u16>(static_cast<i64>(h2.pending_local_mutation_bytes) +
+                                            static_cast<i64>(src.name.len));
         dst.value_len = static_cast<u16>(src.value.len);
         for (u32 j = 0; j < src.value.len; j++) storage[j] = static_cast<u8>(src.value.ptr[j]);
-        h2.pending_local_mutation_bytes += need;
+        h2.pending_local_mutation_bytes = static_cast<u32>(
+            static_cast<i64>(h2.pending_local_mutation_bytes) + static_cast<i64>(need));
         dst.mode = static_cast<u8>(src.mode);
     }
     if (replace_owned_async) h2_clear_async(h2);
@@ -766,21 +799,23 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     } else {
         char tmp[10];
         u32 t = 0;
-        for (u32 v = body_len; v > 0; v /= 10) tmp[t++] = static_cast<char>('0' + (v % 10));
+        for (u32 v = body_len; v > 0; v /= 10)
+            tmp[t++] = static_cast<char>('0' + static_cast<i64>(v % 10));
         while (t > 0) digits[nd++] = tmp[--t];
     }
     static const char kKey[] = "content-length: ";
-    const u32 kKeyLen = 16;             // strlen("content-length: ")
-    const u32 kIns = kKeyLen + nd + 2;  // header line + CRLF
-    if (*len + kIns > cap) return false;
-    const u32 kAt = body_start - 2;  // before the blank-line CRLF
-    for (u32 i = *len; i > kAt; i--) buf[i - 1 + kIns] = buf[i - 1];
+    const u32 kKeyLen = 16;  // strlen("content-length: ")
+    const u32 kIns = static_cast<u32>(static_cast<i64>(kKeyLen) + static_cast<i64>(nd) + 2);
+    if (static_cast<i64>(*len) + static_cast<i64>(kIns) > static_cast<i64>(cap)) return false;
+    const u32 kAt = static_cast<u32>(static_cast<i64>(body_start) - 2);
+    for (u32 i = *len; i > kAt; i--)
+        buf[static_cast<i64>(i) - 1 + static_cast<i64>(kIns)] = buf[static_cast<i64>(i) - 1];
     u32 o = kAt;
     for (u32 i = 0; i < kKeyLen; i++) buf[o++] = static_cast<u8>(kKey[i]);
     for (u32 i = 0; i < nd; i++) buf[o++] = static_cast<u8>(digits[i]);
     buf[o++] = '\r';
     buf[o++] = '\n';
-    *len += kIns;
+    *len = static_cast<u32>(static_cast<i64>(*len) + static_cast<i64>(kIns));
     return true;
 }
 
@@ -853,20 +888,22 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
                 path = headers[i].value;
         }
         const u32 kCapped = param_count > kMaxRouteParams ? kMaxRouteParams : param_count;
-        const u32 kPathStart = method.len + 1;  // path follows "METHOD " in synth
+        const u32 kPathStart = static_cast<u32>(static_cast<i64>(method.len) + 1);
         for (u32 i = 0; i < kCapped; i++) {
             const RouteParam& p = params[i];
             // Defensive: a trie-matched value is always within the raw path, so
             // this skip is unreachable in practice (no silent truncation).
             if (path.ptr == nullptr || p.value < path.ptr ||
-                p.value + p.value_len > path.ptr + path.len)
+                p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
                 continue;
-            const u32 kOff = kPathStart + static_cast<u32>(p.value - path.ptr);
-            h2->pending_route_params[stored++] = {
+            const u32 kOff = static_cast<u32>(static_cast<i64>(kPathStart) +
+                                              static_cast<i64>(p.value - path.ptr));
+            h2->pending_route_params[stored] = {
                 p.name,
                 p.name_len,
-                reinterpret_cast<const char*>(h2->pending_synth + kOff),
+                reinterpret_cast<const char*>(h2->pending_synth + static_cast<i64>(kOff)),
                 p.value_len};
+            stored = static_cast<u32>(static_cast<i64>(stored) + 1);
         }
     }
     h2->pending_route_param_count = stored;
@@ -954,20 +991,25 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     }
     if (o.response_body_idx != 0 && cfg != nullptr &&
         o.response_body_idx <= cfg->response_body_count) {
-        const auto& b = cfg->response_bodies[o.response_body_idx - 1];
+        const auto& b =
+            cfg->response_bodies[static_cast<u32>(static_cast<i64>(o.response_body_idx) - 1)];
         body = reinterpret_cast<const u8*>(b.data);
         body_len = b.len;
     }
     constexpr u32 kMaxEffectiveHeaders =
-        RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+        static_cast<u32>(static_cast<i64>(RouteConfig::kMaxHeadersPerSet) +
+                         static_cast<i64>(Connection::kMaxRespHeaderMutations));
     hpack::Header hdrs[kMaxEffectiveHeaders];
     u32 nhdrs = 0;
     if (o.response_headers_idx != 0 && cfg != nullptr &&
         o.response_headers_idx <= cfg->response_header_set_count) {
-        const auto& ref = cfg->response_header_sets[o.response_headers_idx - 1];
+        const auto& ref = cfg->response_header_sets[static_cast<u32>(
+            static_cast<i64>(o.response_headers_idx) - 1)];
         for (u16 i = 0; i < ref.count; i++) {
-            const char* kn = cfg->header_keys[ref.offset + i].data;
-            const u32 kl = cfg->header_keys[ref.offset + i].len;
+            const u32 key_index =
+                static_cast<u32>(static_cast<i64>(ref.offset) + static_cast<i64>(i));
+            const char* kn = cfg->header_keys[key_index].data;
+            const u32 kl = cfg->header_keys[key_index].len;
             // Connection-specific fields are prohibited in HTTP/2 (RFC 7540
             // §8.1.2.2) and make compliant clients treat the response as malformed.
             // validate_response_header only reserves Connection/Transfer-Encoding/
@@ -975,9 +1017,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             // reach here from a route's response(headers:) set — drop them.
             if (h2_is_prohibited_response_header(kn, kl)) continue;
             hdrs[nhdrs].name = {kn, kl};
-            hdrs[nhdrs].value = {cfg->header_values[ref.offset + i].data,
-                                 cfg->header_values[ref.offset + i].len};
-            nhdrs++;
+            hdrs[nhdrs].value = {cfg->header_values[key_index].data,
+                                 cfg->header_values[key_index].len};
+            nhdrs = static_cast<u32>(static_cast<i64>(nhdrs) + 1);
         }
     }
     if (d.conn->resp_header_mutation_overflow) {
@@ -1001,8 +1043,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                     i++;
                     continue;
                 }
-                for (u32 move = i + 1; move < nhdrs; move++) hdrs[move - 1] = hdrs[move];
-                nhdrs--;
+                for (u32 move = static_cast<u32>(static_cast<i64>(i) + 1); move < nhdrs; move++)
+                    hdrs[static_cast<u32>(static_cast<i64>(move) - 1)] = hdrs[move];
+                nhdrs = static_cast<u32>(static_cast<i64>(nhdrs) - 1);
             }
         }
         if (!remove && !h2_is_prohibited_response_header(mutation.name.ptr, mutation.name.len)) {
@@ -1021,14 +1064,19 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         o.status_code < 200 || o.status_code == 204 || o.status_code == 205 || o.status_code == 304;
     if (body_len != 0 && !bodyless_status && is_head) {
         hpack::Encoder staged = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
-        const u32 n = http2_write_head_response_headers(d.resp + d.resp_len,
-                                                        d.resp_cap - d.resp_len,
-                                                        staged,
-                                                        stream_id,
-                                                        o.status_code,
-                                                        hdrs,
-                                                        nhdrs,
-                                                        body_len);
+        if (d.resp_len > d.resp_cap) {
+            d.overflow = true;
+            return;
+        }
+        const u32 n = http2_write_head_response_headers(
+            d.resp + static_cast<i64>(d.resp_len),
+            static_cast<u32>(static_cast<i64>(d.resp_cap) - static_cast<i64>(d.resp_len)),
+            staged,
+            stream_id,
+            o.status_code,
+            hdrs,
+            nhdrs,
+            body_len);
         if (n == 0) {
             if (d.resp_len != 0)
                 d.overflow = true;
@@ -1040,7 +1088,7 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             d.owned_hpack_after = staged;
         else
             d.conn->h2->hpack_enc = staged;
-        d.resp_len += n;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(n));
         h2_close_stream(d.conn->h2, stream_id);
     } else if (body_len != 0 && !bodyless_status) {
         if (!h2_stage_owned_response(d,
@@ -1163,7 +1211,9 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         auto& value = ctx->route_params[i].value;
         if (value == nullptr) continue;
         const auto* ptr = reinterpret_cast<const u8*>(value);
-        if (ptr < synth || ptr + ctx->route_params[i].value_len > synth + synth_len) continue;
+        if (ptr < synth || ptr + static_cast<i64>(ctx->route_params[i].value_len) >
+                               synth + static_cast<i64>(synth_len))
+            continue;
         value = reinterpret_cast<const char*>(h2->pending_synth + (ptr - synth));
     }
     h2->async_stream = stream_id;
@@ -1301,7 +1351,9 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                 return;
             }
             kOutcome.response_read_timeout_seconds =
-                cfg->policy_bundles[kOutcome.policy_bundle_id - 1].response_read_timeout_seconds;
+                cfg->policy_bundles[static_cast<u32>(static_cast<i64>(kOutcome.policy_bundle_id) -
+                                                     1)]
+                    .response_read_timeout_seconds;
         }
         if (kOutcome.response_read_timeout_seconds != 0) {
             d.close_after_process = true;
@@ -1311,8 +1363,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     if (d.conn->target_transform_recorded &&
         (kOutcome.kind != JitDispatchOutcome::Kind::Forward || cfg == nullptr ||
          !cfg->target_transform_id_is_valid(d.conn->target_transform_id) ||
-         cfg->target_transforms[d.conn->target_transform_id - 1].mode ==
-             ForwardTargetTransformMode::CleanPrefix)) {
+         cfg->target_transforms[static_cast<u32>(static_cast<i64>(d.conn->target_transform_id) - 1)]
+                 .mode == ForwardTargetTransformMode::CleanPrefix)) {
         h2_emit_status(d, stream_id, 400);
         return;
     }
@@ -1502,11 +1554,12 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         d.conn->forward_load_balance = load_balance;
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
-            dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
+            dst.name = {reinterpret_cast<const char*>(h2->pending_synth +
+                                                      static_cast<i64>(mutations[i].name_offset)),
                         mutations[i].name_len};
-            dst.value = {
-                reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
-                mutations[i].value_len};
+            dst.value = {reinterpret_cast<const char*>(h2->pending_synth +
+                                                       static_cast<i64>(mutations[i].value_offset)),
+                         mutations[i].value_len};
             dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
         }
         d.conn->resp_header_mutation_count = mutation_count;
@@ -2050,16 +2103,21 @@ void h2_on_data_cb(
         }
     }
     if (c.pending_stream != stream_id) return;
-    if (c.pending_body_len > 0xffffffffu - len) {
+    if (static_cast<i64>(c.pending_body_len) >
+        static_cast<i64>(UINT32_MAX) - static_cast<i64>(len)) {
         c.pending_overflow = true;
     } else {
-        c.pending_body_len += len;
+        c.pending_body_len =
+            static_cast<u32>(static_cast<i64>(c.pending_body_len) + static_cast<i64>(len));
     }
-    if (c.pending_buffer_body && c.pending_synth_len + len > Http2Conn::kBodySynthCap) {
+    if (c.pending_buffer_body && static_cast<i64>(c.pending_synth_len) + static_cast<i64>(len) >
+                                     static_cast<i64>(Http2Conn::kBodySynthCap)) {
         c.pending_overflow = true;
     } else if (c.pending_buffer_body) {
-        for (u32 i = 0; i < len; i++) c.pending_synth[c.pending_synth_len + i] = data[i];
-        c.pending_synth_len += len;
+        for (u32 i = 0; i < len; i++)
+            c.pending_synth[static_cast<i64>(c.pending_synth_len) + static_cast<i64>(i)] = data[i];
+        c.pending_synth_len =
+            static_cast<u32>(static_cast<i64>(c.pending_synth_len) + static_cast<i64>(len));
     }
     if (end_stream) h2_finish_body(*d, stream_id);
 }
@@ -2185,21 +2243,26 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     const u32 kResult = static_cast<u32>(ev.result);
-    if (conn.send_progress > kSendLen || kResult > (kSendLen - conn.send_progress)) {
+    if (conn.send_progress > kSendLen ||
+        static_cast<i64>(kResult) >
+            static_cast<i64>(kSendLen) - static_cast<i64>(conn.send_progress)) {
         if (conn.h2) h2_clear_outbound(*conn.h2);
         loop->close_conn(conn);
         return;
     }
-    conn.send_progress += kResult;
+    conn.send_progress =
+        static_cast<u32>(static_cast<i64>(conn.send_progress) + static_cast<i64>(kResult));
     if (conn.send_progress < kSendLen) {
         if (kResult == 0u) {
             if (conn.h2) h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
             return;
         }
-        const u32 kRemaining = kSendLen - conn.send_progress;
+        const u32 kRemaining =
+            static_cast<u32>(static_cast<i64>(kSendLen) - static_cast<i64>(conn.send_progress));
         conn.transition_to_sending(&on_h2_sent<Loop>);
-        if (!loop->submit_send(conn, conn.send_buf.data() + conn.send_progress, kRemaining)) {
+        if (!loop->submit_send(
+                conn, conn.send_buf.data() + static_cast<i64>(conn.send_progress), kRemaining)) {
             if (conn.h2) h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
         }
@@ -2328,12 +2391,13 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     u32 engine_written = 0;
-    Http2Result r = conn.h2->process(conn.recv_buf.data(),
-                                     conn.recv_buf.len(),
-                                     ctrl + ctrl_len,
-                                     sizeof(ctrl) - ctrl_len,
-                                     &engine_written);
-    ctrl_len += engine_written;
+    Http2Result r = conn.h2->process(
+        conn.recv_buf.data(),
+        conn.recv_buf.len(),
+        ctrl + static_cast<i64>(ctrl_len),
+        static_cast<u32>(static_cast<i64>(sizeof(ctrl)) - static_cast<i64>(ctrl_len)),
+        &engine_written);
+    ctrl_len = static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(engine_written));
 
     if (d.close_after_process) {
         h2_clear_outbound(*conn.h2);
@@ -2345,9 +2409,14 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Compact unconsumed bytes (a partial trailing frame) to the front so the
     // next recv appends after them.
     const u32 kLen = conn.recv_buf.len();
-    const u32 kRemaining = kLen - r.consumed;
+    if (r.consumed > kLen) {
+        h2_clear_outbound(*conn.h2);
+        loop->close_conn(conn);
+        return;
+    }
+    const u32 kRemaining = static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(r.consumed));
     if (kRemaining > 0 && r.consumed > 0)
-        memmove(conn.recv_slice, conn.recv_slice + r.consumed, kRemaining);
+        memmove(conn.recv_slice, conn.recv_slice + static_cast<i64>(r.consumed), kRemaining);
     conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
@@ -2365,11 +2434,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     const bool kClose = r.close || d.overflow;
 
     if (!kClose && conn.h2->grpc.active) {
-        const u32 used = ctrl_len + d.resp_len;
-        const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
-        const u32 storage_room = kRespStorageCap - d.resp_len;
+        const u32 used =
+            static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
+        const u32 wire_room = used < conn.send_buf.capacity()
+                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
+                                                     static_cast<i64>(used))
+                                  : 0;
+        const u32 storage_room =
+            static_cast<u32>(static_cast<i64>(kRespStorageCap) - static_cast<i64>(d.resp_len));
         const u32 room = storage_room < wire_room ? storage_room : wire_room;
-        d.resp_len += grpc_pump_downstream(loop, conn, d.resp + d.resp_len, room);
+        d.resp_len =
+            static_cast<u32>(static_cast<i64>(d.resp_len) +
+                             static_cast<i64>(grpc_pump_downstream(
+                                 loop, conn, d.resp + static_cast<i64>(d.resp_len), room)));
     }
     conn.h2->grpc.busy = false;
     if constexpr (requires {
@@ -2384,21 +2461,27 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (!kClose && conn.h2->outbound_stream != 0) {
-        const u32 kUsed = ctrl_len + d.resp_len;
-        const u32 kWireRoom =
-            kUsed <= conn.send_buf.capacity() ? conn.send_buf.capacity() - kUsed : 0;
+        const u32 kUsed =
+            static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
+        const u32 kWireRoom = kUsed <= conn.send_buf.capacity()
+                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
+                                                     static_cast<i64>(kUsed))
+                                  : 0;
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN = h2_pump_outbound(
-            *conn.h2,
-            d.resp + d.resp_len,
-            kRespStorageCap - d.resp_len < kWireRoom ? kRespStorageCap - d.resp_len : kWireRoom,
-            pump_status);
+        const u32 kStorageRoom =
+            d.resp_len <= kRespStorageCap
+                ? static_cast<u32>(static_cast<i64>(kRespStorageCap) - static_cast<i64>(d.resp_len))
+                : 0;
+        const u32 kN = h2_pump_outbound(*conn.h2,
+                                        d.resp + static_cast<i64>(d.resp_len),
+                                        kStorageRoom < kWireRoom ? kStorageRoom : kWireRoom,
+                                        pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*conn.h2);
             loop->close_conn(conn);
             return;
         }
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
     }
 
     // A handler suspended on wait() during this batch. Flush whatever queued
@@ -2527,7 +2610,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                 return;
             }
             kOutcome.response_read_timeout_seconds =
-                h2->async_cfg->policy_bundles[kOutcome.policy_bundle_id - 1]
+                h2->async_cfg
+                    ->policy_bundles[static_cast<u32>(static_cast<i64>(kOutcome.policy_bundle_id) -
+                                                      1)]
                     .response_read_timeout_seconds;
         }
         if (kOutcome.response_read_timeout_seconds != 0) {
@@ -2539,8 +2624,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     if (conn.target_transform_recorded &&
         (kOutcome.kind != JitDispatchOutcome::Kind::Forward || h2->async_cfg == nullptr ||
          !h2->async_cfg->target_transform_id_is_valid(conn.target_transform_id) ||
-         h2->async_cfg->target_transforms[conn.target_transform_id - 1].mode ==
-             ForwardTargetTransformMode::CleanPrefix)) {
+         h2->async_cfg
+                 ->target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) -
+                                                      1)]
+                 .mode == ForwardTargetTransformMode::CleanPrefix)) {
         u8 resp[8192];
         H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
         h2_emit_status(d, kStreamId, 400);
@@ -2811,14 +2898,22 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     if (h2->outbound_stream != 0) {
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
-        const u32 kN =
-            h2_pump_outbound(*h2, resp + d.resp_len, sizeof(resp) - d.resp_len, pump_status);
+        if (d.resp_len > sizeof(resp)) {
+            h2_clear_outbound(*h2);
+            loop->close_conn(conn);
+            return;
+        }
+        const u32 kN = h2_pump_outbound(
+            *h2,
+            resp + static_cast<i64>(d.resp_len),
+            static_cast<u32>(static_cast<i64>(sizeof(resp)) - static_cast<i64>(d.resp_len)),
+            pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*h2);
             loop->close_conn(conn);
             return;
         }
-        d.resp_len += kN;
+        d.resp_len = static_cast<u32>(static_cast<i64>(d.resp_len) + static_cast<i64>(kN));
     }
     h2_commit_owned_hpack(d);
 

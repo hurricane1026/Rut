@@ -26994,7 +26994,7 @@ struct StrictLocalSendFailureLoop : SmallLoop {
     ConnState close_saw_state = ConnState::ReadingHeader;
     u32 close_saw_send_len = 0;
     u32 close_saw_send_progress = 0;
-    u32 close_saw_completed_requests = 0;
+    i64 close_saw_completed_requests = 0;
     u32 close_saw_capture_header_len = 0;
 
     bool submit_send(Connection& conn, const u8* buf, u32 len) {
@@ -28471,7 +28471,7 @@ TEST(pipeline, post_cl_then_get) {
 struct PipelineCausalSmallLoop : SmallLoop {
     u32 close_count = 0;
     u32 close_handler_gen = 0;
-    u32 close_completed_requests = 0;
+    i64 close_completed_requests = 0;
     u16 close_pipeline_depth = 0;
     u32 close_recv_len = 0;
     u32 close_req_initial_send_len = 0;
@@ -29248,7 +29248,8 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
 TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_witness) {
     ConnectionBase source{};
     source.reset();
-    source.downstream_completed_request_count = 9;
+    constexpr i64 kCompletedRequests = i64{UINT32_MAX} + 1;
+    source.downstream_completed_request_count = kCompletedRequests;
     source.pipeline_depth = 1;
     source.pipeline_stash_len = 19;
     source.http1_pipeline_request_generation = 41;
@@ -29264,7 +29265,7 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     destination.reset();
     destination.copy_downstream_transport_state_from(source);
     destination.copy_http1_pipeline_state_from(source);
-    CHECK_EQ(destination.downstream_completed_request_count, 9u);
+    CHECK_EQ(destination.downstream_completed_request_count, kCompletedRequests);
     CHECK_EQ(destination.pipeline_depth, 1u);
     CHECK_EQ(destination.pipeline_stash_len, 19u);
     CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
@@ -35784,13 +35785,13 @@ TEST(connection_lifecycle,
     Connection* saturating = loop.alloc_conn();
     REQUIRE(saturating != nullptr);
     REQUIRE_EQ(saturating->id, id);
-    saturating->downstream_completed_request_count = ~u32{0} - 1u;
+    saturating->downstream_completed_request_count = INT64_MAX - 1;
     saturating->req_start_us = monotonic_us();
     on_request_complete<SmallLoop>(&loop, *saturating, 204, 0);
-    REQUIRE_EQ(saturating->downstream_completed_request_count, ~u32{0});
+    REQUIRE_EQ(saturating->downstream_completed_request_count, INT64_MAX);
     saturating->req_start_us = monotonic_us();
     on_request_complete<SmallLoop>(&loop, *saturating, 204, 0);
-    CHECK_EQ(saturating->downstream_completed_request_count, ~u32{0});
+    CHECK_EQ(saturating->downstream_completed_request_count, INT64_MAX);
     saturating->reset();
     CHECK_EQ(saturating->downstream_completed_request_count, 0u);
 }
@@ -46646,6 +46647,35 @@ TEST(iouring_downstream_recv_barrier, recv_aux_and_cancel_metadata_mutations_fai
         CHECK_EQ(fixture.head(), head_before);
         CHECK_EQ(fixture.buffer_tail(), buffer_tail_before);
     }
+}
+
+// In-memory SQ/CQ snapshots exercise the real producer path without entering the kernel.
+TEST(iouring_ring_positions, publish_and_measure_across_rollover) {
+    IoUringBackend backend{};
+    u32 head = UINT32_MAX - 1u;
+    u32 tail = UINT32_MAX;
+    u32 mask = 1;
+    u32 indices[2]{};
+    io_uring_sqe entries[2]{};
+    backend.sq_head = &head;
+    backend.sq_tail = &tail;
+    backend.sq_ring_mask = &mask;
+    backend.sq_ring_entries = 2;
+    backend.sq_array = indices;
+    backend.sq_entries = entries;
+    backend.ring_fd = backend.listen_fd = 1;
+    REQUIRE(backend.sq_has_room());
+    REQUIRE(backend.add_accept());
+    CHECK_EQ(tail, 0u);
+    CHECK_EQ(indices[1], 1u);
+    CHECK_EQ(entries[1].opcode, IORING_OP_ACCEPT);
+    CHECK_FALSE(backend.sq_has_room());
+
+    backend.cq_head = &head;
+    backend.cq_tail = &tail;
+    CHECK_EQ(backend.cq_unharvested(), 2u);
+    head = tail;
+    CHECK_EQ(backend.cq_unharvested(), 0u);
 }
 
 TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_clears_state) {
@@ -60216,8 +60246,7 @@ TEST(response_read_deadline, incomplete_progress_wins_same_batch_timeout_in_both
         CHECK_EQ(conn.response_header_buf.len(), 0u);
         CHECK_EQ(loop->backend.send_state[conn.id].remaining, 0u);
         CHECK_EQ(conn.timer_node.prev,
-                 &loop->timer.slots[(loop->timer.cursor + conn.response_read_deadline_seconds) &
-                                    (TimerWheel::kSlots - 1u)]);
+                 &loop->timer.slots[loop->timer.slot_after(conn.response_read_deadline_seconds)]);
         cleanup_prebuilt_d2(loop, fixture);
     }
 }
@@ -88493,8 +88522,7 @@ TEST(response_read_deadline_fixed_upload_head_batch,
 
                     loop->timer.remove(&conn);
                     loop->timer.add(&conn, 0);
-                    CHECK_EQ(conn.timer_node.prev,
-                             &loop->timer.slots[loop->timer.cursor & (TimerWheel::kSlots - 1u)]);
+                    CHECK_EQ(conn.timer_node.prev, &loop->timer.slots[loop->timer.slot_after(0)]);
                     REQUIRE_EQ(conn.upstream_recv_buf.write(expected.wire, expected.len),
                                expected.len);
                     const IoEvent response = response_read_copy_event(
@@ -88641,9 +88669,9 @@ TEST(response_read_deadline_fixed_upload_head_batch,
                 conn,
                 &on_upstream_response<IoUringEventLoop>,
                 ResponseReadDeadlineOwnerPhase::ArmedForCopy));
-            CHECK_EQ(conn.timer_node.prev,
-                     &loop->timer.slots[(loop->timer.cursor + conn.response_read_deadline_seconds) &
-                                        (TimerWheel::kSlots - 1u)]);
+            CHECK_EQ(
+                conn.timer_node.prev,
+                &loop->timer.slots[loop->timer.slot_after(conn.response_read_deadline_seconds)]);
             CHECK_EQ(health->fails, health_before.fails);
             CHECK_EQ(health->eject_until_us, health_before.eject_until_us);
             CHECK_EQ(health->active_down, health_before.active_down);
@@ -90441,8 +90469,7 @@ TEST(epoll_send, partial_progress_refreshes_timer_without_callback) {
     c->state = ConnState::Sending;
     c->set_slots(nullptr, &on_response_body_sent<EpollEventLoop>, nullptr, nullptr);
     loop->timer.add(c, 1);
-    const u32 expected_slot =
-        (loop->timer.cursor + loop->keepalive_timeout) & (TimerWheel::kSlots - 1u);
+    const u32 expected_slot = loop->timer.slot_after(loop->keepalive_timeout);
 
     loop->dispatch({c->id, 0, 0, 0, IoEventType::Send, 0, kEpollSendProgressAux});
 

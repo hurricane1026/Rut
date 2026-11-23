@@ -280,10 +280,11 @@ bool Rs256Policies::verify(u32 shard,
         Rs256VerifierSet* verifiers = &row.verifiers[i];
         if (auto* remote = row.remote[i]) {
             if (monotonic_ms == ~u64{0}) monotonic_ms = jwt_monotonic_ms();
+            u64 age = 0;
             if (!monotonic_ms || !remote->last_success || remote->empty ||
                 monotonic_ms < remote->last_success ||
-                monotonic_ms - remote->last_success >=
-                    static_cast<u64>(policies_[i].remote().max_age_seconds) * 1000)
+                __builtin_sub_overflow(monotonic_ms, remote->last_success, &age) ||
+                age >= static_cast<u64>(policies_[i].remote().max_age_seconds) * 1000)
                 return false;
             if (remote->use_alternate) verifiers = &remote->alternate;
         }

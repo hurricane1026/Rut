@@ -8,6 +8,18 @@
 
 using namespace rut;
 
+// A stored hash identifies a key. Only the mixing implementation does arithmetic.
+template <typename T>
+constexpr bool supports_hash_arithmetic =
+    requires(T h) { ++h; } || requires(T h) { h++; } || requires(T h) { --h; } ||
+    requires(T h) { h--; } || requires(T h) { h + 1; } || requires(T h) { h - 1; } ||
+    requires(T h) { h + h; } || requires(T h) { h - h; };
+static_assert(!supports_hash_arithmetic<decltype(CacheTable::Slot::key_hash)>);
+
+static_assert(CacheTable::round_capacity(1u << 31) == (1u << 31));
+static_assert(CacheTable::round_capacity((1u << 31) + 1u) == 0);
+static_assert(CacheTable::round_capacity(UINT32_MAX) == 0);
+
 TEST(cache_table, capacity_rounds_up_to_pow2_min_4) {
     CHECK_EQ(CacheTable::round_capacity(1), 4u);
     CHECK_EQ(CacheTable::round_capacity(4), 4u);
@@ -63,8 +75,8 @@ TEST(cache_table, seed_changes_slot_assignment) {
     REQUIRE(b.init(1024, 0x2222u));
     bool any_differs = false;
     for (u32 key = 1; key <= 64 && !any_differs; key++) {
-        const u64 ha = CacheTable::mix(key, a.seed) & (a.set_count - 1);
-        const u64 hb = CacheTable::mix(key, b.seed) & (b.set_count - 1);
+        const u64 ha = a.set_index(a.hash_key(key));
+        const u64 hb = b.set_index(b.hash_key(key));
         any_differs = ha != hb;
     }
     CHECK(any_differs);

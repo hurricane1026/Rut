@@ -12,9 +12,10 @@ inline bool consistent_hash_seed(Str text, u8 (&seed)[16]) {
     for (u32 i = 0; i < 16; ++i) {
         u8 value = 0;
         for (u32 j = 0; j < 2; ++j) {
-            const char c = text.ptr[i * 2 + j];
+            const char c = text.ptr[static_cast<i64>(i) * 2 + static_cast<i64>(j)];
             if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-            value = static_cast<u8>((value << 4) | (c <= '9' ? c - '0' : c - 'a' + 10));
+            value = static_cast<u8>((value << 4) | (c <= '9' ? static_cast<i64>(c - '0')
+                                                             : static_cast<i64>(c - 'a') + 10));
         }
         seed[i] = value;
         nonzero |= value;
@@ -50,19 +51,21 @@ inline bool consistent_hash_digest(Str key, u8 type, Str seed_text, u8 (&digest)
 
 inline u64 consistent_hash_cost(u64 hash) {
     if (hash == 0) hash = 1;
-    const u32 n = 63u - static_cast<u32>(__builtin_clzll(hash));
+    const u32 n = static_cast<u32>(63 - static_cast<i64>(__builtin_clzll(hash)));
     using Wide = unsigned __int128;
-    Wide x = static_cast<Wide>(hash) << (63 - n);
+    Wide x = static_cast<Wide>(hash)
+             << static_cast<u32>(static_cast<i64>(63) - static_cast<i64>(n));
     u64 fraction = 0;
     for (u32 j = 1; j <= 32; ++j) {
         Wide y = (x * x) >> 63;
         if (y >= (static_cast<Wide>(1) << 64)) {
             y >>= 1;
-            fraction |= u64{1} << (32 - j);
+            fraction |= u64{1} << static_cast<u32>(static_cast<i64>(32) - static_cast<i64>(j));
         }
         x = y;
     }
-    return (static_cast<u64>(64 - n) << 32) - fraction;
+    const i64 kWhole = static_cast<i64>(64) - static_cast<i64>(n);
+    return static_cast<u64>((kWhole << 32) - static_cast<i64>(fraction));
 }
 
 inline bool consistent_hash_score(const u8 (&digest)[32], const sockaddr_in& address, u64& cost) {

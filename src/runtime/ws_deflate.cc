@@ -33,13 +33,17 @@ struct WsDeflateCodec {
 namespace {
 voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
     auto& codec = *static_cast<WsDeflateCodec*>(opaque);
-    const u64 kBytes = static_cast<u64>(items) * size;
-    const u32 kStart = (codec.used + 15u) & ~15u;
-    if (kStart > SlicePool::kBulkSliceSize || kBytes > SlicePool::kBulkSliceSize - kStart)
+    u64 kBytes = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(items), static_cast<u64>(size), &kBytes))
         return nullptr;
-    u8* const kResult = reinterpret_cast<u8*>(&codec) + kStart;
+    const u32 kStart = static_cast<u32>((static_cast<i64>(codec.used) + 15) & ~15ll);
+    if (kStart > SlicePool::kBulkSliceSize ||
+        kBytes > static_cast<u64>(static_cast<i64>(SlicePool::kBulkSliceSize) -
+                                  static_cast<i64>(kStart)))
+        return nullptr;
+    u8* const kResult = reinterpret_cast<u8*>(&codec) + static_cast<i64>(kStart);
     memset(kResult, 0, kBytes);
-    codec.used = kStart + static_cast<u32>(kBytes);
+    codec.used = static_cast<u32>(static_cast<i64>(kStart) + static_cast<i64>(kBytes));
     return kResult;
 }
 void codec_free(voidpf, voidpf) {}
@@ -52,14 +56,18 @@ WsDeflateStatus inflate_bytes(
     for (;;) {
         u8 excess = 0;
         const bool kAtLimit = codec.decoded == codec.decoded_limit;
-        stream.next_out = kAtLimit ? &excess : output + codec.decoded;
-        stream.avail_out = kAtLimit ? 1u : codec.decoded_limit - codec.decoded;
+        stream.next_out = kAtLimit ? &excess : output + static_cast<i64>(codec.decoded);
+        stream.avail_out = kAtLimit ? 1u
+                                    : static_cast<u32>(static_cast<i64>(codec.decoded_limit) -
+                                                       static_cast<i64>(codec.decoded));
         const u32 kBeforeInput = stream.avail_in;
         const u32 kBeforeOutput = stream.avail_out;
         const int kStatus = inflate(&stream, Z_BLOCK);
-        const u32 kProduced = kBeforeOutput - stream.avail_out;
+        const u32 kProduced =
+            static_cast<u32>(static_cast<i64>(kBeforeOutput) - static_cast<i64>(stream.avail_out));
         if (kAtLimit && kProduced) return WsDeflateStatus::Limit;
-        codec.decoded += kProduced;
+        codec.decoded =
+            static_cast<u32>(static_cast<i64>(codec.decoded) + static_cast<i64>(kProduced));
         boundary = (stream.data_type & 128) != 0 && (stream.data_type & 63) == 0;
         if (kStatus == Z_STREAM_END) {
             // RFC 7692 permits BFINAL=1 followed by further blocks. Keep the
@@ -91,7 +99,7 @@ WsDeflateCodec* ws_deflate_create(SlicePool& pool, WsDeflateOptions options) {
     codec->encoder.zalloc = codec_alloc;
     codec->encoder.zfree = codec_free;
     codec->encoder.opaque = codec;
-    const int kDecode = inflateInit2(&codec->decoder, -options.receive_window);
+    const int kDecode = inflateInit2(&codec->decoder, -static_cast<int>(options.receive_window));
     if (kDecode != Z_OK) {
         pool.free(kStorage);
         return nullptr;
@@ -151,22 +159,28 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
     *output_len = 0;
     if (!codec.decoding || !output || capacity < codec.decoded_limit || (!input && length))
         return WsDeflateStatus::Error;
-    if (length > ws_deflate_wire_limit(codec.decoded_limit) - codec.wire_bytes) {
+    if (static_cast<i64>(length) > static_cast<i64>(ws_deflate_wire_limit(codec.decoded_limit)) -
+                                       static_cast<i64>(codec.wire_bytes)) {
         codec.decoding = false;
         codec.failed = true;
         return WsDeflateStatus::Limit;
     }
-    codec.wire_bytes += length;
+    codec.wire_bytes =
+        static_cast<u32>(static_cast<i64>(codec.wire_bytes) + static_cast<i64>(length));
     bool boundary = false;
     u32 offset = 0;
     do {
-        const u32 kTake = length - offset < sizeof(codec.scratch)
-                              ? length - offset
-                              : static_cast<u32>(sizeof(codec.scratch));
-        const u8* source = input ? input + offset : nullptr;
+        const u32 remaining = static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(offset));
+        const u32 kTake =
+            remaining < sizeof(codec.scratch) ? remaining : static_cast<u32>(sizeof(codec.scratch));
+        const u8* source = input ? input + static_cast<i64>(offset) : nullptr;
         if (mask_key && kTake) {
             memcpy(codec.scratch, source, kTake);
-            ws_unmask_chunk(codec.scratch, kTake, mask_key, mask_offset + offset);
+            ws_unmask_chunk(codec.scratch,
+                            kTake,
+                            mask_key,
+                            static_cast<u64>(static_cast<i64>(mask_offset & 3) +
+                                             static_cast<i64>(static_cast<u64>(offset) & 3)));
             source = codec.scratch;
         }
         const auto kStatus = inflate_bytes(codec, source, kTake, output, boundary);
@@ -175,7 +189,7 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
             codec.failed = true;
             return kStatus;
         }
-        offset += kTake;
+        offset = static_cast<u32>(static_cast<i64>(offset) + static_cast<i64>(kTake));
     } while (offset < length);
     if (final) {
         static constexpr u8 kTail[] = {0, 0, 0xff, 0xff};
@@ -206,12 +220,15 @@ WsDeflateStatus ws_deflate_payload(
     const int kStatus = deflate(&stream, Z_SYNC_FLUSH);
     if (kStatus != Z_OK) return WsDeflateStatus::Error;
     if (stream.avail_in || stream.avail_out == 0) return WsDeflateStatus::Limit;
-    const u32 kWritten = capacity - stream.avail_out;
+    const u32 kWritten =
+        static_cast<u32>(static_cast<i64>(capacity) - static_cast<i64>(stream.avail_out));
     static constexpr u8 kTail[] = {0, 0, 0xff, 0xff};
     if (kWritten < sizeof(kTail) ||
-        memcmp(output + kWritten - sizeof(kTail), kTail, sizeof(kTail)) != 0)
+        memcmp(output + static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)),
+               kTail,
+               sizeof(kTail)) != 0)
         return WsDeflateStatus::Error;
-    *output_len = kWritten - sizeof(kTail);
+    *output_len = static_cast<u32>(static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)));
     return WsDeflateStatus::Ok;
 }
 }  // namespace rut

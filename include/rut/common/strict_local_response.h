@@ -24,7 +24,7 @@ static constexpr u32 kMaxExactStrictLocalResponsePathLen = kMaxExactPathViewLen;
 // byte is named and validated so forged padding can never hide activation.
 // Runtime ownership and selection are deliberately later increments.
 struct ExactStrictLocalResponseBinding {
-    char path[kMaxExactStrictLocalResponsePathLen + 1]{};
+    char path[static_cast<i64>(kMaxExactStrictLocalResponsePathLen) + 1]{};
     u8 path_len = 0;
     u8 method = 0;
     ExactPathView path_view = ExactPathView::Raw;
@@ -274,8 +274,11 @@ inline bool strict_local_response_policy_table_valid_impl(
             return false;
         const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
         for (const Str field : fields) {
-            if (field.len > kMaxStrictLocalResponsePolicyBytes - total_bytes) return false;
-            total_bytes += field.len;
+            if (static_cast<i64>(field.len) > static_cast<i64>(kMaxStrictLocalResponsePolicyBytes) -
+                                                  static_cast<i64>(total_bytes))
+                return false;
+            total_bytes =
+                static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(field.len));
         }
     }
 
@@ -284,8 +287,8 @@ inline bool strict_local_response_policy_table_valid_impl(
     for (u32 slot = 0; slot < method_slot_count; slot++) {
         const u16 id = method_policy_ids[slot];
         if (id == 0) continue;
-        if (id > policy_count || referenced[id - 1]) return false;
-        referenced[id - 1] = true;
+        if (id > policy_count || referenced[static_cast<i64>(id) - 1]) return false;
+        referenced[static_cast<i64>(id) - 1] = true;
         reference_count++;
     }
     if (reference_count != policy_count) return false;
@@ -345,16 +348,19 @@ inline bool strict_local_response_source_table_valid_impl(
             return false;
         const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
         for (const Str field : fields) {
-            if (field.len > kMaxStrictLocalResponsePolicyBytes - total_bytes) return false;
-            total_bytes += field.len;
+            if (static_cast<i64>(field.len) > static_cast<i64>(kMaxStrictLocalResponsePolicyBytes) -
+                                                  static_cast<i64>(total_bytes))
+                return false;
+            total_bytes =
+                static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(field.len));
         }
     }
 
     bool referenced[kMaxStrictLocalResponsePolicies]{};
     u32 reference_count = 0;
     auto add_reference = [&](u16 id) {
-        if (id == 0 || id > policy_count || referenced[id - 1]) return false;
-        referenced[id - 1] = true;
+        if (id == 0 || id > policy_count || referenced[static_cast<i64>(id) - 1]) return false;
+        referenced[static_cast<i64>(id) - 1] = true;
         reference_count++;
         return true;
     };
@@ -364,7 +370,8 @@ inline bool strict_local_response_source_table_valid_impl(
         if (id == 0) continue;
         if (!add_reference(id)) return false;
         if (slot == kStrictLocalResponseHeadMethodSlot &&
-            policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            policies[static_cast<i64>(id) - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
             return false;
     }
     for (u32 slot = 0; slot < kStrictLocalResponseMethodSlots; slot++) {
@@ -373,7 +380,8 @@ inline bool strict_local_response_source_table_valid_impl(
         if (!add_reference(id)) return false;
         if ((slot == kStrictLocalResponseAnyMethodSlot ||
              slot == kStrictLocalResponseHeadMethodSlot) &&
-            policies[id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            policies[static_cast<i64>(id) - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
             return false;
     }
     for (u32 i = 0; i < exact_binding_capacity; i++) {
@@ -387,7 +395,8 @@ inline bool strict_local_response_source_table_valid_impl(
             return false;
         if ((binding.method == kStrictLocalResponseAnyMethodSlot ||
              binding.method == kStrictLocalResponseHeadMethodSlot) &&
-            policies[binding.policy_id - 1].head_mode != StrictLocalResponseHeadMode::SuppressBody)
+            policies[static_cast<i64>(binding.policy_id) - 1].head_mode !=
+                StrictLocalResponseHeadMode::SuppressBody)
             return false;
         for (u32 prior = 0; prior < i; prior++) {
             const auto& earlier = exact_bindings[prior];

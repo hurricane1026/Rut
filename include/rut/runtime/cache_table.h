@@ -32,8 +32,15 @@
 namespace rut {
 
 struct CacheTable {
+    struct KeyHash {
+        u64 value;
+
+        friend constexpr bool operator==(KeyHash, KeyHash) = default;
+    };
+    static constexpr KeyHash kEmptyHash{0};
+
     struct Slot {
-        u64 key_hash;  // full mixed hash; 0 = empty (mix() never returns 0)
+        KeyHash key_hash;
         i64 value;
     };
     static constexpr u32 kWays = 4;  // set = 64 B = one cache line
@@ -46,7 +53,8 @@ struct CacheTable {
     // capacity == slot count, rounded UP to the next power of two (min 4).
     // Provisioning headroom (e.g. 2× the expected key count) is the
     // declarer's job — the table never grows.
-    static u32 round_capacity(u32 requested) {
+    // Zero means the rounded power of two is not representable in u32.
+    static constexpr u32 round_capacity(u32 requested) {
         u32 c = requested < kWays ? kWays : requested;
         c--;
         c |= c >> 1;
@@ -54,12 +62,14 @@ struct CacheTable {
         c |= c >> 4;
         c |= c >> 8;
         c |= c >> 16;
-        return c + 1;
+        // The low 32 bits of the unrepresentable capacity 2^32 give the zero sentinel.
+        return static_cast<u32>(static_cast<u64>(c) + 1u);
     }
 
     bool init(u32 requested_capacity, u64 mix_seed) {
         destroy();
         const u32 count = round_capacity(requested_capacity);
+        if (count == 0) return false;
         void* mem = ::mmap(nullptr,
                            static_cast<u64>(count) * sizeof(Slot),
                            PROT_READ | PROT_WRITE,
@@ -91,12 +101,16 @@ struct CacheTable {
         return h == 0 ? 1 : h;
     }
 
+    KeyHash hash_key(u32 key) const { return KeyHash{mix(key, seed)}; }
+
+    u32 set_index(KeyHash hash) const { return static_cast<u32>(hash.value & (set_count - 1)); }
+
     bool get(u32 key, i64* out) const {
         if (slots == nullptr) return false;
-        const u64 h = mix(key, seed);
-        Slot* set = slots + (h & (set_count - 1)) * kWays;
+        const KeyHash hash = hash_key(key);
+        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
         for (u32 w = 0; w < kWays; w++) {
-            if (set[w].key_hash == h) {
+            if (set[w].key_hash == hash) {
                 *out = set[w].value;
                 return true;
             }
@@ -106,16 +120,16 @@ struct CacheTable {
 
     void set(u32 key, i64 value) {
         if (slots == nullptr) return;
-        const u64 h = mix(key, seed);
-        Slot* set = slots + (h & (set_count - 1)) * kWays;
+        const KeyHash hash = hash_key(key);
+        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
         u32 victim = 0;
         for (u32 w = 0; w < kWays; w++) {
-            if (set[w].key_hash == h) {  // match → update in place
+            if (set[w].key_hash == hash) {  // match → update in place
                 set[w].value = value;
                 return;
             }
-            if (set[w].key_hash == 0) {  // empty → insert
-                set[w].key_hash = h;
+            if (set[w].key_hash == kEmptyHash) {  // empty → insert
+                set[w].key_hash = hash;
                 set[w].value = value;
                 return;
             }
@@ -123,7 +137,7 @@ struct CacheTable {
         }
         // Full set → evict the min-value slot (most-idle under GCRA tats,
         // oldest window under packed sliding windows).
-        set[victim].key_hash = h;
+        set[victim].key_hash = hash;
         set[victim].value = value;
     }
 };

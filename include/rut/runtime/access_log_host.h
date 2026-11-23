@@ -115,10 +115,13 @@ inline bool access_log_header_view_in_bounds(Str view,
         header_end > receive_length)
         return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(receive_data);
-    if (begin > UINTPTR_MAX - header_end) return false;
-    const uintptr_t end = begin + header_end;
+    uintptr_t end = 0;
+    if (__builtin_add_overflow(begin, static_cast<uintptr_t>(header_end), &end)) return false;
     const uintptr_t address = reinterpret_cast<uintptr_t>(view.ptr);
-    if (address < begin || address > end || view.len > end - address) return false;
+    uintptr_t remaining = 0;
+    if (address < begin || address > end || __builtin_sub_overflow(end, address, &remaining) ||
+        static_cast<uintptr_t>(view.len) > remaining)
+        return false;
     return true;
 }
 

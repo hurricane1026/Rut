@@ -33,16 +33,22 @@ inline bool utf8_valid(const u8* s, u64 n) {
         } else {
             return false;  // 0x80-0xBF lead, or 0xF8+ (5/6-byte forms)
         }
-        if (i + extra >= n) return false;  // truncated multibyte sequence
+        u64 remaining = 0;
+        if (__builtin_sub_overflow(n, i, &remaining) || extra >= remaining)
+            return false;  // truncated multibyte sequence
         for (u64 k = 1; k <= extra; k++) {
-            const u8 cc = s[i + k];
+            u64 offset = 0;
+            if (__builtin_add_overflow(i, k, &offset)) return false;
+            const u8 cc = s[offset];
             if ((cc & 0xC0) != 0x80) return false;  // not a continuation byte
             cp = (cp << 6) | (cc & 0x3F);
         }
         if (cp < min_cp) return false;                   // overlong encoding
         if (cp > 0x10FFFF) return false;                 // beyond Unicode
         if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // UTF-16 surrogate half
-        i += extra + 1;
+        u64 step = 0;
+        if (__builtin_add_overflow(extra, u64{1}, &step) || __builtin_add_overflow(i, step, &i))
+            return false;
     }
     return true;
 }

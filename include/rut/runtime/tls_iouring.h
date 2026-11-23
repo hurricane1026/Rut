@@ -230,13 +230,17 @@ TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& 
     while (off < len) {
         tls_engine_set_output(c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
         TlsOp st = TlsOp::Ok;
-        const i32 kW = tls_engine_write(c.tls_engine, src + off, len - off, st);
+        const i32 kW =
+            tls_engine_write(c.tls_engine,
+                             src + static_cast<i64>(off),
+                             static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(off)),
+                             st);
         c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));  // commit every pass
         if (kW > 0) {
-            off += static_cast<u32>(kW);
+            off = static_cast<u32>(static_cast<i64>(off) + static_cast<i64>(kW));
             if (!defer_initial_drain || off == len) {
                 if (!tls_ensure_draining<Self>(loop, c)) {
-                    out_consumed = off - static_cast<u32>(kW);
+                    out_consumed = static_cast<u32>(static_cast<i64>(off) - static_cast<i64>(kW));
                     return TlsFill::Fatal;
                 }
                 defer_initial_drain = false;
@@ -367,8 +371,13 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
         u32 consumed = 0;
         const TlsFill kSt = tls_fill_output<Self>(
-            loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
-        c.tls_send_off += consumed;
+            loop,
+            c,
+            c.tls_send_src + static_cast<i64>(c.tls_send_off),
+            static_cast<u32>(static_cast<i64>(c.tls_send_len) - static_cast<i64>(c.tls_send_off)),
+            consumed);
+        c.tls_send_off =
+            static_cast<u32>(static_cast<i64>(c.tls_send_off) + static_cast<i64>(consumed));
         if (kSt == TlsFill::Fatal) {
             loop->close_conn(c);
             return;
@@ -656,7 +665,8 @@ void tls_process(Self* loop, Connection& c) {
         IoEvent pev = {};
         pev.conn_id = c.id;
         pev.type = IoEventType::Recv;
-        pev.result = static_cast<i32>(c.recv_buf.len() - kBefore);
+        pev.result =
+            static_cast<i32>(static_cast<i64>(c.recv_buf.len()) - static_cast<i64>(kBefore));
         auto pending_recv = c.tls_pending_on_recv;
         if (c.tls_send_owner_generation != 0 &&
             pending_recv != &tls_resume_pending_send_recv<Self>) {
@@ -673,12 +683,15 @@ void tls_process(Self* loop, Connection& c) {
             c.tls_pending_on_recv = nullptr;
             if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
                 u32 consumed = 0;
-                const TlsFill kFs = tls_fill_output<Self>(loop,
-                                                          c,
-                                                          c.tls_send_src + c.tls_send_off,
-                                                          c.tls_send_len - c.tls_send_off,
-                                                          consumed);
-                c.tls_send_off += consumed;
+                const TlsFill kFs =
+                    tls_fill_output<Self>(loop,
+                                          c,
+                                          c.tls_send_src + static_cast<i64>(c.tls_send_off),
+                                          static_cast<u32>(static_cast<i64>(c.tls_send_len) -
+                                                           static_cast<i64>(c.tls_send_off)),
+                                          consumed);
+                c.tls_send_off =
+                    static_cast<u32>(static_cast<i64>(c.tls_send_off) + static_cast<i64>(consumed));
                 if (kFs == TlsFill::Fatal) {
                     loop->close_conn(c);
                     return;
@@ -990,8 +1003,13 @@ void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent /*ev*/) {
     TlsFill kSt = TlsFill::Done;
     if (c.tls_send_src && c.tls_send_off < c.tls_send_len) {
         kSt = tls_fill_output<Self>(
-            loop, c, c.tls_send_src + c.tls_send_off, c.tls_send_len - c.tls_send_off, consumed);
-        c.tls_send_off += consumed;
+            loop,
+            c,
+            c.tls_send_src + static_cast<i64>(c.tls_send_off),
+            static_cast<u32>(static_cast<i64>(c.tls_send_len) - static_cast<i64>(c.tls_send_off)),
+            consumed);
+        c.tls_send_off =
+            static_cast<u32>(static_cast<i64>(c.tls_send_off) + static_cast<i64>(consumed));
     } else if (c.tls_send_off != c.tls_send_len) {
         loop->close_conn(c);
         return;

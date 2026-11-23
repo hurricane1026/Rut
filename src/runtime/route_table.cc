@@ -95,12 +95,14 @@ bool RouteConfig::add_rs256_configuration(Str value) {
         if (rs256_configurations[i].eq(value)) return true;
     if (!value.ptr || value.len == 0 || value.len > Rs256Policy::kMaxText ||
         rs256_configuration_count == Rs256Policies::kMaxPolicies ||
-        value.len > sizeof(rs256_configuration_bytes) - rs256_configuration_bytes_used)
+        static_cast<i64>(value.len) > static_cast<i64>(sizeof(rs256_configuration_bytes)) -
+                                          static_cast<i64>(rs256_configuration_bytes_used))
         return false;
-    char* out = rs256_configuration_bytes + rs256_configuration_bytes_used;
+    char* out = rs256_configuration_bytes + static_cast<i64>(rs256_configuration_bytes_used);
     __builtin_memcpy(out, value.ptr, value.len);
     rs256_configurations[rs256_configuration_count++] = {out, value.len};
-    rs256_configuration_bytes_used += value.len;
+    rs256_configuration_bytes_used = static_cast<u32>(
+        static_cast<i64>(rs256_configuration_bytes_used) + static_cast<i64>(value.len));
     return true;
 }
 
@@ -112,12 +114,14 @@ bool RouteConfig::add_es256_configuration(Str value) {
         if (es256_configurations[i].eq(value)) return true;
     if (!value.ptr || value.len == 0 || value.len > Es256Policy::kMaxText ||
         es256_configuration_count == Es256Policies::kMaxPolicies ||
-        value.len > sizeof(es256_configuration_bytes) - es256_configuration_bytes_used)
+        static_cast<i64>(value.len) > static_cast<i64>(sizeof(es256_configuration_bytes)) -
+                                          static_cast<i64>(es256_configuration_bytes_used))
         return false;
-    char* out = es256_configuration_bytes + es256_configuration_bytes_used;
+    char* out = es256_configuration_bytes + static_cast<i64>(es256_configuration_bytes_used);
     __builtin_memcpy(out, value.ptr, value.len);
     es256_configurations[es256_configuration_count++] = {out, value.len};
-    es256_configuration_bytes_used += value.len;
+    es256_configuration_bytes_used = static_cast<u32>(
+        static_cast<i64>(es256_configuration_bytes_used) + static_cast<i64>(value.len));
     return true;
 }
 
@@ -127,22 +131,29 @@ u16 RouteConfig::add_validated_strict_local_response_policy(
         strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes)
         return 0;
     for (u32 i = 0; i < strict_local_response_policy_count; i++) {
-        if (!strict_local_response_policy_id_is_owned(static_cast<u16>(i + 1))) return 0;
+        if (!strict_local_response_policy_id_is_owned(static_cast<u16>(static_cast<i64>(i) + 1)))
+            return 0;
         if (strict_local_response_policy_spec_equal(strict_local_response_policies[i], policy))
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     }
     if (strict_local_response_policy_count == kMaxStrictLocalResponsePolicies) return 0;
     u32 total = 0;
     const Str fields[] = {policy.reason, policy.content_type, policy.server, policy.body};
     for (Str field : fields) {
-        if (field.len > kStrictLocalResponseBytesPoolBytes - total) return 0;
-        total += field.len;
+        if (static_cast<i64>(field.len) >
+            static_cast<i64>(kStrictLocalResponseBytesPoolBytes) - static_cast<i64>(total))
+            return 0;
+        total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(field.len));
     }
-    if (total > kStrictLocalResponseBytesPoolBytes - strict_local_response_bytes_used) return 0;
+    if (static_cast<i64>(total) > static_cast<i64>(kStrictLocalResponseBytesPoolBytes) -
+                                      static_cast<i64>(strict_local_response_bytes_used))
+        return 0;
     auto copy = [&](Str src, Str& dst) {
-        char* out = strict_local_response_bytes + strict_local_response_bytes_used;
+        char* out =
+            strict_local_response_bytes + static_cast<i64>(strict_local_response_bytes_used);
         if (src.len != 0) __builtin_memcpy(out, src.ptr, src.len);
-        strict_local_response_bytes_used += src.len;
+        strict_local_response_bytes_used = static_cast<u32>(
+            static_cast<i64>(strict_local_response_bytes_used) + static_cast<i64>(src.len));
         dst = {out, src.len};
     };
     auto& dst = strict_local_response_policies[strict_local_response_policy_count];
@@ -177,7 +188,7 @@ bool RouteConfig::set_unmatched_policy_id(u8 method_key, u16 policy_id) {
         !strict_local_response_policy_id_is_owned(policy_id) || unmatched_policy_ids[slot] != 0)
         return false;
     if ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-        strict_local_response_policies[policy_id - 1].head_mode !=
+        strict_local_response_policies[static_cast<i64>(policy_id) - 1].head_mode !=
             StrictLocalResponseHeadMode::SuppressBody)
         return false;
     unmatched_policy_ids[slot] = policy_id;
@@ -189,8 +200,9 @@ bool RouteConfig::set_pre_route_policy_id(u8 method_key, u16 policy_id) {
     if (slot == kRouteMethodSlotInvalid || slot == kRouteMethodAny || policy_id == 0 ||
         !strict_local_response_policy_id_is_owned(policy_id) || pre_route_policy_ids[slot] != 0)
         return false;
-    if (slot == kRouteMethodHead && strict_local_response_policies[policy_id - 1].head_mode !=
-                                        StrictLocalResponseHeadMode::SuppressBody)
+    if (slot == kRouteMethodHead &&
+        strict_local_response_policies[static_cast<i64>(policy_id) - 1].head_mode !=
+            StrictLocalResponseHeadMode::SuppressBody)
         return false;
     pre_route_policy_ids[slot] = policy_id;
     return true;
@@ -205,7 +217,7 @@ bool RouteConfig::append_exact_strict_local_response_binding(
     const u32 slot = route_method_slot_from_key(source.method);
     if (slot == kRouteMethodSlotInvalid ||
         ((slot == kRouteMethodAny || slot == kRouteMethodHead) &&
-         strict_local_response_policies[owned_policy_id - 1].head_mode !=
+         strict_local_response_policies[static_cast<i64>(owned_policy_id) - 1].head_mode !=
              StrictLocalResponseHeadMode::SuppressBody))
         return false;
     for (u32 i = 0; i < exact_strict_local_response_binding_count; i++) {
@@ -241,13 +253,17 @@ bool RouteConfig::copy_validated_strict_local_response_table_from_owned(const Ro
         if (out == nullptr || !source.strict_local_response_bytes_owned(value)) return false;
         const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
         if (address < source_base) return false;
-        const uintptr_t wide_offset = address - source_base;
+        uintptr_t wide_offset = 0;
+        if (__builtin_sub_overflow(address, source_base, &wide_offset)) return false;
         if (wide_offset > source.strict_local_response_bytes_used ||
             wide_offset > kStrictLocalResponseBytesPoolBytes)
             return false;
         const u32 offset = static_cast<u32>(wide_offset);
-        if (value.len > source.strict_local_response_bytes_used - offset ||
-            value.len > kStrictLocalResponseBytesPoolBytes - offset)
+        if (static_cast<i64>(value.len) >
+                static_cast<i64>(source.strict_local_response_bytes_used) -
+                    static_cast<i64>(offset) ||
+            static_cast<i64>(value.len) >
+                static_cast<i64>(kStrictLocalResponseBytesPoolBytes) - static_cast<i64>(offset))
             return false;
         *out = offset;
         return true;
@@ -275,10 +291,13 @@ bool RouteConfig::copy_validated_strict_local_response_table_from_owned(const Ro
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
         dst.header_order = src.header_order;
-        dst.reason = {strict_local_response_bytes + offsets[i][0], src.reason.len};
-        dst.content_type = {strict_local_response_bytes + offsets[i][1], src.content_type.len};
-        dst.server = {strict_local_response_bytes + offsets[i][2], src.server.len};
-        dst.body = {strict_local_response_bytes + offsets[i][3], src.body.len};
+        dst.reason = {strict_local_response_bytes + static_cast<i64>(offsets[i][0]),
+                      src.reason.len};
+        dst.content_type = {strict_local_response_bytes + static_cast<i64>(offsets[i][1]),
+                            src.content_type.len};
+        dst.server = {strict_local_response_bytes + static_cast<i64>(offsets[i][2]),
+                      src.server.len};
+        dst.body = {strict_local_response_bytes + static_cast<i64>(offsets[i][3]), src.body.len};
     }
     strict_local_response_bytes_used = source.strict_local_response_bytes_used;
     strict_local_response_policy_count = source.strict_local_response_policy_count;
@@ -437,7 +456,7 @@ bool RouteConfig::add_ws_terminate(const char* path,
                                      subprotocol))
         return false;
     if (!add_proxy(path, method, upstream_id)) return false;
-    auto& r = routes[route_count - 1];
+    auto& r = routes[static_cast<i64>(route_count) - 1];
     set_ws_terminate_metadata(r,
                               handler,
                               max_message_size,
@@ -564,7 +583,7 @@ bool RouteConfig::add_route_rate_limit_key(u32 idx,
     const RateLimitRuleSet previous_rules = rs;
     u64 previous_ids[kMaxRateLimitRules];
     for (u32 i = 0; i < kMaxRateLimitRules; i++) previous_ids[i] = routes[idx].rate_limit_ids[i];
-    if (!rs.rules[rs.count - 1].key.add(kind, name, name_len)) return false;
+    if (!rs.rules[static_cast<i64>(rs.count) - 1].key.add(kind, name, name_len)) return false;
     if (refresh_route_rate_limit_ids(idx)) return true;
     rs = previous_rules;
     for (u32 i = 0; i < kMaxRateLimitRules; i++) routes[idx].rate_limit_ids[i] = previous_ids[i];
@@ -744,7 +763,8 @@ bool RouteConfig::add_verified_jit_handler(const char* path,
     if (forward_preflight_mode_can_own_runtime_deadline(forward_preflight_mode) &&
         (!policy_bundle_id_is_valid(preflight_forward_policy_bundle_id) ||
          !response_read_timeout_seconds_valid(
-             policy_bundles[preflight_forward_policy_bundle_id - 1].response_read_timeout_seconds)))
+             policy_bundles[static_cast<i64>(preflight_forward_policy_bundle_id) - 1]
+                 .response_read_timeout_seconds)))
         return false;
     if (!is_routable_path(path)) return false;
     if (!dispatch_accepts_path_shape(path)) return false;
@@ -755,17 +775,19 @@ bool RouteConfig::add_verified_jit_handler(const char* path,
         (needs_req_body || method_key == kRouteMethodAny ||
          !complete_content_length_route_method_is_admitted(method_key) ||
          !forward_response_buffering_uses_content_length_machinery(
-             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering)))
+             policy_bundles[static_cast<i64>(preflight_forward_policy_bundle_id) - 1]
+                 .response_buffering)))
         return false;
     if (forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection &&
         (needs_req_body ||
          ((method_key != kRouteMethodHead && method_key != kRouteMethodGet) ||
           (method_key == kRouteMethodHead &&
-           policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
-               ForwardResponseBufferingMode::None) ||
+           policy_bundles[static_cast<i64>(preflight_forward_policy_bundle_id) - 1]
+                   .response_buffering != ForwardResponseBufferingMode::None) ||
           (method_key == kRouteMethodGet &&
            !forward_response_buffering_uses_content_length_machinery(
-               policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering)))))
+               policy_bundles[static_cast<i64>(preflight_forward_policy_bundle_id) - 1]
+                   .response_buffering)))))
         return false;
     auto& r = routes[route_count];
     r.path_len = 0;
@@ -836,13 +858,15 @@ u16 RouteConfig::add_response_body(const char* data, u32 len) {
     // Subtraction-based capacity check: `body_pool_used + len`
     // would wrap on a large u32 `len` and silently pass, leading
     // to an out-of-bounds write into body_pool.
-    if (len > kResponseBodyPoolBytes - body_pool_used) return 0;
-    char* dst = body_pool + body_pool_used;
+    if (static_cast<i64>(len) >
+        static_cast<i64>(kResponseBodyPoolBytes) - static_cast<i64>(body_pool_used))
+        return 0;
+    char* dst = body_pool + static_cast<i64>(body_pool_used);
     for (u32 i = 0; i < len; i++) dst[i] = data[i];
-    body_pool_used += len;
+    body_pool_used = static_cast<u32>(static_cast<i64>(body_pool_used) + static_cast<i64>(len));
     const u32 idx = response_body_count++;
     response_bodies[idx] = {dst, len};
-    return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    return static_cast<u16>(static_cast<i64>(idx) + 1);  // 1-based; 0 reserved
 }
 
 u16 RouteConfig::add_response_body_view(const char* data, u32 len) {
@@ -851,7 +875,7 @@ u16 RouteConfig::add_response_body_view(const char* data, u32 len) {
         return 0;
     const u32 idx = response_body_count++;
     response_bodies[idx] = {data, len};
-    return static_cast<u16>(idx + 1);
+    return static_cast<u16>(static_cast<i64>(idx) + 1);
 }
 
 u16 RouteConfig::add_response_header_set(const char* const* keys,
@@ -869,7 +893,9 @@ u16 RouteConfig::add_response_header_set(const char* const* keys,
     // never silently drop trailing pairs.
     if (count > kMaxHeadersPerSet) return 0;
     // Subtraction-based capacity check on the (key, value) arrays.
-    if (count > kMaxHeaderPoolEntries - header_pool_used) return 0;
+    if (static_cast<i64>(count) >
+        static_cast<i64>(kMaxHeaderPoolEntries) - static_cast<i64>(header_pool_used))
+        return 0;
     // Tally total bytes we're about to write; reject if the bytes
     // pool can't fit them. Also validate each (key, value) pair
     // via the shared HTTP header validator — parity with the DSL
@@ -888,48 +914,67 @@ u16 RouteConfig::add_response_header_set(const char* const* keys,
             return 0;
         }
         // Guard each add individually against u32 overflow.
-        if (key_lens[i] > 0xffffffffu - total_bytes) return 0;
-        total_bytes += key_lens[i];
-        if (value_lens[i] > 0xffffffffu - total_bytes) return 0;
-        total_bytes += value_lens[i];
+        if (static_cast<i64>(key_lens[i]) >
+            static_cast<i64>(UINT32_MAX) - static_cast<i64>(total_bytes))
+            return 0;
+        total_bytes =
+            static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(key_lens[i]));
+        if (static_cast<i64>(value_lens[i]) >
+            static_cast<i64>(UINT32_MAX) - static_cast<i64>(total_bytes))
+            return 0;
+        total_bytes =
+            static_cast<u32>(static_cast<i64>(total_bytes) + static_cast<i64>(value_lens[i]));
     }
-    if (total_bytes > kResponseHeaderBytesPoolBytes - header_bytes_pool_used) return 0;
+    if (static_cast<i64>(total_bytes) >
+        static_cast<i64>(kResponseHeaderBytesPoolBytes) - static_cast<i64>(header_bytes_pool_used))
+        return 0;
     const u16 offset = static_cast<u16>(header_pool_used);
     for (u32 i = 0; i < count; i++) {
-        char* key_dst = header_bytes_pool + header_bytes_pool_used;
+        char* key_dst = header_bytes_pool + static_cast<i64>(header_bytes_pool_used);
         for (u32 j = 0; j < key_lens[i]; j++) key_dst[j] = keys[i][j];
-        header_bytes_pool_used += key_lens[i];
-        char* val_dst = header_bytes_pool + header_bytes_pool_used;
+        header_bytes_pool_used = static_cast<u32>(static_cast<i64>(header_bytes_pool_used) +
+                                                  static_cast<i64>(key_lens[i]));
+        char* val_dst = header_bytes_pool + static_cast<i64>(header_bytes_pool_used);
         for (u32 j = 0; j < value_lens[i]; j++) val_dst[j] = values[i][j];
-        header_bytes_pool_used += value_lens[i];
-        header_keys[offset + i] = {key_dst, key_lens[i]};
-        header_values[offset + i] = {val_dst, value_lens[i]};
+        header_bytes_pool_used = static_cast<u32>(static_cast<i64>(header_bytes_pool_used) +
+                                                  static_cast<i64>(value_lens[i]));
+        header_keys[static_cast<i64>(offset) + static_cast<i64>(i)] = {key_dst, key_lens[i]};
+        header_values[static_cast<i64>(offset) + static_cast<i64>(i)] = {val_dst, value_lens[i]};
     }
-    header_pool_used += count;
+    header_pool_used =
+        static_cast<u32>(static_cast<i64>(header_pool_used) + static_cast<i64>(count));
     const u32 idx = response_header_set_count++;
     response_header_sets[idx] = {offset, static_cast<u16>(count)};
-    return static_cast<u16>(idx + 1);  // 1-based; 0 reserved
+    return static_cast<u16>(static_cast<i64>(idx) + 1);  // 1-based; 0 reserved
 }
 
 u16 RouteConfig::add_response_policy(const ForwardResponsePolicySpec& policy) {
     if (!response_policy_spec_valid(policy)) return 0;
     for (u32 i = 0; i < response_policy_count; i++) {
         if (response_policy_spec_equal(response_policies[i], policy))
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     }
     if (response_policy_count >= kMaxResponsePolicies) return 0;
     u32 total = policy.server.len;
-    if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+    if (static_cast<i64>(total) > static_cast<i64>(kResponsePolicyBytesPoolBytes) -
+                                      static_cast<i64>(response_policy_bytes_used))
+        return 0;
     for (u32 i = 0; i < policy.hide_header_count; i++) {
-        if (policy.hide_headers[i].len > 0xffffffffu - total) return 0;
-        total += policy.hide_headers[i].len;
+        if (static_cast<i64>(policy.hide_headers[i].len) >
+            static_cast<i64>(UINT32_MAX) - static_cast<i64>(total))
+            return 0;
+        total = static_cast<u32>(static_cast<i64>(total) +
+                                 static_cast<i64>(policy.hide_headers[i].len));
     }
-    if (total > kResponsePolicyBytesPoolBytes - response_policy_bytes_used) return 0;
+    if (static_cast<i64>(total) > static_cast<i64>(kResponsePolicyBytesPoolBytes) -
+                                      static_cast<i64>(response_policy_bytes_used))
+        return 0;
 
     auto copy = [&](Str src, Str& dst) {
-        char* out = response_policy_bytes + response_policy_bytes_used;
+        char* out = response_policy_bytes + static_cast<i64>(response_policy_bytes_used);
         for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
-        response_policy_bytes_used += src.len;
+        response_policy_bytes_used = static_cast<u32>(static_cast<i64>(response_policy_bytes_used) +
+                                                      static_cast<i64>(src.len));
         dst = {out, src.len};
     };
     auto& dst = response_policies[response_policy_count];
@@ -957,21 +1002,31 @@ u16 RouteConfig::add_failure_policy(const ForwardFailurePolicySpec& policy) {
         return 0;
     for (u32 i = 0; i < failure_policy_count; i++)
         if (forward_failure_policy_spec_equal(failure_policies[i], policy))
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     if (failure_policy_count >= kMaxForwardFailurePolicies) return 0;
     u32 total = policy.reason.len;
-    if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
-    if (policy.content_type.len > 0xffffffffu - total) return 0;
-    total += policy.content_type.len;
-    if (policy.server.len > 0xffffffffu - total) return 0;
-    total += policy.server.len;
-    if (policy.body.len > 0xffffffffu - total) return 0;
-    total += policy.body.len;
-    if (total > kFailurePolicyBytesPoolBytes - failure_policy_bytes_used) return 0;
+    if (static_cast<i64>(total) > static_cast<i64>(kFailurePolicyBytesPoolBytes) -
+                                      static_cast<i64>(failure_policy_bytes_used))
+        return 0;
+    if (static_cast<i64>(policy.content_type.len) >
+        static_cast<i64>(UINT32_MAX) - static_cast<i64>(total))
+        return 0;
+    total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(policy.content_type.len));
+    if (static_cast<i64>(policy.server.len) >
+        static_cast<i64>(UINT32_MAX) - static_cast<i64>(total))
+        return 0;
+    total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(policy.server.len));
+    if (static_cast<i64>(policy.body.len) > static_cast<i64>(UINT32_MAX) - static_cast<i64>(total))
+        return 0;
+    total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(policy.body.len));
+    if (static_cast<i64>(total) > static_cast<i64>(kFailurePolicyBytesPoolBytes) -
+                                      static_cast<i64>(failure_policy_bytes_used))
+        return 0;
     auto copy = [&](Str src, Str& dst) {
-        char* out = failure_policy_bytes + failure_policy_bytes_used;
+        char* out = failure_policy_bytes + static_cast<i64>(failure_policy_bytes_used);
         for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
-        failure_policy_bytes_used += src.len;
+        failure_policy_bytes_used = static_cast<u32>(static_cast<i64>(failure_policy_bytes_used) +
+                                                     static_cast<i64>(src.len));
         dst = {out, src.len};
     };
     auto& dst = failure_policies[failure_policy_count];
@@ -1007,7 +1062,7 @@ u16 RouteConfig::add_policy_bundle(u16 response_policy_id,
         // RouteConfig directly (bypassing RIR compilation) cannot publish
         // a bundle the deadline/buffering helpers assume never exists.
         (response_policy_id != 0 &&
-         response_policies[response_policy_id - 1].header_order ==
+         response_policies[static_cast<i64>(response_policy_id) - 1].header_order ==
              ResponsePolicyHeaderOrder::Upstream &&
          (response_read_timeout_seconds != 0 ||
           response_buffering != ForwardResponseBufferingMode::None ||
@@ -1019,7 +1074,7 @@ u16 RouteConfig::add_policy_bundle(u16 response_policy_id,
         // be 502 and closes the downstream connection on mismatch, so
         // repeat that invariant here too.
         (failure_policy_id != 0 &&
-         failure_policies[failure_policy_id - 1].header_order ==
+         failure_policies[static_cast<i64>(failure_policy_id) - 1].header_order ==
              FailurePolicyHeaderOrder::LengthTypeDateServer &&
          response_read_timeout_seconds != 0))
         return 0;
@@ -1027,12 +1082,15 @@ u16 RouteConfig::add_policy_bundle(u16 response_policy_id,
         if (response_policy_id == 0 || failure_policy_id == 0 ||
             !timeout_failure_policy_id_is_valid(timeout_failure_policy_id))
             return 0;
-        const bool response_suppress = response_policies[response_policy_id - 1].head_mode ==
-                                       ResponsePolicyHeadMode::SuppressBody;
-        const bool failure_suppress = failure_policies[failure_policy_id - 1].head_mode ==
-                                      FailurePolicyHeadMode::SuppressBody;
-        const bool timeout_suppress = failure_policies[timeout_failure_policy_id - 1].head_mode ==
-                                      FailurePolicyHeadMode::SuppressBody;
+        const bool response_suppress =
+            response_policies[static_cast<i64>(response_policy_id) - 1].head_mode ==
+            ResponsePolicyHeadMode::SuppressBody;
+        const bool failure_suppress =
+            failure_policies[static_cast<i64>(failure_policy_id) - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
+        const bool timeout_suppress =
+            failure_policies[static_cast<i64>(timeout_failure_policy_id) - 1].head_mode ==
+            FailurePolicyHeadMode::SuppressBody;
         if (response_suppress != failure_suppress || failure_suppress != timeout_suppress) return 0;
     }
     if (response_buffering != ForwardResponseBufferingMode::None &&
@@ -1040,9 +1098,9 @@ u16 RouteConfig::add_policy_bundle(u16 response_policy_id,
          !response_read_timeout_seconds_valid(response_read_timeout_seconds) ||
          response_policy_id == 0 || failure_policy_id == 0 || timeout_failure_policy_id == 0 ||
          !complete_content_length_buffering_policies_valid(
-             response_policies[response_policy_id - 1],
-             failure_policies[failure_policy_id - 1],
-             failure_policies[timeout_failure_policy_id - 1])))
+             response_policies[static_cast<i64>(response_policy_id) - 1],
+             failure_policies[static_cast<i64>(failure_policy_id) - 1],
+             failure_policies[static_cast<i64>(timeout_failure_policy_id) - 1])))
         return 0;
     if (policy_bundle_count > kMaxForwardPolicyBundles) return 0;
     for (u32 i = 0; i < policy_bundle_count; i++) {
@@ -1051,7 +1109,7 @@ u16 RouteConfig::add_policy_bundle(u16 response_policy_id,
             policy_bundles[i].timeout_failure_policy_id == timeout_failure_policy_id &&
             policy_bundles[i].response_read_timeout_seconds == response_read_timeout_seconds &&
             policy_bundles[i].response_buffering == response_buffering)
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     }
     if (policy_bundle_count >= kMaxForwardPolicyBundles) return 0;
     policy_bundles[policy_bundle_count] = {response_policy_id,
@@ -1095,7 +1153,7 @@ bool RouteConfig::forward_policy_tables_valid() const {
     // Every referenced spec is now fully valid, so the admitted checks in
     // policy_bundle_id_is_valid() decide exactly what the full ones would.
     for (u32 i = 0; i < policy_bundle_count; i++)
-        if (!policy_bundle_id_is_valid(static_cast<u16>(i + 1))) return false;
+        if (!policy_bundle_id_is_valid(static_cast<u16>(static_cast<i64>(i) + 1))) return false;
     return true;
 }
 
@@ -1106,17 +1164,22 @@ u16 RouteConfig::add_target_transform(const ForwardTargetTransformSpec& spec) {
         return 0;
     for (u32 i = 0; i < target_transform_count; i++) {
         if (forward_target_transform_spec_equal(target_transforms[i], spec))
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     }
     if (target_transform_count >= kMaxForwardTargetTransforms) return 0;
-    if (spec.strip_prefix.len > kForwardTargetTransformBytes - target_transform_bytes_used)
+    if (static_cast<i64>(spec.strip_prefix.len) > static_cast<i64>(kForwardTargetTransformBytes) -
+                                                      static_cast<i64>(target_transform_bytes_used))
         return 0;
-    const u32 after_strip = target_transform_bytes_used + spec.strip_prefix.len;
-    if (spec.replace_prefix.len > kForwardTargetTransformBytes - after_strip) return 0;
+    const u32 after_strip = static_cast<u32>(static_cast<i64>(target_transform_bytes_used) +
+                                             static_cast<i64>(spec.strip_prefix.len));
+    if (static_cast<i64>(spec.replace_prefix.len) >
+        static_cast<i64>(kForwardTargetTransformBytes) - static_cast<i64>(after_strip))
+        return 0;
     auto copy = [&](Str src, Str& dst) {
-        char* out = target_transform_bytes + target_transform_bytes_used;
+        char* out = target_transform_bytes + static_cast<i64>(target_transform_bytes_used);
         for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
-        target_transform_bytes_used += src.len;
+        target_transform_bytes_used = static_cast<u32>(
+            static_cast<i64>(target_transform_bytes_used) + static_cast<i64>(src.len));
         dst = {out, src.len};
     };
     auto& dst = target_transforms[target_transform_count];
@@ -1135,7 +1198,7 @@ u16 RouteConfig::add_redirect_policy(const RedirectPolicySpec& policy) {
     for (u32 i = 0; i < redirect_policy_count; i++) {
         if (!redirect_policy_strings_are_owned(redirect_policies[i])) return 0;
         if (redirect_policy_spec_equal(redirect_policies[i], policy))
-            return static_cast<u16>(i + 1);
+            return static_cast<u16>(static_cast<i64>(i) + 1);
     }
     if (redirect_policy_count >= kMaxRedirectPolicies) return 0;
     const Str fields[] = {policy.reason,
@@ -1146,14 +1209,17 @@ u16 RouteConfig::add_redirect_policy(const RedirectPolicySpec& policy) {
                           policy.body};
     u32 total = 0;
     for (const Str field : fields) {
-        if (field.len > kRedirectPolicyBytesPoolBytes - redirect_policy_bytes_used - total)
+        if (static_cast<i64>(field.len) > static_cast<i64>(kRedirectPolicyBytesPoolBytes) -
+                                              static_cast<i64>(redirect_policy_bytes_used) -
+                                              static_cast<i64>(total))
             return 0;
-        total += field.len;
+        total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(field.len));
     }
     auto copy = [&](Str src, Str& dst) {
-        char* out = redirect_policy_bytes + redirect_policy_bytes_used;
+        char* out = redirect_policy_bytes + static_cast<i64>(redirect_policy_bytes_used);
         for (u32 i = 0; i < src.len; i++) out[i] = src.ptr[i];
-        redirect_policy_bytes_used += src.len;
+        redirect_policy_bytes_used = static_cast<u32>(static_cast<i64>(redirect_policy_bytes_used) +
+                                                      static_cast<i64>(src.len));
         dst = {out, src.len};
     };
     auto& dst = redirect_policies[redirect_policy_count];
@@ -1189,8 +1255,10 @@ bool RouteConfig::add_redirect_policy_table(const RedirectPolicySpec* specs, u32
                               specs[i].target_path,
                               specs[i].body};
         for (const Str field : fields) {
-            if (field.len > kRedirectPolicyBytesPoolBytes - total) return false;
-            total += field.len;
+            if (static_cast<i64>(field.len) >
+                static_cast<i64>(kRedirectPolicyBytesPoolBytes) - static_cast<i64>(total))
+                return false;
+            total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(field.len));
         }
     }
     u32 used = 0;
@@ -1219,10 +1287,10 @@ bool RouteConfig::add_redirect_policy_table(const RedirectPolicySpec* specs, u32
                                &dst.target_path,
                                &dst.body};
         for (u32 field = 0; field < 6; field++) {
-            char* out = redirect_policy_bytes + used;
+            char* out = redirect_policy_bytes + static_cast<i64>(used);
             for (u32 j = 0; j < fields[field].len; j++) out[j] = fields[field].ptr[j];
             *destinations[field] = {out, fields[field].len};
-            used += fields[field].len;
+            used = static_cast<u32>(static_cast<i64>(used) + static_cast<i64>(fields[field].len));
         }
     }
     redirect_policy_bytes_used = used;

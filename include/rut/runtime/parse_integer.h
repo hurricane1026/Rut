@@ -5,6 +5,18 @@
 namespace rut {
 namespace integer_detail {
 
+inline u64 wrap_add(u64 a, u64 b) {
+    u64 result = 0;
+    (void)__builtin_add_overflow(a, b, &result);
+    return result;
+}
+
+inline u64 wrap_sub(u64 a, u64 b) {
+    u64 result = 0;
+    (void)__builtin_sub_overflow(a, b, &result);
+    return result;
+}
+
 // Each caller proves that the complete word is inside the supplied view.
 inline bool digits8(const char* data, u32& result) {
     u64 word;
@@ -12,13 +24,15 @@ inline bool digits8(const char* data, u32& result) {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     word = __builtin_bswap64(word);
 #endif
-    if (((word + 0x4646464646464646ULL) | (word - 0x3030303030303030ULL)) & 0x8080808080808080ULL)
+    if (((wrap_add(word, 0x4646464646464646ULL) | wrap_sub(word, 0x3030303030303030ULL)) &
+         0x8080808080808080ULL))
         return false;
-    word -= 0x3030303030303030ULL;
-    word = word * 10 + (word >> 8);
-    result = static_cast<u32>(((word & 0x000000ff000000ffULL) * 0x000f424000000064ULL +
-                               ((word >> 16) & 0x000000ff000000ffULL) * 0x0000271000000001ULL) >>
-                              32);
+    word = wrap_sub(word, 0x3030303030303030ULL);
+    word = wrap_add(static_cast<u64>(word) * 10u, static_cast<u64>(word >> 8));
+    result = static_cast<u32>(
+        (wrap_add((word & 0x000000ff000000ffULL) * 0x000f424000000064ULL,
+                  ((word >> 16) & 0x000000ff000000ffULL) * 0x0000271000000001ULL)) >>
+        32);
     return true;
 }
 
@@ -28,9 +42,10 @@ inline bool digits4(const char* data, u32& result) {
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     word = __builtin_bswap32(word);
 #endif
-    if (((word + 0x46464646u) | (word - 0x30303030u)) & 0x80808080u) return false;
-    word -= 0x30303030u;
-    word = word * 10 + (word >> 8);
+    if (((wrap_add(word, 0x46464646u) | wrap_sub(word, 0x30303030u)) & 0x80808080u)) return false;
+    word = wrap_sub(word, 0x30303030u);
+    word =
+        wrap_add(static_cast<u64>(static_cast<u32>(word * u32{10})), static_cast<u64>(word >> 8));
     result = (((word & 0x00ff00ffu) * 0x00640001u) >> 16) & 0xffffu;
     return true;
 }
@@ -64,8 +79,8 @@ inline bool parse_integer(Str text, i64& output) {
                 u64 zeros;
                 __builtin_memcpy(&zeros, data, sizeof(zeros));
                 if (zeros != 0x3030303030303030ULL) break;
-                data += 8;
-                length -= 8;
+                data += static_cast<i64>(8);
+                (void)__builtin_sub_overflow(length, 8u, &length);
             }
             while (length && *data == '0') {
                 ++data;
@@ -78,35 +93,43 @@ inline bool parse_integer(Str text, i64& output) {
                 u64 block;
                 if (!Digits::read16(data, block)) return false;
                 number = block;
-                data += 16;
-                length -= 16;
+                data += static_cast<i64>(16);
+                (void)__builtin_sub_overflow(length, 16u, &length);
             }
         }
         while (length >= 8) {
             u32 block;
             if (!Digits::read8(data, block)) return false;
-            number = number * 100000000 + block;
-            data += 8;
-            length -= 8;
+            number = integer_detail::wrap_add(number * 100000000, block);
+            data += static_cast<i64>(8);
+            (void)__builtin_sub_overflow(length, 8u, &length);
         }
         if (length >= 4) {
             u32 block;
             if (!integer_detail::digits4(data, block)) return false;
-            number = number * 10000 + block;
-            data += 4;
-            length -= 4;
+            number = integer_detail::wrap_add(number * 10000, block);
+            data += static_cast<i64>(4);
+            (void)__builtin_sub_overflow(length, 4u, &length);
         }
     }
     while (length--) {
-        const u32 digit = static_cast<u32>(static_cast<u8>(*data++)) - '0';
-        if (digit > 9) return false;
-        number = number * 10 + digit;
+        const u8 byte = static_cast<u8>(*data++);
+        if (byte < '0' || byte > '9') return false;
+        const u32 digit = static_cast<u32>(static_cast<i32>(byte) - static_cast<i32>('0'));
+        number = integer_detail::wrap_add(number * 10, digit);
     }
     constexpr u64 kPositiveLimit = Wide ? 9223372036854775807ULL : 2147483647ULL;
-    if (number > kPositiveLimit + static_cast<u64>(negative)) return false;
+    u64 max_magnitude = 0;
+    (void)__builtin_add_overflow(kPositiveLimit, static_cast<u64>(negative), &max_magnitude);
+    if (number > max_magnitude) return false;
     // Form the two's-complement representation with unsigned arithmetic, including
     // INT64_MIN, then preserve its bits without a signed overflow.
-    output = __builtin_bit_cast(i64, negative ? u64(0) - number : number);
+    u64 magnitude = 0;
+    if (negative)
+        (void)__builtin_sub_overflow(u64{0}, number, &magnitude);
+    else
+        magnitude = number;
+    output = __builtin_bit_cast(i64, magnitude);
     return true;
 }
 

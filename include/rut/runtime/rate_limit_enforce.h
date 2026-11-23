@@ -18,10 +18,10 @@ inline u32 rate_limit_retry_after_value(u64 wait_us, char* out) {
     char reversed[20];
     u32 n = 0;
     do {
-        reversed[n++] = static_cast<char>('0' + seconds % 10);
+        reversed[n++] = static_cast<char>('0' + static_cast<i64>(seconds % 10));
         seconds /= 10;
     } while (seconds != 0);
-    for (u32 i = 0; i < n; i++) out[i] = reversed[n - 1 - i];
+    for (u32 i = 0; i < n; i++) out[i] = reversed[static_cast<i64>(n) - 1 - static_cast<i64>(i)];
     return n;
 }
 

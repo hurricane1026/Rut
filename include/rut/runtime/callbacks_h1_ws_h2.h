@@ -18,9 +18,11 @@ inline u32 h1ws_h2_response(Connection& c,
                             u32 capacity) {
     u32 used = 0;
     auto put = [&](Str value) {
-        if (value.len > capacity - used) return false;
-        __builtin_memcpy(output + used, value.ptr, value.len);
-        used += value.len;
+        u32 available = 0;
+        if (__builtin_sub_overflow(capacity, used, &available) || value.len > available)
+            return false;
+        __builtin_memcpy(output + static_cast<i64>(used), value.ptr, value.len);
+        (void)__builtin_add_overflow(used, value.len, &used);
         return true;
     };
     Str status{};
@@ -56,7 +58,9 @@ void h1ws_h2_complete_http(Loop* loop, Connection& c, GrpcExchange& x) {
         if (!c.req_start_us) return;
         c.downstream_req_size = c.req_size =
             c.ws_client_header_len ? c.ws_client_header_len : c.req_header_end;
-        const u64 kBytes = x.response_headers_len + x.staged_response_bytes;
+        u64 kBytes = 0;
+        if (__builtin_add_overflow(x.response_headers_len, x.staged_response_bytes, &kBytes))
+            kBytes = UINT64_MAX;
         on_request_complete(
             loop, c, c.resp_status, kBytes > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kBytes));
     }
@@ -65,14 +69,18 @@ void h1ws_h2_complete_http(Loop* loop, Connection& c, GrpcExchange& x) {
 template <typename Loop>
 void h1ws_h2_sent(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
-    if (ev.result <= 0 || static_cast<u32>(ev.result) > c.send_buf.len() - c.send_progress) {
+    u32 remaining = 0;
+    const u32 sent = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
+    if (ev.result <= 0 || __builtin_sub_overflow(c.send_buf.len(), c.send_progress, &remaining) ||
+        sent > remaining) {
         loop->close_conn(c);
         return;
     }
-    c.send_progress += static_cast<u32>(ev.result);
+    (void)__builtin_add_overflow(c.send_progress, sent, &c.send_progress);
     if (c.send_progress < c.send_buf.len()) {
-        if (!client_send(
-                loop, c, c.send_buf.data() + c.send_progress, c.send_buf.len() - c.send_progress))
+        u32 pending = 0;
+        (void)__builtin_sub_overflow(remaining, sent, &pending);
+        if (!client_send(loop, c, c.send_buf.data() + static_cast<i64>(c.send_progress), pending))
             loop->close_conn(c);
         return;
     }
@@ -146,7 +154,8 @@ void h1ws_h2_drive(Loop* loop, Connection& c) {
             const u32 kAmount = length < c.send_buf.capacity() ? length : c.send_buf.capacity();
             c.send_buf.write(output, kAmount);
             grpc_consume_output(*x, false, kAmount);
-            x->staged_response_bytes += kAmount;
+            (void)__builtin_add_overflow(
+                x->staged_response_bytes, static_cast<u64>(kAmount), &x->staged_response_bytes);
         } else if (!x->download_len && x->response_end && !x->response_end_sent) {
             if (!x->ws_accepted) {
                 h1ws_h2_complete_http(loop, c, *x);
@@ -207,7 +216,8 @@ void h1ws_h2_received(void* lp, Connection& c, IoEvent ev) {
         return;
     }
     g.busy = true;
-    u32 length = sizeof(x->upload) - x->upload_len;
+    u32 length = 0;
+    (void)__builtin_sub_overflow(static_cast<u32>(sizeof(x->upload)), x->upload_len, &length);
     if (length > c.recv_buf.len()) length = c.recv_buf.len();
     if (length) {
         const bool kEnd = g.websocket_http1_eof && length == c.recv_buf.len();
@@ -260,16 +270,20 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
         while (start < header.value.len) {
             u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') ++end;
-            Str token{header.value.ptr + start, end - start};
+            u32 token_len = 0;
+            (void)__builtin_sub_overflow(end, start, &token_len);
+            Str token{header.value.ptr + static_cast<i64>(start), token_len};
             while (token.len && (token.ptr[0] == ' ' || token.ptr[0] == '\t')) {
                 ++token.ptr;
                 --token.len;
             }
-            while (token.len &&
-                   (token.ptr[token.len - 1] == ' ' || token.ptr[token.len - 1] == '\t'))
+            while (token.len) {
+                const char last = token.ptr[static_cast<i64>(token.len) - 1];
+                if (last != ' ' && last != '\t') break;
                 --token.len;
+            }
             if (http_header_name_eq_ci(name.ptr, name.len, token.ptr, token.len)) return true;
-            start = end + 1;
+            (void)__builtin_add_overflow(end, 1u, &start);
         }
     }
     return false;
@@ -348,17 +362,20 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
         for (u32 i = 0; i < request.header_count; ++i) {
             const auto& h = request.headers[i];
             if (h1ws_h2_hop_header(request, h.name)) continue;
-            if (n == Http2Conn::kMaxHeadersPerReq || h.name.len > sizeof(names) - used) {
+            u32 available = 0;
+            if (n == Http2Conn::kMaxHeadersPerReq ||
+                __builtin_sub_overflow(static_cast<u32>(sizeof(names)), used, &available) ||
+                h.name.len > available) {
                 reject(400);
                 return true;
             }
             for (u32 j = 0; j < h.name.len; ++j) {
                 const char kCh = h.name.ptr[j];
-                names[used + j] =
+                names[static_cast<i64>(used) + static_cast<i64>(j)] =
                     kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
             }
-            hs[n++] = {{names + used, h.name.len}, h.value};
-            used += h.name.len;
+            hs[n++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
+            (void)__builtin_add_overflow(used, h.name.len, &used);
         }
         ParsedRequest translated{};
         Str protocol{};

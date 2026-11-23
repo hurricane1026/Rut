@@ -92,7 +92,7 @@ constexpr HuffTrie build_trie() {
         const u32 kCode = kHuff[s].code;
         const u8 kBits = kHuff[s].bits;
         i16 node = 0;
-        for (i32 b = kBits - 1; b >= 0; b--) {
+        for (i32 b = static_cast<i32>(kBits) - 1; b >= 0; b--) {
             const u32 kBit = (kCode >> static_cast<u32>(b)) & 1u;
             if (t.child[node][kBit] < 0) {
                 t.child[node][kBit] = static_cast<i16>(t.node_count);
@@ -172,60 +172,63 @@ constexpr HuffFsm kFsm = build_fsm();
 
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     if (len == 0) return 0;
-    const u32 kMask = (1u << prefix_bits) - 1u;
+    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
         return 1;
     }
     // Continuation octets: 7 bits each, low-order first; high bit = "more".
-    u64 acc = kMask;
-    u32 shift = 0;
+    i64 acc = kMask;
+    i64 shift = 0;
     u32 i = 1;
     while (true) {
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
-        acc += static_cast<u64>(kB & 0x7f) << shift;
-        if (acc > 0xffffffffull) return 0;  // exceeds 32 bits
+        acc += static_cast<i64>(kB & 0x7f) << shift;
+        if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
         shift += 7;
         if (shift > 28) return 0;  // would overflow on next octet
     }
     *out = static_cast<u32>(acc);
-    return i;
+    return static_cast<u32>(i);
 }
 
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
-    const u32 kMask = (1u << prefix_bits) - 1u;
+    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
     if (value < kMask) {
         out[0] = static_cast<u8>(prefix_top | value);
         return 1;
     }
     out[0] = static_cast<u8>(prefix_top | kMask);
-    value -= kMask;
-    u32 i = 1;
-    while (value >= 128) {
-        out[i++] = static_cast<u8>((value & 0x7f) | 0x80);
-        value >>= 7;
+    i64 remainder = static_cast<i64>(value) - static_cast<i64>(kMask);
+    i64 i = 1;
+    while (remainder >= 128) {
+        out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
+        remainder >>= 7;
     }
-    out[i++] = static_cast<u8>(value);
-    return i;
+    out[i++] = static_cast<u8>(remainder);
+    return static_cast<u32>(i);
 }
 
-u32 huffman_encoded_len(const u8* src, u32 len) {
-    u64 bits = 0;
-    for (u32 i = 0; i < len; i++) bits += kHuff[src[i]].bits;
-    return static_cast<u32>((bits + 7) / 8);
+i64 huffman_encoded_len(const u8* src, u32 len) {
+    // The longest HPACK code is 30 bits, so the full u32 input range fits in
+    // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
+    i64 bits = 0;
+    for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
+
+    return huffman_encoded_bytes_from_bits(bits);
 }
 
-u32 huffman_encode(u8* out, const u8* src, u32 len) {
+i64 huffman_encode(u8* out, const u8* src, u32 len) {
     u64 acc = 0;    // bit accumulator, MSB-first
-    u32 nbits = 0;  // valid bits in acc
-    u32 o = 0;
+    i64 nbits = 0;  // valid bits in acc
+    i64 o = 0;
     for (u32 i = 0; i < len; i++) {
         const HuffCode kEntry = kHuff[src[i]];
         acc = (acc << kEntry.bits) | kEntry.code;
-        nbits += kEntry.bits;
+        nbits += static_cast<i64>(kEntry.bits);
         while (nbits >= 8) {
             nbits -= 8;
             out[o++] = static_cast<u8>((acc >> nbits) & 0xff);
@@ -233,8 +236,9 @@ u32 huffman_encode(u8* out, const u8* src, u32 len) {
     }
     if (nbits > 0) {
         // Pad the remaining bits with the EOS prefix (all 1s) to an octet.
-        const u32 kPad = 8 - nbits;
-        acc = (acc << kPad) | ((1u << kPad) - 1u);
+        const i64 kPad = 8 - nbits;
+        const i64 kMask = (i64{1} << kPad) - i64{1};
+        acc = (acc << kPad) | static_cast<u64>(kMask);
         out[o++] = static_cast<u8>(acc & 0xff);
     }
     return o;
@@ -272,30 +276,33 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     u32 slen = 0;
     const u32 kHdr = decode_integer(in, len, 7, &slen);
     if (kHdr == 0) return 0;
-    if (kHdr + slen > len) return 0;  // truncated payload
-    const u8* data = in + kHdr;
+    if (static_cast<i64>(kHdr) > static_cast<i64>(len) ||
+        static_cast<i64>(slen) > static_cast<i64>(len) - static_cast<i64>(kHdr))
+        return 0;  // truncated payload
+    const u8* data = in + static_cast<i64>(kHdr);
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
         if (kN < 0) return 0;
         *out_len = static_cast<u32>(kN);
     } else {
         if (slen > cap) return 0;
-        for (u32 i = 0; i < slen; i++) out[i] = data[i];
+        for (i64 i = 0; i < slen; i++) out[i] = data[i];
         *out_len = slen;
     }
-    return kHdr + slen;
+    return static_cast<u32>(static_cast<i64>(kHdr) + static_cast<i64>(slen));
 }
 
-u32 encode_string(u8* out, const u8* src, u32 len) {
-    const u32 kHlen = huffman_encoded_len(src, len);
-    if (kHlen < len) {
-        const u32 kHdr = encode_integer(out, kHlen, 7, 0x80);  // H=1
-        const u32 kN = huffman_encode(out + kHdr, src, len);
+i64 encode_string(u8* out, const u8* src, u32 len) {
+    const i64 kHlen = huffman_encoded_len(src, len);
+    if (kHlen < static_cast<i64>(len)) {
+        // kHlen < len <= UINT32_MAX proves this narrowing is representable.
+        const i64 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
+        const i64 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }
-    const u32 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
-    for (u32 i = 0; i < len; i++) out[kHdr + i] = src[i];
-    return kHdr + len;
+    const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
+    for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
+    return kHdr + static_cast<i64>(len);
 }
 
 namespace {
@@ -393,15 +400,17 @@ void dyn_clear(DynamicTable& d) {
 void dyn_evict_oldest(DynamicTable& d) {
     if (d.nent == 0) return;
     const DynamicTable::Entry kOld = d.ents[0];
-    const u32 kBlen = static_cast<u32>(kOld.nlen) + kOld.vlen;
-    __builtin_memmove(d.buf, d.buf + kBlen, d.byte_used - kBlen);
-    d.byte_used -= kBlen;
-    d.table_size -= (static_cast<u32>(kOld.nlen) + kOld.vlen + 32u);
+    const i64 kBlen = static_cast<i64>(kOld.nlen) + static_cast<i64>(kOld.vlen);
+    __builtin_memmove(d.buf, d.buf + kBlen, static_cast<i64>(d.byte_used) - kBlen);
+    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) - kBlen);
+    const i64 kOldCost = kBlen + 32;
+    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) - kOldCost);
     for (u32 i = 1; i < d.nent; i++) {
-        d.ents[i - 1] = d.ents[i];
-        d.ents[i - 1].off -= kBlen;
+        const i64 kPrevious = static_cast<i64>(i) - 1;
+        d.ents[kPrevious] = d.ents[i];
+        d.ents[kPrevious].off = static_cast<u32>(static_cast<i64>(d.ents[kPrevious].off) - kBlen);
     }
-    d.nent--;
+    d.nent = static_cast<u32>(static_cast<i64>(d.nent) - 1);
 }
 
 void dyn_set_max_size(DynamicTable& d, u32 m) {
@@ -411,30 +420,39 @@ void dyn_set_max_size(DynamicTable& d, u32 m) {
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
 void dyn_add(DynamicTable& d, Str name, Str value) {
-    const u32 kCost = name.len + value.len + 32u;
-    if (kCost > d.max_size) {  // §4.4: entry larger than the table empties it
+    const i64 kPayload = static_cast<i64>(name.len) + static_cast<i64>(value.len);
+    const i64 kCost = kPayload + 32;
+    if (kCost > d.max_size || kPayload > DynamicTable::kByteCap) {
+        // §4.4: entry larger than the table empties it. The payload check also
+        // keeps the u32 offsets and u16 entry lengths representable.
         dyn_clear(d);
         return;
     }
-    while (d.table_size + kCost > d.max_size || d.nent >= DynamicTable::kMaxEntries)
+    while (static_cast<i64>(d.table_size) + kCost > d.max_size ||
+           d.nent >= DynamicTable::kMaxEntries)
         dyn_evict_oldest(d);
+    const u32 kPayload32 = static_cast<u32>(kPayload);
+    const u32 kCost32 = static_cast<u32>(kCost);
     const u32 kOff = d.byte_used;
-    __builtin_memcpy(d.buf + kOff, name.ptr, name.len);
-    __builtin_memcpy(d.buf + kOff + name.len, value.ptr, value.len);
-    d.byte_used += name.len + value.len;
+    const i64 kOffWide = static_cast<i64>(kOff);
+    __builtin_memcpy(d.buf + kOffWide, name.ptr, name.len);
+    __builtin_memcpy(d.buf + kOffWide + static_cast<i64>(name.len), value.ptr, value.len);
+    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) + static_cast<i64>(kPayload32));
     d.ents[d.nent].off = kOff;
     d.ents[d.nent].nlen = static_cast<u16>(name.len);
     d.ents[d.nent].vlen = static_cast<u16>(value.len);
     d.nent++;
-    d.table_size += kCost;
+    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) + static_cast<i64>(kCost32));
 }
 
 bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     if (i >= d.nent) return false;
-    const DynamicTable::Entry& e = d.ents[d.nent - 1 - i];
-    name->ptr = reinterpret_cast<const char*>(d.buf + e.off);
+    const i64 kEntry = static_cast<i64>(d.nent) - 1 - static_cast<i64>(i);
+    const DynamicTable::Entry& e = d.ents[kEntry];
+    name->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off));
     name->len = e.nlen;
-    value->ptr = reinterpret_cast<const char*>(d.buf + e.off + e.nlen);
+    value->ptr =
+        reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + static_cast<i64>(e.nlen));
     value->len = e.vlen;
     return true;
 }
@@ -443,27 +461,33 @@ bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
 bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
     if (idx <= kStaticCount) {
-        const StaticEntry& e = kStatic[idx - 1];
+        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
         *name = {e.name, e.nlen};
         *value = {e.value, e.vlen};
         return true;
     }
-    return dyn_get(d, idx - kStaticCount - 1, name, value);
+    return dyn_get(d,
+                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
+                   name,
+                   value);
 }
 
 bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     Str value;
     if (idx <= kStaticCount) {
         if (idx == 0) return false;
-        const StaticEntry& e = kStatic[idx - 1];
+        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
         *name = {e.name, e.nlen};
         return true;
     }
-    return dyn_get(d, idx - kStaticCount - 1, name, &value);
+    return dyn_get(d,
+                   static_cast<u32>(static_cast<i64>(idx) - static_cast<i64>(kStaticCount) - 1),
+                   name,
+                   &value);
 }
 
 i32 static_find_full(Str name, Str value) {
-    for (u32 i = 0; i < kStaticCount; i++)
+    for (i64 i = 0; i < kStaticCount; i++)
         if (str_eq(name, kStatic[i].name, kStatic[i].nlen) &&
             str_eq(value, kStatic[i].value, kStatic[i].vlen))
             return static_cast<i32>(i + 1);
@@ -471,7 +495,7 @@ i32 static_find_full(Str name, Str value) {
 }
 
 i32 static_find_name(Str name) {
-    for (u32 i = 0; i < kStaticCount; i++)
+    for (i64 i = 0; i < kStaticCount; i++)
         if (str_eq(name, kStatic[i].name, kStatic[i].nlen)) return static_cast<i32>(i + 1);
     return 0;
 }
@@ -480,20 +504,23 @@ i32 static_find_name(Str name) {
 // matching entry (dynamic indices follow the 61 static entries; newest = 62),
 // or 0. j counts from the newest entry, matching the protocol index order.
 i32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
-    for (u32 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
-        const Str kEv{reinterpret_cast<const char*>(d.buf + e.off + e.nlen), e.vlen};
-        if (kEn.eq(name) && kEv.eq(value)) return static_cast<i32>(kStaticCount + 1 + j);
+    for (i64 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
+        const Str kEv{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) +
+                                                    static_cast<i64>(e.nlen)),
+                      e.vlen};
+        if (kEn.eq(name) && kEv.eq(value))
+            return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
     }
     return 0;
 }
 
 i32 dyn_find_name(const DynamicTable& d, Str name) {
-    for (u32 j = 0; j < d.nent; j++) {
-        const DynamicTable::Entry& e = d.ents[d.nent - 1 - j];
-        const Str kEn{reinterpret_cast<const char*>(d.buf + e.off), e.nlen};
-        if (kEn.eq(name)) return static_cast<i32>(kStaticCount + 1 + j);
+    for (i64 j = 0; j < d.nent; j++) {
+        const DynamicTable::Entry& e = d.ents[static_cast<i64>(d.nent) - 1 - j];
+        const Str kEn{reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off)), e.nlen};
+        if (kEn.eq(name)) return static_cast<i32>(static_cast<i64>(kStaticCount) + 1 + j);
     }
     return 0;
 }
@@ -516,17 +543,18 @@ bool decode_header_block(DynamicTable& dyn,
                          Header* headers,
                          u32 max_headers,
                          u32* count) {
-    u32 pos = 0;
-    u32 op = 0;  // out_buf write cursor
+    i64 pos = 0;
+    i64 op = 0;  // out_buf write cursor
     u32 hc = 0;
     while (pos < len) {
         const u8 kByte = in[pos];
         if (kByte & 0x80) {
             // §6.1 Indexed Header Field.
             u32 idx = 0;
-            const u32 kC = decode_integer(in + pos, len - pos, 7, &idx);
+            const u32 kC =
+                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 7, &idx);
             if (kC == 0 || idx == 0) return false;
-            pos += kC;
+            pos += static_cast<i64>(kC);
             Str name, value;
             if (!resolve_full(dyn, idx, &name, &value)) return false;
             if (hc >= max_headers) return false;
@@ -536,9 +564,10 @@ bool decode_header_block(DynamicTable& dyn,
         if (kByte & 0x20 && !(kByte & 0x40)) {
             // §6.3 Dynamic Table Size Update (001xxxxx).
             u32 sz = 0;
-            const u32 kC = decode_integer(in + pos, len - pos, 5, &sz);
+            const u32 kC =
+                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
-            pos += kC;
+            pos += static_cast<i64>(kC);
             dyn_set_max_size(dyn, sz);
             continue;
         }
@@ -547,37 +576,46 @@ bool decode_header_block(DynamicTable& dyn,
         const bool kIncremental = (kByte & 0x40) != 0;
         const u8 kPrefix = kIncremental ? 6 : 4;
         u32 nidx = 0;
-        const u32 kNc = decode_integer(in + pos, len - pos, kPrefix, &nidx);
+        const u32 kNc =
+            decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), kPrefix, &nidx);
         if (kNc == 0) return false;
-        pos += kNc;
+        pos += static_cast<i64>(kNc);
 
         Str name;
         if (nidx == 0) {
             u32 nlen = 0;
-            const u32 kSc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &nlen);
+            const u32 kSc = decode_string(in + pos,
+                                          static_cast<u32>(static_cast<i64>(len) - pos),
+                                          out_buf + op,
+                                          static_cast<u32>(static_cast<i64>(out_cap) - op),
+                                          &nlen);
             if (kSc == 0) return false;
-            pos += kSc;
+            pos += static_cast<i64>(kSc);
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += nlen;
+            op += static_cast<i64>(nlen);
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
         // Value is always a literal string.
         u32 vlen = 0;
-        const u32 kVc = decode_string(in + pos, len - pos, out_buf + op, out_cap - op, &vlen);
+        const u32 kVc = decode_string(in + pos,
+                                      static_cast<u32>(static_cast<i64>(len) - pos),
+                                      out_buf + op,
+                                      static_cast<u32>(static_cast<i64>(out_cap) - op),
+                                      &vlen);
         if (kVc == 0) return false;
-        pos += kVc;
+        pos += static_cast<i64>(kVc);
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
-        op += vlen;
+        op += static_cast<i64>(vlen);
 
         if (kIncremental) {
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
-                if (op + name.len > out_cap) return false;
+                if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += name.len;
+                op += static_cast<i64>(name.len);
             }
             dyn_add(dyn, name, value);
         }
@@ -588,19 +626,19 @@ bool decode_header_block(DynamicTable& dyn,
     return true;
 }
 
-u32 encode_header(u8* out, Str name, Str value) {
+i64 encode_header(u8* out, Str name, Str value) {
     const i32 kFull = static_find_full(name, value);
     if (kFull > 0) return encode_integer(out, static_cast<u32>(kFull), 7, 0x80);
 
     const i32 kNameIdx = static_find_name(name);
     // Literal without indexing (0000xxxx): name index (0 = literal name).
-    u32 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
+    i64 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
     if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     return o;
 }
 
-u32 Encoder::encode(u8* out, Str name, Str value) {
+i64 Encoder::encode(u8* out, Str name, Str value) {
     // Exact (name,value) match → Indexed Header Field (§6.1, 1 byte for small
     // indices). Check the dynamic table first: in steady state most fields hit
     // it, and it is far smaller than the 61-entry static table, so this skips
@@ -614,7 +652,7 @@ u32 Encoder::encode(u8* out, Str name, Str value) {
     // and add the field so the next occurrence indexes to 1 byte.
     i32 nidx = static_find_name(name);
     if (nidx == 0) nidx = dyn_find_name(dyn, name);
-    u32 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
+    i64 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
     if (nidx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     // Index resolution above used the pre-add table — the same order the peer's
@@ -655,13 +693,13 @@ u32 Encoder::emit_pending_size_update(u8* out) {
     // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
     // Signal the smallest size reached first (so the decoder evicts identically),
     // then the final size when it differs.
-    u32 n = 0;
+    i64 n = 0;
     if (pending_min_size >= 0 && pending_min_size != pending_size_update)
-        n += encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20);
-    n += encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20);
+        n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_min_size), 5, 0x20));
+    n += static_cast<i64>(encode_integer(out + n, static_cast<u32>(pending_size_update), 5, 0x20));
     pending_size_update = -1;
     pending_min_size = -1;
-    return n;
+    return static_cast<u32>(n);
 }
 
 }  // namespace rut::hpack

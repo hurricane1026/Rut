@@ -77,7 +77,7 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
         if (seen & bit) return false;
         seen |= bit;
         if (value) {
-            json::Writer out{value, cap - 1};
+            json::Writer out{value, static_cast<u32>(static_cast<i64>(cap) - 1)};
             if (!doc.string(n, out) || !out.ok || !out.len) return false;
             for (u32 i = 0; i < out.len; ++i)
                 if (static_cast<u8>(value[i]) < 32 || static_cast<u8>(value[i]) == 127)
@@ -99,7 +99,8 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
 }
 core::Expected<void, Error> NetClientWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
-    auto allocated = storage.init(sizeof(Slot) * kCapacity + 64);
+    auto allocated =
+        storage.init(static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity + 64));
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
@@ -121,7 +122,7 @@ void NetClientWorker::stop() {
     if (!started) return;
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     if (pthread_join(thread, nullptr) != 0) __builtin_trap();
-    OPENSSL_cleanse(slots, sizeof(Slot) * kCapacity);
+    OPENSSL_cleanse(slots, static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity));
     storage.destroy();
     slots = nullptr;
     started = false;
@@ -131,7 +132,9 @@ void NetClientWorker::adopt_config(const void* config) {
     pool_config = config;
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
-    __atomic_store_n(&pool_epoch, epoch == ~u64(0) ? 0 : epoch ? epoch + 1 : 0, __ATOMIC_RELEASE);
+    u64 next = 0;
+    if (epoch) (void)__builtin_add_overflow(epoch, u64{1}, &next);
+    __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {
     if (!started) return;
@@ -182,7 +185,9 @@ NetReply NetClientWorker::call(u32 owner,
                 reply.status = -4;
                 return reply;
             }
-            if (now < s.started || now - s.started >= s.timeout) {
+            u64 elapsed = 0;
+            if (now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
+                elapsed >= s.timeout) {
                 __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
                 reply.status = -2;
                 return reply;
@@ -198,7 +203,8 @@ NetReply NetClientWorker::call(u32 owner,
                 return reply;
             }
             reply.status = NetReply::kPending;
-            const auto remaining = s.timeout - (now - s.started);
+            const auto remaining =
+                static_cast<u64>(static_cast<i64>(s.timeout) - static_cast<i64>(elapsed));
             reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
             return reply;
         }
@@ -281,11 +287,14 @@ bool NetClientWorker::clean(int fd, SSL* ssl) {
 }
 void NetClientWorker::sweep(u64 now) {
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE);
-    for (auto& p : parked)
+    for (auto& p : parked) {
+        u64 idle = 0;
         if (p.fd >= 0 &&
             (!now || !epoch || p.epoch != epoch || now < p.since ||
-             now - p.since >= p.endpoint.pool_idle_ms || (p.dns_expires && now >= p.dns_expires)))
+             (__builtin_sub_overflow(now, p.since, &idle) || idle >= p.endpoint.pool_idle_ms) ||
+             (p.dns_expires && now >= p.dns_expires)))
             close(p);
+    }
 }
 bool NetClientWorker::borrow(Slot& s) {
     if (!s.endpoint.pool_idle_ms || !s.pool_epoch ||
@@ -306,8 +315,9 @@ bool NetClientWorker::borrow(Slot& s) {
              __builtin_strcmp(p.endpoint.tls.key, s.endpoint.tls.key) != 0))
             continue;
         const u64 now = jwt_monotonic_ms();
-        if (!now || now < p.since || now - p.since >= p.endpoint.pool_idle_ms ||
-            !clean(p.fd, p.ssl)) {
+        u64 idle = 0;
+        if (!now || now < p.since || __builtin_sub_overflow(now, p.since, &idle) ||
+            idle >= p.endpoint.pool_idle_ms || !clean(p.fd, p.ssl)) {
             close(p);
             continue;
         }
@@ -378,7 +388,9 @@ void NetClientWorker::run() {
             }
             const u64 now = jwt_monotonic_ms();
             bool complete = false;
-            if (!now || now < s.started || now - s.started >= s.timeout) {
+            u64 elapsed = 0;
+            if (!now || now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
+                elapsed >= s.timeout) {
                 s.reply.status = -2;
                 complete = true;
             } else {
@@ -493,9 +505,15 @@ bool NetClientWorker::write(Slot& s) {
     ERR_clear_error();
     const int n =
         s.ssl
-            ? SSL_write(s.ssl, s.pending + s.offset, static_cast<int>(s.pending_length - s.offset))
+            ? SSL_write(
+                  s.ssl,
+                  s.pending + static_cast<i64>(s.offset),
+                  static_cast<int>(static_cast<i64>(s.pending_length) - static_cast<i64>(s.offset)))
             : static_cast<int>(send(
-                  s.fd, s.pending + s.offset, s.pending_length - s.offset, platform::kSendFlags));
+                  s.fd,
+                  s.pending + static_cast<i64>(s.offset),
+                  static_cast<u32>(static_cast<i64>(s.pending_length) - static_cast<i64>(s.offset)),
+                  platform::kSendFlags));
     if (n < 0 || (s.ssl && n == 0)) {
         if (s.ssl) {
             const int error = SSL_get_error(s.ssl, n);
@@ -505,7 +523,7 @@ bool NetClientWorker::write(Slot& s) {
         return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ? false : failed(s);
     }
     if (s.datagram && static_cast<u32>(n) != s.pending_length) return failed(s);
-    s.offset += static_cast<u32>(n);
+    s.offset = static_cast<u32>(static_cast<i64>(s.offset) + n);
     return s.offset == s.pending_length ? success(s, s.pending_length) : false;
 }
 bool NetClientWorker::read(Slot& s) {
@@ -527,7 +545,7 @@ bool NetClientWorker::read(Slot& s) {
         wanted = 0;
         for (u32 i = 0; i < s.buffered && i < s.amount; ++i)
             if (s.buffer[i] == '\n') {
-                wanted = i + 1;
+                wanted = static_cast<u32>(static_cast<i64>(i) + 1);
                 break;
             }
         if (!wanted && s.buffered >= s.amount) return failed(s);
@@ -539,17 +557,25 @@ bool NetClientWorker::read(Slot& s) {
         if (s.operation == NetOp::Receive && wanted > s.buffered) wanted = s.buffered;
         if (wanted) __builtin_memcpy(s.reply.bytes, s.buffer, wanted);
         s.reply.length = wanted;
-        s.buffered -= wanted;
-        if (s.buffered) __builtin_memmove(s.buffer, s.buffer + wanted, s.buffered);
+        s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) - static_cast<i64>(wanted));
+        if (s.buffered)
+            __builtin_memmove(s.buffer, s.buffer + static_cast<i64>(wanted), s.buffered);
         return success(s, 0);
     }
     if (s.eof || s.buffered == kMaxBytes) return failed(s);
     ERR_clear_error();
     const int n =
-        s.ssl ? SSL_read(s.ssl, s.buffer + s.buffered, static_cast<int>(kMaxBytes - s.buffered))
-              : static_cast<int>(recv(s.fd, s.buffer + s.buffered, kMaxBytes - s.buffered, 0));
+        s.ssl
+            ? SSL_read(s.ssl,
+                       s.buffer + static_cast<i64>(s.buffered),
+                       static_cast<int>(static_cast<i64>(kMaxBytes) - static_cast<i64>(s.buffered)))
+            : static_cast<int>(
+                  recv(s.fd,
+                       s.buffer + static_cast<i64>(s.buffered),
+                       static_cast<u32>(static_cast<i64>(kMaxBytes) - static_cast<i64>(s.buffered)),
+                       0));
     if (n > 0) {
-        s.buffered += static_cast<u32>(n);
+        s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) + n);
         return false;
     }
     if (s.ssl) {
