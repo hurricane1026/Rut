@@ -3,9 +3,9 @@
 namespace rut {
 
 static i32 hex_val(u8 c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= '0' && c <= '9') return static_cast<i32>(c) - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (static_cast<i32>(c) - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (static_cast<i32>(c) - 'A');
     return -1;
 }
 
@@ -72,12 +72,13 @@ ChunkStatus ChunkedParser::feed(
 
             case State::Data: {
                 // Bulk copy: consume min(remaining input, chunk_remaining).
-                u32 avail = in_len - pos;
+                u32 avail = static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(pos));
                 u32 n = avail < chunk_remaining ? avail : chunk_remaining;
                 *out_start = pos;
                 *out_len = n;
-                *consumed = pos + n;
-                chunk_remaining -= n;
+                *consumed = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(n));
+                chunk_remaining =
+                    static_cast<u32>(static_cast<i64>(chunk_remaining) - static_cast<i64>(n));
                 if (chunk_remaining == 0) {
                     state = State::DataCR;
                 }
