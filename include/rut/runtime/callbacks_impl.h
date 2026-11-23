@@ -2519,13 +2519,15 @@ bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
                 loop->close_conn(conn);
                 return true;
             }
-            const u32 body_len = length - parser.header_end;
+            const u32 body_len =
+                static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(parser.header_end));
             conn.send_buf.reset();
             if (conn.send_buf.write(conn.response_header_buf.data(),
                                     conn.response_header_buf.len()) !=
                     conn.response_header_buf.len() ||
-                conn.send_buf.write(conn.upstream_recv_buf.data() + parser.header_end, body_len) !=
-                    body_len) {
+                conn.send_buf.write(
+                    conn.upstream_recv_buf.data() + static_cast<i64>(parser.header_end),
+                    body_len) != body_len) {
                 loop->close_conn(conn);
                 return true;
             }
@@ -2986,22 +2988,26 @@ inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_en
                        (data[name_start] == ' ' || data[name_start] == '\t'))
                     name_start++;
                 while (name_end > name_start &&
-                       (data[name_end - 1u] == ' ' || data[name_end - 1u] == '\t'))
-                    name_end--;
-                if (name_end - name_start == 17u &&
-                    http_header_name_eq_ci(reinterpret_cast<const char*>(data + name_start),
-                                           name_end - name_start,
-                                           "transfer-encoding",
-                                           17))
+                       (data[static_cast<u32>(static_cast<i64>(name_end) - 1)] == ' ' ||
+                        data[static_cast<u32>(static_cast<i64>(name_end) - 1)] == '\t'))
+                    name_end = static_cast<u32>(static_cast<i64>(name_end) - 1);
+                if (static_cast<i64>(name_end) - static_cast<i64>(name_start) == 17 &&
+                    http_header_name_eq_ci(
+                        reinterpret_cast<const char*>(data + static_cast<i64>(name_start)),
+                        static_cast<u32>(static_cast<i64>(name_end) - static_cast<i64>(name_start)),
+                        "transfer-encoding",
+                        17))
                     return true;
             }
         }
 
         request_line = false;
-        pos = line_end +
-              (data[line_end] == '\r' && line_end + 1u < header_end && data[line_end + 1u] == '\n'
-                   ? 2u
-                   : 1u);
+        pos = static_cast<u32>(
+            static_cast<i64>(line_end) +
+            (data[line_end] == '\r' && static_cast<i64>(line_end) + 1 < header_end &&
+                     data[static_cast<u32>(static_cast<i64>(line_end) + 1)] == '\n'
+                 ? 2
+                 : 1));
     }
     return false;
 }
