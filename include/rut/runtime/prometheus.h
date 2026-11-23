@@ -162,8 +162,7 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     w.str("# TYPE rut_grpc_duration_seconds histogram\n");
     u64 grpc_cumulative = 0;
     for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
-        (void)__builtin_add_overflow(
-            grpc_cumulative, m.grpc_latency.buckets[i], &grpc_cumulative);
+        (void)__builtin_add_overflow(grpc_cumulative, m.grpc_latency.buckets[i], &grpc_cumulative);
         w.str("rut_grpc_duration_seconds_bucket{le=\"");
         w.str(kPromLatencyLe[i]);
         w.str("\"} ");

@@ -110,9 +110,9 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
         } else
             search = end;
     }
+    const i64 budget_remaining = static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1});
     if (size > static_cast<i64>(kStringOutputLimit) ||
-        static_cast<i64>(arena.space_used()) >
-            static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1}) ||
+        arena.space_used() > static_cast<u64>(budget_remaining) ||
         (!arena.current && !arena.init(arena.backend.pool)))
         return 0;
     auto* data = static_cast<char*>(arena.alloc(static_cast<u64>(size ? size : 1)));

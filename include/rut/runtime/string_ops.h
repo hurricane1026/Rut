@@ -53,9 +53,9 @@ inline bool transform_string(
     const i64 size = static_cast<i64>(text.len) -
                      static_cast<i64>(count) * static_cast<i64>(needle.len) +
                      static_cast<i64>(count) * static_cast<i64>(replacement.len);
+    const i64 budget_remaining = static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1});
     if (size > static_cast<i64>(kStringOutputLimit) ||
-        static_cast<i64>(arena->space_used()) >
-            static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1}) ||
+        arena->space_used() > static_cast<u64>(budget_remaining) ||
         (!arena->current && !arena->init(arena->backend.pool)))
         return false;
     auto* data = static_cast<char*>(arena->alloc(static_cast<u64>(size ? size : 1)));
