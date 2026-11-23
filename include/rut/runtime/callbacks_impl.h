@@ -4288,31 +4288,41 @@ inline bool build_h1_forward_response_headers(Connection& conn,
         // handshake must remain byte-compatible with the upstream response.
         if (conn.resp_status == 101) return false;
         u32 line_start = 0;
-        while (line_start + 1 < header_len &&
-               (data[line_start] != '\r' || data[line_start + 1] != '\n'))
-            line_start++;
-        line_start += 2;
-        while (line_start + 1 < header_len &&
-               (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
+        while (static_cast<i64>(line_start) + 1 < header_len &&
+               (data[line_start] != '\r' ||
+                data[static_cast<u32>(static_cast<i64>(line_start) + 1)] != '\n'))
+            line_start = static_cast<u32>(static_cast<i64>(line_start) + 1);
+        line_start = static_cast<u32>(static_cast<i64>(line_start) + 2);
+        while (static_cast<i64>(line_start) + 1 < header_len &&
+               (data[line_start] != '\r' ||
+                data[static_cast<u32>(static_cast<i64>(line_start) + 1)] != '\n')) {
             u32 line_end = line_start;
-            while (line_end + 1 < header_len &&
-                   (data[line_end] != '\r' || data[line_end + 1] != '\n'))
-                line_end++;
-            if (line_end + 1 >= header_len) return false;
+            while (static_cast<i64>(line_end) + 1 < header_len &&
+                   (data[line_end] != '\r' ||
+                    data[static_cast<u32>(static_cast<i64>(line_end) + 1)] != '\n'))
+                line_end = static_cast<u32>(static_cast<i64>(line_end) + 1);
+            if (static_cast<i64>(line_end) + 1 >= header_len) return false;
             u32 colon = line_start;
-            while (colon < line_end && data[colon] != ':') colon++;
+            while (colon < line_end && data[colon] != ':')
+                colon = static_cast<u32>(static_cast<i64>(colon) + 1);
             if (colon == line_end) return false;
             u32 field_name_end = colon;
             while (field_name_end > line_start &&
-                   (data[field_name_end - 1] == ' ' || data[field_name_end - 1] == '\t'))
-                field_name_end--;
+                   (data[static_cast<u32>(static_cast<i64>(field_name_end) - 1)] == ' ' ||
+                    data[static_cast<u32>(static_cast<i64>(field_name_end) - 1)] == '\t'))
+                field_name_end = static_cast<u32>(static_cast<i64>(field_name_end) - 1);
             if (http_header_name_eq_ci(reinterpret_cast<const char*>(data + line_start),
-                                       field_name_end - line_start,
+                                       static_cast<u32>(static_cast<i64>(field_name_end) -
+                                                        static_cast<i64>(line_start)),
                                        "connection",
                                        10) &&
-                connection_value_nominates(data + colon + 1, line_end - colon - 1, name, name_len))
+                connection_value_nominates(
+                    data + static_cast<i64>(colon) + 1,
+                    static_cast<u32>(static_cast<i64>(line_end) - static_cast<i64>(colon) - 1),
+                    name,
+                    name_len))
                 return true;
-            line_start = line_end + 2;
+            line_start = static_cast<u32>(static_cast<i64>(line_end) + 2);
         }
         return false;
     };
