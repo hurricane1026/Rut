@@ -6916,10 +6916,9 @@ inline bool apply_request_header_overrides(Connection& conn) {
     auto splice =
         [&](u32 pos, u32 old_span, const Str& name, const Str& val, bool write_line) -> bool {
         const u32 total = conn.recv_buf.len();
-        const u32 ins_len =
-            write_line
-                ? static_cast<u32>(static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2)
-                : 0;  // ": " + CRLF
+        const i64 ins_len_wide = static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2;
+        if (ins_len_wide > static_cast<i64>(UINT32_MAX)) return false;
+        const u32 ins_len = write_line ? static_cast<u32>(ins_len_wide) : 0;  // ": " + CRLF
         const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
         if (delta > 0 &&
             static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
@@ -7029,8 +7028,9 @@ inline bool apply_request_header_overrides(Connection& conn) {
         // can't place it, so fail closed instead of forwarding without it.
         if (hend < 4 || hend > total) return false;
 
-        const u32 line_len =
-            static_cast<u32>(static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2);
+        const i64 line_len_wide = static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2;
+        if (line_len_wide > static_cast<i64>(UINT32_MAX)) return false;
+        const u32 line_len = static_cast<u32>(line_len_wide);
         u32 fs = 0, fe = 0, search_from = 0;
         if (remove) {
             // Search again at the deletion point after every splice so adjacent
