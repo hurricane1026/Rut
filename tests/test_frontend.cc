@@ -49510,3 +49510,47 @@ TEST(frontend, integer_literals_do_not_change_listener_wire_decimal_grammar) {
     REQUIRE(ast);
     REQUIRE(analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, analyze_rejects_if_let_in_for_loop_match_arms) {
+    const char* sources[] = {
+        "route GET \"/x\" { for n in [1] { match n { 1 => if let x = false { return 201 } "
+        "else { return 202 } _ => return 500 } } return 404 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => match 2 { 1 => if let x = false "
+        "{ return 201 } else { return 202 } _ => return 203 } _ => return 500 } } "
+        "return 404 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit("if-let is not supported inside a static for-loop body")));
+    }
+}
+
+TEST(frontend, mir_unrolls_for_loop_guard_let_from_optional_query_lowers) {
+    const char* sources[] = {
+        "route GET \"/x\" { for n in [1] { guard let p = req.query(\"x\") else { return 400 } "
+        "guard p == \"a\" else { return 401 } } return 200 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => { guard let p = req.query(\"x\") "
+        "else { return 400 } guard p == \"a\" else { return 401 } return 200 } "
+        "_ => return 500 } } return 404 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}

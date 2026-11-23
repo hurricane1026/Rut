@@ -1663,6 +1663,54 @@ TEST(jit, frontend_static_for_loop_all_iterations_and_body_terminator_execute) {
     }
 }
 
+TEST(jit, frontend_static_for_loop_optional_guard_let_executes) {
+    const char* src =
+        "route GET \"/users\" { for n in [1] { guard let p = req.query(\"x\") else { return 400 } "
+        "guard p == \"a\" else { return 401 } } return 200 }\n";
+    const char* requests[] = {
+        "GET /users?x=a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "GET /users?x=b HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    };
+    const u16 expected[] = {200, 400, 401};
+
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+
+    for (u32 i = 0; i < 3; i++) {
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(requests[i]),
+                                               static_cast<u32>(__builtin_strlen(requests[i])),
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(r.status_code, expected[i]);
+    }
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_arith_div_mod_guards_execute) {
     // Runtime operands (locals don't fold at use sites), so the codegen
     // select guards — not the analyze fold — produce these results.

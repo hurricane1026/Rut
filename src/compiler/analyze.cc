@@ -20674,10 +20674,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 local.generic_protocol_count = bound->generic_protocol_count;
                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                     local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                // Success path: HasValue conds (error-capable sources) rule out both
-                // channels. Only the known-nil case (cond folded false, body
-                // unreachable) still binds a may_nil value.
-                local.may_nil = bound->may_nil && !bound->may_error;
+                // Success path: HasValue conds rule out both missing channels,
+                // so the bound value is usable regardless of the source kind.
+                local.may_nil = false;
                 local.may_error = false;
                 local.variant_index = bound->variant_index;
                 local.struct_index = bound->struct_index;
@@ -21000,6 +20999,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             inner_seen_wildcard = true;
                         }
                         if (inner_arm.stmt->kind == AstStmtKind::If) {
+                            if (inner_arm.stmt->bind_value)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_arm.stmt->span,
+                                    lit_str("if-let is not supported inside a static for-loop "
+                                            "body"));
                             const auto simple_branch = [](const AstStatement& branch) {
                                 return is_ast_hir_terminator(branch);
                             };
@@ -21324,11 +21329,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                                     local.generic_protocol_indices[cpi] =
                                         bound->generic_protocol_indices[cpi];
-                                // Success path: HasValue conds (error-capable sources) rule out
-                                // both
-                                // channels; pure-optional runtime values keep may_nil (see
-                                // analyze_guard_cond — their carrier is not lowerable yet).
-                                local.may_nil = bound->may_nil && !bound->may_error;
+                                // Success path: HasValue conds rule out both missing
+                                // channels, so the bound value is usable.
+                                local.may_nil = false;
                                 local.may_error = false;
                                 local.variant_index = bound->variant_index;
                                 local.struct_index = bound->struct_index;
@@ -21520,6 +21523,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             inner_seen_wildcard = true;
                         }
                         if (inner_ast_arm.stmt->kind == AstStmtKind::If) {
+                            if (inner_ast_arm.stmt->bind_value)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_ast_arm.stmt->span,
+                                    lit_str("if-let is not supported inside a static for-loop "
+                                            "body"));
                             const auto simple_branch = [](const AstStatement& branch) {
                                 return is_ast_hir_terminator(branch);
                             };
@@ -21567,6 +21576,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     continue;
                 }
                 if (arm_stmt->kind == AstStmtKind::If) {
+                    if (arm_stmt->bind_value)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->span,
+                            lit_str("if-let is not supported inside a static for-loop body"));
                     const auto simple_branch = [](const AstStatement& branch) {
                         return is_ast_hir_terminator(branch);
                     };
