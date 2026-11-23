@@ -194,6 +194,36 @@ struct Parser {
         return expect(type);
     }
 
+    // Decode source integers once for expressions and bounded configuration
+    // fields. Keep the original token text/span for diagnostics. Check before
+    // multiplying so arbitrarily long inputs cannot wrap into a valid value.
+    static FrontendResult<u64> parse_integer_literal(const Token& token, u64 maximum) {
+        const Str kText = token.text;
+        u32 radix = 10;
+        u32 begin = 0;
+        if (kText.len >= 2 && kText.ptr[0] == '0') {
+            if (kText.ptr[1] == 'b') radix = 2;
+            if (kText.ptr[1] == 'o') radix = 8;
+            if (kText.ptr[1] == 'x') radix = 16;
+            if (radix != 10) begin = 2;
+        }
+        if (begin == kText.len || kText.ptr[begin] == '_')
+            return frontend_error(FrontendError::InvalidInteger, span_from(token), kText);
+        u64 value = 0;
+        for (u32 i = begin; i < kText.len; ++i) {
+            const char kC = kText.ptr[i];
+            if (kC == '_') continue;
+            const u32 kDigit = kC >= '0' && kC <= '9'   ? static_cast<u32>(kC - '0')
+                               : kC >= 'a' && kC <= 'f' ? static_cast<u32>(kC - 'a') + 10u
+                               : kC >= 'A' && kC <= 'F' ? static_cast<u32>(kC - 'A') + 10u
+                                                        : 16u;
+            if (kDigit >= radix || kDigit > maximum || value > (maximum - kDigit) / radix)
+                return frontend_error(FrontendError::InvalidInteger, span_from(token), kText);
+            value = value * radix + kDigit;
+        }
+        return value;
+    }
+
     static FrontendResult<u32> parse_bounded_decimal(const Token& token,
                                                      u32 maximum,
                                                      bool reject_leading_zero) {
@@ -201,8 +231,10 @@ struct Parser {
             return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
         u32 value = 0;
         for (u32 i = 0; i < token.text.len; i++) {
+            if (token.text.ptr[i] < '0' || token.text.ptr[i] > '9')
+                return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
             const u32 digit = static_cast<u32>(token.text.ptr[i] - '0');
-            if (value > (maximum - digit) / 10u)
+            if (digit > maximum || value > (maximum - digit) / 10u)
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
             value = value * 10u + digit;
         }
@@ -1045,15 +1077,12 @@ struct Parser {
                             FrontendError::InvalidInteger, span_from(*arg), arg->text);
                 }
             }
-            u64 value = 0;
-            for (u32 i = 0; i < digit_len; i++) {
-                const u32 digit = static_cast<u32>(arg->text.ptr[i] - '0');
-                if (value > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
-                    return frontend_error(
-                        FrontendError::InvalidInteger, span_from(*arg), arg->text);
-                value = value * 10 + static_cast<u64>(digit);
-            }
-            const u64 ms = value * multiplier_ms;
+            Token integer_token = *arg;
+            integer_token.text = arg->text.slice(0, digit_len);
+            auto parsed_value = parse_integer_literal(integer_token, 0xffffffffull);
+            if (!parsed_value) return core::make_unexpected(parsed_value.error());
+            const u64 kValue = parsed_value.value();
+            const u64 ms = kValue * multiplier_ms;
             if (ms > 0xffffffffull)
                 return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
@@ -1133,15 +1162,11 @@ struct Parser {
             pos++;
             // Literals accumulate to i64 (cap INT64_MAX); analyze types the
             // result I32 when it fits i32, else I64 (oversized auto-widening).
-            i64 value = 0;
-            for (u32 i = 0; i < tok.text.len; i++) {
-                const i64 digit = static_cast<i64>(tok.text.ptr[i] - '0');
-                if (value > (static_cast<i64>(0x7fffffffffffffff) - digit) / 10)
-                    return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-                value = value * 10 + digit;
-            }
+            auto parsed_value = parse_integer_literal(tok, 0x7fffffffffffffffull);
+            if (!parsed_value) return core::make_unexpected(parsed_value.error());
+            const i64 kValue = static_cast<i64>(parsed_value.value());
             expr.kind = AstExprKind::IntLit;
-            expr.int_value = value;
+            expr.int_value = kValue;
             expr.span = span_from(tok);
             return expr;
         }
@@ -1529,16 +1554,12 @@ struct Parser {
     FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
         const Token tok = cur();
         pos++;
-        u64 mag = 0;
-        for (u32 i = 0; i < tok.text.len; i++) {
-            const u64 digit = static_cast<u64>(tok.text.ptr[i] - '0');
-            if (mag > (9223372036854775808ull - digit) / 10ull)
-                return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
-            mag = mag * 10ull + digit;
-        }
+        auto parsed_mag = parse_integer_literal(tok, 0x8000000000000000ull);
+        if (!parsed_mag) return core::make_unexpected(parsed_mag.error());
+        const u64 kMag = parsed_mag.value();
         AstExpr lit{};
         lit.kind = AstExprKind::IntLit;
-        lit.int_value = static_cast<i64>(0ull - mag);
+        lit.int_value = static_cast<i64>(0ull - kMag);
         lit.span = Span{minus.start, tok.end, minus.line, minus.col};
         return lit;
     }
@@ -1955,15 +1976,10 @@ struct Parser {
             }
 
             auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
-                i32 value = 0;
-                for (u32 i = 0; i < tok.text.len; i++) {
-                    const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
-                        return frontend_error(
-                            FrontendError::InvalidInteger, span_from(tok), tok.text);
-                    value = value * 10 + static_cast<i32>(digit);
-                }
-                return value;
+                auto parsed_value = parse_integer_literal(tok, 0x7fffffffull);
+                if (!parsed_value) return core::make_unexpected(parsed_value.error());
+                const i32 kValue = static_cast<i32>(parsed_value.value());
+                return kValue;
             };
 
             auto status = expect(TokenType::IntLit);
@@ -2016,15 +2032,10 @@ struct Parser {
             // Expect an IntLit and parse it as a signed i32 with the
             // INT_MAX overflow check that both branches share.
             auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
-                i32 value = 0;
-                for (u32 i = 0; i < tok.text.len; i++) {
-                    const u32 digit = static_cast<u32>(tok.text.ptr[i] - '0');
-                    if (value > (static_cast<i32>(0x7fffffff) - static_cast<i32>(digit)) / 10)
-                        return frontend_error(
-                            FrontendError::InvalidInteger, span_from(tok), tok.text);
-                    value = value * 10 + static_cast<i32>(digit);
-                }
-                return value;
+                auto parsed_value = parse_integer_literal(tok, 0x7fffffffull);
+                if (!parsed_value) return core::make_unexpected(parsed_value.error());
+                const i32 kValue = static_cast<i32>(parsed_value.value());
+                return kValue;
             };
 
             // `return redirect({...})` is intentionally contextual: redirect is
@@ -3112,13 +3123,9 @@ struct Parser {
                         return frontend_error(FrontendError::UnexpectedToken, span_from(start));
                     auto num = expect(TokenType::IntLit);
                     if (!num) return core::make_unexpected(num.error());
-                    u64 amount = 0;
-                    for (u32 i = 0; i < num.value()->text.len; i++) {
-                        amount = amount * 10 + static_cast<u64>(num.value()->text.ptr[i] - '0');
-                        if (amount > 0xffffffffull)
-                            return frontend_error(
-                                FrontendError::InvalidInteger, span_from(start), num.value()->text);
-                    }
+                    auto parsed_amount = parse_integer_literal(*num.value(), 0xffffffffull);
+                    if (!parsed_amount) return core::make_unexpected(parsed_amount.error());
+                    const u64 kAmount = parsed_amount.value();
                     auto unit = expect(TokenType::Ident);
                     if (!unit) return core::make_unexpected(unit.error());
                     const Str u = unit.value()->text;
@@ -3134,7 +3141,7 @@ struct Parser {
                     else
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(start), u);
-                    const u64 bytes = amount * mult;
+                    const u64 bytes = kAmount * mult;
                     if (bytes == 0 || bytes > 0xffffffffull)
                         return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
                     if (bytes > kWsMaxMessageCapacity) {
@@ -3499,16 +3506,13 @@ struct Parser {
                             FrontendError::InvalidInteger, span_from(*arg), arg->text);
                 }
             }
-            u64 value = 0;
-            for (u32 i = 0; i < digit_len; i++) {
-                const u32 digit = static_cast<u32>(arg->text.ptr[i] - '0');
-                if (value > (static_cast<u64>(0xffffffffu) - static_cast<u64>(digit)) / 10)
-                    return frontend_error(
-                        FrontendError::InvalidInteger, span_from(*arg), arg->text);
-                value = value * 10 + static_cast<u64>(digit);
-            }
+            Token integer_token = *arg;
+            integer_token.text = arg->text.slice(0, digit_len);
+            auto parsed_value = parse_integer_literal(integer_token, 0xffffffffull);
+            if (!parsed_value) return core::make_unexpected(parsed_value.error());
+            const u64 kValue = parsed_value.value();
             // Apply unit; re-check against u32 range after multiplication.
-            const u64 ms = value * multiplier_ms;
+            const u64 ms = kValue * multiplier_ms;
             if (ms > 0xffffffffull)
                 return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
@@ -3843,17 +3847,10 @@ struct Parser {
                     // with the right leading byte) from silently
                     // wrapping past 2^64 and landing below 0xffffffff —
                     // the post-multiply guard alone isn't enough.
-                    u64 v = 0;
-                    for (u32 i = 0; i < lit.value()->text.len; i++) {
-                        const u64 digit = static_cast<u64>(lit.value()->text.ptr[i] - '0');
-                        if (v > (static_cast<u64>(0xffffffffu) - digit) / 10u) {
-                            return frontend_error(FrontendError::InvalidInteger,
-                                                  span_from(*lit.value()),
-                                                  lit.value()->text);
-                        }
-                        v = v * 10 + digit;
-                    }
-                    item.upstream.port_lit = static_cast<u32>(v);
+                    auto parsed_v = parse_integer_literal(*lit.value(), 0xffffffffull);
+                    if (!parsed_v) return core::make_unexpected(parsed_v.error());
+                    const u64 kV = parsed_v.value();
+                    item.upstream.port_lit = static_cast<u32>(kV);
                     item.upstream.port_is_set = true;
                     seen_port = true;
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
@@ -3863,15 +3860,10 @@ struct Parser {
                     seen_minimum_healthy_weight_percent = true;
                     auto lit = expect(TokenType::IntLit);
                     if (!lit) return core::make_unexpected(lit.error());
-                    u32 percent = 0;
-                    for (u32 n = 0; n < lit.value()->text.len; ++n) {
-                        const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
-                        if (percent > (100u - digit) / 10u)
-                            return frontend_error(
-                                FrontendError::InvalidInteger, span_from(*lit.value()), field_name);
-                        percent = percent * 10u + digit;
-                    }
-                    item.upstream.minimum_healthy_weight_percent = static_cast<u8>(percent);
+                    auto parsed_percent = parse_integer_literal(*lit.value(), 100);
+                    if (!parsed_percent) return core::make_unexpected(parsed_percent.error());
+                    const u32 kPercent = static_cast<u32>(parsed_percent.value());
+                    item.upstream.minimum_healthy_weight_percent = static_cast<u8>(kPercent);
                 } else if (field_name.eq({"backends", 8})) {
                     // String arrays retain equal weights; dictionary entries bind each
                     // endpoint directly to its literal weight in declaration order.
@@ -3905,16 +3897,10 @@ struct Parser {
                             }
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
-                            u32 weight = 0;
-                            for (u32 n = 0; n < lit.value()->text.len; ++n) {
-                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[n] - '0');
-                                if (weight > (65535u - digit) / 10u)
-                                    return frontend_error(FrontendError::InvalidInteger,
-                                                          span_from(*lit.value()),
-                                                          field_name);
-                                weight = weight * 10u + digit;
-                            }
-                            item.upstream.backend_weights[index] = static_cast<u16>(weight);
+                            auto parsed_weight = parse_integer_literal(*lit.value(), 65535);
+                            if (!parsed_weight) return core::make_unexpected(parsed_weight.error());
+                            const u32 kWeight = static_cast<u32>(parsed_weight.value());
+                            item.upstream.backend_weights[index] = static_cast<u16>(kWeight);
                             ++item.upstream.weight_count;
                         }
                         item.upstream.backend_lits[item.upstream.backend_count++] =
@@ -3951,19 +3937,13 @@ struct Parser {
                         if (index < 4) {
                             auto literal = expect(TokenType::IntLit);
                             if (!literal) return core::make_unexpected(literal.error());
-                            u32 value = 0;
-                            for (u32 n = 0; n < literal.value()->text.len; ++n) {
-                                const u32 kDigit = literal.value()->text.ptr[n] - '0';
-                                if (value > (255u - kDigit) / 10u)
-                                    return frontend_error(FrontendError::InvalidInteger,
-                                                          span_from(*literal.value()),
-                                                          kName);
-                                value = value * 10 + kDigit;
-                            }
-                            if (index == 0) policy.tcp_failures = static_cast<u8>(value);
-                            if (index == 1) policy.timeouts = static_cast<u8>(value);
-                            if (index == 2) policy.http_failures = static_cast<u8>(value);
-                            if (index == 3) policy.successes = static_cast<u8>(value);
+                            auto parsed_value = parse_integer_literal(*literal.value(), 255);
+                            if (!parsed_value) return core::make_unexpected(parsed_value.error());
+                            const u32 kValue = static_cast<u32>(parsed_value.value());
+                            if (index == 0) policy.tcp_failures = static_cast<u8>(kValue);
+                            if (index == 1) policy.timeouts = static_cast<u8>(kValue);
+                            if (index == 2) policy.http_failures = static_cast<u8>(kValue);
+                            if (index == 3) policy.successes = static_cast<u8>(kValue);
                         } else {
                             auto bracket = expect(TokenType::LBracket);
                             if (!bracket) return core::make_unexpected(bracket.error());
@@ -3972,20 +3952,16 @@ struct Parser {
                             while (cur().type != TokenType::RBracket) {
                                 auto literal = expect(TokenType::IntLit);
                                 if (!literal) return core::make_unexpected(literal.error());
-                                u32 status = 0;
-                                for (u32 n = 0; n < literal.value()->text.len; ++n) {
-                                    const u32 kDigit = literal.value()->text.ptr[n] - '0';
-                                    if (status > (599u - kDigit) / 10u)
-                                        return frontend_error(FrontendError::InvalidInteger,
-                                                              span_from(*literal.value()),
-                                                              kName);
-                                    status = status * 10 + kDigit;
-                                }
-                                if (status < 200 || PassiveHealthPolicy::contains(statuses, status))
+                                auto parsed_status = parse_integer_literal(*literal.value(), 599);
+                                if (!parsed_status)
+                                    return core::make_unexpected(parsed_status.error());
+                                const u32 kStatus = static_cast<u32>(parsed_status.value());
+                                if (kStatus < 200 ||
+                                    PassiveHealthPolicy::contains(statuses, kStatus))
                                     return frontend_error(FrontendError::InvalidInteger,
                                                           span_from(*literal.value()),
                                                           kName);
-                                statuses[(status - 200) / 64] |= u64{1} << ((status - 200) % 64);
+                                statuses[(kStatus - 200) / 64] |= u64{1} << ((kStatus - 200) % 64);
                                 if (!take(TokenType::Comma)) break;
                             }
                             auto end = expect(TokenType::RBracket);
@@ -4112,26 +4088,20 @@ struct Parser {
                             // the valid HTTP range — e.g. 4294967496 -> 200 —
                             // must be rejected, not silently narrowed past the
                             // range check below.
-                            u64 sv = 0;
-                            for (u32 i = 0; i < lit.value()->text.len; i++) {
-                                const u64 digit = static_cast<u64>(lit.value()->text.ptr[i] - '0');
-                                if (sv > (0xffffu - digit) / 10u)
-                                    return frontend_error(FrontendError::InvalidInteger,
-                                                          span_from(*lit.value()),
-                                                          lit.value()->text);
-                                sv = sv * 10 + digit;
-                            }
+                            auto parsed_sv = parse_integer_literal(*lit.value(), 65535);
+                            if (!parsed_sv) return core::make_unexpected(parsed_sv.error());
+                            const u64 kSv = parsed_sv.value();
                             // The probe path parses the upstream reply with
                             // HttpResponseParser, which rejects any response
                             // outside 100..599 BEFORE the equality check — so an
                             // out-of-range expected status (e.g. 0, 99, 600) can
                             // never match and the backend could never be marked
                             // healthy. Reject it here.
-                            if (sv < 100 || sv > 599)
+                            if (kSv < 100 || kSv > 599)
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
-                            item.upstream.hc_expected_status = static_cast<u16>(sv);
+                            item.upstream.hc_expected_status = static_cast<u16>(kSv);
                             seen_status = true;
                         } else if (hc_key.eq({"failure_threshold", 17}) ||
                                    hc_key.eq({"success_threshold", 17})) {
@@ -4143,22 +4113,17 @@ struct Parser {
                                                       hc_key);
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
-                            u32 value = 0;
-                            for (u32 i = 0; i < lit.value()->text.len; i++) {
-                                const u32 digit = static_cast<u32>(lit.value()->text.ptr[i] - '0');
-                                if (value > (ActiveHealthThresholds::kMax - digit) / 10u)
-                                    return frontend_error(FrontendError::InvalidInteger,
-                                                          span_from(*lit.value()),
-                                                          lit.value()->text);
-                                value = value * 10 + digit;
-                            }
-                            if (value == 0)
+                            auto parsed_value =
+                                parse_integer_literal(*lit.value(), ActiveHealthThresholds::kMax);
+                            if (!parsed_value) return core::make_unexpected(parsed_value.error());
+                            const u32 kValue = static_cast<u32>(parsed_value.value());
+                            if (kValue == 0)
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
                             auto& thresholds = item.upstream.hc_thresholds;
                             (kFailure ? thresholds.failures : thresholds.successes) =
-                                static_cast<u8>(value);
+                                static_cast<u8>(kValue);
                             seen = true;
                         } else {
                             return frontend_error(FrontendError::UnexpectedToken,
@@ -5480,13 +5445,9 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto lim = expect(TokenType::IntLit);
             if (!lim) return core::make_unexpected(lim.error());
-            u64 maxv = 0;
-            for (u32 i = 0; i < lim.value()->text.len; i++) {
-                maxv = maxv * 10 + static_cast<u64>(lim.value()->text.ptr[i] - '0');
-                if (maxv > 0xffffffffull)
-                    return frontend_error(
-                        FrontendError::InvalidInteger, deco.span, lim.value()->text);
-            }
+            auto parsed_maxv = parse_integer_literal(*lim.value(), 0xffffffffull);
+            if (!parsed_maxv) return core::make_unexpected(parsed_maxv.error());
+            const u64 kMaxv = parsed_maxv.value();
             if (!expect(TokenType::Comma))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto win_kw = expect(TokenType::Ident);
@@ -5497,7 +5458,7 @@ struct Parser {
             auto dur = expect(TokenType::DurLit);
             if (!dur) return core::make_unexpected(dur.error());
             u32 kWin = 0;
-            if (maxv == 0)
+            if (kMaxv == 0)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       span_from(*lim.value()),
                                       lit_str("rate-limit limit must be greater than zero"));
@@ -5549,14 +5510,10 @@ struct Parser {
                     auto bv = expect(TokenType::IntLit);
                     if (!bv) return core::make_unexpected(bv.error());
                     burst_span = span_from(*bv.value());
-                    u64 b = 0;
-                    for (u32 i = 0; i < bv.value()->text.len; i++) {
-                        b = b * 10 + static_cast<u64>(bv.value()->text.ptr[i] - '0');
-                        if (b > 0xffffffffull)
-                            return frontend_error(
-                                FrontendError::InvalidInteger, deco.span, bv.value()->text);
-                    }
-                    deco.rate_limit_burst = static_cast<u32>(b);
+                    auto parsed_b = parse_integer_literal(*bv.value(), 0xffffffffull);
+                    if (!parsed_b) return core::make_unexpected(parsed_b.error());
+                    const u64 kB = parsed_b.value();
+                    deco.rate_limit_burst = static_cast<u32>(kB);
                 } else {
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*arg.value()),
@@ -5566,13 +5523,13 @@ struct Parser {
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             const u32 burst =
-                deco.rate_limit_burst == 0 ? static_cast<u32>(maxv) : deco.rate_limit_burst;
-            if (!rate_limit_params_representable(static_cast<u32>(maxv), kWin, burst))
+                deco.rate_limit_burst == 0 ? static_cast<u32>(kMaxv) : deco.rate_limit_burst;
+            if (!rate_limit_params_representable(static_cast<u32>(kMaxv), kWin, burst))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     burst_span,
                     lit_str("rate-limit burst is too large for this limit and window"));
-            deco.rate_limit_max = static_cast<u32>(maxv);
+            deco.rate_limit_max = static_cast<u32>(kMaxv);
             deco.rate_limit_window_sec = kWin;
             return deco;
         }
@@ -5588,13 +5545,9 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto num = expect(TokenType::IntLit);
             if (!num) return core::make_unexpected(num.error());
-            u64 amount = 0;
-            for (u32 i = 0; i < num.value()->text.len; i++) {
-                amount = amount * 10 + static_cast<u64>(num.value()->text.ptr[i] - '0');
-                if (amount > 0xffffffffull)
-                    return frontend_error(
-                        FrontendError::InvalidInteger, deco.span, num.value()->text);
-            }
+            auto parsed_amount = parse_integer_literal(*num.value(), 0xffffffffull);
+            if (!parsed_amount) return core::make_unexpected(parsed_amount.error());
+            const u64 kAmount = parsed_amount.value();
             // ByteSize unit — a separate identifier token (e.g. "5mb" lexes as
             // IntLit "5" + Ident "mb"; the duration lexer doesn't claim it).
             auto unit = expect(TokenType::Ident);
@@ -5611,7 +5564,7 @@ struct Parser {
                 mult = 1024ull * 1024 * 1024;
             else
                 return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kUnit2);
-            const u64 kBytes = amount * mult;
+            const u64 kBytes = kAmount * mult;
             if (!expect(TokenType::Comma))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto win_kw = expect(TokenType::Ident);
@@ -5699,16 +5652,11 @@ struct Parser {
             if (step.kind == AstChainStepKind::Before && take(TokenType::KwElse)) {
                 auto status = expect(TokenType::IntLit);
                 if (!status) return core::make_unexpected(status.error());
-                u32 parsed_status = 0;
-                for (u32 i = 0; i < status.value()->text.len; i++) {
-                    const u32 digit = static_cast<u32>(status.value()->text.ptr[i] - '0');
-                    if (parsed_status > (0xffffffffu - digit) / 10)
-                        return frontend_error(FrontendError::InvalidInteger,
-                                              span_from(*status.value()));
-                    parsed_status = parsed_status * 10 + digit;
-                }
+                auto status_value = parse_integer_literal(*status.value(), 0xffffffffull);
+                if (!status_value) return core::make_unexpected(status_value.error());
+                const u32 kParsedStatus = static_cast<u32>(status_value.value());
                 step.has_else = true;
-                step.else_status = parsed_status;
+                step.else_status = kParsedStatus;
                 step.span = Span{start.start, status.value()->end, start.line, start.col};
             } else {
                 step.span = Span{start.start, call->span.end, start.line, start.col};
@@ -5839,19 +5787,14 @@ struct Parser {
                 bit = 1u << 1;
                 auto value = expect(TokenType::IntLit);
                 if (!value) return core::make_unexpected(value.error());
-                u32 status = 0;
-                for (u32 i = 0; i < value.value()->text.len; i++) {
-                    const u32 digit = static_cast<u32>(value.value()->text.ptr[i] - '0');
-                    if (status > (0xffffffffu - digit) / 10)
-                        return frontend_error(FrontendError::InvalidInteger,
-                                              span_from(*value.value()));
-                    status = status * 10 + digit;
-                }
-                if (status > 0xffffu ||
-                    !strict_local_response_status_supported(static_cast<u16>(status)))
+                auto parsed_status = parse_integer_literal(*value.value(), 0xffffffffull);
+                if (!parsed_status) return core::make_unexpected(parsed_status.error());
+                const u32 kStatus = static_cast<u32>(parsed_status.value());
+                if (kStatus > 0xffffu ||
+                    !strict_local_response_status_supported(static_cast<u16>(kStatus)))
                     return frontend_error(FrontendError::InvalidStatusCode,
                                           span_from(*value.value()));
-                policy.status_code = static_cast<u16>(status);
+                policy.status_code = static_cast<u16>(kStatus);
             } else if (field.eq({"reason", 6})) {
                 bit = 1u << 2;
                 auto value = expect(TokenType::StringLit);
@@ -6306,14 +6249,12 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
             auto shard_lit = expect(TokenType::IntLit);
             if (!shard_lit) return core::make_unexpected(shard_lit.error());
-            i64 shard_value = 0;
-            for (u32 ci = 0; ci < shard_lit.value()->text.len && shard_value <= 0xffff; ci++)
-                shard_value = shard_value * 10 + (shard_lit.value()->text.ptr[ci] - '0');
-            if (shard_value > 0xffff)
+            auto shard_value = parse_integer_literal(*shard_lit.value(), 65535);
+            if (!shard_value)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       span_from(*shard_lit.value()),
                                       shard_lit.value()->text);
-            item.timer.shard = static_cast<i32>(shard_value);
+            item.timer.shard = static_cast<i32>(shard_value.value());
         }
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());

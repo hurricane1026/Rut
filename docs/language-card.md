@@ -63,8 +63,9 @@ observation profile described below). Imported files cannot declare it.
 
 ```swift
 // Literals
-42                                      // number (plain integer)
-3.14   0xFF   1_000_000                 // ⏳ float / hex / underscored (lexer takes plain digit runs only)
+42  0b101010  0o52  0x2A                // integers, inferred i32/i64 by value
+1_000_000  0xFF_FF                      // integer digit separators
+3.14                                    // ⏳ floating-point literals
 "text"   "\(req.path)/x"                // strings, \() interpolation (ONLY form)
 500ms  1s  5m  1h                       // Duration (1d ⏳ — lexer knows ms/s/m/h only)
 64b  1kb  16kb  1mb  1gb                // ⏳ ByteSize (no byte-size literal in lexer)
@@ -307,6 +308,31 @@ IP.parse("127.0.0.1")      // IP? — strict IPv4 dotted decimal
 // ⏳ parseFloat, IPv6 parsing, CIDR.parse and Duration.parse remain pending
 200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
+
+## Source integer literals
+
+Integer literals use decimal digits, or the lowercase prefixes `0b` (binary),
+`0o` (octal), and `0x` (hexadecimal). Hexadecimal digits accept either case.
+Following the [Swift lexical grammar](https://docs.swift.org/latest/documentation/the-swift-programming-language/lexicalstructure/),
+the first character after a prefix must be a radix digit; later characters may
+be digits or underscores. Repeated and trailing underscores are accepted:
+`1__000_`, `0xF__`. A leading underscore is an identifier character, not an
+integer separator. Decimal leading zeros do not select octal (`0009 == 9`).
+
+Every spelling denotes a signed magnitude: values through `2147483647` infer
+`i32`; larger values through `9223372036854775807` infer `i64`. A leading minus
+also permits `-0x8000_0000_0000_0000` (`i64` minimum). Overflow is a compile
+error; `0xffff_ffff` is positive `i64`, not an unsigned bit pattern or `-1`.
+The same decoder and field-specific bounds apply to integer configuration
+arguments, status codes, match patterns and bare integer `wait` milliseconds.
+
+Numeric listener addresses and ports retain their plain decimal wire grammar.
+Duration literals retain decimal digits followed immediately by `ms/s/m/h`;
+radix prefixes and separators are not supported there. In the existing
+ByteSize configuration positions, separate a radix integer and unit with
+whitespace (`0x10 kb`); decimal forms such as `16kb` remain accepted.
+Runtime `parseInt`/`parseInt64` continue to accept decimal text only.
+Floating-point literals and source unsigned integer types remain absent.
 
 ## Decimal integer parsing
 

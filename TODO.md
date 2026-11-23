@@ -9,6 +9,12 @@ see [language card](docs/language-card.md#byte-string-core) for bounds/lifetimes
 Unicode semantics and Swift Regex.Match remain absent, with existing explicit
 byte/capture APIs available.
 
+Completed integer source literals: binary/octal/hex prefixes and Swift digit
+separators, checked signed i32/i64 inference and minimum values, and bounded
+configuration arguments. Listener wire spelling and runtime text parsing remain
+decimal; floating-point literals remain pending. See
+[source integer literals](docs/language-card.md#source-integer-literals).
+
 ## P0: Front-End Migration to the Revised Syntax Spec (branch design_syntax)
 
 **Goal**: Migrate lexer/parser/checker to the 2026-07 DESIGN.md §3 revision

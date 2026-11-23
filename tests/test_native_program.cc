@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "es256_fixture.h"
+#include "fixtures/integer_literals.h"
 #include "fixtures/ip_parse.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/query_all.h"
@@ -4340,3 +4341,29 @@ route GET "/ws" { return websocket(backend) { message in
     }
 }
 #endif
+
+TEST(native_program, integer_literals_execute_at_both_optimization_levels) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::integer_literals::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        auto handler = program.p->config.routes[0].fn;
+        REQUIRE(handler);
+        jit::HandlerCtx ctx{};
+        auto connection = std::make_unique<ConnectionBase>();
+        for (const auto& item : test::integer_literals::kCases) {
+            std::string request =
+                std::string("GET / HTTP/1.1\r\nHost: local\r\nX-Value: ") + item.value + "\r\n\r\n";
+            auto result =
+                jit::HandlerResult::unpack(handler(connection.get(),
+                                                   &ctx,
+                                                   reinterpret_cast<const u8*>(request.data()),
+                                                   request.size(),
+                                                   nullptr));
+            CHECK_EQ(result.status_code, item.status);
+        }
+    }
+}

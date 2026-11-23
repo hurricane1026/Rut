@@ -191,9 +191,46 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
         }
 
         if (is_digit(c)) {
+            // Swift integer literals require a digit immediately after a radix
+            // prefix; subsequent digits may be separated or followed by `_`.
+            if (c == '0' && pos + 1 < source.len &&
+                (source.ptr[pos + 1] == 'b' || source.ptr[pos + 1] == 'o' ||
+                 source.ptr[pos + 1] == 'x')) {
+                const char kPrefix = source.ptr[pos + 1];
+                const u32 kRadix = kPrefix == 'b' ? 2u : kPrefix == 'o' ? 8u : 16u;
+                pos += 2;
+                col += 2;
+                const u32 kDigitsStart = pos;
+                bool valid = true;
+                while (pos < source.len && is_ident_continue(source.ptr[pos])) {
+                    const char kDigit = source.ptr[pos];
+                    if (kDigit == '_') {
+                        if (pos == kDigitsStart) valid = false;
+                    } else {
+                        const u32 kValue =
+                            is_digit(kDigit)                 ? static_cast<u32>(kDigit - '0')
+                            : kDigit >= 'a' && kDigit <= 'f' ? static_cast<u32>(kDigit - 'a') + 10u
+                            : kDigit >= 'A' && kDigit <= 'F' ? static_cast<u32>(kDigit - 'A') + 10u
+                                                             : 16u;
+                        if (kValue >= kRadix) valid = false;
+                    }
+                    pos++;
+                    col++;
+                }
+                tok.end = pos;
+                tok.text = source.slice(tok.start, tok.end);
+                if (!valid || pos == kDigitsStart)
+                    return frontend_error(FrontendError::InvalidInteger, token_span(tok), tok.text);
+                tok.type = TokenType::IntLit;
+                if (!out.tokens.push(tok))
+                    return frontend_error(FrontendError::TooManyTokens, token_span(tok));
+                continue;
+            }
             pos++;
             col++;
-            while (pos < source.len && is_digit(source.ptr[pos])) {
+            bool separated = false;
+            while (pos < source.len && (is_digit(source.ptr[pos]) || source.ptr[pos] == '_')) {
+                separated |= source.ptr[pos] == '_';
                 pos++;
                 col++;
             }
@@ -222,6 +259,10 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                 pos = unit_end;
                 tok.end = pos;
                 tok.text = source.slice(tok.start, tok.end);
+                // Duration is a distinct domain literal with decimal digits
+                // only. Do not send separators to its existing unit decoders.
+                if (separated)
+                    return frontend_error(FrontendError::InvalidInteger, token_span(tok), tok.text);
                 tok.type = TokenType::DurLit;
                 if (!out.tokens.push(tok))
                     return frontend_error(FrontendError::TooManyTokens, token_span(tok));
