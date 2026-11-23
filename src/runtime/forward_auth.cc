@@ -89,7 +89,7 @@ bool ForwardAuthPolicy::load(Str configuration) {
         } else
             return false;
         if (seen & bit) return false;
-        json::Writer value{out, cap - 1};
+        json::Writer value{out, static_cast<u32>(static_cast<i64>(cap) - 1)};
         if (!document.string(n, value) || !value.ok || !value.len) return false;
         for (u32 i = 0; i < value.len; ++i)
             if (out[i] == 0) return false;
@@ -171,7 +171,9 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
             cancel(connection, slot.generation);
     }
     if (found) {
-        if (now < found->started_ms || now - found->started_ms >= found->timeout_ms) {
+        if (now < found->started_ms ||
+            static_cast<i64>(now) - static_cast<i64>(found->started_ms) >=
+                static_cast<i64>(found->timeout_ms)) {
             cancel(connection, generation);
             ForwardAuthReply reply;
             reply.status = -2;
@@ -232,7 +234,8 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     if (!found) return {};
     ForwardAuthReply reply;
     reply.status = static_cast<i32>(0x80000000u);
-    const auto kRemaining = found->timeout_ms - (now - found->started_ms);
+    const i64 kRemaining = static_cast<i64>(found->timeout_ms) -
+                           (static_cast<i64>(now) - static_cast<i64>(found->started_ms));
     reply.retry_ms = static_cast<u32>(kRemaining < 10 ? kRemaining : 10);
     return reply;
 }

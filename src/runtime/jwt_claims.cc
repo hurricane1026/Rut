@@ -42,8 +42,10 @@ bool scope_list_matches(Str scopes, Str required, bool& found) {
     for (u32 i = 0; i <= scopes.len; ++i) {
         if (i == scopes.len || scopes.ptr[i] == ' ') {
             if (i == start) return false;
-            found |= Str{scopes.ptr + start, i - start}.eq(required);
-            start = i + 1;
+            found |= Str{scopes.ptr + static_cast<i64>(start),
+                         static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}
+                         .eq(required);
+            start = static_cast<u32>(static_cast<i64>(i) + 1);
         } else if (!scope_token_byte(static_cast<unsigned char>(scopes.ptr[i]))) {
             return false;
         }
@@ -176,11 +178,14 @@ bool scope_set_matches(json::Document& document,
     for (u32 i = 0; i <= required_scopes.len; ++i) {
         if (i != required_scopes.len && required[i] != ' ') continue;
         bool found = false;
-        if (!scope_list_matches(kGranted, {required + start, i - start}, found) ||
+        if (!scope_list_matches(kGranted,
+                                {required + static_cast<i64>(start),
+                                 static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))},
+                                found) ||
             (require_all && !found))
             return false;
         any |= found;
-        start = i + 1;
+        start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
     return require_all || any;
 }
