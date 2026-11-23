@@ -102,7 +102,9 @@ inline constexpr u32 kResponseReadTimerGenerationMask = 0x7FFFFFFFu;
 // On exhaustion, leave both the counter and the caller's owner untouched.
 constexpr bool allocate_io_generation(u32& counter, u32& owner, u32 maximum) {
     if (counter >= maximum) return false;
-    ++counter;
+    u32 next;
+    (void)__builtin_add_overflow(counter, u32{1}, &next);
+    counter = next;
     owner = counter;
     return true;
 }
