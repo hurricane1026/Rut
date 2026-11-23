@@ -4442,24 +4442,30 @@ inline bool build_h1_forward_response_headers(Connection& conn,
         while (colon < line_end && data[colon] != ':') colon++;
         if (colon == line_end) return false;
         u32 name_end = colon;
-        while (name_end > line_start && (data[name_end - 1] == ' ' || data[name_end - 1] == '\t'))
-            name_end--;
-        const bool is_connection =
-            http_header_name_eq_ci(reinterpret_cast<const char*>(data + line_start),
-                                   name_end - line_start,
-                                   "connection",
-                                   10);
-        if (!base_suppressed(reinterpret_cast<const char*>(data + line_start),
-                             name_end - line_start)) {
-            const u8* value = data + colon + 1;
-            const u32 value_len = line_end - colon - 1;
+        while (name_end > line_start &&
+               (data[static_cast<u32>(static_cast<i64>(name_end) - 1)] == ' ' ||
+                data[static_cast<u32>(static_cast<i64>(name_end) - 1)] == '\t'))
+            name_end = static_cast<u32>(static_cast<i64>(name_end) - 1);
+        const bool is_connection = http_header_name_eq_ci(
+            reinterpret_cast<const char*>(data + static_cast<i64>(line_start)),
+            static_cast<u32>(static_cast<i64>(name_end) - static_cast<i64>(line_start)),
+            "connection",
+            10);
+        if (!base_suppressed(
+                reinterpret_cast<const char*>(data + static_cast<i64>(line_start)),
+                static_cast<u32>(static_cast<i64>(name_end) - static_cast<i64>(line_start)))) {
+            const u8* value = data + static_cast<i64>(colon) + 1;
+            const u32 value_len =
+                static_cast<u32>(static_cast<i64>(line_end) - static_cast<i64>(colon) - 1);
             if (is_connection && connection_nominates_mutation(value, value_len)) {
                 if (!write_filtered_connection(value, value_len)) return false;
-            } else if (!write(data + line_start, line_end + 2 - line_start)) {
+            } else if (!write(data + static_cast<i64>(line_start),
+                              static_cast<u32>(static_cast<i64>(line_end) + 2 -
+                                               static_cast<i64>(line_start)))) {
                 return false;
             }
         }
-        line_start = line_end + 2;
+        line_start = static_cast<u32>(static_cast<i64>(line_end) + 2);
     }
 
     static const char kColonSpace[] = ": ";
