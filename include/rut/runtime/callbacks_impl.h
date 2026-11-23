@@ -8544,11 +8544,16 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     bool measuring = true;
     auto append = [&](const u8* p, u32 n) {
         if (measuring) {
-            measured_len += n;
+            u32 next = 0;
+            if (__builtin_add_overflow(measured_len, n, &next)) return false;
+            measured_len = next;
             return true;
         }
-        return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
-               conn.send_buf.write(p, n) == n;
+        if (conn.send_buf.len() > conn.send_buf.capacity() ||
+            static_cast<i64>(n) >
+                static_cast<i64>(conn.send_buf.capacity()) - static_cast<i64>(conn.send_buf.len()))
+            return false;
+        return conn.send_buf.write(p, n) == n;
     };
     auto append_lit = [&](const char* p, u32 n) {
         return append(reinterpret_cast<const u8*>(p), n);
@@ -8556,7 +8561,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     auto append_lower = [&](const u8* p, u32 n) {
         for (u32 i = 0; i < n; i++) {
             u8 c = p[i];
-            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(c + ('a' - 'A'));
+            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(static_cast<i64>(c) + ('a' - 'A'));
             if (!append(&c, 1)) return false;
         }
         return true;
@@ -8860,14 +8865,15 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                               static_cast<u8>(ip >> 16),
                               static_cast<u8>(ip >> 8),
                               static_cast<u8>(ip)};
-        u64 measured = static_cast<u64>(path_ptr - data) + req.path.len + 1u + 8u + 2u;
-        measured += 6u + 2u;
+        i64 measured =
+            static_cast<i64>(path_ptr - data) + static_cast<i64>(req.path.len) + 1 + 8 + 2;
+        measured += 6 + 2;
         for (u8 oi = 0; oi < 4; ++oi) {
             if (oi != 0) ++measured;
-            measured += decimal_len(octets[oi]);
+            measured += static_cast<i64>(decimal_len(octets[oi]));
         }
         const u16 port = ntohs(endpoint.sin_port);
-        if (port != 80) measured += 1u + decimal_len(port);
+        if (port != 80) measured += 1 + static_cast<i64>(decimal_len(port));
         const u8* measured_hs = line_end + 2;
         const u8* measured_header_end = end - 2;
         u32 measured_index = 0;
@@ -8907,15 +8913,17 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                     ++value_start;
                 while (value_end > value_start && parsed_header.raw_value.ptr[value_end - 1] == ' ')
                     --value_end;
-                measured += static_cast<u64>(name_len) + 2u + (value_end - value_start) + 2u;
+                measured +=
+                    static_cast<i64>(name_len) + 2 + static_cast<i64>(value_end - value_start) + 2;
             }
             measured_hs = measured_le + 2;
         }
-        measured += 2u;
-        if (measured_index != req.header_count || measured > conn.send_buf.capacity() ||
-            measured > conn.recv_buf.capacity() || measured > 0xffffffffu)
+        measured += 2;
+        if (measured_index != req.header_count || measured < 0 ||
+            measured > static_cast<i64>(conn.send_buf.capacity()) ||
+            measured > static_cast<i64>(conn.recv_buf.capacity()))
             return false;
-        measured_id3_length = measured;
+        measured_id3_length = static_cast<u64>(measured);
     }
 
     auto append = [&](const u8* p, u32 n) {
