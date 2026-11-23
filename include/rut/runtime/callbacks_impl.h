@@ -4422,10 +4422,14 @@ inline bool build_h1_forward_response_headers(Connection& conn,
     conn.response_header_buf.reset();
     u32 line_start = 0;
     u32 line_end = 0;
-    while (line_end + 1 < header_len && (data[line_end] != '\r' || data[line_end + 1] != '\n'))
-        line_end++;
-    if (line_end + 1 >= header_len || !write(data, line_end + 2)) return false;
-    line_start = line_end + 2;
+    while (
+        static_cast<i64>(line_end) + 1 < header_len &&
+        (data[line_end] != '\r' || data[static_cast<u32>(static_cast<i64>(line_end) + 1)] != '\n'))
+        line_end = static_cast<u32>(static_cast<i64>(line_end) + 1);
+    if (static_cast<i64>(line_end) + 1 >= header_len ||
+        !write(data, static_cast<u32>(static_cast<i64>(line_end) + 2)))
+        return false;
+    line_start = static_cast<u32>(static_cast<i64>(line_end) + 2);
     while (line_start + 1 < header_len &&
            (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
         line_end = line_start;
