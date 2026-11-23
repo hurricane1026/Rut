@@ -892,6 +892,43 @@ u32 record_by_id(json::Document& doc, u32 records, Str id) {
     return json::kNone;
 }
 
+int create_consumer_command(const char* source,
+                            const char* consumer_path,
+                            const char* destination) {
+    Buffer input, consumer;
+    SensitiveDocument base, record;
+    if (!read_private(source, input) || !consumer_registry_valid(base, input.view()))
+        return failure("cannot read valid private registry snapshot\n");
+    if (!read_private(consumer_path, consumer) || !record.parse(consumer.view()) ||
+        record.nodes[0].kind != json::Kind::Object)
+        return failure("cannot read valid private Consumer record\n");
+    const u32 kId = field(record, 0, lit_str("id"));
+    if (!id_valid(record, kId)) return failure("invalid Consumer ID\n");
+    const u32 kConsumers = field(base, 0, lit_str("consumers"));
+    if (find(base, kConsumers, record, kId, true) != json::kNone)
+        return failure("Consumer ID already exists\n");
+
+    Buffer result;
+    json::Writer output{result.data, json::kMaxBytes};
+    output.text(lit_str("{\"version\":1,\"consumers\":["));
+    for (u32 current = base.nodes[kConsumers].child; current != json::kNone;
+         current = base.nodes[current].next) {
+        if (!base.write(current, output)) return failure("cannot encode Consumer registry\n");
+        output.put(',');
+    }
+    if (!record.write(0, output)) return failure("cannot encode Consumer record\n");
+    output.text(lit_str("],\"credentials\":"));
+    if (!base.write(field(base, 0, lit_str("credentials")), output))
+        return failure("cannot encode Consumer registry\n");
+    output.put('}');
+
+    SensitiveDocument checked;
+    if (!output.ok || !consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* const kError = publish(destination, {result.data, output.len});
+    return kError ? failure(kError) : 0;
+}
+
 bool write_consumer_removals(json::Document& base,
                              Str id,
                              bool include_credentials,
@@ -1209,6 +1246,7 @@ constexpr char kUsage[] =
     "       rut-consumers inspect INPUT\n"
     "       rut-consumers inspect-consumer INPUT CONSUMER_ID\n"
     "       rut-consumers inspect-credential INPUT CREDENTIAL_ID\n"
+    "       rut-consumers create-consumer INPUT CONSUMER_FILE OUTPUT\n"
     "       rut-consumers remove-credential INPUT CREDENTIAL_ID OUTPUT\n"
     "       rut-consumers remove-consumer INPUT CONSUMER_ID OUTPUT\n"
     "       rut-consumers remove-consumer-with-credentials INPUT CONSUMER_ID OUTPUT\n"
@@ -1254,6 +1292,8 @@ constexpr char kUsage[] =
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 5 && strcmp(argv[1], "create-consumer") == 0)
+        return create_consumer_command(argv[2], argv[3], argv[4]);
     if (argc == 5 && strcmp(argv[1], "remove-credential") == 0)
         return remove_registry_record(argv[2], argv[3], argv[4], RegistryRemoval::Credential);
     if (argc == 5 && strcmp(argv[1], "remove-consumer") == 0)
