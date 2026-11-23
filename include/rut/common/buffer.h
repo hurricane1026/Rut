@@ -107,11 +107,13 @@ struct Buffer {
     u32 write(const u8* src, u32 n) noexcept {
         if (released_) __builtin_trap();
         if (!ptr_) return 0;
-        u32 avail = cap_ - len_;
+        if (len_ > cap_) __builtin_trap();
+        u32 avail = 0;
+        (void)__builtin_sub_overflow(cap_, len_, &avail);
         u32 to_write = n < avail ? n : avail;
         if (to_write > 0) {
-            __builtin_memmove(ptr_ + len_, src, to_write);
-            len_ += to_write;
+            __builtin_memmove(ptr_ + static_cast<i64>(len_), src, to_write);
+            (void)__builtin_add_overflow(len_, to_write, &len_);
         }
         return to_write;
     }
@@ -147,20 +149,24 @@ struct Buffer {
     // Returns pointer past current data; write_avail() bytes available.
     u8* write_ptr() noexcept {
         if (released_) __builtin_trap();
-        return ptr_ ? ptr_ + len_ : nullptr;
+        return ptr_ ? ptr_ + static_cast<i64>(len_) : nullptr;
     }
 
     u32 write_avail() const noexcept {
         if (released_) __builtin_trap();
-        return ptr_ ? cap_ - len_ : 0;
+        if (!ptr_ || len_ > cap_) return 0;
+        u32 available = 0;
+        (void)__builtin_sub_overflow(cap_, len_, &available);
+        return available;
     }
 
     // Commit n bytes written directly via write_ptr().
     // Call after recv() returns — advances len_ without copying.
     void commit(u32 n) noexcept {
         if (released_) __builtin_trap();
-        if (!ptr_ || len_ + n > cap_) __builtin_trap();
-        len_ += n;
+        u32 end = 0;
+        if (!ptr_ || __builtin_add_overflow(len_, n, &end) || end > cap_) __builtin_trap();
+        len_ = end;
     }
 
     // Set the absolute length after an in-place edit (e.g. rewriting the
@@ -180,8 +186,10 @@ struct Buffer {
             len_ = 0;
             return;
         }
-        __builtin_memmove(ptr_, ptr_ + n, len_ - n);
-        len_ -= n;
+        u32 remaining = 0;
+        (void)__builtin_sub_overflow(len_, n, &remaining);
+        __builtin_memmove(ptr_, ptr_ + static_cast<i64>(n), remaining);
+        len_ = remaining;
     }
 
     // Read-only data pointer for kernel send() / zero-copy forwarding.
