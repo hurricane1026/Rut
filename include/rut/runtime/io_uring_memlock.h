@@ -98,10 +98,11 @@ constexpr u64 saturating_mul(u64 a, u64 b) {
 static constexpr u64 kRingsHeaderBytes = 320;
 constexpr u64 round_up_page(u64 n, u64 page_bytes) {
     if (page_bytes == 0) return 0;
-    u64 page_minus_one = 0;
-    (void)__builtin_sub_overflow(page_bytes, u64{1}, &page_minus_one);
-    const u64 rounded = iouring_memlock_detail::saturating_add(n, page_minus_one);
-    return rounded / page_bytes * page_bytes;
+    const u64 remainder = n % page_bytes;
+    if (remainder == 0) return n;
+    u64 increment = 0;
+    (void)__builtin_sub_overflow(page_bytes, remainder, &increment);
+    return iouring_memlock_detail::saturating_add(n, increment);
 }
 }  // namespace iouring_memlock_detail
 

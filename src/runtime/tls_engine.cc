@@ -27,14 +27,15 @@ int bridge_bio_write(BIO* bio, const char* data, int len) {
         BIO_set_retry_write(bio);
         return -1;
     }
-    const u32 kSpace = eng->out_cap - eng->out_len;
+    const u32 kSpace =
+        static_cast<u32>(static_cast<i64>(eng->out_cap) - static_cast<i64>(eng->out_len));
     if (kSpace == 0) {
         BIO_set_retry_write(bio);
         return -1;
     }
     const u32 kN = static_cast<u32>(len) < kSpace ? static_cast<u32>(len) : kSpace;
-    __builtin_memcpy(eng->out + eng->out_len, data, kN);
-    eng->out_len += kN;
+    __builtin_memcpy(eng->out + static_cast<i64>(eng->out_len), data, kN);
+    eng->out_len = static_cast<u32>(static_cast<i64>(eng->out_len) + static_cast<i64>(kN));
     return static_cast<int>(kN);
 }
 
@@ -46,14 +47,15 @@ int bridge_bio_read(BIO* bio, char* data, int len) {
         BIO_set_retry_read(bio);
         return -1;
     }
-    const u32 kAvail = eng->in_len - eng->in_off;
+    const u32 kAvail =
+        static_cast<u32>(static_cast<i64>(eng->in_len) - static_cast<i64>(eng->in_off));
     if (kAvail == 0) {
         BIO_set_retry_read(bio);
         return -1;
     }
     const u32 kN = static_cast<u32>(len) < kAvail ? static_cast<u32>(len) : kAvail;
-    __builtin_memcpy(data, eng->in + eng->in_off, kN);
-    eng->in_off += kN;
+    __builtin_memcpy(data, eng->in + static_cast<i64>(eng->in_off), kN);
+    eng->in_off = static_cast<u32>(static_cast<i64>(eng->in_off) + static_cast<i64>(kN));
     return static_cast<int>(kN);
 }
 
