@@ -6924,7 +6924,8 @@ inline bool apply_request_header_overrides(Connection& conn) {
         [&](u32 pos, u32 old_span, const Str& name, const Str& val, bool write_line) -> bool {
         const u32 total = conn.recv_buf.len();
         u32 checked_line_len = 0;
-        if (!request_header_override_line_length(name.len, val.len, &checked_line_len)) return false;
+        if (!request_header_override_line_length(name.len, val.len, &checked_line_len))
+            return false;
         const u32 ins_len = write_line ? checked_line_len : 0;  // ": " + CRLF
         const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
         if (delta > 0 &&
@@ -7189,7 +7190,8 @@ inline bool materialize_general_target_transform(Connection& conn,
     auto& arena = conn.json_arena;
     auto allocate = [&](u32 bytes) -> char* {
         if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
-            arena.space_used() > 262144 - bytes)
+            static_cast<i64>(arena.space_used()) >
+                static_cast<i64>(262144) - static_cast<i64>(bytes))
             return nullptr;
         return static_cast<char*>(arena.alloc(bytes));
     };
@@ -7207,19 +7209,23 @@ inline bool materialize_general_target_transform(Connection& conn,
         __builtin_memcmp(target.ptr, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
         return false;
     const u32 kTail = target.len - spec.strip_prefix.len;
-    const u32 kSize = spec.replace_prefix.len + kTail;
+    const i64 kSize_wide = static_cast<i64>(spec.replace_prefix.len) + static_cast<i64>(kTail);
+    if (kSize_wide > static_cast<i64>(UINT32_MAX)) return false;
+    const u32 kSize = static_cast<u32>(kSize_wide);
     if (kSize > 8192) return false;
     char* rewritten = allocate(kSize);
     if (rewritten == nullptr) return false;
     __builtin_memcpy(rewritten, spec.replace_prefix.ptr, spec.replace_prefix.len);
-    __builtin_memcpy(
-        rewritten + spec.replace_prefix.len, target.ptr + spec.strip_prefix.len, kTail);
+    __builtin_memcpy(rewritten + static_cast<i64>(spec.replace_prefix.len),
+                     target.ptr + static_cast<i64>(spec.strip_prefix.len),
+                     kTail);
     u32 final_length = kSize;
     if (spec.mode == ForwardTargetTransformMode::NormalizedPrefix &&
         !normalize_forward_target({rewritten, kSize}, rewritten, kSize, &final_length))
         return false;
     if (!forward_target_valid({rewritten, final_length})) return false;
-    const i64 kFinalBytes = static_cast<i64>(conn.recv_buf.len()) + final_length - request.path.len;
+    const i64 kFinalBytes = static_cast<i64>(conn.recv_buf.len()) + static_cast<i64>(final_length) -
+                            static_cast<i64>(request.path.len);
     if (kFinalBytes < 0 || static_cast<u64>(kFinalBytes) > conn.recv_buf.capacity()) return false;
     // H2 has already stabilized response values before constructing its synth;
     // its send_buf contains protocol frames and must not be used as H1 scratch.
@@ -7288,7 +7294,8 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     if (req.version != HttpVersion::Http11) return false;
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(data);
-    const uintptr_t limit = base + total;
+    uintptr_t limit = 0;
+    if (__builtin_add_overflow(base, static_cast<uintptr_t>(total), &limit)) return false;
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
     if (path_addr < base || path_addr > limit || req.path.len > limit - path_addr) return false;
     const u32 target_start = static_cast<u32>(path_addr - base);
@@ -7296,19 +7303,19 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     if (target_len == 0 || data[target_start] != '/') return false;
 
     for (u32 i = 0; i < target_len; i++) {
-        if (data[target_start + i] == '#') return false;
+        if (data[static_cast<i64>(target_start) + static_cast<i64>(i)] == '#') return false;
     }
 
     u32 path_len = target_len;
     for (u32 i = 0; i < target_len; i++) {
-        if (data[target_start + i] == '?') {
+        if (data[static_cast<i64>(target_start) + static_cast<i64>(i)] == '?') {
             path_len = i;
             break;
         }
     }
     if (path_len == 0) return false;
 
-    const u8* path = data + target_start;
+    const u8* path = data + static_cast<i64>(target_start);
     for (u32 i = 0; i < path_len; i++) {
         const u8 c = path[i];
         if (c < 0x21 || c == 0x7f || c == '%' || c == '#') return false;
@@ -7317,11 +7324,12 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     u32 segment_start = 1;
     for (u32 i = 1; i <= path_len; i++) {
         if (i != path_len && path[i] != '/') continue;
-        const u32 segment_len = i - segment_start;
+        const u32 segment_len =
+            static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(segment_start));
         if ((segment_len == 1 && path[segment_start] == '.') ||
             (segment_len == 2 && path[segment_start] == '.' && path[segment_start + 1] == '.'))
             return false;
-        segment_start = i + 1;
+        segment_start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
 
     const auto& spec = config.target_transforms[conn.target_transform_id - 1];
@@ -7329,19 +7337,26 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         __builtin_memcmp(path, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
         return false;
 
-    const u32 suffix_len = path_len - spec.strip_prefix.len;
-    const u32 query_len = target_len - path_len;
-    const u64 new_target_len = static_cast<u64>(spec.replace_prefix.len) + suffix_len + query_len;
+    const u32 suffix_len =
+        static_cast<u32>(static_cast<i64>(path_len) - static_cast<i64>(spec.strip_prefix.len));
+    const u32 query_len =
+        static_cast<u32>(static_cast<i64>(target_len) - static_cast<i64>(path_len));
+    const u64 new_target_len = static_cast<u64>(spec.replace_prefix.len) +
+                               static_cast<u64>(suffix_len) + static_cast<u64>(query_len);
     const i64 delta = static_cast<i64>(new_target_len) - static_cast<i64>(target_len);
     const i64 final_total = static_cast<i64>(total) + delta;
     if (new_target_len > 0xffffffffu || final_total < 0 ||
         static_cast<u64>(final_total) > conn.recv_buf.capacity())
         return false;
 
-    const u32 target_end = target_start + target_len;
-    const u32 new_target_end = target_start + static_cast<u32>(new_target_len);
-    const u32 suffix_start = target_start + spec.strip_prefix.len;
-    const u32 suffix_dest = target_start + spec.replace_prefix.len;
+    const u32 target_end =
+        static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(target_len));
+    const u32 new_target_end =
+        static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(new_target_len));
+    const u32 suffix_start =
+        static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(spec.strip_prefix.len));
+    const u32 suffix_dest = static_cast<u32>(static_cast<i64>(target_start) +
+                                             static_cast<i64>(spec.replace_prefix.len));
     conn.clear_raw_request_target_witness();
     if (delta < 0) {
         __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
