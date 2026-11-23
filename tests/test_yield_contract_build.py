@@ -273,6 +273,9 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
+            ("const u64 kMillis = rounded;",
+             "const u64 kMillis = (remaining + 999'999) / 1'000'000;"),
+            ("const u64 kMillis = rounded;", "const u64 kMillis = remaining / 1'000'000;"),
             ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
             ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),

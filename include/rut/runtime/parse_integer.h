@@ -28,7 +28,7 @@ inline bool digits8(const char* data, u32& result) {
          0x8080808080808080ULL))
         return false;
     word = wrap_sub(word, 0x3030303030303030ULL);
-    word = wrap_add(word * 10, word >> 8);
+    word = wrap_add(static_cast<u64>(word) * 10u, static_cast<u64>(word >> 8));
     result = static_cast<u32>(
         (wrap_add((word & 0x000000ff000000ffULL) * 0x000f424000000064ULL,
                   ((word >> 16) & 0x000000ff000000ffULL) * 0x0000271000000001ULL)) >>
@@ -44,7 +44,8 @@ inline bool digits4(const char* data, u32& result) {
 #endif
     if (((wrap_add(word, 0x46464646u) | wrap_sub(word, 0x30303030u)) & 0x80808080u)) return false;
     word = wrap_sub(word, 0x30303030u);
-    word = wrap_add(word * 10, word >> 8);
+    word =
+        wrap_add(static_cast<u64>(static_cast<u32>(word * u32{10})), static_cast<u64>(word >> 8));
     result = (((word & 0x00ff00ffu) * 0x00640001u) >> 16) & 0xffffu;
     return true;
 }
