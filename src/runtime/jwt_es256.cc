@@ -28,14 +28,14 @@ bool decode(Str in, char* out, u32 capacity, u32& length) {
         else
             return false;
         accumulator = (accumulator << 6) | value;
-        bits += 6;
+        bits = static_cast<u32>(static_cast<i64>(bits) + 6);
         if (bits >= 8) {
-            bits -= 8;
+            bits = static_cast<u32>(static_cast<i64>(bits) - 8);
             if (length == capacity) return false;
             out[length++] = static_cast<char>((accumulator >> bits) & 255);
         }
     }
-    return bits == 0 || (accumulator & ((1u << bits) - 1)) == 0;
+    return bits == 0 || (accumulator & static_cast<u32>(static_cast<i64>(1 << bits) - 1)) == 0;
 }
 struct Publication {
     json::Document& document;
@@ -78,7 +78,9 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         else
             return false;
     }
-    if (first == 0 || first == token.len || second <= first + 1 || second >= token.len - 1)
+    if (first == 0 || first == token.len ||
+        static_cast<i64>(second) <= static_cast<i64>(first) + 1 ||
+        static_cast<i64>(second) >= static_cast<i64>(token.len) - 1)
         return false;
     char header[1024];
     u32 length = 0;
@@ -127,14 +129,19 @@ bool decode_with_key(EcP256Sha256Verifier* verifier,
         candidate_id = selected.kid;
     }
     char signature[64];
-    if (!decode({token.ptr + second + 1, token.len - second - 1},
+    if (!decode({token.ptr + static_cast<i64>(second) + 1,
+                 static_cast<u32>(static_cast<i64>(token.len) - static_cast<i64>(second) - 1)},
                 signature,
                 sizeof(signature),
                 length) ||
         !verifier->verify({token.ptr, second}, {signature, length}))
         return false;
     const u32 kLimit = capacity < json::kMaxBytes ? capacity : json::kMaxBytes;
-    if (!decode({token.ptr + first + 1, second - first - 1}, payload_out, kLimit, length) ||
+    if (!decode({token.ptr + static_cast<i64>(first) + 1,
+                 static_cast<u32>(static_cast<i64>(second) - static_cast<i64>(first) - 1)},
+                payload_out,
+                kLimit,
+                length) ||
         !document.parse({payload_out, length}) || document.nodes[0].kind != json::Kind::Object)
         return false;
     payload_len = length;
