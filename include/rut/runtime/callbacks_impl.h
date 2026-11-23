@@ -6855,21 +6855,23 @@ inline bool rewrite_request_line_path(Connection& conn) {
     u32 i = 0;
     while (i < total && buf[i] != ' ' && buf[i] != '\r' && buf[i] != '\n') i++;
     if (i >= total || buf[i] != ' ') return false;
-    const u32 path_start = i + 1;
+    const u32 path_start = static_cast<u32>(static_cast<i64>(i) + 1);
     u32 j = path_start;
     while (j < total && buf[j] != ' ' && buf[j] != '\r' && buf[j] != '\n') j++;
     if (j >= total || buf[j] != ' ') return false;
-    const u32 old_len = j - path_start;
+    const u32 old_len = static_cast<u32>(static_cast<i64>(j) - static_cast<i64>(path_start));
     const u32 new_len = conn.req_path_override.len;
     if (new_len == 0) return false;
     const i64 delta = static_cast<i64>(new_len) - static_cast<i64>(old_len);
-    if (delta > 0 && total + static_cast<u32>(delta) > conn.recv_buf.capacity()) return false;
+    if (delta > 0 && static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
+        return false;
     if (delta != 0) {
-        __builtin_memmove(
-            buf + (static_cast<i64>(j) + delta), buf + j, static_cast<size_t>(total - j));
+        __builtin_memmove(buf + (static_cast<i64>(j) + delta),
+                          buf + static_cast<i64>(j),
+                          static_cast<size_t>(static_cast<i64>(total) - static_cast<i64>(j)));
     }
     conn.clear_raw_request_target_witness();
-    __builtin_memcpy(buf + path_start, conn.req_path_override.ptr, new_len);
+    __builtin_memcpy(buf + static_cast<i64>(path_start), conn.req_path_override.ptr, new_len);
     conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(total) + delta));
     // The path sits at the front of the request, so every absolute offset past
     // it shifts by delta: the initial-forward length AND req_header_end (which
