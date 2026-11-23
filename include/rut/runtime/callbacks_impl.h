@@ -7052,7 +7052,12 @@ inline bool apply_request_header_overrides(Connection& conn) {
             continue;
         }
         if (find_field(name, 0, &fs, &fe)) {
-            if (!splice(fs, fe - fs, name, val, /*write_line=*/true)) return false;
+            if (!splice(fs,
+                        static_cast<u32>(static_cast<i64>(fe) - static_cast<i64>(fs)),
+                        name,
+                        val,
+                        /*write_line=*/true))
+                return false;
             search_from = static_cast<u32>(static_cast<i64>(fs) + static_cast<i64>(line_len));
         } else {
             const u32 hbody = static_cast<u32>(static_cast<i64>(conn.req_header_end) - 2);
@@ -7060,7 +7065,12 @@ inline bool apply_request_header_overrides(Connection& conn) {
             search_from = static_cast<u32>(static_cast<i64>(hbody) + static_cast<i64>(line_len));
         }
         // Drop any remaining same-named fields (deletion never grows → never fails).
-        while (find_field(name, search_from, &fs, &fe)) splice(fs, fe - fs, name, val, false);
+        while (find_field(name, search_from, &fs, &fe))
+            splice(fs,
+                   static_cast<u32>(static_cast<i64>(fe) - static_cast<i64>(fs)),
+                   name,
+                   val,
+                   false);
     }
     return true;
 }
@@ -7082,11 +7092,12 @@ inline void strip_ws_extensions(Connection& conn) {
     u32 limit = conn.req_header_end > 0 ? conn.req_header_end : conn.recv_buf.len();
     if (limit > conn.recv_buf.len()) limit = conn.recv_buf.len();
     u32 i = 0;
-    while (i + kHdrLen <= limit) {  // i is always at a line start
+    while (static_cast<i64>(i) + static_cast<i64>(kHdrLen) <= static_cast<i64>(limit)) {
         bool match = true;
         for (u32 j = 0; j < kHdrLen; j++) {
-            u8 c = buf[i + j];
-            if (c >= 'A' && c <= 'Z') c = static_cast<u8>(c - 'A' + 'a');
+            u8 c = buf[static_cast<i64>(i) + static_cast<i64>(j)];
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<u8>(static_cast<i64>(c) - static_cast<i64>('A') + 'a');
             if (c != static_cast<u8>(kHdr[j])) {
                 match = false;
                 break;
@@ -7097,17 +7108,26 @@ inline void strip_ws_extensions(Connection& conn) {
             u32 line_end = i;
             while (line_end < total && buf[line_end] != '\n') line_end++;
             if (line_end < total) line_end++;  // include the LF
-            const u32 removed = line_end - i;
-            __builtin_memmove(buf + i, buf + line_end, static_cast<size_t>(total - line_end));
-            conn.recv_buf.set_len(total - removed);
-            limit -= removed;  // the header block shrank; the next line is now at i
+            const u32 removed = static_cast<u32>(static_cast<i64>(line_end) - static_cast<i64>(i));
+            __builtin_memmove(
+                buf + static_cast<i64>(i),
+                buf + static_cast<i64>(line_end),
+                static_cast<size_t>(static_cast<i64>(total) - static_cast<i64>(line_end)));
+            conn.recv_buf.set_len(
+                static_cast<u32>(static_cast<i64>(total) - static_cast<i64>(removed)));
+            limit = static_cast<u32>(static_cast<i64>(limit) - static_cast<i64>(removed));
             if (conn.req_initial_send_len > i) {
                 conn.req_initial_send_len =
-                    conn.req_initial_send_len > removed ? conn.req_initial_send_len - removed : 0;
+                    conn.req_initial_send_len > removed
+                        ? static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) -
+                                           static_cast<i64>(removed))
+                        : 0;
             }
             if (conn.req_header_end > i) {
-                conn.req_header_end =
-                    conn.req_header_end > removed ? conn.req_header_end - removed : 0;
+                conn.req_header_end = conn.req_header_end > removed
+                                          ? static_cast<u32>(static_cast<i64>(conn.req_header_end) -
+                                                             static_cast<i64>(removed))
+                                          : 0;
             }
             continue;  // re-check at i (the next field) for duplicates
         }
