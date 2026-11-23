@@ -636,6 +636,9 @@ continues to adopt snapshots through its existing deployment path.
 | `allowedMethods` | Allow only the named methods among bearer, header, basic and mtls. The array must be nonempty and unique. The rule checks disabled records too. |
 | `requireExpiryForEnabledCredentials` | Require a positive expiry on every enabled credential record, including records staged under disabled Consumers. |
 | `maxCredentialLifetimeSeconds` | Require finite activation and expiry on every enabled credential. The full window must be no longer than the positive number of seconds configured here. |
+| `minimumRemainingValiditySeconds` | Require an enabled credential record to have a finite expiry at least this many positive seconds after the supplied time. Applies also to future activations and records staged under disabled Consumers. |
+| `minimumActiveCredentials` | Require at least this many active credentials across enabled Consumers, as evaluated at the supplied time. Accepts integers from 0 to 64. |
+| `requireActiveCredentialForEnabledConsumers` | Require every enabled Consumer to own at least one active credential at the supplied time. Disabled Consumers are exempt. |
 
 ### Targeted credential validity windows
 

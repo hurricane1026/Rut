@@ -94,6 +94,29 @@ def test_deployment_policy(tool, root):
     check({limit: 100}, records=[dict(key, expiresAt=0)], rule=limit)
     for invalid in (-0.0, 0, -1, 1.5, '100', 9223372036854775808):
         check({limit: invalid}, rule=limit)
+    remaining = 'minimumRemainingValiditySeconds'
+    check({remaining: 80}, ok=True)
+    check({remaining: 81}, rule=remaining)
+    check({remaining: 1}, now=200, rule=remaining)
+    check({remaining: 1}, records=[dict(key, expiresAt=0)], rule=remaining)
+    check({remaining: 1}, records=[dict(key, expiresAt=0, enabled=False)], ok=True)
+    check({remaining: 9223372036854775807}, now=9223372036854775807, rule=remaining)
+    active = 'minimumActiveCredentials'
+    check({active: 1}, now=100, ok=True)
+    check({active: 1}, now=99, rule=active)
+    check({active: 1}, now=200, rule=active)
+    check({active: 1}, records=[dict(key, consumerId='disabled', groups=[])], rule=active)
+    check({active: 2}, records=[key, dict(parked, enabled=True)], ok=True)
+    check({active: 0}, records=[], ok=True)
+    for invalid in (65, True, '1'):
+        check({active: invalid}, rule=active)
+    each_active = 'requireActiveCredentialForEnabledConsumers'
+    check({each_active: True}, ok=True)
+    enabled_owner = dict(disabled, enabled=True)
+    check({each_active: True}, consumers=[alice, enabled_owner], rule=each_active)
+    check({each_active: True}, consumers=[alice, enabled_owner],
+          records=[key, dict(parked, consumerId='disabled', enabled=True, groups=[])], ok=True)
+    check({each_active: True}, now=200, rule=each_active)
 
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
@@ -143,7 +166,15 @@ def test_apply_checked(tool, root):
     assert b'requireExpiryForEnabledCredentials' in apply_checked().stderr
     assert not output.exists()
     hashed['expiresAt'] = 121
+    private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
+                         requireExpiryForEnabledCredentials=True,
+                         requireActiveCredentialForEnabledConsumers=True))
+    private(patch, changes(remove_credentials=[raw['id']]))
+    assert b'requireActiveCredentialForEnabledConsumers' in apply_checked().stderr
+    assert not output.exists()
     private(patch, changes(credentials=[hashed], remove_credentials=[raw['id']]))
+    assert b'requireActiveCredentialForEnabledConsumers' in apply_checked(now=121).stderr
+    assert not output.exists()
     assert not apply_checked(expected=0).stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert json.loads(output.read_bytes()) == dict(version=1, consumers=[consumer],
