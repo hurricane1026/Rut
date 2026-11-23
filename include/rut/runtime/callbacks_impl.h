@@ -4139,13 +4139,15 @@ inline bool collect_effective_response_headers(const Connection& conn,
     if (conn.resp_header_mutation_overflow) return false;
     if (static_set_index != 0 && cfg != nullptr &&
         static_set_index <= cfg->response_header_set_count) {
-        const auto& ref = cfg->response_header_sets[static_set_index - 1];
+        const auto& ref =
+            cfg->response_header_sets[static_cast<u16>(static_cast<i64>(static_set_index) - 1)];
         if (ref.count > capacity) return false;
         for (u16 i = 0; i < ref.count; i++) {
-            out[*out_count] = {cfg->header_keys[ref.offset + i].data,
-                               cfg->header_keys[ref.offset + i].len,
-                               cfg->header_values[ref.offset + i].data,
-                               cfg->header_values[ref.offset + i].len};
+            const u32 index = static_cast<u32>(static_cast<i64>(ref.offset) + static_cast<i64>(i));
+            out[*out_count] = {cfg->header_keys[index].data,
+                               cfg->header_keys[index].len,
+                               cfg->header_values[index].data,
+                               cfg->header_values[index].len};
             (*out_count)++;
         }
     }
