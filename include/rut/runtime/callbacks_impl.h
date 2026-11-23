@@ -4394,19 +4394,27 @@ inline bool build_h1_forward_response_headers(Connection& conn,
         while (pos < value_len) {
             while (pos < value_len &&
                    (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\t'))
-                pos++;
+                pos = static_cast<u32>(static_cast<i64>(pos) + 1);
             const u32 start = pos;
-            while (pos < value_len && value[pos] != ',') pos++;
+            while (pos < value_len && value[pos] != ',')
+                pos = static_cast<u32>(static_cast<i64>(pos) + 1);
             u32 end = pos;
-            while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
-            if (end == start || nominated_mutation(value + start, end - start)) continue;
+            while (end > start && (value[static_cast<u32>(static_cast<i64>(end) - 1)] == ' ' ||
+                                   value[static_cast<u32>(static_cast<i64>(end) - 1)] == '\t'))
+                end = static_cast<u32>(static_cast<i64>(end) - 1);
+            if (end == start || nominated_mutation(value + static_cast<i64>(start),
+                                                   static_cast<u32>(static_cast<i64>(end) -
+                                                                    static_cast<i64>(start))))
+                continue;
             if (!wrote_header) {
                 if (!write(kConnection, sizeof(kConnection) - 1)) return false;
                 wrote_header = true;
             } else if (!write(kCommaSpace, sizeof(kCommaSpace) - 1)) {
                 return false;
             }
-            if (!write(value + start, end - start)) return false;
+            if (!write(value + static_cast<i64>(start),
+                       static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))))
+                return false;
         }
         return !wrote_header || write(kCrLf, sizeof(kCrLf) - 1);
     };
