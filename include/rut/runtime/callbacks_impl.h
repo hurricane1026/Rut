@@ -7247,10 +7247,12 @@ inline bool materialize_general_target_transform(Connection& conn,
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config) {
     if (!conn.target_transform_recorded) return true;
     if (config.target_transform_id_is_valid(conn.target_transform_id) &&
-        config.target_transforms[conn.target_transform_id - 1].mode !=
-            ForwardTargetTransformMode::CleanPrefix)
+        config.target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) - 1)]
+                .mode != ForwardTargetTransformMode::CleanPrefix)
         return materialize_general_target_transform(
-            conn, config.target_transforms[conn.target_transform_id - 1]);
+            conn,
+            config.target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) -
+                                                      1)]);
     if (!config.target_transform_id_is_valid(conn.target_transform_id) ||
         conn.protocol == ConnProtocol::Http2 || conn.tls_active || conn.req_path_overridden ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
@@ -7279,8 +7281,8 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         for (u32 i = 0; i < name.len; i++) {
             u8 a = static_cast<u8>(name.ptr[i]);
             u8 b = static_cast<u8>(literal[i]);
-            if (a >= 'A' && a <= 'Z') a = static_cast<u8>(a + ('a' - 'A'));
-            if (b >= 'A' && b <= 'Z') b = static_cast<u8>(b + ('a' - 'A'));
+            if (a >= 'A' && a <= 'Z') a = static_cast<u8>(static_cast<i64>(a) + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = static_cast<u8>(static_cast<i64>(b) + ('a' - 'A'));
             if (a != b) return false;
         }
         return true;
@@ -7297,8 +7299,13 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     uintptr_t limit = 0;
     if (__builtin_add_overflow(base, static_cast<uintptr_t>(total), &limit)) return false;
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
-    if (path_addr < base || path_addr > limit || req.path.len > limit - path_addr) return false;
-    const u32 target_start = static_cast<u32>(path_addr - base);
+    uintptr_t path_remaining = 0;
+    uintptr_t path_offset = 0;
+    if (path_addr < base || path_addr > limit ||
+        __builtin_sub_overflow(limit, path_addr, &path_remaining) ||
+        req.path.len > path_remaining || __builtin_sub_overflow(path_addr, base, &path_offset))
+        return false;
+    const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = req.path.len;
     if (target_len == 0 || data[target_start] != '/') return false;
 
@@ -7319,20 +7326,22 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     for (u32 i = 0; i < path_len; i++) {
         const u8 c = path[i];
         if (c < 0x21 || c == 0x7f || c == '%' || c == '#') return false;
-        if (i > 0 && c == '/' && path[i - 1] == '/') return false;
+        if (i > 0 && c == '/' && path[static_cast<i64>(i) - 1] == '/') return false;
     }
     u32 segment_start = 1;
     for (u32 i = 1; i <= path_len; i++) {
         if (i != path_len && path[i] != '/') continue;
         const u32 segment_len =
             static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(segment_start));
-        if ((segment_len == 1 && path[segment_start] == '.') ||
-            (segment_len == 2 && path[segment_start] == '.' && path[segment_start + 1] == '.'))
+        if ((segment_len == 1 && path[static_cast<i64>(segment_start)] == '.') ||
+            (segment_len == 2 && path[static_cast<i64>(segment_start)] == '.' &&
+             path[static_cast<i64>(segment_start) + 1] == '.'))
             return false;
         segment_start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
 
-    const auto& spec = config.target_transforms[conn.target_transform_id - 1];
+    const auto& spec =
+        config.target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) - 1)];
     if (!forward_target_transform_spec_valid(spec) || path_len < spec.strip_prefix.len ||
         __builtin_memcmp(path, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
         return false;
@@ -7341,8 +7350,10 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         static_cast<u32>(static_cast<i64>(path_len) - static_cast<i64>(spec.strip_prefix.len));
     const u32 query_len =
         static_cast<u32>(static_cast<i64>(target_len) - static_cast<i64>(path_len));
-    const u64 new_target_len = static_cast<u64>(spec.replace_prefix.len) +
-                               static_cast<u64>(suffix_len) + static_cast<u64>(query_len);
+    const i64 new_target_len_wide = static_cast<i64>(spec.replace_prefix.len) +
+                                    static_cast<i64>(suffix_len) + static_cast<i64>(query_len);
+    if (new_target_len_wide < 0) return false;
+    const u64 new_target_len = static_cast<u64>(new_target_len_wide);
     const i64 delta = static_cast<i64>(new_target_len) - static_cast<i64>(target_len);
     const i64 final_total = static_cast<i64>(total) + delta;
     if (new_target_len > 0xffffffffu || final_total < 0 ||
@@ -7359,15 +7370,26 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
                                              static_cast<i64>(spec.replace_prefix.len));
     conn.clear_raw_request_target_witness();
     if (delta < 0) {
-        __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
         __builtin_memmove(
-            data + new_target_end, data + target_end, static_cast<size_t>(total - target_end));
+            data + static_cast<i64>(suffix_dest),
+            data + static_cast<i64>(suffix_start),
+            static_cast<size_t>(static_cast<i64>(suffix_len) + static_cast<i64>(query_len)));
+        __builtin_memmove(
+            data + static_cast<i64>(new_target_end),
+            data + static_cast<i64>(target_end),
+            static_cast<size_t>(static_cast<i64>(total) - static_cast<i64>(target_end)));
     } else {
         __builtin_memmove(
-            data + target_end + delta, data + target_end, static_cast<size_t>(total - target_end));
-        __builtin_memmove(data + suffix_dest, data + suffix_start, suffix_len + query_len);
+            data + static_cast<i64>(target_end) + delta,
+            data + static_cast<i64>(target_end),
+            static_cast<size_t>(static_cast<i64>(total) - static_cast<i64>(target_end)));
+        __builtin_memmove(
+            data + static_cast<i64>(suffix_dest),
+            data + static_cast<i64>(suffix_start),
+            static_cast<size_t>(static_cast<i64>(suffix_len) + static_cast<i64>(query_len)));
     }
-    __builtin_memcpy(data + target_start, spec.replace_prefix.ptr, spec.replace_prefix.len);
+    __builtin_memcpy(
+        data + static_cast<i64>(target_start), spec.replace_prefix.ptr, spec.replace_prefix.len);
     conn.recv_buf.set_len(static_cast<u32>(final_total));
     conn.req_header_end = static_cast<u32>(static_cast<i64>(conn.req_header_end) + delta);
     conn.req_initial_send_len =
