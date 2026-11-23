@@ -2772,7 +2772,9 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     if (!ws_retire_handshake_storage(loop, conn)) return;
 #endif
     const bool kOwnsRequestCompletion = conn.req_start_us != 0;
-    const u32 kDurationUs = static_cast<u32>(monotonic_us() - conn.req_start_us);
+    u64 duration_us = 0;
+    if (__builtin_sub_overflow(monotonic_us(), conn.req_start_us, &duration_us)) duration_us = 0;
+    const u32 kDurationUs = duration_us > UINT32_MAX ? UINT32_MAX : static_cast<u32>(duration_us);
 
     // Clear req_start_us so close_conn_impl knows no request is in flight.
     conn.req_start_us = 0;
