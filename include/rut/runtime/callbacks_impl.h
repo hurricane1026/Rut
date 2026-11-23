@@ -3883,11 +3883,14 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     } else if (consume > conn.req_body_remaining) {
         consume = conn.req_body_remaining;
     }
-    conn.req_body_remaining -= consume;
-    conn.downstream_req_size += consume;
-    conn.req_size += consume;
-    conn.req_initial_send_len =
-        conn.req_header_end + (conn.req_content_length - conn.req_body_remaining);
+    conn.req_body_remaining =
+        static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
+    (void)__builtin_add_overflow(
+        conn.downstream_req_size, static_cast<u64>(consume), &conn.downstream_req_size);
+    (void)__builtin_add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
+    conn.req_initial_send_len = static_cast<u32>(
+        static_cast<i64>(conn.req_header_end) +
+        (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
     if (conn.req_body_remaining > 0) {
         if (fixed_upload && !response_read_deadline_fixed_upload_route_stable(conn, false)) {
             loop->close_conn(conn);
