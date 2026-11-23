@@ -10,10 +10,11 @@ constexpr bool send_result_fits(u64 total) {
 
 // IoEvent::result reports the total as i32, including bytes sent before a retry.
 constexpr bool advance_send_bytes(u32& offset, u32& remaining, u32 completed) {
-    if (completed == 0 || completed > remaining || !send_result_fits(u64{offset} + remaining))
+    if (completed == 0 || completed > remaining ||
+        !send_result_fits(static_cast<u64>(static_cast<i64>(offset) + static_cast<i64>(remaining))))
         return false;
-    offset += completed;
-    remaining -= completed;
+    offset = static_cast<u32>(static_cast<i64>(offset) + static_cast<i64>(completed));
+    remaining = static_cast<u32>(static_cast<i64>(remaining) - static_cast<i64>(completed));
     return true;
 }
 

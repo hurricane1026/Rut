@@ -32,11 +32,13 @@ public:
     // prior request, even if terminal. False means no new request was started.
     // A valid begin may record Unavailable when queue/input validation fails.
     bool begin(PasswordWorker& worker, Str password, Str record, u64 now_ms, u32 timeout_ms) {
+        u64 deadline = 0;
         if (status != PasswordRequestStatus::Idle || timeout_ms == 0 ||
-            timeout_ms > kMaxTimeoutMs || now_ms > ~u64{0} - timeout_ms)
+            timeout_ms > kMaxTimeoutMs ||
+            __builtin_add_overflow(now_ms, static_cast<u64>(timeout_ms), &deadline))
             return false;
         owner = &worker;
-        deadline = now_ms + timeout_ms;
+        this->deadline = deadline;
         task = worker.submit(password, record);
         status = task.owner ? PasswordRequestStatus::Pending : PasswordRequestStatus::Unavailable;
         return true;

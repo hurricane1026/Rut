@@ -53,7 +53,7 @@ bool path_has_param_segment(Str path) {
 
 bool has_boundary_sensitive_overlap(const Str* paths, u32 n) {
     for (u32 i = 0; i < n; i++) {
-        for (u32 j = i + 1; j < n; j++) {
+        for (u32 j = static_cast<u32>(static_cast<i64>(i) + 1); j < n; j++) {
             const Str a = finalize_path_canonical(paths[i].ptr, paths[i].len);
             const Str b = finalize_path_canonical(paths[j].ptr, paths[j].len);
             Str shorter;

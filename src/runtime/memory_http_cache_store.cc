@@ -8,8 +8,9 @@ bool MemoryHttpCacheStore::matches(const Entry& entry, KeyView key) {
 }
 bool MemoryHttpCacheStore::find(KeyView key, Record& record) const {
     if (!key.bytes || key.len > kMaxKey) return false;
-    const u32 kStart = static_cast<u32>(key.hash % (kCapacity / kWays)) * kWays;
-    for (u32 i = kStart; i < kStart + kWays; ++i) {
+    const u32 kStart = static_cast<u32>(static_cast<i64>(key.hash % (kCapacity / kWays)) * kWays);
+    for (u32 i = kStart; static_cast<i64>(i) < static_cast<i64>(kStart) + static_cast<i64>(kWays);
+         ++i) {
         const auto& entry = entries_[i];
         if (entry.ready && matches(entry, key)) {
             record = {entry.response,
@@ -24,9 +25,10 @@ bool MemoryHttpCacheStore::find(KeyView key, Record& record) const {
 }
 MemoryHttpCacheStore::Token MemoryHttpCacheStore::reserve(KeyView key, u32 ttl, u64 now_us) {
     if (!key.bytes || key.len > kMaxKey || generation_ == ~u64{0}) return {};
-    const u32 kStart = static_cast<u32>(key.hash % (kCapacity / kWays)) * kWays;
+    const u32 kStart = static_cast<u32>(static_cast<i64>(key.hash % (kCapacity / kWays)) * kWays);
     u32 victim = kStart;
-    for (u32 i = kStart; i < kStart + kWays; ++i) {
+    for (u32 i = kStart; static_cast<i64>(i) < static_cast<i64>(kStart) + static_cast<i64>(kWays);
+         ++i) {
         const auto& entry = entries_[i];
         if (entry.ready && matches(entry, key)) {
             victim = i;

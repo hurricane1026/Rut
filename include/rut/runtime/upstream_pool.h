@@ -81,7 +81,9 @@ struct UpstreamPool {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
-            if (now_sec - c.parked_sec >= max_idle_sec) {
+            u32 idle = 0;
+            (void)__builtin_sub_overflow(now_sec, c.parked_sec, &idle);
+            if (idle >= max_idle_sec) {
                 ::close(c.fd);
                 release_slot(i);
             }
@@ -188,8 +190,10 @@ private:
         push_free_slot(i);
         u32 count = idle_count.load(std::memory_order_relaxed);
         while (count > 0 &&
-               !idle_count.compare_exchange_weak(
-                   count, count - 1, std::memory_order_release, std::memory_order_relaxed)) {
+               !idle_count.compare_exchange_weak(count,
+                                                 static_cast<u32>(static_cast<i64>(count) - 1),
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed)) {
         }
     }
 };

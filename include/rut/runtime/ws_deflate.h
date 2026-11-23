@@ -24,7 +24,8 @@ bool ws_deflate_matches(const WsDeflateCodec& codec, WsDeflateOptions options);
 // Wire work has its own bound, so streams made of empty blocks cannot bypass
 // the decoded-message budget. It admits normal incompressible DEFLATE overhead.
 constexpr u32 ws_deflate_wire_limit(u32 decoded_limit) {
-    return decoded_limit + decoded_limit / 8 + 1024;
+    return static_cast<u32>(static_cast<i64>(decoded_limit) + static_cast<i64>(decoded_limit) / 8 +
+                            1024);
 }
 
 bool ws_inflate_begin(WsDeflateCodec& codec, u32 decoded_limit);

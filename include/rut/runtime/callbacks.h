@@ -220,9 +220,11 @@ inline bool tls_partial_initial_connect_request_owner(const Connection& conn) {
             conn.req_content_length == 0 || conn.req_body_remaining == 0 ||
             conn.req_body_remaining > conn.req_content_length)
             return false;
-        const u64 body_received = conn.req_content_length - conn.req_body_remaining;
+        const u64 body_received = static_cast<u64>(static_cast<i64>(conn.req_content_length) -
+                                                   static_cast<i64>(conn.req_body_remaining));
         return static_cast<u64>(conn.req_initial_send_len) ==
-               static_cast<u64>(conn.req_header_end) + body_received;
+               static_cast<u64>(static_cast<i64>(conn.req_header_end) +
+                                static_cast<i64>(body_received));
     }
     // Chunked partial-send ownership needs a fresh parse of the exact captured
     // body prefix. Until that proof is available, leave it on the conservative 413 path.
@@ -388,7 +390,7 @@ extern template void on_body_send_with_early_response<IoUringEventLoop>(void*,
                                                                         IoEvent);
 
 inline u8 ascii_lower(u8 c) {
-    if (c >= 'A' && c <= 'Z') return static_cast<u8>(c + ('a' - 'A'));
+    if (c >= 'A' && c <= 'Z') return static_cast<u8>(static_cast<i64>(c) + ('a' - 'A'));
     return c;
 }
 

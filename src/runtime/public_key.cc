@@ -62,15 +62,15 @@ bool jwk_modulus(Str input, unsigned char (&output)[512], u32& length) {
         else
             return false;
         accumulator = (accumulator << 6) | value;
-        bits += 6;
+        bits = static_cast<u32>(static_cast<i64>(bits) + 6);
         if (bits >= 8) {
-            bits -= 8;
+            bits = static_cast<u32>(static_cast<i64>(bits) - 8);
             if (length == sizeof(output)) return false;
             output[length++] = static_cast<unsigned char>((accumulator >> bits) & 255);
         }
     }
     return length >= 256 && output[0] != 0 &&
-           (bits == 0 || (accumulator & ((1u << bits) - 1)) == 0);
+           (bits == 0 || (accumulator & static_cast<u32>(static_cast<i64>(1u << bits) - 1)) == 0);
 }
 }  // namespace
 
