@@ -805,8 +805,9 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
         // metadata.  Re-parse exactly its alleged body span so neither a
         // truncated terminal chunk nor successor bytes hidden beyond the real
         // terminal chunk can make a local response reusable.
-        const u8* body = conn.recv_buf.data() + conn.req_header_end;
-        const u32 body_len = conn.req_initial_send_len - conn.req_header_end;
+        const u8* body = conn.recv_buf.data() + static_cast<i64>(conn.req_header_end);
+        const u32 body_len = static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) -
+                                              static_cast<i64>(conn.req_header_end));
         if (body_len == 0) return false;
         ChunkedParser probe;
         probe.reset();
@@ -816,9 +817,14 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
             u32 out_start = 0;
             u32 out_len = 0;
             const ChunkStatus status =
-                probe.feed(body + offset, body_len - offset, &consumed, &out_start, &out_len);
-            if (consumed > body_len - offset) return false;
-            offset += consumed;
+                probe.feed(body + static_cast<i64>(offset),
+                           static_cast<u32>(static_cast<i64>(body_len) - static_cast<i64>(offset)),
+                           &consumed,
+                           &out_start,
+                           &out_len);
+            if (static_cast<i64>(consumed) > static_cast<i64>(body_len) - static_cast<i64>(offset))
+                return false;
+            offset = static_cast<u32>(static_cast<i64>(offset) + static_cast<i64>(consumed));
             if (status == ChunkStatus::Done)
                 return probe.state == ChunkedParser::State::Complete && offset == body_len;
             if (status == ChunkStatus::Error || consumed == 0) return false;
@@ -835,7 +841,8 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
         return conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
                conn.req_initial_send_len == conn.req_header_end;
     }
-    const u64 exact_end = static_cast<u64>(conn.req_header_end) + conn.req_content_length;
+    const i64 exact_end =
+        static_cast<i64>(conn.req_header_end) + static_cast<i64>(conn.req_content_length);
     return conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0 &&
            exact_end == conn.req_initial_send_len;
 }
@@ -861,7 +868,8 @@ inline bool refresh_initial_connect_request_boundary(Connection& conn) {
         request.has_upgrade_header || request.target_has_fragment ||
         request.method == HttpMethod::Unknown || map_log_method(request.method) != conn.req_method)
         return false;
-    const u32 body_len = conn.recv_buf.len() - parser.header_end;
+    const u32 body_len = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                          static_cast<i64>(parser.header_end));
     if (request.has_content_length) {
         if (!request_content_length_identity_is_valid(request) ||
             request.content_length != conn.req_content_length || request.chunked ||
@@ -869,7 +877,8 @@ inline bool refresh_initial_connect_request_boundary(Connection& conn) {
             return false;
         conn.req_body_mode = request.content_length == 0 ? BodyMode::None : BodyMode::ContentLength;
         conn.req_body_remaining = 0;
-        conn.req_initial_send_len = parser.header_end + request.content_length;
+        conn.req_initial_send_len = static_cast<u32>(static_cast<i64>(parser.header_end) +
+                                                     static_cast<i64>(request.content_length));
         conn.downstream_req_size = conn.req_initial_send_len;
         conn.req_size = conn.req_initial_send_len;
         conn.request_body_fully_buffered = true;
@@ -881,20 +890,23 @@ inline bool refresh_initial_connect_request_boundary(Connection& conn) {
         u32 pos = 0;
         while (pos < body_len && probe.state != ChunkedParser::State::Complete) {
             u32 consumed = 0, out_start = 0, out_len = 0;
-            const ChunkStatus status = probe.feed(conn.recv_buf.data() + parser.header_end + pos,
-                                                  body_len - pos,
-                                                  &consumed,
-                                                  &out_start,
-                                                  &out_len);
-            if (consumed > body_len - pos || consumed == 0 || status == ChunkStatus::Error)
+            const ChunkStatus status = probe.feed(
+                conn.recv_buf.data() + static_cast<i64>(parser.header_end) + static_cast<i64>(pos),
+                static_cast<u32>(static_cast<i64>(body_len) - static_cast<i64>(pos)),
+                &consumed,
+                &out_start,
+                &out_len);
+            if (static_cast<i64>(consumed) > static_cast<i64>(body_len) - static_cast<i64>(pos) ||
+                consumed == 0 || status == ChunkStatus::Error)
                 return false;
-            pos += consumed;
+            pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
         }
         if (probe.state != ChunkedParser::State::Complete) return false;
         conn.req_body_mode = BodyMode::Chunked;
         conn.req_body_remaining = 0;
         conn.req_chunk_parser = probe;
-        conn.req_initial_send_len = parser.header_end + pos;
+        conn.req_initial_send_len =
+            static_cast<u32>(static_cast<i64>(parser.header_end) + static_cast<i64>(pos));
         conn.downstream_req_size = conn.req_initial_send_len;
         conn.req_size = conn.req_initial_send_len;
         return true;
