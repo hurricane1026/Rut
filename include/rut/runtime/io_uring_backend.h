@@ -25,7 +25,9 @@ struct IoUringPosition {
     u32 value;
 
     constexpr IoUringPosition advanced_by(u32 count) const {
-        return {static_cast<u32>(static_cast<u64>(value) + count)};
+        u32 next = 0;
+        (void)__builtin_add_overflow(value, count, &next);
+        return {next};
     }
 
     constexpr bool operator==(const IoUringPosition&) const = default;
@@ -36,7 +38,7 @@ struct IoUringPosition {
     }
 
     constexpr u32 distance_to(u32 end) const {
-        return static_cast<u32>(static_cast<i64>(end) - value);
+        return static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(value));
     }
 
     constexpr u32 slot(u32 mask) const { return value & mask; }
@@ -492,16 +494,18 @@ struct IoUringBackend {
     bool provided_buffer_id_valid(u16 buf_id) const {
         if (buf_id < kProvidedBufCount) return true;
         return large_buf_ring != nullptr && buf_id >= kLargeProvidedBufIdBase &&
-               buf_id - kLargeProvidedBufIdBase < kLargeProvidedBufCount;
+               static_cast<u32>(static_cast<i64>(buf_id) -
+                                static_cast<i64>(kLargeProvidedBufIdBase)) < kLargeProvidedBufCount;
     }
     u32 provided_buffer_size(u16 buf_id) const {
         return buf_id < kProvidedBufCount ? kProvidedBufSize : kLargeProvidedBufSize;
     }
     const u8* provided_buffer_data(u16 buf_id) const {
         if (buf_id < kProvidedBufCount)
-            return buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
-        return large_buf_base +
-               static_cast<u64>(buf_id - kLargeProvidedBufIdBase) * kLargeProvidedBufSize;
+            return buf_base + static_cast<i64>(buf_id) * kProvidedBufSize;
+        return large_buf_base + static_cast<i64>(static_cast<i64>(buf_id) -
+                                                 static_cast<i64>(kLargeProvidedBufIdBase)) *
+                                    kLargeProvidedBufSize;
     }
     // Largest length a bounded one-shot *provided-buffer* upstream recv may
     // request. A bulk-sized target instead uses add_recv_upstream_direct,
@@ -542,7 +546,7 @@ private:
             fatal_error.store(EPROTO, std::memory_order_release);
             return false;
         }
-        pending -= static_cast<u32>(flushed);
+        pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(flushed));
         return true;
     }
 
@@ -590,11 +594,13 @@ private:
         // table right after).  It exists so a future caller that resets without
         // unmapping stays correct.  Walks only the live windows, never the table.
         if (downstream_recv_terminal_windows != nullptr) {
-            const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
+            const u32 ring_mask =
+                static_cast<u32>(static_cast<i64>(downstream_recv_terminal_window_capacity) - 1);
             for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
-                auto& window =
-                    downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
-                                                     ring_mask];
+                auto& window = downstream_recv_terminal_windows
+                    [static_cast<u32>(static_cast<i64>(downstream_recv_terminal_window_start) +
+                                      static_cast<i64>(i)) &
+                     ring_mask];
                 const u32 conn_id = terminal_window_conn_id(window.user_data);
                 if (downstream_recv_terminal_slots != nullptr &&
                     conn_id < downstream_recv_terminal_slot_capacity)

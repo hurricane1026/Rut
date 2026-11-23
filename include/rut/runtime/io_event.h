@@ -46,7 +46,8 @@ inline constexpr u32 kIoUserDataMaxUpstreamEpisode = 0x00FFFFFFu;
 // Not representable in the 24-bit token field. Backend decoders use this
 // nonzero value for a malformed upstream token so dispatch treats it as stale
 // rather than falling back to a neutral legacy event.
-inline constexpr u32 kInvalidUpstreamEventEpisode = kIoUserDataMaxUpstreamEpisode + 1u;
+inline constexpr u32 kInvalidUpstreamEventEpisode =
+    static_cast<u32>(static_cast<i64>(kIoUserDataMaxUpstreamEpisode) + 1);
 inline constexpr u64 kInvalidIoUserData = ~static_cast<u64>(0);
 
 inline constexpr bool io_event_is_upstream(IoEventType type) {
@@ -235,7 +236,8 @@ struct IoEvent {
 constexpr bool matches_positive_copy_span(const IoEvent& event, u32 expected_begin) {
     return event.copy_witness == IoEventCopyWitness::Full && event.result > 0 &&
            event.copy_begin == expected_begin && event.copy_end >= event.copy_begin &&
-           event.copy_end - event.copy_begin == static_cast<u32>(event.result);
+           static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==
+               static_cast<i64>(event.result);
 }
 
 // ResponseReadTimer is a transport-only event. Accept only the exact result
