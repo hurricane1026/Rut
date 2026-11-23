@@ -111,6 +111,13 @@ TEST(remove_header, override_line_length_rejects_wide_sum_without_allocating) {
     CHECK(!request_header_override_line_length(UINT32_MAX, UINT32_MAX, &line_len));
 }
 
+TEST(remove_header, request_completion_duration_preserves_missing_and_clock_edges) {
+    CHECK_EQ(request_completion_duration_us(100u, 0u, false), 0u);
+    CHECK_EQ(request_completion_duration_us(99u, 100u, true), 0u);
+    CHECK_EQ(request_completion_duration_us(150u, 100u, true), 50u);
+    CHECK_EQ(request_completion_duration_us(UINT64_MAX, 0u, true), UINT32_MAX);
+}
+
 TEST(http2, forward_request_removes_credentials_and_reset_clears_removal_modes) {
     Connection conn;
     conn.reset();

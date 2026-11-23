@@ -2776,6 +2776,13 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
+inline u32 request_completion_duration_us(u64 now_us, u64 start_us, bool owns_completion) {
+    if (!owns_completion) return 0;
+    u64 duration_us = 0;
+    if (__builtin_sub_overflow(now_us, start_us, &duration_us)) return 0;
+    return duration_us > UINT32_MAX ? UINT32_MAX : static_cast<u32>(duration_us);
+}
+
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
 #if RUT_ENABLE_WEBSOCKET
@@ -2785,9 +2792,8 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     if (!ws_retire_handshake_storage(loop, conn)) return;
 #endif
     const bool kOwnsRequestCompletion = conn.req_start_us != 0;
-    u64 duration_us = 0;
-    if (__builtin_sub_overflow(monotonic_us(), conn.req_start_us, &duration_us)) duration_us = 0;
-    const u32 kDurationUs = duration_us > UINT32_MAX ? UINT32_MAX : static_cast<u32>(duration_us);
+    const u32 kDurationUs =
+        request_completion_duration_us(monotonic_us(), conn.req_start_us, kOwnsRequestCompletion);
 
     // Clear req_start_us so close_conn_impl knows no request is in flight.
     conn.req_start_us = 0;
