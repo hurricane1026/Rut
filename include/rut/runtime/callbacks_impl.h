@@ -4370,12 +4370,18 @@ inline bool build_h1_forward_response_headers(Connection& conn,
         while (pos < value_len) {
             while (pos < value_len &&
                    (value[pos] == ',' || value[pos] == ' ' || value[pos] == '\t'))
-                pos++;
+                pos = static_cast<u32>(static_cast<i64>(pos) + 1);
             const u32 start = pos;
-            while (pos < value_len && value[pos] != ',') pos++;
+            while (pos < value_len && value[pos] != ',')
+                pos = static_cast<u32>(static_cast<i64>(pos) + 1);
             u32 end = pos;
-            while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) end--;
-            if (end > start && nominated_mutation(value + start, end - start)) return true;
+            while (end > start && (value[static_cast<u32>(static_cast<i64>(end) - 1)] == ' ' ||
+                                   value[static_cast<u32>(static_cast<i64>(end) - 1)] == '\t'))
+                end = static_cast<u32>(static_cast<i64>(end) - 1);
+            if (end > start && nominated_mutation(value + static_cast<i64>(start),
+                                                  static_cast<u32>(static_cast<i64>(end) -
+                                                                   static_cast<i64>(start))))
+                return true;
         }
         return false;
     };
