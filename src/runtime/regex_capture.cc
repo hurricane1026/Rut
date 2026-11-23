@@ -111,8 +111,8 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
             search = end;
     }
     if (size > static_cast<i64>(kStringOutputLimit) ||
-        static_cast<i64>(arena.space_used()) > static_cast<i64>(kStringArenaBudget) -
-                                                (size ? size : i64{1}) ||
+        static_cast<i64>(arena.space_used()) >
+            static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1}) ||
         (!arena.current && !arena.init(arena.backend.pool)))
         return 0;
     auto* data = static_cast<char*>(arena.alloc(static_cast<u64>(size ? size : 1)));
@@ -129,8 +129,7 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
         copied = static_cast<i64>(match.end);
     }
     if (static_cast<i64>(text.len) > copied)
-        __builtin_memcpy(data + written, text.ptr + copied,
-                         static_cast<i64>(text.len) - copied);
+        __builtin_memcpy(data + written, text.ptr + copied, static_cast<i64>(text.len) - copied);
     *output = {data, static_cast<u32>(size)};
     return 1;
 }

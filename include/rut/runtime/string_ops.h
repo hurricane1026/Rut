@@ -50,12 +50,12 @@ inline bool transform_string(
     };
     u32 count = 0;
     if (mode == 2) scan([&](u32) { ++count; });
-    const i64 size = static_cast<i64>(text.len) - static_cast<i64>(count) *
-                         static_cast<i64>(needle.len) +
+    const i64 size = static_cast<i64>(text.len) -
+                     static_cast<i64>(count) * static_cast<i64>(needle.len) +
                      static_cast<i64>(count) * static_cast<i64>(replacement.len);
     if (size > static_cast<i64>(kStringOutputLimit) ||
-        static_cast<i64>(arena->space_used()) > static_cast<i64>(kStringArenaBudget) -
-                                             (size ? size : i64{1}) ||
+        static_cast<i64>(arena->space_used()) >
+            static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1}) ||
         (!arena->current && !arena->init(arena->backend.pool)))
         return false;
     auto* data = static_cast<char*>(arena->alloc(static_cast<u64>(size ? size : 1)));
@@ -64,11 +64,10 @@ inline bool transform_string(
     if (mode < 2) {
         for (u32 i = 0; i < text.len; ++i) {
             const u8 c = static_cast<u8>(text.ptr[i]);
-            data[i] = static_cast<char>(mode == 0 && c >= 'a' && c <= 'z'
-                                            ? static_cast<i64>(c) - 32
-                                        : mode == 1 && c >= 'A' && c <= 'Z'
-                                            ? static_cast<i64>(c) + 32
-                                                                            : c);
+            data[i] =
+                static_cast<char>(mode == 0 && c >= 'a' && c <= 'z'   ? static_cast<i64>(c) - 32
+                                  : mode == 1 && c >= 'A' && c <= 'Z' ? static_cast<i64>(c) + 32
+                                                                      : c);
         }
     } else {
         i64 copied = 0;
@@ -81,8 +80,8 @@ inline bool transform_string(
             copied = start + static_cast<i64>(needle.len);
         });
         if (static_cast<i64>(text.len) > copied)
-            __builtin_memcpy(data + written, text.ptr + copied,
-                             static_cast<i64>(text.len) - copied);
+            __builtin_memcpy(
+                data + written, text.ptr + copied, static_cast<i64>(text.len) - copied);
     }
     *output = {data, static_cast<u32>(size)};
     return true;
