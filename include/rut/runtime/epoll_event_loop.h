@@ -46,7 +46,12 @@ static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
 inline u64 monotonic_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<u64>(ts.tv_sec) * 1'000'000'000ull + static_cast<u64>(ts.tv_nsec);
+    u64 seconds = 0;
+    if (__builtin_mul_overflow(static_cast<u64>(ts.tv_sec), u64{1'000'000'000}, &seconds))
+        return UINT64_MAX;
+    u64 result = 0;
+    if (__builtin_add_overflow(seconds, static_cast<u64>(ts.tv_nsec), &result)) return UINT64_MAX;
+    return result;
 }
 
 // Min-heap of pending JIT yield deadlines. The heap's top entry determines
@@ -65,7 +70,8 @@ struct YieldHeap {
     // entries that linger briefly between close and their deadline.
     // Derived from the shared epoll_yield::kMaxConns so the heap and
     // EpollEventLoop always agree on capacity.
-    static constexpr u32 kCap = kMaxConns + 256;  // default compatibility bound
+    static constexpr u32 kCap =
+        static_cast<u32>(static_cast<i64>(kMaxConns) + static_cast<i64>(256));
     MappedArray<Entry> entries;
     u32 capacity = 0;
     u32 size = 0;
@@ -77,7 +83,9 @@ struct YieldHeap {
             return capacity == connection_count
                        ? core::Expected<void, Error>{}
                        : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
-        auto result = entries.init(connection_count + 256);
+        const u32 entry_capacity =
+            static_cast<u32>(static_cast<i64>(connection_count) + static_cast<i64>(256));
+        auto result = entries.init(entry_capacity);
         if (!result) return core::make_unexpected(result.error());
         capacity = connection_count;
         size = 0;
@@ -95,7 +103,9 @@ struct YieldHeap {
     const Entry& top() const { return entries[0]; }
 
     bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
-        if (capacity == 0 || size >= capacity + 256) return false;
+        if (capacity == 0 ||
+            static_cast<i64>(size) >= static_cast<i64>(capacity) + static_cast<i64>(256))
+            return false;
         u32 i = size++;
         entries[i] = {deadline_ns, handler_gen, conn_id};
         sift_up(i);
@@ -115,7 +125,7 @@ struct YieldHeap {
 private:
     void sift_up(u32 i) {
         while (i > 0) {
-            u32 parent = (i - 1) / 2;
+            u32 parent = static_cast<u32>((static_cast<i64>(i) - 1) / 2);
             if (entries[parent].deadline_ns <= entries[i].deadline_ns) break;
             Entry tmp = entries[parent];
             entries[parent] = entries[i];
@@ -279,7 +289,8 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
+                conns[i].capture_buf =
+                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
         }
         return true;
     }
@@ -401,7 +412,11 @@ public:
                 u32 period = drain_period_.load(std::memory_order_relaxed);
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
-                } else if (monotonic_secs() >= start + period) {
+                } else {
+                    u64 deadline = 0;
+                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                        deadline = UINT64_MAX;
+                    if (monotonic_secs() < deadline) continue;
                     force_close_all();
                     running_.store(false, std::memory_order_relaxed);
                 }
@@ -444,14 +459,20 @@ public:
     }
 
     void epoch_enter() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            (void)__builtin_add_overflow(
+                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
     void epoch_leave() {
-        if (epoch)
-            epoch->epoch.store(epoch->epoch.load(std::memory_order_relaxed) + 1,
-                               std::memory_order_release);
+        if (epoch) {
+            u64 next = 0;
+            (void)__builtin_add_overflow(
+                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            epoch->epoch.store(next, std::memory_order_release);
+        }
     }
 
     void shutdown() {
@@ -488,7 +509,9 @@ public:
         }
     }
 
-    u32 active_count() const { return connection_capacity - free_top; }
+    u32 active_count() const {
+        return static_cast<u32>(static_cast<i64>(connection_capacity) - static_cast<i64>(free_top));
+    }
 
     // Allocatable Connection slots remaining. Used by start_health_probe to
     // keep a reserve for real client accepts (epoll frees slots synchronously,
@@ -659,7 +682,8 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf = capture_region_ + static_cast<u64>(id) * kCaptureSliceSize;
+            conns[id].capture_buf =
+                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
         return &conns[id];
     }
 
@@ -818,7 +842,8 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < 4; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? r.segment_len - r.segment_sent
+            const u32 want = writing ? static_cast<u32>(static_cast<i64>(r.segment_len) -
+                                                        static_cast<i64>(r.segment_sent))
                                      : (c.resp_body_remaining < kResponseSpliceChunkSize
                                             ? c.resp_body_remaining
                                             : kResponseSpliceChunkSize);
@@ -846,8 +871,8 @@ public:
                 return;
             }
             if (writing) {
-                r.segment_sent += static_cast<u32>(n);
-                c.resp_body_sent += static_cast<u32>(n);
+                r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
+                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) + n);
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;
@@ -864,8 +889,10 @@ public:
             } else {
                 r.segment_len = static_cast<u32>(n);
                 r.segment_sent = 0;
-                r.body_bytes += r.segment_len;
-                c.resp_body_remaining -= r.segment_len;
+                r.body_bytes = static_cast<u32>(static_cast<i64>(r.body_bytes) +
+                                                static_cast<i64>(r.segment_len));
+                c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
+                                                         static_cast<i64>(r.segment_len));
             }
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
@@ -1037,7 +1064,10 @@ public:
         // recv interest until the next submit_recv rearms it.
         backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
-        u64 deadline = now + static_cast<u64>(ms) * 1'000'000ull;
+        u64 delay_ns = 0;
+        if (__builtin_mul_overflow(static_cast<u64>(ms), u64{1'000'000}, &delay_ns)) return false;
+        u64 deadline = 0;
+        if (__builtin_add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             conn.yield_armed = true;
             rearm_yield_timerfd();
@@ -1087,7 +1117,9 @@ public:
     [[nodiscard]] bool arm_throttle_timer(Connection& conn, u64 delay_ns) {
         if (!conn.ws_shutdown_deadline_armed)
             timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
-        const u64 kDeadline = epoll_yield::monotonic_ns() + delay_ns;
+        u64 kDeadline = 0;
+        if (__builtin_add_overflow(epoll_yield::monotonic_ns(), delay_ns, &kDeadline))
+            kDeadline = UINT64_MAX;
         if (yield_heap.push(kDeadline, conn.handler_gen, conn.id)) {
             rearm_yield_timerfd();
             return true;

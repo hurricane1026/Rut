@@ -156,7 +156,11 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
         errno = err;
         return -err;
     }
-    if (last != nullptr) *last = {fd, events, ev.data.u64, last->gen + 1};
+    if (last != nullptr) {
+        u32 next = 0;
+        (void)__builtin_add_overflow(last->gen, u32{1}, &next);
+        *last = {fd, events, ev.data.u64, next};
+    }
     return 0;
 }
 
@@ -259,8 +263,9 @@ core::Expected<void, Error> EpollBackend::init_state_storage(u32 capacity) {
         active_upstream_episode[i] = 0;
         send_state[i] = {nullptr, -1, 0, 0, IoEventType::Send, false, 0, 0};
         upstream_send_state[i] = {nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
-        fd_interest[2 * i] = {};
-        fd_interest[2 * i + 1] = {};
+        const u32 slot = static_cast<u32>(static_cast<i64>(2) * static_cast<i64>(i));
+        fd_interest[slot] = {};
+        fd_interest[static_cast<u32>(static_cast<i64>(slot) + 1)] = {};
     }
     connection_capacity = capacity;
     return {};
@@ -703,7 +708,14 @@ bool EpollBackend::add_send_upstream(
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
     if (conn_id < connection_capacity) {
         upstream_send_state[conn_id] = {
-            buf, fd, sent, len - sent, IoEventType::UpstreamSend, false, 0, upstream_episode};
+            buf,
+            fd,
+            sent,
+            static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(sent)),
+            IoEventType::UpstreamSend,
+            false,
+            0,
+            upstream_episode};
     }
 
     struct epoll_event ev;
@@ -821,8 +833,15 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool mo
 
     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
     if (conn_id < connection_capacity) {
-        send_state[conn_id] = {
-            buf, fd, sent, len - sent, IoEventType::Send, false, 0, 0, extra_flags};
+        send_state[conn_id] = {buf,
+                               fd,
+                               sent,
+                               static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(sent)),
+                               IoEventType::Send,
+                               false,
+                               0,
+                               0,
+                               extra_flags};
     }
 
     invalidate_fd_interest(conn_id, fd);
@@ -884,9 +903,12 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
     u32 sent = 0;
     while (sent < len) {
         errno = 0;
-        i32 nw = tls_hooks->ssl_write(ssl, buf + sent, static_cast<i32>(len - sent));
+        i32 nw =
+            tls_hooks->ssl_write(ssl,
+                                 buf + static_cast<i64>(sent),
+                                 static_cast<i32>(static_cast<i64>(len) - static_cast<i64>(sent)));
         if (nw > 0) {
-            sent += static_cast<u32>(nw);
+            sent = static_cast<u32>(static_cast<i64>(sent) + static_cast<i64>(nw));
             continue;
         }
 
@@ -895,7 +917,7 @@ bool EpollBackend::add_send_tls(Connection& c, const u8* buf, u32 len) {
             send_state[c.id] = {buf,
                                 c.fd,
                                 sent,
-                                len - sent,
+                                static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(sent)),
                                 IoEventType::Send,
                                 true,
                                 tls_interest_for_error(ssl_err),
@@ -1546,11 +1568,15 @@ u32 EpollBackend::wait(
                     } else
                         while (ss.remaining > 0) {
                             errno = 0;
-                            const i32 kWritten = get_tls_hooks()->ssl_write(
-                                ssl, ss.src + ss.offset, static_cast<i32>(ss.remaining));
+                            const i32 kWritten =
+                                get_tls_hooks()->ssl_write(ssl,
+                                                           ss.src + static_cast<i64>(ss.offset),
+                                                           static_cast<i32>(ss.remaining));
                             if (kWritten > 0) {
-                                ss.offset += static_cast<u32>(kWritten);
-                                ss.remaining -= static_cast<u32>(kWritten);
+                                ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) +
+                                                             static_cast<i64>(kWritten));
+                                ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) -
+                                                                static_cast<i64>(kWritten));
                                 continue;
                             }
                             const i32 kSslError = get_tls_hooks()->ssl_get_error(ssl, kWritten);
@@ -1578,12 +1604,14 @@ u32 EpollBackend::wait(
                 while (ss.remaining > 0) {
                     ssize_t nw;
                     do {
-                        nw = send(
-                            ss.fd, ss.src + ss.offset, ss.remaining, MSG_NOSIGNAL | ss.msg_flags);
+                        nw = send(ss.fd,
+                                  ss.src + static_cast<i64>(ss.offset),
+                                  ss.remaining,
+                                  MSG_NOSIGNAL | ss.msg_flags);
                     } while (nw < 0 && errno == EINTR);
                     if (nw > 0) {
-                        ss.offset += static_cast<u32>(nw);
-                        ss.remaining -= static_cast<u32>(nw);
+                        ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + nw);
+                        ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - nw);
                         made_progress = true;
                     } else if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         pending_retry = true;

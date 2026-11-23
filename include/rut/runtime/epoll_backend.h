@@ -60,10 +60,16 @@ struct EpollBackend {
     };
     MappedArray<FdInterest> fd_interest;  // 2 * capacity entries
     static u32 fd_interest_slot(u32 conn_id, IoEventType type) {
-        return 2 * conn_id +
-               ((io_event_is_upstream(type) || type == IoEventType::RelayRead) ? 1u : 0u);
+        return static_cast<u32>(static_cast<i64>(2) * static_cast<i64>(conn_id) +
+                                ((io_event_is_upstream(type) || type == IoEventType::RelayRead)
+                                     ? static_cast<i64>(1)
+                                     : static_cast<i64>(0)));
     }
-    static void reset_fd_interest(FdInterest& r) { r = {-1, 0, 0, r.gen + 1}; }
+    static void reset_fd_interest(FdInterest& r) {
+        u32 next = 0;
+        (void)__builtin_add_overflow(r.gen, u32{1}, &next);
+        r = {-1, 0, 0, next};
+    }
 
     // Epoll-owned upstream episode ownership. Zero means no active episode;
     // this table is deliberately independent from Connection::upstream_episode
@@ -149,15 +155,17 @@ struct EpollBackend {
     // A connection slot is closed or (re)allocated: forget its registrations.
     void forget_fd_interest(u32 conn_id) {
         if (conn_id >= connection_capacity) return;
-        reset_fd_interest(fd_interest[2 * conn_id]);
-        reset_fd_interest(fd_interest[2 * conn_id + 1]);
+        const u32 slot = static_cast<u32>(static_cast<i64>(2) * static_cast<i64>(conn_id));
+        reset_fd_interest(fd_interest[slot]);
+        reset_fd_interest(fd_interest[static_cast<u32>(static_cast<i64>(slot) + 1)]);
     }
     // An interest change set_fd_interest() did not make: drop records for fd
     // and age both sides' harvested readiness.
     void invalidate_fd_interest(u32 conn_id, i32 fd) {
         if (conn_id >= connection_capacity) return;
         for (u32 side = 0; side < 2; side++) {
-            FdInterest& r = fd_interest[2 * conn_id + side];
+            FdInterest& r = fd_interest[static_cast<u32>(
+                static_cast<i64>(2) * static_cast<i64>(conn_id) + static_cast<i64>(side))];
             if (r.fd == fd)
                 reset_fd_interest(r);
             else
