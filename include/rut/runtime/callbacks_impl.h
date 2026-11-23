@@ -7208,7 +7208,8 @@ inline bool materialize_general_target_transform(Connection& conn,
     if (spec.strip_prefix.len > path_length ||
         __builtin_memcmp(target.ptr, spec.strip_prefix.ptr, spec.strip_prefix.len) != 0)
         return false;
-    const u32 kTail = target.len - spec.strip_prefix.len;
+    const u32 kTail =
+        static_cast<u32>(static_cast<i64>(target.len) - static_cast<i64>(spec.strip_prefix.len));
     const i64 kSize_wide = static_cast<i64>(spec.replace_prefix.len) + static_cast<i64>(kTail);
     if (kSize_wide > static_cast<i64>(UINT32_MAX)) return false;
     const u32 kSize = static_cast<u32>(kSize_wide);
