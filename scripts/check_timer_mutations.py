@@ -26,10 +26,11 @@ MUTATIONS = {
     for (u32 i = 0; i < size; ++i) {
         if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
     }
-    const u32 kRemoved = size - kept;
+    const u32 kRemoved = static_cast<u32>(static_cast<i64>(size) - static_cast<i64>(kept));
     size = kept;
     if (kRemoved > 0) {
-        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
+        for (u32 i = size / 2; i > 0; i = static_cast<u32>(static_cast<i64>(i) - 1))
+            sift_down(entries, size, static_cast<u32>(static_cast<i64>(i) - 1));
     }
     return kRemoved;""",
         """    u32 kRemoved = 0;

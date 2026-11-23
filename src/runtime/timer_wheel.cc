@@ -26,8 +26,9 @@ consteval bool cursor_wrap_contract() {
     if (incremented_address != &wheel.cursor || wheel.cursor != Tick{}) return false;
     Tick* decremented_address = &--wheel.cursor;
     if (decremented_address != &wheel.cursor || wheel.cursor != Tick{UINT32_MAX}) return false;
-    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == Tick{} &&
-           wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
+    return wheel.slot_after(0) == static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1) &&
+           wheel.tick_after(1) == Tick{} && wheel.slot_after(1) == 0 &&
+           wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
            TimerWheel::elapsed_ticks(Tick{UINT32_MAX - 1}, Tick{1}) == 3;
 }
 
@@ -38,13 +39,18 @@ static_assert(TimerWheel::remaining_ticks(3, 1) == 2 && TimerWheel::remaining_ti
 // Check both ends of every representable bucket against the wheel geometry.
 consteval bool yield_fallback_contract() {
     if (TimerWheel::yield_fallback_seconds(0) != 1) return false;
-    for (u32 seconds = 1; seconds < TimerWheel::kSlots; ++seconds) {
-        if (TimerWheel::yield_fallback_seconds((seconds - 1) * 1000 + 1) != seconds ||
-            TimerWheel::yield_fallback_seconds(seconds * 1000) != seconds)
+    for (u32 seconds = 1; seconds < TimerWheel::kSlots;
+         seconds = static_cast<u32>(static_cast<i64>(seconds) + 1)) {
+        if (TimerWheel::yield_fallback_seconds(
+                static_cast<u32>((static_cast<i64>(seconds) - 1) * 1000 + 1)) != seconds ||
+            TimerWheel::yield_fallback_seconds(
+                static_cast<u32>(static_cast<i64>(seconds) * 1000)) != seconds)
             return false;
     }
-    return TimerWheel::yield_fallback_seconds((TimerWheel::kSlots - 1) * 1000 + 1) == 0 &&
-           TimerWheel::yield_fallback_seconds(TimerWheel::kSlots * 1000) == 0 &&
+    return TimerWheel::yield_fallback_seconds(
+               static_cast<u32>((static_cast<i64>(TimerWheel::kSlots) - 1) * 1000 + 1)) == 0 &&
+           TimerWheel::yield_fallback_seconds(
+               static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) * 1000)) == 0 &&
            TimerWheel::yield_fallback_seconds(0xffffffffu) == 0;
 }
 

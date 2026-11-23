@@ -8,7 +8,7 @@ struct ConnectionBase;              // forward decl
 using Connection = ConnectionBase;  // alias (matches connection.h)
 
 constexpr u32 timer_seconds_from_ms(u32 ms) {
-    return static_cast<u32>((static_cast<u64>(ms) + 999u) / 1000u);
+    return static_cast<u32>((static_cast<i64>(ms) + 999) / 1000);
 }
 
 // Timer wheel — O(1) add, refresh, tick.
@@ -37,7 +37,7 @@ struct TimerWheel {
 
     // Tick is a modular timestamp. Widen before each step, then select the low 32 bits.
     friend constexpr Tick& operator++(Tick& t) {
-        t = Tick{static_cast<u32>(static_cast<u64>(t) + 1)};
+        t = Tick{static_cast<u32>(static_cast<i64>(t) + 1)};
         return t;
     }
 
@@ -107,8 +107,8 @@ struct TimerWheel {
             ListNode* next = node->next;
             node->detach();
             // container_of: timer_node is at a known offset in Connection
-            auto* conn =
-                reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - timer_node_offset());
+            auto* conn = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) -
+                                                       static_cast<i64>(timer_node_offset()));
             on_expire(conn);
             count++;
             node = next;
