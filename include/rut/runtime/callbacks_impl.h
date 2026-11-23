@@ -1975,12 +1975,17 @@ bool ws_prepare_handshake_before_forward(Loop* loop, Connection& conn) {
                 reply(503, false);
                 return false;
             }
-            const u32 kRemoved = kOldHeader - kNewHeader;
+            const u32 kRemoved =
+                static_cast<u32>(static_cast<i64>(kOldHeader) - static_cast<i64>(kNewHeader));
             conn.req_header_end = kNewHeader;
-            conn.recv_buf.set_len(conn.recv_buf.len() - kRemoved);
+            conn.recv_buf.set_len(static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                                   static_cast<i64>(kRemoved)));
             if (conn.req_initial_send_len != 0)
                 conn.req_initial_send_len =
-                    conn.req_initial_send_len > kRemoved ? conn.req_initial_send_len - kRemoved : 0;
+                    conn.req_initial_send_len > kRemoved
+                        ? static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) -
+                                           static_cast<i64>(kRemoved))
+                        : 0;
         }
         conn.ws_handshake_slice = slice;
         conn.ws_handshake_offers_len = offers_len;
@@ -2034,7 +2039,8 @@ inline bool deferred_canonical_selection_route_is_valid(const Connection& conn,
         !complete_content_length_route_method_is_admitted(route->method) ||
         !config->policy_bundle_id_is_valid(route->preflight_forward_policy_bundle_id))
         return false;
-    const auto& bundle = config->policy_bundles[route->preflight_forward_policy_bundle_id - 1];
+    const auto& bundle = config->policy_bundles[static_cast<u32>(
+        static_cast<i64>(route->preflight_forward_policy_bundle_id) - 1)];
     return response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) &&
            forward_response_buffering_uses_content_length_machinery(bundle.response_buffering);
 }
@@ -2054,7 +2060,8 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
         (route->method != kRouteMethodHead && route->method != kRouteMethodGet) ||
         !config->policy_bundle_id_is_valid(route->preflight_forward_policy_bundle_id))
         return false;
-    const auto& bundle = config->policy_bundles[route->preflight_forward_policy_bundle_id - 1];
+    const auto& bundle = config->policy_bundles[static_cast<u32>(
+        static_cast<i64>(route->preflight_forward_policy_bundle_id) - 1)];
     if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
         !config->response_policy_id_is_valid(bundle.response_policy_id) ||
         !config->failure_policy_id_is_valid(bundle.failure_policy_id) ||
@@ -2063,16 +2070,22 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
     if (route->method == kRouteMethodHead &&
         (bundle.response_buffering != ForwardResponseBufferingMode::None ||
          !admitted_fixed_upload_head_timeout_policies_valid(
-             config->response_policies[bundle.response_policy_id - 1],
-             config->failure_policies[bundle.failure_policy_id - 1],
-             config->failure_policies[bundle.timeout_failure_policy_id - 1])))
+             config->response_policies[static_cast<u32>(
+                 static_cast<i64>(bundle.response_policy_id) - 1)],
+             config->failure_policies[static_cast<u32>(static_cast<i64>(bundle.failure_policy_id) -
+                                                       1)],
+             config->failure_policies[static_cast<u32>(
+                 static_cast<i64>(bundle.timeout_failure_policy_id) - 1)])))
         return false;
     if (route->method == kRouteMethodGet &&
         (!forward_response_buffering_uses_content_length_machinery(bundle.response_buffering) ||
          !admitted_complete_content_length_buffering_policies_valid(
-             config->response_policies[bundle.response_policy_id - 1],
-             config->failure_policies[bundle.failure_policy_id - 1],
-             config->failure_policies[bundle.timeout_failure_policy_id - 1])))
+             config->response_policies[static_cast<u32>(
+                 static_cast<i64>(bundle.response_policy_id) - 1)],
+             config->failure_policies[static_cast<u32>(static_cast<i64>(bundle.failure_policy_id) -
+                                                       1)],
+             config->failure_policies[static_cast<u32>(
+                 static_cast<i64>(bundle.timeout_failure_policy_id) - 1)])))
         return false;
     return true;
 }
