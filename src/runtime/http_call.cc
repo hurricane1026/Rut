@@ -221,7 +221,7 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
 core::Expected<void, Error> HttpCallWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
     auto allocated =
-        storage.init(static_cast<u64>(sizeof(Slot)) * static_cast<u64>(kCapacity) + 64);
+        storage.init(static_cast<u64>(sizeof(Slot)) * static_cast<u64>(kCapacity) + u64{64});
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
