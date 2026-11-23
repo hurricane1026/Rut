@@ -7849,6 +7849,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     if (stmt.kind == AstStmtKind::Expr)
         return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
+    if (stmt.kind == AstStmtKind::For)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("static for loops are supported only in route bodies"));
+
     if (stmt.kind == AstStmtKind::If) {
         if (stmt.then_stmt == nullptr || stmt.else_stmt == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
@@ -20720,15 +20725,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::If) {
-            // `if let` inside a static for-loop body is currently unreachable —
-            // the parser rejects for-loops wholesale ("for loops are unsupported
-            // in Rut Core"), so no AstStmtKind::For is ever produced and this
-            // analyzer is dead code. Reject the binding form explicitly (fail
-            // loud) rather than fall through: this handler analyzes the cond with
-            // analyze_expr (plain bool), NOT analyze_guard_cond, so it would
-            // mis-treat an if-let's usable-value test as the condition. If static
-            // for-loops are ever enabled, the binding's per-iteration
-            // materialization must be designed before this rejection is lifted.
+            // Static for-loop bodies analyze the cond with analyze_expr (plain
+            // bool), NOT analyze_guard_cond, so an `if let` usable-value test
+            // would be mis-treated as a condition. Reject the binding form
+            // explicitly until per-iteration binding materialization is
+            // designed.
             if (bstmt.bind_value)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,

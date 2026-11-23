@@ -12640,19 +12640,17 @@ TEST(frontend, analyze_rejects_wait_after_for_loop) {
         "wait(50) return 204 }\n",
         "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
         "let ev = wait(downstream.recv()) return 204 }\n",
-        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
-        "wait(50) return 204 }\n",
-        "route GET \"/x\" { for item in [1] { guard item > 0 else { return 400 } } "
-        "let ev = wait(downstream.recv()) return 204 }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(static_cast<u8>(hir.error().code),
                  static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        CHECK(hir.error().detail.eq(lit("wait cannot be used after a static for-loop")));
     }
 }
 
@@ -12662,19 +12660,17 @@ TEST(frontend, analyze_rejects_for_loop_after_wait) {
         "} return 204 }\n",
         "route GET \"/x\" { let ev = wait(downstream.recv()) for item in [1] { guard item "
         "> 0 else { return 400 } } return 204 }\n",
-        "route GET \"/x\" { wait(50) for item in [1] { guard item > 0 else { return 400 } "
-        "} return 204 }\n",
-        "route GET \"/x\" { let ev = wait(downstream.recv()) for item in [1] { guard item "
-        "> 0 else { return 400 } } return 204 }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
-        REQUIRE_FALSE(ast.has_value());
-        CHECK_EQ(static_cast<u8>(ast.error().code),
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(static_cast<u8>(hir.error().code),
                  static_cast<u8>(FrontendError::UnsupportedSyntax));
-        CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+        CHECK(hir.error().detail.eq(lit("static for-loop cannot be combined with wait")));
     }
 }
 
@@ -30936,14 +30932,28 @@ TEST(frontend, parse_array_lit_nested_type) {
     CHECK(let_stmt.type.type_args[0]->type_args[0]->name.eq(lit("i32")));
 }
 
-TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
+TEST(frontend, parse_for_loop_basic) {
+    // `for item in xs { return 200 }` — loop variable stored in `name`,
+    // iteration source in `expr`, body block in `then_stmt`. Parse-only: the
+    // analyze/MIR coverage lives in the analyze_for_loop_* tests below.
     const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    REQUIRE(route.statements[0] != nullptr);
+    const auto& for_stmt = *route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    CHECK(for_stmt.name.eq(lit("item")));
+    CHECK_EQ(static_cast<u8>(for_stmt.expr.kind), static_cast<u8>(AstExprKind::ArrayLit));
+    REQUIRE_EQ(for_stmt.expr.args.len, 3u);
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    // Body is a single-stmt `return 200` (parse_braced_stmt_body collapses
+    // one-stmt blocks to the stmt itself — not a Block wrapper).
+    CHECK_EQ(static_cast<u8>(for_stmt.then_stmt->kind), static_cast<u8>(AstStmtKind::ReturnStatus));
+    CHECK_EQ(for_stmt.then_stmt->status_code, 200u);
 }
 
 TEST(frontend, parse_inline_identifier_is_not_reserved) {
@@ -30967,17 +30977,6 @@ TEST(frontend, parse_rejects_inline_for_compat_spelling) {
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("use 'for', not 'inline for'")));
-}
-
-#if 0
-TEST(frontend, parse_rejects_for_loops_as_unsupported_syntax) {
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 200 }\n";
-    auto lexed = lex(lit(src));
-    REQUIRE(lexed);
-    auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
 }
 
 TEST(frontend, parse_for_loop_field_access_source) {
@@ -31801,10 +31800,6 @@ TEST(frontend, analyze_for_loop_reject_details_name_iterator_shape) {
         {"shadowing loop var",
          "route GET \"/x\" { let item = 1 for item in [2] { return 200 } return 200 }\n",
          lit("static for-loop variable cannot shadow a local")},
-        {"known-error guard let",
-         "route GET \"/x\" { for item in [1] { guard let code = error(.timeout) else { return "
-         "400 } } return 200 }\n",
-         lit("guard let inside static for-loop cannot bind a known error")},
         {"non-array iterator",
          "route GET \"/x\" { for item in 42 { return 200 } return 200 }\n",
          lit("static for-loop iterator must be an array")},
@@ -32100,7 +32095,7 @@ TEST(frontend, mir_unrolls_plain_for_loop_substitutes_element_in_cond) {
 TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
     // A body terminator exits the route during the first iteration, so later
     // iterations are unreachable under normal loop semantics.
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32116,7 +32111,7 @@ TEST(frontend, mir_unrolls_for_loop_with_body_terminator) {
 }
 
 TEST(frontend, mir_unrolls_plain_for_loop_with_body_terminator) {
-    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } else { return 500 } }\n";
+    const char* src = "route GET \"/x\" { for item in [1, 2, 3] { return 200 } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32878,13 +32873,14 @@ TEST(frontend, mir_unrolls_for_multiple_for_loops) {
 TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     // A Scope-A-shape program (one for-loop, body guards only, Direct
     // control, no route guards) that unrolls to more than MirFunction::
-    // kMaxBlocks (16) blocks must reject cleanly at the overflowing step span
+    // kMaxBlocks (32) blocks must reject cleanly at the overflowing step span
     // rather than fail mid-emission with a TooManyItems buried inside a
-    // later `fn.blocks.push`. N=8, M=1 → 2T+1 = 17 > 16. Analyze accepts
+    // later `fn.blocks.push`. N=8, M=2 → 2*N*M+1 = 33 > 32. Analyze accepts
     // this shape (kMaxArgs=8), so the reject must live in MIR's pre-check.
     const char* src =
         "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
-        "guard n > 0 else { return 400 } } return 200 }\n";
+        "guard n > 0 else { return 400 } guard n > 1 else { return 401 } "
+        "} return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32895,14 +32891,16 @@ TEST(frontend, mir_rejects_for_loop_exceeding_block_budget) {
     REQUIRE(!mir);
     CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
     CHECK(mir.error().detail.eq(lit("static for-loop block budget exceeded")));
-    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
-    CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 2u);
+    CHECK(mir.error().span.start >= hir->routes[0].for_loops[0].span.start);
+    CHECK(mir.error().span.start <= hir->routes[0].for_loops[0].span.end);
 }
 
 TEST(frontend, mir_rejects_plain_for_loop_exceeding_block_budget) {
     const char* src =
         "route GET \"/x\" { for n in [1, 2, 3, 4, 5, 6, 7, 8] { "
-        "guard n > 0 else { return 400 } } return 200 }\n";
+        "guard n > 0 else { return 400 } guard n > 1 else { return 401 } "
+        "} return 200 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -32913,8 +32911,9 @@ TEST(frontend, mir_rejects_plain_for_loop_exceeding_block_budget) {
     REQUIRE(!mir);
     CHECK_EQ(mir.error().code, FrontendError::TooManyItems);
     CHECK(mir.error().detail.eq(lit("static for-loop block budget exceeded")));
-    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 1u);
-    CHECK_EQ(mir.error().span.start, hir->routes[0].for_loops[0].body.guards[0].span.start);
+    REQUIRE_EQ(hir->routes[0].for_loops[0].body.guards.len, 2u);
+    CHECK(mir.error().span.start >= hir->routes[0].for_loops[0].span.start);
+    CHECK(mir.error().span.start <= hir->routes[0].for_loops[0].span.end);
 }
 
 TEST(frontend, mir_unrolls_for_loop_with_route_level_guard) {
@@ -36923,7 +36922,7 @@ TEST(frontend,
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let flag = true match flag { true if "
-        "item > 1: return 201 true => return 202 _ => return 404 } } return 500 }\n";
+        "item > 1 => return 201 true => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -36962,7 +36961,7 @@ TEST(frontend, mir_unrolls_for_loop_body_match_guarded_bool_case_falls_through_t
 TEST(frontend, mir_unrolls_plain_for_loop_body_match_guarded_bool_case_falls_through_to_same_case) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let flag = true match flag { true if "
-        "item > 1: return 201 true => return 202 _ => return 404 } } return 500 }\n";
+        "item > 1 => return 201 true => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -37099,7 +37098,7 @@ TEST(frontend, analyze_plain_for_loop_body_match_rejects_unguarded_duplicate_str
 TEST(frontend, mir_unrolls_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" if item "
-        "> 1: return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
+        "> 1 => return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -37137,7 +37136,7 @@ TEST(frontend,
      mir_unrolls_plain_for_loop_body_match_guarded_string_case_falls_through_to_same_case) {
     const char* src =
         "route GET \"/x\" { for item in [1] { let s = \"a\" match s { \"a\" if item "
-        "> 1: return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
+        "> 1 => return 201 \"a\" => return 202 _ => return 404 } } return 500 }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -37295,10 +37294,9 @@ TEST(frontend, parse_for_loop_rejects_missing_in) {
     auto ast = parse_file_heap(lexed.value());
     REQUIRE_FALSE(ast.has_value());
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
-    CHECK(ast.error().detail.eq(lit("for loops are unsupported in Rut Core")));
+    CHECK(ast.error().detail.eq(lit("for loop expects 'in' after iterator name")));
 }
 
-#endif
 TEST(frontend, match_rejects_case_keyword_with_fixit) {
     const char* src =
         "route GET \"/users\" { let code = 200 match code { case 200 => return 200 _ => return "
@@ -38080,22 +38078,95 @@ TEST(frontend, guard_let_function_body_parity_lowers_and_recovers) {
     rir.destroy();
 }
 
-TEST(frontend, if_let_inside_static_for_loop_is_parser_unreachable) {
-    // Round-2 finding 2: an `if let` inside a static for-loop body cannot be
-    // reached — the parser rejects for-loops wholesale, so no AstStmtKind::For is
-    // ever produced and the static-for If analyzer (which would mis-treat an
-    // if-let usable-value test as a plain bool cond) is dead code. This pins the
-    // reachability: the enclosing for-loop fails to parse before any if-let is
-    // seen. (The analyzer also now fail-loud rejects bind_value defensively, so a
-    // future for-loop enablement fails cleanly instead of mis-analyzing.)
+TEST(frontend, analyze_accepts_for_loop_doc_examples) {
+    const char* sources[] = {
+        "func second(a: i32, b: i32) -> i32 => b\n"
+        "route GET \"/tuple\" {\n"
+        "    for pair in [(200, 1), (204, 2)] {\n"
+        "        let code = pair | second(_2, _1)\n"
+        "        guard code == 200 else { return 400 }\n"
+        "    }\n"
+        "    return 200\n"
+        "}\n",
+        "variant Result {\n"
+        "    ok(i32)\n"
+        "    err\n"
+        "}\n"
+        "route GET \"/result\" {\n"
+        "    for state in [Result.ok(200)] {\n"
+        "        match state {\n"
+        "            .ok(code) => return 200\n"
+        "            .err => return 500\n"
+        "            _ => return 500\n"
+        "        }\n"
+        "    }\n"
+        "    return 404\n"
+        "}\n",
+        "struct Box { value: i32 }\n"
+        "route GET \"/boxes\" {\n"
+        "    let boxes = [Box(value: 1), Box(value: 2)]\n"
+        "    for box in boxes {\n"
+        "        guard box.value > 0 else { return 400 }\n"
+        "    }\n"
+        "    return 200\n"
+        "}\n",
+        "variant Result {\n"
+        "    ok(i32)\n"
+        "    err\n"
+        "}\n"
+        "route GET \"/guarded\" {\n"
+        "    for item in [1] {\n"
+        "        let state = Result.ok(item)\n"
+        "        match state {\n"
+        "            .ok(code) if code > 0 => return 200\n"
+        "            .ok(code) => return 422\n"
+        "            _ => return 500\n"
+        "        }\n"
+        "    }\n"
+        "    return 404\n"
+        "}\n",
+    };
+    for (u32 i = 0; i < 4; i++) {
+        auto lexed = lex(lit(sources[i]));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        REQUIRE_EQ(hir->routes.len, 1u);
+        REQUIRE_EQ(hir->routes[0].for_loops.len, 1u);
+    }
+}
+
+TEST(frontend, parse_rejects_static_for_in_helper_body) {
+    // Helper bodies use the expression-oriented function statement parser, so
+    // static loops never reach analyze there.
+    const char* src =
+        "func pick(req: Request) -> i32 { for item in [1] { let x = item } return 2 }\n"
+        "route GET \"/u\" { return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(ast.error().detail.eq(lit("static for loops are supported only in route bodies")));
+}
+
+TEST(frontend, if_let_inside_static_for_loop_is_rejected_by_analyze) {
+    // The static-for If analyzer analyzes the condition as a plain bool, so it
+    // must not mis-handle an `if let` usable-value test. Reject the binding form
+    // loudly at analyze time instead of lowering it as a truthiness guard.
     const char* src =
         "route GET \"/u\" { for item in [1] { if let x = error(7) { return 500 } "
         "else { return 200 } } }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
-    REQUIRE_FALSE(ast.has_value());
-    CHECK_EQ(ast.error().code, FrontendError::UnsupportedSyntax);
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("if-let is not supported inside a static for-loop body")));
 }
 
 TEST(frontend, case_in_match_arm_still_rejected_with_fixit) {
