@@ -6520,8 +6520,10 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
             "Gateway Timeout";
         conn.send_buf.reset();
         if (http1_request_is_head(conn)) {
-            conn.send_buf.write(reinterpret_cast<const u8*>(k504),
-                                sizeof(k504) - 1 - (sizeof("Gateway Timeout") - 1));
+            conn.send_buf.write(
+                reinterpret_cast<const u8*>(k504),
+                static_cast<u32>(static_cast<i64>(sizeof(k504)) - 1 -
+                                 (static_cast<i64>(sizeof("Gateway Timeout")) - 1)));
         } else {
             conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
         }
@@ -6588,7 +6590,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
                 response.status_code == 204 || response.status_code == 205 ||
                 response.status_code == 304;
             if (response.status_code >= 200 && response.has_content_length && !response_bodyless &&
-                probe_len < parser.header_end + response.content_length)
+                static_cast<i64>(probe_len) <
+                    static_cast<i64>(parser.header_end) + static_cast<i64>(response.content_length))
                 break;
             if (response.status_code == 101 || response.status_code >= 200) {
                 complete_early_response = true;
@@ -6596,8 +6599,9 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
                 break;
             }
             if (parser.header_end == 0 || parser.header_end >= probe_len) break;
-            probe_data += parser.header_end;
-            probe_len -= parser.header_end;
+            probe_data += static_cast<i64>(parser.header_end);
+            probe_len =
+                static_cast<u32>(static_cast<i64>(probe_len) - static_cast<i64>(parser.header_end));
         }
     }
     // A 101 commits the Upgrade tunnel, so a lossy successor cannot be
@@ -6624,8 +6628,9 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned &&
         conn.req_initial_send_len <= conn.recv_buf.len();
     if (intermediate_body_send_owner) {
-        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
-        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        const u8* suffix = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
+        const u32 suffix_len = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                                static_cast<i64>(conn.req_initial_send_len));
         bool complete_suffix = false;
         if (conn.req_body_mode == BodyMode::ContentLength) {
             complete_suffix = conn.req_body_remaining <= suffix_len;
@@ -6634,9 +6639,13 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             u32 pos = 0;
             while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
                 u32 consumed = 0, out_start = 0, out_len = 0;
-                const ChunkStatus status =
-                    probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
-                pos += consumed;
+                const ChunkStatus status = probe.feed(
+                    suffix + static_cast<i64>(pos),
+                    static_cast<u32>(static_cast<i64>(suffix_len) - static_cast<i64>(pos)),
+                    &consumed,
+                    &out_start,
+                    &out_len);
+                pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
                 if (status == ChunkStatus::Error || consumed == 0) break;
             }
             complete_suffix = probe.state == ChunkedParser::State::Complete;
@@ -6672,7 +6681,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     // successor was lost in the overflowing CQE.
     if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::ContentLength &&
         conn.req_content_length != 0 && conn.req_header_end <= conn.recv_buf.len() &&
-        conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
+        conn.req_content_length <= static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                                    static_cast<i64>(conn.req_header_end))) {
         // The initial upstream send still owns completion. Keep the buffered
         // current-request bytes available for that send and discard any lossy
         // successor after its completion; do not publish upload completion yet.
@@ -6693,14 +6703,19 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::Chunked &&
         conn.req_initial_send_len <= conn.recv_buf.len()) {
         ChunkedParser probe = conn.req_chunk_parser;
-        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
-        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        const u8* suffix = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
+        const u32 suffix_len = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                                static_cast<i64>(conn.req_initial_send_len));
         u32 pos = 0;
         while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
             u32 consumed = 0, out_start = 0, out_len = 0;
             const ChunkStatus status =
-                probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
-            pos += consumed;
+                probe.feed(suffix + static_cast<i64>(pos),
+                           static_cast<u32>(static_cast<i64>(suffix_len) - static_cast<i64>(pos)),
+                           &consumed,
+                           &out_start,
+                           &out_len);
+            pos = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(consumed));
             if (status == ChunkStatus::Error || consumed == 0) break;
         }
         if (probe.state == ChunkedParser::State::Complete) {
@@ -6757,7 +6772,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     conn.send_buf.reset();
     if (http1_request_is_head(conn)) {
         conn.send_buf.write(reinterpret_cast<const u8*>(k413),
-                            sizeof(k413) - 1 - (sizeof("Payload Too Large") - 1));
+                            static_cast<u32>(static_cast<i64>(sizeof(k413)) - 1 -
+                                             (static_cast<i64>(sizeof("Payload Too Large")) - 1)));
     } else {
         conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
     }
