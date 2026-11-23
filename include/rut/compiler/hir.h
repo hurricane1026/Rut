@@ -144,8 +144,8 @@ enum class HirExprKind : u8 {
     RegexCapture,
     StringConcat,
     StringPredicate,
-    StringTrim,  // byte-exact prefix/suffix removal; borrowed result
-    IpParse,     // strict IPv4 text -> optional IP
+    StringTrim,   // byte-exact prefix/suffix removal; borrowed result
+    IpParse,      // strict IPv4 text -> optional IP
     StringSplit,  // request-owned bounded string fields
     Tuple,
     // Array literal: elements stored in `args`. analyze rejects heterogeneous
