@@ -83,7 +83,9 @@ bool credential_fields_valid(json::Document& doc, u32 object) {
         if (key_count(doc, object, key) != 1) return false;
     if (key_count(doc, object, alternatives[0]) > 1 ||
         key_count(doc, object, alternatives[1]) > 1 ||
-        key_count(doc, object, alternatives[0]) + key_count(doc, object, alternatives[1]) != 1)
+        static_cast<i64>(key_count(doc, object, alternatives[0])) +
+                static_cast<i64>(key_count(doc, object, alternatives[1])) !=
+            1)
         return false;
     for (Str key : optional)
         if (key_count(doc, object, key) > 1) return false;
@@ -393,11 +395,12 @@ bool decode_field(Str raw, char* bytes, u32 capacity, u32& length) {
     for (u32 i = 0; i < raw.len; ++i) {
         u32 byte = static_cast<u8>(raw.ptr[i]);
         if (byte == '%') {
-            if (raw.len - i < 3) return false;
-            const i32 high = field_hex(raw.ptr[i + 1]), low = field_hex(raw.ptr[i + 2]);
+            if (static_cast<i64>(raw.len) - static_cast<i64>(i) < 3) return false;
+            const i32 high = field_hex(raw.ptr[static_cast<i64>(i) + 1]),
+                      low = field_hex(raw.ptr[static_cast<i64>(i) + 2]);
             if (high < 0 || low < 0) return false;
             byte = static_cast<u32>(high * 16 + low);
-            i += 2;
+            i = static_cast<u32>(static_cast<i64>(i) + 2);
         } else if (byte == '+')
             byte = ' ';
         // ASCII profile rejects controls, NUL and alternate raw delimiters.
@@ -438,7 +441,8 @@ static bool authenticate_fields(json::Document& document,
             if (byte == '?' && separator == input.len) separator = i;
         }
         if (separator == input.len) return false;
-        input = {input.ptr + separator + 1, input.len - separator - 1};
+        input = {input.ptr + static_cast<i64>(separator) + 1,
+                 static_cast<u32>(static_cast<i64>(input.len) - static_cast<i64>(separator) - 1)};
     }
     char names[64][64]{};
     u32 lengths[64]{};
@@ -455,7 +459,11 @@ static bool authenticate_fields(json::Document& document,
             ++end;
         }
         if (equals >= end || equals == begin || end == begin ||
-            !decode_field({input.ptr + begin, equals - begin}, names[count], 64, lengths[count]) ||
+            !decode_field({input.ptr + static_cast<i64>(begin),
+                           static_cast<u32>(static_cast<i64>(equals) - static_cast<i64>(begin))},
+                          names[count],
+                          64,
+                          lengths[count]) ||
             !consumer_credential_name_valid({names[count], lengths[count]}))
             return false;
         const Str current{names[count], lengths[count]};
@@ -463,7 +471,8 @@ static bool authenticate_fields(json::Document& document,
             if (current.eq({names[n], lengths[n]})) return false;
         char decoded[4096];
         u32 decoded_length = 0;
-        if (!decode_field({input.ptr + equals + 1, end - equals - 1},
+        if (!decode_field({input.ptr + static_cast<i64>(equals) + 1,
+                           static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(equals) - 1)},
                           decoded,
                           sizeof(decoded),
                           decoded_length))
@@ -473,13 +482,19 @@ static bool authenticate_fields(json::Document& document,
             __builtin_memcpy(credential, decoded, decoded_length);
             credential_length = decoded_length;
         } else {
-            if (remaining_length) remaining[remaining_length++] = '&';
-            __builtin_memcpy(remaining + remaining_length, input.ptr + begin, end - begin);
-            remaining_length += end - begin;
+            if (remaining_length) {
+                remaining[static_cast<i64>(remaining_length)] = '&';
+                remaining_length = static_cast<u32>(static_cast<i64>(remaining_length) + 1);
+            }
+            __builtin_memcpy(remaining + static_cast<i64>(remaining_length),
+                             input.ptr + static_cast<i64>(begin),
+                             static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin)));
+            remaining_length = static_cast<u32>(static_cast<i64>(remaining_length) +
+                                                (static_cast<i64>(end) - static_cast<i64>(begin)));
         }
         ++count;
-        if (end + 1 == input.len) return false;
-        begin = end + 1;
+        if (static_cast<i64>(end) + 1 == static_cast<i64>(input.len)) return false;
+        begin = static_cast<u32>(static_cast<i64>(end) + 1);
     }
     if (!credential_length || !authenticate(document,
                                             configuration,
