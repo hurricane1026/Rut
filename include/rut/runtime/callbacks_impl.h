@@ -4433,9 +4433,11 @@ inline bool build_h1_forward_response_headers(Connection& conn,
     while (line_start + 1 < header_len &&
            (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
         line_end = line_start;
-        while (line_end + 1 < header_len && (data[line_end] != '\r' || data[line_end + 1] != '\n'))
-            line_end++;
-        if (line_end + 1 >= header_len) return false;
+        while (static_cast<i64>(line_end) + 1 < header_len &&
+               (data[line_end] != '\r' ||
+                data[static_cast<u32>(static_cast<i64>(line_end) + 1)] != '\n'))
+            line_end = static_cast<u32>(static_cast<i64>(line_end) + 1);
+        if (static_cast<i64>(line_end) + 1 >= header_len) return false;
         u32 colon = line_start;
         while (colon < line_end && data[colon] != ':') colon++;
         if (colon == line_end) return false;
