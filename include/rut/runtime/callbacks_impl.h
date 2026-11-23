@@ -2163,8 +2163,11 @@ inline void throttle_advance(Connection& conn, u32 len) {
     const u64 kBase = (kNowNs > conn.throttle_tat_ns) ? kNowNs : conn.throttle_tat_ns;
     // len*1e9/bps at full precision per chunk (a precomputed ns-per-byte would
     // truncate to 0 above ~1 GB/s). len*1e9 <= ~4.3e18 for u32 len, within u64.
-    conn.throttle_tat_ns =
-        kBase + static_cast<u64>(len) * 1'000'000'000ull / conn.throttle_down_bps;
+    const i64 delta_ns = static_cast<i64>(len) * static_cast<i64>(1'000'000'000) /
+                         static_cast<i64>(conn.throttle_down_bps);
+    u64 next_tat = 0;
+    if (__builtin_add_overflow(kBase, static_cast<u64>(delta_ns), &next_tat)) next_tat = UINT64_MAX;
+    conn.throttle_tat_ns = next_tat;
 }
 
 // True once the whole proxied response body has been read from the upstream
@@ -2188,7 +2191,8 @@ inline bool proxy_body_complete(const Connection& conn) {
 // tls_active before touching conn again.
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
-    conn.resp_body_sent += newly;
+    conn.resp_body_sent =
+        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(newly));
     throttle_advance(conn, newly);
     if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
     conn.upstream_send_len = conn.tls_send_len;
@@ -2303,7 +2307,8 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
     if (conn.throttle_down_bps == 0) return false;
     const u64 kNowNs = monotonic_ns();
     if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
-    const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
+    u64 kDelayNs = 0;
+    (void)__builtin_sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
@@ -2345,7 +2350,8 @@ void throttle_resume(Loop* loop, Connection& conn) {
         const u64 kNowNs = monotonic_ns();
         if (conn.throttle_tat_ns > kNowNs) {
             // Budget not recovered yet — re-park for the remaining deficit.
-            const u64 kDelayNs = conn.throttle_tat_ns - kNowNs;
+            u64 kDelayNs = 0;
+            (void)__builtin_sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
             bool armed = false;
             if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
                 armed = loop->arm_throttle_timer(conn, kDelayNs);
