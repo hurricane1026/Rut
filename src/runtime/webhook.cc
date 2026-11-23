@@ -39,11 +39,15 @@ bool standard_webhook_valid(Str id,
         const char c = timestamp.ptr[i];
         if (c < '0' || c > '9') return false;
         const u64 digit = static_cast<u64>(c - '0');
-        if (seconds > (kMaxTime - digit) / 10) return false;
-        seconds = seconds * 10 + digit;
+        const i64 signed_seconds = static_cast<i64>(seconds);
+        if (signed_seconds > (static_cast<i64>(kMaxTime) - static_cast<i64>(digit)) / 10)
+            return false;
+        seconds = static_cast<u64>(signed_seconds * 10 + static_cast<i64>(digit));
     }
     const u64 now = static_cast<u64>(unix_seconds);
-    if ((seconds > now ? seconds - now : now - seconds) > tolerance_seconds) return false;
+    const i64 delta = seconds > now ? static_cast<i64>(seconds) - static_cast<i64>(now)
+                                    : static_cast<i64>(now) - static_cast<i64>(seconds);
+    if (delta > static_cast<i64>(tolerance_seconds)) return false;
 
     static constexpr u8 kDot[] = {'.'};
     const rut_crypto_span_v1 parts[] = {
@@ -89,15 +93,19 @@ bool standard_webhook_valid(Str id,
                 valid = false;
             ++comma;
         }
-        if (comma == begin || comma == end || comma + 1 == end) {
+        if (comma == begin || comma == end ||
+            static_cast<i64>(comma) + 1 == static_cast<i64>(end)) {
             valid = false;
             break;
         }
-        for (u32 i = comma + 1; i < end; ++i)
+        for (u32 i = static_cast<u32>(static_cast<i64>(comma) + 1); i < end; ++i)
             if (signature.ptr[i] < 0x21 || signature.ptr[i] > 0x7e || signature.ptr[i] == ',')
                 valid = false;
-        if (Str{signature.ptr + begin, comma - begin}.eq(lit_str("v1"))) {
-            const Str value{signature.ptr + comma + 1, end - comma - 1};
+        if (Str{signature.ptr + static_cast<i64>(begin),
+                static_cast<u32>(static_cast<i64>(comma) - static_cast<i64>(begin))}
+                .eq(lit_str("v1"))) {
+            const Str value{signature.ptr + static_cast<i64>(comma) + 1,
+                            static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(comma) - 1)};
             if (value.len != 44 || value.ptr[43] != '=') {
                 valid = false;
                 break;
@@ -109,7 +117,7 @@ bool standard_webhook_valid(Str id,
                 rut_crypto_equal_v1(reinterpret_cast<const u8*>(value.ptr), encoded, 44) != 0;
         }
         if (end == signature.len) break;
-        begin = end + 1;
+        begin = static_cast<u32>(static_cast<i64>(end) + 1);
         if (begin == signature.len) valid = false;
     }
     rut_crypto_clear_v1(encoded, sizeof(encoded));
