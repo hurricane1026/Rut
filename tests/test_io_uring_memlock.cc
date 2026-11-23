@@ -41,6 +41,19 @@ TEST(io_uring_memlock, startup_minimum_saturates_on_overflow) {
     CHECK_EQ(io_uring_startup_min_locked_bytes(2, 1, max), max);
 }
 
+TEST(io_uring_memlock, page_rounding_handles_u64_boundaries) {
+    using iouring_memlock_detail::round_up_page;
+    const u64 max = ~u64(0);
+    const u64 page = 4096;
+    const u64 aligned_max = max - (max % page);
+    CHECK_EQ(round_up_page(0, page), 0u);
+    CHECK_EQ(round_up_page(4097, page), 8192u);
+    CHECK_EQ(round_up_page(aligned_max, page), aligned_max);
+    CHECK_EQ(round_up_page(max - 1, page), max);
+    CHECK_EQ(round_up_page(max, page), max);
+    CHECK_EQ(round_up_page(max, 0), 0u);
+}
+
 // The default capacity gets SQ 1024 / CQ 32768 (was SQ 16384 / CQ 32768 =
 // 1652 KiB per shard); capacity 1024 gets SQ 1024 / CQ 2048.
 TEST(io_uring_memlock, default_capacity_costs_632_kib_per_shard) {
