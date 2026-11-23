@@ -1592,7 +1592,8 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     const u32 buffered_body = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
                                                static_cast<i64>(proof.raw_header_end));
     if (buffered_body > proof.raw_content_length ||
-        conn.req_body_remaining != proof.raw_content_length - buffered_body)
+        conn.req_body_remaining != static_cast<u32>(static_cast<i64>(proof.raw_content_length) -
+                                                    static_cast<i64>(buffered_body)))
         return false;
     return !require_complete ||
            (conn.recv_buf.len() == proof.raw_total_length && conn.req_body_remaining == 0);
@@ -3875,7 +3876,8 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // buffer delta exactly once; later records either find the body slot
         // cleared at completion or observe a zero delta while the same live recv
         // remains armed. Never clamp bytes past the promised request boundary.
-        consume = conn.recv_buf.len() - conn.req_initial_send_len;
+        consume = static_cast<u32>(static_cast<i64>(conn.recv_buf.len()) -
+                                   static_cast<i64>(conn.req_initial_send_len));
         if (consume > conn.req_body_remaining) {
             loop->close_conn(conn);
             return;
@@ -4169,7 +4171,9 @@ inline bool collect_effective_response_headers(const Connection& conn,
                     i++;
                     continue;
                 }
-                for (u32 move = i + 1; move < *out_count; move++) out[move - 1] = out[move];
+                for (u32 move = static_cast<u32>(static_cast<i64>(i) + 1); move < *out_count;
+                     move++)
+                    out[static_cast<u32>(static_cast<i64>(move) - 1)] = out[move];
                 (*out_count)--;
             }
         }
@@ -4185,7 +4189,8 @@ inline bool collect_effective_response_headers(const Connection& conn,
 inline bool response_mutation_survives(const Connection& conn, u32 index) {
     const auto& current = conn.resp_header_mutations[index];
     if (current.mode == Connection::RespHeaderMutationMode::Remove) return false;
-    for (u32 i = index + 1; i < conn.resp_header_mutation_count; i++) {
+    for (u32 i = static_cast<u32>(static_cast<i64>(index) + 1); i < conn.resp_header_mutation_count;
+         i++) {
         const auto& later = conn.resp_header_mutations[i];
         if (later.mode != Connection::RespHeaderMutationMode::Add &&
             http_header_name_eq_ci(
@@ -4312,11 +4317,12 @@ inline bool build_h1_forward_response_headers(Connection& conn,
                    (data[static_cast<u32>(static_cast<i64>(field_name_end) - 1)] == ' ' ||
                     data[static_cast<u32>(static_cast<i64>(field_name_end) - 1)] == '\t'))
                 field_name_end = static_cast<u32>(static_cast<i64>(field_name_end) - 1);
-            if (http_header_name_eq_ci(reinterpret_cast<const char*>(data + line_start),
-                                       static_cast<u32>(static_cast<i64>(field_name_end) -
-                                                        static_cast<i64>(line_start)),
-                                       "connection",
-                                       10) &&
+            if (http_header_name_eq_ci(
+                    reinterpret_cast<const char*>(data + static_cast<i64>(line_start)),
+                    static_cast<u32>(static_cast<i64>(field_name_end) -
+                                     static_cast<i64>(line_start)),
+                    "connection",
+                    10) &&
                 connection_value_nominates(
                     data + static_cast<i64>(colon) + 1,
                     static_cast<u32>(static_cast<i64>(line_end) - static_cast<i64>(colon) - 1),
@@ -5355,9 +5361,12 @@ void handle_jit_outcome(Loop* loop,
                     forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
                     forward_timeout_failure_policy_id != 0 &&
                     admitted_fixed_upload_head_timeout_policies_valid(
-                        config->response_policies[forward_response_policy_id - 1],
-                        config->failure_policies[forward_failure_policy_id - 1],
-                        config->failure_policies[forward_timeout_failure_policy_id - 1]);
+                        config->response_policies[static_cast<u32>(
+                            static_cast<i64>(forward_response_policy_id) - 1)],
+                        config->failure_policies[static_cast<u32>(
+                            static_cast<i64>(forward_failure_policy_id) - 1)],
+                        config->failure_policies[static_cast<u32>(
+                            static_cast<i64>(forward_timeout_failure_policy_id) - 1)]);
                 fixed_upload_head_admitted =
                     fixed_upload_head_policies_admitted &&
                     (fixed_upload_head_initial_phase || staged_fixed_head_continuation);
@@ -5373,8 +5382,9 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const bool general_target =
                     config->target_transform_id_is_valid(conn.target_transform_id) &&
-                    config->target_transforms[conn.target_transform_id - 1].mode !=
-                        ForwardTargetTransformMode::CleanPrefix;
+                    config->target_transforms[static_cast<u32>(
+                                                  static_cast<i64>(conn.target_transform_id) - 1)]
+                            .mode != ForwardTargetTransformMode::CleanPrefix;
                 const u16 target_response_policy_id = forward_response_policy_id;
                 const u16 target_failure_policy_id = forward_failure_policy_id;
                 const u16 target_timeout_failure_policy_id = forward_timeout_failure_policy_id;
@@ -5386,11 +5396,11 @@ void handle_jit_outcome(Loop* loop,
                      !config->timeout_failure_policy_id_is_valid(
                          target_timeout_failure_policy_id)) ||
                     (target_failure_policy_id != 0 &&
-                     !failure_policy_runtime_supported(
-                         config->failure_policies[target_failure_policy_id - 1])) ||
+                     !failure_policy_runtime_supported(config->failure_policies[static_cast<u32>(
+                         static_cast<i64>(target_failure_policy_id) - 1)])) ||
                     (target_timeout_failure_policy_id != 0 &&
-                     !failure_policy_runtime_supported(
-                         config->failure_policies[target_timeout_failure_policy_id - 1])) ||
+                     !failure_policy_runtime_supported(config->failure_policies[static_cast<u32>(
+                         static_cast<i64>(target_timeout_failure_policy_id) - 1)])) ||
                     !forward_policy_head_modes_compatible(*config,
                                                           target_response_policy_id,
                                                           target_failure_policy_id,
@@ -5416,8 +5426,8 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 if (target_response_policy_id != 0 &&
-                    !response_policy_runtime_supported(
-                        config->response_policies[target_response_policy_id - 1])) {
+                    !response_policy_runtime_supported(config->response_policies[static_cast<u32>(
+                        static_cast<i64>(target_response_policy_id) - 1)])) {
                     reject_response_policy(loop, conn);
                     return;
                 }
@@ -5438,8 +5448,10 @@ void handle_jit_outcome(Loop* loop,
                 bool response_policy_request_connection = false;
                 if (target_response_policy_id != 0) {
                     response_policy_request_connection =
-                        config->response_policies[target_response_policy_id - 1].connection ==
-                        ResponsePolicyConnection::Request;
+                        config
+                            ->response_policies[static_cast<u32>(
+                                static_cast<i64>(target_response_policy_id) - 1)]
+                            .connection == ResponsePolicyConnection::Request;
                 }
                 if (!general_target &&
                     (target.addr_count != 1 || target.addrs[0].sin_family != AF_INET ||
@@ -5516,11 +5528,13 @@ void handle_jit_outcome(Loop* loop,
             }
             bool suppress_body_head =
                 forward_response_policy_id != 0 &&
-                config->response_policies[forward_response_policy_id - 1].head_mode ==
-                    ResponsePolicyHeadMode::SuppressBody &&
+                config->response_policies[static_cast<u32>(
+                                              static_cast<i64>(forward_response_policy_id) - 1)]
+                        .head_mode == ResponsePolicyHeadMode::SuppressBody &&
                 response_policy_suppress_head_admitted(
                     conn,
-                    config->response_policies[forward_response_policy_id - 1],
+                    config->response_policies[static_cast<u32>(
+                        static_cast<i64>(forward_response_policy_id) - 1)],
                     forward_failure_policy_id != 0,
                     outcome.request_policy_id);
             if (fixed_upload_head_admitted) {
@@ -5528,26 +5542,28 @@ void handle_jit_outcome(Loop* loop,
             }
             const bool suppress_failure_head =
                 forward_response_policy_id != 0 && forward_failure_policy_id != 0 &&
-                config->response_policies[forward_response_policy_id - 1].head_mode ==
-                    ResponsePolicyHeadMode::SuppressBody &&
-                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
-                    FailurePolicyHeadMode::SuppressBody &&
+                config->response_policies[static_cast<u32>(
+                                              static_cast<i64>(forward_response_policy_id) - 1)]
+                        .head_mode == ResponsePolicyHeadMode::SuppressBody &&
+                config->failure_policies[static_cast<u32>(
+                                             static_cast<i64>(forward_failure_policy_id) - 1)]
+                        .head_mode == FailurePolicyHeadMode::SuppressBody &&
                 suppress_body_head;
             // Validate the selected failure disposition before request-body
             // waiting, policy rewriting, target materialisation, or any
             // upstream resource can be touched. Only the paired SuppressBody
             // contract below is executable in this increment.
             if (forward_failure_policy_id != 0 &&
-                !failure_policy_runtime_supported(
-                    config->failure_policies[forward_failure_policy_id - 1]) &&
+                !failure_policy_runtime_supported(config->failure_policies[static_cast<u32>(
+                    static_cast<i64>(forward_failure_policy_id) - 1)]) &&
                 !suppress_failure_head) {
                 reject_response_policy(loop, conn);
                 return;
             }
             if (forward_timeout_failure_policy_id != 0 &&
                 (!config->timeout_failure_policy_id_is_valid(forward_timeout_failure_policy_id) ||
-                 (!failure_policy_runtime_supported(
-                      config->failure_policies[forward_timeout_failure_policy_id - 1]) &&
+                 (!failure_policy_runtime_supported(config->failure_policies[static_cast<u32>(
+                      static_cast<i64>(forward_timeout_failure_policy_id) - 1)]) &&
                   !suppress_failure_head))) {
                 reject_response_policy(loop, conn);
                 return;
@@ -5557,8 +5573,9 @@ void handle_jit_outcome(Loop* loop,
             // explicit-close HEAD domain before request-policy body waiting,
             // rewriting, or any upstream resource is touched.
             if (forward_failure_policy_id != 0 &&
-                config->failure_policies[forward_failure_policy_id - 1].head_mode ==
-                    FailurePolicyHeadMode::SuppressBody &&
+                config->failure_policies[static_cast<u32>(
+                                             static_cast<i64>(forward_failure_policy_id) - 1)]
+                        .head_mode == FailurePolicyHeadMode::SuppressBody &&
                 !suppress_failure_head) {
                 reject_response_policy(loop, conn);
                 return;
@@ -5818,8 +5835,10 @@ void handle_jit_outcome(Loop* loop,
             if (forward_response_policy_id != 0 &&
                 config->response_policy_id_is_valid(forward_response_policy_id)) {
                 response_policy_request_connection =
-                    config->response_policies[forward_response_policy_id - 1].connection ==
-                    ResponsePolicyConnection::Request;
+                    config
+                        ->response_policies[static_cast<u32>(
+                            static_cast<i64>(forward_response_policy_id) - 1)]
+                        .connection == ResponsePolicyConnection::Request;
             }
             if ((forward_response_policy_id != 0 || has_failure_policy) &&
                 ((forward_response_policy_id != 0 &&
@@ -5847,8 +5866,8 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             if (forward_response_policy_id != 0 &&
-                !response_policy_runtime_supported(
-                    config->response_policies[forward_response_policy_id - 1]) &&
+                !response_policy_runtime_supported(config->response_policies[static_cast<u32>(
+                    static_cast<i64>(forward_response_policy_id) - 1)]) &&
                 !suppress_body_head) {
                 reject_response_policy(loop, conn);
                 return;
@@ -6272,9 +6291,13 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             !config->timeout_failure_policy_id_is_valid(conn.timeout_failure_policy_id))
             return false;
 
-        const auto& response = config->response_policies[conn.response_policy_id - 1];
-        const auto& failure = config->failure_policies[conn.failure_policy_id - 1];
-        const auto& timeout = config->failure_policies[conn.timeout_failure_policy_id - 1];
+        const auto& response = config->response_policies[static_cast<u32>(
+            static_cast<i64>(conn.response_policy_id) - 1)];
+        const auto& failure =
+            config
+                ->failure_policies[static_cast<u32>(static_cast<i64>(conn.failure_policy_id) - 1)];
+        const auto& timeout = config->failure_policies[static_cast<u32>(
+            static_cast<i64>(conn.timeout_failure_policy_id) - 1)];
         const ResponseReadDeadlineProfile profile =
             explicit_deadline_expiry ? conn.response_read_deadline_profile
                                      : ResponseReadDeadlineProfile::HeaderOnlyHead;
@@ -6405,7 +6428,7 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_wait != 0 ||
             conn.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
             conn.http1_prebuilt_request_prefix_len != 0 ||
-            conn.pending_ops != static_cast<u32>(conn.recv_armed) + 1u ||
+            conn.pending_ops != static_cast<u32>(static_cast<i64>(conn.recv_armed) + 1) ||
             loop->keepalive_timeout == 0 || loop->keepalive_timeout >= TimerWheel::kSlots)
             return false;
 
@@ -6461,9 +6484,10 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             timeout_response.content_length_count != 1 ||
             timeout_response.content_length != timeout.body.len || timeout_response.chunked ||
             timeout_response.headers_truncated || timeout_parser.header_end > response_len ||
-            (suppress_body
-                 ? timeout_parser.header_end != response_len
-                 : timeout_response.content_length != response_len - timeout_parser.header_end))
+            (suppress_body ? timeout_parser.header_end != response_len
+                           : timeout_response.content_length !=
+                                 static_cast<u32>(static_cast<i64>(response_len) -
+                                                  static_cast<i64>(timeout_parser.header_end))))
             return false;
         if (fixed_upload_head &&
             !fixed_upload_head_timeout_response_is_stable(conn, timeout, scratch, response_len))
@@ -6487,10 +6511,12 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
             conn.http1_prebuilt_deadline_upload = conn.response_read_deadline_upload;
             conn.http1_prebuilt_header_end = timeout_parser.header_end;
             conn.http1_prebuilt_total_len = response_len;
-            conn.http1_prebuilt_body_len = (fixed_upload_head || header_only_head_explicit_close ||
-                                            header_only_head_keep_alive)
-                                               ? timeout.body.len
-                                               : response_len - timeout_parser.header_end;
+            conn.http1_prebuilt_body_len =
+                (fixed_upload_head || header_only_head_explicit_close ||
+                 header_only_head_keep_alive)
+                    ? timeout.body.len
+                    : static_cast<u32>(static_cast<i64>(response_len) -
+                                       static_cast<i64>(timeout_parser.header_end));
             conn.http1_prebuilt_status = timeout.status_code;
         }
 
@@ -6577,7 +6603,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         if (!conn.resp_header_mutation_overflow && conn.response_header_buf.valid() &&
             conn.stabilize_response_mutations(source, source_len)) {
             constexpr u32 kMaxEffectiveHeaders =
-                RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                static_cast<u32>(static_cast<i64>(RouteConfig::kMaxHeadersPerSet) +
+                                 static_cast<i64>(Connection::kMaxRespHeaderMutations));
             ResponseHeaderKV headers[kMaxEffectiveHeaders];
             u32 header_count = 0;
             if (collect_effective_response_headers(
@@ -8828,17 +8855,22 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         conn.response_read_deadline_upload.raw_total_length == conn.req_initial_send_len &&
         conn.req_initial_send_len < len;
     const u32 original_request_end = conn.req_initial_send_len;
-    const u32 original_successor_len = coalesced_phase1 ? len - original_request_end : 0;
+    const u32 original_successor_len =
+        coalesced_phase1
+            ? static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(original_request_end))
+            : 0;
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
     if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
     const u32 body_len = req.has_content_length ? req.content_length : 0;
-    const u8* end = data + parser.header_end;
+    const u8* end = data + static_cast<i64>(parser.header_end);
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
-    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
+    if (static_cast<i64>(line_end - data) + 1 >= static_cast<i64>(parser.header_end) ||
+        path_ptr < data || path_ptr + static_cast<i64>(req.path.len) > line_end)
+        return false;
     const bool trim_sp_preserve_htab = request_policy_trims_sp_preserves_htab(policy_id);
     u64 measured_id3_length = 0;
 
@@ -8913,8 +8945,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                     ++value_start;
                 while (value_end > value_start && parsed_header.raw_value.ptr[value_end - 1] == ' ')
                     --value_end;
-                measured +=
-                    static_cast<i64>(name_len) + 2 + static_cast<i64>(value_end - value_start) + 2;
+                measured += static_cast<i64>(name_len) + 2 + static_cast<i64>(value_end) -
+                            static_cast<i64>(value_start) + 2;
             }
             measured_hs = measured_le + 2;
         }
@@ -8927,8 +8959,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     }
 
     auto append = [&](const u8* p, u32 n) {
-        return n <= conn.send_buf.capacity() - conn.send_buf.len() &&
-               conn.send_buf.write(p, n) == n;
+        if (conn.send_buf.len() > conn.send_buf.capacity() ||
+            static_cast<i64>(n) >
+                static_cast<i64>(conn.send_buf.capacity()) - static_cast<i64>(conn.send_buf.len()))
+            return false;
+        return conn.send_buf.write(p, n) == n;
     };
     auto append_lit = [&](const char* p, u32 n) {
         return append(reinterpret_cast<const u8*>(p), n);
@@ -8937,10 +8972,10 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         char digits[10];
         u32 n = 0;
         do {
-            digits[n++] = static_cast<char>('0' + value % 10);
+            digits[n++] = static_cast<char>('0' + static_cast<i64>(value % 10));
             value /= 10;
         } while (value != 0);
-        for (u32 i = n; i > 0; i--) {
+        for (i64 i = static_cast<i64>(n); i > 0; i--) {
             if (!append(reinterpret_cast<const u8*>(&digits[i - 1]), 1)) return false;
         }
         return true;
@@ -8953,7 +8988,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         return false;
 
     char authority[32];
-    u32 authority_len = 0;
+    i64 authority_len = 0;
     const u32 ip = ntohl(endpoint.sin_addr.s_addr);
     const u8 octets[4] = {static_cast<u8>(ip >> 24),
                           static_cast<u8>(ip >> 16),
@@ -8963,9 +8998,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         if (oi != 0) authority[authority_len++] = '.';
         u32 v = octets[oi];
         char digits[3];
-        u32 dn = 0;
+        i64 dn = 0;
         do {
-            digits[dn++] = static_cast<char>('0' + (v % 10));
+            digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));
             v /= 10;
         } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
@@ -8974,15 +9009,17 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (port != 80) {
         authority[authority_len++] = ':';
         char digits[5];
-        u32 dn = 0, v = port;
+        i64 dn = 0;
+        u32 v = port;
         do {
-            digits[dn++] = static_cast<char>('0' + (v % 10));
+            digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));
             v /= 10;
         } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
     }
     if (!append_lit("Host: ", 6) ||
-        !append(reinterpret_cast<const u8*>(authority), authority_len) || !append_lit("\r\n", 2))
+        !append(reinterpret_cast<const u8*>(authority), static_cast<u32>(authority_len)) ||
+        !append_lit("\r\n", 2))
         return false;
     const bool content_length_after_host =
         request_policy_places_content_length_after_host(policy_id);
