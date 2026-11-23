@@ -33719,11 +33719,12 @@ TEST(jit, string_find_returns_absolute_optional_offsets_without_arena_storage) {
             const auto text_offset = request.size();
             request.append(item.input.ptr, item.input.len);
             connection->jit_response_body_valid = false;
-            const auto result = HandlerResult::unpack(handler(connection.get(),
-                                                               nullptr,
-                                                               reinterpret_cast<const u8*>(request.data()),
-                                                               request.size(),
-                                                               nullptr));
+            const auto result =
+                HandlerResult::unpack(handler(connection.get(),
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              nullptr));
             CHECK_EQ(result.status_code, item.expected >= 0 ? 200u : 404u);
             if (item.expected >= 0) {
                 REQUIRE(connection->jit_response_body_valid);

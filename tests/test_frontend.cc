@@ -49058,12 +49058,23 @@ TEST(frontend, string_find_preserves_optional_offsets_and_composes_with_slices) 
 
 TEST(frontend, string_find_rejects_mixed_strings_bytes_and_optional_operands) {
     const char* expressions[] = {
-        R"("x".find())", R"("x".find("x", 0, 1))", R"("x".find(b"x"))", R"("x".find(120))",
-        R"("x".find("x", true))", R"("x".find("x", i64(0)))", R"("x".find("x", "0"))",
-        R"("x".find("x", parseInt("0")))", R"("x".find(req.header("X")))",
-        R"(req.header("X").find("x"))", R"("x".slice(0, 1).find("x"))",
-        R"("x".find("x") + 1)", R"(b"x".find("x"))", R"("x".find("x").len)",
-        R"(req.header("X").len)", R"(b"x".len)", R"("x".len())",
+        R"("x".find())",
+        R"("x".find("x", 0, 1))",
+        R"("x".find(b"x"))",
+        R"("x".find(120))",
+        R"("x".find("x", true))",
+        R"("x".find("x", i64(0)))",
+        R"("x".find("x", "0"))",
+        R"("x".find("x", parseInt("0")))",
+        R"("x".find(req.header("X")))",
+        R"(req.header("X").find("x"))",
+        R"("x".slice(0, 1).find("x"))",
+        R"("x".find("x") + 1)",
+        R"(b"x".find("x"))",
+        R"("x".find("x").len)",
+        R"(req.header("X").len)",
+        R"(b"x".len)",
+        R"("x".len())",
     };
     for (const char* expression : expressions) {
         const std::string source =

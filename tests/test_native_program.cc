@@ -4149,8 +4149,12 @@ TEST(native_program, string_find_returns_absolute_optional_offsets_without_arena
             const auto text_offset = request.size();
             request.append(item.input.ptr, item.input.len);
             connection->jit_response_body_valid = false;
-            const auto result = jit::HandlerResult::unpack(
-                handler(connection.get(), &ctx, reinterpret_cast<const u8*>(request.data()), request.size(), nullptr));
+            const auto result =
+                jit::HandlerResult::unpack(handler(connection.get(),
+                                                   &ctx,
+                                                   reinterpret_cast<const u8*>(request.data()),
+                                                   request.size(),
+                                                   nullptr));
             CHECK_EQ(result.status_code, item.expected >= 0 ? 200u : 404u);
             if (item.expected >= 0) {
                 REQUIRE(connection->jit_response_body_valid);
@@ -4167,6 +4171,43 @@ TEST(native_program, string_find_returns_absolute_optional_offsets_without_arena
         }
     }
 }
+#if RUT_ENABLE_WEBSOCKET
+TEST(native_program, string_find_extracts_fields_in_websocket_callbacks) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(R"rut(
+upstream backend at "127.0.0.1:9999"
+route GET "/ws" { return websocket(backend) { message in
+    guard let end = message.text.find(":", 1) else { message.drop() }
+    guard end < message.text.len else { message.drop() }
+    guard let value = message.text.slice(1, end) else { message.drop() }
+    guard value == "12" else { message.drop() }
+    message.forward()
+} }
+)rut"));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto handler = program.p->config.routes[0].ws_frame_handler;
+        REQUIRE(handler);
+        const Str payloads[] = {lit_str(":12:"),
+                                lit_str(":12:tail"),
+                                lit_str(":1:"),
+                                lit_str(":13:"),
+                                lit_str(":12"),
+                                lit_str(""),
+                                lit_str(":\0\xff:")};
+        for (u32 i = 0; i < 7; ++i)
+            CHECK(handler(nullptr,
+                          WsOpcode::Text,
+                          reinterpret_cast<const u8*>(payloads[i].ptr),
+                          payloads[i].len,
+                          true) == (i < 2 ? WsFrameAction::Forward : WsFrameAction::Drop));
+    }
+}
+#endif
+
 TEST(native_program, string_split_executes_owned_dynamic_fields_at_both_optimization_levels) {
     for (u8 opt : {0u, 2u}) {
         Source source;
