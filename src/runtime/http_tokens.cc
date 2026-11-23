@@ -23,7 +23,9 @@ bool parse_tokens(Str text, Tokens& tokens) {
         const u32 kStart = offset;
         while (offset < text.len && is_http_tchar(static_cast<u8>(text.ptr[offset]))) ++offset;
         if (offset == kStart || tokens.count == kMaxHttpTokenListItems) return false;
-        tokens.values[tokens.count++] = {text.ptr + kStart, offset - kStart};
+        tokens.values[tokens.count++] = {
+            text.ptr + static_cast<i64>(kStart),
+            static_cast<u32>(static_cast<i64>(offset) - static_cast<i64>(kStart))};
         while (offset < text.len && (text.ptr[offset] == ' ' || text.ptr[offset] == '\t')) ++offset;
         if (offset == text.len) return true;
         if (text.ptr[offset++] != ',') return false;
@@ -43,16 +45,18 @@ bool valid_origin(Str origin) {
     u32 end = start;
     if (origin.ptr[start] == '[') {
         while (end < origin.len && origin.ptr[end] != ']') ++end;
-        if (end == origin.len || end - start <= 1 || end - start - 1 >= INET6_ADDRSTRLEN)
+        const i64 address_len = static_cast<i64>(end) - static_cast<i64>(start);
+        if (end == origin.len || address_len <= 1 || address_len - 1 >= INET6_ADDRSTRLEN)
             return false;
-        for (u32 i = start + 1; i < end; ++i) {
+        for (u32 i = static_cast<u32>(static_cast<i64>(start) + 1); i < end; ++i) {
             const char kC = origin.ptr[i];
             const bool kHex =
                 (kC >= '0' && kC <= '9') || (kC >= 'a' && kC <= 'f') || (kC >= 'A' && kC <= 'F');
             if (!kHex && kC != ':' && kC != '.') return false;
         }
         char address[INET6_ADDRSTRLEN]{};
-        __builtin_memcpy(address, origin.ptr + start + 1, end - start - 1);
+        __builtin_memcpy(
+            address, origin.ptr + static_cast<i64>(start) + 1, static_cast<u32>(address_len - 1));
         in6_addr parsed{};
         if (inet_pton(AF_INET6, address, &parsed) != 1) return false;
         ++end;
@@ -61,8 +65,9 @@ bool valid_origin(Str origin) {
         while (end < origin.len && origin.ptr[end] != ':') {
             const char kC = origin.ptr[end];
             if (kC == '.') {
-                if (end == label_start || origin.ptr[end - 1] == '-') return false;
-                label_start = end + 1;
+                if (end == label_start || origin.ptr[static_cast<i64>(end) - 1] == '-')
+                    return false;
+                label_start = static_cast<u32>(static_cast<i64>(end) + 1);
             } else {
                 const bool kAlnum = (kC >= 'a' && kC <= 'z') || (kC >= 'A' && kC <= 'Z') ||
                                     (kC >= '0' && kC <= '9');
@@ -70,7 +75,8 @@ bool valid_origin(Str origin) {
             }
             ++end;
         }
-        if (end == start || end == label_start || origin.ptr[end - 1] == '-') return false;
+        if (end == start || end == label_start) return false;
+        if (origin.ptr[static_cast<i64>(end) - 1] == '-') return false;
     }
     if (end == origin.len) return true;
     if (origin.ptr[end] != ':') return false;
@@ -79,8 +85,9 @@ bool valid_origin(Str origin) {
     for (; end < origin.len; ++end) {
         const char kC = origin.ptr[end];
         if (kC < '0' || kC > '9') return false;
-        port = port * 10 + static_cast<u32>(kC - '0');
-        if (port > 65535) return false;
+        const i64 next_port = static_cast<i64>(port) * 10 + static_cast<i64>(kC - '0');
+        if (next_port > 65535) return false;
+        port = static_cast<u32>(next_port);
     }
     return true;
 }
@@ -118,8 +125,11 @@ bool http_origin_list_allows(Str allowed, Str origin, bool credentials) {
         const u32 kStart = offset;
         while (offset < allowed.len && allowed.ptr[offset] != ',') ++offset;
         u32 end = offset;
-        while (end > kStart && (allowed.ptr[end - 1] == ' ' || allowed.ptr[end - 1] == '\t')) --end;
-        const Str kItem{allowed.ptr + kStart, end - kStart};
+        while (end > kStart && (allowed.ptr[static_cast<i64>(end) - 1] == ' ' ||
+                                allowed.ptr[static_cast<i64>(end) - 1] == '\t'))
+            --end;
+        const Str kItem{allowed.ptr + static_cast<i64>(kStart),
+                        static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(kStart))};
         if (++count > 32 || !valid_origin(kItem)) return false;
         found |= kItem.eq(origin);
         if (offset == allowed.len) return found;
