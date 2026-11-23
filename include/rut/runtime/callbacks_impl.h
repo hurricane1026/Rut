@@ -475,7 +475,8 @@ inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
         tmp[t++] = static_cast<char>('0' + port % 10);
         port = static_cast<u16>(port / 10);
     }
-    for (u32 i = 0; i < t; i++) out[w++] = tmp[t - 1 - i];
+    for (u32 i = 0; i < t; i++)
+        out[w++] = tmp[static_cast<u32>(static_cast<i64>(t) - 1 - static_cast<i64>(i))];
     return w;
 }
 

@@ -179,7 +179,8 @@ def main():
             ("event.copy_end >= event.copy_begin &&", ""),
             ("event.result > 0 &&", "event.result >= 0 &&"),
             ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
-            ("event.copy_end - event.copy_begin ==", "event.copy_end - event.copy_begin >="),
+            ("static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==",
+             "static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) >="),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
             check(compiler, root, overlay, "Response copy violates positive span contract", source=source)
