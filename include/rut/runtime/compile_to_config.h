@@ -121,7 +121,10 @@ inline bool rir_function_buffers_h2_forward_body(const rir::Function& fn, const 
         if (block.insts == nullptr) return false;
         for (u32 ii = 0; ii < block.inst_count; ii++) {
             const auto& inst = block.insts[ii];
-            if (inst.op == rir::Opcode::ReqSetPath && inst.imm.i32_val == 1) return true;
+            if ((inst.op == rir::Opcode::ReqSetPath || inst.op == rir::Opcode::ReqSetBody) &&
+                inst.imm.i32_val == 1)
+                return true;
+            if (inst.op == rir::Opcode::ReqSetBody) return true;
             if (inst.op == rir::Opcode::ReqSetTargetTransform && inst.imm.i32_val > 0 &&
                 static_cast<u32>(inst.imm.i32_val) <= mod.target_transform_count &&
                 mod.target_transforms[inst.imm.i32_val - 1].mode !=

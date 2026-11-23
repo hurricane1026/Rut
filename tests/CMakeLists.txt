@@ -4418,6 +4418,12 @@ if(RUT_ENABLE_JIT)
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend})
                 set_tests_properties(test_consumer_fields_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_consumer_form_forward_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_form_forward.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/consumer-form-forward-auth.rut
+                        --backend ${auth_free_backend})
+                set_tests_properties(test_consumer_form_forward_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 foreach(consumer_query_opt 0 2)
                     add_test(NAME test_consumer_query_forward_${auth_free_backend}_O${consumer_query_opt}
                         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_consumer_query_forward.py
@@ -4479,6 +4485,12 @@ if(RUT_ENABLE_JIT)
                         --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signed-request-replay-auth.rut
                         --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --signed)
                 set_tests_properties(test_signed_replay_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_github_webhook_replay_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_github_webhook_replay.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/github-webhook-replay-auth.rut
+                        --backend ${auth_free_backend})
+                set_tests_properties(test_github_webhook_replay_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
                 foreach(replay_tls plain tls)
                     set(replay_tls_flag)

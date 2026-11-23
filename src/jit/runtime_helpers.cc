@@ -35,6 +35,7 @@
 #include "rut/runtime/parse_ip.h"
 #include "rut/runtime/password_gateway.h"
 #include "rut/runtime/regex_capture.h"
+#include "rut/runtime/request_body_override.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
@@ -665,6 +666,84 @@ void rut_helper_req_unique_header(const u8* req_data,
                                   const char** out_ptr,
                                   u32* out_len) {
     lookup_req_header(req_data, req_len, name, name_len, out_has_value, out_ptr, out_len, true);
+}
+
+namespace {
+bool apply_request_body_override(ConnectionBase& conn, Str body) {
+    if (body.len > kMaxForwardBodyOverride || conn.req_body_overridden ||
+        conn.req_body_override_failed || conn.req_malformed || !conn.recv_buf.valid() ||
+        conn.recv_buf.is_released() || conn.req_header_end == 0 ||
+        conn.req_body_mode != BodyMode::ContentLength || conn.req_body_remaining != 0)
+        return false;
+    const u32 total = conn.recv_buf.len();
+    const u32 old_header_end = conn.req_header_end;
+    const u32 old_body_len = conn.req_content_length;
+    if (old_header_end > total || old_body_len > total - old_header_end ||
+        conn.req_initial_send_len < old_header_end ||
+        conn.req_initial_send_len - old_header_end < old_body_len)
+        return false;
+    u8* data = conn.recv_slice;
+    if (data == nullptr || data != conn.recv_buf.data()) return false;
+    u32 new_total = total;
+    u32 new_header_end = old_header_end;
+    if (!replace_h1_body_in_place(
+            data, &new_total, conn.recv_buf.capacity(), &new_header_end, old_body_len, body))
+        return false;
+    conn.recv_buf.set_len(new_total);
+    conn.req_header_end = new_header_end;
+    conn.req_content_length = body.len;
+    conn.req_initial_send_len = new_header_end + body.len;
+    conn.req_body_overridden = true;
+    // Body bytes changed even when the total length happens to match.
+    t_parse_cache = {};
+    return true;
+}
+}  // namespace
+
+void rut_helper_req_set_body(void* conn, const char* body, u32 len) {
+    if (conn == nullptr) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    if (len > kMaxForwardBodyOverride || connection.req_body_overridden ||
+        connection.req_body_override_failed) {
+        connection.req_body_override_failed = true;
+        return;
+    }
+    if (connection.h2 != nullptr) {
+        connection.req_body_override = {body, len};
+        connection.req_body_overridden = true;
+        return;
+    }
+    if (!apply_request_body_override(connection, {body, len}))
+        connection.req_body_override_failed = true;
+}
+
+void rut_helper_req_set_owned_body(void* conn, const char* body, u32 len) {
+    if (conn == nullptr) return;
+    auto& connection = *static_cast<ConnectionBase*>(conn);
+    if (len > kMaxForwardBodyOverride || connection.req_body_overridden ||
+        connection.req_body_override_failed) {
+        connection.req_body_override_failed = true;
+        return;
+    }
+    auto& arena = connection.json_arena;
+    if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+        arena.space_used() > 262144 - len) {
+        connection.req_body_override_failed = true;
+        return;
+    }
+    auto* copy = len ? static_cast<char*>(arena.alloc(len)) : nullptr;
+    if (len && copy == nullptr) {
+        connection.req_body_override_failed = true;
+        return;
+    }
+    if (len) __builtin_memcpy(copy, body, len);
+    if (connection.h2 != nullptr) {
+        connection.req_body_override = {copy, len};
+        connection.req_body_overridden = true;
+        return;
+    }
+    if (!apply_request_body_override(connection, {copy, len}))
+        connection.req_body_override_failed = true;
 }
 
 // forward(set_path:) — record the path override on the connection. The proxy

@@ -2323,7 +2323,8 @@ struct Parser {
                         if (stmt.has_forward_request_policy)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
-                        if (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+                        if (stmt.has_forward_set_path || stmt.has_forward_set_body ||
+                            stmt.forward_set_headers.len != 0)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
                         auto lbrace = expect(TokenType::LBrace);
@@ -2891,7 +2892,8 @@ struct Parser {
                         if (stmt.has_forward_target_transform)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
-                        if (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+                        if (stmt.has_forward_set_path || stmt.has_forward_set_body ||
+                            stmt.forward_set_headers.len != 0)
                             return frontend_error(
                                 FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
                         auto lbrace = expect(TokenType::LBrace);
@@ -2973,6 +2975,23 @@ struct Parser {
                             stmt.forward_set_path_expr = owned.value();
                         }
                         stmt.has_forward_set_path = true;
+                    } else if (kw_text.eq({"set_body", 8})) {
+                        if (stmt.has_forward_set_body)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        if (stmt.has_forward_target_transform)
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
+                        auto value = parse_expr();
+                        if (!value) return core::make_unexpected(value.error());
+                        if (value->kind == AstExprKind::StrLit) {
+                            stmt.forward_set_body = value->str_value;
+                        } else {
+                            auto owned = alloc_expr(value.value());
+                            if (!owned) return core::make_unexpected(owned.error());
+                            stmt.forward_set_body_expr = owned.value();
+                        }
+                        stmt.has_forward_set_body = true;
                     } else if (kw_text.eq({"set_header", 10})) {
                         // set_header: { "Name": "Value", ... } — request-header
                         // overrides applied to the outbound proxied request. Same
@@ -3034,7 +3053,8 @@ struct Parser {
                             FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                     }
                     if ((stmt.has_forward_request_policy || stmt.has_forward_target_transform) &&
-                        (stmt.has_forward_set_path || stmt.forward_set_headers.len != 0))
+                        (stmt.has_forward_set_path || stmt.has_forward_set_body ||
+                         stmt.forward_set_headers.len != 0))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(*kw.value()), kw_text);
                 }

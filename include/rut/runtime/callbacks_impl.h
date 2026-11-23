@@ -3164,6 +3164,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_attempts = 0;
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.req_body_overridden = false;
+    conn.req_body_override_failed = false;
+    conn.req_body_override = {nullptr, 0};
     conn.target_transform_id = 0;
     conn.target_transform_recorded = false;
     conn.req_header_owned_bytes = 0;
@@ -7036,6 +7039,7 @@ inline bool request_header_override_line_length(u32 name_len, u32 value_len, u32
 }
 
 inline bool apply_request_header_overrides(Connection& conn) {
+    if (conn.req_body_override_failed) return false;
     if (conn.req_header_override_count == 0 && !conn.req_header_override_overflow) return true;
     // More overrides were requested than the table holds (direct-RIR only): a
     // dropped override must not be forwarded as a silent no-op — fail closed.
@@ -7288,8 +7292,8 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
         return false;
     conn.reanchor_response_mutations(old_base, conn.req_initial_send_len, conn.send_buf.data());
     conn.response_mutations_snapshotted = true;
-    conn.retry_req_snapshot_replayable =
-        !conn.req_path_overridden && conn.req_header_override_count == 0;
+    conn.retry_req_snapshot_replayable = !conn.req_path_overridden && !conn.req_body_overridden &&
+                                         conn.req_header_override_count == 0;
     return true;
 }
 
@@ -7302,7 +7306,7 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
 inline bool materialize_general_target_transform(Connection& conn,
                                                  const ForwardTargetTransformSpec& spec) {
     if (!forward_target_transform_spec_valid(spec) || conn.req_path_overridden ||
-        conn.req_malformed || conn.req_header_override_overflow ||
+        conn.req_body_overridden || conn.req_malformed || conn.req_header_override_overflow ||
         conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
         return false;

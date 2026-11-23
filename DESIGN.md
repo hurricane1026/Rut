@@ -554,6 +554,16 @@ only bounded (8192-byte) valid origin-form targets, preserves percent spelling
 and explicit query bytes, and fails closed on invalid input or ownership failure.
 This does not implicitly normalize routing paths or change route selection.
 
+Runtime `forward(..., set_body: expression)` accepts the same unwrapped-string
+surface and replaces one fully buffered HTTP/1 Content-Length body before
+upstream connection. The bounded helper rewrites the single Content-Length field
+and body bytes in place, copies dynamic values into the request Arena, and
+rejects chunked/partial/ambiguous framing or more than 65536 replacement bytes.
+HTTP/2 routes apply the replacement while synthesizing the H1 upstream request
+and fail closed before upstream effects; the original request and access-log
+snapshot remain intact. It does not add general body streaming or form parsing
+semantics.
+
 Explicit `target_transform.mode` selects `.rawPrefix` byte replacement or
 `.normalizedPrefix` URI-normalized replacement; the default `.cleanPrefix`
 keeps its frozen admission contract. General modes compose with request body
@@ -10399,6 +10409,10 @@ without renewing age. Missing ETag on accepted 200 clears prior state.
 Optional Boolean `conditionalDiscovery` lets a separate same-initial-address
 strong ETag revalidate previously accepted discovery metadata before
 `maxAgeSeconds`. The discovery path and TLS identity remain configuration-owned.
+Optional `discoveryAddress`/`discoveryPort`/`discoveryServerName`/`discoveryCa`
+move the discovery GET to a separately trusted fixed TLS origin; it does not use
+the JWKS DNS resolver or allowlist, and the metadata's `jwks_uri` must still
+match the main configured endpoint.
 A successful discovery 200 or matching 304 may commit its own validator before
 keys are fetched, and cannot renew key age. Optional `discoveryCacheSeconds`
 skips discovery while the last proven metadata is fresh for the same initial
@@ -11429,8 +11443,11 @@ fixed-endpoint HTTPS form POST from sanitized fields and authenticated identity.
 The query forwarding example joins the original path-only view to the remaining
 query fields and uses the existing owned `set_path` effect. It records request
 lengths through the source `downstreamRequestBytes` log profile. Deployments
-using legacy access logs can opt into `--access-log-path-only`. Form-body
-rewriting remains separate. See
+using legacy access logs can opt into `--access-log-path-only`. The form
+forwarding example passes the sanitized remaining fields to the owned
+`forward(..., set_body: body)` effect; the runtime replaces the Content-Length
+field and body bytes on H1/H2, or fails closed before forwarding when the
+request is not one complete, non-chunked Content-Length body. See
 [the contract](docs/consumer-registry.md#explicit-query-and-form-credentials).
 
 `JwksFetch` publishes initialized state only after both HTTPS contexts initialize.

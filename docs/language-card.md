@@ -979,6 +979,28 @@ connection; no URI normalization is implicit. Queries are part of the supplied
 target, not automatically appended. Existing explicit request-policy combination
 restrictions still apply. See [the capability ledger](kong-routing-capability-gaps.md).
 
+### Runtime request-body replacement
+
+`forward(upstream, load_balance: .roundRobin, set_body: body)` accepts an
+unwrapped `str` expression, including the sanitized `remaining` value returned by
+`consumerAuthenticateForm`. Literal bodies are accepted; runtime values are
+copied into the request Arena before forwarding. The runtime rewrites the single
+`Content-Length` field and replaces the exact body bytes in place, preserving
+the request target, method and all other headers.
+
+The bounded profile requires a complete, fully buffered Content-Length request
+with no `Transfer-Encoding`; chunked, partial, duplicate/ambiguous framing and
+replacement bodies above 65536 bytes fail closed before the upstream request is
+sent. A
+missing `Content-Length`, an empty body and an empty replacement body are
+distinct: the first two are not overridden, while an empty replacement sends
+`Content-Length: 0`. HTTP/1 and HTTP/2 downstream requests are supported; the
+HTTP/2 bridge applies the replacement while constructing the H1 upstream
+request, within its existing 16 KiB synth budget. This is an explicit request mutation, not general body streaming,
+multipart processing or form parsing. `set_body` may be combined with
+`set_path`/`set_header`; `target_transform` and `request_policy` combinations
+remain rejected. See [the query/form contract](consumer-registry.md#explicit-query-and-form-credentials).
+
 ### Explicit prefix rewrite modes
 
 `target_transform` additionally accepts `mode: .rawPrefix` or
@@ -2960,7 +2982,13 @@ configuration validation. Optional `requireNonEmptyKeys` rejects refreshes
 with no approved keys and keeps the last snapshot only within its original maximum
 age; its default is false. Optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
-validation. In DNS mode `dnsCacheSeconds` (1–3600) enables per-shard reuse up
+validation. Optional `discoveryAddress`, `discoveryPort`, `discoveryServerName`
+and `discoveryCa` move discovery to a separately trusted fixed TLS origin. The
+address is a bare IP literal, the port defaults to 443, and
+`discoveryAddress`/`discoveryServerName`/`discoveryCa` must appear together.
+That origin does not use the JWKS DNS resolver or allowlist and never follows a
+redirect; `jwks_uri` must still match the main configured endpoint. In DNS mode
+`dnsCacheSeconds` (1–3600) enables per-shard reuse up
 to the earlier of the configured cap and the shortest validated record TTL.
 Neither profile accepts request-selected destinations. See
 [JWKS DNS/discovery](jwks-discovery.md) for schema, ownership and failure limits.
@@ -4130,8 +4158,9 @@ and [authorization coverage](auth-coverage.md#bounded-consumer-rbac).
 
 The ordinary Rut Redis module exposes `redisReplayClaim` for atomic authenticated
 `SET NX EX 601` claims, with terminal status after RESET/release. `replay.key` and
-`replay.requireClaimed` compose it after Standard Webhooks or fixed signed-request
-verification. Claims use stable signer/profile namespaces and SHA-256 identities;
+`replay.requireClaimed` compose it after Standard Webhooks, fixed signed-request
+or GitHub body verification. Claims use stable signer/profile namespaces and
+SHA-256 identities;
 no gateway Cache or GET-before-SET fallback is used. See [replay claims](auth-replay.md)
 for the freshness/retention assumption, failure uncertainty, persistence ownership
 and distinction from exactly-once business delivery. These are Rut functions,
@@ -4161,8 +4190,9 @@ singleton expected Content-Type. They do not mutate the original request or add
 implicit fallback. A query route can pass the verified identity and
 `req.pathOnly` to `consumer_query.forwardingTarget` from
 `examples/middleware/consumer_query.rut` and supply the result to
-`forward(..., set_path: target)`. A form route can send the remaining fields in
-an explicitly rebuilt request. See
+`forward(..., set_path: target)`. A form route can pass the remaining fields to
+`forward(..., set_body: body)`, which replaces the forwarded Content-Length body
+without rebuilding the request. See
 [the source/redaction contract](consumer-registry.md#explicit-query-and-form-credentials).
 
 ### Keycloak access-token role helpers

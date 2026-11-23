@@ -807,6 +807,15 @@ struct Builder {
         return {};
     }
 
+    VoidResult emit_req_set_body(ValueId body, SourceLoc loc = {}, bool owned = false) {
+        if (!val_has_type(body, TypeKind::Str)) return err(RirError::InvalidState);
+        auto r = TRY(emit(Opcode::ReqSetBody, nullptr, loc));
+        r.inst->imm.i32_val = owned ? 1 : 0;
+        r.inst->operands[0] = body;
+        r.inst->operand_count = 1;
+        return {};
+    }
+
     VoidResult emit_req_set_target_transform(u32 transform_id, SourceLoc loc = {}) {
         if (transform_id == 0 || transform_id > kMaxForwardTargetTransforms)
             return err(RirError::InvalidState);

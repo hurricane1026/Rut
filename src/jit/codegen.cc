@@ -378,6 +378,20 @@ struct Ctx {
         return helper;
     }
 
+    // void rut_helper_req_set_body(ptr conn, ptr body, i32 len)
+    LLVMValueRef fn_req_set_body = nullptr;
+    LLVMValueRef fn_req_set_owned_body = nullptr;
+    LLVMValueRef get_req_set_body(bool owned = false) {
+        auto& helper = owned ? fn_req_set_owned_body : fn_req_set_body;
+        if (!helper) {
+            LLVMTypeRef params[] = {ptr_ty, ptr_ty, i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(void_ty, params, 3, 0);
+            helper = LLVMAddFunction(
+                llvm_mod, owned ? "rut_helper_req_set_owned_body" : "rut_helper_req_set_body", ft);
+        }
+        return helper;
+    }
+
     LLVMValueRef fn_req_set_hash = nullptr;
     LLVMValueRef get_req_set_hash() {
         if (!fn_req_set_hash) {
@@ -1488,6 +1502,22 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder,
                            LLVMGlobalGetValueType(c.get_req_set_path(inst.imm.i32_val != 0)),
                            c.get_req_set_path(inst.imm.i32_val != 0),
+                           args,
+                           3,
+                           "");
+            break;
+        }
+        case rir::Opcode::ReqSetBody: {
+            // Replace the fully buffered Content-Length request body in place.
+            // The helper copies owned values and fails closed for unsupported
+            // framing; forwarding checks the recorded failure.
+            LLVMValueRef body = c.get_value(inst.operands[0]);
+            LLVMValueRef p = LLVMBuildExtractValue(c.builder, body, 0, "setbody.ptr");
+            LLVMValueRef l = LLVMBuildExtractValue(c.builder, body, 1, "setbody.len");
+            LLVMValueRef args[] = {c.param_conn, p, l};
+            LLVMBuildCall2(c.builder,
+                           LLVMGlobalGetValueType(c.get_req_set_body(inst.imm.i32_val != 0)),
+                           c.get_req_set_body(inst.imm.i32_val != 0),
                            args,
                            3,
                            "");

@@ -701,7 +701,9 @@ canonical spelling for common gateway tasks.
 - [x] 静态 RS256 策略支持 `revokedJtis` 和 `issuedAfter`；验证通过后才发布 claims。
 - [x] 固定 IPv4、TLS 主机名与 CA 的有界远程 JWKS 获取、shard 独立缓存/刷新、
   最大年龄拒绝和取消回收；只导入预先批准 kid，不按 Token 触发请求。
-- [ ] JWKS DNS/discovery、自动新 kid 准入、其他传输与缓存 profile 仍需验收。
+- [x] JWKS A/AAAA DNS（含 CNAME、TTL 缓存、地址 allowlist）、精确 issuer/
+  JWKS-URI discovery、条件请求与退避，以及独立固定 discovery origin。
+- [ ] 自动新 kid 准入、其他 DNS 传输与缓存 profile 仍需验收。
 
 - [x] 通用 MD5、SHA-1/224/256/384/512 及对应 HMAC：固定函数名选择算法，
   返回 `str?` 小写 hex；输入有界、request arena 拥有结果；JWT/Webhook 共用底座。
@@ -710,7 +712,9 @@ canonical spelling for common gateway tasks.
 
 执行范围与逐项验收见 [auth 覆盖清单](docs/auth-coverage.md)。本分支延续 #901：
 - [x] 固定 HMAC-SHA256 原语、Rut 身份映射与双密钥轮换、GitHub 原始 body 验签。
-- [ ] Kong/APISIX HTTP HMAC 签名完整 profile、Standard Webhooks 及持久重放防护。
+- [x] APISIX 风格 fixed HMAC profile、Standard Webhooks，以及 Redis/AOF 持久重放
+  和 GitHub 已签名 body digest 去重。
+- [ ] Kong/APISIX 完整插件 profile、动态签名密钥 registry 与跨节点持久化。
 
 
 - [ ] 先以 Rut 模块交付 API Key、Basic、HMAC、JWT/JWE、ACL、外部授权、Webhook 校验。
@@ -883,12 +887,14 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 
 - [x] Bounded Consumer/credential/group registry snapshots and identity-only
   projection, strict compile-time validation and old/new native-program isolation.
-- [x] Atomic authenticated Redis replay claims for Standard Webhooks and the fixed
-  signed-request profile; no allow on uncertain write or cleanup failure.
+- [x] Atomic authenticated Redis replay claims for Standard Webhooks, the fixed
+  signed-request profile and GitHub signed-body digests; no allow on uncertain
+  write or cleanup failure.
 - [x] Opt-in local AOF-confirmed replay claims with a bounded same-connection
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL recovery tests.
-- [x] Bounded A-only DNS and issuer/JWKS-URI metadata validation for RS256/ES256
-  refresh, with configured IP allowlists and existing monotonic cache expiry.
+- [x] Bounded A/AAAA DNS, CNAME, issuer/JWKS-URI discovery, optional separately
+  trusted fixed discovery origin and configured IP allowlists for RS256/ES256
+  refresh, with existing monotonic cache expiry.
 - [x] Explicit bounded query/form Consumer raw-key authentication with decoded
   duplicate rejection and sanitized fields for rebuilt HTTPS requests.
 - [x] Offline Consumer administration with full-record upserts, removal, disabled
@@ -896,10 +902,12 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   validated atomic no-replace private snapshots (`rut-consumers`).
 - [x] Opt-in Consumer query credential hiding for proxy routes using verified
   remaining fields and the owned forwarding target effect.
+- [x] Explicit bounded form-body replacement for proxy routes using the verified
+  `remaining` fields and `forward(..., set_body: body)` on H1/H2.
 - [x] Opt-in legacy access logging without query fields, including denied
   requests and admitted HTTP/2 gRPC targets.
 - [ ] Remaining #1072 interfaces include online administrative management and
-  transparent form-body mutation.
+  online scheduling/revocation publication.
 - [ ] Replicated persistence/failover verification for the replay authority beyond
   the tested single-instance intact-AOF recovery profile;
   broad DNS profiles/automatic kid onboarding remain separately scoped.

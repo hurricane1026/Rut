@@ -337,6 +337,12 @@ struct MirTerminator {
     bool has_forward_path() const {
         return forward_set_path.ptr != nullptr || forward_path_value != nullptr;
     }
+    // Request-body replacement for forward(set_body:).
+    Str forward_set_body{};
+    MirValue* forward_body_value = nullptr;
+    bool has_forward_body() const {
+        return forward_set_body.ptr != nullptr || forward_body_value != nullptr;
+    }
     // Request-header overrides for forward(set_header:) — carried verbatim from
     // HIR. len > 0 → lower_rir emits one ReqSetHeader per entry before RetForward.
     FixedVec<MirHeaderKV, kMaxHeaders> forward_set_headers;
@@ -549,6 +555,7 @@ private:
         for (u32 i = 0; i < locals.len; i++) rebase_value(locals[i].init, other);
         for (u32 i = 0; i < blocks.len; i++) {
             rebase_value_ptr(other, blocks[i].term.forward_path_value);
+            rebase_value_ptr(other, blocks[i].term.forward_body_value);
             rebase_value_ptr(other, blocks[i].term.forward_hash_value);
             rebase_value(blocks[i].term.cond, other);
             rebase_value(blocks[i].term.lhs, other);

@@ -470,6 +470,12 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // forward(set_body:) applies eagerly while the handler runs. A failed
+    // override poisons forwarding instead of silently sending the original
+    // credential-bearing body.
+    bool req_body_overridden;
+    bool req_body_override_failed;
+    Str req_body_override;
     // Foundation-only target-transform effect. The recorded flag distinguishes
     // no effect from a forged zero/sentinel ID; every recorded effect is rejected
     // before upstream selection until target materialization exists.
@@ -2188,6 +2194,9 @@ struct ConnectionBase {
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        req_body_overridden = false;
+        req_body_override_failed = false;
+        req_body_override = {nullptr, 0};
         target_transform_id = 0;
         target_transform_recorded = false;
         req_header_override_count = 0;

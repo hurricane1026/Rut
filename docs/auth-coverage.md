@@ -14,12 +14,12 @@ whether a competing open-source edition includes them.
 
 | Capability | Current evidence | Remaining acceptance scope |
 | --- | --- | --- |
-| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion, separate key/verifier provisioning and constrained rotation preserving owner/groups/windows in validated private outputs, an opt-in sanitized forwarding target for query credentials, and opt-in legacy access logs without queries | Online administrative registry APIs, online scheduling/revocation and transparent form-body mutation; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
+| API Key / Basic / mTLS Consumer | Bounded 32-Consumer/64-credential snapshots with stable IDs, enable/disable, rotation, Consumer groups and optional per-credential least-privilege group subsets; identity-only projection and optional strict Unix-second credential windows; exact inclusive activation/exclusive expiry across Bearer/Basic/header/query/form and verified mTLS; raw or SHA-256 bearer/header key verifier profiles with ambiguity rejection; offline `rut-consumers` snapshot administration, OS-CSPRNG key generation, all-or-nothing verifier conversion, separate key/verifier provisioning and constrained rotation preserving owner/groups/windows in validated private outputs, an opt-in sanitized forwarding target for query credentials, an explicit bounded `set_body` replacement for form credentials, and opt-in legacy access logs without queries | Online administrative registry APIs, online scheduling/revocation; the two-file key/snapshot publication is not atomic, SHA-256 verifiers do not protect low-entropy keys from offline guessing, and host wall-clock rollback can change window decisions |
 | Password storage | Native C++ fixed-cost PBKDF2-HMAC-SHA256 record hashing and verification; OS-generated or caller-provided 16-byte salt, an offline hash/verify provisioning CLI with private no-replace files, bounded password bytes, strict canonical records, constant-time derived-key comparison and an eight-slot off-shard verification worker with deadline/completion-FD adapters, HTTP/1 + HTTP/2 timer bridges, a bounded Rut/JIT/native-artifact header prefix and automatic shard lifecycle | User registry, password lifecycle and durable sessions |
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, bounded A/AAAA DNS with CNAME support and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, other DNS transports, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus GitHub signed-body digest claims, opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny; optional exact static Consumer-ID-to-route-tenant binding before RBAC | Larger policy sets, intrinsic tenant claims/ownership and storage isolation, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
@@ -97,19 +97,21 @@ The 2026-10-27 audit separates these layers:
   The remote access-token integration composes that cache with strict `at+jwt` claims,
   client and scope
   checks. Live and durable token revocation remain outstanding.
-- Anonymous access needs a presence distinction: singleton Authorization reads
-  return nil for both absence and duplicates. Falling back on nil would turn
-  malformed duplicate credentials into anonymous access. No anonymous helper is
-  advertised until absence can be distinguished safely.
+- Anonymous access uses `req.headerCount("Authorization")` to distinguish
+  absence (0) from a singleton empty field (1) and duplicates (2+, or -1 for
+  parse failure). `auth.apiKeyOrAnonymous` returns the explicit guest identity
+  only for proven absence; malformed, duplicate or invalid credentials never
+  downgrade to anonymous.
 - External authorization now has bounded response-consuming `httpCall` with
   cancellation/close tests, and an OPA Data API authorization library. OAuth2
   introspection now has its own authenticated request and metadata-policy
   helpers; cached authorization/refresh remains outside that per-request profile.
 
-The Standard Webhooks identity middleware is integrated here; its freshness
-checks do not implement persistent replay protection. The bounded Consumer
-policy work from #924, required credentials from #925, and header-count
-primitive from #926 are already present in this main base.
+The Standard Webhooks identity middleware is integrated here. Persistent replay
+claims now exist separately for Standard Webhooks, fixed signed requests and
+GitHub signed-body digests; freshness checks alone still do not prove replay
+protection. The bounded Consumer policy work from #924, required credentials
+from #925, and header-count primitive from #926 are also present.
 
 ### Signed-request HMAC-SHA256 subprofile
 
@@ -1678,11 +1680,12 @@ JIT tests also cover the 1024/1025-byte bound. See
   preserves expired windows, and uses private key-first/snapshot-second publication.
   Diff validates both private inputs before output, omits key fields and reports
   only metadata plus key-material/representation booleans. It creates no files.
-  Neither command publishes configuration. Online management APIs and
-  transparent form-body mutation remain open under #1072.
+  Neither command publishes configuration. Online management APIs remain open
+  under #1072.
 - [Replay claims](auth-replay.md): authenticated Redis NX arbitration after signed
-  Standard Webhooks/fixed HMAC requests, cleanup-before-allow, two-shard concurrency
-  and gateway-restart retention. The opt-in local-AOF profile adds a confirmed
+  Standard Webhooks, fixed HMAC requests and GitHub body digests,
+  cleanup-before-allow, two-shard concurrency and gateway-restart retention. The
+  opt-in local-AOF profile adds a confirmed
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL tests with verified TLS on
   both backends. Eviction policy, volume integrity and replicated failover remain
   deployment responsibilities (#1076).
@@ -1693,9 +1696,10 @@ JIT tests also cover the 1024/1025-byte bound. See
   resolution with CNAME support, an opt-in dual-stack policy that validates both
   families and prefers IPv6, a finite address allowlist, sequential failover
   after definitive TCP connect
-  failures, exact issuer and pre-authorized URI, opt-in TTL-bounded DNS reuse,
-  capped exponential retries and bounded authenticated Retry-After hints.
-  Both asymmetric algorithms and both Linux backends are covered (#1077).
+  failures, exact issuer and pre-authorized URI, optional separately trusted
+  fixed discovery origin, opt-in TTL-bounded DNS reuse, capped exponential
+  retries and bounded authenticated Retry-After hints. Both asymmetric
+  algorithms and both Linux backends are covered (#1077).
 
 These profiles are proposed free foundations. Their security fixes and necessary
 failure protection do not depend on a commercial tier. Enterprise governance,
@@ -1707,11 +1711,13 @@ compile-time registry/name proof and whole-list duplicate/encoding validation.
 The returned `remaining` content removes the selected credential. The executable
 fixed-HTTPS form adapter rebuilds an outbound request. The query forwarding
 example passes an explicitly sanitized target to the existing owned forward
-effect. Both examples verify upstream redaction on native H1/H2 and both Linux
-backends. The original request remains available to the handler. The
+effect. [consumer-form-forward-auth.rut](../examples/consumer-form-forward-auth.rut)
+passes the sanitized form fields to `forward(..., set_body: body)`; the bounded
+runtime replaces the Content-Length field and body bytes on H1/H2 or fails closed
+before forwarding. Both examples verify upstream redaction on native H1/H2 and
+both Linux backends. The original request remains available to the handler. The
 `--access-log-path-only` legacy CLI option omits queries before target capture
 on strict H1 and admitted H2 gRPC, including denied strict H1 requests.
-Transparent form-body mutation remains outside this profile.
 See [the precise input/redaction bounds](consumer-registry.md#explicit-query-and-form-credentials).
 `consumerAuthenticateMtls(configuration)` maps the existing verified TLS peer
 fingerprint to a Consumer record in the bounded registry. `mtls` records require

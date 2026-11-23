@@ -1,0 +1,28 @@
+import "clients/redis-client.rut"
+import "middleware/auth.rut"
+import "middleware/replay.rut"
+
+listen :8080
+
+// GitHub signs the body only. X-GitHub-Delivery is not covered by that signature,
+// so it must not be used as the replay identity: a captured request could keep a
+// valid signature while changing the delivery header. Claim the exact signed body
+// digest instead. Keep REPLAY_NAMESPACE stable across secret rotation.
+route POST "/webhooks/github" {
+    let delivery = req.uniqueHeader("X-GitHub-Delivery").or("")
+    let identity = auth.githubWebhook(req.body, req.uniqueHeader("X-Hub-Signature-256").or(""),
+                                      env("GITHUB_WEBHOOK_SECRET"), "github", "github-webhook-v1")
+    guard delivery != "" else { return 400 }
+    guard let digest = sha256(req.body) else { return 503 }
+    guard let key = replay.key(env("REPLAY_NAMESPACE"), digest) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisReplayClaim(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let admitted = replay.requireClaimed(status)
+    // Only this branch may perform side effects. A captured signature cannot
+    // re-admit the same body under a different delivery ID. Identical legitimate
+    // bodies with distinct delivery IDs are also treated as one signed message.
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+route "/" { return 404 }

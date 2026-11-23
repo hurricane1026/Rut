@@ -247,6 +247,7 @@ enum class Opcode : u8 {
     RespCommitHeaders,      // publish pending Response-builder mutations
     ReqSetHash,             // req.set_hash %key, %constant_seed
     ReqSetPath,             // req.set_path %path
+    ReqSetBody,             // req.set_body %body
     ReqSetTargetTransform,  // req.set_target_transform <1-based transform id>
     CtxStoreSlotI32,        // if i < ctx.slot_count: ctx.slot[i] = %val
                             // Stored as a zero-extended i64 slot. If no slot
