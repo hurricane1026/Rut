@@ -4430,8 +4430,9 @@ inline bool build_h1_forward_response_headers(Connection& conn,
         !write(data, static_cast<u32>(static_cast<i64>(line_end) + 2)))
         return false;
     line_start = static_cast<u32>(static_cast<i64>(line_end) + 2);
-    while (line_start + 1 < header_len &&
-           (data[line_start] != '\r' || data[line_start + 1] != '\n')) {
+    while (static_cast<i64>(line_start) + 1 < header_len &&
+           (data[line_start] != '\r' ||
+            data[static_cast<u32>(static_cast<i64>(line_start) + 1)] != '\n')) {
         line_end = line_start;
         while (static_cast<i64>(line_end) + 1 < header_len &&
                (data[line_end] != '\r' ||
