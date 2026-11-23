@@ -170,10 +170,12 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
         else
             cancel(connection, slot.generation);
     }
+    u64 elapsed = 0;
     if (found) {
-        if (now < found->started_ms ||
-            static_cast<i64>(now) - static_cast<i64>(found->started_ms) >=
-                static_cast<i64>(found->timeout_ms)) {
+        const bool elapsed_invalid = now < found->started_ms ||
+                                     __builtin_sub_overflow(now, found->started_ms, &elapsed) ||
+                                     elapsed >= static_cast<u64>(found->timeout_ms);
+        if (elapsed_invalid) {
             cancel(connection, generation);
             ForwardAuthReply reply;
             reply.status = -2;
@@ -234,9 +236,9 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     if (!found) return {};
     ForwardAuthReply reply;
     reply.status = static_cast<i32>(0x80000000u);
-    const i64 kRemaining = static_cast<i64>(found->timeout_ms) -
-                           (static_cast<i64>(now) - static_cast<i64>(found->started_ms));
-    reply.retry_ms = static_cast<u32>(kRemaining < 10 ? kRemaining : 10);
+    u64 remaining = 0;
+    (void)__builtin_sub_overflow(static_cast<u64>(found->timeout_ms), elapsed, &remaining);
+    reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
     return reply;
 }
 void* ForwardAuthWorker::entry(void* self) {
