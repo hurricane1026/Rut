@@ -493,6 +493,19 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_str_split(ValueId text, ValueId separator, SourceLoc loc = {}) {
+        if (!val_has_type(text, TypeKind::Str) || !val_has_type(separator, TypeKind::Str))
+            return err(RirError::InvalidState);
+        auto* element = TRY(make_type(TypeKind::Str));
+        auto* array = TRY(make_type(TypeKind::Array, element));
+        auto* type = TRY(make_type(TypeKind::Optional, array));
+        auto [inst, value] = TRY(emit(Opcode::StrSplit, type, loc));
+        inst->operand_count = 2;
+        inst->operands[0] = text;
+        inst->operands[1] = separator;
+        return value;
+    }
+
     Result<ValueId> emit_req_query_all(Str name, SourceLoc loc = {}) {
         if (!http_query_name_valid(name)) return err(RirError::InvalidState);
         auto* element = TRY(make_type(TypeKind::Str));

@@ -141,6 +141,9 @@ without presenting lossy or per-shard state as exact shared state.
   empty-span boundaries. This is one M1 string primitive slice, not completion
   of the broader collections/state work.
 
+- [x] Bounded byte-string `split(text, separator)` / `text.split(separator)`
+  into request-owned `Collected<str>?`, with empty fields and explicit pipeline
+  support; limits: 8 KiB input, 256-byte separator, 64 fields, HTTP without wait.
 - [x] `req.queryAll("key")` returns at most 64 ordered raw query values through
   `Collected<str>?`. Missing keys produce empty collections; limits and request
   storage failures produce nil. Bind the read before guard/if-let narrowing.

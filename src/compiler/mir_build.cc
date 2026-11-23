@@ -777,6 +777,28 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.error_variant_index = expr.error_variant_index;
         return v;
     }
+    if (expr.kind == HirExprKind::StringSplit) {
+        if (!expr.lhs || !expr.rhs || expr.type != HirTypeKind::Collected || !expr.may_nil ||
+            expr.may_error || expr.lhs->type != HirTypeKind::Str || expr.lhs->may_nil ||
+            expr.lhs->may_error || expr.rhs->type != HirTypeKind::Str || expr.rhs->may_nil ||
+            expr.rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto text = mir_value(*expr.lhs, module, fn, ctx);
+        if (!text) return core::make_unexpected(text.error());
+        auto separator = mir_value(*expr.rhs, module, fn, ctx);
+        if (!separator) return core::make_unexpected(separator.error());
+        if (!fn->values.push(text.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.lhs = &fn->values[fn->values.len - 1];
+        if (!fn->values.push(separator.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        v.rhs = &fn->values[fn->values.len - 1];
+        v.kind = MirValueKind::StringSplit;
+        v.type = MirTypeKind::Collected;
+        v.may_nil = true;
+        v.shape_index = expr.shape_index;
+        return v;
+    }
     if (expr.kind == HirExprKind::ReqHeaderAll || expr.kind == HirExprKind::ReqQueryAll) {
         v.kind = expr.kind == HirExprKind::ReqQueryAll ? MirValueKind::ReqQueryAll
                                                        : MirValueKind::ReqHeaderAll;

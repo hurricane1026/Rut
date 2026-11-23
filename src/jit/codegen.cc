@@ -1369,6 +1369,31 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, v);
             break;
         }
+        case rir::Opcode::StrSplit: {
+            const auto kText = c.get_value(inst.operand(0));
+            const auto kSeparator = c.get_value(inst.operand(1));
+            LLVMTypeRef parameters[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            const auto kType = LLVMFunctionType(c.ptr_ty, parameters, 6, 0);
+            auto helper = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_str_split");
+            if (!helper) helper = LLVMAddFunction(c.llvm_mod, "rut_helper_str_split", kType);
+            LLVMValueRef arguments[] = {
+                c.param_conn,
+                c.param_arena,
+                LLVMBuildExtractValue(c.builder, kText, 0, "split.text"),
+                LLVMBuildExtractValue(c.builder, kText, 1, "split.length"),
+                LLVMBuildExtractValue(c.builder, kSeparator, 0, "split.separator"),
+                LLVMBuildExtractValue(c.builder, kSeparator, 1, "split.separator.length")};
+            const auto kPointer =
+                LLVMBuildCall2(c.builder, kType, helper, arguments, 6, "split.fields");
+            const auto kHas =
+                LLVMBuildICmp(c.builder, LLVMIntNE, kPointer, LLVMConstNull(c.ptr_ty), "split.has");
+            auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result = LLVMBuildInsertValue(
+                c.builder, result, LLVMBuildZExt(c.builder, kHas, c.i8_ty, ""), 0, "");
+            result = LLVMBuildInsertValue(c.builder, result, kPointer, 1, "");
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::ReqHeaderAll:
         case rir::Opcode::ReqQueryAll: {
             const char* name = inst.op == rir::Opcode::ReqQueryAll ? "rut_helper_req_query_all"

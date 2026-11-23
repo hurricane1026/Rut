@@ -2,6 +2,7 @@
 #include "fixtures/ip_parse.h"
 #include "fixtures/query_all.h"
 #include "fixtures/string_slice.h"
+#include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
 #include "fixtures/ws_bool_select.h"
 #include "fixtures/ws_borrowed_binary.h"
@@ -48923,7 +48924,6 @@ TEST(frontend, request_query_all_requires_binding_before_guard_or_if_narrowing) 
                                       "collections must be evaluated once")));
     }
 }
-
 TEST(frontend, string_slice_preserves_optional_text_through_helpers_and_user_methods) {
     const char* sources[] = {
         test::string_slice::kSource,
@@ -49000,5 +49000,96 @@ TEST(frontend, string_slice_rejects_optional_inputs_and_non_i32_bounds) {
         auto ast = parse_file_heap(tokens.value());
         REQUIRE(ast);
         CHECK_FALSE(analyze_file_heap(ast.value()));
+    }
+}
+TEST(frontend, string_split_lowers_owned_helper_results_and_free_pipeline_calls) {
+    const char* sources[] = {
+        test::string_split::kSource,
+        R"(route POST "/" { let pending = split(req.body, ",")
+            guard let parts = pending else { return 503 }
+            let second = req.body | split(_, "::")
+            if let more = second { return 204 } else { return 503 } })",
+        R"(func split(_ text: str, _ separator: str) -> str { text }
+            route POST "/" { let value = split(req.body, ",") return response(200, body: value) })",
+    };
+    for (u32 i = 0; i < 3; ++i) {
+        auto tokens = lex(lit(sources[i]));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK(rir::verify_module(rir.module).ok);
+        CHECK_EQ(function_has_op(rir.module.functions[0], rir::Opcode::StrSplit), i != 2);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, string_split_rejects_invalid_types_and_unsafe_allocation_contexts) {
+    const char* sources[] = {
+        R"(route POST "/" { let p = req.body.split() return 204 })",
+        R"(route POST "/" { let p = req.body.split(",", ":") return 204 })",
+        R"(route POST "/" { let p = req.body.split(1) return 204 })",
+        R"(route POST "/" { let p = split(1, ",") return 204 })",
+        R"(route POST "/" { let p = req.body | split("x", ",") return 204 })",
+        R"(route POST "/" { let p = split(req.body) return 204 })",
+        R"(route POST "/" { let p = split(req.body, ",", ":") return 204 })",
+        R"(route POST "/" { let p = split(req.header("X"), ",") return 204 })",
+        R"(route POST "/" { let p = req.header("X").split(",") return 204 })",
+        R"(route POST "/" { let p = req.body.split(",") let value = p.get(0) return 204 })",
+        R"(timer test, every: 1s { let p = "a,b".split(",") })",
+        R"(route POST "/" { let p = req.body.split(",") wait(1ms) return 204 })",
+        R"(route POST "/" { wait(1ms) let p = req.body.split(",") return 204 })",
+        R"(func parts(_ s: str) -> Collected<str> { s.split(",") }
+            route POST "/" { let p = parts(req.body) wait(1ms) return 204 })",
+#if RUT_ENABLE_WEBSOCKET
+        R"(upstream backend
+            route GET "/" { return websocket(backend) { msg in
+                let p = "a,b".split(",") msg.forward() } })",
+        R"(func parts(_ s: str) -> Collected<str> { s.split(",") }
+            upstream backend
+            route GET "/" { return websocket(backend) { msg in
+                let p = parts("a,b") msg.forward() } })",
+#endif
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "unexpectedly accepted: %s\n", source);
+        CHECK_FALSE(hir);
+    }
+}
+
+TEST(frontend, string_split_fresh_narrowing_requires_a_single_evaluation_binding) {
+    const char* bodies[] = {
+        R"(guard let p = req.body.split(",") else { return 503 } return 204)",
+        R"(guard let p = parts(req.body) else { return 503 } return 204)",
+        R"(if let p = split(req.body, ",") { return 204 } else { return 503 })",
+        R"(let pending = req.body.split(",")
+            guard let fallback = pending else { return 503 }
+            guard let p = req.body.split(":").or(fallback).get(0) else { return 404 }
+            return response(200, body: p))",
+    };
+    for (const char* body : bodies) {
+        const std::string source =
+            std::string(R"(func parts(_ s: str) -> Collected<str> { s.split(",") }
+                route POST "/" { )") +
+            body + " }";
+        auto tokens = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK(
+            hir.error().detail.eq(lit("bind split() to a let before guard let/if let; fresh "
+                                      "collections must be evaluated once")));
     }
 }

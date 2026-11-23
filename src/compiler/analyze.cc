@@ -184,6 +184,10 @@ constexpr Str kUuidWaitDetail = lit_str(
 constexpr Str kHeaderAllWaitDetail = lit_str("req.getAll() requires a route without explicit wait");
 constexpr Str kQueryAllWaitDetail =
     lit_str("req.queryAll() requires a route without explicit wait");
+constexpr Str kStringSplitWaitDetail =
+    lit_str("split() requires an HTTP route without explicit wait");
+constexpr Str kStringSplitBindDetail = lit_str(
+    "bind split() to a let before guard let/if let; fresh collections must be evaluated once");
 constexpr Str kQueryAllBindDetail = lit_str(
     "bind req.queryAll() to a let before guard let/if let; fresh collections must be evaluated "
     "once");
@@ -4687,6 +4691,55 @@ static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
         FrontendError::UnsupportedSyntax, expr.span, lit_str("unknown json operation"));
 }
 
+static FrontendResult<HirExpr> make_string_split(const HirExpr& text,
+                                                 const HirExpr& separator,
+                                                 Span span,
+                                                 HirRoute* route,
+                                                 const HirModule& mod) {
+    if (!route || route->is_timer || route->is_ws_callback || route->time_ops_blocked)
+        return frontend_error(FrontendError::UnsupportedSyntax, span, kStringSplitWaitDetail);
+    if (text.type != HirTypeKind::Str || text.may_nil || text.may_error ||
+        separator.type != HirTypeKind::Str || separator.may_nil || separator.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              span,
+                              lit_str("split expects two unwrapped str values"));
+    auto element = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                         HirTypeKind::Str,
+                                         0xffffffffu,
+                                         0xffffffffu,
+                                         0xffffffffu,
+                                         0,
+                                         nullptr,
+                                         nullptr,
+                                         nullptr,
+                                         span);
+    if (!element) return core::make_unexpected(element.error());
+    auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                       HirTypeKind::Collected,
+                                       0xffffffffu,
+                                       0xffffffffu,
+                                       0xffffffffu,
+                                       0,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       span,
+                                       element.value());
+    if (!shape) return core::make_unexpected(shape.error());
+    HirExpr result{};
+    result.kind = HirExprKind::StringSplit;
+    result.type = HirTypeKind::Collected;
+    result.shape_index = shape.value();
+    result.may_nil = true;
+    result.span = span;
+    if (!route->exprs.push(text)) return frontend_error(FrontendError::OutOfMemory, span);
+    result.lhs = &route->exprs[route->exprs.len - 1];
+    if (!route->exprs.push(separator)) return frontend_error(FrontendError::OutOfMemory, span);
+    result.rhs = &route->exprs[route->exprs.len - 1];
+    route->uses_http_values = true;
+    return result;
+}
+
 static FrontendResult<HirExpr> analyze_method_call_expr(
     const AstExpr& expr,
     HirRoute* route,
@@ -5443,6 +5496,16 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     }
     if (recv.may_nil || recv.may_error)
         return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+
+    if (recv.type == HirTypeKind::Str && expr.name.eq(lit_str("split"))) {
+        if (expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("str.split expects one unwrapped str separator"));
+        auto separator = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!separator) return core::make_unexpected(separator.error());
+        return make_string_split(recv, separator.value(), expr.span, route, mod);
+    }
 
     if (recv.type == HirTypeKind::Str &&
         (expr.name.eq(lit_str("trimPrefix")) || expr.name.eq(lit_str("trimSuffix")))) {
@@ -15130,6 +15193,20 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         return result;
     }
 
+    if (expr.name.eq(lit_str("split")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 2 || !expr.args[0] || !expr.args[1])
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("split expects two unwrapped str values"));
+        auto text = first_arg_override ? FrontendResult<HirExpr>(*first_arg_override)
+                                       : analyze_builtin_arg(*expr.args[0]);
+        if (!text) return core::make_unexpected(text.error());
+        auto separator = analyze_builtin_arg(*expr.args[1]);
+        if (!separator) return core::make_unexpected(separator.error());
+        return make_string_split(text.value(), separator.value(), expr.span, route, mod);
+    }
+
     if ((expr.name.eq(lit_str("parseInt")) || expr.name.eq(lit_str("parseInt64"))) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail = lit_str("parseInt/parseInt64 expects one unwrapped str or Bytes");
@@ -16748,6 +16825,24 @@ static FrontendResult<HirExpr> build_guard_cond_from_analyzed(const HirExpr& ana
     cond.type = HirTypeKind::Bool;
 
     if (binds_value) {
+        u32 split_visits = 0;
+        const auto kFreshSplit = [&](auto&& self, const HirExpr& value, u32 depth) -> bool {
+            if (++split_visits > 4096 || depth > 128) return true;
+            if (value.kind == HirExprKind::LocalRef || value.kind == HirExprKind::BoundValue)
+                return false;
+            if (value.kind == HirExprKind::StringSplit) return true;
+            if (value.lhs && self(self, *value.lhs, depth + 1)) return true;
+            if (value.rhs && self(self, *value.rhs, depth + 1)) return true;
+            for (u32 i = 0; i < value.args.len; ++i)
+                if (value.args[i] && self(self, *value.args[i], depth + 1)) return true;
+            for (u32 i = 0; i < value.field_inits.len; ++i)
+                if (value.field_inits[i].value &&
+                    self(self, *value.field_inits[i].value, depth + 1))
+                    return true;
+            return false;
+        };
+        if (kFreshSplit(kFreshSplit, analyzed, 0))
+            return frontend_error(FrontendError::UnsupportedSyntax, span, kStringSplitBindDetail);
         if (analyzed.type == HirTypeKind::Collected) {
             // Guard narrowing currently materializes a fresh initializer twice.
             // Existing lexical/route bindings already own their evaluated carrier.
@@ -21415,6 +21510,7 @@ static bool hir_expr_uses_request(const HirExpr& e) {
         case HirExprKind::Uuid:
         case HirExprKind::ReqHeaderAll:
         case HirExprKind::ReqQueryAll:
+        case HirExprKind::StringSplit:
         case HirExprKind::ReqHeaderCount:
         case HirExprKind::ReqUniqueHeader:
         case HirExprKind::ReqHeader:
@@ -26696,6 +26792,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
                 if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
+                if (e.kind == HirExprKind::StringSplit) return kStringSplitWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
@@ -27295,6 +27392,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             auto blocked_detail = [](const HirExpr& e) -> Str {
                 if (e.kind == HirExprKind::ReqHeaderAll) return kHeaderAllWaitDetail;
                 if (e.kind == HirExprKind::ReqQueryAll) return kQueryAllWaitDetail;
+                if (e.kind == HirExprKind::StringSplit) return kStringSplitWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;
                 return {};

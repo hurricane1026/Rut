@@ -38,6 +38,7 @@
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/signed_request.h"
+#include "rut/runtime/string_split.h"
 #include "rut/runtime/uuid.h"
 #include "rut/runtime/webhook.h"
 #include "rut/runtime/ws_frame.h"
@@ -1061,6 +1062,17 @@ void rut_helper_req_query(const u8* req_data,
             return;
         }
     }
+}
+
+void* rut_helper_str_split(void* conn,
+                           void* arena,
+                           const char* data,
+                           u32 length,
+                           const char* separator,
+                           u32 separator_length) {
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (!storage && conn) storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    return split_string(storage, {data, length}, {separator, separator_length});
 }
 
 void* rut_helper_req_query_all(

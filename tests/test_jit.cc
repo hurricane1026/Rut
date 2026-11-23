@@ -5,6 +5,7 @@
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
 #include "fixtures/string_slice.h"
+#include "fixtures/string_split.h"
 #include "fixtures/string_trim.h"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/common/types.h"
@@ -33519,7 +33520,6 @@ TEST(jit, request_query_all_executes_dynamic_matrix_at_both_optimization_levels)
         rir.destroy();
     }
 }
-
 TEST(jit, string_slice_returns_checked_borrowed_text_without_arena_storage) {
     for (u8 opt : {0u, 2u}) {
         auto tokens = lex(lit(test::string_slice::kSource));
@@ -33567,6 +33567,66 @@ TEST(jit, string_slice_returns_checked_borrowed_text_without_arena_storage) {
             }
             CHECK_EQ(connection->json_arena.space_used(), 0u);
         }
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+TEST(jit, string_split_executes_owned_dynamic_fields_at_both_optimization_levels) {
+    for (u8 opt : {0u, 2u}) {
+        auto tokens = lex(lit(test::string_split::kSource));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        engine.opt_level = static_cast<OptLevel>(opt);
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler);
+        SlicePool pool;
+        REQUIRE(pool.init(8));
+        SliceArena arena;
+        REQUIRE(arena.init(&pool));
+        for (const auto& item : test::string_split::kCases) {
+            arena.reset();
+            std::string request = "POST / HTTP/1.1\r\nHost: local\r\nX-Separator: ";
+            request.append(item.separator.ptr, item.separator.len);
+            request += "\r\nX-Count: " + std::to_string(item.count) + "\r\nX-First: ";
+            request.append(item.first.ptr, item.first.len);
+            request += "\r\nX-Last: ";
+            request.append(item.last.ptr, item.last.len);
+            request += "\r\nContent-Length: " + std::to_string(item.input.len) + "\r\n\r\n";
+            request.append(item.input.ptr, item.input.len);
+            const auto result =
+                HandlerResult::unpack(handler(nullptr,
+                                              nullptr,
+                                              reinterpret_cast<const u8*>(request.data()),
+                                              request.size(),
+                                              &arena));
+            CHECK_EQ(result.status_code, item.status);
+            if (item.status == 204) {
+                const u64 minimum = sizeof(CollectedValues) + item.count * sizeof(Str);
+                CHECK(arena.space_used() >= minimum);
+                CHECK(arena.space_used() <= minimum + item.input.len + 7u * item.count);
+            } else {
+                CHECK_EQ(arena.space_used(), 0u);
+            }
+        }
+        const auto request = lit("POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 3\r\n\r\na,b");
+        const auto failed = HandlerResult::unpack(handler(
+            nullptr, nullptr, reinterpret_cast<const u8*>(request.ptr), request.len, nullptr));
+        CHECK_EQ(failed.status_code, 503u);
+        arena.destroy();
+        CHECK_EQ(pool.in_use(), 0u);
+        pool.destroy();
         engine.shutdown();
         rir.destroy();
     }

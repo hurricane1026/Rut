@@ -4665,7 +4665,7 @@ s.trim()                          // string
 s.trimPrefix(prefix)              // string
 s.trimSuffix(suffix)              // string
 s.replace(old, new)               // string
-s.split(sep)                      // [string]
+s.split(sep)                      // Collected<str>? (bounded byte splitting)
 s.slice(start, end)               // str? — checked, borrowed half-open byte range
 s.matches(re"pattern")            // bool (Vectorscan)
 s.match(re"pattern")              // error-capable match object (capture groups)
@@ -4677,6 +4677,14 @@ s.match(re"pattern")              // error-capable match object (capture groups)
 // that input's lifetime. Indices count bytes, including NUL/non-UTF-8 octets;
 // Unicode character boundaries are not adjusted. No Swift range syntax is added.
 
+// split(text, sep) and text | split(_, sep) are equivalent builtin spellings.
+// split matches the complete separator left to right, without overlap, preserving
+// empty fields (including one field for empty input) and all input bytes.
+// Input <= 8192 bytes, separator 1..256 bytes, result <= 64 fields; invalid bounds
+// or request arena/pool exhaustion produce nil, never a truncated collection.
+// Bind to let before guard let/if let; after unwrap use count/get(index).
+// Fields own their bytes through request reset/retirement. HTTP routes/helpers
+// only for now: explicit wait, timers and WebSocket callbacks are unsupported.
 // --- Type Conversion / Parse ---
 42 as string                      // string (infallible conversion)
 IP.parse("10.0.0.1")              // typed parse
