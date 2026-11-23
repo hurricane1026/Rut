@@ -131,7 +131,6 @@ struct Arena {
             current->used = next_used;
             return p;
         }
-        if (size > static_cast<u64>(-1) - Block::kHeaderSize) return nullptr;
         u64 needed = 0;
         if (__builtin_add_overflow(Block::kHeaderSize, size, &needed)) return nullptr;
         Block* b = alloc_block(needed, current);
