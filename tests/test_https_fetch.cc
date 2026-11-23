@@ -837,6 +837,32 @@ TEST(https_fetch, forward_auth_worker_bounds_deadline_cancellation_and_generatio
     worker.stop();
 }
 
+TEST(https_fetch, forward_auth_worker_crosses_signed_time_range_without_overflow) {
+    TlsOrigin origin;
+    origin.count = 0;
+    REQUIRE(origin.init());
+    ForwardAuthPolicy policy;
+    policy.endpoint = origin.endpoint();
+    __builtin_memcpy(policy.identity_header, "X-Consumer-ID", 14);
+    ForwardAuthWorker worker;
+    REQUIRE(worker.start().has_value());
+    constexpr u64 kStart = static_cast<u64>(INT64_MAX);
+    const auto initial = worker.authorize(1,
+                                          6,
+                                          lit_str("Authorization"),
+                                          policy,
+                                          lit_str("Bearer fixture"),
+                                          lit_str("GET"),
+                                          lit_str("/"),
+                                          kStart,
+                                          1);
+    CHECK_EQ(initial.status, static_cast<i32>(0x80000000u));
+    CHECK_EQ(initial.retry_ms, 1u);
+    const auto expired = worker.authorize(1, 6, {}, policy, {}, {}, {}, kStart + 1, 1);
+    CHECK_EQ(expired.status, -2);
+    worker.stop();
+}
+
 TEST(https_fetch, callout_request_rejects_transport_injection_and_preserves_body) {
     HttpsEndpoint endpoint;
     REQUIRE(http_call_policy(
