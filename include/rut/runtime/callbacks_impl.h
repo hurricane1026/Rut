@@ -4292,6 +4292,7 @@ inline bool build_h1_forward_response_headers(Connection& conn,
                (data[line_start] != '\r' ||
                 data[static_cast<u32>(static_cast<i64>(line_start) + 1)] != '\n'))
             line_start = static_cast<u32>(static_cast<i64>(line_start) + 1);
+        if (static_cast<i64>(line_start) + 1 >= header_len) return false;
         line_start = static_cast<u32>(static_cast<i64>(line_start) + 2);
         while (static_cast<i64>(line_start) + 1 < header_len &&
                (data[line_start] != '\r' ||
