@@ -39,8 +39,9 @@ i32 capture_write_entry(i32 fd, const CaptureEntry& entry) {
             return -1;
         }
         if (kBytesWritten == 0) return -1;
+        if (static_cast<u64>(kBytesWritten) > remaining) return -1;
         p += kBytesWritten;
-        remaining -= static_cast<u32>(kBytesWritten);
+        remaining = static_cast<u32>(static_cast<i64>(remaining) - kBytesWritten);
     }
     return 0;
 }
@@ -55,8 +56,9 @@ i32 capture_read_entry(i32 fd, CaptureEntry& entry) {
             return -1;
         }
         if (kBytesRead == 0) return -1;
+        if (static_cast<u64>(kBytesRead) > remaining) return -1;
         p += kBytesRead;
-        remaining -= static_cast<u32>(kBytesRead);
+        remaining = static_cast<u32>(static_cast<i64>(remaining) - kBytesRead);
     }
     return 0;
 }
