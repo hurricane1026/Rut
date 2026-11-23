@@ -271,6 +271,15 @@ build/src/rut-consumers diff consumer-config/v1.json consumer-config/v2.json
 The audit compares supplied immutable snapshots; deployment and historical
 retention remain host responsibilities. #1072 remains open.
 
+`create-credential INPUT CREDENTIAL_FILE OUTPUT` appends one operator-supplied
+credential from a private JSON file containing a version-1 credential object.
+Its Consumer must already exist, and its ID must be new even if an existing
+record with that ID is disabled. The complete candidate passes the same checks
+as `apply`, including rules for duplicate keys, group subsets and validity
+windows. The output uses atomic no-replace publication. The command preserves
+all prior records and leaves deployment to the host. Use the commands below
+when the CLI should generate a new API key.
+
 `generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT` adds one generated
 credential to a new snapshot. Only `bearer` and `header` methods are accepted.
 The Consumer must already exist, and the credential ID must not appear in the

@@ -1009,6 +1009,37 @@ int inspect_record_command(char** args, bool credential) {
     return output.ok && write_all(STDOUT_FILENO, {result.data, output.len}) ? 0 : 2;
 }
 
+int create_credential_command(const char* source,
+                              const char* credential_path,
+                              const char* destination) {
+    Buffer input, credential;
+    SensitiveDocument base, record;
+    if (!read_private(source, input) || !consumer_registry_valid(base, input.view()))
+        return failure("cannot read valid private registry snapshot\n");
+    if (!read_private(credential_path, credential) || !record.parse(credential.view()) ||
+        record.nodes[0].kind != json::Kind::Object)
+        return failure("cannot read valid private credential record\n");
+    const u32 kId = field(record, 0, lit_str("id"));
+    if (!id_valid(record, kId)) return failure("invalid credential ID\n");
+    const u32 kCredentials = field(base, 0, lit_str("credentials"));
+    if (find(base, kCredentials, record, kId, true) != json::kNone)
+        return failure("credential ID already exists\n");
+
+    Buffer changes, result;
+    json::Writer change{changes.data, json::kMaxBytes};
+    change.text(lit_str("{\"consumers\":[],\"credentials\":["));
+    if (!record.write(0, change)) return failure("cannot encode credential record\n");
+    change.text(lit_str("],\"removeConsumers\":[],\"removeCredentials\":[]}"));
+
+    SensitiveDocument patch, checked;
+    json::Writer output{result.data, json::kMaxBytes};
+    if (!change.ok || !patch.parse({changes.data, change.len}) || !apply(base, patch, output) ||
+        !consumer_registry_valid(checked, {result.data, output.len}))
+        return failure("invalid updated Consumer registry snapshot\n");
+    const char* const kError = publish(destination, {result.data, output.len});
+    return kError ? failure(kError) : 0;
+}
+
 bool provision_change(json::Document& profile, Str digest, json::Writer& output) {
     const u32 kConsumer = field(profile, 0, lit_str("consumer"));
     const u32 kCredential = field(profile, 0, lit_str("credential"));
@@ -1254,6 +1285,7 @@ constexpr char kUsage[] =
     "       rut-consumers plan INPUT CHANGES\n"
     "       rut-consumers apply INPUT CHANGES OUTPUT\n"
     "       rut-consumers apply-checked INPUT CHANGES POLICY NOW_UNIX_SECONDS OUTPUT\n"
+    "       rut-consumers create-credential INPUT CREDENTIAL_FILE OUTPUT\n"
     "       rut-consumers generate-key INPUT CONSUMER_ID CREDENTIAL_ID METHOD OUTPUT\n"
     "       rut-consumers generate-key-verifier INPUT CONSUMER_ID CREDENTIAL_ID METHOD "
     "SNAPSHOT_OUTPUT KEY_OUTPUT\n"
@@ -1317,6 +1349,8 @@ int main(int argc, char** argv) {
         return inspect_record_command(argv, true);
     if (argc == 5 && strcmp(argv[1], "prune-credentials") == 0)
         return prune_credentials_command(argv[2], argv[3], argv[4]);
+    if (argc == 5 && strcmp(argv[1], "create-credential") == 0)
+        return create_credential_command(argv[2], argv[3], argv[4]);
     if (argc == 6 && strcmp(argv[1], "provision-key-verifier") == 0)
         return provision_key_verifier_command(argv[2], argv[3], argv[4], argv[5]);
     if (argc == 6 && (strcmp(argv[1], "set-consumer-enabled") == 0 ||
