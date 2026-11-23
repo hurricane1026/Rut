@@ -7406,8 +7406,8 @@ inline bool request_policy_name_eq(const u8* p, u32 n, const char* q, u32 qn) {
     for (u32 i = 0; i < n; i++) {
         u8 a = p[i];
         u8 b = static_cast<u8>(q[i]);
-        if (a >= 'A' && a <= 'Z') a = static_cast<u8>(a + ('a' - 'A'));
-        if (b >= 'A' && b <= 'Z') b = static_cast<u8>(b + ('a' - 'A'));
+        if (a >= 'A' && a <= 'Z') a = static_cast<u8>(static_cast<i64>(a) + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = static_cast<u8>(static_cast<i64>(b) + ('a' - 'A'));
         if (a != b) return false;
     }
     return true;
@@ -7775,7 +7775,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
          conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0))
         return RequestPolicyBodyState::Invalid;
 
-    const u8* end = data + parser.header_end;
+    const u8* end = data + static_cast<i64>(parser.header_end);
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     if (line_end + 1 >= end) return RequestPolicyBodyState::Invalid;
@@ -8031,12 +8031,14 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         return RequestPolicyBodyState::Invalid;
     if (has_te && !request_policy_preserves_host(policy_id)) return RequestPolicyBodyState::Invalid;
     if (!req.has_content_length ||
-        req.content_length > conn.recv_buf.capacity() - parser.header_end)
+        static_cast<i64>(req.content_length) >
+            static_cast<i64>(conn.recv_buf.capacity()) - static_cast<i64>(parser.header_end))
         return RequestPolicyBodyState::Invalid;
     if (request_policy_places_content_length_after_host(policy_id) && req.content_length == 0)
         return RequestPolicyBodyState::Invalid;
-    const u64 required = static_cast<u64>(parser.header_end) + req.content_length;
-    if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
+    const i64 required = static_cast<i64>(parser.header_end) + static_cast<i64>(req.content_length);
+    if (required > static_cast<i64>(conn.recv_buf.capacity()))
+        return RequestPolicyBodyState::Invalid;
     // INVARIANT: every rejection above this line depends only on headers,
     // the request line, or connection state already known before any body
     // byte has necessarily arrived -- never on the content of body bytes
@@ -8189,11 +8191,13 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // body; the check here is retained too, as defense in depth.
     if (req.target_has_fragment) return false;
     const u32 body_len = req.has_content_length ? req.content_length : 0;
-    const u8* end = data + parser.header_end;
+    const u8* end = data + static_cast<i64>(parser.header_end);
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
-    if (line_end + 1 >= end || path_ptr < data || path_ptr + req.path.len > line_end) return false;
+    if (line_end + 1 >= end || path_ptr < data ||
+        path_ptr + static_cast<i64>(req.path.len) > line_end)
+        return false;
     const u8* header_end = end - 2;
 
     // Pass 1: locate the single client Host header and fail closed on any
