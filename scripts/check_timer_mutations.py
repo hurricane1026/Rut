@@ -21,24 +21,37 @@ MUTATIONS = {
                          "&slots[cursor & (kSlots - 1)]",
                          "&slots[(cursor + 1) & (kSlots - 1)]"),
     "heap_scan_sifts_before_compacting": (
-        "rut/runtime/epoll_event_loop.h",
-        """        u32 kept = 0;
-        for (u32 i = 0; i < size; ++i) {
-            if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
+        "rut/runtime/yield_heap.h",
+        """    u32 kept = 0;
+    for (u32 i = 0; i < size; ++i) {
+        if (entries[i].conn_id != conn_id) entries[kept++] = entries[i];
+    }
+    const u32 kRemoved = size - kept;
+    size = kept;
+    if (kRemoved > 0) {
+        for (u32 i = size / 2; i > 0; --i) sift_down(entries, size, i - 1);
+    }
+    return kRemoved;""",
+        """    u32 removed = 0;
+    u32 i = 0;
+    while (i < size) {
+        if (entries[i].conn_id != conn_id) { ++i; continue; }
+        entries[i] = entries[--size];
+        ++removed;
+        if (i < size) {
+            u32 j = i;
+            while (j > 0) {
+                u32 parent = (j - 1) / 2;
+                if (entries[parent].deadline_ns <= entries[j].deadline_ns) break;
+                const Entry saved = entries[parent];
+                entries[parent] = entries[j];
+                entries[j] = saved;
+                j = parent;
+            }
+            sift_down(entries, size, i);
         }
-        const u32 removed = size - kept;
-        size = kept;
-        if (removed > 0) {
-            for (u32 i = size / 2; i > 0; --i) sift_down(i - 1);
-        }""",
-        """        u32 removed = 0;
-        u32 i = 0;
-        while (i < size) {
-            if (entries[i].conn_id != conn_id) { ++i; continue; }
-            entries[i] = entries[--size];
-            ++removed;
-            if (i < size) { sift_up(i); sift_down(i); }
-        }"""),
+    }
+    return removed;"""),
     "stale_uring_disarms_successor": ("rut/runtime/iouring_event_loop.h",
                                       "if (matching_generation) {", "if (true) {"),
 }

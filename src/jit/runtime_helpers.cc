@@ -32,6 +32,7 @@
 #include "rut/runtime/net_client.h"
 #include "rut/runtime/oauth_introspection.h"
 #include "rut/runtime/parse_integer.h"
+#include "rut/runtime/parse_ip.h"
 #include "rut/runtime/password_gateway.h"
 #include "rut/runtime/regex_capture.h"
 #include "rut/runtime/route_params.h"
@@ -3370,6 +3371,12 @@ extern "C" void rut_helper_resp_body(
     c.jit_response_head = parsed.ok && parsed.req.method == HttpMethod::HEAD;
     c.jit_response_body = {ptr, len};
     c.jit_response_body_valid = ptr != nullptr && len <= SlicePool::kSliceSize;
+}
+
+extern "C" rut::u8 rut_helper_ip_parse(const char* data, rut::u32 length, rut::u32* output) {
+    if (!output) return 0;
+    *output = 0;
+    return rut::parse_ipv4_address({data, length}, *output) ? 1u : 0u;
 }
 
 extern "C" rut::u8 rut_helper_parse_int(const char* data,

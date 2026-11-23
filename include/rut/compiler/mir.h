@@ -39,6 +39,7 @@ enum class MirValueKind : u8 {
     StringConcat,
     StringPredicate,
     StringTrim,  // byte-exact prefix/suffix removal; borrowed result
+    IpParse,     // strict IPv4 text -> optional IP
     Tuple,
     TupleSlot,
     VariantCase,

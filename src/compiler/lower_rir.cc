@@ -1585,6 +1585,29 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
+    if (value.kind == MirValueKind::IpParse) {
+        if (!value.lhs || value.lhs->type != MirTypeKind::Str || value.lhs->may_nil ||
+            value.lhs->may_error || value.type != MirTypeKind::IP || !value.may_nil ||
+            value.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto text = materialize_value(*value.lhs,
+                                      mir,
+                                      variant_infos,
+                                      tuple_infos,
+                                      tuple_info_count,
+                                      error_scalar_infos,
+                                      error_variant_infos,
+                                      error_struct_infos,
+                                      user_struct_defs,
+                                      b,
+                                      locals,
+                                      local_count,
+                                      span);
+        if (!text) return core::make_unexpected(text.error());
+        auto result = b.emit_ip_parse(text.value(), {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::RegexMatch || value.kind == MirValueKind::RegexCapture) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
@@ -3349,6 +3372,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
         const rir::TypeKind inner_kind = shape.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
                                          : shape.type == MirTypeKind::Str ? rir::TypeKind::Str
                                          : shape.type == MirTypeKind::I64 ? rir::TypeKind::I64
+                                         : shape.type == MirTypeKind::IP  ? rir::TypeKind::IP
                                                                           : rir::TypeKind::I32;
         auto inner = b.make_type(inner_kind);
         if (!inner) return frontend_error(FrontendError::OutOfMemory, span);
@@ -3539,7 +3563,7 @@ static FrontendResult<rir::ValueId> materialize_local_init(
     if (local_shape.type != MirTypeKind::Bool && local_shape.type != MirTypeKind::I32 &&
         local_shape.type != MirTypeKind::I64 && local_shape.type != MirTypeKind::Str &&
         local_shape.type != MirTypeKind::Variant && local_shape.type != MirTypeKind::Struct &&
-        local_shape.type != MirTypeKind::Collected)
+        local_shape.type != MirTypeKind::Collected && local_shape.type != MirTypeKind::IP)
         return frontend_error(FrontendError::UnsupportedSyntax, local.span);
 
     auto inner = make_inner_type(local_shape, local.span);

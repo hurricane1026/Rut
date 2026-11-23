@@ -4814,6 +4814,27 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             expr, route, mod, locals, local_count, binding, nullptr);
     }
 
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("IP")) && expr.name.eq(lit_str("parse")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("IP"))) {
+        constexpr auto kDetail = lit_str("IP.parse expects one unwrapped str");
+        if (expr.args.len != 1 || !expr.args[0])
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        auto text = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!text) return core::make_unexpected(text.error());
+        if (text->type != HirTypeKind::Str || text->may_nil || text->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr out{};
+        out.kind = HirExprKind::IpParse;
+        out.type = HirTypeKind::IP;
+        out.may_nil = true;
+        out.span = expr.span;
+        if (!route->exprs.push(text.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
+
     // Cache<K, i64> instance receiver (DESIGN.md §3.3.6): an Ident
     // matching a declared cache, unless shadowed by a user binding (same
     // precedence rule as the bitwise namespace). Handlers get exactly
@@ -15025,6 +15046,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringPredicate:
                 case HirExprKind::StringTrim:
+                case HirExprKind::IpParse:
                 case HirExprKind::HashDigest:
                 case HirExprKind::ConstantTimeEqual:
                 case HirExprKind::JsonDecode:
@@ -16271,6 +16293,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 case HirExprKind::LetIn:
                 case HirExprKind::StringConcat:
                 case HirExprKind::StringTrim:
+                case HirExprKind::IpParse:
                     break;
                 case HirExprKind::JsonOp:
                     // str.slice is a bounded, allocation-free borrowed view.

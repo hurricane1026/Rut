@@ -251,7 +251,8 @@ User impl Hashable { func hash() -> u64 => fnv64(self.id) }  // Type impl Protoc
 
 parseInt("42")             // i32? — strict decimal, str or Bytes
 parseInt64(b"9223372036854775807")  // i64? — inferred wide result
-// ⏳ parseFloat, IP.parse, CIDR.parse and Duration.parse remain pending
+IP.parse("127.0.0.1")      // IP? — strict IPv4 dotted decimal
+// ⏳ parseFloat, IPv6 parsing, CIDR.parse and Duration.parse remain pending
 200 as str            // ⏳ infallible conversion (`as` / checked `as?` pending)
 ```
 
@@ -278,6 +279,33 @@ Use `guard let`, `if let`, `== nil` or `.or(...)` to handle failure. The existin
 `i64(...)` builtin widens an `i32`; it does not parse text. Source-level `i64`
 type annotations and unsigned 64-bit results remain unsupported. See
 [the parsing contract and performance study](parse-integers.md).
+
+## IPv4 text parsing
+
+`IP.parse(text) -> IP?` accepts one unwrapped `str`. It consumes the whole span
+as exactly four ASCII decimal octets (0–255), separated by dots. An octet with
+more than one digit cannot start with zero. Empty input, whitespace, signs,
+embedded NULs, hostnames, shorthand/integer/hex/octal forms, ports, CIDR suffixes,
+IPv6 and mapped IPv6 return nil. `0.0.0.0` is a present IP value, distinct from
+nil. This slice uses the current 32-bit IP carrier and does not add IPv6 support.
+
+```swift
+route POST "/peer" {
+    guard let address = IP.parse(req.body) else { return 400 }
+    guard address == req.remoteAddr else { return 403 }
+    return 204
+}
+```
+
+The parser allocates no storage, retains no input, performs no I/O and needs no
+connection, arena, terminator or input padding. Its result uses the same network
+byte order as `req.remoteAddr`, so equality, `Cache<IP, i64>` keys and bounded
+consistent-hash keys use the existing IP representation. Optional results work
+with `guard let`, `if let`, nil checks and `.or(anIP)`; string/integer fallbacks
+are rejected. Inlined helpers and WebSocket callbacks can use this pure parse.
+User bindings/types/import namespaces named `IP` shadow the builtin namespace.
+Parsing a header does not establish trust in that header; forwarding policies
+must separately decide which peers may supply client addresses.
 
 ## Process access log
 

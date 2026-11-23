@@ -1285,6 +1285,16 @@ struct Builder {
         return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;
     }
 
+    Result<ValueId> emit_ip_parse(ValueId text, SourceLoc loc = {}) {
+        if (!val_has_type(text, TypeKind::Str)) return err(RirError::InvalidState);
+        auto* inner = TRY(make_type(TypeKind::IP));
+        auto* ty = TRY(make_type(TypeKind::Optional, inner));
+        auto [inst, vid] = TRY(emit(Opcode::IpParse, ty, loc));
+        inst->operands[0] = text;
+        inst->operand_count = 1;
+        return vid;
+    }
+
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
         if (!val_has_type(ip, TypeKind::IP)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));

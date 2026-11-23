@@ -1,5 +1,6 @@
 #include "deferred_preflight_fixture.h"
 #include "es256_fixture.h"
+#include "fixtures/ip_parse.h"
 #include "fixtures/jwt_lifetime.h"
 #include "fixtures/query_all.h"
 #include "fixtures/signed_request.h"
@@ -65,6 +66,7 @@ TEST(native_program, helper_resolver_rejects_unlisted_symbols) {
     CHECK(find_native_helper(lit_str("rut_helper_jwt_issue_hs256")) != nullptr);
     CHECK(find_native_helper(lit_str("rut_helper_jwt_issue_hs256_with_id")) != nullptr);
 }
+
 namespace {
 struct Source {
     char path[4096] = "/tmp/rut native source-XXXXXX";
@@ -4054,6 +4056,26 @@ TEST(native_program, string_slice_returns_checked_borrowed_text_without_arena_st
     }
 }
 
+TEST(native_program, ip_parse_runs_without_source_or_arena) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::ip_parse::kSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        const auto& route = program.p->config.routes[0];
+        REQUIRE(route.fn);
+        for (const auto& item : test::ip_parse::kCases) {
+            const std::string request =
+                std::string("POST / HTTP/1.1\r\nHost: local\r\nX-Expected: ") + item.expected +
+                "\r\nContent-Length: " + std::to_string(strlen(item.input)) + "\r\n\r\n" +
+                item.input;
+            CHECK_EQ(invoke(route, request).status_code, item.status);
+        }
+    }
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(native_program, string_slice_extracts_text_in_websocket_callbacks) {
     for (u8 opt : {0u, 2u}) {
@@ -4085,6 +4107,18 @@ route GET "/ws" { return websocket(backend) { message in
                           reinterpret_cast<const u8*>(payloads[i].ptr),
                           payloads[i].len,
                           true) == (i < 2 ? WsFrameAction::Forward : WsFrameAction::Drop));
+    }
+}
+
+TEST(native_program, ip_parse_compares_websocket_text_with_connection_ip) {
+    for (u8 opt : {0u, 2u}) {
+        Source source;
+        REQUIRE(source.append(test::ip_parse::kWsSource));
+        Program program;
+        REQUIRE(program.p);
+        REQUIRE(load(source, *program.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        test::ip_parse::check_ws(_tc, program.p->config);
     }
 }
 #endif

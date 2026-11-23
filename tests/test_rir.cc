@@ -3186,3 +3186,32 @@ TEST(RirVerifier, RequestQueryAllRejectsForgedNamesAndCarriers) {
     CHECK(verify_function(fn).ok);
     tc.destroy();
 }
+
+TEST(RirVerifier, IpParseRequiresAStringAndOptionalIpCarrier) {
+    TestContext tc;
+    REQUIRE(tc.init());
+    Builder b;
+    b.init(&tc.mod);
+    auto* fn = V(b.create_function(lit("ip_parse"), lit("/"), 'P'));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    const auto text = V(b.emit_const_str(lit("1.2.3.4")));
+    const auto number = V(b.emit_const_i32(1));
+    CHECK_FALSE(b.emit_ip_parse(number));
+    V(b.emit_ip_parse(text));
+    VOK(b.emit_ret_status(204));
+    REQUIRE(verify_function(fn).ok);
+    auto& inst = fn->entry()->insts[2];
+    const auto saved = inst;
+    for (u32 mode = 0; mode < 4; ++mode) {
+        inst = saved;
+        if (mode == 0) inst.operand_count = 0;
+        if (mode == 1) inst.operands[0] = number;
+        if (mode == 2) inst.result = number;
+        if (mode == 3) inst.operands[0] = kNoValue;
+        CHECK_FALSE(verify_function(fn).ok);
+    }
+    inst = saved;
+    CHECK(verify_function(fn).ok);
+    tc.destroy();
+}

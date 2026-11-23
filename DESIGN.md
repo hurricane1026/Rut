@@ -370,8 +370,20 @@ ip.isLoopback                        // bool — 127.0.0.0/8 or ::1
 ip.in(10.0.0.0/8)                    // bool — CIDR containment
 ip.octets                            // [u8] — 4 or 16 bytes
 ip as string                         // "10.0.0.1"
-IP.parse("10.0.0.1")                // IP? / error-capable parse, depending on context
+IP.parse("10.0.0.1")                // IP? — implemented strict IPv4 dotted decimal
 ```
+
+**Implemented IPv4 text conversion:** `IP.parse(str) -> IP?` consumes exactly
+four decimal octets in 0–255, rejects leading-zero octets except `0`, and returns
+nil for all other spelling, including whitespace, ports, CIDR suffixes,
+shorthand/hex/octal/integer addresses and IPv6. Zero and broadcast addresses are
+ordinary present values. The scalar result uses the current 32-bit,
+network-order IP carrier shared with `req.remoteAddr`. The kernel reads at most
+15 bytes, allocates nothing and retains no input. HIR/MIR preserve its optional
+IP type through helpers, narrowing and typed `.or` fallback; RIR checks the
+unwrapped string operand and `Optional<IP>` result. JIT/native compilation share
+that kernel. IPv6 parsing and the remaining IP properties in the target surface
+above are not supplied by this slice.
 
 **CIDR** — network range
 
@@ -4288,8 +4300,8 @@ sharing the same validation contract, with native per-architecture CI tests and
 benchmarks. See [contract, research and benchmarks](docs/parse-integers.md).
 
 The remaining conversion/domain APIs below are design targets unless marked
-implemented in the language card (`parseFloat`, `as`, `as?`, IP/CIDR/Duration
-parsing remain pending).
+implemented in the language card (`parseFloat`, `as`, `as?`, IPv6 and
+CIDR/Duration parsing remain pending; strict IPv4 `IP.parse` is implemented).
 
 `as` is for value-to-value conversion, not text parsing.
 
