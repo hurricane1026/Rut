@@ -10324,8 +10324,8 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // until the full request is written, then read the response.
     Http2Conn* h2 = conn.h2;
     u32 next_sent = 0;
-    if (ev.result < 0 ||
-        __builtin_add_overflow(h2->async_synth_sent, static_cast<u32>(ev.result), &next_sent)) {
+    if (__builtin_add_overflow(h2->async_synth_sent, static_cast<u32>(ev.result), &next_sent) ||
+        next_sent > h2->async_synth_len) {
         h2_proxy_fail(loop, conn, 502);
         return;
     }
