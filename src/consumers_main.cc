@@ -801,24 +801,20 @@ bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
 
 bool policy_active(PolicySnapshot& snapshot, u32 credential) {
     auto& doc = snapshot.registry;
-    const i64 start = policy_time(doc, credential, lit_str("notBefore"));
-    const i64 end = policy_time(doc, credential, lit_str("expiresAt"));
-    return policy_enabled(doc, credential) && start <= snapshot.now &&
-           (end == 0 || snapshot.now < end);
+    const i64 kStart = policy_time(doc, credential, lit_str("notBefore"));
+    const i64 kEnd = policy_time(doc, credential, lit_str("expiresAt"));
+    return policy_enabled(doc, credential) && kStart <= snapshot.now &&
+           (kEnd == 0 || snapshot.now < kEnd);
 }
 
-bool policy_owner_matches(json::Document& doc, u32 credential, u32 consumer_id) {
-    return equal(doc, field(doc, credential, lit_str("consumerId")), doc, consumer_id);
-}
-
-u32 policy_count_credentials(PolicySnapshot& snapshot, u32 consumer, bool active_only) {
+u32 policy_count_active_credentials(PolicySnapshot& snapshot, u32 consumer) {
     auto& doc = snapshot.registry;
-    const u32 id = field(doc, consumer, lit_str("id"));
+    const u32 kId = field(doc, consumer, lit_str("id"));
     u32 count = 0;
     for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
          record = doc.nodes[record].next) {
-        if (policy_owner_matches(doc, record, id) &&
-            (!active_only || policy_active(snapshot, record)))
+        if (equal(doc, field(doc, record, lit_str("consumerId")), doc, kId) &&
+            policy_active(snapshot, record))
             ++count;
     }
     return count;
@@ -832,7 +828,7 @@ bool policy_minimum_active(PolicySnapshot& snapshot, u32 value) {
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
          consumer = doc.nodes[consumer].next) {
         if (policy_enabled(doc, consumer))
-            count += policy_count_credentials(snapshot, consumer, true);
+            count += policy_count_active_credentials(snapshot, consumer);
     }
     return count >= static_cast<u32>(minimum);
 }
@@ -841,7 +837,7 @@ bool policy_each_consumer_active(PolicySnapshot& snapshot, u32) {
     auto& doc = snapshot.registry;
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
          consumer = doc.nodes[consumer].next) {
-        if (policy_enabled(doc, consumer) && !policy_count_credentials(snapshot, consumer, true))
+        if (policy_enabled(doc, consumer) && !policy_count_active_credentials(snapshot, consumer))
             return false;
     }
     return true;

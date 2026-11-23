@@ -166,7 +166,15 @@ def test_apply_checked(tool, root):
     assert b'requireExpiryForEnabledCredentials' in apply_checked().stderr
     assert not output.exists()
     hashed['expiresAt'] = 121
+    private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
+                         requireExpiryForEnabledCredentials=True,
+                         requireActiveCredentialForEnabledConsumers=True))
+    private(patch, changes(remove_credentials=[raw['id']]))
+    assert b'requireActiveCredentialForEnabledConsumers' in apply_checked().stderr
+    assert not output.exists()
     private(patch, changes(credentials=[hashed], remove_credentials=[raw['id']]))
+    assert b'requireActiveCredentialForEnabledConsumers' in apply_checked(now=121).stderr
+    assert not output.exists()
     assert not apply_checked(expected=0).stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert json.loads(output.read_bytes()) == dict(version=1, consumers=[consumer],
