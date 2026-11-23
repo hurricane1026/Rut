@@ -234,8 +234,7 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
     if (inst.op != Opcode::IpParse && inst.op != Opcode::StrPredicate &&
         inst.op != Opcode::StrInterpolate && inst.op != Opcode::StrTrimPrefix &&
         inst.op != Opcode::StrTrimSuffix && inst.op != Opcode::StrTrimAscii &&
-        inst.op != Opcode::ReqSetPath &&
-        inst.op != Opcode::ReqSetHash)
+        inst.op != Opcode::ReqSetPath && inst.op != Opcode::ReqSetHash)
         return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
     const auto kExact = [&](ValueId id, TypeKind kind) {
