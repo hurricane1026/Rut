@@ -12,11 +12,11 @@ inline constexpr u32 kStringArenaBudget = 262144;
 inline Str trim_ascii_string(Str text) {
     if (!text.ptr) return {};
     const auto space = [](u8 c) { return c == 32 || (c >= 9 && c <= 13); };
-    u32 begin = 0;
-    u32 end = text.len;
+    i64 begin = 0;
+    i64 end = static_cast<i64>(text.len);
     while (begin < end && space(static_cast<u8>(text.ptr[begin]))) ++begin;
     while (end > begin && space(static_cast<u8>(text.ptr[end - 1]))) --end;
-    return {text.ptr + begin, end - begin};
+    return {text.ptr + begin, static_cast<u32>(end - begin)};
 }
 
 // Modes 0/1: ASCII upper/lower. Mode 2: all nonoverlapping literal matches.
@@ -31,7 +31,7 @@ inline bool transform_string(
         return false;
     u16 prefix[kStringNeedleLimit]{};
     if (mode == 2) {
-        for (u32 i = 1, j = 0; i < needle.len; ++i) {
+        for (i64 i = 1, j = 0; i < static_cast<i64>(needle.len); ++i) {
             while (j && needle.ptr[i] != needle.ptr[j]) j = prefix[j - 1];
             if (needle.ptr[i] == needle.ptr[j]) ++j;
             prefix[i] = static_cast<u16>(j);
@@ -39,44 +39,50 @@ inline bool transform_string(
     }
     // Both passes use KMP: linear work even for adversarial repetitive input.
     const auto scan = [&](auto&& match) {
-        for (u32 i = 0, j = 0; i < text.len; ++i) {
+        for (i64 i = 0, j = 0; i < static_cast<i64>(text.len); ++i) {
             while (j && text.ptr[i] != needle.ptr[j]) j = prefix[j - 1];
             if (text.ptr[i] == needle.ptr[j]) ++j;
             if (j == needle.len) {
-                match(i + 1 - needle.len);
+                match(i + 1 - static_cast<i64>(needle.len));
                 j = 0;
             }
         }
     };
     u32 count = 0;
     if (mode == 2) scan([&](u32) { ++count; });
-    const u64 size = static_cast<u64>(text.len) - static_cast<u64>(count) * needle.len +
-                     static_cast<u64>(count) * replacement.len;
-    if (size > kStringOutputLimit || arena->space_used() > kStringArenaBudget - (size ? size : 1) ||
+    const i64 size = static_cast<i64>(text.len) - static_cast<i64>(count) *
+                         static_cast<i64>(needle.len) +
+                     static_cast<i64>(count) * static_cast<i64>(replacement.len);
+    if (size > static_cast<i64>(kStringOutputLimit) ||
+        static_cast<i64>(arena->space_used()) > static_cast<i64>(kStringArenaBudget) -
+                                             (size ? size : i64{1}) ||
         (!arena->current && !arena->init(arena->backend.pool)))
         return false;
-    auto* data = static_cast<char*>(arena->alloc(size ? size : 1));
+    auto* data = static_cast<char*>(arena->alloc(static_cast<u64>(size ? size : 1)));
     if (!data) return false;
-    u32 written = 0;
+    i64 written = 0;
     if (mode < 2) {
         for (u32 i = 0; i < text.len; ++i) {
             const u8 c = static_cast<u8>(text.ptr[i]);
-            data[i] = static_cast<char>(mode == 0 && c >= 'a' && c <= 'z'   ? c - 32
-                                        : mode == 1 && c >= 'A' && c <= 'Z' ? c + 32
+            data[i] = static_cast<char>(mode == 0 && c >= 'a' && c <= 'z'
+                                            ? static_cast<i64>(c) - 32
+                                        : mode == 1 && c >= 'A' && c <= 'Z'
+                                            ? static_cast<i64>(c) + 32
                                                                             : c);
         }
     } else {
-        u32 copied = 0;
-        scan([&](u32 start) {
-            const u32 length = start - copied;
+        i64 copied = 0;
+        scan([&](i64 start) {
+            const i64 length = start - copied;
             if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
             written += length;
             if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-            written += replacement.len;
-            copied = start + needle.len;
+            written += static_cast<i64>(replacement.len);
+            copied = start + static_cast<i64>(needle.len);
         });
-        if (text.len > copied)
-            __builtin_memcpy(data + written, text.ptr + copied, text.len - copied);
+        if (static_cast<i64>(text.len) > copied)
+            __builtin_memcpy(data + written, text.ptr + copied,
+                             static_cast<i64>(text.len) - copied);
     }
     *output = {data, static_cast<u32>(size)};
     return true;

@@ -70,7 +70,7 @@ u8 capture_regex_match(void* raw, SliceArena& arena, Str subject, u32 group, Str
                      subject.len,
                      re2::RE2::UNANCHORED,
                      captures,
-                     static_cast<int>(group + 1)))
+                     static_cast<int>(static_cast<i64>(group) + 1)))
         return 0;
     const auto kCapture = captures[group];
     if (!kCapture.data()) return 0;
@@ -92,41 +92,45 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
     Match matches[64]{};
     u32 count = 0;
     u32 search = 0;
-    u64 size = subject.len;
+    i64 size = static_cast<i64>(subject.len);
     while (search <= subject.len) {
         re2::StringView found;
         if (!regex.Match(
                 CaptureProgram::view(text), search, text.len, re2::RE2::UNANCHORED, &found, 1))
             break;
         if (count == 64 || !found.data()) return 0;
-        const u32 start = static_cast<u32>(found.data() - text.ptr);
-        const u32 end = start + static_cast<u32>(found.size());
-        if (start < search || end > text.len) return 0;
-        matches[count++] = {start, end};
-        size = size - (end - start) + replacement.len;
+        const i64 start = static_cast<i64>(found.data() - text.ptr);
+        const i64 end = start + static_cast<i64>(found.size());
+        if (start < static_cast<i64>(search) || end > static_cast<i64>(text.len)) return 0;
+        matches[count++] = {static_cast<u32>(start), static_cast<u32>(end)};
+        size = size - (end - start) + static_cast<i64>(replacement.len);
         if (end == start) {
             if (end == text.len) break;
-            search = end + 1;
+            search = static_cast<u32>(end + 1);
         } else
             search = end;
     }
-    if (size > kStringOutputLimit || arena.space_used() > kStringArenaBudget - (size ? size : 1) ||
+    if (size > static_cast<i64>(kStringOutputLimit) ||
+        static_cast<i64>(arena.space_used()) > static_cast<i64>(kStringArenaBudget) -
+                                                (size ? size : i64{1}) ||
         (!arena.current && !arena.init(arena.backend.pool)))
         return 0;
-    auto* data = static_cast<char*>(arena.alloc(size ? size : 1));
+    auto* data = static_cast<char*>(arena.alloc(static_cast<u64>(size ? size : 1)));
     if (!data) return 0;
-    u32 copied = 0;
-    u32 written = 0;
+    i64 copied = 0;
+    i64 written = 0;
     for (u32 i = 0; i < count; ++i) {
         const auto match = matches[i];
-        const u32 length = match.start - copied;
+        const i64 length = static_cast<i64>(match.start) - static_cast<i64>(copied);
         if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
         written += length;
         if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-        written += replacement.len;
-        copied = match.end;
+        written += static_cast<i64>(replacement.len);
+        copied = static_cast<i64>(match.end);
     }
-    if (text.len > copied) __builtin_memcpy(data + written, text.ptr + copied, text.len - copied);
+    if (static_cast<i64>(text.len) > copied)
+        __builtin_memcpy(data + written, text.ptr + copied,
+                         static_cast<i64>(text.len) - copied);
     *output = {data, static_cast<u32>(size)};
     return 1;
 }
