@@ -124,7 +124,9 @@ bool http_call_policy(Str configuration, HttpsEndpoint& endpoint) {
         } else
             return false;
         u32 length = 0;
-        if ((seen & bit) || !decoded(doc, n, value, cap - 1, length) || !length) return false;
+        if ((seen & bit) ||
+            !decoded(doc, n, value, static_cast<u32>(static_cast<i64>(cap) - 1), length) || !length)
+            return false;
         for (u32 i = 0; i < length; ++i)
             if (!value[i]) return false;
         value[length] = 0;
@@ -281,8 +283,10 @@ HttpCallReply HttpCallWorker::call(u32 connection,
         else
             cancel(connection, slot.generation);
     }
+    u64 elapsed = 0;
     if (found) {
-        if (now < found->started || now - found->started >= found->timeout) {
+        if (now < found->started || __builtin_sub_overflow(now, found->started, &elapsed) ||
+            elapsed >= static_cast<u64>(found->timeout)) {
             cancel(connection, generation);
             reply.status = -2;
             return reply;
@@ -319,7 +323,8 @@ HttpCallReply HttpCallWorker::call(u32 connection,
         return reply;
     }
     reply.status = static_cast<i32>(0x80000000u);
-    const auto remaining = found->timeout - (now - found->started);
+    u64 remaining = 0;
+    (void)__builtin_sub_overflow(static_cast<u64>(found->timeout), elapsed, &remaining);
     reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
     return reply;
 }
