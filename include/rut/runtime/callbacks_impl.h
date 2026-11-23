@@ -9017,7 +9017,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                     name_addr != reinterpret_cast<uintptr_t>(hs) || raw_addr < data_addr ||
                     raw_addr > data_end || parsed_header.raw_value.len > data_end - raw_addr ||
                     parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
-                    parsed_header.raw_value.len != static_cast<u32>(le - colon - 1))
+                    parsed_header.raw_value.len !=
+                        static_cast<u32>(static_cast<i64>(le - colon) - 1))
                     return false;
                 value_start = reinterpret_cast<const u8*>(parsed_header.raw_value.ptr);
                 value_end = value_start + parsed_header.raw_value.len;
@@ -9030,7 +9031,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                     value_end--;
             }
             if (!append(hs, name_len) || !append_lit(": ", 2) ||
-                !append(value_start, static_cast<u32>(value_end - value_start)) ||
+                !append(value_start, static_cast<u32>(static_cast<i64>(value_end - value_start))) ||
                 !append_lit("\r\n", 2))
                 return false;
         }
@@ -9048,7 +9049,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end &&
         !coalesced_phase1)
         return false;
-    if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+    if (!append(data + static_cast<i64>(body_start), body_len) ||
+        !append(data + static_cast<i64>(request_end),
+                static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(request_end))))
         return false;
     if (coalesced_phase1 &&
         (request_end != original_request_end || conn.send_buf.len() < original_successor_len ||
@@ -9061,7 +9064,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
         return false;
     conn.req_header_end = new_header_len;
-    conn.req_initial_send_len = new_header_len + body_len;
+    conn.req_initial_send_len =
+        static_cast<u32>(static_cast<i64>(new_header_len) + static_cast<i64>(body_len));
     conn.req_size = conn.req_initial_send_len;
     conn.req_keep_alive = true;
     conn.request_policy_id = policy_id;
