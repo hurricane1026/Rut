@@ -8646,10 +8646,12 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
 
         new_header_len = measuring ? measured_len : conn.send_buf.len();
         const u32 body_start = parser.header_end;
-        const u64 request_end64 = static_cast<u64>(body_start) + body_len;
-        if (request_end64 > len) return false;
-        const u32 request_end = static_cast<u32>(request_end64);
-        if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
+        const i64 request_end_wide = static_cast<i64>(body_start) + static_cast<i64>(body_len);
+        if (request_end_wide > static_cast<i64>(len)) return false;
+        const u32 request_end = static_cast<u32>(request_end_wide);
+        if (!append(data + static_cast<i64>(body_start), body_len) ||
+            !append(data + static_cast<i64>(request_end),
+                    static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(request_end))))
             return false;
 
         if (measuring &&
@@ -8661,7 +8663,8 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     if (conn.recv_buf.write(conn.send_buf.data(), conn.send_buf.len()) != conn.send_buf.len())
         return false;
     conn.req_header_end = new_header_len;
-    conn.req_initial_send_len = new_header_len + body_len;
+    conn.req_initial_send_len =
+        static_cast<u32>(static_cast<i64>(new_header_len) + static_cast<i64>(body_len));
     conn.req_size = conn.req_initial_send_len;
     conn.req_keep_alive = true;
     conn.request_policy_id = policy_id;
