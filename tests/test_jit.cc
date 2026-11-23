@@ -30506,6 +30506,34 @@ route GET "/" {
     CHECK_FALSE(analyze_file_heap(ast.value()));
 }
 
+TEST(jit, frontend_string_replace_pipeline_validates_wide_ast_placeholder_slots) {
+    constexpr i64 kSlots[] = {0, -1, 1, 2, 11, 2147483648ll, 4294967297ll};
+    const auto src = R"rut(
+route GET "/" {
+    let value = "old-old" | replace("old-old", "old", _)
+    return 200
+}
+)rut";
+    for (const i64 slot : kSlots) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        REQUIRE_EQ(ast->items.len, 1u);
+        REQUIRE_EQ(ast->items[0].route.statements.len, 2u);
+        auto* pipeline = &ast->items[0].route.statements[0]->expr;
+        REQUIRE(pipeline->rhs != nullptr);
+        REQUIRE_EQ(pipeline->rhs->args.len, 3u);
+        REQUIRE(pipeline->rhs->args[2] != nullptr);
+        pipeline->rhs->args[2]->int_value = slot;
+        auto hir = analyze_file_heap(ast.value());
+        if (slot == 1)
+            REQUIRE(hir);
+        else
+            CHECK_FALSE(hir);
+    }
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(jit, websocket_nominal_domains_match_in_ordinary_http_helpers_and_routes) {
     const char* source = R"rut(

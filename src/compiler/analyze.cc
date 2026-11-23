@@ -5549,44 +5549,44 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
         HirExpr replacement = empty;
         Str pattern{};
         u32 mode = expr.name.eq(lit_str("upper")) ? 0 : replace ? 2 : 1;
-        const auto analyze_string_arg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
+        const auto kAnalyzeStringArg = [&](const AstExpr& arg) -> FrontendResult<HirExpr> {
             if (arg.kind != AstExprKind::Placeholder)
                 return analyze_expr(arg, route, mod, locals, local_count, binding);
             if (pipe_placeholder_source == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder outside pipe"));
-            const i32 slot = arg.int_value;
-            if (slot <= 0 || slot > static_cast<i32>(kMaxTupleSlots))
+            const i64 kSlot = arg.int_value;
+            if (kSlot <= 0 || kSlot > static_cast<i64>(kMaxTupleSlots))
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot out of range"));
             if (pipe_placeholder_source->type != HirTypeKind::Tuple) {
-                if (slot != 1)
+                if (kSlot != 1)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           arg.span,
                                           lit_str("non-tuple source with non-unit placeholder"));
                 return *pipe_placeholder_source;
             }
-            if (slot > static_cast<i32>(pipe_placeholder_source->tuple_len))
+            if (kSlot > static_cast<i64>(pipe_placeholder_source->tuple_len))
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot exceeds tuple arity"));
             if (!route->exprs.push(*pipe_placeholder_source))
                 return frontend_error(FrontendError::OutOfMemory, arg.span);
             HirExpr* source = &route->exprs[route->exprs.len - 1];
-            const u32 slot_index = static_cast<u32>(slot - 1);
-            if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
-                return *source->args[slot_index];
+            const u32 kSlotIndex = static_cast<u32>(kSlot - 1);
+            if (source->args.len == source->tuple_len && source->args[kSlotIndex] != nullptr)
+                return *source->args[kSlotIndex];
             HirExpr out{};
             out.kind = HirExprKind::TupleSlot;
-            out.type = source->tuple_types[slot_index];
+            out.type = source->tuple_types[kSlotIndex];
             if (out.type == HirTypeKind::Generic)
-                out.generic_index = source->tuple_struct_indices[slot_index];
+                out.generic_index = source->tuple_struct_indices[kSlotIndex];
             else if (out.type == HirTypeKind::Struct)
-                out.struct_index = source->tuple_struct_indices[slot_index];
+                out.struct_index = source->tuple_struct_indices[kSlotIndex];
             else if (out.type == HirTypeKind::Variant)
-                out.variant_index = source->tuple_variant_indices[slot_index];
+                out.variant_index = source->tuple_variant_indices[kSlotIndex];
             auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
                                                out.type,
                                                out.generic_index,
@@ -5600,7 +5600,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
             if (!shape) return core::make_unexpected(shape.error());
             out.shape_index = shape.value();
             out.span = arg.span;
-            out.int_value = static_cast<i32>(slot_index);
+            out.int_value = static_cast<i32>(kSlotIndex);
             out.lhs = source;
             return out;
         };
@@ -5615,11 +5615,11 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                 capture_regex_destroy(compiled);
                 mode = 3;
             } else {
-                auto value = analyze_string_arg(*expr.args[0]);
+                auto value = kAnalyzeStringArg(*expr.args[0]);
                 if (!value) return value;
                 needle = value.value();
             }
-            auto value = analyze_string_arg(*expr.args[1]);
+            auto value = kAnalyzeStringArg(*expr.args[1]);
             if (!value) return value;
             replacement = value.value();
         }
