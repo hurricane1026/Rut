@@ -6901,6 +6901,13 @@ inline bool rewrite_request_line_path(Connection& conn) {
 // override can't fit recv_buf (so the caller fails the request closed rather than
 // forwarding it with a security-sensitive override silently dropped); true on a
 // no-op or full success.
+inline bool request_header_override_line_length(u32 name_len, u32 value_len, u32* out) {
+    const i64 wide = static_cast<i64>(name_len) + 2 + static_cast<i64>(value_len) + 2;
+    if (wide > static_cast<i64>(UINT32_MAX)) return false;
+    *out = static_cast<u32>(wide);
+    return true;
+}
+
 inline bool apply_request_header_overrides(Connection& conn) {
     if (conn.req_header_override_count == 0 && !conn.req_header_override_overflow) return true;
     // More overrides were requested than the table holds (direct-RIR only): a
@@ -6916,9 +6923,9 @@ inline bool apply_request_header_overrides(Connection& conn) {
     auto splice =
         [&](u32 pos, u32 old_span, const Str& name, const Str& val, bool write_line) -> bool {
         const u32 total = conn.recv_buf.len();
-        const i64 ins_len_wide = static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2;
-        if (ins_len_wide > static_cast<i64>(UINT32_MAX)) return false;
-        const u32 ins_len = write_line ? static_cast<u32>(ins_len_wide) : 0;  // ": " + CRLF
+        u32 checked_line_len = 0;
+        if (!request_header_override_line_length(name.len, val.len, &checked_line_len)) return false;
+        const u32 ins_len = write_line ? checked_line_len : 0;  // ": " + CRLF
         const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
         if (delta > 0 &&
             static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
@@ -7028,9 +7035,8 @@ inline bool apply_request_header_overrides(Connection& conn) {
         // can't place it, so fail closed instead of forwarding without it.
         if (hend < 4 || hend > total) return false;
 
-        const i64 line_len_wide = static_cast<i64>(name.len) + 2 + static_cast<i64>(val.len) + 2;
-        if (line_len_wide > static_cast<i64>(UINT32_MAX)) return false;
-        const u32 line_len = static_cast<u32>(line_len_wide);
+        u32 line_len = 0;
+        if (!request_header_override_line_length(name.len, val.len, &line_len)) return false;
         u32 fs = 0, fe = 0, search_from = 0;
         if (remove) {
             // Search again at the deletion point after every splice so adjacent
