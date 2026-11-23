@@ -49554,3 +49554,29 @@ TEST(frontend, mir_unrolls_for_loop_guard_let_from_optional_query_lowers) {
         rir.destroy();
     }
 }
+
+TEST(frontend, analyze_rejects_allocating_for_loop_body_bindings) {
+    const char* sources[] = {
+        "route GET \"/x\" { for n in [1] { let pending = req.path.lower() guard let p = "
+        "pending else { return 400 } guard p == p else { return 401 } } return 200 }\n",
+        "route GET \"/x\" { for n in [1] { guard let p = req.path.lower() else { return 400 } "
+        "guard p == \"a\" else { return 401 } } return 200 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => { let pending = req.path.lower() "
+        "guard let p = pending else { return 400 } guard p == p else { return 401 } "
+        "return 200 } _ => return 500 } } return 404 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => { guard let p = req.path.lower() "
+        "else { return 400 } return 200 } _ => return 500 } } return 404 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(
+            lit("static for-loop body bindings must be non-allocating; bind the value before "
+                "the loop")));
+    }
+}

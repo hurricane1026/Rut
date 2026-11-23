@@ -211,6 +211,8 @@ Static `for` loops are intentionally narrow:
 - empty loop bodies are rejected by the parser
 - statements after a loop-body terminator are rejected
 - `if let` inside a loop body is rejected
+- loop-body `let` and `guard let` initializers must be non-allocating; bind
+  allocating values (for example `req.path.lower()`) before the loop
 - routes that combine `wait(...)` and static for-loop lowering are rejected
 - `for` is accepted only in route bodies, not helper/function bodies
 - `break` and `continue` are not implemented yet
