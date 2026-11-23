@@ -30421,6 +30421,91 @@ TEST(jit, frontend_string_helpers_preserve_lazy_branches_and_actual_argument_eva
     }
 }
 
+TEST(jit, frontend_string_replace_pipeline_resolves_all_argument_slots) {
+    const auto src = R"rut(
+func pair() -> (str, str) => ("old", "new")
+route GET "/" {
+    let receiver = "old-old" | replace(_, "old", "new")
+    let tuple_slots = pair() | replace("old-old", _1, _2)
+    let replacement = "new" | replace("old-old", "old", _)
+    let regex = "new" | replace("old-old", re"old", _)
+    let method = "template" | _.replace("template", _)
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    REQUIRE(hir->routes[0].locals.len >= 5u);
+    const auto& receiver = hir->routes[0].locals[0].init;
+    const auto& tuple_slots = hir->routes[0].locals[1].init;
+    const auto& replacement = hir->routes[0].locals[2].init;
+    const auto& regex = hir->routes[0].locals[3].init;
+    const auto& method = hir->routes[0].locals[4].init;
+    CHECK(receiver.kind == HirExprKind::StringTransform);
+    CHECK(receiver.args.len == 3u);
+    CHECK(receiver.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(receiver.args[1]->str_value.eq(lit_str("old")));
+    CHECK(receiver.args[2]->str_value.eq(lit_str("new")));
+    CHECK(tuple_slots.kind == HirExprKind::StringTransform);
+    CHECK(tuple_slots.args.len == 3u);
+    CHECK(tuple_slots.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(tuple_slots.args[1]->str_value.eq(lit_str("old")));
+    CHECK(tuple_slots.args[2]->str_value.eq(lit_str("new")));
+    CHECK(replacement.kind == HirExprKind::StringTransform);
+    CHECK(replacement.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(replacement.args[2]->str_value.eq(lit_str("new")));
+    CHECK(regex.kind == HirExprKind::RegexReplace);
+    CHECK(regex.str_value.eq(lit_str("old")));
+    CHECK(regex.args[0]->str_value.eq(lit_str("old-old")));
+    CHECK(regex.args[2]->str_value.eq(lit_str("new")));
+    CHECK(method.kind == HirExprKind::StringTransform);
+    CHECK(method.args[1]->str_value.eq(lit_str("template")));
+    CHECK(method.args[2]->str_value.eq(lit_str("template")));
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    constexpr char request[] = "GET / HTTP/1.1\r\nHost: local\r\n\r\n";
+    const auto result = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, frontend_string_replace_pipeline_rejects_invalid_placeholder_slots) {
+    const auto src = R"rut(
+route GET "/" {
+    let invalid = "template" | replace("template", _2, "new")
+    return 200
+}
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}
+
 #if RUT_ENABLE_WEBSOCKET
 TEST(jit, websocket_nominal_domains_match_in_ordinary_http_helpers_and_routes) {
     const char* source = R"rut(
