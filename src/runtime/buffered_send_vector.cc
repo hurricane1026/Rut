@@ -9,17 +9,21 @@ namespace {
 // production cursor advances relative to its previous iovec and remaining length.
 consteval bool suffix_matches(
     const BufferedSendVector& v, const u8* first, u32 n, const u8* second, u32 m, u32 sent) {
-    const u64 total = static_cast<u64>(n) + m;
+    const u64 total = static_cast<u64>(static_cast<i64>(n) + static_cast<i64>(m));
     if (v.first_source != first || v.first_size != n || v.second_source != second ||
         v.total_size != total)
         return false;
     if (sent < n)
         return v.message.msg_iov == v.parts && v.message.msg_iovlen == 2 &&
-               v.parts[0].iov_base == first + sent && v.parts[0].iov_len == n - sent &&
+               v.parts[0].iov_base == first + static_cast<i64>(sent) &&
+               v.parts[0].iov_len ==
+                   static_cast<u64>(static_cast<i64>(n) - static_cast<i64>(sent)) &&
                v.parts[1].iov_base == second && v.parts[1].iov_len == m;
     if (sent < total)
         return v.message.msg_iov == v.parts + 1 && v.message.msg_iovlen == 1 &&
-               v.parts[1].iov_base == second + (sent - n) && v.parts[1].iov_len == total - sent;
+               v.parts[1].iov_base == second + (static_cast<i64>(sent) - static_cast<i64>(n)) &&
+               v.parts[1].iov_len ==
+                   static_cast<u64>(static_cast<i64>(total) - static_cast<i64>(sent));
     return v.message.msg_iov == v.parts + 2 && v.message.msg_iovlen == 0;
 }
 
@@ -28,14 +32,16 @@ consteval bool vector_cursor_contract() {
     u8 second[4]{};
     for (u32 n = 1; n <= sizeof(first); ++n) {
         for (u32 m = 1; m <= sizeof(second); ++m) {
-            for (u32 start = 0; start <= n + m; ++start) {
-                for (u32 end = start; end <= n + m; ++end) {
+            for (u32 start = 0; start <= static_cast<i64>(n) + static_cast<i64>(m); ++start) {
+                for (u32 end = start; end <= static_cast<i64>(n) + static_cast<i64>(m); ++end) {
                     BufferedSendVector v{};
                     v.bind(first, n, second, m);
-                    if (!v.matches(first, n + m)) return false;
+                    if (!v.matches(first,
+                                   static_cast<u32>(static_cast<i64>(n) + static_cast<i64>(m))))
+                        return false;
                     v.advance(start);
                     if (!suffix_matches(v, first, n, second, m, start)) return false;
-                    v.advance(end - start);
+                    v.advance(static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start)));
                     if (!suffix_matches(v, first, n, second, m, end)) return false;
                 }
             }
