@@ -3289,6 +3289,7 @@ TEST(http2_conn, connection_window_update_overflow_goaway) {
     Http2Conn c;
     Capture cap;
     setup(c, cap);
+    const i64 original_window = c.conn_send_window;
     const u8 kBig[4] = {0x7f, 0xff, 0xff, 0xff};  // +2^31-1 overflows the conn window
     u8 frame[64];
     u32 fn = put_frame(frame, Http2FrameType::WindowUpdate, 0, 0, kBig, 4);
@@ -3297,6 +3298,7 @@ TEST(http2_conn, connection_window_update_overflow_goaway) {
     u8 out[256];
     u32 ow = 0;
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_EQ(c.conn_send_window, original_window);
     CHECK(r.close);
     CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
 }

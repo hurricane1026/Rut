@@ -1,5 +1,6 @@
 #include "rut/runtime/jwt_hs256.h"
 
+#include "rut/common/bounded_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
@@ -32,15 +33,21 @@ bool valid_claim_string(Str value) {
     return true;
 }
 
-bool append_positive_integer(json::Writer& output, i64 value) {
-    if (value <= 0) return false;
+using JwtTimestamp = BoundedInt<struct JwtTimestampTag, 1, INT64_MAX>;
+using JwtTtl = BoundedInt<struct JwtTtlTag, 1, 86400>;
+
+bool append_timestamp(json::Writer& output, JwtTimestamp timestamp) {
+    i64 value = timestamp.value();
     char reversed[20];
-    u32 length = 0;
-    while (value > 0) {
-        reversed[length++] = static_cast<char>('0' + value % 10);
+    using DigitCount = BoundedInt<struct DigitCountTag, 0, sizeof(reversed)>;
+    auto length = DigitCount::constant<0>();
+    do {
+        const i64 index = length.value();
+        if (!length.try_increment()) return false;
+        reversed[index] = static_cast<char>('0' + value % 10);
         value /= 10;
-    }
-    while (length > 0) output.put(reversed[--length]);
+    } while (value);
+    while (length.try_decrement()) output.put(reversed[length.value()]);
     return output.ok;
 }
 
@@ -65,6 +72,14 @@ bool base64url_encode(const u8* input, u32 input_length, char* output, u32 capac
 }  // namespace
 
 namespace {
+[[nodiscard]] core::Expected<JwtTimestamp, IntegerRangeError> jwt_expiry(JwtTimestamp issued,
+                                                                         JwtTtl ttl) {
+    i64 expiry;
+    if (__builtin_add_overflow(issued.value(), ttl.value(), &expiry))
+        return core::make_unexpected(IntegerRangeError::OutOfRange);
+    return JwtTimestamp::from(expiry);
+}
+
 bool issue(Str key,
            Str subject,
            Str issuer,
@@ -97,9 +112,14 @@ bool issue(Str key,
     if (!key.ptr || key.len < 32 || key.len > kMaxJwtHs256KeyBytes ||
         !valid_claim_string(subject) || !valid_claim_string(issuer) ||
         !valid_claim_string(audience) || (include_id && !valid_claim_string(token_id)) ||
-        (include_scope && !jwt_scope_list_valid(scope)) || unix_seconds <= 0 || ttl_seconds <= 0 ||
-        ttl_seconds > 86400 || unix_seconds > 0x7fffffffffffffffLL - ttl_seconds || !output)
+        (include_scope && !jwt_scope_list_valid(scope)) || !output)
         return false;
+
+    auto issued = JwtTimestamp::from(unix_seconds);
+    auto ttl = JwtTtl::from(ttl_seconds);
+    if (!issued || !ttl) return false;
+    auto expiry = jwt_expiry(issued.value(), ttl.value());
+    if (!expiry) return false;
 
     char payload[kMaxJwtHs256PayloadBytes];
     json::Writer claims{payload, sizeof(payload)};
@@ -118,9 +138,9 @@ bool issue(Str key,
         if (!json::quote(scope, claims)) return false;
     }
     claims.text(lit_str(",\"iat\":"));
-    if (!append_positive_integer(claims, unix_seconds)) return false;
+    if (!append_timestamp(claims, issued.value())) return false;
     claims.text(lit_str(",\"exp\":"));
-    if (!append_positive_integer(claims, unix_seconds + ttl_seconds)) return false;
+    if (!append_timestamp(claims, expiry.value())) return false;
     claims.put('}');
     if (!claims.ok || claims.len == 0) return false;
 

@@ -55,6 +55,16 @@ struct SimServer {
 
 // === Basic simulation ===
 
+TEST(sim, elapsed_microsecond_bounds) {
+    const timespec start{1, 999999000};
+    CHECK_EQ(elapsed_us(start, {2, 0}), 1u);
+    CHECK_EQ(elapsed_us(start, {1, 0}), 0u);
+    CHECK_EQ(elapsed_us(start, {0, 999999999}), 0u);
+    CHECK_EQ(elapsed_us({0, 0}, {4294, 967294000}), UINT32_MAX - 1);
+    CHECK_EQ(elapsed_us({0, 0}, {4294, 967296000}), UINT32_MAX);
+    CHECK_EQ(elapsed_us({0, 0}, {4295, 0}), UINT32_MAX);
+}
+
 TEST(sim, single_request_200) {
     RouteConfig cfg;
     cfg.add_static("/health", 0, 200);

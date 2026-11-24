@@ -1,5 +1,6 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/common/bounded_int.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
 
@@ -13,6 +14,13 @@ u32 read_u32(const u8* p) {
 }
 
 constexpr i64 kMaxWindow = 2147483647;  // 2^31 - 1
+
+[[nodiscard]] Http2Error credit_connection_window(Http2Conn& conn, u32 increment) {
+    if (increment == 0) return Http2Error::ProtocolError;
+    if (!checked_positive_sum(conn.conn_send_window, increment, kMaxWindow, conn.conn_send_window))
+        return Http2Error::FlowControlError;
+    return Http2Error::NoError;
+}
 
 }  // namespace
 
@@ -206,21 +214,25 @@ bool Http2Conn::consume_data(u32 stream_id, u32 len) {
 // --- Response serialization ---
 
 namespace {
-constexpr i64 hpack_integer_octets(u32 value, u8 prefix_bits) {
-    const i64 kPrefixMax = (i64{1} << prefix_bits) - i64{1};
-    const i64 kValue = static_cast<i64>(value);
-    if (kValue < kPrefixMax) return 1;
-    i64 n = 1;
-    i64 remainder = kValue - kPrefixMax;
-    while (remainder >= 128) {
-        remainder >>= 7;
-        n++;
-    }
-    return n + 1;
+// A string length uses a 7-bit prefix followed by at most five base-128 octets.
+using HpackLengthOctets = BoundedInt<struct HpackLengthOctetsTag, 1, 6>;
+
+constexpr HpackLengthOctets hpack_length_octets(u32 length) {
+    constexpr i64 kPrefixMax = 127;
+    if (length < kPrefixMax) return HpackLengthOctets::constant<1>();
+    const i64 remainder = static_cast<i64>(length) - kPrefixMax;
+    if (remainder < (i64{1} << 7)) return HpackLengthOctets::constant<2>();
+    if (remainder < (i64{1} << 14)) return HpackLengthOctets::constant<3>();
+    if (remainder < (i64{1} << 21)) return HpackLengthOctets::constant<4>();
+    if (remainder < (i64{1} << 28)) return HpackLengthOctets::constant<5>();
+    return HpackLengthOctets::constant<6>();
 }
 
+static_assert(hpack_length_octets(126).value() == 1 && hpack_length_octets(127).value() == 2);
+static_assert(hpack_length_octets(UINT32_MAX).value() == 6);
+
 constexpr i64 hpack_field_overhead(u32 name_len, u32 value_len) {
-    return 1 + hpack_integer_octets(name_len, 7) + hpack_integer_octets(value_len, 7);
+    return 1 + hpack_length_octets(name_len).value() + hpack_length_octets(value_len).value();
 }
 }  // namespace
 
@@ -1125,9 +1137,7 @@ static Http2Error handle_frame(Http2Conn& c,
             if (h.length != 4) return Http2Error::FrameSizeError;
             const u32 kInc = read_u32(payload) & 0x7fffffffu;
             if (h.stream_id == 0) {
-                if (kInc == 0) return Http2Error::ProtocolError;
-                c.conn_send_window += static_cast<i64>(kInc);
-                if (c.conn_send_window > kMaxWindow) return Http2Error::FlowControlError;
+                return credit_connection_window(c, kInc);
             } else {
                 Http2Stream* s = c.find_stream(h.stream_id);
                 if (!s) {

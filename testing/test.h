@@ -32,6 +32,7 @@
 //   ./test_foo --shard-index=0 --shard-count=2
 //   ./test_foo --help                # show usage
 
+#include <limits.h>
 #include <stdint.h>
 #include <unistd.h>  // write
 
@@ -126,10 +127,18 @@ inline TestCase* g_head = nullptr;
 inline TestCase** g_tail = &g_head;
 inline thread_local TestCase* g_current_test_case = nullptr;
 
+inline void increment_check_count(int& count) {
+    if (count == INT_MAX) {
+        out("test check count exceeds INT_MAX\n");
+        _exit(1);
+    }
+    ++count;
+}
+
 inline void report_external_failure(const char* file, int line, const char* expr) {
     TestCase* tc = g_current_test_case;
     if (tc == nullptr) return;
-    tc->checks_failed++;
+    increment_check_count(tc->checks_failed);
     tc->fail_file = file;
     tc->fail_line = line;
     unsigned length = 0;
@@ -156,30 +165,30 @@ inline void register_test(TestCase* tc) {
 
 // --- Check macros ---
 
-#define RUT_TEST_REPORT_FAILURE(kind, expr_str) \
-    do {                                        \
-        _tc->checks_failed++;                   \
-        _tc->fail_file = __FILE__;              \
-        _tc->fail_line = __LINE__;              \
-        _tc->fail_expr = expr_str;              \
-        ::rut::test::out("    ");               \
-        ::rut::test::out(kind);                 \
-        ::rut::test::out(": ");                 \
-        ::rut::test::out(__FILE__);             \
-        ::rut::test::out(":");                  \
-        ::rut::test::out_int(__LINE__);         \
-        ::rut::test::out(" -> ");               \
-        ::rut::test::out(expr_str);             \
-        ::rut::test::out("\n");                 \
+#define RUT_TEST_REPORT_FAILURE(kind, expr_str)                 \
+    do {                                                        \
+        ::rut::test::increment_check_count(_tc->checks_failed); \
+        _tc->fail_file = __FILE__;                              \
+        _tc->fail_line = __LINE__;                              \
+        _tc->fail_expr = expr_str;                              \
+        ::rut::test::out("    ");                               \
+        ::rut::test::out(kind);                                 \
+        ::rut::test::out(": ");                                 \
+        ::rut::test::out(__FILE__);                             \
+        ::rut::test::out(":");                                  \
+        ::rut::test::out_int(__LINE__);                         \
+        ::rut::test::out(" -> ");                               \
+        ::rut::test::out(expr_str);                             \
+        ::rut::test::out("\n");                                 \
     } while (0)
 
-#define CHECK(expr)                                  \
-    do {                                             \
-        if (expr) {                                  \
-            _tc->checks_passed++;                    \
-        } else {                                     \
-            RUT_TEST_REPORT_FAILURE("check", #expr); \
-        }                                            \
+#define CHECK(expr)                                                 \
+    do {                                                            \
+        if (expr) {                                                 \
+            ::rut::test::increment_check_count(_tc->checks_passed); \
+        } else {                                                    \
+            RUT_TEST_REPORT_FAILURE("check", #expr);                \
+        }                                                           \
     } while (0)
 
 #define CHECK_EQ(a, b) CHECK((a) == (b))
@@ -191,23 +200,23 @@ inline void register_test(TestCase* tc) {
 #define CHECK_TRUE(v) CHECK((v))
 #define CHECK_FALSE(v) CHECK(!(v))
 #define CHECK_STREQ(a, b) CHECK(::rut::test::str_eq_safe((a), (b)))
-#define CHECK_MSG(expr, msg)                       \
-    do {                                           \
-        if (expr) {                                \
-            _tc->checks_passed++;                  \
-        } else {                                   \
-            RUT_TEST_REPORT_FAILURE("check", msg); \
-        }                                          \
+#define CHECK_MSG(expr, msg)                                        \
+    do {                                                            \
+        if (expr) {                                                 \
+            ::rut::test::increment_check_count(_tc->checks_passed); \
+        } else {                                                    \
+            RUT_TEST_REPORT_FAILURE("check", msg);                  \
+        }                                                           \
     } while (0)
 
-#define REQUIRE(expr)                                  \
-    do {                                               \
-        if (expr) {                                    \
-            _tc->checks_passed++;                      \
-        } else {                                       \
-            RUT_TEST_REPORT_FAILURE("require", #expr); \
-            return;                                    \
-        }                                              \
+#define REQUIRE(expr)                                               \
+    do {                                                            \
+        if (expr) {                                                 \
+            ::rut::test::increment_check_count(_tc->checks_passed); \
+        } else {                                                    \
+            RUT_TEST_REPORT_FAILURE("require", #expr);              \
+            return;                                                 \
+        }                                                           \
     } while (0)
 
 #define REQUIRE_EQ(a, b) REQUIRE((a) == (b))
@@ -219,14 +228,14 @@ inline void register_test(TestCase* tc) {
 #define REQUIRE_TRUE(v) REQUIRE((v))
 #define REQUIRE_FALSE(v) REQUIRE(!(v))
 #define REQUIRE_STREQ(a, b) REQUIRE(::rut::test::str_eq_safe((a), (b)))
-#define REQUIRE_MSG(expr, msg)                       \
-    do {                                             \
-        if (expr) {                                  \
-            _tc->checks_passed++;                    \
-        } else {                                     \
-            RUT_TEST_REPORT_FAILURE("require", msg); \
-            return;                                  \
-        }                                            \
+#define REQUIRE_MSG(expr, msg)                                      \
+    do {                                                            \
+        if (expr) {                                                 \
+            ::rut::test::increment_check_count(_tc->checks_passed); \
+        } else {                                                    \
+            RUT_TEST_REPORT_FAILURE("require", msg);                \
+            return;                                                 \
+        }                                                           \
     } while (0)
 
 #define EXPECT(expr) CHECK(expr)

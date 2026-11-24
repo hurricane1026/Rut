@@ -259,9 +259,17 @@ jobs:
           fi
 
       - name: Build
+        id: native_build
         run: |
           ninja -C build
           ccache --show-stats
+
+      - name: Check positive integer contracts with Clang Static Analyzer
+        if: matrix.compiler == 'clang' && matrix.shard == 1
+        run: |
+          clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_positive_sum.cc \
+            -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_positive_sum.so
+          python3 scripts/check_positive_sums.py build build/check_positive_sum.so --clang clang-22
 
       - name: Audit runtime integer arithmetic
         if: matrix.compiler == 'clang' && matrix.shard == 1
@@ -371,6 +379,26 @@ jobs:
             build/ci-shard-inventory.json
             build/ci-shard-results.xml
             build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+      - name: Prove signed addition and subtraction ranges
+        if: ${{ !cancelled() && steps.native_build.outcome == 'success' && matrix.compiler == 'clang' && matrix.shard == 1 }}
+        run: |
+          clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 scripts/clang/check_signed_arithmetic.cc \
+            $(llvm-config-22 --ldflags --libs irreader passes transformutils --system-libs) -o build/check_signed_arithmetic
+          status=0
+          python3 scripts/check_signed_arithmetic.py build build/check_signed_arithmetic --clang clang-22 --report signed-arithmetic.txt || status=$?
+          if [[ -f signed-arithmetic.txt ]]; then
+            printf 'Signed arithmetic range checks found **%s** unproven sites. See the signed-arithmetic artifact for locations.\n' \
+              "$(wc -l < signed-arithmetic.txt)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+      - name: Preserve signed arithmetic report
+        uses: actions/upload-artifact@v4
+        if: always() && steps.native_build.outcome == 'success' && matrix.compiler == 'clang' && matrix.shard == 1
+        with:
+          name: signed-arithmetic-${{ matrix.build_type }}
+          path: signed-arithmetic.txt
           if-no-files-found: ignore
 
   nginx-required:

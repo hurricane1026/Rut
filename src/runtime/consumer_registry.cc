@@ -273,7 +273,8 @@ static bool authenticate(json::Document& document,
                          bool allow_mtls,
                          json::Writer& output,
                          bool injected_time = false,
-                         i64 injected_seconds = 0) {
+                         i64 injected_seconds = 0,
+                         Str remaining_fields = {}) {
     if (method.eq(lit_str("mtls")) && !allow_mtls) return false;
     Registry registry;
     if (!load(document, configuration, registry)) return false;
@@ -342,6 +343,11 @@ static bool authenticate(json::Document& document,
     output.text(lit_str(",\"groups\":"));
     const u32 kGroups = credential.groups < document.count ? credential.groups : consumer.groups;
     output.text(document.raw(kGroups));
+    if (remaining_fields.ptr) {
+        if (!output.ok) return false;
+        output.text(lit_str(",\"remaining\":"));
+        if (!json::quote(remaining_fields, output)) return false;
+    }
     output.put('}');
     return output.ok;
 }
@@ -496,21 +502,15 @@ static bool authenticate_fields(json::Document& document,
         if (static_cast<i64>(end) + 1 == static_cast<i64>(input.len)) return false;
         begin = static_cast<u32>(static_cast<i64>(end) + 1);
     }
-    if (!credential_length || !authenticate(document,
-                                            configuration,
-                                            lit_str("header"),
-                                            {credential, credential_length},
-                                            false,
-                                            output,
-                                            injected_time,
-                                            injected_seconds))
-        return false;
-    // Authentication wrote one complete identity object. Extend only on success.
-    --output.len;
-    output.text(lit_str(",\"remaining\":"));
-    if (!json::quote({remaining, remaining_length}, output)) return false;
-    output.put('}');
-    return output.ok;
+    return credential_length != 0 && authenticate(document,
+                                                  configuration,
+                                                  lit_str("header"),
+                                                  {credential, credential_length},
+                                                  false,
+                                                  output,
+                                                  injected_time,
+                                                  injected_seconds,
+                                                  {remaining, remaining_length});
 }
 
 bool consumer_registry_authenticate_fields(json::Document& document,

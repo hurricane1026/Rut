@@ -103,15 +103,17 @@ inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& resul
 
 // Elapsed microseconds between two CLOCK_MONOTONIC timespecs.
 inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
-    i64 sec_diff = static_cast<i64>(t1.tv_sec) - static_cast<i64>(t0.tv_sec);
+    u64 sec_diff;
+    if (__builtin_sub_overflow(t1.tv_sec, t0.tv_sec, &sec_diff)) return 0;
     i64 nsec_diff = static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec);
     if (nsec_diff < 0) {
-        sec_diff -= 1;
+        if (sec_diff == 0) return 0;
+        --sec_diff;
         nsec_diff += 1000000000LL;
     }
-    if (sec_diff < 0) return 0;
-    u64 total_us = static_cast<u64>(sec_diff) * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
-    return static_cast<u32>(total_us);
+    if (sec_diff > UINT32_MAX / 1000000ULL) return UINT32_MAX;
+    const u64 total_us = sec_diff * 1000000ULL + static_cast<u64>(nsec_diff) / 1000ULL;
+    return total_us > UINT32_MAX ? UINT32_MAX : static_cast<u32>(total_us);
 }
 
 // Synthetic resume values used when replaying JIT waits in the simulator.

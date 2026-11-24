@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/positive.h"
 #include "rut/common/types.h"
 #include "rut/runtime/grpc_proxy_state.h"
 #include "rut/runtime/hpack.h"
@@ -105,7 +106,7 @@ struct Http2Conn {
     hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)
     Http2Settings our_settings;
     Http2Settings peer_settings;
-    i64 conn_send_window;
+    i64 conn_send_window RUT_POSITIVE_SUM;
     i64 conn_recv_window;
     bool preface_seen;
     bool our_settings_sent;
