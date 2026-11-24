@@ -248,6 +248,15 @@ TEST(https_fetch, cancellation_timeout_clock_failure_and_endpoint_validation) {
     CHECK(!no_ca.init(bad));
 }
 
+static long long fixture_time_after(time_t now, int seconds) {
+    long long result;
+    if (__builtin_add_overflow(now, seconds, &result)) {
+        rut::test::out("HTTPS fixture timestamp exceeds range\n");
+        _exit(1);
+    }
+    return result;
+}
+
 template <typename Fixture>
 static int print_remote_fixture(bool discovery = false, bool access = false) {
     Fixture first, second;
@@ -261,7 +270,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
                   sizeof(access_claims),
                   R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-1","scope":"orders:read"})",
                   static_cast<long long>(now),
-                  static_cast<long long>(now + 600))
+                  fixture_time_after(now, 600))
             : 0;
     if (access && (claims_size <= 0 || claims_size >= static_cast<int>(sizeof(access_claims))))
         return 2;
@@ -316,7 +325,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             sizeof(altered),
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"other-client","jti":"access-bad-client","scope":"orders:read"})",
             static_cast<long long>(now),
-            static_cast<long long>(now + 600));
+            fixture_time_after(now, 600));
         if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
         const Str bad_client =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_client_bytes);
@@ -325,7 +334,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             sizeof(altered),
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-scope","scope":"orders:write"})",
             static_cast<long long>(now),
-            static_cast<long long>(now + 600));
+            fixture_time_after(now, 600));
         if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
         const Str bad_scope =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_scope_bytes);
@@ -333,8 +342,8 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             altered,
             sizeof(altered),
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-iat","scope":"orders:read"})",
-            static_cast<long long>(now + 301),
-            static_cast<long long>(now + 600));
+            fixture_time_after(now, 301),
+            fixture_time_after(now, 600));
         if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
         const Str bad_iat = first.sign(header, {altered, static_cast<u32>(length)}, bad_iat_bytes);
         length = snprintf(
@@ -342,7 +351,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             sizeof(altered),
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"","scope":"orders:read"})",
             static_cast<long long>(now),
-            static_cast<long long>(now + 600));
+            fixture_time_after(now, 600));
         if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
         const Str bad_jti = first.sign(header, {altered, static_cast<u32>(length)}, bad_jti_bytes);
         const Str bad_kid = first.sign(Fixture::unapproved_access_header, claims, bad_kid_bytes);
@@ -1451,13 +1460,13 @@ struct DnsOrigin {
             answer[sizeof(answer) - 1] = second;
             __builtin_memcpy(packet + length + sizeof(answer), answer, sizeof(answer));
         }
-        const auto kResponseSize = length + packet[7] * static_cast<ssize_t>(sizeof(answer));
+        const auto kResponseSize = static_cast<size_t>(length) + packet[7] * sizeof(answer);
         return sendto(fd,
                       packet,
                       static_cast<u32>(kResponseSize),
                       0,
                       reinterpret_cast<sockaddr*>(&peer),
-                      size) == kResponseSize;
+                      size) == static_cast<ssize_t>(kResponseSize);
     }
     ~DnsOrigin() {
         if (fd >= 0) close(fd);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -84,10 +85,10 @@ static int open_unlistened_socket(std::uint16_t& port) {
 }
 
 static int open_fd_count() {
-    int count = 0;
+    unsigned count = 0;
     for (int fd = 0; fd < 4096; ++fd)
         if (fcntl(fd, F_GETFD) >= 0) ++count;
-    return count;
+    return static_cast<int>(count);
 }
 
 static std::string valid_response() {
@@ -244,23 +245,23 @@ static bool exchange_server(const std::string& response,
 }
 
 #ifdef RUT_BOUNDED_HTTP_EXCHANGE_TEST_SEAM
-static int shutdown_calls = 0;
+static unsigned shutdown_calls = 0;
 static std::int64_t seam_now_value = 0;
 static std::int64_t seam_deadline = 0;
-static int seam_clock_calls = 0;
-static int seam_deadline_call = 0;
+static unsigned seam_clock_calls = 0;
+static unsigned seam_deadline_call = 0;
 
 static std::int64_t fixed_seam_clock() {
     return seam_now_value;
 }
 
 static std::int64_t threshold_seam_clock() {
-    ++seam_clock_calls;
+    if (seam_clock_calls < UINT_MAX) ++seam_clock_calls;
     return seam_clock_calls >= seam_deadline_call ? seam_deadline : seam_now_value;
 }
 
 static int shutdown_eintr_then_success(int fd, int how) {
-    ++shutdown_calls;
+    if (shutdown_calls < UINT_MAX) ++shutdown_calls;
     if (shutdown_calls == 1) {
         errno = EINTR;
         return -1;
@@ -269,15 +270,16 @@ static int shutdown_eintr_then_success(int fd, int how) {
 }
 
 static int shutdown_not_connected(int, int) {
-    ++shutdown_calls;
+    if (shutdown_calls < UINT_MAX) ++shutdown_calls;
     errno = ENOTCONN;
     return -1;
 }
 
 static int shutdown_eintr_until_deadline(int, int) {
-    ++shutdown_calls;
+    if (shutdown_calls < UINT_MAX) ++shutdown_calls;
     errno = EINTR;
-    seam_now_value += 250000000LL;
+    if (__builtin_add_overflow(seam_now_value, 250000000LL, &seam_now_value))
+        seam_now_value = INT64_MAX;
     return -1;
 }
 #endif

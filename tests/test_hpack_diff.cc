@@ -8,6 +8,7 @@
 // Plus a shared-dynamic-table sequence (nghttp2 encoder state vs rut decoder
 // state must stay in sync across requests) and a randomized fuzz.
 
+#include "fixtures/hpack.h"
 #include "rut/runtime/hpack.h"
 #include "test.h"
 
@@ -110,9 +111,11 @@ TEST(hpack_diff, our_encode_nghttp2_inflate) {
     u8 block[4096];
     u32 bp = 0;
     for (u32 i = 0; i < kN; i++)
-        bp += hpack::encode_header(block + bp,
-                                   Str{reqs[i].name, slen(reqs[i].name)},
-                                   Str{reqs[i].value, slen(reqs[i].value)});
+        REQUIRE(rut::test::hpack_fixture::append_field(block,
+                                                       bp,
+                                                       Str{reqs[i].name, slen(reqs[i].name)},
+                                                       Str{reqs[i].value, slen(reqs[i].value)},
+                                                       hpack::encode_header));
 
     KV out[32];
     char arena[4096];
@@ -235,9 +238,11 @@ TEST(hpack_diff, fuzz_both_directions) {
         u8 block[8192];
         u32 bp = 0;
         for (u32 i = 0; i < nh; i++)
-            bp += hpack::encode_header(block + bp,
-                                       Str{kvs[i].name, slen(kvs[i].name)},
-                                       Str{kvs[i].value, slen(kvs[i].value)});
+            REQUIRE(rut::test::hpack_fixture::append_field(block,
+                                                           bp,
+                                                           Str{kvs[i].name, slen(kvs[i].name)},
+                                                           Str{kvs[i].value, slen(kvs[i].value)},
+                                                           hpack::encode_header));
         KV out[8];
         char arena[8192];
         i32 dn = nghttp2_decode(block, bp, out, arena, sizeof(arena), 8);
@@ -290,9 +295,12 @@ TEST(hpack_diff, our_indexing_encoder_vs_nghttp2_inflate) {
         u8 block[1024];
         u32 bp = 0;
         for (u32 i = 0; i < kN; i++)
-            bp += enc.encode(block + bp,
-                             Str{reqs[i].name, slen(reqs[i].name)},
-                             Str{reqs[i].value, slen(reqs[i].value)});
+            REQUIRE(rut::test::hpack_fixture::append_field(
+                block,
+                bp,
+                Str{reqs[i].name, slen(reqs[i].name)},
+                Str{reqs[i].value, slen(reqs[i].value)},
+                [&enc](u8* out, Str key, Str data) { return enc.encode(out, key, data); }));
         // Decode this block with nghttp2.
         KV out[16];
         char arena[2048];

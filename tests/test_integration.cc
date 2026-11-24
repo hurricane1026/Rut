@@ -3006,7 +3006,7 @@ TEST(active_health, stalled_probe_reaped_then_reprobed) {
     // Advance the wheel past the probe deadline (upstream_timeout=3) → reap.
     IoEvent tick{};
     tick.type = IoEventType::Timeout;
-    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    REQUIRE(!__builtin_add_overflow(loop->upstream_timeout, 1, &tick.result));
     loop->dispatch(tick);
 
     // Reaped: backend recorded down, in-flight guard cleared, slot freed.
@@ -3100,7 +3100,7 @@ TEST(active_health, probe_deadline_stays_upstream_timeout) {
     // upstream_timeout. (Pre-fix: deadline would be keepalive (60), unreached.)
     IoEvent tick{};
     tick.type = IoEventType::Timeout;
-    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    REQUIRE(!__builtin_add_overflow(loop->upstream_timeout, 1, &tick.result));
     loop->dispatch(tick);
 
     CHECK_EQ(loop->active_count(), 0u);
@@ -3497,7 +3497,7 @@ TEST(active_health, coalesced_timeout_does_not_reap_new_probe) {
     loop->health_probe_deadline_ns[uid] = 0;
     IoEvent tick{};
     tick.type = IoEventType::Timeout;
-    tick.result = static_cast<i32>(loop->upstream_timeout) + 1;
+    REQUIRE(!__builtin_add_overflow(loop->upstream_timeout, 1, &tick.result));
     loop->dispatch(tick);
 
     CHECK_EQ(loop->active_count(), 0u);
@@ -8530,7 +8530,7 @@ struct TlsIouringHarness : SmallLoop {
 
     bool process_buffered_tls_input(Connection& conn) {
         if (conn.tls_out_inflight) return false;
-        if (tls_overflow_control_flights_to_emit != 0) {
+        if (tls_overflow_control_flights_to_emit > 0) {
             if (tls_overflow_control_flights_to_emit == 2 && conn.tls_in_buf.len() > 1)
                 conn.tls_in_buf.consume(2);
             else
@@ -23659,11 +23659,11 @@ TEST(route, dsl_return_forward_enters_proxy_state) {
     // line (or the buffer fills / timeout). That makes the
     // "HTTP/1.1 502" assertion below robust against split-recv.
     char buf[1024];
-    i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
-        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+    u32 total = 0;
+    while (total < sizeof(buf)) {
+        const i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
-        total += n;
+        total += static_cast<u32>(n);
         if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
     }
     CHECK_GT(total, 0);
@@ -23741,11 +23741,11 @@ TEST(route, dsl_return_websocket_enters_proxy_state) {
     const char kReq[] = "GET /ws HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
-    i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
-        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+    u32 total = 0;
+    while (total < sizeof(buf)) {
+        const i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
-        total += n;
+        total += static_cast<u32>(n);
         if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
     }
     CHECK_GT(total, 0);
@@ -37397,11 +37397,11 @@ TEST(route, populate_route_config_binds_upstream_from_dsl) {
     const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[1024];
-    i32 total = 0;
-    while (total < static_cast<i32>(sizeof(buf))) {
-        i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
+    u32 total = 0;
+    while (total < sizeof(buf)) {
+        const i32 n = recv_timeout(c, buf + total, sizeof(buf) - total, 500);
         if (n <= 0) break;
-        total += n;
+        total += static_cast<u32>(n);
         if (buf_contains(buf, static_cast<u32>(total), "\r\n", 2)) break;
     }
     CHECK_GT(total, 0);

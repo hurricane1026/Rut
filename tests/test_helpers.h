@@ -561,7 +561,8 @@ struct AsyncMockBackend {
     }
 
     const MockOp* last_op(MockOp::Type type) const {
-        for (i32 i = static_cast<i32>(op_count) - 1; i >= 0; i--) {
+        for (u32 i = op_count; i > 0;) {
+            --i;
             if (ops[i].type == type) return &ops[i];
         }
         return nullptr;
@@ -1358,7 +1359,7 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ssize_t n = recv(fd, buf, len, 0);
         if (n >= 0) return static_cast<i32>(n);
-        if (errno != EINTR) return -errno;
+        if (errno != EINTR) return reverse_kernel_error(errno);
         if (test_mono_ms() >= deadline) {
             // Leave errno matching the synthetic timeout: callers that
             // record errno (the ws-flake setup evidence) must see EAGAIN,
@@ -1370,7 +1371,7 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
 }
 
 inline bool has_200(const char* buf, i32 n) {
-    for (i32 i = 0; i < n - 2; i++)
+    for (i64 i = 0; i + 2 < static_cast<i64>(n); ++i)
         if (buf[i] == '2' && buf[i + 1] == '0' && buf[i + 2] == '0') return true;
     return false;
 }
@@ -1407,18 +1408,14 @@ struct LoopThread {
     // Tests whose client drives a multi-round-trip conversation should set
     // this to cover the whole conversation; stop() remains the normal exit.
     i64 max_run_ms = 0;
-    static i64 mono_ms() {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
-    }
     static void* run(void* arg) {
         auto* lt = static_cast<LoopThread*>(arg);
         auto* lp = lt->loop;
         lp->backend.add_accept();
         IoEvent events[256];
-        i32 iters = 0;
-        const i64 deadline = lt->max_run_ms > 0 ? mono_ms() + lt->max_run_ms : 0;
+        i64 iters = 0;
+        const bool timed = lt->max_run_ms > 0;
+        const i64 deadline = timed ? test_deadline_after_ms(lt->max_run_ms) : 0;
         while (lp->is_running()) {
             lp->drain_ready_jit_handlers();
             u32 n = lp->backend.wait(events,
@@ -1427,8 +1424,8 @@ struct LoopThread {
                                      RealLoop::kMaxConns,
                                      lp->has_ready_jit_handlers() ? 0u : ~u32{0});
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
-            if (deadline != 0) {
-                if (mono_ms() >= deadline) break;
+            if (timed) {
+                if (test_mono_ms() >= deadline) break;
             } else if (++iters >= lt->max_iters) {
                 break;
             }

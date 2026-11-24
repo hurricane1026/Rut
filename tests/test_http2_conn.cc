@@ -4,6 +4,7 @@
 // built with the engine's own response writers (HPACK encoder), fed through
 // process(), and the decoded callbacks + emitted control frames are asserted.
 
+#include "fixtures/hpack.h"
 #include "rut/runtime/callbacks_grpc.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
@@ -2257,15 +2258,27 @@ TEST(http2_conn, duplicate_headers_block_is_decoded_before_reset) {
     enc.init(4096);
     u8 dup_block[128];
     u32 dup_len = 0;
-    dup_len += enc.encode(dup_block + dup_len, Str{"x-seen", 6}, Str{"v", 1});
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        dup_block, dup_len, Str{"x-seen", 6}, Str{"v", 1}, [&enc](u8* out, Str key, Str data) {
+            return enc.encode(out, key, data);
+        }));
     fn += put_frame(
         frame + fn, Http2FrameType::Headers, http2_flag::kEndHeaders, 1, dup_block, dup_len);
 
     u8 next_block[256];
     u32 next_len = 0;
-    next_len += enc.encode(next_block + next_len, Str{":method", 7}, Str{"GET", 3});
-    next_len += enc.encode(next_block + next_len, Str{":path", 5}, Str{"/", 1});
-    next_len += enc.encode(next_block + next_len, Str{"x-seen", 6}, Str{"v", 1});
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        next_block, next_len, Str{":method", 7}, Str{"GET", 3}, [&enc](u8* out, Str key, Str data) {
+            return enc.encode(out, key, data);
+        }));
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        next_block, next_len, Str{":path", 5}, Str{"/", 1}, [&enc](u8* out, Str key, Str data) {
+            return enc.encode(out, key, data);
+        }));
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        next_block, next_len, Str{"x-seen", 6}, Str{"v", 1}, [&enc](u8* out, Str key, Str data) {
+            return enc.encode(out, key, data);
+        }));
     fn += put_frame(frame + fn,
                     Http2FrameType::Headers,
                     http2_flag::kEndHeaders | http2_flag::kEndStream,
