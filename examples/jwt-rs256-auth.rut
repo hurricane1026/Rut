@@ -9,6 +9,8 @@
 // Adopt replacement configuration to update revocation; old readers keep old policy.
 // Optional remoteJwks config pins IPv4, TLS hostname, CA, path and cache deadlines;
 // remote mode rejects until its first successful fetch. See docs/language-card.md.
+// Optional "admitNewKids":true trusts matching RS256 keys from that authenticated
+// set and permits "kids":[] with no bootstrap keys; other algorithms are ignored.
 // Keys must explicitly declare alg=RS256. Never populate policy from a request.
 import "middleware/auth.rut"
 

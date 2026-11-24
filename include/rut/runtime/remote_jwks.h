@@ -30,6 +30,9 @@ struct RemoteJwks {
     u32 max_retry_seconds = 0;
     u32 max_retry_after_seconds = 0;
     bool require_non_empty_keys = false;
+    // Opt in to importing every matching key from the authenticated refresh set,
+    // not only the bootstrap-approved IDs. Requires the remote profile.
+    bool admit_new_kids = false;
     bool conditional_requests = false;
     bool conditional_discovery = false;
     u32 max_age_seconds = 0;

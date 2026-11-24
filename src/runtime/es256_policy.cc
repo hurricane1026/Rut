@@ -111,11 +111,15 @@ bool Es256Policy::load(Str configuration) {
         approved[count] = {ids[count], id.len};
         ++count;
     }
+    // New-kid admission may start with no bootstrap keys; the authenticated
+    // first refresh installs the initial verifier bank.
+    if (!count) return remote_configuration.admit_new_kids;
     return import_jwks(document.raw(jwks), issuer(), audience(), approved, count);
 }
 
 bool Es256Policy::permits(json::Document& document) const {
-    if (!key_set.valid() || !document.valid || document.nodes[0].kind != json::Kind::Object)
+    if ((!key_set.valid() && !remote_configuration.enabled()) || !document.valid ||
+        document.nodes[0].kind != json::Kind::Object)
         return false;
     if (!require_jti && !issued_after) return true;
     bool has_jti = false;
@@ -143,7 +147,8 @@ bool Es256Policy::permits(json::Document& document) const {
 }
 
 Es256Policy::Refresh Es256Policy::prepare_refresh(Str jwks, Es256KeySet& output) const {
-    if (!key_set.valid() || output.valid()) return Refresh::Invalid;
+    if (output.valid() || (!key_set.valid() && !remote_configuration.admit_new_kids))
+        return Refresh::Invalid;
     json::Document document;
     if (!document.parse(jwks) || document.nodes[0].kind != json::Kind::Object)
         return Refresh::Invalid;
@@ -159,15 +164,30 @@ Es256Policy::Refresh Es256Policy::prepare_refresh(Str jwks, Es256KeySet& output)
     u32 lengths[Es256KeySet::kMaxKeys];
     Str approved[Es256KeySet::kMaxKeys];
     u32 count = 0, selected = 0;
+    const auto member_equals = [&](u32 member, const char* expected) {
+        if (member == json::kNone) return false;
+        json::Writer value{document.other};
+        if (!document.string(member, value)) return false;
+        return Str{document.other, value.len}.eq(
+            {expected, static_cast<u32>(__builtin_strlen(expected))});
+    };
     for (u32 n = document.nodes[entries].child; n != json::kNone; n = document.nodes[n].next) {
         if (count == Es256KeySet::kMaxKeys || document.nodes[n].kind != json::Kind::Object)
             return Refresh::Invalid;
         u32 kid = json::kNone;
+        u32 kty = json::kNone;
+        u32 alg = json::kNone;
         for (u32 member = document.nodes[n].child; member != json::kNone;
              member = document.nodes[member].next) {
             json::Writer name{document.scratch};
             if (!document.string(document.nodes[member].key, name)) return Refresh::Invalid;
-            if (Str{document.scratch, name.len}.eq(lit_str("kid"))) kid = member;
+            const Str kKey{document.scratch, name.len};
+            if (kKey.eq(lit_str("kid")))
+                kid = member;
+            else if (kKey.eq(lit_str("kty")))
+                kty = member;
+            else if (kKey.eq(lit_str("alg")))
+                alg = member;
         }
         if (kid == json::kNone) return Refresh::Invalid;
         json::Writer id{ids[count], sizeof(ids[count])};
@@ -176,8 +196,15 @@ Es256Policy::Refresh Es256Policy::prepare_refresh(Str jwks, Es256KeySet& output)
         for (u32 i = 0; i < count; ++i)
             if (kValue.eq({ids[i], lengths[i]})) return Refresh::Invalid;
         lengths[count++] = id.len;
-        for (u32 i = 0; i < key_set.size(); ++i) {
-            if (kValue.eq(key_set.kid_at(i))) approved[selected++] = key_set.kid_at(i);
+        if (remote_configuration.admit_new_kids) {
+            // The authenticated set defines the trusted inventory. Other
+            // algorithms in the same provider set are ignored, not admitted.
+            if (member_equals(kty, "EC") && member_equals(alg, "ES256"))
+                approved[selected++] = {ids[count - 1], id.len};
+        } else {
+            for (u32 i = 0; i < key_set.size(); ++i) {
+                if (kValue.eq(key_set.kid_at(i))) approved[selected++] = key_set.kid_at(i);
+            }
         }
     }
     if (!selected) return Refresh::Empty;
@@ -237,7 +264,9 @@ bool Es256Policies::activate(u32 shard) {
     if (row.attempted) return row.ready;
     row.attempted = true;
     for (u32 i = 0; i < count; ++i) {
-        if (!row.verifiers[i].init(policies[i].keys())) {
+        // New-kid admission may publish an empty bootstrap bank until the
+        // authenticated first refresh installs keys.
+        if (policies[i].keys().valid() && !row.verifiers[i].init(policies[i].keys())) {
             for (u32 j = 0; j <= i; ++j) row.verifiers[j].reset();
             return false;
         }

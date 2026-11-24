@@ -560,6 +560,172 @@ TEST(https_fetch, es256_remote_key_import_checks_complete_set_and_never_expands_
     remote_key_import<test::Es256Fixture, Es256Policy, Es256KeySet>(_tc);
 }
 
+static Str replace_once(Str input, Str from, Str to, char* output, u32 capacity) {
+    if (!from.len || input.len < from.len) return {};
+    u32 position = 0;
+    bool found = false;
+    for (u32 i = 0; i + from.len <= input.len; ++i) {
+        bool match = true;
+        for (u32 j = 0; j < from.len; ++j) {
+            if (input.ptr[i + j] != from.ptr[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            position = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return {};
+    const u32 size = input.len - from.len + to.len;
+    if (size > capacity) return {};
+    __builtin_memcpy(output, input.ptr, position);
+    __builtin_memcpy(output + position, to.ptr, to.len);
+    __builtin_memcpy(output + position + to.len,
+                     input.ptr + position + from.len,
+                     input.len - position - from.len);
+    return {output, size};
+}
+
+template <typename Fixture, typename Policy, typename Policies>
+static void remote_new_kid_admission(test::TestCase* _tc) {
+    Fixture rotated;
+    REQUIRE(rotated.init());
+    json::Document document;
+    char renamed[4096], mixed[4096], response[8192], configuration[8192];
+    char malformed[8192], empty[8192];
+    const Str jwks = fixture_jwks(rotated, document);
+    REQUIRE(jwks.len);
+    const Str renamed_jwks = replace_once(jwks,
+                                          lit_str(R"("kid":"current")"),
+                                          lit_str(R"("kid":"rotated")"),
+                                          renamed,
+                                          sizeof(renamed));
+    REQUIRE(renamed_jwks.len);
+    // A provider set may carry another algorithm for unrelated consumers. It
+    // must neither enter this policy nor fail an otherwise valid refresh.
+    const Str mixed_jwks =
+        replace_once(renamed_jwks,
+                     lit_str("]}"),
+                     lit_str(R"(,{"kid":"unrelated","kty":"oct","alg":"HS256","k":"AA"}]})"),
+                     mixed,
+                     sizeof(mixed));
+    REQUIRE(mixed_jwks.len);
+    const Str body = json_response(mixed_jwks, response, sizeof(response));
+    REQUIRE(body.len);
+    TlsOrigin origin;
+    origin.count = 3;
+    origin.responses[0] = body;
+    origin.responses[1] = json_response(lit_str("{bad"), malformed, sizeof(malformed));
+    origin.responses[2] = json_response(lit_str(R"({"keys":[]})"), empty, sizeof(empty));
+    REQUIRE(origin.responses[1].len && origin.responses[2].len);
+    REQUIRE(origin.init());
+    const int size =
+        snprintf(configuration,
+                 sizeof(configuration),
+                 R"({"issuer":"issuer","audience":"gateway","kids":[],"jwks":{"keys":[]},)"
+                 R"("remoteJwks":{"address":"127.0.0.1","port":%u,"serverName":"localhost",)"
+                 R"("ca":"%s","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,)"
+                 R"("timeoutSeconds":5,"admitNewKids":true}})",
+                 origin.port,
+                 RUT_TESTDATA_DIR "/localhost_cert.pem");
+    REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(configuration));
+    const Str policy_bytes{configuration, static_cast<u32>(size)};
+    Policy policy;
+    REQUIRE(policy.load(policy_bytes));
+    CHECK(!policy.keys().valid());
+    Policies policies;
+    REQUIRE(policies.load(&policy_bytes, 1));
+    REQUIRE(policies.activate(0));
+    char token_bytes[4096], payload[8192], admitted_header[128];
+    const Str admitted_header_bytes = replace_once(Fixture::header,
+                                                   lit_str(R"("kid":"current")"),
+                                                   lit_str(R"("kid":"rotated")"),
+                                                   admitted_header,
+                                                   sizeof(admitted_header));
+    REQUIRE(admitted_header_bytes.len);
+    const Str admitted = rotated.sign(admitted_header_bytes, Fixture::claims, token_bytes);
+    REQUIRE(admitted.len);
+    char stale_bytes[4096];
+    const Str stale = rotated.sign(Fixture::header, Fixture::claims, stale_bytes);
+    REQUIRE(stale.len);
+    u32 length = 9;
+    CHECK(!policies.verify(
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+    CHECK_EQ(length, 0u);
+    const auto refresh = [&](u64 now, u32 expected) {
+        u32 completed = 0;
+        for (u32 i = 0; i < 3000; ++i) {
+            policies.maintain(0, now);
+            if (__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE) >= expected && ++completed == 100)
+                return true;
+            usleep(1000);
+        }
+        return false;
+    };
+    REQUIRE(refresh(100, 1));
+    CHECK(policies.verify(
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+    CHECK(!policies.verify(
+        0, policy_bytes, document, stale, 100, payload, sizeof(payload), length, 100));
+    // A malformed refresh keeps the admitted bank only within its original age.
+    REQUIRE(refresh(1100, 2));
+    CHECK(policies.verify(
+        0, policy_bytes, document, admitted, 1100, payload, sizeof(payload), length, 1100));
+    CHECK(!policies.verify(
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+    // An authoritative empty set removes the admitted keys immediately.
+    REQUIRE(refresh(2100, 3));
+    CHECK(!policies.verify(
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+    policies.cancel(0);
+}
+
+TEST(https_fetch, remote_new_kid_admission_installs_only_authenticated_matching_keys) {
+    remote_new_kid_admission<test::Rs256Fixture, Rs256Policy, Rs256Policies>(_tc);
+}
+
+TEST(https_fetch, es256_remote_new_kid_admission_installs_only_authenticated_matching_keys) {
+    remote_new_kid_admission<test::Es256Fixture, Es256Policy, Es256Policies>(_tc);
+}
+
+template <typename Policy>
+static void remote_admission_configuration(test::TestCase* _tc) {
+    const char* configurations[] = {
+        R"({"issuer":"issuer","audience":"gateway","kids":[],"jwks":{"keys":[]},)"
+        R"("remoteJwks":{"address":"127.0.0.1","port":443,"serverName":"localhost",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,)"
+        R"("timeoutSeconds":5}})",
+        R"({"issuer":"issuer","audience":"gateway","kids":[],"jwks":{"keys":[]},)"
+        R"("remoteJwks":{"address":"127.0.0.1","port":443,"serverName":"localhost",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,)"
+        R"("timeoutSeconds":5,"admitNewKids":true}})",
+        R"({"issuer":"issuer","audience":"gateway","kids":[],"jwks":{"keys":[]},)"
+        R"("remoteJwks":{"address":"127.0.0.1","port":443,"serverName":"localhost",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,)"
+        R"("timeoutSeconds":5,"admitNewKids":1}})",
+        R"({"issuer":"issuer","audience":"gateway","kids":[],"jwks":{"keys":[]},)"
+        R"("remoteJwks":{"address":"127.0.0.1","port":443,"serverName":"localhost",)"
+        R"("ca":"ca.pem","path":"/keys","refreshSeconds":1,"maxAgeSeconds":2,)"
+        R"("timeoutSeconds":5,"admitNewKids":false}})",
+    };
+    for (u32 i = 0; i < sizeof(configurations) / sizeof(configurations[0]); ++i) {
+        Policy policy;
+        const char* value = configurations[i];
+        CHECK_EQ(policy.load({value, static_cast<u32>(strlen(value))}), i == 1);
+    }
+}
+
+TEST(https_fetch, remote_new_kid_admission_requires_explicit_boolean_opt_in) {
+    remote_admission_configuration<Rs256Policy>(_tc);
+}
+
+TEST(https_fetch, es256_remote_new_kid_admission_requires_explicit_boolean_opt_in) {
+    remote_admission_configuration<Es256Policy>(_tc);
+}
+
 TEST(https_fetch, es256_refresh_rejects_invalid_selected_key_material) {
     test::Es256Fixture fixture;
     REQUIRE(fixture.init());

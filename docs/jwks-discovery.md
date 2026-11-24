@@ -12,6 +12,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "maxAgeSeconds": 120, "timeoutSeconds": 10,
   "dnsTimeoutSeconds": 2, "discoveryTimeoutSeconds": 3,
   "conditionalRequests": true, "conditionalDiscovery": true,
+  "admitNewKids": true,
   "discoveryCacheSeconds": 30,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
@@ -140,6 +141,30 @@ This option delays the effect of an authoritative empty set until expiry, so use
 it only when that availability and revocation tradeoff is intended. It never
 admits unapproved kids or extends maximum age.
 
+## Optional new-kid admission
+
+`admitNewKids` is an optional Boolean, default false, and is valid only with the
+remote key profile. When true, the authenticated refresh response defines the
+trusted inventory: every entry whose `kty` and `alg` match this policy
+(`RSA`/`RS256` or `EC`/`ES256`) is imported, whether or not its decoded `kid`
+appeared in the bootstrap `kids`. Entries for other algorithms in the same
+provider set are ignored rather than admitted. A matching entry that fails the
+fixed key profile rejects the whole refresh; it never partially expands trust.
+
+With admission enabled, the bootstrap `kids` array may be empty and the local
+`jwks` object supplies no keys. Remote mode still rejects every token until the
+first successful authenticated fetch installs the initial verifier bank. A
+nonempty bootstrap list keeps the previous behavior as a cold-start seed.
+Admission never relaxes the exact HTTPS endpoint, TLS server-name/CA
+authentication, issuer/JWKS-URI discovery checks, the 8192-byte/16-entry set
+bound, unique nonempty `kid` bytes, or the fixed public-key profile. Fetch
+failures, malformed sets, ambiguous IDs and empty intersections remain failures;
+the last accepted bank is used only within its original maximum age.
+`requireNonEmptyKeys` still applies, and removed keys disappear with the next
+authoritative set. Tokens never select keys, trigger a fetch, add algorithms or
+extend cache lifetime. See the tests for mixed-algorithm sets, opt-in
+validation and a bootstrap-free first refresh.
+
 ## Conditional key refresh
 
 Optional `conditionalRequests` is a Boolean, defaulting to false. The default
@@ -158,7 +183,8 @@ The tag and selected IP address are owned by one policy/shard and tied to that
 accepted representation. A later key GET sends `If-None-Match` only on its initial
 candidate, at that same address, while the accepted cache remains fresh. Changed
 addresses and failover candidates always receive unconditional GETs. TLS name,
-CA, issuer, path and approved kid inventory remain configuration-owned.
+CA, issuer, path and the approved or opt-in algorithm-bounded key inventory
+remain configuration-owned.
 
 An authenticated 304 must contain exactly one strong ETag matching the exact
 validator actually sent. A 304 is bodyless. Transfer-Encoding is rejected and
@@ -275,6 +301,8 @@ Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
 The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
 a disallowed destination and recovery with rotated keys on both Linux backends.
-Other DNS transports, automatic kid inventory and full OIDC workflows remain
-open under #1077. A discovery origin with a rotating DNS name is not part of the
-separately configured fixed-address profile.
+Other DNS transports and full OIDC workflows remain
+open under #1077. New-kid admission is opt-in and limited to algorithm-matching
+entries from the authenticated set; it does not expand the destination or
+algorithm trust boundary. A discovery origin with a rotating DNS name is not part
+of the separately configured fixed-address profile.

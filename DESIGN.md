@@ -10371,8 +10371,10 @@ and ES256 policies without a new language keyword, dependency or handler ABI.
 See the language card for exact syntax and bounds. A fixed IPv4 endpoint, CA file,
 certificate hostname and origin-form path define a trusted TLS GET. No Token
 field selects endpoints/algorithms or triggers refresh. Initial JWKS keys only
-establish the approved kid inventory in remote mode; no token verifies before
-the first authenticated successful fetch.
+establish the approved kid inventory in remote mode; with opt-in `admitNewKids`
+that bootstrap inventory may be empty and the first authenticated set installs
+matching-algorithm keys. No token verifies before the first authenticated
+successful fetch.
 
 `HttpsFetch` is a reusable bounded cold maintenance task. It reuses the pinned
 OpenSSL client, HTTP response parser and chunk decoder. Its connection proceeds
@@ -10442,9 +10444,8 @@ loops use the same maintenance hook. Config replacement cancels the retiring sha
 fetch while preserving its RCU-owned keys for existing readers until expiration;
 shutdown/destruction close resources. No blocking DNS/network operation, request-
 time key parsing, coroutine, virtual dispatch, external HTTP client library or
-cross-shard mutable cache is introduced. New-kid auto-admission,
-HTTP/2 origin fetching and distributed refresh coordination remain outside this
-bounded profile.
+cross-shard mutable cache is introduced. HTTP/2 origin fetching and distributed
+refresh coordination remain outside this bounded profile.
 
 ### Native password-storage foundation
 
@@ -11445,6 +11446,10 @@ The UDP resolver and HTTPS endpoint each support bare IPv4 or IPv6 literals.
 The allowlist rejects duplicate binary addresses at configuration load. Optional
 `requireNonEmptyKeys` treats a zero-approved-key refresh as failure, retaining
 last-good keys only within their original maximum age; the default removes keys.
+Optional `admitNewKids` lets the authenticated set admit matching new kids and
+allows an empty bootstrap inventory. Other algorithms are ignored, while any
+matching entry that fails the fixed key profile rejects the whole refresh. No
+request- or token-selected destination, key or algorithm is introduced.
 
 Optional `dnsCacheSeconds` caps reuse of the fully validated address set by its
 shortest record TTL and the configured limit. The set is owned by the shard

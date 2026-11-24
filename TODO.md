@@ -723,7 +723,9 @@ canonical spelling for common gateway tasks.
   最大年龄拒绝和取消回收；只导入预先批准 kid，不按 Token 触发请求。
 - [x] JWKS A/AAAA DNS（含 CNAME、TTL 缓存、地址 allowlist）、精确 issuer/
   JWKS-URI discovery、条件请求与退避，以及独立固定 discovery origin。
-- [ ] 自动新 kid 准入、其他 DNS 传输与缓存 profile 仍需验收。
+- [x] 可选自动新 kid 准入：仅信任已认证刷新端点中算法匹配的键，支持空 bootstrap
+  清单、忽略其他算法并拒绝不合格匹配键；仍受原有大小、缓存与重试边界。
+- [ ] 其他 DNS 传输与缓存 profile 仍需验收。
 
 - [x] 通用 MD5、SHA-1/224/256/384/512 及对应 HMAC：固定函数名选择算法，
   返回 `str?` 小写 hex；输入有界、request arena 拥有结果；JWT/Webhook 共用底座。
@@ -915,6 +917,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Bounded A/AAAA DNS, CNAME, issuer/JWKS-URI discovery, optional separately
   trusted fixed discovery origin and configured IP allowlists for RS256/ES256
   refresh, with existing monotonic cache expiry.
+- [x] Opt-in authenticated RS256/ES256 new-kid admission from the configured
+  refresh set, with an empty bootstrap inventory, mixed-algorithm filtering,
+  fixed key-profile validation and existing cache/retry bounds.
 - [x] Explicit bounded query/form Consumer raw-key authentication with decoded
   duplicate rejection and sanitized fields for rebuilt HTTPS requests.
 - [x] Offline Consumer administration with full-record upserts, removal, disabled
@@ -931,8 +936,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [ ] Remaining #1072 interfaces include online administrative management and
   online scheduling/revocation publication.
 - [ ] Replicated persistence/failover verification for the replay authority beyond
-  the tested single-instance intact-AOF recovery profile;
-  broad DNS profiles/automatic kid onboarding remain separately scoped.
+  the tested single-instance intact-AOF recovery profile; broader DNS
+  transports remain separately scoped.
 - [ ] Online signing-key refresh and replicated key coordination remain separate.
 
 Contracts and executable coverage: `docs/consumer-registry.md`,

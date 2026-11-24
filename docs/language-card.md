@@ -3024,7 +3024,9 @@ conditional and trusted DNS/discovery settings described below:
 ```
 
 The enclosing policy still requires `issuer`, `audience`, `kids` and `jwks`.
-The initial public JWKS validates the explicitly approved kid inventory; remote
+With `admitNewKids` the `kids` array may be empty and `jwks` may contain no
+bootstrap keys. The initial public JWKS validates the explicitly approved kid
+inventory; remote
 mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a bare IPv4 or IPv6
@@ -3033,7 +3035,10 @@ DNS with CNAME chains. The default `dnsRecordType` is `"A"`. Choose `"AAAA"`
 to use an IPv6 allowlist. Duplicate addresses, including equivalent IPv6 spellings, fail
 configuration validation. Optional `requireNonEmptyKeys` rejects refreshes
 with no approved keys and keeps the last snapshot only within its original maximum
-age; its default is false. Optional
+age; its default is false. Optional `admitNewKids` lets the authenticated refresh
+inventory admit new matching RS256/ES256 kids and permits an empty bootstrap
+`kids` array; other algorithms are ignored, and every admitted key must still
+satisfy the fixed public-key profile. Optional
 `discoveryPath`/`discoveryIssuer` enable exact issuer and pre-authorized JWKS URI
 validation. Optional `discoveryAddress`, `discoveryPort`, `discoveryServerName`
 and `discoveryCa` move discovery to a separately trusted fixed TLS origin. The
@@ -3102,10 +3107,13 @@ Cache-Control-derived lifetimes, HTTP/2 origin fetches and compressed responses
 remain outside this profile.
 
 A fetched set contains at most 16 objects with distinct nonempty bounded kids.
-Only the intersection with the configured approved kids can become trusted;
-unknown keys never expand trust. Selected keys retain their algorithm-specific
-strict RS256 or ES256 public JWK profile. Preapprove future kids through
-replacement configuration before rotating to them. An otherwise valid empty
+By default only the intersection with the configured approved kids can become
+trusted; unknown keys never expand trust. Opt-in `admitNewKids` instead trusts
+every entry whose `kty`/`alg` matches this policy from the authenticated set,
+permits an empty bootstrap `kids` array and ignores other algorithms. Selected
+keys retain their algorithm-specific strict RS256 or ES256 public JWK profile.
+Preapprove future kids through replacement configuration before rotating to them
+when admission is off. An otherwise valid empty
 intersection is authoritative removal and immediately denies all tokens, rather
 than falling back to old keys.
 
@@ -3134,7 +3142,8 @@ accept the same trusted compile-time four-field policy shape as RS256: `issuer`,
 `audience`, approved `kids`, and a local public `jwks`. Optional `revokedJtis`
 and `issuedAfter` have the same immutable snapshot semantics. Optional
 `remoteJwks` uses the bounded authenticated HTTPS refresh contract above,
-including its eight endpoint fields, approved-kid intersection and maximum age.
+including its eight endpoint fields, approved-kid intersection (or opt-in
+`admitNewKids` inventory), and maximum age.
 Remote mode rejects tokens until the first successful authenticated fetch;
 selected keys must satisfy the ES256 public JWK profile below.
 

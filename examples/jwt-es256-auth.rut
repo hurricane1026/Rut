@@ -8,6 +8,8 @@
 // Optional revokedJtis/issuedAfter are immutable revocation snapshots.
 // Optional remoteJwks uses the same eight-field bounded HTTPS profile as RS256.
 // Initial keys approve IDs; remote mode denies until its first successful fetch.
+// Optional "admitNewKids":true trusts matching ES256 keys from the authenticated
+// set and permits an empty bootstrap kids list; other algorithms are ignored.
 import "middleware/auth.rut"
 
 route GET "/orders" {
