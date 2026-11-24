@@ -204,8 +204,8 @@ match status {                            // general dispatch — no `case` keyw
 
 for item in [1, 2, 3] {                   // static array literal or route-local alias,
                                           // unrolled at compile time; no runtime iterables
-    guard item > 0 else { return 400 }    // break/continue only as body stmt or guard else;
-                                          // still no while
+    guard item > 0 else { return 400 }    // break/continue: body stmt, guard else,
+                                          // single-stmt if branch; still no while
 }
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)

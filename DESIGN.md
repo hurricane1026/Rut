@@ -362,8 +362,12 @@ construct.
 Likewise, `if const` is the lightweight compile-time boolean branch.
 
 The current implementation covers the route-local static array subset and lowers
-supported shapes by compile-time unrolling. For that implemented subset, see
-[docs/for-loops.md](docs/for-loops.md).
+supported shapes by compile-time unrolling. `break`/`continue` are accepted as
+direct loop-body statements, as a `guard ... else` failure path, and as
+single-statement `if` branches (each branch must end the iteration with a route
+terminator, `break`, or `continue`); loop-body `match` arms, `if let`, and bodies
+that mix loop control with an unconditional route terminator remain absent. For
+that implemented subset, see [docs/for-loops.md](docs/for-loops.md).
 
 ### 3.3 Type System
 
