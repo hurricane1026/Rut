@@ -124,15 +124,15 @@ uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
     if (!*input || !*output || !*scratch || !*mont || !BN_MONT_CTX_set(*mont, *modulus, *scratch))
         goto fail;
     const int bits = BN_num_bits(*modulus);
-    if (bits < 0 || bits > INT_MAX - 64) goto fail;
-    const int workspace_bits = (int)((int64_t)bits + 64);
-    if (!BN_set_bit(*input, workspace_bits) || !BN_set_bit(*output, workspace_bits) ||
+    // The only caller uses a loaded RsaPublicKey, whose loader admits 2048–4096 bits.
+    if (bits > INT_MAX - 64) __builtin_unreachable();
+    if (!BN_set_bit(*input, bits + 64) || !BN_set_bit(*output, bits + 64) ||
         !BN_copy(*input, *modulus) || !BN_sub_word(*input, 1) ||
         !BN_mod_exp_mont(*output, *input, *exponent, *modulus, *scratch, *mont))
         goto fail;
     BN_zero(*input);
     BN_zero(*output);
-    *bytes = (uint32_t)(((int64_t)bits + 7) / 8);
+    *bytes = (uint32_t)((bits + 7) / 8);
     return 1;
 fail:
     rut_crypto_rsa_workspace_reset_internal(

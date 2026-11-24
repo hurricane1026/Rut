@@ -781,7 +781,11 @@ bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
         if (!policy_enabled(doc, record)) continue;
         const i64 start = policy_time(doc, record, lit_str("notBefore"));
         const i64 end = policy_time(doc, record, lit_str("expiresAt"));
-        if (!start || !end || static_cast<__int128_t>(end) - start > maximum) return false;
+        if (!start || !end) return false;
+        // The schema validator accepts only positive Unix seconds.
+        i64 lifetime = 0;
+        if (__builtin_sub_overflow(end, start, &lifetime)) __builtin_unreachable();
+        if (lifetime > maximum) return false;
     }
     return true;
 }
@@ -792,10 +796,11 @@ bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
     auto& doc = snapshot.registry;
     for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
          record = doc.nodes[record].next) {
-        if (policy_enabled(doc, record) &&
-            static_cast<__int128_t>(policy_time(doc, record, lit_str("expiresAt"))) - snapshot.now <
-                minimum)
-            return false;
+        if (!policy_enabled(doc, record)) continue;
+        const i64 expires_at = policy_time(doc, record, lit_str("expiresAt"));
+        // Missing timestamps are zero. The CLI validates the evaluation time.
+        if (expires_at < 0 || snapshot.now < 0) __builtin_unreachable();
+        if (expires_at - snapshot.now < minimum) return false;
     }
     return true;
 }

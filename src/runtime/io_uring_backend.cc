@@ -91,20 +91,27 @@ static constexpr u32 kCancelConnId = 0xFFFFFD;
 
 // --- Syscall wrappers (no liburing) ---
 
+// libc puts a positive error number in errno for a failed syscall.
+static i32 negative_syscall_errno() {
+    const i32 code = errno;
+    if (code == INT32_MIN) __builtin_unreachable();
+    return -code;
+}
+
 static i32 io_uring_setup(u32 entries, struct io_uring_params* p) {
     i32 ret = static_cast<i32>(syscall(__NR_io_uring_setup, static_cast<long>(entries), p));
-    return ret >= 0 ? ret : reverse_kernel_error(errno);
+    return ret >= 0 ? ret : negative_syscall_errno();
 }
 
 static i32 io_uring_enter(i32 fd, u32 to_submit, u32 min_complete, u32 flags) {
     i32 ret = static_cast<i32>(
         syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, nullptr, 0));
-    return ret >= 0 ? ret : reverse_kernel_error(errno);
+    return ret >= 0 ? ret : negative_syscall_errno();
 }
 
 static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
     i32 ret = static_cast<i32>(syscall(__NR_io_uring_register, fd, opcode, arg, nr_args));
-    return ret >= 0 ? ret : reverse_kernel_error(errno);
+    return ret >= 0 ? ret : negative_syscall_errno();
 }
 
 // --- user_data encoding ---
@@ -2131,7 +2138,7 @@ u32 IoUringBackend::wait(
                             ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) -
                                                             static_cast<i64>(sent));
                         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                            result = reverse_kernel_error(errno);
+                            result = negative_syscall_errno();
                         }
                     }
                 }

@@ -15,7 +15,7 @@ inline bool content_length_line(const u8* data, u32 header_end, u32* line_start,
     while (position + 1 < kHeaderEnd && !(data[position] == '\r' && data[position + 1] == '\n'))
         ++position;
     if (position + 1 >= kHeaderEnd) return false;
-    position = static_cast<i64>(static_cast<__int128_t>(position) + 2);
+    if (__builtin_add_overflow(position, 2, &position)) __builtin_unreachable();
     u32 found = 0;
     while (position < kHeaderEnd) {
         const i64 start = position;
@@ -23,12 +23,15 @@ inline bool content_length_line(const u8* data, u32 header_end, u32* line_start,
             ++position;
         if (position + 1 >= kHeaderEnd) return false;
         const i64 end = position;
-        position = static_cast<i64>(static_cast<__int128_t>(position) + 2);
+        if (__builtin_add_overflow(position, 2, &position)) __builtin_unreachable();
         i64 colon = start;
         while (colon < end && data[colon] != ':') ++colon;
         if (colon == end) continue;
+        // Both cursors lie within the validated header length.
+        i64 name_length = 0;
+        if (__builtin_sub_overflow(colon, start, &name_length)) __builtin_unreachable();
         if (!http_header_name_eq_ci(reinterpret_cast<const char*>(data + start),
-                                    static_cast<u32>(static_cast<__int128_t>(colon) - start),
+                                    static_cast<u32>(name_length),
                                     "Content-Length",
                                     14))
             continue;

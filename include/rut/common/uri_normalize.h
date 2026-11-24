@@ -23,58 +23,61 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
                value == '~';
     };
     static constexpr char kHex[] = "0123456789ABCDEF";
-    u32 path_end = 0;
+    i64 path_end = 0;
     while (path_end < static_cast<i64>(input.len) && input.ptr[path_end] != '?') ++path_end;
-    u32 decoded = 0;
-    for (u32 i = 0; i < path_end; ++i) {
+    // Decoding and compaction only advance within the u32-sized input.
+    const auto next_output = [](i64& index) {
+        if (index == INT64_MAX) __builtin_unreachable();
+        return index++;
+    };
+    i64 decoded = 0;
+    for (i64 i = 0; i < path_end; ++i) {
+        if (i > INT64_MAX - 3) __builtin_unreachable();
         if (input.ptr[i] != '%') {
-            output[decoded++] = input.ptr[i];
+            output[next_output(decoded)] = input.ptr[i];
             continue;
         }
-        const u8 kValue = static_cast<u8>((hex(input.ptr[static_cast<i64>(i) + 1]) << 4) |
-                                          hex(input.ptr[static_cast<i64>(i) + 2]));
+        const u8 kValue = static_cast<u8>((hex(input.ptr[i + 1]) << 4) | hex(input.ptr[i + 2]));
         if (unreserved(kValue))
-            output[decoded++] = static_cast<char>(kValue);
+            output[next_output(decoded)] = static_cast<char>(kValue);
         else {
-            output[decoded++] = '%';
-            output[decoded++] = kHex[kValue >> 4];
-            output[decoded++] = kHex[kValue & 15];
+            output[next_output(decoded)] = '%';
+            output[next_output(decoded)] = kHex[kValue >> 4];
+            output[next_output(decoded)] = kHex[kValue & 15];
         }
-        i = static_cast<u32>(static_cast<i64>(i) + 2);
+        i += 2;
     }
-    bool trailing_slash = decoded > 1 && output[static_cast<i64>(decoded) - 1] == '/';
-    u32 write = 1;
-    u32 read = 1;
+    bool trailing_slash = decoded > 1 && output[decoded - 1] == '/';
+    i64 write = 1;
+    i64 read = 1;
     while (read < decoded) {
         while (read < decoded && output[read] == '/') read++;
-        const u32 kBegin = read;
+        const i64 kBegin = read;
         while (read < decoded && output[read] != '/') read++;
-        const i64 kSize = static_cast<i64>(read) - static_cast<i64>(kBegin);
+        const i64 kSize = static_cast<i64>(static_cast<__int128_t>(read) - kBegin);
         if (kSize == 0) break;
         const bool kDot = kSize == 1 && output[kBegin] == '.';
-        const bool kParent =
-            kSize == 2 && output[kBegin] == '.' && output[static_cast<i64>(kBegin) + 1] == '.';
+        if (kBegin == INT64_MAX) __builtin_unreachable();
+        const bool kParent = kSize == 2 && output[kBegin] == '.' && output[kBegin + 1] == '.';
         if (kDot || kParent) {
             if (read == decoded) trailing_slash = true;
             if (kParent && write > 1) {
-                while (write > 1 && output[static_cast<i64>(write) - 1] != '/') --write;
+                while (write > 1 && output[write - 1] != '/') --write;
                 if (write > 1) write--;
             }
             continue;
         }
-        if (write > 1) output[write++] = '/';
-        __builtin_memmove(output + static_cast<i64>(write),
-                          output + static_cast<i64>(kBegin),
-                          static_cast<u32>(kSize));
-        write = static_cast<u32>(static_cast<i64>(write) + kSize);
+        if (write > 1) output[next_output(write)] = '/';
+        __builtin_memmove(output + write, output + kBegin, static_cast<u32>(kSize));
+        if (__builtin_add_overflow(write, kSize, &write)) __builtin_unreachable();
     }
-    if (trailing_slash && write > 1) output[write++] = '/';
-    const i64 kQueryLength = static_cast<i64>(input.len) - static_cast<i64>(path_end);
+    if (trailing_slash && write > 1) output[next_output(write)] = '/';
+    const i64 kQueryLength = static_cast<i64>(input.len) - path_end;
     if (kQueryLength != 0)
-        __builtin_memmove(output + static_cast<i64>(write),
-                          input.ptr + static_cast<i64>(path_end),
-                          static_cast<u32>(kQueryLength));
-    *length = static_cast<u32>(static_cast<i64>(write) + kQueryLength);
+        __builtin_memmove(output + write, input.ptr + path_end, static_cast<u32>(kQueryLength));
+    i64 total = 0;
+    if (__builtin_add_overflow(write, kQueryLength, &total)) __builtin_unreachable();
+    *length = static_cast<u32>(total);
     return true;
 }
 }  // namespace rut

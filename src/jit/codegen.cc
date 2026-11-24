@@ -4899,8 +4899,10 @@ bool emit_ws_handler(LLVMModuleRef mod,
             const u32 kCount = guards[i].accessor == 37 ? 3u : 2u;
             for (u32 j = 0; j < kCount; ++j) {
                 const u32 kChild = kChildren[j];
-                if (kChild >= i || !guards[kChild].is_operand || parents[kChild] != 0) return false;
-                parents[kChild] = 1;
+                if (kChild >= i || !guards[kChild].is_operand) return false;
+                // The walk returns on the first duplicate, so every prior count is 0 or 1.
+                if (parents[kChild] > 1) __builtin_unreachable();
+                if (++parents[kChild] != 1) return false;
             }
         }
         // Source clauses remain bounded by the frontend. Explicit forward roots

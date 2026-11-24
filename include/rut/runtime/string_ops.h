@@ -16,7 +16,10 @@ inline Str trim_ascii_string(Str text) {
     i64 end = static_cast<i64>(text.len);
     while (begin < end && space(static_cast<u8>(text.ptr[begin]))) ++begin;
     while (end > begin && space(static_cast<u8>(text.ptr[end - 1]))) --end;
-    return {text.ptr + begin, static_cast<u32>(static_cast<__int128_t>(end) - begin)};
+    // Both positions are inside a u32-sized string.
+    i64 length = 0;
+    if (__builtin_sub_overflow(end, begin, &length)) __builtin_unreachable();
+    return {text.ptr + begin, static_cast<u32>(length)};
 }
 
 // Modes 0/1: ASCII upper/lower. Mode 2: all nonoverlapping literal matches.
@@ -78,10 +81,11 @@ inline bool transform_string(
         scan([&](i64 start) {
             const i64 length = static_cast<i64>(static_cast<__int128_t>(start) - copied);
             if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
-            written = static_cast<i64>(static_cast<__int128_t>(written) + length);
+            // The sizing pass bounds every contribution to written by size.
+            if (__builtin_add_overflow(written, length, &written)) __builtin_unreachable();
             if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-            written = static_cast<i64>(static_cast<__int128_t>(written) +
-                                       static_cast<i64>(replacement.len));
+            if (__builtin_add_overflow(written, static_cast<i64>(replacement.len), &written))
+                __builtin_unreachable();
             copied =
                 static_cast<i64>(static_cast<__int128_t>(start) + static_cast<i64>(needle.len));
         });

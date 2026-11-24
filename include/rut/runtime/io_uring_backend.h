@@ -576,8 +576,11 @@ private:
     void submit_timer_read();
 
     void record_enter_error(i32 result) {
-        if (result < 0 && result != -EINTR)
-            fatal_error.store(reverse_kernel_error(result), std::memory_order_release);
+        if (result < 0 && result != -EINTR) {
+            // Negative io_uring_enter results are negated Linux errno values.
+            if (result == INT32_MIN) __builtin_unreachable();
+            fatal_error.store(-result, std::memory_order_release);
+        }
     }
 
     // conn_id of a window's token, via the same decode the CQE path uses.

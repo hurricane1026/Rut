@@ -591,8 +591,12 @@ inline bool integer(Str s, i64& out) {
         // signed counterpart for the widened multiplication.
         if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
             n = limit;
-        else
-            n = static_cast<u64>(static_cast<__int128_t>(n) * 10 + static_cast<i64>(d));
+        else {
+            i64 next = 0;
+            if (__builtin_add_overflow(static_cast<i64>(n) * 10, static_cast<i64>(d), &next))
+                __builtin_unreachable();
+            n = static_cast<u64>(next);
+        }
     }
     if (!negative) {
         out = static_cast<i64>(n);

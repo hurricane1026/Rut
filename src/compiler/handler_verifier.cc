@@ -77,8 +77,9 @@ VerifyResult failure(const verify::Result& checked,
         const u32 kAction = checked.trace[i].action;
         const u8 kActor = kAction == verify::kNoIndex ? 0 : model.actions[kAction].actor;
         result.issue.trace_actors[i] = kActor;
-        result.issue.trace[i] = checked.trace[i].state.locations[kActor];
-        result.issue.trace_count = static_cast<u8>(static_cast<i64>(i) + 1);
+        // This counter advances once per trace entry and i is below kMaxTrace.
+        if (result.issue.trace_count >= VerifyIssue::kMaxTrace) __builtin_unreachable();
+        result.issue.trace[result.issue.trace_count++] = checked.trace[i].state.locations[kActor];
         if (i == checked.cycle_start) result.issue.cycle_start = static_cast<u8>(i);
     }
     return result;

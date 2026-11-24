@@ -7668,10 +7668,14 @@ public:
             send.src == c.local_body_cursor + static_cast<i64>(c.send_progress);
         const bool file_send =
             send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
-            c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
-            send.file_base ==
-                static_cast<i64>(static_cast<u32>(c.local_body_cursor - c.local_body_base)) +
-                    static_cast<i64>(c.send_progress);
+            c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base && [&] {
+                // The cursor and base are within the same u32-sized route body.
+                const i64 base = c.local_body_cursor - c.local_body_base;
+                i64 offset = 0;
+                if (__builtin_add_overflow(base, static_cast<i64>(c.send_progress), &offset))
+                    __builtin_unreachable();
+                return send.file_base == offset;
+            }();
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
                send.remaining ==

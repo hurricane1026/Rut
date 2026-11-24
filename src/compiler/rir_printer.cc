@@ -59,9 +59,10 @@ void PrintBuf::put_u32(u32 val) {
         return;
     }
     char tmp[10];
-    u32 i = 0;
+    i32 i = 0;
     while (val > 0) {
-        tmp[i++] = static_cast<char>('0' + static_cast<i32>(val % 10));
+        if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+        tmp[i++] = static_cast<char>('0' + val % 10);
         val /= 10;
     }
     while (i > 0) put(tmp[--i]);
@@ -87,9 +88,10 @@ void PrintBuf::put_i64(i64 val) {
             return;
         }
         char tmp[20];
-        u32 i = 0;
+        i32 i = 0;
         while (abs > 0) {
-            tmp[i++] = static_cast<char>('0' + static_cast<i32>(abs % 10));
+            if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+            tmp[i++] = static_cast<char>('0' + abs % 10);
             abs /= 10;
         }
         while (i > 0) put(tmp[--i]);
@@ -100,9 +102,10 @@ void PrintBuf::put_i64(i64 val) {
             return;
         }
         char tmp[20];
-        u32 i = 0;
+        i32 i = 0;
         while (v > 0) {
-            tmp[i++] = static_cast<char>('0' + static_cast<i32>(v % 10));
+            if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+            tmp[i++] = static_cast<char>('0' + v % 10);
             v /= 10;
         }
         while (i > 0) put(tmp[--i]);
