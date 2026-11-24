@@ -8,13 +8,15 @@ namespace rut {
 // Parsing occurs before configuration publication, never from token metadata.
 struct RemoteJwks {
     static constexpr u32 kMaxDnsAddresses = 8;
-    enum class DnsTransport : u8 { Udp, Tcp };
+    enum class DnsTransport : u8 { Udp, Tcp, Tls };
     HttpsEndpoint endpoint{};
     char dns_address[HttpsEndpoint::kAddressCapacity]{};
     bool dns_aaaa = false;
     bool dns_dual_stack = false;
     DnsTransport dns_transport = DnsTransport::Udp;
+    UpstreamTlsSpec dns_tls{};
     u16 dns_port = 53;
+    u16 dns_tls_port = 853;
     u32 dns_cache_seconds = 0;
     u32 dns_timeout_seconds = 0;
     char allowed_addresses[kMaxDnsAddresses][HttpsEndpoint::kAddressCapacity]{};
@@ -105,7 +107,9 @@ private:
     HttpsFetch keys_;
     HttpsFetch discovery_;
     State state_ = State::Idle;
-    enum class DnsStep : u8 { None, Connect, Write, ReadLength, ReadBody };
+    enum class DnsStep : u8 { None, Connect, TlsHandshake, Write, ReadLength, ReadBody };
+    TlsClientContext dns_tls_context_{};
+    SSL* dns_ssl_ = nullptr;
     i32 dns_fd_ = -1;
     DnsStep dns_step_ = DnsStep::None;
     u8 query_[272]{};
@@ -128,6 +132,7 @@ private:
     bool discovering_ = false;
     bool initialized_ = false;
     bool send_dns_query(bool aaaa);
+    bool begin_dns_tls();
     bool advance_dns_stream(u64 now);
     bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
     void close_dns();

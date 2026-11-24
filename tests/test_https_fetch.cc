@@ -847,6 +847,38 @@ TEST(https_fetch,
     failed_remote_activation<test::Es256Fixture, Es256Policies>(_tc);
 }
 
+template <typename Fixture, typename Policies>
+static void failed_dns_tls_activation(test::TestCase* _tc) {
+    Fixture fixture;
+    REQUIRE(fixture.init());
+    char bytes[8192];
+    const int size =
+        snprintf(bytes,
+                 sizeof(bytes),
+                 "%.*s,\"remoteJwks\":{\"address\":\"127.0.0.1\",\"port\":443,"
+                 "\"serverName\":\"localhost\",\"ca\":\"ca.pem\",\"path\":\"/keys\","
+                 "\"refreshSeconds\":1,\"maxAgeSeconds\":2,\"timeoutSeconds\":5,"
+                 "\"dnsTransport\":\"tls\",\"dnsAddress\":\"127.0.0.1\","
+                 "\"allowedAddresses\":[\"127.0.0.1\"],\"dnsTlsPort\":853,"
+                 "\"dnsTlsServerName\":\"localhost\",\"dnsTlsCa\":\"/missing/rut-test-ca.pem\"}}",
+                 fixture.policy.len - 1,
+                 fixture.policy.ptr);
+    REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(bytes));
+    const Str policy{bytes, static_cast<u32>(size)};
+    Policies policies;
+    REQUIRE(policies.load(&policy, 1));
+    CHECK(!policies.activate(0));
+    CHECK(!policies.activate(0));
+}
+
+TEST(https_fetch, failed_dns_tls_trust_context_prevents_activation) {
+    failed_dns_tls_activation<test::Rs256Fixture, Rs256Policies>(_tc);
+}
+
+TEST(https_fetch, es256_failed_dns_tls_trust_context_prevents_activation) {
+    failed_dns_tls_activation<test::Es256Fixture, Es256Policies>(_tc);
+}
+
 TEST(https_fetch, only_authenticated_tls_eof_completes_a_close_delimited_body) {
     const bool clean[] = {true, false};
     for (bool close_notify : clean) {

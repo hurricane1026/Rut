@@ -15,7 +15,8 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "admitNewKids": true,
   "discoveryCacheSeconds": 30,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
-  "dnsTransport": "tcp",
+  "dnsTransport": "tls", "dnsTlsPort": 853,
+  "dnsTlsServerName": "resolver.example", "dnsTlsCa": "/etc/rut/resolver-ca.pem",
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
   "discoveryIssuer": "https://issuer.example",
@@ -85,15 +86,22 @@ By default each attempt resolves the configured TLS hostname through one
 connected nonblocking UDP socket to the configured resolver. No blocking libc
 resolver, system search list, request-selected name or new library is used.
 
-Optional `dnsTransport` selects `"udp"` (default) or `"tcp"`. TCP uses the
-RFC 7766 two-byte length prefix on one connected nonblocking stream per query;
-it never falls back to UDP, and UDP never falls back to TCP. Both transports
-use the same configured resolver literal, query construction, response
-validation, address allowlist, timeout and retry rules. The client reads
-exactly one framed response and then closes the connection; short, oversized,
-zero-length, malformed or abruptly closed frames fail the attempt. TCP is not
-encrypted and is not claimed to be DNSSEC-authenticated; use the configured
-TLS/issuer bounds for the JWKS origin and keep the resolver address trusted.
+Optional `dnsTransport` selects `"udp"` (default), `"tcp"` or `"tls"`. TCP and
+TLS use the RFC 7766 two-byte length prefix on one connected nonblocking stream
+per query; they never fall back to UDP, and UDP never falls back to a stream.
+All transports share the configured resolver literal, query construction,
+response validation, address allowlist, timeout and retry rules. The client
+reads exactly one framed response and then closes the connection; short,
+oversized, zero-length, malformed or abruptly closed frames fail the attempt.
+
+`"tls"` additionally requires `dnsTlsServerName` and `dnsTlsCa`, with an
+optional `dnsTlsPort` defaulting to 853. The resolver certificate is verified
+against that CA and exact server name with the pinned OpenSSL client; the DNS
+profile sends no ALPN and does not fall back to plaintext. `dnsPort` is reserved
+for UDP/TCP and is rejected with TLS. These fields are trusted configuration,
+never request data. Plain TCP is not encrypted, and neither TCP nor TLS is
+claimed to be DNSSEC-authenticated; keep the resolver address trusted and use
+the configured TLS/issuer bounds for the JWKS origin.
 
 Each query uses a fresh random ID and one IN A or IN AAAA question without EDNS.
 Dual-stack attempts require a positive, fully validated reply to both queries
@@ -312,9 +320,10 @@ Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
 The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
 a disallowed destination and recovery with rotated keys on both Linux backends.
-A TCP resolver fixture checks RFC 7766 framing, a short frame, cache expiry and
-recovery after a resolver fault on both Linux backends.
-DNS-over-TLS/HTTPS and full OIDC workflows remain
+TCP and DNS-over-TLS resolver fixtures check RFC 7766 framing, a short frame,
+cache expiry and recovery after a resolver fault on both Linux backends. A
+missing TLS trust file prevents remote activation.
+DNS-over-HTTPS and full OIDC workflows remain
 open under #1077. New-kid admission is opt-in and limited to algorithm-matching
 entries from the authenticated set; it does not expand the destination or
 algorithm trust boundary. A discovery origin with a rotating DNS name is not part

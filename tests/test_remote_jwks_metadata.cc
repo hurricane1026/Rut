@@ -115,6 +115,37 @@ TEST(remote_jwks_metadata, dns_transport_is_explicit_and_bounded) {
     RemoteJwks rejected;
     REQUIRE(document.parse({bytes, static_cast<u32>(no_dns)}));
     CHECK(!rejected.load(document, 0));
+
+    const char* tls =
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"localhost","dnsTlsCa":"ca.pem","dnsTlsPort":8853)";
+    const int tls_size = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, dns, tls);
+    REQUIRE(tls_size > 0 && static_cast<u32>(tls_size) < sizeof(bytes));
+    RemoteJwks tls_configuration;
+    REQUIRE(document.parse({bytes, static_cast<u32>(tls_size)}));
+    REQUIRE(tls_configuration.load(document, 0));
+    CHECK(tls_configuration.dns_transport == RemoteJwks::DnsTransport::Tls);
+    CHECK(tls_configuration.dns_tls.enabled);
+    CHECK(tls_configuration.dns_tls_port == 8853);
+    CHECK(strcmp(tls_configuration.dns_tls.server_name, "localhost") == 0);
+    CHECK(strcmp(tls_configuration.dns_tls.ca, "ca.pem") == 0);
+
+    const char* invalid_tls[] = {
+        R"(,"dnsTransport":"tls")",
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"localhost")",
+        R"(,"dnsTransport":"tls","dnsTlsCa":"ca.pem")",
+        R"(,"dnsTransport":"tcp","dnsTlsServerName":"localhost","dnsTlsCa":"ca.pem")",
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"localhost","dnsTlsCa":"ca.pem","dnsPort":853)",
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"localhost","dnsTlsCa":"ca.pem","dnsTlsPort":0)",
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"localhost","dnsTlsCa":"ca.pem","dnsTlsPort":65536)",
+        R"(,"dnsTransport":"tls","dnsTlsServerName":"bad/name","dnsTlsCa":"ca.pem")",
+    };
+    for (const char* addition : invalid_tls) {
+        const int size = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, dns, addition);
+        REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(bytes));
+        RemoteJwks configuration;
+        REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+        CHECK(!configuration.load(document, 0));
+    }
 }
 
 TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {

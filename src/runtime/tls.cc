@@ -421,13 +421,15 @@ void destroy_tls_client_context(TlsClientContext& ctx) {
 
 core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
                                                     const UpstreamTlsSpec& spec,
-                                                    bool http2) {
+                                                    bool http2,
+                                                    bool offer_alpn) {
     if (ctx.ssl_ctx || !spec.enabled || !valid_upstream_tls(spec))
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
     ctx.ssl_ctx = SSL_CTX_new(TLS_client_method());
     ctx.http2 = http2;
+    ctx.offer_alpn = offer_alpn;
     ctx.socket_bio_method = make_nosigpipe_socket_method();
     ctx.bridge_bio_method = make_tls_engine_bridge_method();
     if (!ctx.ssl_ctx || !ctx.socket_bio_method || !ctx.bridge_bio_method) {
@@ -448,7 +450,7 @@ core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
     return {};
 }
 
-bool configure_tls_client_ssl(SSL* ssl, const char* server_name, bool http2) {
+bool configure_tls_client_ssl(SSL* ssl, const char* server_name, bool http2, bool offer_alpn) {
     if (!ssl || !server_name || !server_name[0]) return false;
     in_addr address{};
     const bool kIsIp = inet_pton(AF_INET, server_name, &address) == 1;
@@ -463,6 +465,7 @@ bool configure_tls_client_ssl(SSL* ssl, const char* server_name, bool http2) {
     SSL_set_mode(ssl,
                  SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
                      SSL_MODE_RELEASE_BUFFERS);
+    if (!offer_alpn) return true;
     return http2 ? SSL_set_alpn_protos(ssl, kAlpnH2, sizeof(kAlpnH2)) == 0
                  : SSL_set_alpn_protos(ssl, kAlpnHttp11, sizeof(kAlpnHttp11)) == 0;
 }
@@ -478,7 +481,7 @@ core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext& ctx,
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
     }
     SSL_set_bio(ssl, bio, bio);
-    if (!configure_tls_client_ssl(ssl, server_name, ctx.http2)) {
+    if (!configure_tls_client_ssl(ssl, server_name, ctx.http2, ctx.offer_alpn)) {
         SSL_free(ssl);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }

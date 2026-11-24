@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--dual-stack", action="store_true")
     parser.add_argument("--admit-new-kids", action="store_true")
     parser.add_argument("--dns-tcp", action="store_true")
+    parser.add_argument("--dns-tls", action="store_true")
     args = parser.parse_args()
     assert not (args.dual_stack and args.ipv6)
     if args.ipv6 or args.dual_stack:
@@ -246,43 +247,50 @@ def main():
     dns = None
     tcp_dns = None
     dns_port = 0
-    if args.dns_tcp:
+    if args.dns_tcp or args.dns_tls:
         tcp_dns = socket.socket(family, socket.SOCK_STREAM)
         tcp_dns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_dns.bind((loopback, 0))
         tcp_dns.listen(8)
         tcp_dns.settimeout(.1)
         dns_port = tcp_dns.getsockname()[1]
+        def serve(connection):
+            connection.settimeout(1)
+            try:
+                header = b""
+                while len(header) < 2:
+                    chunk = connection.recv(2 - len(header))
+                    if not chunk: raise OSError
+                    header += chunk
+                length = int.from_bytes(header, "big")
+                if length < 12 or length > 512: raise OSError
+                query = b""
+                while len(query) < length:
+                    chunk = connection.recv(length - len(query))
+                    if not chunk: raise OSError
+                    query += chunk
+                response = answer(query)
+                if response is not None:
+                    with lock:
+                        mode = state["dns"]
+                    if mode == "tcp-short":
+                        connection.sendall((len(response) + 3).to_bytes(2, "big") + response)
+                    else:
+                        connection.sendall(len(response).to_bytes(2, "big") + response)
+            except (OSError, TimeoutError):
+                pass
         def resolve():
             while not dns_stop.is_set():
                 try: connection, _ = tcp_dns.accept()
                 except socket.timeout: continue
                 except OSError: return
+                if args.dns_tls:
+                    try: connection = context.wrap_socket(connection, server_side=True)
+                    except (OSError, ssl.SSLError):
+                        connection.close()
+                        continue
                 with connection:
-                    connection.settimeout(1)
-                    try:
-                        header = b""
-                        while len(header) < 2:
-                            chunk = connection.recv(2 - len(header))
-                            if not chunk: raise OSError
-                            header += chunk
-                        length = int.from_bytes(header, "big")
-                        if length < 12 or length > 512: raise OSError
-                        query = b""
-                        while len(query) < length:
-                            chunk = connection.recv(length - len(query))
-                            if not chunk: raise OSError
-                            query += chunk
-                        response = answer(query)
-                        if response is not None:
-                            with lock:
-                                mode = state["dns"]
-                            if mode == "tcp-short":
-                                connection.sendall((len(response) + 3).to_bytes(2, "big") + response)
-                            else:
-                                connection.sendall(len(response).to_bytes(2, "big") + response)
-                    except (OSError, TimeoutError):
-                        pass
+                    serve(connection)
     else:
         dns = socket.socket(family, socket.SOCK_DGRAM)
         dns.bind((loopback, 0))
@@ -346,6 +354,11 @@ def main():
         elif args.dns_tcp:
             policy["remoteJwks"].update(dnsAddress=loopback, dnsPort=dns_port,
                                         allowedAddresses=[loopback], dnsTransport="tcp")
+        elif args.dns_tls:
+            policy["remoteJwks"].update(
+                dnsAddress=loopback, dnsTlsPort=dns_port, allowedAddresses=[loopback],
+                dnsTransport="tls", dnsTlsServerName="localhost",
+                dnsTlsCa=str(pathlib.Path(args.testdata) / "localhost_cert.pem"))
         elif args.discovery_dns:
             # Reserve the allowlisted first address without listening on it.
             refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -500,7 +513,7 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.dns_tcp:
+            if args.dns_tcp or args.dns_tls:
                 wait_status(fixture["a"], 200)
                 with lock:
                     state["dns"] = "tcp-short"
