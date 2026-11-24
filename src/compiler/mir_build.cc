@@ -1945,6 +1945,9 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         };
         auto guard_fail_block_count = [&](const HirGuard& guard) -> u32 {
             if (guard.fail_kind == HirGuard::FailKind::Term) return 1;
+            if (guard.fail_kind == HirGuard::FailKind::LoopBreak ||
+                guard.fail_kind == HirGuard::FailKind::LoopContinue)
+                return 0;
             if (guard.fail_kind == HirGuard::FailKind::Body)
                 return guard.fail_body.body_kind == HirGuardBody::BodyKind::If ? 3u : 1u;
             u32 non_wildcard = 0;
@@ -1965,6 +1968,14 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 if (!fn.blocks.push(fail_block))
                     return frontend_error(FrontendError::TooManyItems, fn.span);
                 return {};
+            }
+
+            if (guard.fail_kind == HirGuard::FailKind::LoopBreak ||
+                guard.fail_kind == HirGuard::FailKind::LoopContinue) {
+                // Loop-control guards branch to an unrolled step block instead
+                // of owning fail blocks; reaching here means the caller missed
+                // that resolution.
+                return frontend_error(FrontendError::UnsupportedSyntax, guard.span);
             }
 
             if (guard.fail_kind == HirGuard::FailKind::Body) {
@@ -2509,6 +2520,21 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 u32 order_seq = 0;
                 bool has_ctx = false;
                 u32 ctx_index = 0xffffffffu;
+                // Outermost for-loop that emitted this step (target remapping
+                // base for break/continue) and the innermost loop-iteration slot
+                // the step belongs to (0xffffffff for route-level guards).
+                u32 top_loop = 0xffffffffu;
+                u32 iter_slot = 0xffffffffu;
+            };
+            struct IterSlot {
+                // Emission-order positions relative to the top-level loop run:
+                // first step of this iteration and the first step after it.
+                u32 first_rel = 0xffffffffu;
+                u32 after_rel = 0xffffffffu;
+                // First step after the whole loop instance (`break` target) and
+                // the next iteration slot of the same instance, if any.
+                u32 exit_rel = 0xffffffffu;
+                u32 next_slot = 0xffffffffu;
             };
             constexpr u32 kMaxUnrolled = HirExpr::kMaxArgs * HirForLoopBody::kMaxSteps;
             constexpr u32 kMaxForRouteSteps =
@@ -2516,6 +2542,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             FixedVec<RouteStep, kMaxForRouteSteps> steps{};
             std::vector<ForLoopCtx> step_contexts;
             step_contexts.reserve(kMaxForRouteSteps);
+            std::vector<IterSlot> iter_slots;
             u32 route_step_seq = 0;
             auto set_step_ctx = [&](RouteStep* step,
                                     const ForLoopCtx& ctx) -> FrontendResult<void> {
@@ -2558,7 +2585,9 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             auto emit_for_loop = [&](auto&& self,
                                      u32 fi,
                                      const ForLoopCtx* parent_ctx,
-                                     u32 order_start) -> FrontendResult<void> {
+                                     u32 order_start,
+                                     u32 top_loop,
+                                     u32 top_base) -> FrontendResult<void> {
                 const auto& fl = source_route.for_loops[fi];
                 const HirExpr* iter_array = iter_array_for(fl);
                 // This unroll requires a compile-time-known array literal,
@@ -2575,6 +2604,16 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 }
                 const u32 iter_count =
                     fl.body.has_term && iter_array->args.len != 0 ? 1u : iter_array->args.len;
+                // One slot per iteration of this loop instance, so a `continue`
+                // can target the next iteration's first step. Positions are
+                // recorded relative to the top-level loop run, which keeps them
+                // valid after the global source-order sort below.
+                const u32 slot_base = static_cast<u32>(iter_slots.size());
+                for (u32 ai = 0; ai < iter_count; ai++) iter_slots.push_back(IterSlot{});
+                for (u32 ai = 0; ai < iter_count; ai++) {
+                    if (ai + 1 < iter_count)
+                        iter_slots[slot_base + ai].next_slot = slot_base + ai + 1;
+                }
                 for (u32 ai = 0; ai < iter_count; ai++) {
                     auto elem = mir_value(*iter_array->args[ai], module, &fn, parent_ctx);
                     if (!elem) return core::make_unexpected(elem.error());
@@ -2582,8 +2621,23 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     auto loop_binding =
                         push_ctx_binding(&ctx, fl.loop_var_ref_index, elem.value(), fl.span);
                     if (!loop_binding) return core::make_unexpected(loop_binding.error());
+                    iter_slots[slot_base + ai].first_rel = static_cast<u32>(steps.len - top_base);
+                    const auto stamp = [&](RouteStep* step) {
+                        step->top_loop = top_loop;
+                        step->iter_slot = slot_base + ai;
+                    };
+                    bool loop_done = false;
                     for (u32 bi = 0; bi < fl.body.steps.len; bi++) {
                         const auto& body_step = fl.body.steps[bi];
+                        // Compile-time loop control: `break` stops this loop's
+                        // remaining iterations, `continue` only skips the rest
+                        // of the current iteration. Both leave already-emitted
+                        // steps untouched, so no runtime branch is needed.
+                        if (body_step.kind == HirForLoopBody::Step::Kind::Break) {
+                            loop_done = true;
+                            break;
+                        }
+                        if (body_step.kind == HirForLoopBody::Step::Kind::Continue) break;
                         if (body_step.kind == HirForLoopBody::Step::Kind::Let) {
                             if (body_step.index >= fl.body.locals.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2606,6 +2660,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             step.span = fl.body.guards[body_step.index].span;
                             step.order_start = order_start;
                             step.order_seq = route_step_seq++;
+                            stamp(&step);
                             auto ctx_set = set_step_ctx(&step, ctx);
                             if (!ctx_set) return core::make_unexpected(ctx_set.error());
                             if (!steps.push(step))
@@ -2622,6 +2677,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             step.span = fl.body.ifs[body_step.index].span;
                             step.order_start = order_start;
                             step.order_seq = route_step_seq++;
+                            stamp(&step);
                             auto ctx_set = set_step_ctx(&step, ctx);
                             if (!ctx_set) return core::make_unexpected(ctx_set.error());
                             if (!steps.push(step))
@@ -2638,6 +2694,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             step.span = fl.body.matches[body_step.index].span;
                             step.order_start = order_start;
                             step.order_seq = route_step_seq++;
+                            stamp(&step);
                             auto ctx_set = set_step_ctx(&step, ctx);
                             if (!ctx_set) return core::make_unexpected(ctx_set.error());
                             if (!steps.push(step))
@@ -2648,7 +2705,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             if (body_step.index >= source_route.for_loops.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       body_step.span);
-                            auto child = self(self, body_step.index, &ctx, order_start);
+                            auto child =
+                                self(self, body_step.index, &ctx, order_start, top_loop, top_base);
                             if (!child) return core::make_unexpected(child.error());
                             continue;
                         }
@@ -2658,12 +2716,19 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         step.span = fl.body.term.span;
                         step.order_start = order_start;
                         step.order_seq = route_step_seq++;
+                        stamp(&step);
                         auto ctx_set = set_step_ctx(&step, ctx);
                         if (!ctx_set) return core::make_unexpected(ctx_set.error());
                         if (!steps.push(step))
                             return frontend_error(FrontendError::TooManyItems, fl.span);
                     }
+                    iter_slots[slot_base + ai].after_rel = static_cast<u32>(steps.len - top_base);
+                    if (loop_done) break;
                 }
+                // `break` leaves the whole instance, so every iteration of this
+                // instance shares the position after its last emitted step.
+                for (u32 ai = slot_base; ai < slot_base + iter_count; ai++)
+                    iter_slots[ai].exit_rel = static_cast<u32>(steps.len - top_base);
                 return {};
             };
             for (u32 gi = 0; gi < source_route.guards.len; gi++) {
@@ -2685,8 +2750,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             for (u32 fi = 0; fi < source_route.for_loops.len; fi++) {
                 if (for_loop_is_child[fi]) continue;
-                auto emitted = emit_for_loop(
-                    emit_for_loop, fi, nullptr, source_route.for_loops[fi].span.start);
+                const u32 top_base = static_cast<u32>(steps.len);
+                auto emitted = emit_for_loop(emit_for_loop,
+                                             fi,
+                                             nullptr,
+                                             source_route.for_loops[fi].span.start,
+                                             fi,
+                                             top_base);
                 if (!emitted) return core::make_unexpected(emitted.error());
             }
             for (u32 si = 1; si < steps.len; si++) {
@@ -2850,8 +2920,40 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     fail_cursor = match_end_index;
                 }
             }
+            // Static loop-control targets. Steps of one top-level loop stay
+            // contiguous and in emission order after the source-order sort, so
+            // a loop-relative position maps to a block index by adding the
+            // loop's first step block.
+            u32 top_block_start[HirRoute::kMaxForLoops];
+            for (u32 fi = 0; fi < HirRoute::kMaxForLoops; fi++) top_block_start[fi] = 0xffffffffu;
+            for (u32 si = 0; si < step_count; si++) {
+                const u32 top = steps[si].top_loop;
+                if (top < HirRoute::kMaxForLoops && top_block_start[top] == 0xffffffffu)
+                    top_block_start[top] = si;
+            }
+            auto loop_control_target = [&](const RouteStep& step, bool want_break) -> u32 {
+                const u32 top = step.top_loop;
+                if (top >= HirRoute::kMaxForLoops || step.iter_slot >= iter_slots.size() ||
+                    top_block_start[top] == 0xffffffffu)
+                    return terminal_index;
+                const auto& slot = iter_slots[step.iter_slot];
+                u32 rel = slot.exit_rel;
+                if (rel == 0xffffffffu) rel = slot.after_rel;
+                if (!want_break && slot.next_slot != 0xffffffffu &&
+                    iter_slots[slot.next_slot].first_rel != 0xffffffffu)
+                    rel = iter_slots[slot.next_slot].first_rel;
+                const u32 target = rel == 0xffffffffu ? step_count : top_block_start[top] + rel;
+                return target >= step_count ? terminal_index : target;
+            };
             for (u32 si = 0; si < step_count; si++) {
                 if (steps[si].kind != RouteStep::Kind::Guard) continue;
+                const auto fail_kind = steps[si].guard->fail_kind;
+                if (fail_kind == HirGuard::FailKind::LoopBreak ||
+                    fail_kind == HirGuard::FailKind::LoopContinue) {
+                    guard_fail_index[si] =
+                        loop_control_target(steps[si], fail_kind == HirGuard::FailKind::LoopBreak);
+                    continue;
+                }
                 guard_fail_index[si] = fail_cursor;
                 reserve_blocks(
                     &fail_cursor, guard_fail_block_count(*steps[si].guard), steps[si].span);
@@ -3333,6 +3435,11 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             // Fail blocks, one per route/virtual guard step.
             for (u32 si = 0; si < step_count; si++) {
                 if (steps[si].kind != RouteStep::Kind::Guard) continue;
+                const auto fail_kind = steps[si].guard->fail_kind;
+                // Loop-control guards branch straight to an unrolled step block.
+                if (fail_kind == HirGuard::FailKind::LoopBreak ||
+                    fail_kind == HirGuard::FailKind::LoopContinue)
+                    continue;
                 auto emitted = emit_guard_fail(*steps[si].guard, route_step_ctx(steps[si]));
                 if (!emitted) return core::make_unexpected(emitted.error());
             }

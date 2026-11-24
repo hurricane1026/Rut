@@ -26,8 +26,8 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   fix-it errors; lone `&`/`^`/`~` → bitwise.* fix-it; `?` → if-let fix-it
   (commit: slice 1). `respond` is implemented as a contextual statement word
   so user declarations and members may still use that name. Static route-local
-  `for` loops are now enabled (array literal or alias, compile-time unrolled);
-  runtime iterables plus `break`/`continue` remain pending.
+  `for` loops are now enabled (array literal or alias, compile-time unrolled),
+  including `break`/`continue` loop control; runtime iterables remain pending.
 - [x] Parser: `!`/`!=`/`<=`/`>=` desugar to Eq/Lt/Gt (+ `== false` wrap);
   `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
   sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
@@ -179,8 +179,11 @@ without presenting lossy or per-shard state as exact shared state.
   element substitution, guards, nested loops, body `let`/`if`/`match`, typed
   empty arrays, route-level guard ordering, JIT execution, and the documented
   rejects (`wait`, non-array/dynamic/field iterators, shadowing, post-terminator
-  statements, `if let`, helper bodies). `break`/`continue` and runtime iterables
-  remain future work.
+  statements, `if let`, helper bodies). `break`/`continue` are accepted as
+  direct loop-body statements and as a `guard ... else` failure path, resolved
+  to unrolled step blocks for the innermost loop; loop-body `if`/`match` arms
+  and bodies that also contain route terminators still reject them. Runtime
+  iterables remain future work.
 
 - [x] Reject a fifth stacked `@rateLimit` decorator with a capacity diagnostic at
   that decorator, instead of silently omitting the rule. Boundary regression

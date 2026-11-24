@@ -49580,3 +49580,182 @@ TEST(frontend, analyze_rejects_allocating_for_loop_body_bindings) {
                 "the loop")));
     }
 }
+
+TEST(frontend, parse_for_loop_break_continue_statements) {
+    const auto source =
+        lit("route GET \"/x\" { for n in [1] { guard n != 2 else { break } "
+            "guard n != 3 else { continue } break } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 2u);
+    REQUIRE(route.statements[0] != nullptr);
+    const auto& for_stmt = *route.statements[0];
+    CHECK_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    const auto& loop_body = *for_stmt.then_stmt;
+    REQUIRE_EQ(static_cast<u8>(loop_body.kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE_EQ(loop_body.block_stmts.len, 3u);
+    REQUIRE(loop_body.block_stmts[0] != nullptr);
+    CHECK_EQ(static_cast<u8>(loop_body.block_stmts[0]->kind), static_cast<u8>(AstStmtKind::Guard));
+    REQUIRE(loop_body.block_stmts[0]->else_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(loop_body.block_stmts[0]->else_stmt->kind),
+             static_cast<u8>(AstStmtKind::Break));
+    REQUIRE(loop_body.block_stmts[1] != nullptr);
+    CHECK_EQ(static_cast<u8>(loop_body.block_stmts[1]->kind), static_cast<u8>(AstStmtKind::Guard));
+    REQUIRE(loop_body.block_stmts[1]->else_stmt != nullptr);
+    CHECK_EQ(static_cast<u8>(loop_body.block_stmts[1]->else_stmt->kind),
+             static_cast<u8>(AstStmtKind::Continue));
+    REQUIRE(loop_body.block_stmts[2] != nullptr);
+    CHECK_EQ(static_cast<u8>(loop_body.block_stmts[2]->kind), static_cast<u8>(AstStmtKind::Break));
+}
+
+TEST(frontend, parse_loop_control_words_remain_identifiers) {
+    // `break`/`continue` are contextual statement words, so identifiers and
+    // members with those names keep parsing (mirrors `respond`).
+    const auto source =
+        lit("route GET \"/x\" { let break = 1 let continue = 2 "
+            "guard break != continue else { return 400 } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_loop_control_outside_static_for_body) {
+    const auto source = lit("route GET \"/x\" { break return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(lit("break is only supported inside a static for-loop body")));
+
+    const auto continue_source = lit("route GET \"/x\" { continue return 200 }\n");
+    auto continue_tokens = lex(continue_source);
+    REQUIRE(continue_tokens);
+    auto continue_ast = parse_file_heap(continue_tokens.value());
+    REQUIRE(continue_ast);
+    auto continue_hir = analyze_file_heap(continue_ast.value());
+    REQUIRE_FALSE(continue_hir);
+    CHECK_EQ(continue_hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(continue_hir.error().detail.eq(
+        lit("continue is only supported inside a static for-loop body")));
+
+    // A route-level guard is not a loop, so its failure path cannot loop-control.
+    const auto guard_source = lit("route GET \"/x\" { guard true else { break } return 200 }\n");
+    auto guard_tokens = lex(guard_source);
+    REQUIRE(guard_tokens);
+    auto guard_ast = parse_file_heap(guard_tokens.value());
+    REQUIRE(guard_ast);
+    auto guard_hir = analyze_file_heap(guard_ast.value());
+    REQUIRE_FALSE(guard_hir);
+    CHECK_EQ(guard_hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(
+        guard_hir.error().detail.eq(lit("break is only supported inside a static for-loop body")));
+}
+
+TEST(frontend, analyze_rejects_statements_after_direct_loop_control) {
+    const char* sources[] = {
+        "route GET \"/x\" { for n in [1] { break guard n > 0 else { return 400 } } "
+        "return 200 }\n",
+        "route GET \"/x\" { for n in [1] { continue guard n > 0 else { return 400 } } "
+        "return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(
+            lit("static for-loop body cannot continue after break/continue")));
+    }
+}
+
+TEST(frontend, analyze_rejects_loop_control_inside_loop_body_arms) {
+    const char* sources[] = {
+        "route GET \"/x\" { for n in [1] { if n == 1 { break } else { return 500 } } "
+        "return 200 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => break _ => return 500 } } "
+        "return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(
+            lit("break/continue inside a static for-loop body if or match arm is not supported "
+                "yet; use them as direct loop-body statements")));
+    }
+}
+
+TEST(frontend, analyze_rejects_loop_control_mixed_with_route_terminators) {
+    const auto source =
+        lit("route GET \"/x\" { for n in [1] { guard n != 2 else { break } "
+            "if n == 1 { return 200 } else { return 500 } } return 404 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(
+        lit("a static for-loop body cannot combine break/continue with route terminators")));
+}
+
+TEST(frontend, mir_unrolls_for_loop_break_and_continue) {
+    const char* sources[] = {
+        // break leaves the loop before the last iteration's guard can fail.
+        "route GET \"/x\" { for n in [1, 2, 3] { guard n != 2 else { break } "
+        "guard n != 3 else { return 400 } } return 200 }\n",
+        // continue skips only the current iteration's remaining steps.
+        "route GET \"/x\" { for n in [1, 2, 3] { guard n != 2 else { continue } "
+        "guard n != 3 else { return 401 } } return 200 }\n",
+        // Direct statements still lower.
+        "route GET \"/x\" { for n in [1, 2, 3] { continue } return 200 }\n",
+        "route GET \"/x\" { for n in [1, 2, 3] { break } return 200 }\n",
+        // Nested loops bind loop control to the innermost loop.
+        "route GET \"/x\" { for a in [1, 2] { for b in [1, 2] { "
+        "guard b != 2 else { break } guard a != 2 else { return 402 } } } return 200 }\n",
+        "route GET \"/x\" { for a in [1, 2] { for b in [1, 2] { "
+        "guard b != 1 else { continue } guard a != 2 else { return 403 } } } return 200 }\n",
+        // guard-let loop control keeps the binding on the success path only.
+        "route GET \"/x\" { for n in [1] { guard let p = req.query(\"x\") else { continue } "
+        "guard p != \"a\" else { return 404 } } return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "loop control source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
