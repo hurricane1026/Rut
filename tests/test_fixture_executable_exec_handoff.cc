@@ -53,7 +53,8 @@ int open_fd_count() {
     while (const dirent* entry = readdir(directory)) {
         char* end = nullptr;
         const long value = std::strtol(entry->d_name, &end, 10);
-        if (end != entry->d_name && *end == '\0' && value >= 0 && value != own_fd && count != INT_MAX)
+        if (end != entry->d_name && *end == '\0' && value >= 0 && value != own_fd &&
+            count != INT_MAX)
             ++count;
     }
     if (closedir(directory) != 0) return -1;

@@ -2504,9 +2504,7 @@ route "/partial" {
             test_fault::ScopedSyscallFault clock(
                 test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
             on_header_received<SmallLoop>(
-                loop.get(),
-                *conn,
-                make_ev(conn_id, IoEventType::Recv, static_cast<i32>(recv_len)));
+                loop.get(), *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(recv_len)));
         }
         CHECK(conn->on_recv == &on_jit_request_body_recvd<SmallLoop>);
         CHECK_EQ(conn->req_body_remaining, body.size() - prefix.size());

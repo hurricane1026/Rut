@@ -50,7 +50,8 @@ WaitResult wait_for(int fd, short events, std::int64_t deadline) {
         std::int64_t left = 0;
         if (__builtin_sub_overflow(deadline, now, &left)) return {};
         if (left <= 0) return {};
-        const int ms = static_cast<int>(std::min<std::int64_t>(left / 1000000 + (left % 1000000 != 0), 30000));
+        const int ms =
+            static_cast<int>(std::min<std::int64_t>(left / 1000000 + (left % 1000000 != 0), 30000));
         pollfd p{fd, events, 0};
         const int result = poll(&p, 1, ms);
         if (result < 0 && errno == EINTR) continue;

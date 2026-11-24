@@ -42,7 +42,8 @@ TEST(format_integer, canonical_decimal_and_signed_limits) {
     const i64 kOffsets[] = {-1, 0, 1};
     for (i64 power = 10; power <= 1000000000000000000LL; power *= 10) {
         for (i64 offset : kOffsets) {
-            if ((offset > 0 && power > INT64_MAX - offset) || (offset < 0 && power < INT64_MIN - offset))
+            if ((offset > 0 && power > INT64_MAX - offset) ||
+                (offset < 0 && power < INT64_MIN - offset))
                 continue;
             compare(_tc, power + offset);
             const i64 neg_power = power == INT64_MIN ? INT64_MIN : -power;
