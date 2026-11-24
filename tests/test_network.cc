@@ -1268,7 +1268,7 @@ TEST(set_path, snapshots_response_mutations_before_request_rewrite) {
                                    ConnectionBase::RespHeaderMutationMode::Set};
     c->resp_header_mutation_count = 1;
 
-    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(c->snapshot_response_mutations_before_request_rewrite());
     REQUIRE(rewrite_request_line_path(*c));
 
     CHECK_EQ(c->checked_raw_request_target().state, RawRequestTargetWitnessState::Neutral);
@@ -8344,7 +8344,7 @@ TEST(set_path, streamed_pipeline_stash_preserves_response_mutation_snapshot) {
                                    ConnectionBase::RespHeaderMutationMode::Set};
     c->resp_header_mutation_count = 1;
 
-    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(c->snapshot_response_mutations_before_request_rewrite());
     reserve_response_mutation_snapshot(*c);
     const u32 snapshot_len = c->retry_req_send_len;
     REQUIRE_EQ(snapshot_len, kReqLen);
@@ -39275,7 +39275,7 @@ TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
-    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(c->snapshot_response_mutations_before_request_rewrite());
     REQUIRE_EQ(c->retry_req_send_len, 0u);
 
     static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -39386,7 +39386,7 @@ TEST(response_headers, failed_initial_send_reserves_snapshot_before_pipeline_sta
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
-    REQUIRE(snapshot_response_mutations_before_request_rewrite(*c));
+    REQUIRE(c->snapshot_response_mutations_before_request_rewrite());
     REQUIRE_EQ(c->retry_req_send_len, 0u);
 
     static const char response[] = "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n";
