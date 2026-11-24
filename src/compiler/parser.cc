@@ -1160,8 +1160,13 @@ struct Parser {
         if (cur().type == TokenType::IntLit) {
             const Token tok = cur();
             pos++;
-            // Byte-size literal: adjacent `<int><b|kb|mb|gb>`.
-            if (cur().type == TokenType::Ident && cur().start == tok.end) {
+            // Byte-size literal: adjacent decimal `<int><b|kb|mb|gb>`. Radix
+            // amounts stay whitespace-separated (`0x10 kb` config form), so a
+            // radix token never composes with an adjacent unit identifier.
+            const bool decimal_token =
+                !(tok.text.len >= 2 && tok.text.ptr[0] == '0' &&
+                  (tok.text.ptr[1] == 'b' || tok.text.ptr[1] == 'o' || tok.text.ptr[1] == 'x'));
+            if (decimal_token && cur().type == TokenType::Ident && cur().start == tok.end) {
                 const Token& unit = cur();
                 u64 mult = 0;
                 if (unit.text.eq({"b", 1}))

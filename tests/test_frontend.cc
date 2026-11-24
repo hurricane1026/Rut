@@ -49922,6 +49922,11 @@ TEST(frontend, parse_byte_size_literals) {
         REQUIRE(bad_tokens);
         CHECK_FALSE(parse_file_heap(bad_tokens.value()).has_value());
     }
+    // A radix amount never composes with an adjacent unit: byte-size units
+    // follow decimal amounts only, so `0x10kb` stays an invalid hex literal.
+    auto radix_unit = lex(lit("route GET \"/x\" { let a = 0x10kb return 200 }\n"));
+    REQUIRE_FALSE(radix_unit.has_value());
+    CHECK_EQ(radix_unit.error().code, FrontendError::InvalidInteger);
 }
 
 TEST(frontend, analyze_byte_size_literals) {

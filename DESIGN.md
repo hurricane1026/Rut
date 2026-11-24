@@ -245,7 +245,13 @@ bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 
 Source integers follow Swift's radix-prefix and digit-separator lexical grammar:
 `0b`, `0o`, `0x` require a first radix digit; subsequent digits may include
-repeated or trailing underscores. Hex digits accept either case; prefixes are
+repeated or trailing underscores. The one exception is the bare `0b` spelling:
+when no binary digit and no identifier continuation follows it, `0b` is the
+zero-byte ByteSize literal (`0b` == zero bytes), while a binary integer literal
+still needs its first digit (`0b1`). ByteSize literals spell a decimal amount
+immediately followed by `b`/`kb`/`mb`/`gb`; radix amounts are not ByteSize
+literals, and configuration fields keep their whitespace-separated
+`<radix integer> <unit>` spelling. Hex digits accept either case; prefixes are
 lowercase. Decimal leading zeros remain decimal. All spellings use Rut's
 existing signed `i32`/`i64` magnitude inference, including fused negative
 `i64` minimum; overflow is rejected before accumulation can wrap. Positive hex
