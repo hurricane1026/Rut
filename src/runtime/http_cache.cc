@@ -259,9 +259,10 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     else if (policy.max_seen)
         lifetime = policy.max_age;
     else if (expires_seen)
-        lifetime = expires > date
-                       ? static_cast<u64>(static_cast<i64>(expires) - static_cast<i64>(date))
-                       : 0;
+        lifetime =
+            expires > date
+                ? static_cast<u64>(static_cast<__int128_t>(expires) - static_cast<__int128_t>(date))
+                : 0;
     if (lifetime > cap) lifetime = cap;
     const u64 kDateUs = static_cast<u64>(static_cast<i64>(date) * 1000000);
     u64 kApparent = 0;
@@ -457,8 +458,8 @@ bool HttpCachePolicy::prepare_record(
         length != static_cast<u32>(static_cast<i64>(info.header_end) +
                                    static_cast<i64>(info.parsed.content_length)))
         return false;
-    const u64 kRemainingUs =
-        static_cast<u64>(static_cast<i64>(info.ttl) * 1000000 - static_cast<i64>(info.age_us));
+    const u64 kRemainingUs = static_cast<u64>(static_cast<__int128_t>(info.ttl) * 1000000 -
+                                              static_cast<__int128_t>(info.age_us));
     u64 max_remaining = 0;
     if (__builtin_sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining)
         return false;

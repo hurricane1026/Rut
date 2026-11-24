@@ -298,7 +298,7 @@ i64 encode_string(u8* out, const u8* src, u32 len) {
         // kHlen < len <= UINT32_MAX proves this narrowing is representable.
         const i64 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
         const i64 kN = huffman_encode(out + kHdr, src, len);
-        return kHdr + kN;
+        return static_cast<i64>(static_cast<__int128_t>(kHdr) + static_cast<__int128_t>(kN));
     }
     const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
     for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
@@ -551,8 +551,11 @@ bool decode_header_block(DynamicTable& dyn,
         if (kByte & 0x80) {
             // §6.1 Indexed Header Field.
             u32 idx = 0;
-            const u32 kC =
-                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 7, &idx);
+            const u32 kC = decode_integer(
+                in + pos,
+                static_cast<u32>(static_cast<__int128_t>(len) - static_cast<__int128_t>(pos)),
+                7,
+                &idx);
             if (kC == 0 || idx == 0) return false;
             pos += static_cast<i64>(kC);
             Str name, value;
@@ -564,8 +567,11 @@ bool decode_header_block(DynamicTable& dyn,
         if (kByte & 0x20 && !(kByte & 0x40)) {
             // §6.3 Dynamic Table Size Update (001xxxxx).
             u32 sz = 0;
-            const u32 kC =
-                decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), 5, &sz);
+            const u32 kC = decode_integer(
+                in + pos,
+                static_cast<u32>(static_cast<__int128_t>(len) - static_cast<__int128_t>(pos)),
+                5,
+                &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
             pos += static_cast<i64>(kC);
             dyn_set_max_size(dyn, sz);
@@ -576,37 +582,42 @@ bool decode_header_block(DynamicTable& dyn,
         const bool kIncremental = (kByte & 0x40) != 0;
         const u8 kPrefix = kIncremental ? 6 : 4;
         u32 nidx = 0;
-        const u32 kNc =
-            decode_integer(in + pos, static_cast<u32>(static_cast<i64>(len) - pos), kPrefix, &nidx);
+        const u32 kNc = decode_integer(
+            in + pos,
+            static_cast<u32>(static_cast<__int128_t>(len) - static_cast<__int128_t>(pos)),
+            kPrefix,
+            &nidx);
         if (kNc == 0) return false;
         pos += static_cast<i64>(kNc);
 
         Str name;
         if (nidx == 0) {
             u32 nlen = 0;
-            const u32 kSc = decode_string(in + pos,
-                                          static_cast<u32>(static_cast<i64>(len) - pos),
-                                          out_buf + op,
-                                          static_cast<u32>(static_cast<i64>(out_cap) - op),
-                                          &nlen);
+            const u32 kSc = decode_string(
+                in + pos,
+                static_cast<u32>(static_cast<__int128_t>(len) - static_cast<__int128_t>(pos)),
+                out_buf + op,
+                static_cast<u32>(static_cast<__int128_t>(out_cap) - static_cast<__int128_t>(op)),
+                &nlen);
             if (kSc == 0) return false;
             pos += static_cast<i64>(kSc);
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += static_cast<i64>(nlen);
+            op = static_cast<i64>(static_cast<__int128_t>(op) + static_cast<__int128_t>(nlen));
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
         // Value is always a literal string.
         u32 vlen = 0;
-        const u32 kVc = decode_string(in + pos,
-                                      static_cast<u32>(static_cast<i64>(len) - pos),
-                                      out_buf + op,
-                                      static_cast<u32>(static_cast<i64>(out_cap) - op),
-                                      &vlen);
+        const u32 kVc = decode_string(
+            in + pos,
+            static_cast<u32>(static_cast<__int128_t>(len) - static_cast<__int128_t>(pos)),
+            out_buf + op,
+            static_cast<u32>(static_cast<__int128_t>(out_cap) - static_cast<__int128_t>(op)),
+            &vlen);
         if (kVc == 0) return false;
         pos += static_cast<i64>(kVc);
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
-        op += static_cast<i64>(vlen);
+        op = static_cast<i64>(static_cast<__int128_t>(op) + static_cast<__int128_t>(vlen));
 
         if (kIncremental) {
             // The name may alias dyn.buf (table reference); copy it into out_buf

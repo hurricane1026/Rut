@@ -400,7 +400,8 @@ static bool write_with_poll(
 
         if (rc == 0) {
             if (!running_flag->load(std::memory_order_relaxed)) {
-                if (++stall_polls >= static_cast<i64>(max_stall)) return false;
+                stall_polls = static_cast<i64>(static_cast<__int128_t>(stall_polls) + 1);
+                if (stall_polls >= static_cast<i64>(max_stall)) return false;
             }
             continue;
         }
@@ -413,11 +414,13 @@ static bool write_with_poll(
         }
 
         // Write in bounded chunks so we return to poll promptly.
-        i64 to_write = static_cast<i64>(len) - written;
+        i64 to_write =
+            static_cast<i64>(static_cast<__int128_t>(len) - static_cast<__int128_t>(written));
         if (to_write > static_cast<i64>(kChunkSize)) to_write = kChunkSize;
         ssize_t n = ::write(fd, buf + written, to_write);
         if (n > 0) {
-            written += static_cast<i64>(n);
+            written =
+                static_cast<i64>(static_cast<__int128_t>(written) + static_cast<__int128_t>(n));
             stall_polls = 0;
         } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
             continue;  // transient — re-poll

@@ -199,7 +199,8 @@ static inline void match_connection(const u8* val, u32 vlen, ParsedRequest* req)
         // Find end of token
         i64 tok_start = i;
         while (i < static_cast<i64>(vlen) && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
-        u32 tok_len = static_cast<u32>(i - tok_start);
+        u32 tok_len =
+            static_cast<u32>(static_cast<__int128_t>(i) - static_cast<__int128_t>(tok_start));
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             req->keep_alive = false;
@@ -249,7 +250,9 @@ static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, 
         while (i < static_cast<i64>(vlen) && is_transfer_coding_token_char(val[i])) i++;
         if (i == start) return RequestTransferEncoding::Unsupported;
         saw_token = true;
-        const bool is_chunked = i - start == 7 && str_ci_eq(val + start, "chunked", 7);
+        const bool is_chunked =
+            static_cast<i64>(static_cast<__int128_t>(i) - static_cast<__int128_t>(start)) == 7 &&
+            str_ci_eq(val + start, "chunked", 7);
         if (is_chunked) {
             if (saw_chunked) return RequestTransferEncoding::Unsupported;
             saw_chunked = true;
@@ -311,7 +314,8 @@ static inline ParseStatus apply_semantic_header(
                 while (ti < static_cast<i64>(vlen) && val[ti] != ',' && val[ti] != ' ' &&
                        val[ti] != '\t')
                     ti++;
-                u32 tok_len = static_cast<u32>(ti - tok_start);
+                u32 tok_len = static_cast<u32>(static_cast<__int128_t>(ti) -
+                                               static_cast<__int128_t>(tok_start));
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     req->chunked = true;
                     break;
@@ -344,7 +348,9 @@ static inline ParseStatus apply_semantic_header(
                 i64 start = kItemStart;
                 while (start < end && (val[start] == ' ' || val[start] == '\t')) start++;
                 while (end > start && (val[end - 1] == ' ' || val[end - 1] == '\t')) end--;
-                if (end - start == 9 && str_ci_eq(val + start, "websocket", 9))
+                if (static_cast<i64>(static_cast<__int128_t>(end) -
+                                     static_cast<__int128_t>(start)) == 9 &&
+                    str_ci_eq(val + start, "websocket", 9))
                     req->upgrade_is_websocket = true;
                 if (i == static_cast<i64>(vlen)) break;
                 i++;
@@ -556,7 +562,8 @@ static inline void match_connection_response(const u8* val, u32 vlen, ParsedResp
         // Find end of token
         i64 tok_start = i;
         while (i < static_cast<i64>(vlen) && val[i] != ',' && val[i] != ' ' && val[i] != '\t') i++;
-        u32 tok_len = static_cast<u32>(i - tok_start);
+        u32 tok_len =
+            static_cast<u32>(static_cast<__int128_t>(i) - static_cast<__int128_t>(tok_start));
 
         if (tok_len == 5 && str_ci_eq(val + tok_start, "close", 5)) {
             resp->connection_close = true;
@@ -601,7 +608,8 @@ static inline ParseStatus apply_semantic_header_response(
                 while (ti < static_cast<i64>(vlen) && val[ti] != ',' && val[ti] != ' ' &&
                        val[ti] != '\t')
                     ti++;
-                u32 tok_len = static_cast<u32>(ti - tok_start);
+                u32 tok_len = static_cast<u32>(static_cast<__int128_t>(ti) -
+                                               static_cast<__int128_t>(tok_start));
                 if (tok_len == 7 && str_ci_eq(val + tok_start, "chunked", 7)) {
                     resp->chunked = true;
                     break;
