@@ -972,7 +972,7 @@ TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = parsed.value();
-    forged.http.server.listen.port++;
+    forged.http.server.listen.port ^= 1u;
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     std::string alternate_http(parsed.value().http.source.ptr, parsed.value().http.source.len);
@@ -1366,7 +1366,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     REQUIRE_FALSE(rejected);
 
     forged = profile.value();
-    forged.server.listen.port++;
+    forged.server.listen.port ^= 1u;
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
@@ -1950,7 +1950,7 @@ TEST(nginx_converter,
     forged.access_log.path.ptr = reinterpret_cast<const char*>(1u);
     rejected(forged);
     forged = parsed.value();
-    forged.server.listen.port++;
+    forged.server.listen.port ^= 1u;
     rejected(forged);
     forged = parsed.value();
     forged.server.listen.address = static_cast<ListenerAddress>(255u);
@@ -2098,7 +2098,7 @@ TEST(nginx_parser, models_exact_no_content_return_in_either_order_with_source_pr
         const auto column = [&](const char* ptr) {
             const char* line_start = ptr;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(ptr - line_start + 1);
+            return static_cast<u32>((ptr + 1) - line_start);
         };
         const auto line = [&](const char* ptr) {
             u32 result = 1;
@@ -2220,7 +2220,7 @@ TEST(nginx_parser, models_bounded_exact_no_content_path_in_either_order) {
         const auto column = [&](const char* ptr) {
             const char* line_start = ptr;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(ptr - line_start + 1);
+            return static_cast<u32>((ptr + 1) - line_start);
         };
 
         REQUIRE(location.present);
@@ -2391,7 +2391,7 @@ TEST(nginx_parser, rejects_excluded_exact_no_content_path_shapes_and_reserved_ac
     const char* status = strstr(reserved, "204");
     REQUIRE(status != nullptr);
     CHECK_EQ(reserved_result.error().span.start, static_cast<u32>(status - reserved));
-    CHECK_EQ(reserved_result.error().span.end, static_cast<u32>(status - reserved + 3));
+    CHECK_EQ(reserved_result.error().span.end, static_cast<u32>((status + 3) - reserved));
 }
 
 TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
@@ -2442,7 +2442,7 @@ TEST(nginx_parser, models_one_internal_exact_local_body_space_in_either_order) {
         const auto column = [&](const char* ptr) {
             const char* line_start = ptr;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(ptr - line_start + 1);
+            return static_cast<u32>((ptr + 1) - line_start);
         };
 
         CHECK_EQ(server.span.start, offset(server_start));
@@ -2593,7 +2593,7 @@ TEST(nginx_parser, models_multiple_internal_exact_local_body_spaces_in_either_or
         const auto column = [&](const char* ptr) {
             const char* line_start = ptr;
             while (line_start != vector.source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(ptr - line_start + 1);
+            return static_cast<u32>((ptr + 1) - line_start);
         };
 
         CHECK_EQ(server.span.start, offset(server_start));
@@ -2953,7 +2953,7 @@ TEST(nginx_parser, parses_bounded_clean_exact_local_return_path_in_either_order)
         const auto column = [&](const char* ptr) {
             const char* line_start = ptr;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(ptr - line_start + 1);
+            return static_cast<u32>((ptr + 1) - line_start);
         };
         const auto check_default_span = [&](Span span) {
             CHECK_EQ(span.start, 0u);
@@ -3390,11 +3390,11 @@ TEST(nginx_parser, parses_bounded_proxy_read_timeout_in_either_directive_order) 
     REQUIRE(first_value != nullptr);
     REQUIRE(first_semicolon != nullptr);
     CHECK_EQ(first_timeout.span.start, static_cast<u32>(first_keyword - timeout_first));
-    CHECK_EQ(first_timeout.span.end, static_cast<u32>(first_semicolon - timeout_first + 1));
+    CHECK_EQ(first_timeout.span.end, static_cast<u32>((first_semicolon + 1) - timeout_first));
     CHECK_EQ(first_timeout.span.line, 4u);
     CHECK_EQ(first_timeout.span.col, 5u);
     CHECK_EQ(first_timeout.value_span.start, static_cast<u32>(first_value - timeout_first));
-    CHECK_EQ(first_timeout.value_span.end, static_cast<u32>(first_value - timeout_first + 2));
+    CHECK_EQ(first_timeout.value_span.end, static_cast<u32>((first_value + 2) - timeout_first));
     CHECK_EQ(first_timeout.value_span.line, 4u);
     CHECK_EQ(first_timeout.value_span.col, 24u);
 
@@ -3413,9 +3413,9 @@ TEST(nginx_parser, parses_bounded_proxy_read_timeout_in_either_directive_order) 
     REQUIRE(last_value != nullptr);
     REQUIRE(last_semicolon != nullptr);
     CHECK_EQ(last_timeout.span.start, static_cast<u32>(last_keyword - timeout_last));
-    CHECK_EQ(last_timeout.span.end, static_cast<u32>(last_semicolon - timeout_last + 1));
+    CHECK_EQ(last_timeout.span.end, static_cast<u32>((last_semicolon + 1) - timeout_last));
     CHECK_EQ(last_timeout.value_span.start, static_cast<u32>(last_value - timeout_last));
-    CHECK_EQ(last_timeout.value_span.end, static_cast<u32>(last_value - timeout_last + 3));
+    CHECK_EQ(last_timeout.value_span.end, static_cast<u32>((last_value + 3) - timeout_last));
 }
 
 TEST(nginx_parser, rejects_proxy_read_timeout_bad_arity_and_bounded_values) {
@@ -3718,7 +3718,7 @@ TEST(nginx_parser, admits_bounded_explicit_proxy_buffering_off_timeout_profile) 
     shifted_timeout.location.proxy_read_timeout.value_span.start++;
     CHECK_FALSE(nginx::lower_to_rut(shifted_timeout));
     auto changed_port = parsed.value();
-    changed_port.location.proxy_pass.port++;
+    changed_port.location.proxy_pass.port ^= 1u;
     CHECK_FALSE(nginx::lower_to_rut(changed_port));
     auto changed_address = parsed.value();
     changed_address.location.proxy_pass.address[3] = 2u;
@@ -4258,7 +4258,7 @@ TEST(nginx_parser, parses_bounded_clean_proxy_location_with_exact_source_provena
     CHECK_EQ(location.path_span.line, 4u);
     CHECK_EQ(location.path_span.col, 14u);
     CHECK_EQ(location.span.start, static_cast<u32>(location_keyword - root_uri));
-    CHECK_EQ(location.span.end, static_cast<u32>(closing_brace - root_uri + 1));
+    CHECK_EQ(location.span.end, static_cast<u32>((closing_brace + 1) - root_uri));
     CHECK_EQ(location.span.line, 4u);
     CHECK_EQ(location.span.col, 5u);
     CHECK_GE(location.path.ptr, root_uri);
@@ -4311,7 +4311,7 @@ TEST(nginx_parser, enforces_bounded_clean_proxy_location_capacity) {
     CHECK_EQ(accepted_location.path_span.col, 32u);
     CHECK_EQ(accepted_location.span.start, static_cast<u32>(accepted_keyword - accepted_source));
     CHECK_EQ(accepted_location.span.end,
-             static_cast<u32>(accepted_closing_brace - accepted_source + 1));
+             static_cast<u32>((accepted_closing_brace + 1) - accepted_source));
     CHECK_EQ(accepted_location.span.line, 1u);
     CHECK_EQ(accepted_location.span.col, 23u);
 
@@ -4530,7 +4530,7 @@ TEST(nginx_parser, models_static_query_proxy_uri_in_either_server_directive_orde
         CHECK_EQ(proxy.uri_span.line, expected_line);
         const char* line_start = replacement;
         while (line_start != source && line_start[-1] != '\n') --line_start;
-        CHECK_EQ(proxy.uri_span.col, static_cast<u32>(replacement - line_start + 1u));
+        CHECK_EQ(proxy.uri_span.col, static_cast<u32>((replacement + 1u) - line_start));
         CHECK_LT(proxy.uri_span.end, proxy.span.end);
         CHECK_GE(proxy.uri.ptr, source);
         CHECK_LE(proxy.uri.ptr + proxy.uri.len, source + source_len);
@@ -4581,7 +4581,7 @@ TEST(nginx_parser, issue360_models_terminal_empty_query_with_exact_provenance_an
         CHECK_EQ(proxy.uri_span.end, expected_start + 5u);
         CHECK_EQ(proxy.uri_span.end - proxy.uri_span.start, 5u);
         CHECK_EQ(proxy.uri_span.line, expected_line);
-        CHECK_EQ(proxy.uri_span.col, static_cast<u32>(replacement - line_start + 1u));
+        CHECK_EQ(proxy.uri_span.col, static_cast<u32>((replacement + 1u) - line_start));
         CHECK_LT(proxy.uri_span.end, proxy.span.end);
         CHECK_EQ(location.path.ptr, source + location.path_span.start);
         CHECK_EQ(reinterpret_cast<uintptr_t>(proxy.uri.ptr) - proxy.uri_span.start,
@@ -4689,7 +4689,7 @@ TEST(nginx_parser, issue372_models_root_empty_query_in_both_orders_with_exact_pr
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') line_start--;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             CHECK_EQ(span.start, offset(start));
@@ -5491,7 +5491,7 @@ TEST(nginx_parser, rejects_unbounded_or_malformed_exact_no_content_return_shapes
     CHECK_EQ(missing_semicolon_result.error().span.start,
              static_cast<u32>(exact_close - missing_semicolon));
     CHECK_EQ(missing_semicolon_result.error().span.end,
-             static_cast<u32>(exact_close - missing_semicolon + 1));
+             static_cast<u32>((exact_close + 1) - missing_semicolon));
 
     const char eof_after_status[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:1; } location = "
@@ -7335,7 +7335,7 @@ TEST(nginx_converter, lowers_exact_absolute_redirect_in_either_order_to_stable_r
     const char* legacy_any = strstr(legacy_get, "route \"/\" {");
     REQUIRE(legacy_forward != nullptr);
     REQUIRE(legacy_any != nullptr);
-    const u32 canonical_forward_len = static_cast<u32>(legacy_any - legacy_forward - 2);
+    const u32 canonical_forward_len = static_cast<u32>((legacy_any - 2) - legacy_forward);
     CHECK((
         Str{generated_forward, canonical_forward_len}.eq({legacy_forward, canonical_forward_len})));
     const char* generated_close = generated_forward + canonical_forward_len;
@@ -7431,7 +7431,7 @@ TEST(nginx_converter, lowers_exact_302_absolute_redirect_to_exact_stable_rut) {
                static_cast<u32>(sizeof(kRedirectGolden) - 1u));
     CHECK((Str{generated_route, sizeof(kRedirectGolden) - 1u}.eq(
         {kRedirectGolden, sizeof(kRedirectGolden) - 1u})));
-    const u32 canonical_forward_len = static_cast<u32>(legacy_any - legacy_forward - 2);
+    const u32 canonical_forward_len = static_cast<u32>((legacy_any - 2) - legacy_forward);
     CHECK((
         Str{generated_forward, canonical_forward_len}.eq({legacy_forward, canonical_forward_len})));
     const char* generated_close = generated_forward + canonical_forward_len;
@@ -9985,8 +9985,8 @@ TEST(nginx_converter, emitted_exact_redirect_reaches_owned_runtime_config) {
     CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodConnect], 1u);
     CHECK_EQ(populated->unmatched_policy_ids[kRouteMethodAny], 3u);
     CHECK(populated->strict_local_response_table_is_valid());
-    for (u16 id = 1; id <= populated->strict_local_response_policy_count; id++) {
-        REQUIRE(populated->strict_local_response_policy_id_is_owned(id));
+    for (u32 id = 1; id <= populated->strict_local_response_policy_count; ++id) {
+        REQUIRE(populated->strict_local_response_policy_id_is_owned(static_cast<u16>(id)));
         const auto& policy = populated->strict_local_response_policies[id - 1];
         const bool bad_request = policy.status_code == 400;
         CHECK(policy.reason.eq(bad_request ? lit_str("Bad Request") : lit_str("Not Allowed")));
@@ -12421,7 +12421,7 @@ TEST(nginx_parser, parses_explicit_ipv4_wildcard_listen_with_exact_spans_and_lif
         CHECK_EQ(listen.value_span.line, expected_line);
         CHECK_EQ(listen.value_span.col, 10u);
         CHECK_EQ(listen.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(listen.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(listen.span.line, expected_line);
         CHECK_EQ(listen.span.col, 3u);
 
@@ -12435,7 +12435,7 @@ TEST(nginx_parser, parses_explicit_ipv4_wildcard_listen_with_exact_spans_and_lif
         CHECK_EQ(retained.value_span.start, static_cast<u32>(endpoint - source));
         CHECK_EQ(retained.value_span.end, static_cast<u32>(semicolon - source));
         CHECK_EQ(retained.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(retained.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(retained.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(retained.span.line, expected_line);
         CHECK_EQ(retained.span.col, 3u);
     };
@@ -12464,7 +12464,7 @@ TEST(nginx_parser, parses_explicit_ipv4_wildcard_listen_with_exact_spans_and_lif
         REQUIRE(directive != nullptr);
         REQUIRE(semicolon != nullptr);
         CHECK_EQ(parsed.value().listen.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(parsed.value().listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(parsed.value().listen.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(parsed.value().listen.span.line, 1u);
         CHECK_EQ(parsed.value().listen.span.col, 10u);
     }
@@ -12501,7 +12501,7 @@ TEST(nginx_parser, parses_asterisk_ipv4_wildcard_listen_with_exact_spans_and_lif
         CHECK_EQ(listen.value_span.line, expected_line);
         CHECK_EQ(listen.value_span.col, 10u);
         CHECK_EQ(listen.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(listen.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(listen.span.line, expected_line);
         CHECK_EQ(listen.span.col, 3u);
 
@@ -12513,7 +12513,7 @@ TEST(nginx_parser, parses_asterisk_ipv4_wildcard_listen_with_exact_spans_and_lif
         CHECK_EQ(retained.value_span.start, static_cast<u32>(endpoint - source));
         CHECK_EQ(retained.value_span.end, static_cast<u32>(semicolon - source));
         CHECK_EQ(retained.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(retained.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(retained.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(retained.span.line, expected_line);
         CHECK_EQ(retained.span.col, 3u);
     };
@@ -12542,7 +12542,7 @@ TEST(nginx_parser, parses_asterisk_ipv4_wildcard_listen_with_exact_spans_and_lif
         REQUIRE(directive != nullptr);
         REQUIRE(semicolon != nullptr);
         CHECK_EQ(parsed.value().listen.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(parsed.value().listen.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(parsed.value().listen.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(parsed.value().listen.span.line, 1u);
         CHECK_EQ(parsed.value().listen.span.col, 10u);
     }
@@ -12580,7 +12580,7 @@ TEST(nginx_parser, parses_exact_loopback_listen_with_endpoint_provenance_and_own
         CHECK_EQ(listener.value_span.line, expected_line);
         CHECK_EQ(listener.value_span.col, 10u);
         CHECK_EQ(listener.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(listener.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(listener.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(listener.span.line, expected_line);
         CHECK_EQ(listener.span.col, 3u);
 
@@ -12657,7 +12657,7 @@ TEST(nginx_parser, issue398_parses_canonical_numeric_ipv4_listen_with_exact_prov
         CHECK_EQ(listener.value_span.line, expected_line);
         CHECK_EQ(listener.value_span.col, 10u);
         CHECK_EQ(listener.span.start, static_cast<u32>(directive - source));
-        CHECK_EQ(listener.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(listener.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(listener.span.line, expected_line);
         CHECK_EQ(listener.span.col, 3u);
 
@@ -12816,7 +12816,7 @@ TEST(nginx_parser, issue348_combines_exact_loopback_no_content_and_root_proxy_wi
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') line_start--;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             CHECK_EQ(span.start, offset(start));
@@ -13206,7 +13206,7 @@ TEST(nginx_parser,
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') line_start--;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             CHECK_EQ(span.start, offset(start));
@@ -13668,7 +13668,7 @@ TEST(nginx_parser,
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') line_start--;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             CHECK_EQ(span.start, offset(start));
@@ -14313,7 +14313,7 @@ TEST(nginx_parser,
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             CHECK_EQ(span.start, offset(start));
@@ -14603,7 +14603,7 @@ TEST(nginx_parser,
         CHECK_EQ(rejected.error().span.end,
                  static_cast<u32>(offending - vector.source) + offending_len);
         CHECK_EQ(rejected.error().span.line, 1u);
-        CHECK_EQ(rejected.error().span.col, static_cast<u32>(offending - vector.source + 1u));
+        CHECK_EQ(rejected.error().span.col, static_cast<u32>((offending + 1u) - vector.source));
     }
 
     static constexpr char kNonRootReplacement[] =
@@ -14877,7 +14877,7 @@ TEST(nginx_parser,
         const auto column = [&](const char* pointer) {
             const char* line_start = pointer;
             while (line_start != source && line_start[-1] != '\n') --line_start;
-            return static_cast<u32>(pointer - line_start + 1u);
+            return static_cast<u32>((pointer + 1u) - line_start);
         };
         const auto span_matches = [&](Span span, const char* start, const char* end) {
             return span.start == offset(start) && span.end == offset(end) &&
@@ -15253,7 +15253,7 @@ TEST(nginx_parser,
         CHECK_EQ(rejected.error().span.end,
                  static_cast<u32>(offending - vector.source) + offending_len);
         CHECK_EQ(rejected.error().span.line, 1u);
-        CHECK_EQ(rejected.error().span.col, static_cast<u32>(offending - vector.source + 1u));
+        CHECK_EQ(rejected.error().span.col, static_cast<u32>((offending + 1u) - vector.source));
     }
 
     static constexpr char kConfiguredQuery[] =
@@ -15475,7 +15475,7 @@ TEST(nginx_converter,
         const auto col = [&](const char* pointer) {
             const char* cursor = pointer;
             while (cursor != source && cursor[-1] != '\n') cursor--;
-            return static_cast<u32>(pointer - cursor + 1u);
+            return static_cast<u32>((pointer + 1u) - cursor);
         };
         const auto check_span = [&](Span span, const char* start, const char* end) {
             REQUIRE_EQ(span.start, static_cast<u32>(start - source));
@@ -18246,7 +18246,7 @@ TEST(nginx_parser, rejects_malformed_exact_listen_endpoints) {
         CHECK_EQ(parsed.error().span.end,
                  static_cast<u32>(offending - source + strlen(rejection.offending)));
         CHECK_EQ(parsed.error().span.line, 1u);
-        CHECK_EQ(parsed.error().span.col, static_cast<u32>(offending - source + 1u));
+        CHECK_EQ(parsed.error().span.col, static_cast<u32>((offending + 1u) - source));
     }
 
     const char comment_split[] =
@@ -18264,7 +18264,7 @@ TEST(nginx_parser, rejects_malformed_exact_listen_endpoints) {
              static_cast<u32>(comment_offending - comment_split + strlen("127.0.0.")));
     CHECK_EQ(comment_result.error().span.line, 1u);
     CHECK_EQ(comment_result.error().span.col,
-             static_cast<u32>(comment_offending - comment_split + 1u));
+             static_cast<u32>((comment_offending + 1u) - comment_split));
 
     const char option[] =
         "server { listen 127.0.0.1:8080 default_server; "
@@ -20629,13 +20629,13 @@ TEST(nginx_parser_issue373, parses_literal_proxy_hide_header_in_four_orders_with
         CHECK_EQ(header.name.ptr, name);
         CHECK_EQ(header.name.len, 15u);
         CHECK_EQ(header.name_span.start, static_cast<u32>(name - source));
-        CHECK_EQ(header.name_span.end, static_cast<u32>(name - source + 15u));
+        CHECK_EQ(header.name_span.end, static_cast<u32>((name + 15u) - source));
         CHECK_EQ(header.name_span.line, 1u);
-        CHECK_EQ(header.name_span.col, static_cast<u32>(name - source + 1u));
+        CHECK_EQ(header.name_span.col, static_cast<u32>((name + 1u) - source));
         CHECK_EQ(header.span.start, static_cast<u32>(keyword - source));
-        CHECK_EQ(header.span.end, static_cast<u32>(semicolon - source + 1u));
+        CHECK_EQ(header.span.end, static_cast<u32>((semicolon + 1u) - source));
         CHECK_EQ(header.span.line, 1u);
-        CHECK_EQ(header.span.col, static_cast<u32>(keyword - source + 1u));
+        CHECK_EQ(header.span.col, static_cast<u32>((keyword + 1u) - source));
         CHECK_FALSE(parsed.value().location.proxy_read_timeout.present);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);

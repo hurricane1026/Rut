@@ -26851,7 +26851,9 @@ route POST "/" {
     std::string signature;
     signature_for(timestamp, signature);
     REQUIRE(!signature.empty());
-    const std::string stale = std::to_string(now.tv_sec - 1000);
+    i64 stale_seconds;
+    REQUIRE(!__builtin_sub_overflow(now.tv_sec, 1000, &stale_seconds));
+    const std::string stale = std::to_string(stale_seconds);
     std::string stale_signature;
     signature_for(stale, stale_signature);
     REQUIRE(!stale_signature.empty());
@@ -26977,11 +26979,15 @@ route POST "/signed" {
     CHECK_EQ(invoke("POST", target, body, good, "Digest: SHA-256=invalid"), 401u);
     CHECK_EQ(invoke("POST", target, body, good, "Authorization: " + good.authorization), 401u);
 
+    i64 stale_seconds;
+    i64 future_seconds;
+    REQUIRE(!__builtin_sub_overflow(now.tv_sec, 600, &stale_seconds));
+    REQUIRE(!__builtin_add_overflow(now.tv_sec, 600, &future_seconds));
     const auto stale =
-        ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec - 600);
+        ::rut::test::signed_request::make_headers("POST", target, body, stale_seconds);
     CHECK_EQ(invoke("POST", target, body, stale), 401u);
     const auto future =
-        ::rut::test::signed_request::make_headers("POST", target, body, now.tv_sec + 600);
+        ::rut::test::signed_request::make_headers("POST", target, body, future_seconds);
     CHECK_EQ(invoke("POST", target, body, future), 401u);
     const std::string oversized_body(16 * 1024 + 1, 'x');
     const auto oversized =
@@ -27910,17 +27916,29 @@ route GET "/large" {
     REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
     REQUIRE(now.tv_sec > 1000);
     const auto current = static_cast<std::int64_t>(now.tv_sec);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600), 204);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 400, current + 3600), 401);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 8000), 401);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600, "issuer", false),
-                 401);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current + 3600, "wrong-issuer"),
-                 401);
-    check_claims(::rut::test::jwt_lifetime::claims(current - 60, current - 1), 401);
+    i64 issued_recently;
+    i64 issued_early;
+    i64 expires_in_one_hour;
+    i64 expires_too_late;
+    i64 expired;
+    REQUIRE(!__builtin_sub_overflow(current, 60, &issued_recently));
+    REQUIRE(!__builtin_sub_overflow(current, 400, &issued_early));
+    REQUIRE(!__builtin_add_overflow(current, 3600, &expires_in_one_hour));
+    REQUIRE(!__builtin_add_overflow(current, 8000, &expires_too_late));
+    REQUIRE(!__builtin_sub_overflow(current, 1, &expired));
+    check_claims(::rut::test::jwt_lifetime::claims(issued_recently, expires_in_one_hour), 204);
+    check_claims(::rut::test::jwt_lifetime::claims(issued_early, expires_in_one_hour), 401);
+    check_claims(::rut::test::jwt_lifetime::claims(issued_recently, expires_too_late), 401);
+    check_claims(
+        ::rut::test::jwt_lifetime::claims(issued_recently, expires_in_one_hour, "issuer", false),
+        401);
+    check_claims(
+        ::rut::test::jwt_lifetime::claims(issued_recently, expires_in_one_hour, "wrong-issuer"),
+        401);
+    check_claims(::rut::test::jwt_lifetime::claims(issued_recently, expired), 401);
     arena.reset();
     const auto large_token = ::rut::test::jwt_lifetime::make_token(
-        ::rut::test::jwt_lifetime::claims(current - 60, current + 3600));
+        ::rut::test::jwt_lifetime::claims(issued_recently, expires_in_one_hour));
     const std::string large_request =
         "GET /large HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + large_token +
         "\r\n\r\n";
