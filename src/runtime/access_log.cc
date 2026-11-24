@@ -203,7 +203,10 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     w += static_cast<i64>(copy_str(line + w, method_str(entry.method)));
     line[w++] = ' ';
 
-    const auto invalid_target = [&] { w += static_cast<i64>(copy_str(line + w, kInvalid)); };
+    const auto invalid_target = [&] {
+        w = static_cast<i64>(static_cast<__int128_t>(w) +
+                             static_cast<i64>(copy_str(line + w, kInvalid)));
+    };
     switch (entry.target_state) {
         case AccessLogTargetState::LegacyNullTerminated: {
             if (entry.target_length != 0u) {
@@ -246,15 +249,20 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     }
     line[w++] = ' ';
 
-    w += static_cast<i64>(write_u64_dec(line + w, entry.status));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(write_u64_dec(line + w, entry.status)));
     line[w++] = ' ';
-    w += static_cast<i64>(write_u64_dec(line + w, entry.duration_us));
-    w += static_cast<i64>(copy_str(line + w, "us "));
-    w += static_cast<i64>(write_u64_dec(line + w, entry.req_size));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(write_u64_dec(line + w, entry.duration_us)));
+    w = static_cast<i64>(static_cast<__int128_t>(w) + static_cast<i64>(copy_str(line + w, "us ")));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(write_u64_dec(line + w, entry.req_size)));
     line[w++] = ' ';
-    w += static_cast<i64>(write_u64_dec(line + w, entry.resp_size));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(write_u64_dec(line + w, entry.resp_size)));
     line[w++] = ' ';
-    w += static_cast<i64>(format_ipv4(line + w, entry.addr));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(format_ipv4(line + w, entry.addr)));
 
     // Upstream (if present)
     if (entry.upstream[0] != '\0') {
@@ -263,16 +271,22 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
         while (up_len < sizeof(entry.upstream) && entry.upstream[up_len]) up_len++;
         for (i64 i = 0; i < up_len; i++) line[w++] = entry.upstream[i];
         line[w++] = ' ';
-        w += static_cast<i64>(write_u64_dec(line + w, entry.upstream_us));
-        w += static_cast<i64>(copy_str(line + w, "us"));
+        w = static_cast<i64>(static_cast<__int128_t>(w) +
+                             static_cast<i64>(write_u64_dec(line + w, entry.upstream_us)));
+        w = static_cast<i64>(static_cast<__int128_t>(w) +
+                             static_cast<i64>(copy_str(line + w, "us")));
     }
 
-    w += static_cast<i64>(copy_str(line + w, " s="));
-    w += static_cast<i64>(write_u64_dec(line + w, entry.shard_id));
+    w = static_cast<i64>(static_cast<__int128_t>(w) + static_cast<i64>(copy_str(line + w, " s=")));
+    w = static_cast<i64>(static_cast<__int128_t>(w) +
+                         static_cast<i64>(write_u64_dec(line + w, entry.shard_id)));
     if (entry.grpc_status_plus_one != 0 && entry.grpc_status_plus_one <= 17) {
-        w += static_cast<i64>(copy_str(line + w, " grpc_status="));
-        w += static_cast<i64>(write_u64_dec(
-            line + w, static_cast<u64>(static_cast<i64>(entry.grpc_status_plus_one) - 1)));
+        w = static_cast<i64>(static_cast<__int128_t>(w) +
+                             static_cast<i64>(copy_str(line + w, " grpc_status=")));
+        w = static_cast<i64>(
+            static_cast<__int128_t>(w) +
+            static_cast<i64>(write_u64_dec(
+                line + w, static_cast<u64>(static_cast<i64>(entry.grpc_status_plus_one) - 1))));
     }
     line[w++] = '\n';
     if (w > static_cast<i64>(sizeof(line)) || buf == nullptr || static_cast<i64>(buf_size) < w)

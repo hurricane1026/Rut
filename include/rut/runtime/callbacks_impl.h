@@ -345,8 +345,11 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
     i64 configured = 0;
     i64 healthy = 0;
     for (u32 i = 0; i < target.addr_count; ++i) {
-        configured += static_cast<i64>(target.weights[i]);
-        if (!backend_ejected(uid, i, now)) healthy += static_cast<i64>(target.weights[i]);
+        configured = static_cast<i64>(static_cast<__int128_t>(configured) +
+                                      static_cast<i64>(target.weights[i]));
+        if (!backend_ejected(uid, i, now))
+            healthy = static_cast<i64>(static_cast<__int128_t>(healthy) +
+                                       static_cast<i64>(target.weights[i]));
     }
     return configured != 0 &&
            healthy * 100 >= configured * static_cast<i64>(target.minimum_healthy_weight_percent);
@@ -425,10 +428,10 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         // Eight u16 weights total at most 524280; the maintained i32 credits
         // therefore remain representable after each bounded update.
         current[i] = static_cast<i32>(static_cast<i64>(current[i]) + static_cast<i64>(weights[i]));
-        total += static_cast<i64>(weights[i]);
+        total = static_cast<i64>(static_cast<__int128_t>(total) + static_cast<i64>(weights[i]));
         if (best == count || current[i] > current[best]) best = i;
     }
-    current[best] = static_cast<i32>(static_cast<i64>(current[best]) - total);
+    current[best] = static_cast<i32>(static_cast<__int128_t>(current[best]) - total);
     cursor = static_cast<u16>((static_cast<i32>(best) + 1) % static_cast<i32>(count));
     return best;
 }
@@ -8857,8 +8860,8 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
     const u8* path_ptr = reinterpret_cast<const u8*>(req.path.ptr);
-    if (static_cast<i64>(line_end - data) + 1 >= static_cast<i64>(parser.header_end) ||
-        path_ptr < data || path_ptr + static_cast<i64>(req.path.len) > line_end)
+    if (line_end + 1 >= end || path_ptr < data ||
+        path_ptr + static_cast<i64>(req.path.len) > line_end)
         return false;
     const bool trim_sp_preserve_htab = request_policy_trims_sp_preserves_htab(policy_id);
     u64 measured_id3_length = 0;
@@ -8886,15 +8889,18 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                               static_cast<u8>(ip >> 16),
                               static_cast<u8>(ip >> 8),
                               static_cast<u8>(ip)};
-        i64 measured =
-            static_cast<i64>(path_ptr - data) + static_cast<i64>(req.path.len) + 1 + 8 + 2;
-        measured += 6 + 2;
+        i64 measured = static_cast<i64>(static_cast<__int128_t>(path_ptr - data) +
+                                        static_cast<i64>(req.path.len) + 1 + 8 + 2);
+        measured = static_cast<i64>(static_cast<__int128_t>(measured) + 6 + 2);
         for (u8 oi = 0; oi < 4; ++oi) {
-            if (oi != 0) ++measured;
-            measured += static_cast<i64>(decimal_len(octets[oi]));
+            if (oi != 0) measured = static_cast<i64>(static_cast<__int128_t>(measured) + 1);
+            measured = static_cast<i64>(static_cast<__int128_t>(measured) +
+                                        static_cast<i64>(decimal_len(octets[oi])));
         }
         const u16 port = ntohs(endpoint.sin_port);
-        if (port != 80) measured += 1 + static_cast<i64>(decimal_len(port));
+        if (port != 80)
+            measured = static_cast<i64>(static_cast<__int128_t>(measured) + 1 +
+                                        static_cast<i64>(decimal_len(port)));
         const u8* measured_hs = line_end + 2;
         const u8* measured_header_end = end - 2;
         u32 measured_index = 0;
@@ -8925,7 +8931,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                            raw_end > data_end;
                 }()) ||
                 parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
-                parsed_header.raw_value.len != static_cast<u32>(measured_le - colon - 1))
+                parsed_header.raw_value.len != static_cast<u32>(measured_le - (colon + 1)))
                 return false;
             const bool drop =
                 request_policy_name_eq(measured_hs, name_len, "content-length", 14) ||
@@ -8945,12 +8951,13 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                        parsed_header.raw_value
                                .ptr[static_cast<u32>(static_cast<i64>(value_end) - 1)] == ' ')
                     value_end = static_cast<u32>(static_cast<i64>(value_end) - 1);
-                measured += static_cast<i64>(name_len) + 2 + static_cast<i64>(value_end) -
-                            static_cast<i64>(value_start) + 2;
+                measured = static_cast<i64>(
+                    static_cast<__int128_t>(measured) + static_cast<i64>(name_len) + 2 +
+                    static_cast<i64>(value_end) - static_cast<i64>(value_start) + 2);
             }
             measured_hs = measured_le + 2;
         }
-        measured += 2;
+        measured = static_cast<i64>(static_cast<__int128_t>(measured) + 2);
         if (measured_index != req.header_count || measured < 0 ||
             measured > static_cast<i64>(conn.send_buf.capacity()) ||
             measured > static_cast<i64>(conn.recv_buf.capacity()))
@@ -9071,8 +9078,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                                raw_end > data_end;
                     }()) ||
                     parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
-                    parsed_header.raw_value.len !=
-                        static_cast<u32>(static_cast<i64>(le - colon) - 1))
+                    parsed_header.raw_value.len != static_cast<u32>(le - (colon + 1)))
                     return false;
                 value_start = reinterpret_cast<const u8*>(parsed_header.raw_value.ptr);
                 value_end = value_start + static_cast<i64>(parsed_header.raw_value.len);
@@ -14578,7 +14584,7 @@ inline u32 strict_response_date(char* out, u64 now_us) {
     *p++ = ' ';
     for (const char* s = kMonth[tm.tm_mon]; *s; ++s) *p++ = *s;
     *p++ = ' ';
-    int year = tm.tm_year + 1900;
+    const int year = static_cast<int>(static_cast<i64>(tm.tm_year) + 1900);
     *p++ = static_cast<char>('0' + year / 1000);
     *p++ = static_cast<char>('0' + (year / 100) % 10);
     *p++ = static_cast<char>('0' + (year / 10) % 10);

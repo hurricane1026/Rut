@@ -407,8 +407,8 @@ bool emit_frame(u8* out,
     (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
-    const u64 output_len = static_cast<u64>(static_cast<i64>(len) + static_cast<i64>(prefix.len) +
-                                            static_cast<i64>(suffix.len));
+    const u64 output_len = static_cast<u64>(
+        static_cast<__int128_t>(len) + static_cast<i64>(prefix.len) + static_cast<i64>(suffix.len));
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
@@ -420,14 +420,13 @@ bool emit_frame(u8* out,
         out[static_cast<i64>(*produced) + static_cast<i64>(i)] = hdr[i];
     u8* dst = out + static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength);
     for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
-    for (u64 i = 0; i < len; i++)
-        dst[static_cast<i64>(prefix.len) + static_cast<i64>(i)] = payload[i];
+    for (u64 i = 0; i < len; i++) (dst + static_cast<i64>(prefix.len))[i] = payload[i];
     for (u32 i = 0; i < suffix.len; i++)
-        dst[static_cast<i64>(prefix.len) + static_cast<i64>(len) + static_cast<i64>(i)] =
+        (dst + static_cast<i64>(prefix.len) + static_cast<i64>(len))[i] =
             static_cast<u8>(suffix.ptr[i]);
     if (masked) ws_unmask(dst, output_len, key);
-    *produced = static_cast<u32>(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
-                                 static_cast<i64>(output_len));
+    *produced = static_cast<u32>(static_cast<__int128_t>(*produced) +
+                                 static_cast<i64>(kHeaderLength) + static_cast<i64>(output_len));
     return true;
 }
 
@@ -626,7 +625,7 @@ bool ws_valid_text_rewrite(const WsTextRewrite& rewrite, u64 max_size) {
     if (rewrite.source == WsTextSource::Dynamic)
         return !rewrite.prefix.ptr && !rewrite.prefix.len && !rewrite.suffix.ptr &&
                !rewrite.suffix.len && !rewrite.source_path.ptr && !rewrite.source_path.len;
-    const u64 literal_size = static_cast<u64>(static_cast<i64>(rewrite.prefix.len) +
+    const u64 literal_size = static_cast<u64>(static_cast<__int128_t>(rewrite.prefix.len) +
                                               static_cast<i64>(rewrite.suffix.len));
     const bool kSourceValid =
         rewrite.source <= WsTextSource::MessageBytes &&
@@ -736,7 +735,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 if (h.payload_len > msg_cap) return WsInspectStatus::Error;
                 const u32 payload_len = static_cast<u32>(h.payload_len);
                 if (static_cast<i64>(payload_len) >
-                    static_cast<i64>(UINT32_MAX) - static_cast<i64>(st.message_len))
+                    static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
+                                     static_cast<__int128_t>(st.message_len)))
                     return WsInspectStatus::Error;
                 const u32 message_total = static_cast<u32>(static_cast<i64>(st.message_len) +
                                                            static_cast<i64>(payload_len));
@@ -775,7 +775,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                                                 rewrite.source != WsTextSource::LiteralBinary
                                             ? kOriginalSize
                                             : 0;
-                return static_cast<u64>(static_cast<i64>(rewrite.prefix.len) +
+                return static_cast<u64>(static_cast<__int128_t>(rewrite.prefix.len) +
                                         static_cast<i64>(rewrite.suffix.len) +
                                         static_cast<i64>(kSourceSize));
             };
@@ -794,7 +794,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if (reason_size != 0 && close_size > data_size) data_size = close_size;
             const u64 needed = ws_opcode_is_control(h.opcode)
                                    ? frame_total
-                                   : (h.fin ? static_cast<u64>(static_cast<i64>(data_size) +
+                                   : (h.fin ? static_cast<u64>(static_cast<__int128_t>(data_size) +
                                                                static_cast<i64>(kWsMaxHeaderSize))
                                             : 0);
             if (static_cast<i64>(needed) > static_cast<i64>(out_cap) - static_cast<i64>(*produced))
@@ -838,8 +838,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
-            *consumed =
-                static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(frame_total));
+            *consumed = static_cast<u32>(static_cast<__int128_t>(*consumed) +
+                                         static_cast<__int128_t>(frame_total));
             if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
             continue;
         }
@@ -882,8 +882,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
             for (u32 i = 0; i < chunk; i++) dst[i] = payload[i];
             if (st.masked) ws_unmask_chunk(dst, chunk, h.mask_key, st.partial_payload_len);
         }
-        st.partial_payload_len =
-            static_cast<u32>(static_cast<i64>(st.partial_payload_len) + static_cast<i64>(chunk));
+        st.partial_payload_len = static_cast<u32>(static_cast<__int128_t>(st.partial_payload_len) +
+                                                  static_cast<i64>(chunk));
         *consumed = static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(header_len) +
                                      static_cast<i64>(chunk));
         if (st.partial_payload_len < h.payload_len) {
@@ -906,7 +906,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
         if (!kCompressed) {
             if (h.payload_len > UINT32_MAX ||
                 static_cast<i64>(h.payload_len) >
-                    static_cast<i64>(UINT32_MAX) - static_cast<i64>(st.message_len))
+                    static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
+                                     static_cast<__int128_t>(st.message_len)))
                 return WsInspectStatus::Error;
             st.message_len = static_cast<u32>(static_cast<i64>(st.message_len) +
                                               static_cast<i64>(h.payload_len));
@@ -984,7 +985,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                                              rewrite.source == WsTextSource::MessageBytes
                                          ? total
                                          : 0;
-            const u64 kOutputSize = static_cast<u64>(static_cast<i64>(kPayloadSize) +
+            const u64 kOutputSize = static_cast<u64>(static_cast<__int128_t>(kPayloadSize) +
                                                      static_cast<i64>(rewrite.prefix.len) +
                                                      static_cast<i64>(rewrite.suffix.len));
             if (rewrite.source == WsTextSource::Dynamic ||
@@ -1198,8 +1199,8 @@ WsClosingRead ws_read_closing(
             static_cast<u32>(static_cast<i64>(kAvailable) - static_cast<i64>(kHeaderLen));
         const u32 kTake =
             kRemaining < kAvailablePayload ? static_cast<u32>(kRemaining) : kAvailablePayload;
-        st.partial_payload_len =
-            static_cast<u32>(static_cast<i64>(st.partial_payload_len) + static_cast<i64>(kTake));
+        st.partial_payload_len = static_cast<u32>(static_cast<__int128_t>(st.partial_payload_len) +
+                                                  static_cast<i64>(kTake));
         *consumed = static_cast<u32>(static_cast<i64>(*consumed) + static_cast<i64>(kHeaderLen) +
                                      static_cast<i64>(kTake));
         if (st.partial_payload_len != header.payload_len) {

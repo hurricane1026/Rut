@@ -1053,7 +1053,8 @@ static Http2Error handle_frame(Http2Conn& c,
         case Http2FrameType::Data: {
             if (h.stream_id == 0) return Http2Error::ProtocolError;
             // Connection-level flow control counts the whole frame payload.
-            c.conn_recv_window -= static_cast<i64>(h.length);
+            c.conn_recv_window = static_cast<i64>(static_cast<__int128_t>(c.conn_recv_window) -
+                                                  static_cast<i64>(h.length));
             if (c.conn_recv_window < 0) return Http2Error::FlowControlError;
 
             Http2Stream* s = c.find_stream(h.stream_id);
@@ -1243,7 +1244,8 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
             w.len = static_cast<u32>(static_cast<i64>(w.len) +
                                      static_cast<i64>(write_window_update(
                                          w.out + static_cast<i64>(w.len), 0, conn_recv_credit)));
-            conn_recv_window += static_cast<i64>(conn_recv_credit);
+            conn_recv_window = static_cast<i64>(static_cast<__int128_t>(conn_recv_window) +
+                                                static_cast<i64>(conn_recv_credit));
             conn_recv_credit = 0;
         }
         for (u32 i = 0; i < nstreams; i++) {
