@@ -134,13 +134,13 @@ static u32 format_timestamp(char* buf, u64 timestamp_us) {
     gmtime_r(&t, &tm);
 
     i64 w = 0;
-    u32 year = static_cast<u32>(tm.tm_year + 1900);
+    u32 year = static_cast<u32>(static_cast<i64>(tm.tm_year) + 1900);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(year / 1000));
     buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 100) % 10));
     buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 10) % 10));
     buf[w++] = static_cast<char>('0' + static_cast<i64>(year % 10));
     buf[w++] = '-';
-    u32 mon = static_cast<u32>(tm.tm_mon + 1);
+    u32 mon = static_cast<u32>(static_cast<i64>(tm.tm_mon) + 1);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(mon / 10));
     buf[w++] = static_cast<char>('0' + static_cast<i64>(mon % 10));
     buf[w++] = '-';
