@@ -470,6 +470,12 @@ struct ConnectionBase {
     // line in recv_buf before forwarding. Reset per request.
     bool req_path_overridden;
     Str req_path_override;
+    // forward(set_body:) applies eagerly while the handler runs. A failed
+    // override poisons forwarding instead of silently sending the original
+    // credential-bearing body.
+    bool req_body_overridden;
+    bool req_body_override_failed;
+    Str req_body_override;
     // Foundation-only target-transform effect. The recorded flag distinguishes
     // no effect from a forged zero/sentinel ID; every recorded effect is rejected
     // before upstream selection until target materialization exists.
@@ -552,6 +558,27 @@ struct ConnectionBase {
                 continue;
             value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
         }
+    }
+
+    // Preserve request-backed after-mutation values before forward(set_path:),
+    // forward(set_header:) or forward(set_body:) rewrite recv_buf in place.
+    // send_buf remains pinned until the response completes; on_upstream_request_sent
+    // later reserves this snapshot as the prefix used by pipeline_stash.
+    bool snapshot_response_mutations_before_request_rewrite() {
+        if (resp_header_mutation_count == 0 || retry_req_send_len != 0 ||
+            response_mutations_snapshotted)
+            return true;
+        if (req_initial_send_len == 0 || req_initial_send_len > recv_buf.len() ||
+            req_initial_send_len > send_buf.capacity())
+            return false;
+        const u8* old_base = recv_buf.data();
+        send_buf.reset();
+        if (send_buf.write(old_base, req_initial_send_len) != req_initial_send_len) return false;
+        reanchor_response_mutations(old_base, req_initial_send_len, send_buf.data());
+        response_mutations_snapshotted = true;
+        retry_req_snapshot_replayable =
+            !req_path_overridden && !req_body_overridden && req_header_override_count == 0;
+        return true;
     }
 
     // Copy request-backed mutation values out of a synthesized request before
@@ -2188,6 +2215,9 @@ struct ConnectionBase {
         h2_proxy_synth_quarantined = false;
         req_path_overridden = false;
         req_path_override = {nullptr, 0};
+        req_body_overridden = false;
+        req_body_override_failed = false;
+        req_body_override = {nullptr, 0};
         target_transform_id = 0;
         target_transform_recorded = false;
         req_header_override_count = 0;

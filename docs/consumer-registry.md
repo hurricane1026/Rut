@@ -139,17 +139,18 @@ bytes and order. Empty remaining content is an empty string. Neither the decoded
 credential nor the full registry appears in this result. The remaining fields
 are still untrusted application input; this is not general secret classification.
 Authentication leaves the original request bytes unchanged. Use the sanitized
-fields to build an outbound message or explicitly replace the forwarded query
-target.
+fields to build an outbound message, explicitly replace the forwarded query
+target, or pass the form fields to `forward(..., set_body: body)`.
 
 [consumer-fields-auth.rut](../examples/consumer-fields-auth.rut) demonstrates this
 contract: both source-specific routes submit sanitized fields as a new form POST
 to one configuration-owned verified HTTPS `httpCall` endpoint. The downstream
 query target and original body/headers are not copied, and client identity headers
 cannot select the forwarded Consumer. This is a bounded callout adapter, not a
-transparent body/target rewriting proxy. Its remote success is required before
+general body/target rewriting proxy. Its remote success is required before
 returning 204. Native H1/H2 tests inspect the actual upstream wire contents on both
 backends after deleting the source, and verify invalid requests make no callout.
+A direct proxy route can instead use the owned `set_body` effect described below.
 
 ### Forwarding without the query credential
 
@@ -176,7 +177,26 @@ the entire query before recording the original encoded path. This process-wide
 option also covers requests denied by authentication or group policy. It
 affects only the log. Forwarding still needs the explicit target replacement
 above. Keep query credentials out of custom raw-target logging and captures.
-For form credentials use the explicitly rebuilt callout above.
+### Forwarding without the form credential
+
+[consumer-form-forward-auth.rut](../examples/consumer-form-forward-auth.rut)
+authenticates an application/x-www-form-urlencoded body, checks the verified
+Consumer group, and passes the `remaining` fields to the owned
+`forward(..., set_body: body)` effect. The
+[`remainingBody` helper](../examples/middleware/consumer_form.rut) returns the
+sanitized form string. The runtime replaces the single Content-Length field and
+the exact forwarded body bytes; the original request, target and access-log
+capture remain untouched. A missing or wrongly typed `remaining` member yields
+nil and the route fails closed.
+
+The body profile accepts at most 65536 replacement bytes on HTTP/1 and stays
+within the existing 16 KiB HTTP/2 synth budget; it requires one complete, fully
+buffered Content-Length request with no Transfer-Encoding. Chunked,
+partial, ambiguous or oversized replacement requests return 500 before contacting
+the upstream, rather than forwarding the credential-bearing body. The route returns
+401 for failed authentication, 403 for a missing required group, and 415 for a
+different Content-Type. Native H1/H2 tests inspect the exact upstream body on
+epoll and io_uring and verify rejected requests make no upstream call.
 
 Native H1/H2 fixtures read the exact upstream request and inspect the
 target-free access log on epoll and io_uring at O0 and O2.
@@ -570,8 +590,9 @@ writers, all-or-nothing/idempotent verifier conversion, and separate key/verifie
 provisioning with preflight and publication-fault checks. Native HTTP fixtures
 consume generated snapshots on
 epoll/io_uring with HTTP/1 and HTTP/2, verify overlap, then reject a disabled
-old generated key while retaining the new one. Transparent
-request-target/body mutation and online administrative HTTP APIs remain separate.
+old generated key while retaining the new one. Explicit query-target and form-body
+replacement are owned forwarding effects; online administrative HTTP APIs remain
+separate.
 
 ### Targeted lifecycle commands
 

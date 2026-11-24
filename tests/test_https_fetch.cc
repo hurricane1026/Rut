@@ -1305,6 +1305,52 @@ void complete_jwks(JwksFetch& fetch, DnsOrigin* resolver = nullptr, u8 first = 1
     }
 }
 }  // namespace
+TEST(https_fetch, separate_discovery_origin_uses_its_own_fixed_endpoint) {
+    signal(SIGPIPE, SIG_IGN);
+    TlsOrigin keys_origin;
+    TlsOrigin discovery_origin;
+    REQUIRE(keys_origin.init());
+    REQUIRE(discovery_origin.init());
+    char metadata[2048];
+    const int metadata_length =
+        snprintf(metadata,
+                 sizeof(metadata),
+                 "{\"issuer\":\"https://localhost/tenant\",\"jwks_uri\":\"https://localhost:%u/"
+                 "keys?profile=rs256\"}",
+                 keys_origin.port);
+    REQUIRE(metadata_length > 0);
+    char discovery_response[4096];
+    const int discovery_size = snprintf(
+        discovery_response,
+        sizeof(discovery_response),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s",
+        metadata_length,
+        metadata);
+    REQUIRE(discovery_size > 0);
+    discovery_origin.responses[0] = {discovery_response, static_cast<u32>(discovery_size)};
+    discovery_origin.count = 1;
+    keys_origin.responses[0] = lit_str(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        "11\r\n\r\n{\"keys\":[]}");
+    keys_origin.count = 1;
+    RemoteJwks configuration;
+    configuration.endpoint = keys_origin.endpoint();
+    configuration.discovery_endpoint = discovery_origin.endpoint();
+    strcpy(configuration.discovery_endpoint.path, "/metadata");
+    configuration.discovery_separate = true;
+    strcpy(configuration.discovery_path, "/metadata");
+    strcpy(configuration.discovery_issuer, "https://localhost/tenant");
+    JwksFetch fetch;
+    REQUIRE(fetch.init(configuration));
+    REQUIRE(fetch.start(jwt_monotonic_ms(), 3000));
+    complete_jwks(fetch);
+    REQUIRE_EQ(fetch.state(), JwksFetch::State::Done);
+    CHECK(fetch.body().eq(lit_str("{\"keys\":[]}")));
+    CHECK_EQ(__atomic_load_n(&discovery_origin.served, __ATOMIC_ACQUIRE), 1u);
+    CHECK_EQ(__atomic_load_n(&keys_origin.served, __ATOMIC_ACQUIRE), 1u);
+    CHECK(strstr(discovery_origin.request, "GET /metadata HTTP/1.1") != nullptr);
+    CHECK(strstr(keys_origin.request, "GET /keys?profile=rs256 HTTP/1.1") != nullptr);
+}
 TEST(https_fetch, jwks_stage_deadlines_preserve_total_timeout_and_cancel) {
     DnsOrigin dns;
     PoolOrigin stalled_tls;

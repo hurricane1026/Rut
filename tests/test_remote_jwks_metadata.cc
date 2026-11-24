@@ -112,6 +112,44 @@ TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     CHECK(valid("https://issuer.example:443"));
 }
 
+TEST(remote_jwks_metadata, separate_discovery_origin_is_explicit_and_bounded) {
+    const char* base =
+        R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+        R"("path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":1,)"
+        R"("discoveryPath":"/.well-known/openid-configuration",)"
+        R"("discoveryIssuer":"https://issuer.example/tenant")";
+    RemoteJwks configuration;
+    json::Document document;
+    char bytes[2048];
+    const auto load = [&](const char* extra) {
+        const int length = snprintf(bytes, sizeof(bytes), "{%s%s}", base, extra);
+        return length > 0 && static_cast<u32>(length) < sizeof(bytes) &&
+               document.parse({bytes, static_cast<u32>(length)}) && configuration.load(document, 0);
+    };
+    REQUIRE(load(""));
+    CHECK(!configuration.discovery_separate);
+    CHECK(strcmp(configuration.discovery_endpoint.address, "192.0.2.1") == 0);
+    CHECK(strcmp(configuration.discovery_endpoint.path, "/.well-known/openid-configuration") == 0);
+    const char* separate = R"(,"discoveryAddress":"192.0.2.2","discoveryPort":8443,)"
+                           R"("discoveryServerName":"idp.example","discoveryCa":"idp-ca.pem")";
+    REQUIRE(load(separate));
+    CHECK(configuration.discovery_separate);
+    CHECK(strcmp(configuration.discovery_endpoint.address, "192.0.2.2") == 0);
+    CHECK_EQ(configuration.discovery_endpoint.port, 8443u);
+    CHECK(strcmp(configuration.discovery_endpoint.tls.server_name, "idp.example") == 0);
+    CHECK(strcmp(configuration.discovery_endpoint.tls.ca, "idp-ca.pem") == 0);
+    CHECK(strcmp(configuration.discovery_endpoint.path, "/.well-known/openid-configuration") == 0);
+    const char* invalid[] = {
+        R"(,"discoveryAddress":"192.0.2.2")",
+        R"(,"discoveryAddress":"192.0.2.2","discoveryServerName":"idp.example")",
+        R"(,"discoveryAddress":"192.0.2.2","discoveryServerName":"idp.example","discoveryCa":"idp-ca.pem","discoveryPort":0)",
+        R"(,"discoveryAddress":"invalid","discoveryServerName":"idp.example","discoveryCa":"idp-ca.pem")",
+        R"(,"discoveryAddress":"192.0.2.2","discoveryServerName":"bad/name","discoveryCa":"idp-ca.pem")",
+        R"(,"discoveryAddress":"192.0.2.2","discoveryServerName":"idp.example","discoveryCa":"")",
+        R"(,"discoveryPort":8443)",
+    };
+    for (const char* extra : invalid) CHECK(!load(extra));
+}
 TEST(remote_jwks_metadata, stage_timeouts_require_their_stage_and_fit_the_total) {
     const char* base =
         R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"

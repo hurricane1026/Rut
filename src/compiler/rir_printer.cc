@@ -270,6 +270,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::ReqSetPath:
             buf.put_cstr("req.set_path");
             break;
+        case Opcode::ReqSetBody:
+            buf.put_cstr("req.set_body");
+            break;
         case Opcode::ReqSetTargetTransform:
             buf.put_cstr("req.set_target_transform");
             break;
@@ -877,6 +880,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_value_ref(buf, inst.operands[1]);
             break;
         case Opcode::ReqSetPath:
+        case Opcode::ReqSetBody:
         case Opcode::SextI64:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);

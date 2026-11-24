@@ -1,4 +1,5 @@
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/request_body_override.h"
 #include "rut/runtime/simd/simd.h"
 #include "test.h"
 #include <string>
@@ -4233,6 +4234,112 @@ TEST(response_parser, headers_truncated_flag) {
         CHECK_EQ(resp.header_count, kMaxHeaders);  // saturates
         CHECK(resp.headers_truncated);             // tail dropped from headers[]
     }
+}
+
+static u32 request_header_end(const char* raw) {
+    const char* end = strstr(raw, "\r\n\r\n");
+    return end == nullptr ? 0 : static_cast<u32>(end - raw) + 4;
+}
+
+TEST(http_parser, request_body_override_rewrites_length_and_preserves_tail) {
+    char buffer[256];
+    const char* same = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc";
+    memcpy(buffer, same, strlen(same));
+    u32 total = static_cast<u32>(strlen(same));
+    u32 header_end = request_header_end(buffer);
+    REQUIRE(header_end != 0);
+    REQUIRE(replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, sizeof(buffer), &header_end, 3, lit_str("xyz")));
+    CHECK_EQ(total, static_cast<u32>(strlen(same)));
+    CHECK(memcmp(buffer + header_end, "xyz", 3) == 0);
+
+    const char* tail =
+        "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc"
+        "GET /next HTTP/1.1\r\n\r\n";
+    memcpy(buffer, tail, strlen(tail));
+    total = static_cast<u32>(strlen(tail));
+    header_end = request_header_end(buffer);
+    REQUIRE(header_end != 0);
+    REQUIRE(replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, sizeof(buffer), &header_end, 3, lit_str("z")));
+    CHECK(strstr(buffer, "Content-Length: 1\r\n") != nullptr);
+    const char* expected_tail = "zGET /next HTTP/1.1\r\n\r\n";
+    CHECK(memcmp(buffer + header_end, expected_tail, strlen(expected_tail)) == 0);
+    CHECK_EQ(total, static_cast<u32>(strlen(tail)) - 2);
+
+    memcpy(buffer, same, strlen(same));
+    total = static_cast<u32>(strlen(same));
+    header_end = request_header_end(buffer);
+    REQUIRE(replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, sizeof(buffer), &header_end, 3, lit_str("longer")));
+    CHECK(strstr(buffer, "Content-Length: 6\r\n") != nullptr);
+    CHECK(memcmp(buffer + header_end, "longer", 6) == 0);
+
+    memcpy(buffer, same, strlen(same));
+    total = static_cast<u32>(strlen(same));
+    header_end = request_header_end(buffer);
+    REQUIRE(replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, sizeof(buffer), &header_end, 3, lit_str("")));
+    CHECK(strstr(buffer, "Content-Length: 0\r\n") != nullptr);
+    CHECK_EQ(total, header_end);
+}
+
+TEST(http_parser, request_body_override_bounds_intermediate_header_expansion) {
+    // Normalizing a space-less Content-Length header grows that line by one byte
+    // while the body is removed entirely. The first in-place move therefore writes
+    // through old_total + 1, so capacity must cover that intermediate extent even
+    // though the final request is two bytes shorter.
+    const char* raw = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length:3\r\n\r\nabc";
+    const u32 raw_len = static_cast<u32>(strlen(raw));
+    char buffer[128];
+    for (u32 i = 0; i < static_cast<u32>(sizeof(buffer)); i++) buffer[i] = static_cast<char>(0x5a);
+    memcpy(buffer, raw, raw_len);
+    u32 total = raw_len;
+    u32 header_end = request_header_end(buffer);
+    REQUIRE(header_end != 0);
+    CHECK(!replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, raw_len, &header_end, 3, lit_str("")));
+    CHECK_EQ(total, raw_len);
+    CHECK_EQ(buffer[raw_len], static_cast<char>(0x5a));  // guard byte untouched
+
+    total = raw_len;
+    header_end = request_header_end(buffer);
+    REQUIRE(replace_h1_body_in_place(
+        reinterpret_cast<u8*>(buffer), &total, raw_len + 1, &header_end, 3, lit_str("")));
+    CHECK(strstr(buffer, "Content-Length: 0\r\n") != nullptr);
+    CHECK_EQ(total, raw_len - 2);
+    CHECK_EQ(buffer[raw_len + 1], static_cast<char>(0x5a));
+}
+
+TEST(http_parser, request_body_override_rejects_ambiguous_or_oversized_frames) {
+    char buffer[128];
+    const char* duplicate =
+        "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na";
+    const char* chunked =
+        "POST /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n";
+    const char* missing = "POST /x HTTP/1.1\r\nHost: a\r\n\r\na";
+    const char* valid = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\na";
+    const char* invalid[] = {duplicate, chunked, missing};
+    for (const char* raw : invalid) {
+        memcpy(buffer, raw, strlen(raw));
+        u32 total = static_cast<u32>(strlen(raw));
+        u32 header_end = request_header_end(buffer);
+        CHECK(!replace_h1_body_in_place(reinterpret_cast<u8*>(buffer),
+                                        &total,
+                                        sizeof(buffer),
+                                        &header_end,
+                                        0xffffffffu,
+                                        lit_str("sanitized")));
+    }
+    memcpy(buffer, valid, strlen(valid));
+    u32 total = static_cast<u32>(strlen(valid));
+    u32 header_end = request_header_end(buffer);
+    CHECK(!replace_h1_body_in_place(reinterpret_cast<u8*>(buffer),
+                                    &total,
+                                    sizeof(buffer),
+                                    &header_end,
+                                    2,
+                                    lit_str("sanitized")));
 }
 
 int main(int argc, char** argv) {

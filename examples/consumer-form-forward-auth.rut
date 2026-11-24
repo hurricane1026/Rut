@@ -1,0 +1,21 @@
+import "middleware/consumer_form.rut"
+
+// Replace the forwarded form body with the authenticated identity's sanitized
+// remaining fields. The original request and access-log target stay untouched.
+accessLog { path: "/tmp/rut-consumer-form-access.log", format: downstreamRequestBytes, publication: live }
+listen :8080
+upstream api at "127.0.0.1:9000"
+
+route POST "/form/:resource" {
+    req.remove("Authorization")
+    req.remove("X-API-Key")
+    req.remove("X-Consumer-ID")
+    guard req.uniqueHeader("Content-Type").or("") == "application/x-www-form-urlencoded" else { return 415 }
+    guard let identity = consumerAuthenticateForm(req.body, env("AUTH_REGISTRY"), "api_key") else { return 401 }
+    guard jwtHasGroup(identity, "staff") else { return 403 }
+    guard let body = consumer_form.remainingBody(identity) else { return 503 }
+    return forward(api, load_balance: .roundRobin, set_body: body)
+}
+
+route GET "/ready" { return 204 }
+route "/" { return 404 }

@@ -311,6 +311,12 @@ struct AstStatement {
     Str forward_set_path{};
     AstExpr* forward_set_path_expr = nullptr;
     bool has_forward_set_path = false;
+    // Optional request-body replacement from `forward(name, set_body: expr)`.
+    // Lowered to a ReqSetBody op before the forward terminator; the runtime
+    // admits only a fully buffered, non-chunked Content-Length request.
+    Str forward_set_body{};
+    AstExpr* forward_set_body_expr = nullptr;
+    bool has_forward_set_body = false;
     // Request-header overrides from `forward(name, set_header: { "K": "V", ... })`.
     // Inline-stored like response_headers; lowered to ReqSetHeader ops before the
     // forward terminator so the proxy injects/replaces the lines outbound.

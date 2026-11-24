@@ -144,6 +144,18 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             target = next.discovery_issuer;
             capacity = sizeof(next.discovery_issuer);
             fields |= 2048;
+        } else if (kKey.eq(lit_str("discoveryAddress"))) {
+            target = next.discovery_endpoint.address;
+            capacity = sizeof(next.discovery_endpoint.address);
+            fields |= 16384;
+        } else if (kKey.eq(lit_str("discoveryServerName"))) {
+            target = next.discovery_endpoint.tls.server_name;
+            capacity = sizeof(next.discovery_endpoint.tls.server_name);
+            fields |= 65536;
+        } else if (kKey.eq(lit_str("discoveryCa"))) {
+            target = next.discovery_endpoint.tls.ca;
+            capacity = sizeof(next.discovery_endpoint.tls.ca);
+            fields |= 131072;
         }
         if (target) {
             json::Writer value{target, static_cast<u32>(static_cast<i64>(capacity) - 1)};
@@ -165,6 +177,10 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_port = static_cast<u16>(value);
             fields |= 4096;
+        } else if (kKey.eq(lit_str("discoveryPort"))) {
+            if (value > 65535) return false;
+            next.discovery_endpoint.port = static_cast<u16>(value);
+            fields |= 32768;
         } else if (kKey.eq(lit_str("dnsTimeoutSeconds"))) {
             if (value > 60) return false;
             next.dns_timeout_seconds = static_cast<u32>(value);
@@ -211,6 +227,15 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     if ((fields & 255) != 255 || !next.endpoint.valid() ||
         next.max_age_seconds <= next.refresh_seconds)
         return false;
+    constexpr u32 kDiscoveryOriginMask = 16384 | 32768 | 65536 | 131072;
+    if (fields & kDiscoveryOriginMask) {
+        if ((fields & (16384 | 65536 | 131072)) != (16384 | 65536 | 131072)) return false;
+        next.discovery_separate = true;
+        next.discovery_endpoint.tls.enabled = true;
+        next.discovery_endpoint.allow_ipv6 = true;
+    } else {
+        next.discovery_endpoint = next.endpoint;
+    }
     if ((fields & (256 | 512 | 4096 | 8192)) || next.dns_cache_seconds ||
         next.dns_timeout_seconds) {
         sockaddr_storage resolver{};
@@ -238,13 +263,21 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         if (next.dns_dual_stack && !(has_ipv4 && has_ipv6)) return false;
     }
     if (next.discovery_cache_seconds > next.max_age_seconds) return false;
-    if ((fields & (1024 | 2048)) || next.discovery_timeout_seconds || next.conditional_discovery ||
-        next.discovery_cache_seconds) {
+    if ((fields & (1024 | 2048 | kDiscoveryOriginMask)) || next.discovery_timeout_seconds ||
+        next.conditional_discovery || next.discovery_cache_seconds) {
         if (!(fields & 1024) || !(fields & 2048) || !discovery_issuer_valid(next.discovery_issuer))
             return false;
-        HttpsEndpoint discovery = next.endpoint;
-        __builtin_memcpy(discovery.path, next.discovery_path, sizeof(discovery.path));
-        if (!discovery.valid()) return false;
+        if (next.discovery_separate) {
+            __builtin_memcpy(next.discovery_endpoint.path,
+                             next.discovery_path,
+                             sizeof(next.discovery_endpoint.path));
+            if (!next.discovery_endpoint.valid()) return false;
+        } else {
+            HttpsEndpoint discovery = next.endpoint;
+            __builtin_memcpy(discovery.path, next.discovery_path, sizeof(discovery.path));
+            if (!discovery.valid()) return false;
+            next.discovery_endpoint = discovery;
+        }
     }
     *this = next;
     return true;
@@ -555,8 +588,11 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
         !keys_.init(configuration.endpoint, configuration.max_retry_after_seconds != 0))
         return false;
     if (configuration.discovery_path[0]) {
-        HttpsEndpoint endpoint = configuration.endpoint;
-        __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
+        HttpsEndpoint endpoint = configuration.discovery_endpoint;
+        if (!configuration.discovery_separate) {
+            endpoint = configuration.endpoint;
+            __builtin_memcpy(endpoint.path, configuration.discovery_path, sizeof(endpoint.path));
+        }
         if (!discovery_.init(endpoint)) return false;
     }
     configuration_ = configuration;
@@ -599,23 +635,29 @@ bool JwksFetch::begin_http(u64 now) {
     discovering_ = configuration_.discovery_path[0] != 0;
     if (addresses_.count) {
         const Str kAddress = ctext(addresses_.values[address_index_]);
-        if (!keys_.set_address(kAddress) || (discovering_ && !discovery_.set_address(kAddress)))
+        if (!keys_.set_address(kAddress) || (discovering_ && !configuration_.discovery_separate &&
+                                             !discovery_.set_address(kAddress)))
             return fail();
     }
     if (discovering_ && address_index_ == 0 &&
         jwks_cache_fresh(now, discovery_accepted_at_, configuration_.discovery_cache_seconds) &&
-        ctext(discovery_address_).eq(selected_address()))
+        ctext(discovery_address_).eq(discovery_selected_address()))
         discovering_ = false;
     auto& fetch = discovering_ ? discovery_ : keys_;
     return start_http(fetch, now);
 }
 bool JwksFetch::can_try_next_address(const HttpsFetch& fetch) const {
+    if (&fetch == &discovery_ && configuration_.discovery_separate) return false;
     return fetch.connect_failed() &&
            static_cast<i64>(address_index_) + 1 < static_cast<i64>(addresses_.count);
 }
 Str JwksFetch::selected_address() const {
     return addresses_.count ? ctext(addresses_.values[address_index_])
                             : ctext(configuration_.endpoint.address);
+}
+Str JwksFetch::discovery_selected_address() const {
+    return configuration_.discovery_separate ? ctext(configuration_.discovery_endpoint.address)
+                                             : selected_address();
 }
 bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
     if (&fetch == &keys_ && configuration_.conditional_requests) {
@@ -628,7 +670,7 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         const Str kTag =
             address_index_ == 0 &&
                     jwks_cache_fresh(now, discovery_accepted_at_, configuration_.max_age_seconds)
-                ? discovery_validator_.matching(selected_address())
+                ? discovery_validator_.matching(discovery_selected_address())
                 : Str{};
         if (!discovery_.set_jwks_condition(kTag)) return fail();
         sent_discovery_validator_ = kTag.len != 0;
@@ -722,7 +764,7 @@ bool JwksFetch::accept_discovery(u64 now) {
         if (!sent_discovery_validator_ ||
             !jwks_cache_fresh(now, discovery_accepted_at_, configuration_.max_age_seconds) ||
             !discovery_.headers(response) || !jwks_response_etag(response, tag) ||
-            !tag.eq(discovery_validator_.matching(selected_address())))
+            !tag.eq(discovery_validator_.matching(discovery_selected_address())))
             return false;
         discovery_accepted_at_ = now;
         return true;
@@ -734,12 +776,12 @@ bool JwksFetch::accept_discovery(u64 now) {
         Str tag{};
         JwksValidator next{};
         if (!discovery_.headers(response) || !jwks_response_etag(response, tag) ||
-            (tag.len && !next.bind(tag, selected_address())))
+            (tag.len && !next.bind(tag, discovery_selected_address())))
             return false;
         discovery_validator_ = next;
     }
     if (configuration_.discovery_cache_seconds) {
-        const Str kAddress = selected_address();
+        const Str kAddress = discovery_selected_address();
         __builtin_memcpy(discovery_address_, kAddress.ptr, kAddress.len);
         discovery_address_[kAddress.len] = 0;
     }

@@ -585,6 +585,12 @@ void rut_helper_str_trim_suffix(const char* s,
 void rut_helper_req_set_path(void* conn, const char* path, rut::u32 len);
 void rut_helper_req_set_owned_path(void* conn, const char* path, rut::u32 len);
 
+// forward(set_body:) request mutation — replaces a fully buffered,
+// Content-Length framed request body in place. Unsupported framing or size is
+// recorded as a forwarding poison rather than silently keeping the original.
+void rut_helper_req_set_body(void* conn, const char* body, rut::u32 len);
+void rut_helper_req_set_owned_body(void* conn, const char* body, rut::u32 len);
+
 // Foundation-only target-transform effect. Records one bounded 1-based ID;
 // malformed or duplicate effects are retained as a fail-closed sentinel.
 rut::u32 rut_helper_req_set_load_balance(void* conn, rut::u32 encoded);

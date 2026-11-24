@@ -962,6 +962,13 @@ struct HirTerminator {
     bool has_forward_path() const {
         return forward_set_path.ptr != nullptr || forward_path_expr_index != 0xffffffffu;
     }
+    // Request-body replacement for forward(set_body:). ptr != nullptr or a
+    // non-sentinel expression index means lowering emits ReqSetBody.
+    Str forward_set_body{};
+    u32 forward_body_expr_index = 0xffffffffu;
+    bool has_forward_body() const {
+        return forward_set_body.ptr != nullptr || forward_body_expr_index != 0xffffffffu;
+    }
     // Request-header overrides for `forward(name, set_header: {...})`. len == 0
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;

@@ -16319,7 +16319,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid redirect policy"));
         if (stmt.response_headers.len != 0 || stmt.forward_set_path.len != 0 ||
-            stmt.forward_set_headers.len != 0)
+            stmt.has_forward_set_body || stmt.forward_set_headers.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
                                   lit_str("redirect cannot carry response or request mutations"));
@@ -16614,6 +16614,26 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                 return frontend_error(FrontendError::OutOfMemory, stmt.span);
         }
     }
+    if (stmt.has_forward_set_body) {
+        term.forward_set_body = stmt.forward_set_body;
+        if (stmt.forward_set_body_expr != nullptr) {
+            if (route == nullptr)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    stmt.span,
+                    lit_str("dynamic forwarding body requires a request expression scope"));
+            auto body =
+                analyze_expr(*stmt.forward_set_body_expr, route, mod, locals, local_count, binding);
+            if (!body) return core::make_unexpected(body.error());
+            if (body->type != HirTypeKind::Str || body->may_nil || body->may_error)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      lit_str("forwarding body must be an unwrapped str"));
+            term.forward_body_expr_index = route->exprs.len;
+            if (!route->exprs.push(body.value()))
+                return frontend_error(FrontendError::OutOfMemory, stmt.span);
+        }
+    }
     if (stmt.has_forward_request_policy)
         term.forward_request_policy_id = stmt.forward_request_policy_id;
     if (stmt.has_forward_response_policy)
@@ -16628,12 +16648,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
         term.forward_response_buffering = stmt.forward_response_buffering;
     if (stmt.has_forward_target_transform) {
         if (!forward_target_transform_spec_valid(stmt.forward_target_transform) ||
-            stmt.has_forward_set_path || stmt.forward_set_headers.len != 0)
+            stmt.has_forward_set_path || stmt.has_forward_set_body ||
+            stmt.forward_set_headers.len != 0)
             return frontend_error(
                 FrontendError::UnsupportedSyntax,
                 stmt.span,
-                lit_str(
-                    "target_transform cannot be combined with request target or header overrides"));
+                lit_str("target_transform cannot be combined with request target, body or header "
+                        "overrides"));
         term.has_forward_target_transform = true;
         term.forward_target_transform = stmt.forward_target_transform;
     }
@@ -27053,6 +27074,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        term.redirect_policy_id == 0 && !term.has_forward_path() &&
+                       !term.has_forward_body() &&
                        term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&
@@ -27073,6 +27095,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        !term.commit_response_mutations && !term.has_forward_path() &&
+                       !term.has_forward_body() &&
                        term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && term.forward_request_policy_id == 0 &&
                        term.forward_response_policy_id == 0 &&
@@ -27094,7 +27117,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 structural_common && timeout_term_count == 1 &&
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
                 route.exprs.len == 0 && direct.kind == HirTerminatorKind::ForwardUpstream &&
-                !direct.has_forward_path() &&
+                !direct.has_forward_path() && !direct.has_forward_body() &&
                 direct.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                 direct.forward_set_headers.len == 0 && !direct.has_forward_target_transform &&
                 !direct.commit_response_mutations && timeout_request_policy_is_admitted(direct) &&
@@ -27134,6 +27157,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.local_ref_index == 0xffffffffu && term.status_code == 0 &&
                        term.response_body.ptr == nullptr && term.response_headers.len == 0 &&
                        term.redirect_policy_id == 0 && !term.has_forward_path() &&
+                       !term.has_forward_body() &&
                        term.forward_load_balance.policy != LoadBalancePolicy::ConsistentHash &&
                        term.forward_set_headers.len == 0 && !term.has_forward_target_transform &&
                        !term.commit_response_mutations &&

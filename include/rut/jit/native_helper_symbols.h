@@ -26,6 +26,8 @@
     X(rut_helper_req_header)                          \
     X(rut_helper_req_set_owned_path)                  \
     X(rut_helper_req_set_path)                        \
+    X(rut_helper_req_set_owned_body)                  \
+    X(rut_helper_req_set_body)                        \
     X(rut_helper_req_set_hash)                        \
     X(rut_helper_req_set_load_balance)                \
     X(rut_helper_req_set_target_transform)            \

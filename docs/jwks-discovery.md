@@ -16,7 +16,9 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
-  "discoveryIssuer": "https://issuer.example"
+  "discoveryIssuer": "https://issuer.example",
+  "discoveryAddress": "192.0.2.20", "discoveryPort": 443,
+  "discoveryServerName": "idp.example", "discoveryCa": "/etc/rut/idp-ca.pem"
 }
 ```
 
@@ -179,8 +181,18 @@ No request traffic, token or unknown kid creates extra work.
 
 `discoveryPath` and `discoveryIssuer` must appear together. The issuer is a bounded
 HTTPS URI with no credentials, query or fragment, and must equal the enclosing
-JWT policy's issuer exactly. Discovery uses the same configured HTTPS origin and
-resolved address. A completed 200 JSON object must contain exact string `issuer`
+JWT policy's issuer exactly. By default discovery uses the same configured HTTPS
+origin and resolved address.
+
+Optional `discoveryAddress`, `discoveryServerName`, `discoveryCa` and
+`discoveryPort` move only the discovery GET to a separately trusted fixed TLS
+origin. The address is a bare IPv4 or IPv6 literal; the port defaults to 443.
+The three fields `discoveryAddress`, `discoveryServerName` and `discoveryCa`
+must appear together, and any of the four requires `discoveryPath` and
+`discoveryIssuer`. This fixed origin does not use the JWKS DNS resolver or its
+address allowlist, has no failover candidates and never follows redirects. TLS
+SNI/CA authentication, the exact issuer check and the pre-authorized JWKS URI
+check are unchanged. A completed 200 JSON object must contain exact string `issuer`
 and `jwks_uri` fields, with duplicate-name rejection. Extra provider metadata is
 ignored; this is JWKS discovery, not OIDC login or validation of all OP metadata.
 
@@ -263,4 +275,6 @@ Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
 The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
 a disallowed destination and recovery with rotated keys on both Linux backends.
-Other DNS transports, alternative discovery origins, automatic kid inventory and full OIDC workflows remain open under #1077.
+Other DNS transports, automatic kid inventory and full OIDC workflows remain
+open under #1077. A discovery origin with a rotating DNS name is not part of the
+separately configured fixed-address profile.

@@ -4,8 +4,9 @@
 Standard Webhooks v1 signature/freshness verifier with an authenticated Redis
 atomic claim. [signed-request-replay-auth.rut](../examples/signed-request-replay-auth.rut)
 provides the same claim lifecycle for the existing fixed HMAC-SHA256 signed-request
-profile. These are free authentication foundations (#1076), not a managed event
-queue or business transaction engine.
+profile, and [github-webhook-replay-auth.rut](../examples/github-webhook-replay-auth.rut)
+does so for the GitHub body-only signature. These are free authentication
+foundations (#1076), not a managed event queue or business transaction engine.
 
 Only authenticate first, then call `replay.key` and `redisReplayClaim`. Invalid
 signatures, stale/future timestamps, duplicate singleton fields and unsupported
@@ -31,6 +32,27 @@ key rotation. It does not alter the legacy fixed-POST key. Switching an existing
 endpoint to this new key format requires draining the full 601-second replay
 window before accepting traffic under the new profile; otherwise outstanding
 claims in the old namespace do not protect the new one.
+
+## GitHub body claims
+
+[github-webhook-replay-auth.rut](../examples/github-webhook-replay-auth.rut)
+composes the existing GitHub `X-Hub-Signature-256` verifier with the same atomic
+claim lifecycle. GitHub signs the body only; `X-GitHub-Delivery` is not covered
+by that signature and must **not** be used as the replay identity. An attacker
+holding a captured request could otherwise keep the valid signature and choose a
+new delivery header. Claim the exact signed body digest under a stable
+`REPLAY_NAMESPACE` instead. `X-GitHub-Delivery` must still be a singleton when the
+route requires it for protocol hygiene, but it carries no replay authority.
+
+Authenticate the exact body first, then call `sha256`/`replay.key` and
+`redisReplayClaim`; never issue side effects before admission. Keep the namespace
+stable across secret rotation, and use a distinct namespace for independent GitHub
+endpoints. Two legitimate deliveries with byte-identical bodies are treated as one
+signed message and the second is rejected. The ordinary claim has the same
+601-second retention and uncertain-write semantics above; replace
+`redisReplayClaim` with `redisReplayDurableClaim` if local AOF confirmation is
+required. This profile does not claim full GitHub webhook plugin equivalence or
+cross-node persistence.
 
 ## Claim and failure contract
 

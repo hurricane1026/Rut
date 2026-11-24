@@ -4031,6 +4031,41 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!b.emit_req_set_path(path.value(), {term.span.line, term.span.col}, true))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
         }
+        // ReqSetBody rewrites recv_buf eagerly, so publish response mutations
+        // before it: a borrowed value such as resp.set("X", req.path) would
+        // otherwise be committed after the bytes it points into shifted. Every
+        // other forward keeps the later commit point below.
+        const bool kSetBody =
+            term.forward_set_body.ptr != nullptr || term.forward_body_value != nullptr;
+        if (term.commit_response_mutations && kSetBody &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
+        // forward(set_body: ...): emit ReqSetBody before the terminator. The
+        // runtime helper replaces the buffered Content-Length body in place and
+        // fails closed for chunked/partial requests.
+        if (term.forward_set_body.ptr != nullptr) {
+            auto body = b.emit_const_str(term.forward_set_body, {term.span.line, term.span.col});
+            if (!body || !b.emit_req_set_body(body.value(), {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        }
+        if (term.forward_body_value != nullptr) {
+            auto body = materialize_value(*term.forward_body_value,
+                                          mir,
+                                          variant_infos,
+                                          tuple_infos,
+                                          tuple_info_count,
+                                          error_scalar_infos,
+                                          error_variant_infos,
+                                          error_struct_infos,
+                                          user_struct_defs,
+                                          b,
+                                          locals,
+                                          local_count,
+                                          term.span);
+            if (!body) return core::make_unexpected(body.error());
+            if (!b.emit_req_set_body(body.value(), {term.span.line, term.span.col}, true))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+        }
         // forward(set_header: {...}): one ReqSetHeader(name, const-str value) per
         // entry before the terminator (name is the op immediate, value a register).
         for (u32 i = 0; i < term.forward_set_headers.len; i++) {
@@ -4105,7 +4140,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 if (!transform) return core::make_unexpected(transform.error());
                 target_transform_id = transform.value();
             }
-            if (term.commit_response_mutations &&
+            if (term.commit_response_mutations && !kSetBody &&
                 !b.emit_resp_commit_headers({term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             if (target_transform_id != 0 &&
@@ -4150,7 +4185,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!transform) return core::make_unexpected(transform.error());
             target_transform_id = transform.value();
         }
-        if (term.commit_response_mutations &&
+        if (term.commit_response_mutations && !kSetBody &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         if (target_transform_id != 0 &&

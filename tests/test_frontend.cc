@@ -19762,6 +19762,61 @@ TEST(frontend, guard_fallback_forward_materializes_scoped_target_local) {
     CHECK(found_fallback_target);
     rir.destroy();
 }
+TEST(frontend, forward_set_body_lowers_literal_and_owned_values) {
+    const char* src =
+        "upstream api\n"
+        "route POST \"/literal\" { return forward(api, load_balance: .roundRobin, "
+        "set_body: \"sanitized\") }\n"
+        "route POST \"/dynamic\" { let body = req.body return forward(api, "
+        "load_balance: .roundRobin, set_body: body) }\n"
+        "route POST \"/empty\" { return forward(api, load_balance: .roundRobin, "
+        "set_body: \"\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.func_count, 3u);
+    auto* literal = find_first_op(rir.module.functions[0], rir::Opcode::ReqSetBody);
+    REQUIRE(literal);
+    CHECK_EQ(literal->operand_count, 1u);
+    CHECK_EQ(literal->imm.i32_val, 0);
+    auto* owned = find_first_op(rir.module.functions[1], rir::Opcode::ReqSetBody);
+    REQUIRE(owned);
+    CHECK_EQ(owned->operand_count, 1u);
+    CHECK_EQ(owned->imm.i32_val, 1);
+    CHECK(find_first_op(rir.module.functions[1], rir::Opcode::RetForward) != nullptr);
+    auto* empty = find_first_op(rir.module.functions[2], rir::Opcode::ReqSetBody);
+    REQUIRE(empty);
+    CHECK_EQ(empty->operand_count, 1u);
+    CHECK_EQ(empty->imm.i32_val, 0);
+    rir.destroy();
+}
+TEST(frontend, forward_set_body_rejects_invalid_shapes) {
+    const char* invalid[] = {
+        "upstream api\nroute POST \"/\" { return forward(api, load_balance: .roundRobin, "
+        "set_body: 1) }\n",
+        "upstream api\nroute POST \"/\" { return forward(api, load_balance: .roundRobin, "
+        "set_body: \"a\", set_body: \"b\") }\n",
+        "upstream api\nroute POST \"/\" { return forward(api, load_balance: .roundRobin, "
+        "set_body: \"a\", target_transform: {mode: .rawPrefix, strip_prefix: \"/a\", "
+        "replace_prefix: \"/b\"}) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        CHECK(lexed);
+        if (!lexed) continue;
+        auto ast = parse_file_heap(lexed.value());
+        if (!ast) continue;
+        CHECK(!analyze_file_heap(ast.value()));
+    }
+}
 TEST(frontend, lower_rejects_out_of_range_request_property_selector) {
     const char* src =
         "route GET \"/users\" { guard let path = req.normalizedPath else { return 400 } return 200 "

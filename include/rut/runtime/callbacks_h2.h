@@ -22,6 +22,7 @@
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/receive_headroom.h"
+#include "rut/runtime/request_body_override.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/route_params.h"
 #include "rut/runtime/route_table.h"
@@ -52,6 +53,9 @@ inline void h2_reset_request_mutations(Connection& conn, bool release_json_body 
     conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.req_body_overridden = false;
+    conn.req_body_override_failed = false;
+    conn.req_body_override = {nullptr, 0};
     conn.target_transform_id = 0;
     conn.target_transform_recorded = false;
     conn.req_header_owned_bytes = 0;
@@ -102,7 +106,22 @@ inline bool h2_prepare_forward_request(Connection& conn,
     conn.req_header_end = header_end;
     conn.req_initial_send_len = synth_len;
     conn.req_client_transfer_encoding = RequestTransferEncoding::None;
-    const bool ok = h2_apply_forward_request_overrides(conn, config);
+    bool ok = h2_apply_forward_request_overrides(conn, config);
+    if (conn.req_body_override_failed) ok = false;
+    if (ok && conn.req_body_overridden) {
+        u32 length = conn.recv_buf.len();
+        u32 header_end_after_overrides = conn.req_header_end;
+        ok = replace_h1_body_in_place(out,
+                                      &length,
+                                      out_cap,
+                                      &header_end_after_overrides,
+                                      0xffffffffu,
+                                      conn.req_body_override);
+        if (ok) {
+            conn.recv_buf.set_len(length);
+            conn.req_header_end = header_end_after_overrides;
+        }
+    }
     if (ok) *out_len = conn.recv_buf.len();
     conn.recv_buf = static_cast<Buffer&&>(saved_buf);
     conn.recv_slice = saved_slice;

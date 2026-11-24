@@ -17,6 +17,10 @@ struct RemoteJwks {
     u32 dns_timeout_seconds = 0;
     char allowed_addresses[kMaxDnsAddresses][HttpsEndpoint::kAddressCapacity]{};
     u32 allowed_count = 0;
+    // Discovery may use a separately configured fixed TLS origin. When absent,
+    // discovery reuses endpoint with only discovery_path replaced.
+    HttpsEndpoint discovery_endpoint{};
+    bool discovery_separate = false;
     char discovery_path[1024]{};
     char discovery_issuer[1024]{};
     u32 discovery_timeout_seconds = 0;
@@ -113,6 +117,7 @@ private:
     bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
     Str selected_address() const;
+    Str discovery_selected_address() const;
     bool accept_discovery(u64 now);
     void clear_dns_cache();
     bool fail();

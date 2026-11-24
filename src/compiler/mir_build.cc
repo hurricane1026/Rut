@@ -1862,6 +1862,25 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     }
                 }
             }
+            out->forward_set_body = term.forward_set_body;
+            if (term.forward_body_expr_index != 0xffffffffu) {
+                if (term.forward_body_expr_index >= source_route.exprs.len) {
+                    invalid_forward_path = true;
+                    forward_path_error = {FrontendError::UnsupportedSyntax, term.span, {}};
+                } else {
+                    auto value = mir_value(
+                        source_route.exprs[term.forward_body_expr_index], module, &fn, ctx);
+                    if (!value) {
+                        invalid_forward_path = true;
+                        forward_path_error = value.error();
+                    } else if (!fn.values.push(value.value())) {
+                        invalid_forward_path = true;
+                        forward_path_error = {FrontendError::OutOfMemory, term.span, {}};
+                    } else {
+                        out->forward_body_value = &fn.values[fn.values.len - 1];
+                    }
+                }
+            }
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_load_balance = term.forward_load_balance;
             out->forward_hash_seed = term.forward_hash_seed;

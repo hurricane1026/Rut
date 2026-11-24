@@ -1,0 +1,7 @@
+// identity comes from successful consumerAuthenticateForm on the same request.
+// The returned body is the exact remaining form fields with the credential removed.
+func remainingBody(_ identity: Json) -> str {
+    guard let fieldValue = json.get(identity, "/remaining") else { nil }
+    guard let body = json.string(fieldValue) else { nil }
+    body
+}

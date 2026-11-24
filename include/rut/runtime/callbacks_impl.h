@@ -2476,6 +2476,13 @@ inline bool build_h1_forward_response_headers(Connection& conn,
 template <typename Loop>
 bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
     if (!conn.http_cache_ttl) return false;
+    // A pinned response-mutation snapshot owns send_buf until the exchange ends,
+    // and its length is the send_buf prefix pipeline_stash must append after. The
+    // lookup below already reports Bypass here (mutations without CORS admission),
+    // but its reset would zero send_buf.len(); reserve_response_mutation_snapshot
+    // would then record 0 and a pipelined successor would be stashed at offset 0
+    // over the borrowed values. Return before that side effect.
+    if (conn.response_mutations_snapshotted) return false;
     conn.send_buf.reset();
     conn.http_cache_route = (conn.http_cache_route << 16) | upstream;
     const bool keep_alive = conn.keep_alive && conn.req_keep_alive;
@@ -3164,6 +3171,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.upstream_attempts = 0;
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
+    conn.req_body_overridden = false;
+    conn.req_body_override_failed = false;
+    conn.req_body_override = {nullptr, 0};
     conn.target_transform_id = 0;
     conn.target_transform_recorded = false;
     conn.req_header_owned_bytes = 0;
@@ -7036,6 +7046,7 @@ inline bool request_header_override_line_length(u32 name_len, u32 value_len, u32
 }
 
 inline bool apply_request_header_overrides(Connection& conn) {
+    if (conn.req_body_override_failed) return false;
     if (conn.req_header_override_count == 0 && !conn.req_header_override_overflow) return true;
     // More overrides were requested than the table holds (direct-RIR only): a
     // dropped override must not be forwarded as a silent no-op — fail closed.
@@ -7271,28 +7282,6 @@ inline void strip_ws_extensions(Connection& conn) {
 }
 #endif
 
-// Preserve request-backed after-mutation values before forward(set_path:) and
-// forward(set_header:) rewrite recv_buf in place. send_buf remains pinned until
-// the response completes; on_upstream_request_sent later reserves this snapshot
-// as the prefix used by pipeline_stash.
-inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn) {
-    if (conn.resp_header_mutation_count == 0 || conn.retry_req_send_len != 0 ||
-        conn.response_mutations_snapshotted)
-        return true;
-    if (conn.req_initial_send_len == 0 || conn.req_initial_send_len > conn.recv_buf.len() ||
-        conn.req_initial_send_len > conn.send_buf.capacity())
-        return false;
-    const u8* old_base = conn.recv_buf.data();
-    conn.send_buf.reset();
-    if (conn.send_buf.write(old_base, conn.req_initial_send_len) != conn.req_initial_send_len)
-        return false;
-    conn.reanchor_response_mutations(old_base, conn.req_initial_send_len, conn.send_buf.data());
-    conn.response_mutations_snapshotted = true;
-    conn.retry_req_snapshot_replayable =
-        !conn.req_path_overridden && conn.req_header_override_count == 0;
-    return true;
-}
-
 // Materialize the foundation target-transform effect for the first supported
 // domain.  This deliberately runs before target selection, policy materializa-
 // tion, slot acquisition, idle reuse, and socket/connect side effects.  Every
@@ -7302,7 +7291,7 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
 inline bool materialize_general_target_transform(Connection& conn,
                                                  const ForwardTargetTransformSpec& spec) {
     if (!forward_target_transform_spec_valid(spec) || conn.req_path_overridden ||
-        conn.req_malformed || conn.req_header_override_overflow ||
+        conn.req_body_overridden || conn.req_malformed || conn.req_header_override_overflow ||
         conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count ||
         conn.resp_header_mutation_pending_overflow || conn.resp_header_mutation_overflow)
         return false;
@@ -7358,7 +7347,7 @@ inline bool materialize_general_target_transform(Connection& conn,
     // H2 has already stabilized response values before constructing its synth;
     // its send_buf contains protocol frames and must not be used as H1 scratch.
     if (conn.protocol != ConnProtocol::Http2 &&
-        !snapshot_response_mutations_before_request_rewrite(conn))
+        !conn.snapshot_response_mutations_before_request_rewrite())
         return false;
     conn.req_path_override = {rewritten, final_length};
     conn.req_path_overridden = true;
@@ -9299,7 +9288,8 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     // retry replay the request bytes live in send_buf, while recv_buf may already
     // hold the next pipelined request, so only rewrite the initial forward buffer.
     if (conn.retry_req_send_len == 0) {
-        const bool mutations_snapshotted = snapshot_response_mutations_before_request_rewrite(conn);
+        const bool mutations_snapshotted =
+            conn.snapshot_response_mutations_before_request_rewrite();
         const bool path_rewritten = mutations_snapshotted && rewrite_request_line_path(conn);
         // forward(set_header:) — inject/replace request header lines (no-op unless
         // overrides were recorded). After the path rewrite so it reads the updated
@@ -9698,7 +9688,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // Normal forwarding snapshots in on_upstream_connected, before overrides.
     // Keep this fallback for callers that submit an already-prepared request
     // directly (and fail closed if their request-backed values cannot be pinned).
-    if (!snapshot_response_mutations_before_request_rewrite(conn)) {
+    if (!conn.snapshot_response_mutations_before_request_rewrite()) {
         loop->close_conn(conn);
         return;
     }
