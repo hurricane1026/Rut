@@ -176,12 +176,19 @@ without presenting lossy or per-shard state as exact shared state.
   decimal digits after `.`), including static-loop elements. Literal tuples
   fold to the element; non-tuple receivers and out-of-range slots are rejected
   with dedicated diagnostics. Nullable/fallible receivers must be narrowed
-  before projection. Nested tuples and `let (x, y) = pair` destructuring remain
-  pending. Projecting a *generic* element does not carry its type parameter's
+  before projection. Nested tuples remain pending. Projecting a *generic*
+  element does not carry its type parameter's
   Eq/Ord/Error/custom-protocol constraints (they are function-scoped and are not
   represented per tuple element), so constrained uses must pass the element
   through a helper parameter of type `T`; extending the type system with
   per-element constraint metadata is a follow-up.
+- [x] Tuple destructuring: route-level `let (a, b) = pair` binds one local per
+  element through a hidden single-evaluation carrier local, so a runtime tuple
+  is materialized once rather than at each slot use. Arity, duplicate names,
+  existing-local collisions, non-tuple initializers, and nullable/fallible
+  receivers are rejected with dedicated diagnostics. Nested bodies (loops,
+  guard/arm blocks, helper bodies) and type annotations keep single-name `let`
+  for now.
 - [x] Static route-local `for` loops are enabled end to end. The parser accepts
   `for name in <static array> { ... }` (still rejecting `inline for`), analyze
   builds the existing `HirForLoop` subset, and MIR unrolls literals or

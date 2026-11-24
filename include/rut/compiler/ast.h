@@ -268,6 +268,11 @@ struct AstStatement {
     AstStmtKind kind = AstStmtKind::ReturnStatus;
     Span span{};
     Str name{};
+    // `let (a, b) = pair` destructuring (route statements only for now):
+    // element names bind one local each from the tuple initializer in `expr`.
+    static constexpr u32 kMaxTupleLetNames = 4;
+    u32 tuple_let_count = 0;
+    Str tuple_let_names[kMaxTupleLetNames]{};
     bool bind_value = false;
     // WsTerminate only: the `maxMessageSize:` kwarg in bytes (`websocket(x, maxMessageSize: 8kb)`),
     // 0 when omitted (the loader then uses the engine default); explicit values fit bounded pool

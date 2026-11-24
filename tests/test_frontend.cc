@@ -49720,6 +49720,124 @@ TEST(frontend, analyze_rejects_invalid_tuple_slot_projection) {
     }
 }
 
+TEST(frontend, parse_tuple_destructuring_let) {
+    const auto source =
+        lit("route GET \"/x\" { let (code, tag) = pair guard code == 200 else { return 400 } "
+            "return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 3u);
+    REQUIRE(route.statements[0] != nullptr);
+    const auto& let_stmt = *route.statements[0];
+    REQUIRE_EQ(static_cast<u8>(let_stmt.kind), static_cast<u8>(AstStmtKind::Let));
+    CHECK_EQ(let_stmt.tuple_let_count, 2u);
+    CHECK(let_stmt.tuple_let_names[0].eq(lit("code")));
+    CHECK(let_stmt.tuple_let_names[1].eq(lit("tag")));
+    CHECK(let_stmt.name.len == 0);
+
+    // Nested bodies and non-route statements keep single-name lets.
+    const char* outside_route[] = {
+        "func f() -> i32 { let (a, b) = (1, 2) return a }\n"
+        "route GET \"/x\" { return 200 }\n",
+        "route GET \"/x\" { for n in [1] { let (a, b) = (1, 2) } return 200 }\n",
+    };
+    for (const char* src : outside_route) {
+        auto bad_tokens = lex(lit(src));
+        REQUIRE(bad_tokens);
+        CHECK_FALSE(parse_file_heap(bad_tokens.value()).has_value());
+    }
+    // A type annotation is rejected.
+    auto annotated = lex(lit("route GET \"/x\" { let (a, b): (i32, i32) = (1, 2) return 200 }\n"));
+    REQUIRE(annotated);
+    CHECK_FALSE(parse_file_heap(annotated.value()).has_value());
+}
+
+TEST(frontend, analyze_tuple_destructuring_let) {
+    const char* sources[] = {
+        "route GET \"/x\" { let (code, n) = (200, 1) guard code == 200 else { return 400 } "
+        "guard n == 1 else { return 401 } return 200 }\n",
+        // The initializer runs once into a hidden carrier, so a non-literal
+        // tuple local can be destructured too.
+        "route GET \"/x\" { let pair = (100 + 100, 1 + 1) let (a, b) = pair "
+        "guard a == 200 else { return 402 } guard b == 2 else { return 403 } return 200 }\n",
+        "route GET \"/x\" { let (tag, n) = (\"ok\", 1) guard tag == \"ok\" else { return 404 } "
+        "return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "tuple destructuring source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, mir_materializes_tuple_destructuring_carrier_once) {
+    // The carrier local must be materialized once and read per slot; a
+    // duplicated lowering would sample the clock twice.
+    const auto source =
+        lit("route GET \"/x\" { let (stamp, n) = (time.nowMicros(), 0) "
+            "guard n == 0 else { return 400 } guard stamp > 0 else { return 401 } "
+            "return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 clock_reads = 0;
+    const auto& fn = rir.module.functions[0];
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            if (fn.blocks[bi].insts[ii].op == rir::Opcode::TimeNowMicros) clock_reads++;
+        }
+    }
+    CHECK_EQ(clock_reads, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, analyze_rejects_invalid_tuple_destructuring) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { let (a, b) = 1 return 200 }\n",
+         "tuple destructuring requires a tuple value"},
+        {"route GET \"/x\" { let (a, b, c) = (1, 2) return 200 }\n",
+         "tuple destructuring arity does not match the tuple value"},
+        {"route GET \"/x\" { let a = 1 let (a, b) = (1, 2) return 200 }\n", nullptr},
+        {"route GET \"/x\" { let (a, a) = (1, 2) return 200 }\n", nullptr},
+        {"route GET \"/x\" { let (a, b) = nil return 200 }\n", nullptr},
+    };
+    for (const auto& item : cases) {
+        auto lexed = lex(lit(item.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        if (item.detail != nullptr) CHECK(hir.error().detail.eq(lit(item.detail)));
+    }
+}
+
 TEST(frontend, parse_for_loop_break_continue_statements) {
     const auto source =
         lit("route GET \"/x\" { for n in [1] { guard n != 2 else { break } "

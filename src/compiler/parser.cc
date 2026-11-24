@@ -1828,7 +1828,7 @@ struct Parser {
         return lhs.value();
     }
 
-    FrontendResult<AstStatement> parse_stmt() {
+    FrontendResult<AstStatement> parse_stmt(bool allow_tuple_let = false) {
         const Token start = cur();
         if (take(TokenType::LBrace)) {
             AstStatement stmt{};
@@ -1862,6 +1862,40 @@ struct Parser {
                                       span_from(*rbrace.value()),
                                       kEmptyBlockDetail);
             stmt.span.end = rbrace.value()->end;
+            return stmt;
+        }
+        if (cur().type == TokenType::KwLet && peek().type == TokenType::LParen) {
+            // `let (a, b) = pair` — tuple destructuring. Only route statements
+            // accept it for now; nested bodies keep a single-name `let`.
+            if (!allow_tuple_let)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span_from(start),
+                    lit_str("tuple destructuring is only supported in route bodies"));
+            pos += 2;  // consume 'let' and '('
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::Let;
+            while (true) {
+                auto elem = expect(TokenType::Ident);
+                if (!elem) return core::make_unexpected(elem.error());
+                if (stmt.tuple_let_count >= AstStatement::kMaxTupleLetNames)
+                    return frontend_error(FrontendError::TooManyItems, span_from(*elem.value()));
+                stmt.tuple_let_names[stmt.tuple_let_count++] = elem.value()->text;
+                if (take(TokenType::RParen)) break;
+                auto comma = expect(TokenType::Comma);
+                if (!comma) return core::make_unexpected(comma.error());
+            }
+            if (cur().type == TokenType::Colon)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span_from(cur()),
+                    lit_str("tuple destructuring does not take a type annotation"));
+            auto eq = expect(TokenType::Eq);
+            if (!eq) return core::make_unexpected(eq.error());
+            auto init = parse_expr();
+            if (!init) return core::make_unexpected(init.error());
+            stmt.expr = init.value();
+            stmt.span = Span{start.start, init->span.end, start.line, start.col};
             return stmt;
         }
         if (take(TokenType::KwLet)) {
@@ -5799,7 +5833,7 @@ struct Parser {
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-            auto stmt = parse_stmt();
+            auto stmt = parse_stmt(/*allow_tuple_let=*/true);
             if (!stmt) return core::make_unexpected(stmt.error());
             auto stmt_ptr = alloc_stmt(stmt.value());
             if (!stmt_ptr) return core::make_unexpected(stmt_ptr.error());

@@ -272,8 +272,8 @@ All functions inline at compile time.
 Domain types are first-class: `Duration ByteSize StatusCode Method IP CIDR Port
 MediaType Regex Time`. Numeric: `i8..i64 u8..u64 f32 f64`, `str`, `[T]`,
 tuples `(a, b)` — `.0`/`.1` projection (a generic element does not carry its
-type parameter's constraints yet — pass it through a `T` helper parameter);
-⏳ `let (x, y) = pair` destructuring pending
+type parameter's constraints yet — pass it through a `T` helper parameter) and
+route-level `let (x, y) = pair` destructuring (nested bodies pending)
 
 `Bytes` is an immutable raw-byte view, distinct from `str`. Construct constants
 with the existing `b"\x00\xff"` literal syntax (at most 4096 decoded bytes per
