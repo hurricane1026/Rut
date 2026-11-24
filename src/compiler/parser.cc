@@ -596,7 +596,8 @@ struct Parser {
         return &file->type_pool[file->type_pool.len - 1];
     }
 
-    FrontendResult<AstStatement> parse_braced_stmt_body(const Token& lbrace_tok) {
+    FrontendResult<AstStatement> parse_braced_stmt_body(const Token& lbrace_tok,
+                                                        bool allow_tuple_let = false) {
         AstStatement block{};
         block.kind = AstStmtKind::Block;
         block.span = span_from(lbrace_tok);
@@ -605,7 +606,7 @@ struct Parser {
         const bool saved_dot_stop = arm_body_stops_cross_line_dot;
         arm_body_stops_cross_line_dot = false;
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
-            auto inner = parse_stmt();
+            auto inner = parse_stmt(allow_tuple_let);
             if (!inner) {
                 arm_body_stops_cross_line_dot = saved_dot_stop;
                 return core::make_unexpected(inner.error());
@@ -3710,7 +3711,7 @@ struct Parser {
             if (!iter_expr) return core::make_unexpected(iter_expr.error());
             auto lbrace = expect(TokenType::LBrace);
             if (!lbrace) return core::make_unexpected(lbrace.error());
-            auto body = parse_braced_stmt_body(*lbrace.value());
+            auto body = parse_braced_stmt_body(*lbrace.value(), /*allow_tuple_let=*/true);
             if (!body) return core::make_unexpected(body.error());
             auto body_ptr = alloc_stmt(body.value());
             if (!body_ptr) return core::make_unexpected(body_ptr.error());

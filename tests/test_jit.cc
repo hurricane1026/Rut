@@ -2062,6 +2062,46 @@ TEST(jit, frontend_byte_size_literals_execute) {
     rir.destroy();
 }
 
+TEST(jit, frontend_for_loop_tuple_destructuring_executes) {
+    const char* src =
+        "route GET \"/users\" { for pair in [(200, 1), (204, 2)] { let (code, n) = pair "
+        "guard code != 204 else { return 401 } guard n == 1 else { return 402 } } "
+        "return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler != nullptr);
+    const char* request = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    auto r = HandlerResult::unpack(handler(nullptr,
+                                           nullptr,
+                                           reinterpret_cast<const u8*>(request),
+                                           static_cast<u32>(__builtin_strlen(request)),
+                                           nullptr));
+    CHECK(r.action == HandlerAction::ReturnStatus);
+    CHECK_EQ(r.status_code, 401);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, frontend_arith_div_mod_guards_execute) {
     // Runtime operands (locals don't fold at use sites), so the codegen
     // select guards — not the analyze fold — produce these results.
