@@ -106,6 +106,16 @@
 
 namespace {
 
+template <class T, class U>
+T checked_fixture_sum(T value, U addend) {
+    T result;
+    if (__builtin_add_overflow(value, addend, &result)) {
+        std::fputs("differential fixture sum exceeds integer range\n", stderr);
+        std::abort();
+    }
+    return result;
+}
+
 constexpr const char* kEnvoyImage = RUT_PINNED_ENVOY_IMAGE;
 constexpr int kClientTimeoutMs = 3000;
 // How many times to retry Envoy's own listener port after a bind collision
@@ -1755,7 +1765,7 @@ int g_docker_rm_confirm_window_ms = 5000;
 // failure, `*detail` (when given) receives the last CLI output and exit
 // status so the FAIL message says what docker actually reported.
 bool docker_rm_force(const std::string& name, std::string* detail = nullptr) {
-    g_docker_rm_invocations++;
+    g_docker_rm_invocations = checked_fixture_sum(g_docker_rm_invocations, 1);
     const int64_t deadline = now_ms() + g_docker_rm_confirm_window_ms;
     for (;;) {
         std::string output;
@@ -2359,7 +2369,7 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port, uid_t u
         }
         for (size_t i = 0; i < eligible_count; i++) {
             if (local_addr == eligible[i]) {
-                count++;
+                count = checked_fixture_sum(count, 1);
                 break;
             }
         }
@@ -2386,8 +2396,9 @@ int count_listeners_on_port(const std::string& tcp_table, uint16_t port, uid_t u
 // (below), while one checking a `rut` listener (a plain host process, not a
 // container) passes `getuid()`.
 int count_listeners_on_port(uint16_t port, uid_t uid) {
-    return count_listeners_on_port(read_file_contents("/proc/net/tcp"), port, uid) +
-           count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port, uid);
+    return checked_fixture_sum(
+        count_listeners_on_port(read_file_contents("/proc/net/tcp"), port, uid),
+        count_listeners_on_port(read_file_contents("/proc/net/tcp6"), port, uid));
 }
 
 // The uid EnvoyInstance::launch() always runs the container as, regardless
@@ -3806,17 +3817,17 @@ bool is_rfc1123_http_date(const std::string& value) {
     // Sakamoto's algorithm: the weekday for a Gregorian calendar date, as
     // 0 = Sunday .. 6 = Saturday.
     static const int kSakamotoMonthTable[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
-    int adjusted_year = static_cast<int>(year);
+    int64_t adjusted_year = year;
     const int month_1based = month_index + 1;
     if (month_1based < 3) adjusted_year -= 1;
-    const int sakamoto_weekday =
+    const int64_t sakamoto_weekday =
         (adjusted_year + adjusted_year / 4 - adjusted_year / 100 + adjusted_year / 400 +
          kSakamotoMonthTable[month_index] + static_cast<int>(day)) %
         7;
     // Translate Sakamoto's 0=Sunday..6=Saturday into kWeekdays' 0=Mon..6=Sun
     // indexing: Sunday (0) maps to kWeekdays' last slot (6), Monday (1) to
     // kWeekdays' first slot (0), and so on.
-    const int computed_weekday_index = (sakamoto_weekday + 6) % 7;
+    const int64_t computed_weekday_index = (sakamoto_weekday + 6) % 7;
     if (computed_weekday_index != weekday_index) return false;
 
     return true;
@@ -3870,8 +3881,9 @@ bool rfc1123_http_date_is_current(const std::string& value, time_t now, int tole
     parsed.tm_sec = static_cast<int>(two_digits(23));
     const time_t parsed_time = timegm(&parsed);
     if (parsed_time == static_cast<time_t>(-1)) return false;
-    const long long diff = static_cast<long long>(parsed_time) - static_cast<long long>(now);
-    return diff >= -tolerance_seconds && diff <= tolerance_seconds;
+    int64_t diff;
+    return !__builtin_sub_overflow(parsed_time, now, &diff) &&
+           diff >= -static_cast<int64_t>(tolerance_seconds) && diff <= tolerance_seconds;
 }
 
 // Formats `t` (interpreted as UTC/GMT) in the exact 29-byte RFC 1123 shape
@@ -3889,11 +3901,11 @@ std::string format_rfc1123_http_date(time_t t) {
     char buf[30];
     std::snprintf(buf,
                   sizeof(buf),
-                  "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                  "%s, %02d %s %04lld %02d:%02d:%02d GMT",
                   kWeekdays[tm_buf.tm_wday],
                   tm_buf.tm_mday,
                   kMonths[tm_buf.tm_mon],
-                  tm_buf.tm_year + 1900,
+                  static_cast<long long>(tm_buf.tm_year) + 1900,
                   tm_buf.tm_hour,
                   tm_buf.tm_min,
                   tm_buf.tm_sec);
@@ -4277,7 +4289,7 @@ int count_header(const std::string& raw, const std::string& name) {
                     return std::tolower(static_cast<unsigned char>(a)) ==
                            std::tolower(static_cast<unsigned char>(b));
                 }))
-                count++;
+                count = checked_fixture_sum(count, 1);
         }
         if (line_end == headers.size()) break;
         start = line_end + 2;
@@ -4351,8 +4363,10 @@ bool assert_connect_failure(const std::vector<CaseResult>& results) {
 int container_name_suffix_counter = 0;
 
 std::string make_container_name(const char* label) {
+    const int suffix = container_name_suffix_counter;
+    container_name_suffix_counter = checked_fixture_sum(suffix, 1);
     return std::string("rut-envoy-oracle-") + std::to_string(getpid()) + "-" + label + "-" +
-           std::to_string(container_name_suffix_counter++);
+           std::to_string(suffix);
 }
 
 // Case-insensitive scan of an Envoy log for a bind-collision message (Envoy
@@ -4591,7 +4605,10 @@ bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadl
                 return false;
             }
         }
-        const int budget_ms = static_cast<int>(std::min<int64_t>(deadline_ms - now_ms(), 1000));
+        int64_t remaining;
+        if (__builtin_sub_overflow(deadline_ms, now_ms(), &remaining) || remaining <= 0)
+            return false;
+        const int budget_ms = static_cast<int>(std::min<int64_t>(remaining, 1000));
         if (budget_ms > 0) {
             const int fd = connect_with_timeout(port, budget_ms);
             if (fd >= 0) {
@@ -6230,7 +6247,7 @@ bool self_test_wait_idle_redrains_after_active_handler() {
     int delayed_fd = -1;
     upstream.set_test_before_active_handler_wait_hook(
         [port, persistent_fd, &hook_calls, &delayed_fd] {
-            hook_calls++;
+            hook_calls = checked_fixture_sum(hook_calls, 1);
             if (hook_calls != 1) return;  // only the first time step 4 is entered
             delayed_fd = connect_with_timeout(port, kClientTimeoutMs);
             if (delayed_fd >= 0) {
@@ -6346,7 +6363,7 @@ bool self_test_wait_idle_fails_on_relentless_arrivals() {
     constexpr int kInjectionSleepMs = 5;
     int hook_calls = 0;
     upstream.set_test_before_quiet_window_poll_hook([port, &hook_calls] {
-        hook_calls++;
+        hook_calls = checked_fixture_sum(hook_calls, 1);
         struct timespec delay{0, static_cast<long>(kInjectionSleepMs) * 1'000'000};
         nanosleep(&delay, nullptr);
         const int fd = connect_with_timeout(port, kClientTimeoutMs);
@@ -7481,7 +7498,8 @@ bool self_test_allocate_distinct_ports_exhaustion() {
         uint16_t out1 = 0, out2 = 0;
         uint16_t next = 100;
         const bool result = allocate_distinct_ports_with({&out1, &out2}, [&next](uint16_t* port) {
-            *port = next++;
+            *port = next;
+            next = checked_fixture_sum(next, 1);
             return true;
         });
         if (!result || out1 != 100 || out2 != 101) {
@@ -8133,10 +8151,10 @@ bool self_test_envoy_instance_cleans_up_after_readiness_reaps_docker() {
     const int after = g_docker_rm_invocations;
 
     bool ok = true;
-    if (after != before + 1) {
+    if (static_cast<int64_t>(after) != static_cast<int64_t>(before) + 1) {
         std::cerr << "FAIL [self-test envoy instance cleans up reaped docker]: expected exactly "
                      "one docker rm -f invocation, got "
-                  << (after - before) << "\n";
+                  << (static_cast<int64_t>(after) - static_cast<int64_t>(before)) << "\n";
         ok = false;
     }
     if (envoy.launched) {
@@ -8230,10 +8248,10 @@ bool self_test_docker_rm_failure_preserves_launched() {
         const bool stopped = envoy.stop();
         const int after = g_docker_rm_invocations;
 
-        if (after != before + 1) {
+        if (static_cast<int64_t>(after) != static_cast<int64_t>(before) + 1) {
             std::cerr << "FAIL [self-test docker rm outcomes]: case \"" << c.label
-                      << "\" expected exactly one docker rm -f invocation, got " << (after - before)
-                      << "\n";
+                      << "\" expected exactly one docker rm -f invocation, got "
+                      << (static_cast<int64_t>(after) - static_cast<int64_t>(before)) << "\n";
             ok = false;
         }
         if (envoy.launched != !c.expect_launched_cleared) {
@@ -8306,10 +8324,10 @@ bool self_test_docker_rm_rides_out_autoremove_race() {
     const bool stopped = envoy.stop();
     const int after = g_docker_rm_invocations;
 
-    if (after != before + 1) {
+    if (static_cast<int64_t>(after) != static_cast<int64_t>(before) + 1) {
         std::cerr << "FAIL [self-test docker rm autoremove race]: expected exactly one "
                      "docker_rm_force invocation, got "
-                  << (after - before) << "\n";
+                  << (static_cast<int64_t>(after) - static_cast<int64_t>(before)) << "\n";
         ok = false;
     }
     std::ifstream calls_in(calls_path);
@@ -10024,13 +10042,13 @@ bool make_orphan_sentinel(pid_t* sentinel_pid) {
             _exit(0);
         }
         if (grand > 0) {
-            ssize_t written = 0;
-            while (written < static_cast<ssize_t>(sizeof(grand))) {
+            size_t written = 0;
+            while (written < sizeof(grand)) {
                 const ssize_t n = write(fds[1],
                                         reinterpret_cast<const char*>(&grand) + written,
                                         sizeof(grand) - written);
                 if (n <= 0) break;
-                written += n;
+                written += static_cast<size_t>(n);
             }
         }
         close(fds[1]);
@@ -10038,18 +10056,18 @@ bool make_orphan_sentinel(pid_t* sentinel_pid) {
     }
     close(fds[1]);
     pid_t grand = -1;
-    ssize_t total_read = 0;
-    while (total_read < static_cast<ssize_t>(sizeof(grand))) {
+    size_t total_read = 0;
+    while (total_read < sizeof(grand)) {
         const ssize_t n =
             read(fds[0], reinterpret_cast<char*>(&grand) + total_read, sizeof(grand) - total_read);
         if (n <= 0) break;
-        total_read += n;
+        total_read += static_cast<size_t>(n);
     }
     close(fds[0]);
     int status = 0;
     while (waitpid(mid, &status, 0) < 0 && errno == EINTR) {
     }
-    if (total_read != static_cast<ssize_t>(sizeof(grand)) || grand <= 0) return false;
+    if (total_read != sizeof(grand) || grand <= 0) return false;
     *sentinel_pid = grand;
     return true;
 }
@@ -12219,7 +12237,7 @@ bool self_test_malformed_date_rejected() {
     // well-formed RFC 1123 date (is_rfc1123_http_date() alone still accepts
     // it, exercised directly below), just not one anywhere near "now".
     const time_t self_test_now = time(nullptr);
-    const std::string valid = format_rfc1123_http_date(self_test_now + 60);
+    const std::string valid = format_rfc1123_http_date(checked_fixture_sum(self_test_now, 60));
     if (!is_rfc1123_http_date(valid)) {
         std::cerr << "FAIL [self-test malformed date]: a valid RFC 1123 date was rejected\n";
         ok = false;
@@ -12302,8 +12320,8 @@ bool self_test_malformed_date_rejected() {
     }
     // Two well-formed, different (but both current) synthesized dates: the
     // placeholder still hides the unavoidable timestamp difference.
-    if (!compare_pair_case(
-            make_pair("trace", valid, format_rfc1123_http_date(self_test_now + 120)))) {
+    if (!compare_pair_case(make_pair(
+            "trace", valid, format_rfc1123_http_date(checked_fixture_sum(self_test_now, 120))))) {
         std::cerr << "FAIL [self-test malformed date]: compare_pair_case rejected two valid, "
                      "differing synthesized Date values\n";
         ok = false;
@@ -12499,7 +12517,8 @@ bool self_test_preserved_upstream_date_enforced() {
     // live, current, well-formed values -- different from each other, but
     // each individually valid, exactly what previously normalized to the
     // same placeholder and reported a false MATCH.
-    if (compare_pair_case(make_pair(live_now, format_rfc1123_http_date(now + 60)))) {
+    if (compare_pair_case(
+            make_pair(live_now, format_rfc1123_http_date(checked_fixture_sum(now, 60))))) {
         std::cerr << "FAIL [self-test preserved upstream date]: compare_pair_case matched two "
                      "sides that both incorrectly replaced the preserved upstream Date with "
                      "fresh synthesized values\n";

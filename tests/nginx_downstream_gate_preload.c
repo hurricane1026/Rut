@@ -29,13 +29,14 @@ static void gate_resolve_symbols(void) {
     if (real_write_fn != 0 && real_writev_fn != 0 && real_send_fn != 0 && real_sendmsg_fn != 0 &&
         real_recv_fn != 0)
         return;
-    gate_inside++;
+    const int saved_gate_inside = gate_inside;
+    gate_inside = 1;
     *(void**)(&real_write_fn) = dlsym(RTLD_NEXT, "write");
     *(void**)(&real_writev_fn) = dlsym(RTLD_NEXT, "writev");
     *(void**)(&real_send_fn) = dlsym(RTLD_NEXT, "send");
     *(void**)(&real_sendmsg_fn) = dlsym(RTLD_NEXT, "sendmsg");
     *(void**)(&real_recv_fn) = dlsym(RTLD_NEXT, "recv");
-    gate_inside--;
+    gate_inside = saved_gate_inside;
 }
 
 static int gate_protocol_valid(void) {
@@ -140,7 +141,12 @@ static int gate_wait_for_request_two(int fd) {
         rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_PROTOCOL);
         return 0;
     }
-    const int64_t deadline = rut_downstream_gate_now_ms() + 5000;
+    const int64_t start = rut_downstream_gate_now_ms();
+    int64_t deadline;
+    if (start < 0 || __builtin_add_overflow(start, 5000, &deadline)) {
+        rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_TIMEOUT);
+        return 0;
+    }
     unsigned char peek[RUT_DOWNSTREAM_GATE_REQUEST_CAPACITY + 1];
     for (;;) {
         const int64_t now = rut_downstream_gate_now_ms();
@@ -325,10 +331,10 @@ ssize_t write(int fd, const void* data, size_t length) {
         errno = ENOSYS;
         return -1;
     }
-    gate_inside++;
+    gate_inside = 1;
     gate_before_publication(
         fd, RUT_DOWNSTREAM_GATE_OP_WRITE, length, (const unsigned char*)data, length);
-    gate_inside--;
+    gate_inside = 0;
     return real_write_fn(fd, data, length);
 }
 
@@ -349,9 +355,9 @@ ssize_t writev(int fd, const struct iovec* iov, int count) {
     size_t prefix_length = 0;
     if (count > 0)
         prefix_length = gate_copy_iov_prefix(prefix, sizeof(prefix), iov, (size_t)count, &total);
-    gate_inside++;
+    gate_inside = 1;
     gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_WRITEV, total, prefix, prefix_length);
-    gate_inside--;
+    gate_inside = 0;
     return real_writev_fn(fd, iov, count);
 }
 
@@ -367,10 +373,10 @@ ssize_t send(int fd, const void* data, size_t length, int flags) {
         errno = ENOSYS;
         return -1;
     }
-    gate_inside++;
+    gate_inside = 1;
     gate_before_publication(
         fd, RUT_DOWNSTREAM_GATE_OP_SEND, length, (const unsigned char*)data, length);
-    gate_inside--;
+    gate_inside = 0;
     return real_send_fn(fd, data, length, flags);
 }
 
@@ -392,9 +398,9 @@ ssize_t sendmsg(int fd, const struct msghdr* message, int flags) {
     if (message != 0 && message->msg_iov != 0)
         prefix_length = gate_copy_iov_prefix(
             prefix, sizeof(prefix), message->msg_iov, message->msg_iovlen, &total);
-    gate_inside++;
+    gate_inside = 1;
     gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_SENDMSG, total, prefix, prefix_length);
-    gate_inside--;
+    gate_inside = 0;
     return real_sendmsg_fn(fd, message, flags);
 }
 
@@ -405,8 +411,8 @@ ssize_t recv(int fd, void* data, size_t length, int flags) {
         errno = ENOSYS;
         return -1;
     }
-    gate_inside++;
+    gate_inside = 1;
     const ssize_t result = gate_coalesced_ingress_recv(fd, data, length, flags);
-    gate_inside--;
+    gate_inside = 0;
     return result;
 }

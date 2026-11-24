@@ -152,9 +152,9 @@ inline bool grpc_test_ssl_call(SSL* ssl,
     }
 }
 
-volatile sig_atomic_t grpc_test_signal_count = 0;
+volatile sig_atomic_t grpc_test_signal_seen = 0;
 void grpc_test_signal_handler(int) {
-    grpc_test_signal_count = grpc_test_signal_count + 1;
+    grpc_test_signal_seen = 1;
 }
 
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
@@ -221,11 +221,13 @@ bool flush_session(nghttp2_session* session, int fd, SSL* ssl = nullptr) {
         if (!ssl) {
             if (!write_all_fd(fd, data, static_cast<u32>(n))) return false;
         } else {
-            ssize_t offset = 0;
-            while (offset < n) {
-                const int sent = SSL_write(ssl, data + offset, static_cast<int>(n - offset));
+            if (n > INT_MAX) return false;
+            const size_t length = static_cast<size_t>(n);
+            size_t offset = 0;
+            while (offset < length) {
+                const int sent = SSL_write(ssl, data + offset, static_cast<int>(length - offset));
                 if (sent <= 0) return false;
-                offset += sent;
+                offset += static_cast<size_t>(sent);
             }
         }
     }
@@ -446,7 +448,7 @@ struct EchoServer {
             if (nghttp2_session_consume(session, id, amount) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             *flags |= NGHTTP2_DATA_FLAG_EOF;
-            return out_header + static_cast<ssize_t>(header.payload_len);
+            return static_cast<ssize_t>(out_header + static_cast<u32>(header.payload_len));
         }
         if (s->wire_message) {
             static constexpr u8 request[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};
@@ -816,9 +818,17 @@ struct Client {
         }
         return n;
     }
+    Rpc* rpc_for_stream(int32_t sid) {
+        if (sid <= 0) return nullptr;
+        const u32 index = (static_cast<u32>(sid) - 1u) / 2u;
+        return index < sizeof(rpcs) / sizeof(rpcs[0]) ? &rpcs[index] : nullptr;
+    }
+
     static int receive(
         nghttp2_session*, uint8_t, int32_t sid, const uint8_t* data, size_t len, void* ctx) {
-        auto& rpc = static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2];
+        auto* stream = static_cast<Client*>(ctx)->rpc_for_stream(sid);
+        if (!stream) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        auto& rpc = *stream;
         static constexpr u8 wire[] = {0x82, 5, 'h', 'e', 'l', 'l', 'o'};
         for (u32 i = 0; i < len; i++) {
             const u32 at = rpc.received + i;
@@ -837,7 +847,9 @@ struct Client {
                       size_t v,
                       uint8_t,
                       void* ctx) {
-        auto& rpc = static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2];
+        auto* stream = static_cast<Client*>(ctx)->rpc_for_stream(f->hd.stream_id);
+        if (!stream) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        auto& rpc = *stream;
         if (n == 7 && memcmp(name, ":status", n) == 0) {
             rpc.http_status = 0;
             for (size_t i = 0; i < v; ++i) rpc.http_status = rpc.http_status * 10 + value[i] - '0';
@@ -856,13 +868,18 @@ struct Client {
     static int frame(nghttp2_session*, const nghttp2_frame* f, void* ctx) {
         if (f->hd.type == NGHTTP2_GOAWAY) static_cast<Client*>(ctx)->goaway = true;
         if ((f->hd.type == NGHTTP2_HEADERS || f->hd.type == NGHTTP2_DATA) &&
-            (f->hd.flags & NGHTTP2_FLAG_END_STREAM))
-            static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2].response_end = true;
+            (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+            auto* stream = static_cast<Client*>(ctx)->rpc_for_stream(f->hd.stream_id);
+            if (!stream) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            stream->response_end = true;
+        }
         return 0;
     }
     static int closed(nghttp2_session*, int32_t sid, uint32_t error, void* ctx) {
-        static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
-        static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].reset_error = error;
+        auto* stream = static_cast<Client*>(ctx)->rpc_for_stream(sid);
+        if (!stream) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        stream->closed = true;
+        stream->reset_error = error;
         return 0;
     }
     bool init(u16 port, bool tls = false, const char* client_name = "client") {
@@ -1398,10 +1415,11 @@ struct H1WebSocketClient {
         return true;
     }
     bool read_more() {
-        if (used == sizeof(bytes)) return false;
+        if (used >= sizeof(bytes)) return false;
+        const size_t remaining = sizeof(bytes) - static_cast<size_t>(used);
         int n;
         if (ssl)
-            n = tls_io([&] { return SSL_read(ssl, bytes + used, sizeof(bytes) - used); });
+            n = tls_io([&] { return SSL_read(ssl, bytes + used, static_cast<int>(remaining)); });
         else {
             do {
                 n = recv(fd, bytes + used, sizeof(bytes) - used, 0);
@@ -4580,7 +4598,7 @@ TEST(grpc_proxy, tls_client_init_retries_handshake_eintr) {
     action.sa_handler = grpc_test_signal_handler;
     sigemptyset(&action.sa_mask);
     action.sa_flags = 0;
-    grpc_test_signal_count = 0;
+    grpc_test_signal_seen = 0;
     REQUIRE(sigaction(SIGUSR1, &action, &old_action) == 0);
 
     pthread_t client_thread{};
@@ -4611,7 +4629,7 @@ TEST(grpc_proxy, tls_client_init_retries_handshake_eintr) {
     const u8 release = 1;
     CHECK_EQ(write(server.handshake_gate[1], &release, 1), 1);
     pthread_join(client_thread, nullptr);
-    CHECK_GT(grpc_test_signal_count, 0);
+    CHECK_GT(grpc_test_signal_seen, 0);
     CHECK(call.initialized.load(std::memory_order_acquire));
     sigaction(SIGUSR1, &old_action, nullptr);
 }

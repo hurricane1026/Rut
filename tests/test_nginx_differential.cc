@@ -1414,7 +1414,7 @@ static bool poll_child(Child& child) {
 }
 
 static bool wait_child(Child& child, int timeout_ms) {
-    for (int elapsed = 0; elapsed < timeout_ms; elapsed += 20) {
+    for (int64_t elapsed = 0; elapsed < timeout_ms; elapsed += 20) {
         if (poll_child(child)) return true;
         usleep(20'000);
     }
@@ -2668,10 +2668,12 @@ static bool run_docker_info_preflight_self_check(std::string& error,
                                       &high_fd_closed) ||
         (can_create_inherited_high_fd && !high_fd_closed) || fd_limited_opened <= 0 ||
         !proc_fd_snapshot_matches_complete_entries(fd_limited_proc) ||
-        fd_limited_proc.fd_scan_entries != static_cast<size_t>(fd_limited_opened + 6) ||
+        fd_limited_proc.fd_scan_entries !=
+            static_cast<size_t>(static_cast<int64_t>(fd_limited_opened) + 6) ||
         fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit ||
         fd_limited_proc.fd_output_truncated !=
-            (static_cast<size_t>(fd_limited_opened + 4) > kDockerProcSnapshotFdLimit) ||
+            (static_cast<size_t>(static_cast<int64_t>(fd_limited_opened) + 4) >
+             kDockerProcSnapshotFdLimit) ||
         (fd_limited_proc.fd_output_truncated && !fd_limited_proc.truncated)) {
         error = "complete proc fd output/lowest-fd/high-inherited-fd control failed";
         cleanup();
@@ -2788,13 +2790,15 @@ static bool run_docker_info_preflight_self_check(std::string& error,
     int low_limit_opened = 0;
     if (!snapshot_fd_limit_self_check(low_limit_proc, 96, low_limit_opened, 8) ||
         low_limit_opened <= 0 || !proc_fd_snapshot_matches_complete_entries(low_limit_proc) ||
-        low_limit_proc.fd_scan_entries != static_cast<size_t>(low_limit_opened + 6) ||
+        low_limit_proc.fd_scan_entries !=
+            static_cast<size_t>(static_cast<int64_t>(low_limit_opened) + 6) ||
         low_limit_proc.fd_scan_entries >= kDockerProcSnapshotDirEntryLimit) {
         error = "low-RLIMIT proc fd control did not complete with a bounded sorted result";
         cleanup();
         return false;
     }
-    if (low_limit_proc.fd_count != static_cast<size_t>(low_limit_opened + 4)) {
+    if (low_limit_proc.fd_count !=
+        static_cast<size_t>(static_cast<int64_t>(low_limit_opened) + 4)) {
         error = "low-RLIMIT proc fd control did not retain its complete descriptor set";
         cleanup();
         return false;
@@ -3679,12 +3683,12 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
                 const unsigned char payload[3] = {1,
                                                   static_cast<unsigned char>(port >> 8),
                                                   static_cast<unsigned char>(port & 0xff)};
-                ssize_t written = 0;
-                while (written < static_cast<ssize_t>(sizeof(payload))) {
+                size_t written = 0;
+                while (written < sizeof(payload)) {
                     const ssize_t n =
                         write(ready_pipe[1], payload + written, sizeof(payload) - written);
                     if (n <= 0) _exit(48);
-                    written += n;
+                    written += static_cast<size_t>(n);
                 }
                 for (;;) pause();
             },
@@ -3692,9 +3696,9 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     }
     close(ready_pipe[1]);
     unsigned char ready[3] = {};
-    ssize_t received = 0;
+    size_t received = 0;
     const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (received < static_cast<ssize_t>(sizeof(ready))) {
+    while (received < sizeof(ready)) {
         const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       ready_deadline - std::chrono::steady_clock::now())
                                       .count();
@@ -3703,14 +3707,14 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
         if (poll(&ready_poll, 1, static_cast<int>(remaining_ms)) <= 0) break;
         const ssize_t n = read(ready_pipe[0], ready + received, sizeof(ready) - received);
         if (n <= 0) break;
-        received += n;
+        received += static_cast<size_t>(n);
     }
     close(ready_pipe[0]);
 
     Child child;
     child.pid = control;
     bool ok = true;
-    if (received != static_cast<ssize_t>(sizeof(ready)) || ready[0] != 1) {
+    if (received != sizeof(ready) || ready[0] != 1) {
         error = "stalling control did not reach readiness";
         ok = false;
     }
@@ -28097,7 +28101,12 @@ struct RutIoUringGateRelease {
 static bool wait_for_downstream_gate_hook(rut_downstream_publication_gate& gate,
                                           int timeout_ms,
                                           std::string& error) {
-    const int64_t deadline = rut_downstream_gate_now_ms() + timeout_ms;
+    const int64_t start = rut_downstream_gate_now_ms();
+    int64_t deadline;
+    if (start < 0 || __builtin_add_overflow(start, timeout_ms, &deadline)) {
+        error = "gate startup deadline exceeds clock range";
+        return false;
+    }
     while (rut_downstream_gate_now_ms() < deadline) {
         if (rut_downstream_gate_load(&gate.state) == RUT_DOWNSTREAM_GATE_FAILED) {
             error = "preload hook reported startup failure " +
@@ -28897,7 +28906,12 @@ static bool run_nginx_coalesced_ingress_gate_evidence(u16 frontend_port,
 static bool wait_for_rut_iouring_gate_hook(rut_iouring_gate& gate,
                                            int timeout_ms,
                                            std::string& error) {
-    const int64_t deadline = rut_downstream_gate_now_ms() + timeout_ms;
+    const int64_t start = rut_downstream_gate_now_ms();
+    int64_t deadline;
+    if (start < 0 || __builtin_add_overflow(start, timeout_ms, &deadline)) {
+        error = "gate startup deadline exceeds clock range";
+        return false;
+    }
     while (rut_downstream_gate_now_ms() < deadline) {
         if (rut_downstream_gate_load(&gate.state) == RUT_DOWNSTREAM_GATE_FAILED) {
             error =
@@ -50220,9 +50234,9 @@ static bool capture_generated_exact_loopback_action_side(
         const u32 root_line = exact_first ? 4u : 3u;
         const uintptr_t source_base = reinterpret_cast<uintptr_t>(borrowed_fragment.data());
         const auto line_of = [&](size_t offset) {
-            return static_cast<u32>(1u + std::count(borrowed_fragment.begin(),
-                                                    borrowed_fragment.begin() + offset,
-                                                    '\n'));
+            const auto preceding =
+                std::count(borrowed_fragment.begin(), borrowed_fragment.begin() + offset, '\n');
+            return static_cast<u32>(static_cast<size_t>(preceding) + 1u);
         };
         const auto col_of = [&](size_t offset) {
             const size_t line_start =
@@ -59773,7 +59787,10 @@ static bool run_proxy_hide_header_generated_observation_self_checks(
             return false;
     }
     candidate = baseline;
-    candidate.child_pid++;
+    if (__builtin_add_overflow(candidate.child_pid, 1, &candidate.child_pid)) {
+        error = "child PID mutation exceeds fixture range";
+        return false;
+    }
     if (!rejects(candidate, "child_pid", candidate.child_pid != baseline.child_pid, "child PID"))
         return false;
     candidate = baseline;
@@ -60428,8 +60445,9 @@ static bool run_proxy_hide_header_final_self_checks(
         return false;
     candidate = baseline;
     u16 unused_port = 9999u;
-    while (std::find(std::begin(baseline.ports), std::end(baseline.ports), unused_port) !=
-           std::end(baseline.ports))
+    while (unused_port >= 1024u &&
+           std::find(std::begin(baseline.ports), std::end(baseline.ports), unused_port) !=
+               std::end(baseline.ports))
         --unused_port;
     if (unused_port < 1024u || unused_port == baseline.ports[4]) {
         error = "#373 final port mutation fixture lacked a unique four-digit endpoint";
