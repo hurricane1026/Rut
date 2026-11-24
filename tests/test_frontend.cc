@@ -49739,11 +49739,12 @@ TEST(frontend, parse_tuple_destructuring_let) {
     CHECK(let_stmt.tuple_let_names[1].eq(lit("tag")));
     CHECK(let_stmt.name.len == 0);
 
-    // Nested bodies and non-route statements keep single-name lets.
+    // Nested bodies other than static for-loop bodies keep single-name lets;
+    // the loop form is covered by parse_tuple_destructuring_in_for_loop.
     const char* outside_route[] = {
         "func f() -> i32 { let (a, b) = (1, 2) return a }\n"
         "route GET \"/x\" { return 200 }\n",
-        "route GET \"/x\" { for n in [1] { let (a, b) = (1, 2) } return 200 }\n",
+        "route GET \"/x\" { if true { let (a, b) = (1, 2) return 200 } else { return 201 } }\n",
     };
     for (const char* src : outside_route) {
         auto bad_tokens = lex(lit(src));
@@ -49754,6 +49755,79 @@ TEST(frontend, parse_tuple_destructuring_let) {
     auto annotated = lex(lit("route GET \"/x\" { let (a, b): (i32, i32) = (1, 2) return 200 }\n"));
     REQUIRE(annotated);
     CHECK_FALSE(parse_file_heap(annotated.value()).has_value());
+}
+
+TEST(frontend, parse_tuple_destructuring_in_for_loop) {
+    const auto source =
+        lit("route GET \"/x\" { for pair in [(200, 1)] { let (code, n) = pair "
+            "guard code == 200 else { return 400 } } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE(route.statements[0] != nullptr);
+    const auto& for_stmt = *route.statements[0];
+    REQUIRE_EQ(static_cast<u8>(for_stmt.kind), static_cast<u8>(AstStmtKind::For));
+    REQUIRE(for_stmt.then_stmt != nullptr);
+    const auto& body = *for_stmt.then_stmt;
+    REQUIRE_EQ(static_cast<u8>(body.kind), static_cast<u8>(AstStmtKind::Block));
+    REQUIRE(body.block_stmts.len != 0);
+    REQUIRE(body.block_stmts[0] != nullptr);
+    CHECK_EQ(body.block_stmts[0]->tuple_let_count, 2u);
+    CHECK(body.block_stmts[0]->tuple_let_names[0].eq(lit("code")));
+    CHECK(body.block_stmts[0]->tuple_let_names[1].eq(lit("n")));
+}
+
+TEST(frontend, analyze_tuple_destructuring_in_for_loop) {
+    const char* sources[] = {
+        "route GET \"/x\" { for pair in [(200, 1), (204, 2)] { let (code, n) = pair "
+        "guard code != 204 else { return 401 } guard n > 0 else { return 402 } } "
+        "return 200 }\n",
+        "route GET \"/x\" { for n in [1] { let (code, tag) = (200, \"ok\") "
+        "guard code == 200 else { return 403 } } return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "loop destructuring source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, analyze_rejects_invalid_loop_tuple_destructuring) {
+    struct Case {
+        const char* src;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {"route GET \"/x\" { for n in [1] { let (a, b, c) = (1, 2) } return 200 }\n",
+         "tuple destructuring arity does not match the tuple value"},
+        {"route GET \"/x\" { for n in [1] { let (a, a) = (1, 2) } return 200 }\n", nullptr},
+        {"route GET \"/x\" { for n in [1] { let (a, b) = 1 } return 200 }\n",
+         "tuple destructuring requires a tuple value"},
+        // `nil` has no tuple type to destructure.
+        {"route GET \"/x\" { for n in [1] { let (a, b) = nil } return 200 }\n", nullptr},
+    };
+    for (const auto& item : cases) {
+        auto lexed = lex(lit(item.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        if (item.detail != nullptr) CHECK(hir.error().detail.eq(lit(item.detail)));
+    }
 }
 
 TEST(frontend, analyze_tuple_destructuring_let) {

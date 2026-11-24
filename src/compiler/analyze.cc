@@ -20808,6 +20808,114 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.expr.span,
                     lit_str("static for-loop body locals cannot be wait or array literals"));
+            if (bstmt.tuple_let_count != 0) {
+                // `let (a, b) = pair` inside a loop body: each name becomes a
+                // slot local. The substitution model re-evaluates the tuple at
+                // each use, so the initializer must stay repeatable.
+                auto init = analyze_expr(
+                    bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
+                if (!init) return core::make_unexpected(init.error());
+                if (init->type != HirTypeKind::Tuple)
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          bstmt.expr.span,
+                                          lit_str("tuple destructuring requires a tuple value"));
+                if (init->may_nil || init->may_error)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        bstmt.expr.span,
+                        lit_str("tuple destructuring requires a narrowed tuple value; guard "
+                                "the optional or fallible tuple first"));
+                if (bstmt.tuple_let_count != init->tuple_len)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        bstmt.span,
+                        lit_str("tuple destructuring arity does not match the tuple value"));
+                if (!static_for_init_repeatable(init.value()))
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        bstmt.expr.span,
+                        lit_str("static for-loop body bindings must be non-allocating; bind the "
+                                "value before the loop"));
+                for (u32 ni = 0; ni < bstmt.tuple_let_count; ni++) {
+                    const Str name = bstmt.tuple_let_names[ni];
+                    if (name.len == 0)
+                        return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                    for (u32 li = 0; li < route->locals.len; li++) {
+                        if (route->locals[li].name.len != 0 && route->locals[li].name.eq(name))
+                            return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                    }
+                    for (u32 nj = 0; nj < ni; nj++) {
+                        if (bstmt.tuple_let_names[nj].eq(name))
+                            return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
+                    }
+                }
+                if (!route->exprs.push(init.value()))
+                    return frontend_error(FrontendError::OutOfMemory, bstmt.span);
+                const HirExpr* tuple_value = &route->exprs[route->exprs.len - 1];
+                const HirTypeShape* tuple_shape = init->shape_index < mod.type_shapes.len
+                                                      ? &mod.type_shapes[init->shape_index]
+                                                      : nullptr;
+                for (u32 ni = 0; ni < bstmt.tuple_let_count; ni++) {
+                    u32 elem_shape_index = 0xffffffffu;
+                    if (tuple_shape != nullptr && tuple_shape->type == HirTypeKind::Tuple)
+                        elem_shape_index = tuple_shape->tuple_elem_shape_indices[ni];
+                    const HirTypeShape* elem_shape = elem_shape_index < mod.type_shapes.len
+                                                         ? &mod.type_shapes[elem_shape_index]
+                                                         : nullptr;
+                    HirExpr slot{};
+                    slot.kind = HirExprKind::TupleSlot;
+                    slot.type = elem_shape != nullptr ? elem_shape->type : init->tuple_types[ni];
+                    if (slot.type == HirTypeKind::Generic) {
+                        slot.generic_index = elem_shape != nullptr ? elem_shape->generic_index
+                                                                   : init->tuple_struct_indices[ni];
+                    } else if (slot.type == HirTypeKind::Variant) {
+                        slot.variant_index = elem_shape != nullptr
+                                                 ? elem_shape->variant_index
+                                                 : init->tuple_variant_indices[ni];
+                    } else if (slot.type == HirTypeKind::Struct) {
+                        slot.struct_index = elem_shape != nullptr ? elem_shape->struct_index
+                                                                  : init->tuple_struct_indices[ni];
+                    }
+                    auto slot_shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                                            slot.type,
+                                                            slot.generic_index,
+                                                            slot.variant_index,
+                                                            slot.struct_index,
+                                                            slot.tuple_len,
+                                                            slot.tuple_types,
+                                                            slot.tuple_variant_indices,
+                                                            slot.tuple_struct_indices,
+                                                            bstmt.span);
+                    if (!slot_shape) return core::make_unexpected(slot_shape.error());
+                    slot.shape_index = slot_shape.value();
+                    slot.int_value = static_cast<i32>(ni);
+                    slot.lhs = const_cast<HirExpr*>(tuple_value);
+                    slot.span = bstmt.span;
+                    HirLocal local{};
+                    local.span = bstmt.span;
+                    local.name = bstmt.tuple_let_names[ni];
+                    local.ref_index =
+                        next_local_ref_index(route, route->locals.data, route->locals.len);
+                    local.type = slot.type;
+                    local.generic_index = slot.generic_index;
+                    local.variant_index = slot.variant_index;
+                    local.struct_index = slot.struct_index;
+                    local.shape_index = slot.shape_index;
+                    local.init = slot;
+                    const u32 local_index = loop.body.locals.len;
+                    if (!route->locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                    if (!loop.body.locals.push(local))
+                        return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                    HirForLoopBody::Step local_step{};
+                    local_step.kind = HirForLoopBody::Step::Kind::Let;
+                    local_step.index = local_index;
+                    local_step.span = bstmt.span;
+                    if (!loop.body.steps.push(local_step))
+                        return frontend_error(FrontendError::TooManyItems, bstmt.span);
+                }
+                continue;
+            }
             for (u32 li = 0; li < route->locals.len; li++) {
                 if (route->locals[li].name.len != 0 && route->locals[li].name.eq(bstmt.name))
                     return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);

@@ -191,9 +191,10 @@ without presenting lossy or per-shard state as exact shared state.
   element through a hidden single-evaluation carrier local, so a runtime tuple
   is materialized once rather than at each slot use. Arity, duplicate names,
   existing-local collisions, non-tuple initializers, and nullable/fallible
-  receivers are rejected with dedicated diagnostics. Nested bodies (loops,
-  guard/arm blocks, helper bodies) and type annotations keep single-name `let`
-  for now.
+  receivers are rejected with dedicated diagnostics. Static for-loop bodies
+  support destructuring too (each name is a body slot; the initializer must stay
+  repeatable). Guard/arm blocks, helper bodies, and type annotations still keep
+  single-name `let`.
 - [x] Static route-local `for` loops are enabled end to end. The parser accepts
   `for name in <static array> { ... }` (still rejecting `inline for`), analyze
   builds the existing `HirForLoop` subset, and MIR unrolls literals or
