@@ -11,7 +11,7 @@
 
 namespace rut {
 
-enum class IntegerRangeError { OutOfRange };
+enum class IntegerRangeError : u8 { OutOfRange };
 
 // Tag identifies the unit even when two quantities have identical limits.
 template <typename Tag, i64 Minimum, i64 Maximum>

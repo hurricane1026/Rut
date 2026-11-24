@@ -160,9 +160,9 @@ bool parse_http_date(Str value, u64& seconds) {
                    static_cast<i64>((static_cast<i64>(static_cast<__int128_t>(days) + 4) % 7)) * 3,
                3))
         return false;
-    const i64 seconds_wide =
-        static_cast<i64>(static_cast<__int128_t>(days) * 86400 + static_cast<i64>(hour) * 3600 +
-                         static_cast<i64>(minute) * 60 + static_cast<i64>(second));
+    const i64 seconds_wide = static_cast<i64>(
+        static_cast<__int128_t>(days) * 86400 + static_cast<__int128_t>(hour) * 3600 +
+        static_cast<__int128_t>(minute) * 60 + static_cast<i64>(second));
     seconds = static_cast<u64>(seconds_wide);
     return true;
 }
