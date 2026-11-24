@@ -49424,8 +49424,9 @@ TEST(frontend, integer_literal_lexemes_preserve_spans_and_swift_separators) {
         CHECK_EQ(token.line, 1u);
         CHECK_EQ(token.col, token.start + 1);
     }
-    for (const char* text : {"0b",
-                             "0o",
+    // `0b` is the zero-byte literal now, so a bare binary prefix is covered by
+    // frontend.parse_zero_byte_literal_and_radix_prefixes instead.
+    for (const char* text : {"0o",
                              "0x",
                              "0b_1",
                              "0o_7",
@@ -49835,6 +49836,59 @@ TEST(frontend, analyze_rejects_invalid_tuple_destructuring) {
         REQUIRE_FALSE(hir);
         CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
         if (item.detail != nullptr) CHECK(hir.error().detail.eq(lit(item.detail)));
+    }
+}
+
+TEST(frontend, parse_zero_byte_literal_and_radix_prefixes) {
+    // `0b` is the zero-byte literal; binary literals keep their prefix.
+    const auto source =
+        lit("route GET \"/x\" { let zero = 0b let five = 0b101 "
+            "guard zero < five else { return 400 } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 4u);
+    REQUIRE_EQ(static_cast<u8>(route.statements[0]->expr.kind),
+               static_cast<u8>(AstExprKind::ByteSizeLit));
+    CHECK_EQ(route.statements[0]->expr.int_value, 0);
+    REQUIRE_EQ(static_cast<u8>(route.statements[1]->expr.kind),
+               static_cast<u8>(AstExprKind::IntLit));
+    CHECK_EQ(route.statements[1]->expr.int_value, 5);
+
+    // A binary digit or separator after `0b` is still a radix prefix.
+    const char* binary_errors[] = {
+        "route GET \"/x\" { let a = 0b_1 guard a > 0 else { return 400 } return 200 }\n",
+        "route GET \"/x\" { let a = 0b2 guard a > 0 else { return 400 } return 200 }\n",
+    };
+    for (const char* src : binary_errors) {
+        auto bad = lex(lit(src));
+        REQUIRE_FALSE(bad.has_value());
+        CHECK_EQ(bad.error().code, FrontendError::InvalidInteger);
+    }
+}
+
+TEST(frontend, analyze_const_byte_size_comparisons) {
+    const char* sources[] = {
+        "route GET \"/x\" { if const 1kb < 2kb { return 200 } else { return 400 } }\n",
+        "route GET \"/x\" { let limit = 4kb if const limit > 1kb { return 200 } "
+        "else { return 400 } }\n",
+        "route GET \"/x\" { if const 1kb == 1024b { return 200 } else { return 400 } }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
     }
 }
 

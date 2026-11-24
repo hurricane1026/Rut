@@ -193,7 +193,14 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
         if (is_digit(c)) {
             // Swift integer literals require a digit immediately after a radix
             // prefix; subsequent digits may be separated or followed by `_`.
-            if (c == '0' && pos + 1 < source.len &&
+            // `0b` with no binary digit and no identifier continuation is the
+            // zero-byte literal: lex `0` as an integer and leave `b` as the
+            // adjacent unit identifier. `0b1`/`0b_1`/`0b2` keep their binary
+            // prefix diagnostics.
+            const bool zero_byte_suffix =
+                c == '0' && pos + 1 < source.len && source.ptr[pos + 1] == 'b' &&
+                (pos + 2 >= source.len || !is_ident_continue(source.ptr[pos + 2]));
+            if (!zero_byte_suffix && c == '0' && pos + 1 < source.len &&
                 (source.ptr[pos + 1] == 'b' || source.ptr[pos + 1] == 'o' ||
                  source.ptr[pos + 1] == 'x')) {
                 const char kPrefix = source.ptr[pos + 1];
