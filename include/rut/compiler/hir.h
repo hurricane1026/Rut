@@ -1080,8 +1080,21 @@ struct HirControl {
 };
 
 struct HirForLoopIf {
+    // How a branch leaves the loop body: a route terminator, or static loop
+    // control (`break` / `continue`). Every branch must be one of these, so the
+    // step always ends its iteration; only `Term` branches lower to their own
+    // block, while loop control jumps to the unrolled loop-exit or
+    // next-iteration block.
+    enum class BranchKind : u8 {
+        Term,
+        Break,
+        Continue,
+    };
+
     Span span{};
     HirExpr cond{};
+    BranchKind then_kind = BranchKind::Term;
+    BranchKind else_kind = BranchKind::Term;
     HirTerminator then_term{};
     HirTerminator else_term{};
 };

@@ -180,10 +180,10 @@ without presenting lossy or per-shard state as exact shared state.
   empty arrays, route-level guard ordering, JIT execution, and the documented
   rejects (`wait`, non-array/dynamic/field iterators, shadowing, post-terminator
   statements, `if let`, helper bodies). `break`/`continue` are accepted as
-  direct loop-body statements and as a `guard ... else` failure path, resolved
-  to unrolled step blocks for the innermost loop; loop-body `if`/`match` arms
-  and bodies that also contain route terminators still reject them. Runtime
-  iterables remain future work.
+  direct loop-body statements, as a `guard ... else` failure path, and as
+  loop-body `if` branches, resolved to unrolled step blocks for the innermost
+  loop; loop-body `match` arms and bodies that also contain an unconditional
+  route terminator still reject them. Runtime iterables remain future work.
 
 - [x] Reject a fifth stacked `@rateLimit` decorator with a capacity diagnostic at
   that decorator, instead of silently omitting the rule. Boundary regression

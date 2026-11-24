@@ -49687,11 +49687,11 @@ TEST(frontend, analyze_rejects_statements_after_direct_loop_control) {
     }
 }
 
-TEST(frontend, analyze_rejects_loop_control_inside_loop_body_arms) {
+TEST(frontend, analyze_rejects_loop_control_inside_loop_body_match_arms) {
     const char* sources[] = {
-        "route GET \"/x\" { for n in [1] { if n == 1 { break } else { return 500 } } "
-        "return 200 }\n",
         "route GET \"/x\" { for n in [1] { match n { 1 => break _ => return 500 } } "
+        "return 200 }\n",
+        "route GET \"/x\" { for n in [1] { match n { 1 => continue _ => return 500 } } "
         "return 200 }\n",
     };
     for (const char* src : sources) {
@@ -49706,6 +49706,61 @@ TEST(frontend, analyze_rejects_loop_control_inside_loop_body_arms) {
             lit("break/continue inside a static for-loop body if or match arm is not supported "
                 "yet; use them as direct loop-body statements")));
     }
+}
+
+TEST(frontend, mir_unrolls_for_loop_conditional_loop_control) {
+    const char* sources[] = {
+        // Both branches loop-control: iteration ends without ending the route.
+        "route GET \"/x\" { for n in [1, 2, 3] { if n == 2 { break } else { continue } } "
+        "return 200 }\n",
+        // A route terminator branch keeps its own block.
+        "route GET \"/x\" { for n in [1, 2, 3] { if n == 2 { return 201 } "
+        "else { continue } } return 200 }\n",
+        "route GET \"/x\" { for n in [1, 2, 3] { if n == 1 { continue } "
+        "else { return 202 } } return 200 }\n",
+        // A preceding continue guard keeps iterations reachable past a mixed if.
+        "route GET \"/x\" { for n in [0, 1, 2] { guard n != 0 else { continue } "
+        "if n == 1 { break } else { return 203 } } return 200 }\n",
+        // Nested loops keep binding loop control to the innermost loop.
+        "route GET \"/x\" { for a in [1, 2] { for b in [1, 2] { "
+        "if b == 1 { break } else { continue } } guard a != 2 else { return 204 } } "
+        "return 200 }\n",
+        // All-terminator ifs keep the existing route-terminating shape.
+        "route GET \"/x\" { for n in [1] { if n == 1 { return 205 } else { return 206 } } "
+        "return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "conditional loop-control source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, analyze_rejects_multi_statement_loop_body_if_branch) {
+    // A branch body must itself be one iteration-ending statement.
+    const auto source =
+        lit("route GET \"/x\" { for n in [1] { if n == 1 { let m = 1 break } "
+            "else { return 500 } } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE_FALSE(hir);
+    CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    CHECK(hir.error().detail.eq(
+        lit("break/continue inside a static for-loop body if or match arm is not supported "
+            "yet; use them as direct loop-body statements")));
 }
 
 TEST(frontend, analyze_rejects_loop_control_mixed_with_route_terminators) {

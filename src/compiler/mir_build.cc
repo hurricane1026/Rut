@@ -2712,6 +2712,19 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             if (!ctx_set) return core::make_unexpected(ctx_set.error());
                             if (!steps.push(step))
                                 return frontend_error(FrontendError::TooManyItems, fl.span);
+                            const auto& body_if = fl.body.ifs[body_step.index];
+                            const bool all_term =
+                                body_if.then_kind == HirForLoopIf::BranchKind::Term &&
+                                body_if.else_kind == HirForLoopIf::BranchKind::Term;
+                            if (!all_term) {
+                                // A continue branch keeps later iterations
+                                // reachable; without one only an earlier
+                                // continue guard can bypass this exit.
+                                const bool has_continue =
+                                    body_if.then_kind == HirForLoopIf::BranchKind::Continue ||
+                                    body_if.else_kind == HirForLoopIf::BranchKind::Continue;
+                                if (!has_continue) loop_done = !continue_can_bypass_break;
+                            }
                             continue;
                         }
                         if (body_step.kind == HirForLoopBody::Step::Kind::Match) {
@@ -2805,8 +2818,11 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             bool has_terminating_step = false;
             u32 terminating_step_index = 0xffffffffu;
             for (u32 si = 0; si < steps.len; si++) {
-                if (steps[si].kind == RouteStep::Kind::Term ||
-                    steps[si].kind == RouteStep::Kind::If ||
+                const bool all_term_if =
+                    steps[si].kind == RouteStep::Kind::If &&
+                    steps[si].body_if->then_kind == HirForLoopIf::BranchKind::Term &&
+                    steps[si].body_if->else_kind == HirForLoopIf::BranchKind::Term;
+                if (steps[si].kind == RouteStep::Kind::Term || all_term_if ||
                     steps[si].kind == RouteStep::Kind::Match) {
                     step_count = si + 1;
                     has_terminating_step = true;
@@ -2975,6 +2991,21 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 const u32 target = rel == 0xffffffffu ? step_count : top_block_start[top] + rel;
                 return target >= step_count ? terminal_index : target;
             };
+            // Route-terminating branches of a conditional loop-body if keep
+            // their own block; break/continue branches jump to loop targets.
+            u32 cond_if_then_block[kMaxForRouteSteps]{};
+            u32 cond_if_else_block[kMaxForRouteSteps]{};
+            for (u32 si = 0; si < step_count; si++) {
+                if (steps[si].kind != RouteStep::Kind::If) continue;
+                const auto& body_if = *steps[si].body_if;
+                const bool all_term = body_if.then_kind == HirForLoopIf::BranchKind::Term &&
+                                      body_if.else_kind == HirForLoopIf::BranchKind::Term;
+                if (all_term) continue;
+                if (body_if.then_kind == HirForLoopIf::BranchKind::Term)
+                    cond_if_then_block[si] = reserve_blocks(&fail_cursor, 1, steps[si].span);
+                if (body_if.else_kind == HirForLoopIf::BranchKind::Term)
+                    cond_if_else_block[si] = reserve_blocks(&fail_cursor, 1, steps[si].span);
+            }
             for (u32 si = 0; si < step_count; si++) {
                 if (steps[si].kind != RouteStep::Kind::Guard) continue;
                 const auto fail_kind = steps[si].guard->fail_kind;
@@ -3074,13 +3105,31 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     continue;
                 }
                 if (steps[si].kind == RouteStep::Kind::If) {
+                    const auto& body_if = *steps[si].body_if;
                     block.term.kind = MirTerminatorKind::Branch;
-                    block.term.span = steps[si].body_if->span;
-                    auto cond = mir_value(steps[si].body_if->cond, module, &fn, step_ctx);
+                    block.term.span = body_if.span;
+                    auto cond = mir_value(body_if.cond, module, &fn, step_ctx);
                     if (!cond) return core::make_unexpected(cond.error());
                     block.term.cond = cond.value();
-                    block.term.then_block = terminal_index;
-                    block.term.else_block = terminal_index + 1;
+                    const bool all_term = body_if.then_kind == HirForLoopIf::BranchKind::Term &&
+                                          body_if.else_kind == HirForLoopIf::BranchKind::Term;
+                    if (all_term) {
+                        block.term.then_block = terminal_index;
+                        block.term.else_block = terminal_index + 1;
+                    } else {
+                        block.term.then_block =
+                            body_if.then_kind == HirForLoopIf::BranchKind::Term
+                                ? cond_if_then_block[si]
+                                : loop_control_target(
+                                      steps[si],
+                                      body_if.then_kind == HirForLoopIf::BranchKind::Break);
+                        block.term.else_block =
+                            body_if.else_kind == HirForLoopIf::BranchKind::Term
+                                ? cond_if_else_block[si]
+                                : loop_control_target(
+                                      steps[si],
+                                      body_if.else_kind == HirForLoopIf::BranchKind::Break);
+                    }
                     if (!fn.blocks.push(block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     continue;
@@ -3472,6 +3521,31 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             }
                         }
                     }
+                }
+            }
+
+            // Terminator blocks for conditional loop-body ifs, in the same
+            // order their indices were reserved above.
+            for (u32 si = 0; si < step_count; si++) {
+                if (steps[si].kind != RouteStep::Kind::If) continue;
+                const auto& body_if = *steps[si].body_if;
+                const bool all_term = body_if.then_kind == HirForLoopIf::BranchKind::Term &&
+                                      body_if.else_kind == HirForLoopIf::BranchKind::Term;
+                if (all_term) continue;
+                const ForLoopCtx* step_ctx = route_step_ctx(steps[si]);
+                if (body_if.then_kind == HirForLoopIf::BranchKind::Term) {
+                    MirBlock then_block{};
+                    then_block.label = then_label();
+                    set_term_from_hir(&then_block.term, body_if.then_term, step_ctx);
+                    if (!fn.blocks.push(then_block))
+                        return frontend_error(FrontendError::TooManyItems, fn.span);
+                }
+                if (body_if.else_kind == HirForLoopIf::BranchKind::Term) {
+                    MirBlock else_block{};
+                    else_block.label = else_label();
+                    set_term_from_hir(&else_block.term, body_if.else_term, step_ctx);
+                    if (!fn.blocks.push(else_block))
+                        return frontend_error(FrontendError::TooManyItems, fn.span);
                 }
             }
 
