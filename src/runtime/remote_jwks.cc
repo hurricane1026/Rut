@@ -836,7 +836,8 @@ bool JwksFetch::advance_dns_stream(u64 now) {
                 return fail();
             }
             if (sent == 0) return fail();
-            dns_out_sent_ = static_cast<u32>(static_cast<i64>(dns_out_sent_) + sent);
+            dns_out_sent_ = static_cast<u32>(static_cast<i64>(dns_out_sent_) +
+                                             static_cast<i64>(static_cast<u32>(sent)));
             if (dns_out_sent_ == dns_out_len_) dns_step_ = DnsStep::ReadLength;
             continue;
         }
@@ -852,7 +853,8 @@ bool JwksFetch::advance_dns_stream(u64 now) {
                 return fail();
             }
             if (received == 0) return fail();
-            dns_length_have_ = static_cast<u32>(static_cast<i64>(dns_length_have_) + received);
+            dns_length_have_ = static_cast<u32>(static_cast<i64>(dns_length_have_) +
+                                                static_cast<i64>(static_cast<u32>(received)));
             if (dns_length_have_ != 2) continue;
             const u32 kExpected =
                 (static_cast<u32>(dns_length_[0]) << 8) | static_cast<u32>(dns_length_[1]);
@@ -871,7 +873,8 @@ bool JwksFetch::advance_dns_stream(u64 now) {
             return fail();
         }
         if (received == 0) return fail();
-        dns_in_len_ = static_cast<u32>(static_cast<i64>(dns_in_len_) + received);
+        dns_in_len_ = static_cast<u32>(static_cast<i64>(dns_in_len_) +
+                                       static_cast<i64>(static_cast<u32>(received)));
         if (dns_in_len_ != dns_in_expected_) continue;
         JwksDnsAddresses result;
         if (!jwks_dns_answer({dns_in_, dns_in_len_},
