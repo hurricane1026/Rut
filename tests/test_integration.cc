@@ -103,6 +103,20 @@ struct TestConn {
     }
 };
 
+static i64 test_elapsed_ns(const timespec& before, const timespec& after) {
+    i64 seconds;
+    i64 nanoseconds;
+    i64 elapsed;
+    if (__builtin_sub_overflow(after.tv_sec, before.tv_sec, &seconds) ||
+        __builtin_sub_overflow(after.tv_nsec, before.tv_nsec, &nanoseconds) ||
+        __builtin_mul_overflow(seconds, 1'000'000'000, &elapsed) ||
+        __builtin_add_overflow(elapsed, nanoseconds, &elapsed)) {
+        rut::test::out("integration clock interval exceeds nanosecond range\n");
+        _exit(1);
+    }
+    return elapsed;
+}
+
 static u32 fill_socket_send_buffer(i32 fd, i32 peer);
 
 namespace {
@@ -2564,8 +2578,7 @@ TEST(throttle_e2e, downstream_paces_proxied_body) {
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     close(c);
-    const double elapsed =
-        static_cast<double>(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    const double elapsed = static_cast<double>(test_elapsed_ns(t0, t1)) / 1e9;
     CHECK(total >= 40000u);  // full body delivered
     CHECK(elapsed >= 1.5);   // paced (≈5s ideal; unthrottled would be < 0.1s)
 
@@ -5586,9 +5599,10 @@ TEST(uring, precise_response_read_timer_expires_with_exact_transport_identity) {
     CHECK_EQ(event.copy_begin, 0u);
     CHECK_EQ(event.copy_end, 0u);
 
-    const i64 elapsed_ns = static_cast<i64>(after.tv_sec - before.tv_sec) * 1'000'000'000LL +
-                           static_cast<i64>(after.tv_nsec - before.tv_nsec);
-    const u64 elapsed_ms = static_cast<u64>((elapsed_ns + 999'999) / 1'000'000);
+    const i64 elapsed_ns = test_elapsed_ns(before, after);
+    REQUIRE_GE(elapsed_ns, 0);
+    const u64 elapsed_ms = static_cast<u64>(elapsed_ns) / 1'000'000u +
+                           (static_cast<u64>(elapsed_ns) % 1'000'000u != 0);
     CHECK_GE(elapsed_ms, 30u);
     CHECK_LT(elapsed_ms, 500u);
     REQUIRE(tc.conn.consume_response_read_timer_completion(event.non_upstream_generation));
@@ -15465,8 +15479,7 @@ TEST(route, wait_ms_precision_sub_second) {
     // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
     // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
     // handle it.
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns = test_elapsed_ns(t0, t1);
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -15553,8 +15566,7 @@ TEST(route, let_across_wait_drives_return_real_socket) {
     i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns = test_elapsed_ns(t0, t1);
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -15646,8 +15658,7 @@ TEST(route, wait_longer_than_keepalive_not_resumed_by_wheel) {
     // Compute delta in signed nanoseconds so tv_nsec underflow (t1.tv_nsec
     // < t0.tv_nsec) doesn't wrap to a huge u64 when the tv_sec carry should
     // handle it.
-    i64 elapsed_ns = static_cast<i64>(t1.tv_sec - t0.tv_sec) * 1'000'000'000LL +
-                     (static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec));
+    i64 elapsed_ns = test_elapsed_ns(t0, t1);
     i64 elapsed_ms = elapsed_ns / 1'000'000LL;
 
     CHECK_GT(n, 0);
@@ -35849,7 +35860,7 @@ TEST(route, failure_policy_suppress_body_connect_error_serializes_head_bundle) {
                 close(client);
                 return false;
             }
-            for (u32 i = 0; i < 29; i++) normalized[(date - normalized) + 6 + i] = 'X';
+            for (u32 i = 0; i < 29; i++) (date + 6)[i] = 'X';
             if (response_len != sizeof(kExpected) - 1 ||
                 memcmp(normalized, kExpected, sizeof(kExpected) - 1) != 0) {
                 fprintf(stderr,
@@ -50542,8 +50553,7 @@ TEST(route, public_ordinary_source_narrow_first_response_deadline_iouring) {
         client.fd, false, response, sizeof(response), response_len, 8000));
     struct timespec finished{};
     REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
-    const double elapsed = static_cast<double>(finished.tv_sec - started.tv_sec) +
-                           (finished.tv_nsec - started.tv_nsec) / 1e9;
+    const double elapsed = static_cast<double>(test_elapsed_ns(started, finished)) / 1e9;
     // This is the narrow first-zero-byte-response deadline.  No claim is made
     // here about nginx proxy_read_timeout or positive-progress rearming.
     CHECK_LT(elapsed, 8.0);
@@ -51040,8 +51050,7 @@ TEST(route, public_ordinary_source_get_cl0_response_deadline_reuses_downstream_i
     REQUIRE(read_fixed_response(client.fd, 20, response, sizeof(response), response_len, 8000));
     struct timespec finished{};
     REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
-    const double elapsed = static_cast<double>(finished.tv_sec - started.tv_sec) +
-                           (finished.tv_nsec - started.tv_nsec) / 1e9;
+    const double elapsed = static_cast<double>(test_elapsed_ns(started, finished)) / 1e9;
     CHECK_LT(elapsed, 8.0);
     REQUIRE(normalize_public_date(response, response_len));
     REQUIRE_EQ(response_len, static_cast<u32>(strlen(kTimeoutExpected)));
@@ -51564,8 +51573,7 @@ TEST(route, public_ordinary_source_post_cl0_response_deadline_reuses_downstream_
     REQUIRE(read_fixed_response(client.fd, 20, response, sizeof(response), response_len, 8000));
     struct timespec finished{};
     REQUIRE_EQ(clock_gettime(CLOCK_MONOTONIC, &finished), 0);
-    const double elapsed = static_cast<double>(finished.tv_sec - started.tv_sec) +
-                           (finished.tv_nsec - started.tv_nsec) / 1e9;
+    const double elapsed = static_cast<double>(test_elapsed_ns(started, finished)) / 1e9;
     CHECK_GT(elapsed, 0.9);
     CHECK_LT(elapsed, 8.0);
     REQUIRE(normalize_public_date(response, response_len));
