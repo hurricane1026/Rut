@@ -717,6 +717,8 @@ static bool hir_type_shape_satisfies_ord_constraint(const HirModule& mod,
         case HirTypeKind::I32:
         case HirTypeKind::I64:
         case HirTypeKind::Str:
+        // ByteSize is an ordered scalar; lower_rir emits a native compare.
+        case HirTypeKind::ByteSize:
             return true;
         case HirTypeKind::Tuple:
             for (u32 i = 0; i < tuple_len; i++) {
@@ -11721,6 +11723,12 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         out.bool_value = expr.bool_value;
         return out;
     }
+    if (expr.kind == AstExprKind::ByteSizeLit) {
+        out.kind = HirExprKind::ByteSizeLit;
+        out.type = HirTypeKind::ByteSize;
+        out.int_value = expr.int_value;
+        return out;
+    }
     if (expr.kind == AstExprKind::IntLit) {
         out.kind = HirExprKind::IntLit;
         // Literal auto-widening: fits i32 → I32, else I64 (the parser caps
@@ -16994,6 +17002,11 @@ static bool const_eval_expr(
         out->int_value = expr.int_value;
         return true;
     }
+    if (expr.kind == HirExprKind::ByteSizeLit) {
+        out->type = HirTypeKind::ByteSize;
+        out->int_value = expr.int_value;
+        return true;
+    }
     if (expr.kind == HirExprKind::StrLit) {
         out->type = HirTypeKind::Str;
         out->str_value = expr.str_value;
@@ -17094,7 +17107,8 @@ static bool const_eval_expr(
                 return true;
             }
             if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64 ||
-                lhs.type == HirTypeKind::Method || is_ws_enum_type(lhs.type)) {
+                lhs.type == HirTypeKind::ByteSize || lhs.type == HirTypeKind::Method ||
+                is_ws_enum_type(lhs.type)) {
                 out->bool_value = lhs.int_value == rhs.int_value;
                 return true;
             }
@@ -17109,7 +17123,8 @@ static bool const_eval_expr(
             }
             return false;
         }
-        if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64) {
+        if (lhs.type == HirTypeKind::I32 || lhs.type == HirTypeKind::I64 ||
+            lhs.type == HirTypeKind::ByteSize) {
             out->bool_value = expr.kind == HirExprKind::Lt ? (lhs.int_value < rhs.int_value)
                                                            : (lhs.int_value > rhs.int_value);
             return true;
@@ -20565,6 +20580,7 @@ static bool static_for_init_repeatable(const HirExpr& expr) {
     switch (expr.kind) {
         case HirExprKind::BoolLit:
         case HirExprKind::IntLit:
+        case HirExprKind::ByteSizeLit:
         case HirExprKind::StrLit:
         case HirExprKind::BytesLit:
         case HirExprKind::Nil:

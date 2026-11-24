@@ -172,6 +172,11 @@ without presenting lossy or per-shard state as exact shared state.
   Values are copied; raw encoding/empty-value semantics are documented, and
   explicit-wait/non-request contexts are rejected. This
   completes the repeated-query read primitive, not general arrays or iteration.
+- [x] ByteSize literals: `64b`, `16kb`, `2mb`, `1gb` parse as `ByteSize`
+  expressions (the unit must be adjacent to the digits; a spaced unit stays an
+  identifier so config kwargs keep their `<IntLit><unit>` spelling). Lowering
+  emits `ConstByteSize`, and ordered comparisons (`<`/`<=`/`>`/`>=`) accept
+  ByteSize so request body limits can be written against `req.contentLength`.
 - [x] Tuple element access: `pair.0` / `pair.1` project a tuple slot (adjacent
   decimal digits after `.`), including static-loop elements. Literal tuples
   fold to the element; non-tuple receivers and out-of-range slots are rejected

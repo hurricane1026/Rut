@@ -68,7 +68,8 @@ observation profile described below). Imported files cannot declare it.
 3.14                                    // ⏳ floating-point literals
 "text"   "\(req.path)/x"                // strings, \() interpolation (ONLY form)
 500ms  1s  5m  1h                       // Duration (1d ⏳ — lexer knows ms/s/m/h only)
-64b  1kb  16kb  1mb  1gb                // ⏳ ByteSize (no byte-size literal in lexer)
+64b  1kb  16kb  1mb  1gb  0b            // ByteSize (unit adjacent; `0b` is zero bytes,
+                                        // a binary literal still needs a digit: 0b1)
 10.0.0.0/8                              // CIDR
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)

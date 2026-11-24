@@ -1160,6 +1160,33 @@ struct Parser {
         if (cur().type == TokenType::IntLit) {
             const Token tok = cur();
             pos++;
+            // Byte-size literal: adjacent decimal `<int><b|kb|mb|gb>`. Radix
+            // amounts stay whitespace-separated (`0x10 kb` config form), so a
+            // radix token never composes with an adjacent unit identifier.
+            const bool decimal_token =
+                !(tok.text.len >= 2 && tok.text.ptr[0] == '0' &&
+                  (tok.text.ptr[1] == 'b' || tok.text.ptr[1] == 'o' || tok.text.ptr[1] == 'x'));
+            if (decimal_token && cur().type == TokenType::Ident && cur().start == tok.end) {
+                const Token& unit = cur();
+                u64 mult = 0;
+                if (unit.text.eq({"b", 1}))
+                    mult = 1;
+                else if (unit.text.eq({"kb", 2}))
+                    mult = 1024;
+                else if (unit.text.eq({"mb", 2}))
+                    mult = 1024ull * 1024;
+                else if (unit.text.eq({"gb", 2}))
+                    mult = 1024ull * 1024 * 1024;
+                if (mult != 0) {
+                    auto amount = parse_integer_literal(tok, 0x7fffffffffffffffull / mult);
+                    if (!amount) return core::make_unexpected(amount.error());
+                    pos++;  // consume the unit
+                    expr.kind = AstExprKind::ByteSizeLit;
+                    expr.int_value = static_cast<i64>(amount.value() * mult);
+                    expr.span = Span{tok.start, unit.end, tok.line, tok.col};
+                    return expr;
+                }
+            }
             // Literals accumulate to i64 (cap INT64_MAX); analyze types the
             // result I32 when it fits i32, else I64 (oversized auto-widening).
             auto parsed_value = parse_integer_literal(tok, 0x7fffffffffffffffull);

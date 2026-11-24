@@ -156,6 +156,11 @@ struct AstHeaderKV {
 enum class AstExprKind : u8 {
     BoolLit,
     IntLit,
+    // `64b` / `16kb` / `2mb` / `1gb` — byte-size literal. `int_value` holds the
+    // decoded byte count. The unit must be adjacent to the digits; a spaced
+    // unit stays an identifier (config kwargs keep their own `<IntLit><unit>`
+    // spelling).
+    ByteSizeLit,
     StrLit,
     RegexLit,
     Tuple,

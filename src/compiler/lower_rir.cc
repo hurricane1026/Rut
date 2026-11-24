@@ -1060,7 +1060,8 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
     rir::Builder& b,
     Span span,
     bool less_than) {
-    if (type == MirTypeKind::I32 || type == MirTypeKind::I64 || type == MirTypeKind::Str) {
+    if (type == MirTypeKind::I32 || type == MirTypeKind::I64 || type == MirTypeKind::Str ||
+        type == MirTypeKind::ByteSize) {
         auto op = less_than ? rir::Opcode::CmpLt : rir::Opcode::CmpGt;
         auto cmp = b.emit_cmp(op, lhs, rhs, {span.line, span.col});
         if (!cmp) return frontend_error(FrontendError::OutOfMemory, span);
@@ -1532,7 +1533,9 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         return v.value();
     }
     if (value.kind == MirValueKind::IntConst) {
-        auto v = value.type == MirTypeKind::I64
+        auto v = value.type == MirTypeKind::ByteSize
+                     ? b.emit_const_bytesize(value.int_value, {span.line, span.col})
+                 : value.type == MirTypeKind::I64
                      ? b.emit_const_i64(value.int_value, {span.line, span.col})
                      : b.emit_const_i32(static_cast<i32>(value.int_value), {span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
