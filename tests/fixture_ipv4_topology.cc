@@ -134,8 +134,24 @@ static std::string trim(std::string value) {
     return value.substr(first);
 }
 
+static std::int64_t phase_deadline_before(std::int64_t end, std::int64_t reserve) {
+    std::int64_t deadline;
+    // A positive expired deadline still constrains the command runner.
+    return __builtin_sub_overflow(end, reserve, &deadline) ? 1 : deadline;
+}
+
+template <typename T>
+static void increment_fixture_value(T& value) {
+    if (__builtin_add_overflow(value, 1, &value)) {
+        std::fputs("topology fixture mutation exceeds integer range\n", stderr);
+        std::abort();
+    }
+}
+
 static bool process_group_gone(pid_t pgid) {
-    if (kill(-pgid, 0) == 0) return false;
+    if (pgid <= 1) return false;
+    const pid_t group = static_cast<pid_t>(-static_cast<std::int64_t>(pgid));
+    if (kill(group, 0) == 0) return false;
     return errno == ESRCH;
 }
 
@@ -148,22 +164,26 @@ static bool process_group_gone(pid_t pgid) {
     // orphan a same-uid command group.  SIGKILL is not catchable; once the
     // group is gone, terminate this runner rather than returning a normal
     // CommandResult.
+    if (pgid <= 1) _exit(125);
+    const pid_t group = static_cast<pid_t>(-static_cast<std::int64_t>(pgid));
     for (;;) {
         if (process_group_gone(pgid)) _exit(125);
-        (void)kill(-pgid, SIGKILL);
+        (void)kill(group, SIGKILL);
         (void)usleep(10000);
     }
 }
 
 static bool terminate_group_bounded(pid_t pgid) {
+    if (pgid <= 1) return false;
     if (process_group_gone(pgid)) return true;
-    (void)kill(-pgid, SIGTERM);
+    const pid_t group = static_cast<pid_t>(-static_cast<std::int64_t>(pgid));
+    (void)kill(group, SIGTERM);
     const auto term_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (std::chrono::steady_clock::now() < term_deadline) {
         if (process_group_gone(pgid)) return true;
         (void)usleep(10000);
     }
-    (void)kill(-pgid, SIGKILL);
+    (void)kill(group, SIGKILL);
     const auto kill_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
     while (std::chrono::steady_clock::now() < kill_deadline) {
         if (process_group_gone(pgid)) return true;
@@ -874,11 +894,13 @@ static bool exact_read_recv_control(int fd, ExactReadControlRecord& record, bool
             static_cast<long>(worker),
             static_cast<long long>(deadline_ns),
             reason);
+    if (worker <= 1) _exit(125);
+    const pid_t group = static_cast<pid_t>(-static_cast<std::int64_t>(worker));
     for (;;) {
-        if (worker > 0) (void)kill(-worker, SIGKILL);
+        (void)kill(group, SIGKILL);
         for (;;) {
             int status = 0;
-            const pid_t reaped = waitpid(-worker, &status, WNOHANG | __WALL);
+            const pid_t reaped = waitpid(group, &status, WNOHANG | __WALL);
             if (reaped > 0) continue;
             if (reaped < 0 && errno == ECHILD) _exit(125);
             if (reaped < 0 && errno == EINTR) continue;
@@ -1162,9 +1184,14 @@ static bool exact_read_send_receipt(int fd, const ExactReadSupervisorReceipt& re
         terminal_flags |= kExactReadFlagLeaderExitedBeforeCleanup;
 
     (void)kill(-worker, SIGTERM);
-    const std::int64_t grace_end =
-        std::min<std::int64_t>(start.final_deadline_ns, exact_read_monotonic_ns() + 50000000LL);
-    while (exact_read_monotonic_ns() < grace_end) (void)poll(nullptr, 0, 2);
+    const std::int64_t grace_start = exact_read_monotonic_ns();
+    std::int64_t grace_end;
+    if (grace_start >= 0 && !__builtin_add_overflow(grace_start, 50000000LL, &grace_end)) {
+        grace_end = std::min(start.final_deadline_ns, grace_end);
+        for (auto now = exact_read_monotonic_ns(); now >= 0 && now < grace_end;
+             now = exact_read_monotonic_ns())
+            (void)poll(nullptr, 0, 2);
+    }
     (void)kill(-worker, SIGKILL);
 
     std::uint32_t reap_count = 0;
@@ -1231,7 +1258,8 @@ static bool run_exact_read_command_until_impl(const std::vector<std::string>& ar
     const std::int64_t remaining_ms = (final_deadline_ns - now_ns) / 1000000LL;
     const std::int64_t cleanup_reserve_ns =
         std::min<std::int64_t>(200, std::max<std::int64_t>(50, remaining_ms / 2)) * 1000000LL;
-    const std::int64_t begin_cleanup_ns = final_deadline_ns - cleanup_reserve_ns;
+    const std::int64_t begin_cleanup_ns =
+        phase_deadline_before(final_deadline_ns, cleanup_reserve_ns);
     result.final_deadline_recorded = true;
 
     const long raw_open_max = sysconf(_SC_OPEN_MAX);
@@ -8543,7 +8571,7 @@ static bool write_refusal_self_checks_impl(std::uint32_t& mutation_rejections,
     ++mutated.source_inode;
     if (!bracket_rejects(mutated)) return false;
     mutated = bracket;
-    ++mutated.source_ctime_nanoseconds;
+    increment_fixture_value(mutated.source_ctime_nanoseconds);
     if (!bracket_rejects(mutated)) return false;
     if (mutation_rejections != 16u) {
         diagnostic = {ExactInputMountPhase::WriteRefusalObservation,
@@ -9261,9 +9289,9 @@ static bool settle_nginx_sibling(ExactInputMountOwner& owner,
         close_nginx_pidfds(lease);
         return true;
     }
-    const std::int64_t quit_deadline = final_deadline_ns - 8000000000LL;
-    const std::int64_t term_deadline = final_deadline_ns - 5000000000LL;
-    const std::int64_t kill_deadline = final_deadline_ns - 3000000000LL;
+    const std::int64_t quit_deadline = phase_deadline_before(final_deadline_ns, 8000000000LL);
+    const std::int64_t term_deadline = phase_deadline_before(final_deadline_ns, 5000000000LL);
+    const std::int64_t kill_deadline = phase_deadline_before(final_deadline_ns, 3000000000LL);
     NginxInspectEvidence inspect;
     std::string inspect_error;
     if (!inspect_nginx_sibling(owner, inspect, inspect_error, final_deadline_ns)) {
@@ -9736,10 +9764,10 @@ bool exact_input_mount_test_nginx_lifecycle_self_checks(std::uint32_t& mutation_
     mutation.bracket_start_nanoseconds = first.bracket_end_nanoseconds + 249999999LL;
     if (!reject_sample(mutation)) return false;
     mutation = second;
-    ++mutation.master_pid;
+    increment_fixture_value(mutation.master_pid);
     if (!reject_sample(mutation)) return false;
     mutation = second;
-    ++mutation.worker_pid;
+    increment_fixture_value(mutation.worker_pid);
     if (!reject_sample(mutation)) return false;
     mutation = second;
     ++mutation.master_start;
@@ -11065,8 +11093,10 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
                               "unified cgroup v2 process-membership proof is unsupported",
                               ENOTSUP);
 
-    const std::int64_t sample_a_deadline = current.final_deadline_nanoseconds - 15000000000LL;
-    const std::int64_t sample_b_deadline = current.final_deadline_nanoseconds - 12000000000LL;
+    const std::int64_t sample_a_deadline =
+        phase_deadline_before(current.final_deadline_nanoseconds, 15000000000LL);
+    const std::int64_t sample_b_deadline =
+        phase_deadline_before(current.final_deadline_nanoseconds, 12000000000LL);
     CommandDeadlineScope command_deadline(sample_a_deadline);
     fixture_exact_input_file_lease::Diagnostic source_diagnostic;
     std::string error;
@@ -11251,8 +11281,8 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
     // The transport phase has its own cutoff inside the single lifecycle
     // deadline, leaving the final twelve seconds for sample B and cleanup.
     const std::int64_t http_deadline =
-        current.final_deadline_nanoseconds -
-        (owner->rotated_lifecycle_authority ? 10000000000LL : 13000000000LL);
+        phase_deadline_before(current.final_deadline_nanoseconds,
+                              owner->rotated_lifecycle_authority ? 10000000000LL : 13000000000LL);
     command_deadline.set(http_deadline);
     static constexpr char kPinnedRequest[] =
         "GET / HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
@@ -11301,10 +11331,11 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
     }
 
     if (owner->rotated_lifecycle_authority &&
-        !capture_rotation_terminal_tcp(*owner,
-                                       owner->lifecycle_terminal_tcp,
-                                       current.final_deadline_nanoseconds - 9000000000LL,
-                                       error))
+        !capture_rotation_terminal_tcp(
+            *owner,
+            owner->lifecycle_terminal_tcp,
+            phase_deadline_before(current.final_deadline_nanoseconds, 9000000000LL),
+            error))
         return freeze_failure(ExactInputNginxLifecycleOutcome::SampleDrift,
                               "terminal nginx TIME_WAIT evidence failed: " + error);
 
@@ -12640,7 +12671,8 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
     if (!mutate(
             "holder absence ID",
             [](auto& value) { value.old_absence.holder.container_id = std::string(64, '9'); }) ||
-        !mutate("holder absence PID", [](auto& value) { ++value.old_absence.holder.pid; }) ||
+        !mutate("holder absence PID",
+                [](auto& value) { increment_fixture_value(value.old_absence.holder.pid); }) ||
         !mutate("holder absence start", [](auto& value) { ++value.old_absence.holder.start; }) ||
         !mutate("holder ID absence missing",
                 [](auto& value) { value.old_absence.holder.container_id_absent = false; }) ||
@@ -12649,7 +12681,8 @@ static bool held_namespace_generation_rotation_self_checks(std::string& error) {
         !mutate(
             "sidecar absence ID",
             [](auto& value) { value.old_absence.sidecar.container_id = std::string(64, '9'); }) ||
-        !mutate("sidecar absence PID", [](auto& value) { ++value.old_absence.sidecar.pid; }) ||
+        !mutate("sidecar absence PID",
+                [](auto& value) { increment_fixture_value(value.old_absence.sidecar.pid); }) ||
         !mutate("sidecar absence start", [](auto& value) { ++value.old_absence.sidecar.start; }) ||
         !mutate("sidecar ID absence missing",
                 [](auto& value) { value.old_absence.sidecar.container_id_absent = false; }) ||
@@ -13105,12 +13138,12 @@ bool pure_validation_self_checks(std::string& error) {
             return false;
         }
     }
-    for (const auto& change :
-         {std::function<void(HeldNamespaceSidecarSnapshot&)>(
-              [](auto& value) { value.id = std::string(64, 'd'); }),
-          std::function<void(HeldNamespaceSidecarSnapshot&)>([](auto& value) { value.pid += 1; }),
-          std::function<void(HeldNamespaceSidecarSnapshot&)>(
-              [](auto& value) { value.start += 1; })}) {
+    for (const auto& change : {std::function<void(HeldNamespaceSidecarSnapshot&)>(
+                                   [](auto& value) { value.id = std::string(64, 'd'); }),
+                               std::function<void(HeldNamespaceSidecarSnapshot&)>(
+                                   [](auto& value) { increment_fixture_value(value.pid); }),
+                               std::function<void(HeldNamespaceSidecarSnapshot&)>(
+                                   [](auto& value) { value.start += 1; })}) {
         HeldNamespaceSidecarSnapshot changed = sidecar;
         change(changed);
         sidecar_error.clear();
@@ -16889,8 +16922,9 @@ bool exact_input_rotation_pure_self_checks(std::uint32_t& mutation_rejections, s
         !reject([](auto& value) { value.fresh_clean_baseline = false; }) ||
         !reject([](auto& value) { value.old_nginx.sample_a.tcp_exact = false; }) ||
         !reject([](auto& value) {
-            value.old_nginx.sample_b.bracket_end_nanoseconds =
-                value.old_nginx.http.start_nanoseconds + 1;
+            auto end = value.old_nginx.http.start_nanoseconds;
+            increment_fixture_value(end);
+            value.old_nginx.sample_b.bracket_end_nanoseconds = end;
         }) ||
         !reject([](auto& value) { value.old_nginx.http.write_shutdown_started = true; }) ||
         !reject(
