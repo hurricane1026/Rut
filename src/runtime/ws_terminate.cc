@@ -449,8 +449,8 @@ bool compress_emitted_message(WsInspector& st,
                         st.masked,
                         &header) != ParseStatus::Complete ||
         (header.opcode != WsOpcode::Text && header.opcode != WsOpcode::Binary) ||
-        static_cast<i64>(header.header_len) + static_cast<i64>(header.payload_len) !=
-            static_cast<i64>(*produced) - static_cast<i64>(begin))
+        static_cast<u64>(header.header_len) + header.payload_len !=
+            static_cast<u64>(static_cast<i64>(*produced) - static_cast<i64>(begin)))
         return false;
     u8* const kPayload = out + static_cast<i64>(begin) + static_cast<i64>(header.header_len);
     if (st.masked) ws_unmask(kPayload, header.payload_len, header.mask_key);
@@ -748,9 +748,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
+        // The parser accepts at most 63 payload-length bits. Partial progress
+        // belongs to this frame and never exceeds its payload length.
         const u64 frame_total =
-            static_cast<u64>(static_cast<i64>(header_len) + static_cast<i64>(h.payload_len) -
-                             static_cast<i64>(st.partial_payload_len));
+            static_cast<u64>(header_len) + h.payload_len - st.partial_payload_len;
         if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
         if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
         // A completed fragmented message can be larger than this input chunk. Flush
@@ -1191,8 +1192,7 @@ WsClosingRead ws_read_closing(
             return WsClosingRead::Error;
         st.compressed_message = kCompressed;
         const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
-        const u64 kRemaining = static_cast<u64>(static_cast<i64>(header.payload_len) -
-                                                static_cast<i64>(st.partial_payload_len));
+        const u64 kRemaining = header.payload_len - st.partial_payload_len;
         const u32 kAvailablePayload =
             static_cast<u32>(static_cast<i64>(kAvailable) - static_cast<i64>(kHeaderLen));
         const u32 kTake =

@@ -361,7 +361,7 @@ bool load_native_program(const char* source,
         }
         void cancel() {
             if (!reaped) {
-                if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
+                if (kill(static_cast<pid_t>(-i64{pid}), SIGKILL) != 0) kill(pid, SIGKILL);
             }
             while (!reaped) {
                 pid_t result = waitpid(pid, &status, WNOHANG);
