@@ -1757,7 +1757,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
 
         for (u32 li = 0; li < source_route.locals.len; li++) {
             if (source_route.locals[li].run_at_response_return) continue;
-            if (source_route.locals[li].type == HirTypeKind::Tuple) continue;
+            // Tuple-valued locals have no runtime carrier except the hidden
+            // destructuring carrier emitted by `let (a, b) = pair`, which the
+            // slot locals read through LocalRef so the tuple is built once.
+            if (source_route.locals[li].type == HirTypeKind::Tuple &&
+                !source_route.locals[li].is_runtime_synthetic)
+                continue;
             // Array locals are compile-time constants for for-loop unroll
             // only. They have no runtime MirValue carrier yet, so do not
             // emit a MIR local for them.

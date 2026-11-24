@@ -49783,6 +49783,35 @@ TEST(frontend, analyze_tuple_destructuring_let) {
     }
 }
 
+TEST(frontend, mir_materializes_tuple_destructuring_carrier_once) {
+    // The carrier local must be materialized once and read per slot; a
+    // duplicated lowering would sample the clock twice.
+    const auto source =
+        lit("route GET \"/x\" { let (stamp, n) = (time.nowMicros(), 0) "
+            "guard n == 0 else { return 400 } guard stamp > 0 else { return 401 } "
+            "return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    u32 clock_reads = 0;
+    const auto& fn = rir.module.functions[0];
+    for (u32 bi = 0; bi < fn.block_count; bi++) {
+        for (u32 ii = 0; ii < fn.blocks[bi].inst_count; ii++) {
+            if (fn.blocks[bi].insts[ii].op == rir::Opcode::TimeNowMicros) clock_reads++;
+        }
+    }
+    CHECK_EQ(clock_reads, 1u);
+    rir.destroy();
+}
+
 TEST(frontend, analyze_rejects_invalid_tuple_destructuring) {
     struct Case {
         const char* src;

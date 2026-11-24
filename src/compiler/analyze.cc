@@ -26665,7 +26665,22 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     carrier.init = init.value();
                     if (!route.locals.push(carrier))
                         return frontend_error(FrontendError::TooManyItems, stmt.span);
-                    if (!route.exprs.push(init.value()))
+                    // Slots read the carrier local through LocalRef so the
+                    // tuple (and any runtime work inside it) is materialized
+                    // exactly once.
+                    HirExpr carrier_ref{};
+                    carrier_ref.kind = HirExprKind::LocalRef;
+                    carrier_ref.type = HirTypeKind::Tuple;
+                    carrier_ref.local_index = carrier.ref_index;
+                    carrier_ref.shape_index = carrier.shape_index;
+                    carrier_ref.tuple_len = carrier.tuple_len;
+                    for (u32 ti = 0; ti < carrier.tuple_len; ti++) {
+                        carrier_ref.tuple_types[ti] = carrier.tuple_types[ti];
+                        carrier_ref.tuple_variant_indices[ti] = carrier.tuple_variant_indices[ti];
+                        carrier_ref.tuple_struct_indices[ti] = carrier.tuple_struct_indices[ti];
+                    }
+                    carrier_ref.span = stmt.span;
+                    if (!route.exprs.push(carrier_ref))
                         return frontend_error(FrontendError::OutOfMemory, stmt.span);
                     const HirExpr* carrier_value = &route.exprs[route.exprs.len - 1];
                     const HirTypeShape* tuple_shape = init->shape_index < mod.type_shapes.len
