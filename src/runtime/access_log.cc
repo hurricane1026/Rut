@@ -91,7 +91,7 @@ static u32 write_u64_dec(char* buf, u64 val) {
 }
 
 static u32 copy_str(char* dst, const char* src) {
-    i64 n = 0;
+    u64 n = 0;
     while (src[n]) {
         dst[n] = src[n];
         n++;
@@ -172,7 +172,7 @@ static u32 format_timestamp(char* buf, u64 timestamp_us) {
 // Access raw bytes to be endian-safe (works on both LE and BE hosts).
 static u32 format_ipv4(char* buf, u32 addr) {
     const auto* bytes = reinterpret_cast<const u8*>(&addr);
-    i64 w = 0;
+    u64 w = 0;
     for (i64 i = 0; i < 4; i++) {
         if (i > 0) buf[w++] = '.';
         u8 octet = bytes[i];

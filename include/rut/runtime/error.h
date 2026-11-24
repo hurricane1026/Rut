@@ -6,6 +6,12 @@
 
 namespace rut {
 
+// A kernel errno fits i32 in either sign. Widen before negating so the
+// arithmetic is defined for the entire storage type.
+constexpr i32 reverse_kernel_error(i32 value) {
+    return static_cast<i32>(-static_cast<i64>(value));
+}
+
 // Runtime error — carries errno + context about where the error occurred.
 // Used as the E type in Expected<T, Error> for init/setup functions.
 struct Error {
