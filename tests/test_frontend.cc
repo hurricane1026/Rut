@@ -49838,6 +49838,68 @@ TEST(frontend, analyze_rejects_invalid_tuple_destructuring) {
     }
 }
 
+TEST(frontend, parse_byte_size_literals) {
+    const auto source =
+        lit("route GET \"/x\" { let a = 64b let b = 16kb let c = 2mb let d = 1gb "
+            "guard a < b else { return 400 } return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 6u);
+    const i64 expected[] = {64, 16 * 1024, 2 * 1024 * 1024, 1024ll * 1024 * 1024};
+    for (u32 i = 0; i < 4; i++) {
+        REQUIRE(route.statements[i] != nullptr);
+        const auto& stmt = *route.statements[i];
+        REQUIRE_EQ(static_cast<u8>(stmt.kind), static_cast<u8>(AstStmtKind::Let));
+        REQUIRE_EQ(static_cast<u8>(stmt.expr.kind), static_cast<u8>(AstExprKind::ByteSizeLit));
+        CHECK_EQ(stmt.expr.int_value, expected[i]);
+    }
+
+    // The unit must be one of b/kb/mb/gb and adjacent to the digits.
+    const char* bad[] = {
+        "route GET \"/x\" { let a = 1 tb guard a > 0 else { return 400 } return 200 }\n",
+        "route GET \"/x\" { let a = 1 kb guard a > 0 else { return 400 } return 200 }\n",
+        "route GET \"/x\" { let a = 99999999999999999gb return 200 }\n",
+    };
+    for (const char* src : bad) {
+        auto bad_tokens = lex(lit(src));
+        REQUIRE(bad_tokens);
+        CHECK_FALSE(parse_file_heap(bad_tokens.value()).has_value());
+    }
+}
+
+TEST(frontend, analyze_byte_size_literals) {
+    const char* sources[] = {
+        // Compared against a runtime ByteSize value.
+        "route POST \"/upload\" { guard req.contentLength <= 4kb else { return 413 } "
+        "return 200 }\n",
+        // Stored and compared.
+        "route GET \"/x\" { let limit = 16kb guard limit > 1kb else { return 400 } "
+        "return 200 }\n",
+        // Repeatable inside a static loop body.
+        "route GET \"/x\" { for n in [1] { let limit = 2kb guard limit > 1kb else { return 401 } } "
+        "return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "byte-size source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        CHECK(function_has_op(rir.module.functions[0], rir::Opcode::ConstByteSize));
+        rir.destroy();
+    }
+}
+
 TEST(frontend, parse_for_loop_break_continue_statements) {
     const auto source =
         lit("route GET \"/x\" { for n in [1] { guard n != 2 else { break } "

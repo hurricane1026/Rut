@@ -139,6 +139,8 @@ struct HirTypeAlias {
 enum class HirExprKind : u8 {
     BoolLit,
     IntLit,
+    // `64b` / `16kb` / `2mb` / `1gb` literal; int_value holds the byte count.
+    ByteSizeLit,
     StrLit,
     RegexMatch,
     RegexCapture,
