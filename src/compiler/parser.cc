@@ -1957,6 +1957,22 @@ struct Parser {
             }
             return stmt;
         }
+        // `break` / `continue` are recognized contextually in statement position,
+        // not reserved globally, so identifiers/members with those names keep
+        // working (mirrors `respond`). A postfix continuation (`break(...)`,
+        // `break.x`, `break[i]`) stays an expression statement about an
+        // identifier, not loop control.
+        if (cur().type == TokenType::Ident &&
+            (cur().text.eq({"break", 5}) || cur().text.eq({"continue", 8})) &&
+            peek().type != TokenType::LParen && peek().type != TokenType::Dot &&
+            peek().type != TokenType::LBracket) {
+            const Token keyword = cur();
+            pos++;
+            AstStatement stmt{};
+            stmt.kind = keyword.text.eq({"break", 5}) ? AstStmtKind::Break : AstStmtKind::Continue;
+            stmt.span = span_from(keyword);
+            return stmt;
+        }
         if (cur().type == TokenType::Ident && cur().text.eq(lit_str("respond")) &&
             (peek().type == TokenType::IntLit || peek().type == TokenType::Ident)) {
             if (!in_function_body)
@@ -5742,9 +5758,13 @@ struct Parser {
             if (!stmt_ptr) return core::make_unexpected(stmt_ptr.error());
             if (!item.route.statements.push(stmt_ptr.value()))
                 return frontend_error(FrontendError::TooManyItems, stmt.value().span);
+            // Break/continue parse here so analyze can report the dedicated
+            // "only inside a static for-loop body" diagnostic instead of a
+            // generic unexpected-token error.
             if (stmt->kind != AstStmtKind::Let && stmt->kind != AstStmtKind::Guard &&
                 stmt->kind != AstStmtKind::Wait && stmt->kind != AstStmtKind::For &&
-                stmt->kind != AstStmtKind::Expr)
+                stmt->kind != AstStmtKind::Expr && stmt->kind != AstStmtKind::Break &&
+                stmt->kind != AstStmtKind::Continue)
                 break;
         }
         auto rbrace = expect(TokenType::RBrace);

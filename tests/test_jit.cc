@@ -1711,6 +1711,108 @@ TEST(jit, frontend_static_for_loop_optional_guard_let_executes) {
     rir.destroy();
 }
 
+TEST(jit, frontend_static_for_loop_break_continue_execute) {
+    // `guard cond else { break|continue }` is the loop-control surface for the
+    // static unroll: the unroller resolves the guard's failure edge to the step
+    // block after the innermost loop (`break`) or to the next iteration's first
+    // step (`continue`).
+    struct Case {
+        const char* src;
+        u16 status;
+    };
+    const Case cases[] = {
+        // break leaves before the third iteration's failing guard.
+        {"route GET \"/users\" { for n in [1, 2, 3] { guard n != 2 else { break } "
+         "guard n != 3 else { return 500 } } return 200 }\n",
+         200},
+        // continue skips only iteration 2; iteration 3 trips the second guard.
+        {"route GET \"/users\" { for n in [1, 2, 3] { guard n != 2 else { continue } "
+         "guard n != 3 else { return 501 } } return 200 }\n",
+         501},
+        // break in the inner loop must not exit the outer loop.
+        {"route GET \"/users\" { for a in [1, 2] { for b in [1, 2] { "
+         "guard b != 2 else { break } guard a != 2 else { return 502 } } } return 200 }\n",
+         502},
+        // continue in the inner loop resumes the outer loop.
+        {"route GET \"/users\" { for a in [1, 2] { for b in [1, 2] { "
+         "guard b != 1 else { continue } guard a != 2 else { return 503 } } } return 200 }\n",
+         503},
+        // guard-let failure continues rather than responding.
+        {"route GET \"/users\" { for n in [1] { guard let p = req.query(\"x\") else { continue } "
+         "guard p != \"a\" else { return 504 } } return 200 }\n",
+         200},
+        // break in the inner loop still runs the outer body's later steps.
+        {"route GET \"/users\" { for a in [1, 2] { for b in [1, 2] { "
+         "guard b != 1 else { break } } guard a != 2 else { return 505 } } return 200 }\n",
+         505},
+        // continue in the inner loop still runs the outer body's later steps.
+        {"route GET \"/users\" { for a in [1, 2] { for b in [1, 2] { "
+         "guard b != 1 else { continue } } guard a != 2 else { return 506 } } return 200 }\n",
+         506},
+        // break lands on the later top-level loop, not past the route tail.
+        {"route GET \"/users\" { for a in [1, 2] { guard a != 1 else { break } } "
+         "for b in [1, 2] { guard b != 1 else { return 507 } } return 200 }\n",
+         507},
+        // break lands on the route guard that follows the loop.
+        {"route GET \"/users\" { for n in [1, 2, 3] { guard n != 2 else { break } } "
+         "guard req.method == GET else { return 508 } return 200 }\n",
+         200},
+        // A continue guard bypasses the direct break, so the later iteration
+        // must still be emitted (and can terminate the route).
+        {"route GET \"/users\" { for n in [false, true] { guard n else { continue } "
+         "guard false else { return 509 } break } return 200 }\n",
+         509},
+        // ... and the bypassed break still exits the loop instead of falling
+        // through into the following iteration.
+        {"route GET \"/users\" { for n in [0, 1, 2] { guard n != 0 else { continue } "
+         "guard n != 2 else { return 510 } break } return 200 }\n",
+         200},
+        // The same bypass rules apply to a nested loop, whose break still only
+        // leaves the inner loop.
+        {"route GET \"/users\" { for a in [1] { for b in [0, 1, 2] { "
+         "guard b != 0 else { continue } guard b != 2 else { return 511 } break } "
+         "guard a != 1 else { return 512 } } return 200 }\n",
+         512},
+    };
+    const char* request = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    for (const auto& item : cases) {
+        auto lexed = lex(lit(item.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(request),
+                                               static_cast<u32>(__builtin_strlen(request)),
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(r.status_code, item.status);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
 TEST(jit, frontend_arith_div_mod_guards_execute) {
     // Runtime operands (locals don't fold at use sites), so the codegen
     // select guards — not the analyze fold — produce these results.

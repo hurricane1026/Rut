@@ -85,8 +85,9 @@ enum class AstStmtKind : u8 {
     //   - expr        = iteration source expression (must type-check as Array<T>)
     //   - then_stmt   = body block (via parse_braced_stmt_body; may be a single
     //                   stmt if the block contained exactly one stmt)
-    // No break / continue / else / labels (spec §3.3.9: every iteration runs
-    // to completion). Analyze (Phase 3b) enforces the iteration source is
+    // `else` and labels are not accepted; `break`/`continue` are parsed as
+    // their own statements and analyzed as loop-body steps (see Break/Continue
+    // below). Analyze (Phase 3b) enforces the iteration source is
     // array-typed and compile-time-sized and builds a HirForLoop. `inline for`
     // is not accepted as a compatibility spelling; static `for` is the single
     // canonical loop surface. MIR build unrolls supported static for-loops into
@@ -94,6 +95,14 @@ enum class AstStmtKind : u8 {
     // — see mir_build.cc.
     // Runtime iterables remain later work.
     For,
+    // `break` / `continue` — Swift-identical loop control (DESIGN.md §3.3.9).
+    // Both words stay usable as identifiers elsewhere (recognized contextually
+    // in statement position, like `respond`). Analyze admits them only as
+    // direct statements of a static for-loop body, where MIR unrolling
+    // truncates the remaining iterations (`break`) or the remaining body steps
+    // of the current iteration (`continue`). Neither exits the route.
+    Break,
+    Continue,
 };
 
 enum class WaitEventKind : u8 {

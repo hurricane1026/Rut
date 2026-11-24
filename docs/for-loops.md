@@ -119,6 +119,7 @@ The supported loop body surface is route-oriented:
 - terminal `if`
 - terminal `match`
 - nested static `for` loops
+- `break` and `continue` loop control (see [Loop Control](#loop-control))
 
 Loop bodies can introduce locals before guards:
 
@@ -176,6 +177,52 @@ on invalid failure behavior.
 no per-iteration binding materialization, so the compiler rejects it rather than
 misreading the usable-value test as a boolean condition.
 
+## Loop Control
+
+`break` and `continue` follow their Swift meaning. Because loops are unrolled at
+compile time, both are resolved while emitting the iteration steps instead of
+introducing a runtime loop carrier:
+
+- `break` leaves the innermost enclosing loop; later iterations are not emitted.
+- `continue` skips the remaining steps of the current iteration and resumes at
+  the next iteration.
+- In nested loops both bind to the innermost loop; the outer loop continues
+  normally after the inner loop finishes.
+
+They are accepted as direct loop-body statements, but the useful form is a
+guard failure path, which is how a conditional exit reads in Rut:
+
+```rut
+route GET "/x" {
+    for n in [1, 2, 3, 4] {
+        guard n != 2 else { continue }              // skip iteration 2
+        guard n != 4 else { break }                 // stop before iteration 4
+    }
+    return 200
+}
+```
+
+Direct statements end the body, so nothing may follow them:
+
+```rut
+route GET "/x" {
+    for item in [1, 2, 3] {
+        break                                       // ends the whole loop
+    }
+    return 200
+}
+```
+
+For conditional control prefer `guard`, as above: a direct `break`/`continue`
+always runs and therefore also makes every later step of the body unreachable.
+
+Loop control is not yet accepted inside loop-body `if` or `match` arms: those
+steps are lowered as terminal route branches, and a conditional iteration exit
+would need a partial-iteration control graph. A loop body that uses
+`break`/`continue` also cannot contain a route terminator (`return`, terminal
+`if`, terminal `match`); keep the loop body free of route exits and put them
+after the loop.
+
 ## Ordering
 
 Static loops are lowered in source order with surrounding route statements.
@@ -218,5 +265,7 @@ Static `for` loops are intentionally narrow:
   invocation (see the language card), so every use observes the same value
 - routes that combine `wait(...)` and static for-loop lowering are rejected
 - `for` is accepted only in route bodies, not helper/function bodies
-- `break` and `continue` are not implemented yet
+- `break`/`continue` are accepted as direct loop-body statements and as a
+  `guard ... else` failure path; loop-body `if`/`match` arms reject them for now
+- a loop body that uses `break`/`continue` cannot also contain route terminators
 - block-budget overflow reports the overflowing loop step, guard, or arm

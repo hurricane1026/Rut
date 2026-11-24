@@ -1009,6 +1009,12 @@ struct HirGuard {
         Term,
         Match,
         Body,
+        // Static for-loop guards only: the failure path leaves the enclosing
+        // loop (`break`) or skips to its next iteration (`continue`) instead of
+        // terminating the route. mir_build resolves these to unrolled block
+        // targets; they never allocate fail blocks.
+        LoopBreak,
+        LoopContinue,
     };
 
     static constexpr u32 kMaxFailMatchArms = 8;
@@ -1136,6 +1142,11 @@ struct HirForLoopBody {
             Match,
             For,
             Term,
+            // `break` / `continue` — compile-time loop control. They occupy
+            // their source position in `steps` and end the body, so at most one
+            // of them can appear (see kMaxSteps).
+            Break,
+            Continue,
         };
         Kind kind = Kind::Let;
         u32 index = 0;
@@ -1151,7 +1162,9 @@ struct HirForLoopBody {
     static constexpr u32 kMaxGuards = 2;
     static constexpr u32 kMaxIfs = 1;
     static constexpr u32 kMaxMatches = 1;
-    static constexpr u32 kMaxSteps = kMaxLocals + kMaxGuards + kMaxIfs + kMaxMatches + 2;
+    // +3 covers the nested-loop step, the route-terminator step, and one of
+    // break/continue (they end the body, so at most one appears per body).
+    static constexpr u32 kMaxSteps = kMaxLocals + kMaxGuards + kMaxIfs + kMaxMatches + 3;
     FixedVec<Step, kMaxSteps> steps;
     FixedVec<HirLocal, kMaxLocals> locals;
     FixedVec<HirGuard, kMaxGuards> guards;

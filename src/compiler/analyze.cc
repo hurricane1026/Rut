@@ -8892,6 +8892,33 @@ static bool wait_any_wait_arm_has_block_let(const AstStatement& stmt) {
     return false;
 }
 
+// True when a statement is, or lexically contains, loop control (`break` /
+// `continue`). Static for-loop bodies only accept loop control as direct body
+// statements: the unroller walks body steps in source order, so a conditional
+// or nested-arm exit would need a partial-iteration control graph.
+static bool ast_contains_loop_control(const AstStatement& stmt) {
+    if (stmt.kind == AstStmtKind::Break || stmt.kind == AstStmtKind::Continue) return true;
+    if (stmt.kind == AstStmtKind::Block) {
+        for (u32 i = 0; i < stmt.block_stmts.len; i++) {
+            if (ast_contains_loop_control(*stmt.block_stmts[i])) return true;
+        }
+        return false;
+    }
+    if (stmt.kind == AstStmtKind::If) {
+        if (stmt.then_stmt != nullptr && ast_contains_loop_control(*stmt.then_stmt)) return true;
+        if (stmt.else_stmt != nullptr && ast_contains_loop_control(*stmt.else_stmt)) return true;
+        return false;
+    }
+    if (stmt.kind == AstStmtKind::Match) {
+        for (u32 ai = 0; ai < stmt.match_arms.len; ai++) {
+            const auto& arm = stmt.match_arms[ai];
+            if (arm.stmt != nullptr && ast_contains_loop_control(*arm.stmt)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 // Function declarations retain their existing HTTP control/effect representation.
 // Message calls reuse the same analyzer with real lexical initializers, then
 // normalize the result into the function's owning pool (never retain AST views).
@@ -20510,6 +20537,16 @@ static bool static_for_init_repeatable(const HirExpr& expr) {
     return true;
 }
 
+constexpr Str kForLoopBreakOutsideDetail =
+    lit_str("break is only supported inside a static for-loop body");
+constexpr Str kForLoopContinueOutsideDetail =
+    lit_str("continue is only supported inside a static for-loop body");
+constexpr Str kForLoopAfterLoopControlDetail =
+    lit_str("static for-loop body cannot continue after break/continue");
+constexpr Str kForLoopNestedLoopControlDetail = lit_str(
+    "break/continue inside a static for-loop body if or match arm is not supported yet; "
+    "use them as direct loop-body statements");
+
 static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             HirRoute* route,
                                             HirModule& mod) {
@@ -20607,9 +20644,31 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
 
     const AstStatement* body = stmt.then_stmt;
     const u32 body_item_count = body->kind == AstStmtKind::Block ? body->block_stmts.len : 1u;
+    bool body_exited = false;
+    bool body_uses_loop_control = false;
     for (u32 bi = 0; bi < body_item_count; bi++) {
         const AstStatement& bstmt =
             (body->kind == AstStmtKind::Block) ? *body->block_stmts[bi] : *body;
+        if (body_exited)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, bstmt.span, kForLoopAfterLoopControlDetail);
+        if (bstmt.kind == AstStmtKind::Break || bstmt.kind == AstStmtKind::Continue) {
+            if (loop.body.has_term)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.span,
+                    lit_str("static for-loop body cannot continue after a route terminator"));
+            HirForLoopBody::Step exit_step{};
+            exit_step.kind = bstmt.kind == AstStmtKind::Break
+                                 ? HirForLoopBody::Step::Kind::Break
+                                 : HirForLoopBody::Step::Kind::Continue;
+            exit_step.span = bstmt.span;
+            if (!loop.body.steps.push(exit_step))
+                return frontend_error(FrontendError::TooManyItems, bstmt.span);
+            body_exited = true;
+            body_uses_loop_control = true;
+            continue;
+        }
         if (bstmt.kind == AstStmtKind::Let) {
             if (loop.body.has_term)
                 return frontend_error(
@@ -20729,6 +20788,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                         bstmt.expr.span,
                         lit_str("guard match inside static for-loop requires an error value"));
                 }
+            } else if (bstmt.else_stmt->kind == AstStmtKind::Break ||
+                       bstmt.else_stmt->kind == AstStmtKind::Continue) {
+                // `guard cond else { break|continue }` is the idiomatic static
+                // loop-control form: the success path falls through to the rest
+                // of the iteration, the failure path leaves the loop or skips to
+                // the next iteration.
+                guard.fail_kind = bstmt.else_stmt->kind == AstStmtKind::Break
+                                      ? HirGuard::FailKind::LoopBreak
+                                      : HirGuard::FailKind::LoopContinue;
+                body_uses_loop_control = true;
             } else if (is_ast_hir_terminator(*bstmt.else_stmt)) {
                 auto fail = analyze_term(*bstmt.else_stmt, mod);
                 if (!fail) return core::make_unexpected(fail.error());
@@ -20846,6 +20915,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             const auto simple_branch = [](const AstStatement& branch) {
                 return is_ast_hir_terminator(branch);
             };
+            if ((bstmt.then_stmt != nullptr && ast_contains_loop_control(*bstmt.then_stmt)) ||
+                (bstmt.else_stmt != nullptr && ast_contains_loop_control(*bstmt.else_stmt)))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, bstmt.span, kForLoopNestedLoopControlDetail);
             if (bstmt.then_stmt == nullptr || bstmt.else_stmt == nullptr ||
                 !simple_branch(*bstmt.then_stmt) || !simple_branch(*bstmt.else_stmt))
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
@@ -20914,6 +20987,10 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             bool seen_unguarded_variant_cases[HirVariant::kMaxCases]{};
             for (u32 ai = 0; ai < bstmt.match_arms.len; ai++) {
                 const auto& ast_arm = bstmt.match_arms[ai];
+                if (ast_arm.stmt != nullptr && ast_contains_loop_control(*ast_arm.stmt))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          ast_arm.span,
+                                          kForLoopNestedLoopControlDetail);
                 const AstStatement* nested_match_stmt = nullptr;
                 const bool can_expand_nested_match =
                     !ast_arm.is_wildcard && !ast_arm.has_guard && ast_arm.pattern->lhs == nullptr;
@@ -21800,6 +21877,16 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             FrontendError::UnsupportedSyntax,
             stmt.span,
             lit_str("static for-loop body must contain at least one supported step"));
+    // Route terminators and loop control share one linear step chain today: a
+    // terminator truncates every later step, which would also drop the
+    // break/continue target blocks. Keep the two forms separate until the
+    // unroller carries a real control-flow graph.
+    if (body_uses_loop_control && loop.body.has_term)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("a static for-loop body cannot combine break/continue with route "
+                    "terminators"));
     for (u32 li = locals_saved; li < route->locals.len; li++) route->locals[li].name = {};
     return for_index;
 }
@@ -26567,6 +26654,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                         return frontend_error(FrontendError::UnsupportedSyntax, stmt.expr.span);
                     }
                 } else {
+                    if (stmt.else_stmt->kind == AstStmtKind::Break ||
+                        stmt.else_stmt->kind == AstStmtKind::Continue)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              stmt.else_stmt->span,
+                                              stmt.else_stmt->kind == AstStmtKind::Break
+                                                  ? kForLoopBreakOutsideDetail
+                                                  : kForLoopContinueOutsideDetail);
                     if (is_ast_hir_terminator(*stmt.else_stmt)) {
                         auto fail_term = analyze_term(
                             *stmt.else_stmt, mod, &route, route.locals.data, route.locals.len);
@@ -26647,6 +26741,12 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                           route_decl.statements[si + 1]->span);
                 break;
             }
+            if (stmt.kind == AstStmtKind::Break || stmt.kind == AstStmtKind::Continue)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      stmt.span,
+                                      stmt.kind == AstStmtKind::Break
+                                          ? kForLoopBreakOutsideDetail
+                                          : kForLoopContinueOutsideDetail);
             if (stmt.kind == AstStmtKind::For) {
                 if (seen_wait)
                     return frontend_error(FrontendError::UnsupportedSyntax,
