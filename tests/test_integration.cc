@@ -26540,11 +26540,11 @@ struct Reply {
 Reply read_reply(i32 fd, i32 ms) {
     Reply r;
     char buf[2048];
-    const i64 deadline = test_mono_ms() + ms;
+    const i64 deadline = test_deadline_after_ms(ms);
     u32 body_off = 0;
     u32 cl = 0;
     while (r.total < sizeof(buf)) {
-        const i64 left = deadline - test_mono_ms();
+        const i64 left = test_ms_until(deadline);
         if (left <= 0) break;
         const i32 n =
             recv_timeout(fd, buf + r.total, sizeof(buf) - r.total, static_cast<i32>(left));
@@ -29127,7 +29127,7 @@ struct ScopedIoUringProxyRequestCompletionBarrier {
             if (!self->barrier_reached.load(std::memory_order_relaxed) &&
                 completion_boundary_ready(self)) {
                 self->barrier_reached.store(true, std::memory_order_release);
-                const i64 deadline = test_mono_ms() + 10'000;
+                const i64 deadline = test_deadline_after_ms(10'000);
                 while (!self->barrier_release.load(std::memory_order_acquire) &&
                        loop->is_running() && test_mono_ms() < deadline)
                     sched_yield();
@@ -29162,7 +29162,7 @@ struct ScopedIoUringProxyRequestCompletionBarrier {
     }
 
     bool wait_until_reached(i64 timeout_ms) {
-        const i64 deadline = test_mono_ms() + timeout_ms;
+        const i64 deadline = test_deadline_after_ms(timeout_ms);
         while (!barrier_reached.load(std::memory_order_acquire) &&
                !barrier_failed.load(std::memory_order_acquire) &&
                !exited.load(std::memory_order_acquire) && test_mono_ms() < deadline)
@@ -30420,7 +30420,7 @@ route GET "/compiled-sentinel" { return 204 }
                                u32* observed_len) -> ReadOutcome {
         *observed_len = 0;
         while (*observed_len < expected_len) {
-            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            const i64 remaining_ms = test_ms_until(absolute_deadline_ms);
             if (remaining_ms <= 0) return ReadOutcome::Timeout;
             const i32 got = recv_timeout(fd,
                                          out + *observed_len,
@@ -30440,7 +30440,7 @@ route GET "/compiled-sentinel" { return 204 }
     auto expect_eof = [](i32 fd, i64 absolute_deadline_ms) {
         char tail[32];
         while (test_mono_ms() < absolute_deadline_ms) {
-            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            const i64 remaining_ms = test_ms_until(absolute_deadline_ms);
             if (remaining_ms <= 0) break;
             const i32 got = recv_timeout(fd, tail, sizeof(tail), static_cast<i32>(remaining_ms));
             if (got == -EINTR) continue;
@@ -30452,7 +30452,7 @@ route GET "/compiled-sentinel" { return 204 }
         char wire[512]{};
         if (expected_len > sizeof(wire)) return false;
         u32 wire_len = 0;
-        if (read_exact_until(fd, wire, expected_len, test_mono_ms() + 5000, &wire_len) !=
+        if (read_exact_until(fd, wire, expected_len, test_deadline_after_ms(5000), &wire_len) !=
                 ReadOutcome::Complete ||
             wire_len != expected_len || !normalize_public_date(wire, wire_len))
             return false;
@@ -30498,7 +30498,7 @@ route GET "/compiled-sentinel" { return 204 }
     REQUIRE(send_all(sequential.fd, kHead, sizeof(kHead) - 1u));
     REQUIRE(
         exact_normalized_wire(sequential.fd, kExpectedHeadClose, sizeof(kExpectedHeadClose) - 1u));
-    REQUIRE(expect_eof(sequential.fd, test_mono_ms() + 3000));
+    REQUIRE(expect_eof(sequential.fd, test_deadline_after_ms(3000)));
     REQUIRE(shard.loop->is_running());
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(close(sequential.fd), 0);
@@ -30509,7 +30509,7 @@ route GET "/compiled-sentinel" { return 204 }
     set_socket_timeouts(post.fd, 5);
     REQUIRE(send_all(post.fd, kPost, sizeof(kPost) - 1u));
     REQUIRE(exact_normalized_wire(post.fd, kExpectedClose, sizeof(kExpectedClose) - 1u));
-    REQUIRE(expect_eof(post.fd, test_mono_ms() + 3000));
+    REQUIRE(expect_eof(post.fd, test_deadline_after_ms(3000)));
     REQUIRE(shard.loop->is_running());
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(close(post.fd), 0);
@@ -30520,7 +30520,7 @@ route GET "/compiled-sentinel" { return 204 }
     set_socket_timeouts(options.fd, 5);
     REQUIRE(send_all(options.fd, kOptions, sizeof(kOptions) - 1u));
     REQUIRE(exact_normalized_wire(options.fd, kExpectedClose, sizeof(kExpectedClose) - 1u));
-    REQUIRE(expect_eof(options.fd, test_mono_ms() + 3000));
+    REQUIRE(expect_eof(options.fd, test_deadline_after_ms(3000)));
     REQUIRE(shard.loop->is_running());
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     REQUIRE_EQ(close(options.fd), 0);
@@ -41272,7 +41272,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
                                u32* observed_len) -> ReadOutcome {
         *observed_len = 0;
         while (*observed_len < expected_len) {
-            const i64 remaining_ms = absolute_deadline_ms - test_mono_ms();
+            const i64 remaining_ms = test_ms_until(absolute_deadline_ms);
             if (remaining_ms <= 0) return ReadOutcome::Timeout;
             const i32 timeout_ms = remaining_ms > 5000 ? 5000 : static_cast<i32>(remaining_ms);
             const i32 got =
@@ -41296,7 +41296,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
     char response[sizeof(kExpectedKeepAlive) + 32]{};
     u32 response_len = 0;
-    const i64 response_one_deadline_ms = test_mono_ms() + 5000;
+    const i64 response_one_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(read_exact_until(client.fd,
                                 response,
                                 sizeof(kExpectedKeepAlive) - 1u,
@@ -41323,7 +41323,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kHeadRequest, sizeof(kHeadRequest) - 1u));
     memset(response, 0, sizeof(response));
     response_len = 0;
-    const i64 head_deadline_ms = test_mono_ms() + 5000;
+    const i64 head_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(
         read_exact_until(
             client.fd, response, sizeof(kExpectedHead) - 1u, head_deadline_ms, &response_len),
@@ -41340,7 +41340,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kRequestTwo, sizeof(kRequestTwo) - 1u));
     memset(response, 0, sizeof(response));
     response_len = 0;
-    const i64 response_two_deadline_ms = test_mono_ms() + 5000;
+    const i64 response_two_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(read_exact_until(client.fd,
                                 response,
                                 sizeof(kExpectedClose) - 1u,
@@ -41354,10 +41354,10 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
 
     // EOF is a wire witness, not a cleanup side effect: keep the client fd and
     // both owners live, and wait on one absolute three-second budget.
-    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 eof_deadline_ms = test_deadline_after_ms(3000);
     i32 eof_result = -EAGAIN;
     do {
-        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(eof_deadline_ms);
         if (remaining_ms <= 0) break;
         eof_result = recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
     } while (eof_result == -EINTR);
@@ -41386,7 +41386,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kH10DefaultCloseRequest, sizeof(kH10DefaultCloseRequest) - 1u));
     memset(response, 0, sizeof(response));
     response_len = 0;
-    const i64 default_close_deadline_ms = test_mono_ms() + 5000;
+    const i64 default_close_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(read_exact_until(client.fd,
                                 response,
                                 sizeof(kH10DefaultCloseResponse) - 1u,
@@ -41395,10 +41395,10 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
                ReadOutcome::Complete);
     REQUIRE_EQ(response_len, sizeof(kH10DefaultCloseResponse) - 1u);
     CHECK_EQ(memcmp(response, kH10DefaultCloseResponse, response_len), 0);
-    const i64 default_eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 default_eof_deadline_ms = test_deadline_after_ms(3000);
     i32 default_eof_result = -EAGAIN;
     do {
-        const i64 remaining_ms = default_eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(default_eof_deadline_ms);
         if (remaining_ms <= 0) break;
         default_eof_result =
             recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
@@ -41428,7 +41428,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kH11RequestOne, sizeof(kH11RequestOne) - 1u));
     memset(response, 0, sizeof(response));
     response_len = 0;
-    const i64 h11_one_deadline_ms = test_mono_ms() + 5000;
+    const i64 h11_one_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(read_exact_until(client.fd,
                                 response,
                                 sizeof(kH11ExpectedKeepAlive) - 1u,
@@ -41444,7 +41444,7 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
     REQUIRE(send_all(client.fd, kH11RequestTwo, sizeof(kH11RequestTwo) - 1u));
     memset(response, 0, sizeof(response));
     response_len = 0;
-    const i64 h11_two_deadline_ms = test_mono_ms() + 5000;
+    const i64 h11_two_deadline_ms = test_deadline_after_ms(5000);
     REQUIRE_EQ(read_exact_until(client.fd,
                                 response,
                                 sizeof(kH11ExpectedClose) - 1u,
@@ -41453,10 +41453,10 @@ static void run_ordinary_source_local_response_request_persistence(rut::test::Te
                ReadOutcome::Complete);
     REQUIRE_EQ(response_len, sizeof(kH11ExpectedClose) - 1u);
     CHECK_EQ(memcmp(response, kH11ExpectedClose, response_len), 0);
-    const i64 h11_eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 h11_eof_deadline_ms = test_deadline_after_ms(3000);
     i32 h11_eof_result = -EAGAIN;
     do {
-        const i64 remaining_ms = h11_eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(h11_eof_deadline_ms);
         if (remaining_ms <= 0) break;
         h11_eof_result =
             recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
@@ -42347,7 +42347,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         }
     } runner{shard};
     REQUIRE(runner.start());
-    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    const i64 entered_deadline_ms = test_deadline_after_ms(3000);
     while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
         sched_yield();
     REQUIRE(runner.entered.load(std::memory_order_acquire));
@@ -42362,7 +42362,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     set_socket_timeouts(client.fd, 8);
     REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
 
-    const i64 staged_deadline_ms = test_mono_ms() + 5000;
+    const i64 staged_deadline_ms = test_deadline_after_ms(5000);
     while (!runner.send_staged.load(std::memory_order_acquire) &&
            test_mono_ms() < staged_deadline_ms)
         sched_yield();
@@ -42439,7 +42439,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
         encode_non_upstream_user_data({kRawTimerConnId, IoEventType::Timeout, 0});
     REQUIRE_NE(expected_recv_user_data, kInvalidIoUserData);
     REQUIRE_NE(expected_timer_user_data, kInvalidIoUserData);
-    const i64 raw_deadline_ms = test_mono_ms() + 5000;
+    const i64 raw_deadline_ms = test_deadline_after_ms(5000);
     while (raw_request_len < sizeof(kRequestTwo) - 1u && test_mono_ms() < raw_deadline_ms) {
         const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
         REQUIRE_LE(raw_tail - raw_head, backend.cq_ring_entries);
@@ -42505,9 +42505,9 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
     char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
     const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
     u32 wire_len = 0;
-    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    const i64 wire_deadline_ms = test_deadline_after_ms(5000);
     while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
-        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(wire_deadline_ms);
         if (remaining_ms <= 0) break;
         const i32 got = recv_timeout(
             client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
@@ -42522,10 +42522,10 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                0);
 
     char eof_probe[32];
-    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 eof_deadline_ms = test_deadline_after_ms(3000);
     i32 eof_result = -EAGAIN;
     while (test_mono_ms() < eof_deadline_ms) {
-        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(eof_deadline_ms);
         if (remaining_ms <= 0) break;
         eof_result =
             recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
@@ -42985,7 +42985,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
         }
     } runner{shard};
     REQUIRE(runner.start());
-    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    const i64 entered_deadline_ms = test_deadline_after_ms(3000);
     while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
         sched_yield();
     REQUIRE(runner.entered.load(std::memory_order_acquire));
@@ -43000,7 +43000,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     set_socket_timeouts(client.fd, 8);
     REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
 
-    const i64 staged_deadline_ms = test_mono_ms() + 5000;
+    const i64 staged_deadline_ms = test_deadline_after_ms(5000);
     while (!runner.send_staged.load(std::memory_order_acquire) &&
            test_mono_ms() < staged_deadline_ms)
         sched_yield();
@@ -43092,7 +43092,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
         encode_non_upstream_user_data({kRawTimerConnId, IoEventType::Timeout, 0});
     REQUIRE_NE(expected_recv_user_data, kInvalidIoUserData);
     REQUIRE_NE(expected_timer_user_data, kInvalidIoUserData);
-    const i64 raw_deadline_ms = test_mono_ms() + 5000;
+    const i64 raw_deadline_ms = test_deadline_after_ms(5000);
     while (raw_request_len < sizeof(kRequestTwo) - 1u && test_mono_ms() < raw_deadline_ms) {
         const u32 raw_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
         REQUIRE_LE(raw_tail - raw_head, backend.cq_ring_entries);
@@ -43158,9 +43158,9 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
     const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
     u32 wire_len = 0;
-    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    const i64 wire_deadline_ms = test_deadline_after_ms(5000);
     while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
-        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(wire_deadline_ms);
         if (remaining_ms <= 0) break;
         const i32 got = recv_timeout(
             client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
@@ -43176,10 +43176,10 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
                0);
 
     char eof_probe[32];
-    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 eof_deadline_ms = test_deadline_after_ms(3000);
     i32 eof_result = -EAGAIN;
     while (test_mono_ms() < eof_deadline_ms) {
-        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(eof_deadline_ms);
         if (remaining_ms <= 0) break;
         eof_result =
             recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
@@ -43582,12 +43582,12 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     // first downstream Recv batch has a deterministic opportunity to harvest
     // both requests without a startup sleep.
     REQUIRE(runner.start());
-    const i64 entered_deadline_ms = test_mono_ms() + 3000;
+    const i64 entered_deadline_ms = test_deadline_after_ms(3000);
     while (!runner.entered.load(std::memory_order_acquire) && test_mono_ms() < entered_deadline_ms)
         sched_yield();
     REQUIRE(runner.entered.load(std::memory_order_acquire));
 
-    const i64 ingress_deadline_ms = test_mono_ms() + 5000;
+    const i64 ingress_deadline_ms = test_deadline_after_ms(5000);
     while (!runner.ingress_checked.load(std::memory_order_acquire) &&
            test_mono_ms() < ingress_deadline_ms)
         sched_yield();
@@ -43618,9 +43618,9 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
     char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
     const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
     u32 wire_len = 0;
-    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    const i64 wire_deadline_ms = test_deadline_after_ms(5000);
     while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
-        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(wire_deadline_ms);
         if (remaining_ms <= 0) break;
         const i32 got = recv_timeout(
             client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));
@@ -43635,10 +43635,10 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
                0);
 
     char eof_probe[32];
-    const i64 eof_deadline_ms = test_mono_ms() + 3000;
+    const i64 eof_deadline_ms = test_deadline_after_ms(3000);
     i32 eof_result = -EAGAIN;
     while (test_mono_ms() < eof_deadline_ms) {
-        const i64 remaining_ms = eof_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(eof_deadline_ms);
         if (remaining_ms <= 0) break;
         eof_result =
             recv_timeout(client.fd, eof_probe, sizeof(eof_probe), static_cast<i32>(remaining_ms));
@@ -44131,7 +44131,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                static_cast<ssize_t>(sizeof(kRequestWire) - 1u));
     REQUIRE(runner.start());
 
-    const i64 ingress_deadline_ms = test_mono_ms() + 5000;
+    const i64 ingress_deadline_ms = test_deadline_after_ms(5000);
     while (!runner.ingress_checked.load(std::memory_order_acquire) &&
            test_mono_ms() < ingress_deadline_ms)
         sched_yield();
@@ -44153,7 +44153,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
     REQUIRE_LT(runner.conn_id, IoUringEventLoop::kMaxConns);
     runner.ingress_release.store(true, std::memory_order_release);
 
-    const i64 stage_deadline_ms = test_mono_ms() + 5000;
+    const i64 stage_deadline_ms = test_deadline_after_ms(5000);
     while (!runner.exact_staged.load(std::memory_order_acquire) &&
            !runner.exited.load(std::memory_order_acquire) && test_mono_ms() < stage_deadline_ms)
         sched_yield();
@@ -44206,9 +44206,9 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
     char wire[sizeof(kExpectedOne) + sizeof(kExpectedTwo) + 32]{};
     const u32 expected_wire_len = sizeof(kExpectedOne) - 1u + sizeof(kExpectedTwo) - 1u;
     u32 wire_len = 0;
-    const i64 wire_deadline_ms = test_mono_ms() + 5000;
+    const i64 wire_deadline_ms = test_deadline_after_ms(5000);
     while (wire_len < expected_wire_len && test_mono_ms() < wire_deadline_ms) {
-        const i64 remaining_ms = wire_deadline_ms - test_mono_ms();
+        const i64 remaining_ms = test_ms_until(wire_deadline_ms);
         if (remaining_ms <= 0) break;
         const i32 got = recv_timeout(
             client.fd, wire + wire_len, sizeof(wire) - wire_len, static_cast<i32>(remaining_ms));

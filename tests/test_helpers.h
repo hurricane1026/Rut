@@ -1294,9 +1294,32 @@ inline bool send_all(i32 fd, const char* d, u32 len) {
 }
 
 inline i64 test_mono_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+    timespec ts{};
+    i64 ms;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || __builtin_mul_overflow(ts.tv_sec, 1000, &ms) ||
+        __builtin_add_overflow(ms, ts.tv_nsec / 1'000'000, &ms)) {
+        rut::test::out("test monotonic clock cannot be read as milliseconds\n");
+        _exit(1);
+    }
+    return ms;
+}
+
+inline i64 test_deadline_after_ms(i64 delay) {
+    i64 deadline;
+    if (__builtin_add_overflow(test_mono_ms(), delay, &deadline)) {
+        rut::test::out("test deadline exceeds monotonic clock range\n");
+        _exit(1);
+    }
+    return deadline;
+}
+
+inline i64 test_ms_until(i64 deadline) {
+    i64 remaining;
+    if (__builtin_sub_overflow(deadline, test_mono_ms(), &remaining)) {
+        rut::test::out("test deadline and monotonic clock difference exceeds range\n");
+        _exit(1);
+    }
+    return remaining;
 }
 
 inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
@@ -1305,9 +1328,9 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
     // handler exists. Field evidence (PR #186 dump): step=recv-101-nothing
     // errno=4. Retry with the remaining budget instead of surfacing a
     // spurious failure; a genuinely expired budget still returns -EAGAIN.
-    const i64 deadline = test_mono_ms() + ms;
+    const i64 deadline = test_deadline_after_ms(ms);
     for (;;) {
-        i64 left = deadline - test_mono_ms();
+        i64 left = test_ms_until(deadline);
         if (left < 1) left = 1;
         struct timeval tv;
         tv.tv_sec = left / 1000;
