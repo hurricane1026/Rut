@@ -150,12 +150,19 @@ bool parse_http_date(Str value, u64& seconds) {
     };
     i64 days = (static_cast<i64>(year) - 1970) * 365 +
                leap_years(static_cast<u32>(static_cast<i64>(year) - 1)) - leap_years(1969);
-    for (u32 i = 0; i < month; ++i) days += static_cast<i64>(kDays[i]) + (i == 1 && kLeap ? 1 : 0);
+    for (u32 i = 0; i < month; ++i)
+        days = static_cast<i64>(static_cast<__int128_t>(days) + static_cast<i64>(kDays[i]) +
+                                (i == 1 && kLeap ? 1 : 0));
     days += static_cast<i64>(day) - 1;
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!equal({p, 3}, kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3)) return false;
-    const i64 seconds_wide = days * 86400 + static_cast<i64>(hour) * 3600 +
-                             static_cast<i64>(minute) * 60 + static_cast<i64>(second);
+    if (!equal({p, 3},
+               kWeekdays +
+                   static_cast<i64>((static_cast<i64>(static_cast<__int128_t>(days) + 4) % 7)) * 3,
+               3))
+        return false;
+    const i64 seconds_wide =
+        static_cast<i64>(static_cast<__int128_t>(days) * 86400 + static_cast<i64>(hour) * 3600 +
+                         static_cast<i64>(minute) * 60 + static_cast<i64>(second));
     seconds = static_cast<u64>(seconds_wide);
     return true;
 }

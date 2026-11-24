@@ -244,15 +244,16 @@ u32 http2_write_headers(
     for (u32 i = 0; i < n; i++) {
         // Prefix width follows the actual 32-bit lengths; check in i64 so huge
         // direct inputs are rejected before any pointer arithmetic.
-        const i64 kWorst = static_cast<i64>(o) + static_cast<i64>(hs[i].name.len) +
-                           static_cast<i64>(hs[i].value.len) +
-                           hpack_field_overhead(hs[i].name.len, hs[i].value.len);
+        const i64 kWorst =
+            static_cast<i64>(static_cast<__int128_t>(o) + static_cast<i64>(hs[i].name.len) +
+                             static_cast<i64>(hs[i].value.len) +
+                             hpack_field_overhead(hs[i].name.len, hs[i].value.len));
         if (kWorst > static_cast<i64>(out_cap) ||
             kWorst - static_cast<i64>(kFrameHeaderSize) > static_cast<i64>(kMaxFramePayload))
             return 0;
         const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
         // kWorst is a complete write-before bound for encode_header.
-        o += kEncoded;
+        o = static_cast<i64>(static_cast<__int128_t>(o) + kEncoded);
     }
     const i64 kPayload = o - static_cast<i64>(kFrameHeaderSize);
     if (kPayload > static_cast<i64>(kMaxFramePayload)) return 0;
@@ -363,7 +364,7 @@ static u32 http2_write_response_impl(u8* out,
             }
         }
         const i64 kEncoded = enc.encode(hblock + hb, name, hdrs[i].value);
-        hb += kEncoded;
+        hb = static_cast<i64>(static_cast<__int128_t>(hb) + kEncoded);
     }
     if (body_len > 0) {
         char clbuf[10];
@@ -373,14 +374,15 @@ static u32 http2_write_response_impl(u8* out,
         if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;  // (reserved above)
         const i64 kClEncoded =
             enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
-        hb += kClEncoded;
+        hb = static_cast<i64>(static_cast<__int128_t>(hb) + kClEncoded);
     }
 
     const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
-    const i64 kNeed = static_cast<i64>(kFrameHeaderSize) + hb +
-                      (!headers_only && body_len > 0
-                           ? static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(body_len)
-                           : 0);
+    const i64 kNeed =
+        static_cast<i64>(static_cast<__int128_t>(kFrameHeaderSize) + hb +
+                         (!headers_only && body_len > 0
+                              ? static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(body_len)
+                              : 0));
     if (!headers_only && body_len > 0x00ffffffu) return 0;
     if (kNeed > out_cap) return 0;
 
@@ -391,11 +393,12 @@ static u32 http2_write_response_impl(u8* out,
         static_cast<u8>(http2_flag::kEndHeaders | (kEndOnHeaders ? http2_flag::kEndStream : 0));
     h.stream_id = stream_id;
     write_frame_header(out, h);
-    for (i64 i = 0; i < hb; i++) out[static_cast<i64>(kFrameHeaderSize) + i] = hblock[i];
+    for (i64 i = 0; i < hb; i++) (out + static_cast<i64>(kFrameHeaderSize))[i] = hblock[i];
     i64 o = static_cast<i64>(kFrameHeaderSize) + hb;
     if (!headers_only && body_len > 0)
-        o += static_cast<i64>(
-            http2_write_data(out + o, stream_id, body, body_len, /*end_stream=*/true));
+        o = static_cast<i64>(static_cast<__int128_t>(o) +
+                             static_cast<i64>(http2_write_data(
+                                 out + o, stream_id, body, body_len, /*end_stream=*/true)));
     return static_cast<u32>(o);
 }
 

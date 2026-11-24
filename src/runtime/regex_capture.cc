@@ -100,17 +100,21 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
             break;
         if (count == 64 || !found.data()) return 0;
         const i64 start = static_cast<i64>(found.data() - text.ptr);
-        const i64 end = start + static_cast<i64>(found.size());
+        const i64 end = static_cast<i64>(static_cast<__int128_t>(start) +
+                                         static_cast<__int128_t>(found.size()));
         if (start < static_cast<i64>(search) || end > static_cast<i64>(text.len)) return 0;
         matches[count++] = {static_cast<u32>(start), static_cast<u32>(end)};
-        size = size - (end - start) + static_cast<i64>(replacement.len);
+        size = static_cast<i64>(static_cast<__int128_t>(size) -
+                                (static_cast<__int128_t>(end) - start) +
+                                static_cast<i64>(replacement.len));
         if (end == start) {
             if (end == text.len) break;
             search = static_cast<u32>(end + 1);
         } else
             search = end;
     }
-    const i64 budget_remaining = static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1});
+    const i64 budget_remaining =
+        static_cast<i64>(static_cast<__int128_t>(kStringArenaBudget) - (size ? size : i64{1}));
     if (size > static_cast<i64>(kStringOutputLimit) ||
         arena.space_used() > static_cast<u64>(budget_remaining) ||
         (!arena.current && !arena.init(arena.backend.pool)))
@@ -123,9 +127,10 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
         const auto match = matches[i];
         const i64 length = static_cast<i64>(match.start) - static_cast<i64>(copied);
         if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
-        written += length;
+        written = static_cast<i64>(static_cast<__int128_t>(written) + length);
         if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-        written += static_cast<i64>(replacement.len);
+        written =
+            static_cast<i64>(static_cast<__int128_t>(written) + static_cast<i64>(replacement.len));
         copied = static_cast<i64>(match.end);
     }
     if (static_cast<i64>(text.len) > copied)

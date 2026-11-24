@@ -156,7 +156,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         at = static_cast<u32>(end_wide);
     }
     if (at != len) return DnsAnswer::Invalid;
-    memcpy(result.canonical, name, static_cast<size_t>(static_cast<i64>(strlen(name)) + 1));
+    memcpy(result.canonical, name, static_cast<size_t>(static_cast<__int128_t>(strlen(name)) + 1));
     for (u32 depth = 0; depth <= 8; ++depth) {
         bool alias = false;
         char target[254]{};
@@ -238,7 +238,7 @@ int DnsResolver::resolve(
         }
         u64 next_valid = 0;
         q.valid_until = __builtin_add_overflow(now, u64{60000}, &next_valid) ? ~u64{0} : next_valid;
-        memcpy(q.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
+        memcpy(q.name, host, static_cast<size_t>(static_cast<__int128_t>(strlen(host)) + 1));
         q.phase = 1;
     }
     const u32 kAvailable = server ? 1 : count;
@@ -303,7 +303,8 @@ int DnsResolver::resolve(
                  platform::kSendFlags);
         if (kN < 0 && pending()) return 0;
         if (kN <= 0) return retry();
-        q.sent = static_cast<u32>(static_cast<i64>(q.sent) + kN);
+        q.sent =
+            static_cast<u32>(static_cast<i64>(q.sent) + static_cast<i64>(static_cast<u32>(kN)));
         if (static_cast<i64>(q.sent) == static_cast<i64>(q.question_size) + 2) q.phase = 6;
         return 0;
     } else if (q.phase == 6) {
@@ -315,7 +316,8 @@ int DnsResolver::resolve(
                  0);
         if (kN < 0 && pending()) return 0;
         if (kN <= 0) return retry();
-        q.received = static_cast<u32>(static_cast<i64>(q.received) + kN);
+        q.received =
+            static_cast<u32>(static_cast<i64>(q.received) + static_cast<i64>(static_cast<u32>(kN)));
         if (q.received == 2) {
             q.size = word(q.packet);
             if (q.size < 12 || q.size > 4096) return retry();
@@ -366,7 +368,7 @@ int DnsResolver::resolve(
     if (result.ttl && expires > now) {
         auto& e = cache[replacement++ % 16];
         e = {};
-        memcpy(e.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
+        memcpy(e.name, host, static_cast<size_t>(static_cast<__int128_t>(strlen(host)) + 1));
         e.server = server;
         e.port = port;
         e.epoch = epoch;
