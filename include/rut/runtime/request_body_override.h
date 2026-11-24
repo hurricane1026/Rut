@@ -89,7 +89,14 @@ inline bool replace_h1_body_in_place(
                          static_cast<i64>(old_body_len);
     const i64 new_total =
         static_cast<i64>(old_header_end) + header_delta + static_cast<i64>(body.len) + tail_len;
-    if (tail_len < 0 || new_total < 0 || new_total > static_cast<i64>(capacity)) return false;
+    // Growing the Content-Length line shifts the body and tail up by header_delta
+    // before the body is shortened. That intermediate extent can therefore exceed
+    // the final total, so bound the larger of the two writes.
+    const i64 intermediate_total =
+        static_cast<i64>(old_total) + (header_delta > 0 ? header_delta : 0);
+    if (tail_len < 0 || new_total < 0 || new_total > static_cast<i64>(capacity) ||
+        intermediate_total > static_cast<i64>(capacity))
+        return false;
 
     const u32 after_line = static_cast<u32>(static_cast<i64>(line_end) + 2);
     if (header_delta != 0) {

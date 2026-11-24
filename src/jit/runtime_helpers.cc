@@ -684,6 +684,11 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
         return false;
     u8* data = conn.recv_slice;
     if (data == nullptr || data != conn.recv_buf.data()) return false;
+    // Response header mutations may borrow request bytes, e.g.
+    // resp.set("X-Request-Path", req.path). The terminator publishes them before
+    // this helper runs, so pin those values before the in-place body rewrite
+    // shifts the header lines and body they point into.
+    if (!conn.snapshot_response_mutations_before_request_rewrite()) return false;
     u32 new_total = total;
     u32 new_header_end = old_header_end;
     if (!replace_h1_body_in_place(
@@ -693,6 +698,9 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
     conn.req_header_end = new_header_end;
     conn.req_content_length = body.len;
     conn.req_initial_send_len = new_header_end + body.len;
+    // The pinned snapshot still holds the pre-rewrite request, so a reused-socket
+    // retry can no longer replay it; the rewritten bytes live in recv_buf instead.
+    if (conn.response_mutations_snapshotted) conn.retry_req_snapshot_replayable = false;
     conn.req_body_overridden = true;
     // Body bytes changed even when the total length happens to match.
     t_parse_cache = {};

@@ -4031,6 +4031,15 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!b.emit_req_set_path(path.value(), {term.span.line, term.span.col}, true))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
         }
+        // ReqSetBody rewrites recv_buf eagerly, so publish response mutations
+        // before it: a borrowed value such as resp.set("X", req.path) would
+        // otherwise be committed after the bytes it points into shifted. Every
+        // other forward keeps the later commit point below.
+        const bool kSetBody =
+            term.forward_set_body.ptr != nullptr || term.forward_body_value != nullptr;
+        if (term.commit_response_mutations && kSetBody &&
+            !b.emit_resp_commit_headers({term.span.line, term.span.col}))
+            return frontend_error(FrontendError::OutOfMemory, term.span);
         // forward(set_body: ...): emit ReqSetBody before the terminator. The
         // runtime helper replaces the buffered Content-Length body in place and
         // fails closed for chunked/partial requests.
@@ -4131,7 +4140,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                 if (!transform) return core::make_unexpected(transform.error());
                 target_transform_id = transform.value();
             }
-            if (term.commit_response_mutations &&
+            if (term.commit_response_mutations && !kSetBody &&
                 !b.emit_resp_commit_headers({term.span.line, term.span.col}))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             if (target_transform_id != 0 &&
@@ -4176,7 +4185,7 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
             if (!transform) return core::make_unexpected(transform.error());
             target_transform_id = transform.value();
         }
-        if (term.commit_response_mutations &&
+        if (term.commit_response_mutations && !kSetBody &&
             !b.emit_resp_commit_headers({term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         if (target_transform_id != 0 &&

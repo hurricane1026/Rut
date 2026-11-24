@@ -560,6 +560,27 @@ struct ConnectionBase {
         }
     }
 
+    // Preserve request-backed after-mutation values before forward(set_path:),
+    // forward(set_header:) or forward(set_body:) rewrite recv_buf in place.
+    // send_buf remains pinned until the response completes; on_upstream_request_sent
+    // later reserves this snapshot as the prefix used by pipeline_stash.
+    bool snapshot_response_mutations_before_request_rewrite() {
+        if (resp_header_mutation_count == 0 || retry_req_send_len != 0 ||
+            response_mutations_snapshotted)
+            return true;
+        if (req_initial_send_len == 0 || req_initial_send_len > recv_buf.len() ||
+            req_initial_send_len > send_buf.capacity())
+            return false;
+        const u8* old_base = recv_buf.data();
+        send_buf.reset();
+        if (send_buf.write(old_base, req_initial_send_len) != req_initial_send_len) return false;
+        reanchor_response_mutations(old_base, req_initial_send_len, send_buf.data());
+        response_mutations_snapshotted = true;
+        retry_req_snapshot_replayable =
+            !req_path_overridden && !req_body_overridden && req_header_override_count == 0;
+        return true;
+    }
+
     // Copy request-backed mutation values out of a synthesized request before
     // HTTP/2 reuses its request scratch for the encoded response. Literal values
     // already live in JIT-owned storage and do not need copying.

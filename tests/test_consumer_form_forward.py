@@ -71,7 +71,12 @@ def main():
                 ' guard let body = consumer_form.remainingBody(identity) else { return 503 }'
                 ' return forward(api, load_balance: .roundRobin, set_path: "/combined-target", set_body: body) }\n'
                 'route POST "/oversize-override" {'
-                ' return forward(api, load_balance: .roundRobin, set_body: "' + 'x' * 65537 + '") }\n')
+                ' return forward(api, load_balance: .roundRobin, set_body: "' + 'x' * 65537 + '") }\n'
+                'func echoBack(_ req: i32, _ resp: Response) -> i32 {'
+                ' resp.set("X-Echo-Back", req.uniqueHeader("X-Echo-Back").or("missing")) 0 }\n'
+                'chain echo { after echoBack(req, resp) }\n'
+                'route POST "/override-echo" use chain echo {'
+                ' return forward(api, load_balance: .roundRobin, set_body: "0123456789") }\n')
             source.write_text(text)
             log = root / 'gateway.log'
             with log.open('w') as output:
@@ -109,6 +114,24 @@ def main():
                             break
                         data += part
                 return int(data.split(b' ', 2)[1])
+
+            def raw_response(path, headers, body):
+                wire = f'POST {path} HTTP/1.1\r\nHost: local\r\n{headers}\r\n'.encode() + body
+                with socket.create_connection(('127.0.0.1', port), timeout=6) as connection:
+                    connection.sendall(wire)
+                    data = b''
+                    while True:
+                        part = connection.recv(65536)
+                        if not part:
+                            break
+                        data += part
+                head, _, _ = data.partition(b'\r\n\r\n')
+                lines = head.split(b'\r\n')
+                received_headers = {}
+                for line in lines[1:]:
+                    name, _, value = line.partition(b':')
+                    received_headers[name.strip().lower()] = value.strip()
+                return int(lines[0].split(b' ')[1]), received_headers
 
             try:
                 deadline = time.monotonic() + 30
@@ -165,6 +188,18 @@ def main():
                 keepalive.close()
                 with lock:
                     assert [item[2] for item in received[-2:]] == [b'a=1', b'b=2'], received[-2:]
+                # A response header borrowed from a request header must survive
+                # the in-place set_body rewrite. Content-Length is listed first
+                # so its length change shifts the borrowed header bytes.
+                status, echoed_headers = raw_response(
+                    '/override-echo',
+                    'Content-Length: 9\r\nX-Echo-Back: needle\r\nConnection: close\r\n',
+                    b'012345678')
+                assert status == 200, status
+                assert echoed_headers.get(b'x-echo-back') == b'needle', echoed_headers
+                with lock:
+                    assert received[-1][0] == '/override-echo', received[-1]
+                    assert received[-1][2] == b'0123456789', received[-1]
                 before = len(received)
                 for body in ['api_key=', 'api_key=wrong', 'api_key=custom-key&x=1&x=2',
                              'api_key=custom-key&x=%00', 'api_key=custom-key&x=%gg',
