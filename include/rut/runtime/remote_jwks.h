@@ -8,10 +8,12 @@ namespace rut {
 // Parsing occurs before configuration publication, never from token metadata.
 struct RemoteJwks {
     static constexpr u32 kMaxDnsAddresses = 8;
+    enum class DnsTransport : u8 { Udp, Tcp };
     HttpsEndpoint endpoint{};
     char dns_address[HttpsEndpoint::kAddressCapacity]{};
     bool dns_aaaa = false;
     bool dns_dual_stack = false;
+    DnsTransport dns_transport = DnsTransport::Udp;
     u16 dns_port = 53;
     u32 dns_cache_seconds = 0;
     u32 dns_timeout_seconds = 0;
@@ -103,9 +105,19 @@ private:
     HttpsFetch keys_;
     HttpsFetch discovery_;
     State state_ = State::Idle;
+    enum class DnsStep : u8 { None, Connect, Write, ReadLength, ReadBody };
     i32 dns_fd_ = -1;
+    DnsStep dns_step_ = DnsStep::None;
     u8 query_[272]{};
     u32 query_length_ = 0;
+    char dns_out_[274]{};
+    u32 dns_out_len_ = 0;
+    u32 dns_out_sent_ = 0;
+    u8 dns_length_[2]{};
+    u32 dns_length_have_ = 0;
+    char dns_in_[4096]{};
+    u32 dns_in_len_ = 0;
+    u32 dns_in_expected_ = 0;
     u64 started_ = 0;
     u32 timeout_ = 0;
     JwksDnsAddresses addresses_{};
@@ -116,6 +128,9 @@ private:
     bool discovering_ = false;
     bool initialized_ = false;
     bool send_dns_query(bool aaaa);
+    bool advance_dns_stream(u64 now);
+    bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
+    void close_dns();
     bool begin_http(u64 now);
     bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;

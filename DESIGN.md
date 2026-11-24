@@ -11448,7 +11448,9 @@ must match the selected family and an explicit finite allowlist. TLS name/CA, is
 kid/algorithm inventory remain configuration-owned. The validated terminal
 addresses are tried in answer order after definitive TCP establishment failures.
 Each address runs its own discovery and key exchange within the shared deadline.
-The UDP resolver and HTTPS endpoint each support bare IPv4 or IPv6 literals.
+The resolver supports bare IPv4 or IPv6 literals over UDP (default) or an
+explicit TCP profile with RFC 7766 length framing; there is no transport
+fallback. The HTTPS endpoint also supports bare IPv4 or IPv6 literals.
 The allowlist rejects duplicate binary addresses at configuration load. Optional
 `requireNonEmptyKeys` treats a zero-approved-key refresh as failure, retaining
 last-good keys only within their original maximum age; the default removes keys.
