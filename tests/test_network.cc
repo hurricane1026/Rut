@@ -55,6 +55,18 @@ using rut::test_fault::ScopedRecvData;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
 
+static rut::ConnectionBase::RespHeaderMutation& append_test_response_mutation(
+    rut::ConnectionBase& connection) {
+    const rut::u8 index = connection.resp_header_mutation_count;
+    static_assert(rut::ConnectionBase::kMaxRespHeaderMutations <= UINT8_MAX);
+    if (index >= rut::ConnectionBase::kMaxRespHeaderMutations) {
+        rut::test::out("test response header mutation capacity exceeded\n");
+        _exit(1);
+    }
+    connection.resp_header_mutation_count = index + 1;
+    return connection.resp_header_mutations[index];
+}
+
 static i32 count_open_fds() {
 #ifdef __APPLE__
     DIR* directory = opendir("/dev/fd");
@@ -67,10 +79,10 @@ static i32 count_open_fds() {
         if ((entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
             (entry->d_name[0] == '.' && entry->d_name[1] == '.' && entry->d_name[2] == '\0'))
             continue;
-        count++;
+        rut::test::increment_check_count(count);
     }
     closedir(directory);
-    return count - 1;  // Exclude the directory fd used for this inventory.
+    return count > 0 ? count - 1 : -1;  // Exclude the fd used for this inventory.
 }
 
 struct ScopedListenerTestFd {
@@ -19320,7 +19332,7 @@ TEST(response_headers, request_backed_forward_mutation_survives_recv_reuse) {
     const u32 len = sizeof(request) - 1;
     c->recv_buf.write(reinterpret_cast<const u8*>(request), len);
     c->req_initial_send_len = len;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
@@ -19508,7 +19520,7 @@ TEST(response_headers, forward_mutation_snapshot_released_at_exchange_completion
     const u32 len = sizeof(request) - 1;
     c->recv_buf.write(reinterpret_cast<const u8*>(request), len);
     c->req_initial_send_len = len;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
@@ -19568,7 +19580,7 @@ TEST(response_headers, forward_mutation_release_keeps_pipeline_stash_and_serves_
     c->recv_buf.write(reinterpret_cast<const u8*>(req1), len1);
     c->recv_buf.write(reinterpret_cast<const u8*>(req2), len2);
     c->req_initial_send_len = len1;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
@@ -19638,7 +19650,7 @@ TEST(response_headers, forward_mutation_release_keeps_two_request_stash_until_re
     c->recv_buf.write(reinterpret_cast<const u8*>(req2), len2);
     c->recv_buf.write(reinterpret_cast<const u8*>(req3), len3);
     c->req_initial_send_len = len1;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
@@ -39271,7 +39283,7 @@ TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
     c->req_initial_send_len = sizeof(first) - 1;
     c->req_body_mode = BodyMode::None;
     c->keep_alive = true;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
@@ -39382,7 +39394,7 @@ TEST(response_headers, failed_initial_send_reserves_snapshot_before_pipeline_sta
     c->req_initial_send_len = sizeof(first) - 1;
     c->req_body_mode = BodyMode::None;
     c->keep_alive = true;
-    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*c);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Path", 6};
     mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 6};
@@ -86918,7 +86930,7 @@ TEST(response_headers, dynamic_mutations_merge_with_static_headers_in_order) {
                             u32 name_len,
                             const char* value,
                             u32 value_len) {
-        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        auto& mutation = append_test_response_mutation(conn);
         mutation.mode = mode;
         mutation.name = {name, name_len};
         mutation.value = {value, value_len};
@@ -86954,7 +86966,7 @@ TEST(response_headers, content_type_removal_suppresses_direct_response_default) 
 
     Connection conn;
     conn.reset();
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
     mutation.name = {"content-type", 12};
     mutation.value = {nullptr, 0};
@@ -87279,7 +87291,7 @@ TEST(response_headers, committed_after_header_preserves_status_reason_body) {
 
     RouteConfig cfg{};
     conn->request_config = &cfg;
-    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
     mutation.name = {"X-After", 7};
     mutation.value = {"yes", 3};
@@ -87305,7 +87317,7 @@ TEST(response_headers, removing_last_header_preserves_headers_only_body_mode) {
 
     Connection conn;
     conn.reset();
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
     mutation.name = {"x-test", 6};
     mutation.value = {nullptr, 0};
@@ -87346,7 +87358,7 @@ TEST(response_headers, committed_mutations_rewrite_forwarded_h1_headers) {
                             u32 name_len,
                             const char* value,
                             u32 value_len) {
-        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        auto& mutation = append_test_response_mutation(conn);
         mutation.mode = mode;
         mutation.name = {name, name_len};
         mutation.value = {value, value_len};
@@ -87381,7 +87393,7 @@ TEST(response_headers, forwarded_mutations_fold_in_source_order) {
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
     auto add =
         [&](ConnectionBase::RespHeaderMutationMode mode, const char* name, const char* value) {
-            auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+            auto& mutation = append_test_response_mutation(conn);
             mutation.mode = mode;
             mutation.name = {name, static_cast<u32>(strlen(name))};
             mutation.value = {value, value ? static_cast<u32>(strlen(value)) : 0u};
@@ -87417,7 +87429,7 @@ TEST(response_headers, forwarded_header_growth_does_not_need_upstream_body_headr
         static const u8 body = 'x';
         conn.upstream_recv_buf.write(&body, 1);
     }
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
     mutation.name = {"X-Expanded", 10};
     static const char expanded[] = "a header that would not fit in the full upstream buffer";
@@ -87439,7 +87451,7 @@ TEST(response_headers, forwarded_mutations_keep_drain_close_signal) {
     static const char response[] =
         "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
     mutation.name = {"X-Test", 6};
     mutation.value = {"yes", 3};
@@ -87533,7 +87545,7 @@ TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {
     conn.response_header_buf.bind(header_storage, sizeof(header_storage));
     static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Dynamic", 9};
     mutation.value = {"safe\r\nInjected: yes", 19};
@@ -87553,7 +87565,7 @@ TEST(response_headers, forwarded_mutations_reject_framing_headers) {
         conn.response_header_buf.bind(header_storage, sizeof(header_storage));
         static const char response[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
         conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        auto& mutation = append_test_response_mutation(conn);
         mutation.mode = mode;
         mutation.name = {name, static_cast<u32>(strlen(name))};
         mutation.value = {"100", 3};
@@ -87583,7 +87595,7 @@ TEST(response_headers, forwarded_mutations_remove_matching_connection_nomination
         "X-Security: origin\r\n"
         "\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Security", 10};
     mutation.value = {"enforced", 8};
@@ -87612,7 +87624,7 @@ TEST(response_headers, forwarded_remove_strips_stale_connection_nomination) {
         "X-Internal: secret\r\n"
         "\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Remove;
     mutation.name = {"X-Internal", 10};
 
@@ -87638,7 +87650,7 @@ TEST(response_headers, forwarded_add_drops_upstream_connection_nominated_field) 
         "Content-Length: 0\r\n"
         "\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
     mutation.name = {"X-Internal", 10};
     mutation.value = {"public", 6};
@@ -87668,7 +87680,7 @@ TEST(response_headers, forwarded_connection_nomination_preserves_body_framing) {
         "body";
     constexpr u32 kHeaderLen = sizeof(response) - 1 - 4;
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Add;
     mutation.name = {"X-Test", 6};
     mutation.value = {"yes", 3};
@@ -87697,7 +87709,7 @@ TEST(response_headers, forwarded_101_unrelated_mutation_preserves_upgrade_handsh
         "Upgrade: h2c\r\n"
         "\r\n";
     conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-    auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(conn);
     mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Trace", 7};
     mutation.value = {"yes", 3};
@@ -87726,7 +87738,7 @@ TEST(response_headers, forwarded_101_rejects_destructive_handshake_mutations) {
             "Upgrade: websocket\r\n"
             "\r\n";
         conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), sizeof(response) - 1);
-        auto& mutation = conn.resp_header_mutations[conn.resp_header_mutation_count++];
+        auto& mutation = append_test_response_mutation(conn);
         mutation.mode = mode;
         mutation.name = {name, static_cast<u32>(strlen(name))};
         mutation.value =

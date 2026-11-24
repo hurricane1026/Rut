@@ -127,12 +127,15 @@ inline TestCase* g_head = nullptr;
 inline TestCase** g_tail = &g_head;
 inline thread_local TestCase* g_current_test_case = nullptr;
 
-inline void increment_check_count(int& count) {
-    if (count == INT_MAX) {
+inline void add_check_count(int& count, int addend) {
+    if (__builtin_add_overflow(count, addend, &count)) {
         out("test check count exceeds INT_MAX\n");
         _exit(1);
     }
-    ++count;
+}
+
+inline void increment_check_count(int& count) {
+    add_check_count(count, 1);
 }
 
 inline void report_external_failure(const char* file, int line, const char* expr) {
@@ -337,15 +340,16 @@ struct Filter {
         }
     }
 
-    void set_filter(int idx, const char* suite, int suite_len, const char* name, int name_len) {
+    void set_filter(
+        int idx, const char* suite, size_t suite_len, const char* name, size_t name_len) {
         if (idx < 0 || idx >= kMaxFilters) return;
 
         suite_filter[idx] = nullptr;
         name_filter[idx] = nullptr;
 
         if (suite) {
-            int copy_len = suite_len < (kMaxTokenLen - 1) ? suite_len : (kMaxTokenLen - 1);
-            for (int i = 0; i < copy_len; i++) suite_storage[idx][i] = suite[i];
+            size_t copy_len = suite_len < (kMaxTokenLen - 1) ? suite_len : (kMaxTokenLen - 1);
+            for (size_t i = 0; i < copy_len; i++) suite_storage[idx][i] = suite[i];
             suite_storage[idx][copy_len] = '\0';
             suite_filter[idx] = suite_storage[idx];
         } else {
@@ -353,8 +357,8 @@ struct Filter {
         }
 
         if (name) {
-            int copy_len = name_len < (kMaxTokenLen - 1) ? name_len : (kMaxTokenLen - 1);
-            for (int i = 0; i < copy_len; i++) name_storage[idx][i] = name[i];
+            size_t copy_len = name_len < (kMaxTokenLen - 1) ? name_len : (kMaxTokenLen - 1);
+            for (size_t i = 0; i < copy_len; i++) name_storage[idx][i] = name[i];
             name_storage[idx][copy_len] = '\0';
             name_filter[idx] = name_storage[idx];
         } else {
@@ -377,61 +381,44 @@ struct Filter {
     bool token_match(const char* value, const char* token) const {
         if (!value || !token) return false;
 
-        int first_star = -1;
-        int last_star = -1;
-        int star_count = 0;
-        int len = 0;
-        for (int i = 0; token[i]; i++) {
-            if (token[i] == '*') {
-                if (first_star < 0) first_star = i;
-                last_star = i;
-                star_count++;
-            }
-            len++;
+        const char* first_star = nullptr;
+        const char* last_star = nullptr;
+        const char* end = token;
+        for (; *end; ++end) {
+            if (*end != '*') continue;
+            if (!first_star)
+                first_star = end;
+            else if (last_star != first_star)
+                return false;
+            last_star = end;
         }
-        if (first_star < 0) return str_contains(value, token);
+        if (!first_star) return str_contains(value, token);
+        if (token[0] == '*' && token[1] == '\0') return true;
 
-        if (len == 1) return true;
-
-        const bool kPrefixStar = first_star == 0;
-        const bool kSuffixStar = last_star == len - 1;
-        const bool kWrappedStar = kPrefixStar && kSuffixStar;
-        if (!kPrefixStar && !kSuffixStar) return false;
-        if (kWrappedStar) {
-            if (star_count != 2) return false;
-        } else if (star_count != 1) {
-            return false;
-        }
-
-        if (token[0] == '*' && token[len - 1] == '*') {
+        const bool kLeadingStar = first_star == token;
+        const bool kTrailingStar = last_star + 1 == end;
+        if (first_star != last_star) {
+            if (!kLeadingStar || !kTrailingStar) return false;
             char core[128];
-            int n = 0;
-            for (int i = 1; i + 1 < len && n < 127; i++) core[n++] = token[i];
-            core[n] = '\0';
+            char* out = core;
+            for (const char* in = token + 1; in != last_star && out != core + 127; ++in)
+                *out++ = *in;
+            *out = '\0';
             return str_contains(value, core);
         }
-
-        if (token[0] == '*') {
-            int suffix_len = 0;
-            while (token[1 + suffix_len]) suffix_len++;
-            int vlen = 0;
-            while (value[vlen]) vlen++;
-            if (suffix_len > vlen) return false;
-            for (int i = 0; i < suffix_len; i++) {
-                if (token[1 + i] != value[vlen - suffix_len + i]) return false;
-            }
+        if (kLeadingStar) {
+            const char* suffix = token + 1;
+            const size_t kSuffixLength = __builtin_strlen(suffix);
+            const size_t kValueLength = __builtin_strlen(value);
+            if (kSuffixLength > kValueLength) return false;
+            return str_eq(value + (kValueLength - kSuffixLength), suffix);
+        }
+        if (kTrailingStar) {
+            for (const char* in = token; in != last_star; ++in, ++value)
+                if (*in != *value) return false;
             return true;
         }
-
-        if (token[len - 1] == '*') {
-            for (int i = 0; i < len - 1; i++) {
-                if (token[i] != value[i]) return false;
-                if (value[i] == '\0') return false;
-            }
-            return true;
-        }
-
-        return str_contains(value, token);
+        return false;
     }
 
     bool matches(const TestCase* tc) const {
@@ -455,36 +442,28 @@ inline Filter parse_filter(const char* arg) {
     filter.clear();
     if (!arg || !arg[0]) return filter;
 
-    int token_count = 0;
-    int start = 0;
-    for (int i = 0;; i++) {
-        if (arg[i] == ',' || arg[i] == '\0') {
-            if (token_count >= Filter::kMaxFilters) break;
-
-            const int len = i - start;
-            if (len > 0) {
-                int split = -1;
-                for (int k = 0; k < len; k++) {
-                    if (arg[start + k] == '.') {
-                        split = k;
-                        break;
-                    }
-                }
-
-                if (split >= 0) {
-                    filter.set_filter(
-                        token_count, arg + start, split, arg + start + split + 1, len - split - 1);
-                } else {
-                    filter.set_filter(token_count, nullptr, 0, arg + start, len);
-                }
-
-                filter.filter_count++;
-                token_count++;
+    const char* start = arg;
+    for (const char* end = arg;; ++end) {
+        if (*end != ',' && *end != '\0') continue;
+        const int index = filter.filter_count;
+        if (index >= Filter::kMaxFilters) break;
+        if (start != end) {
+            const char* split = start;
+            while (split != end && *split != '.') ++split;
+            if (split != end) {
+                const char* name = split + 1;
+                filter.set_filter(index,
+                                  start,
+                                  static_cast<size_t>(split - start),
+                                  name,
+                                  static_cast<size_t>(end - name));
+            } else {
+                filter.set_filter(index, nullptr, 0, start, static_cast<size_t>(end - start));
             }
-
-            if (arg[i] == '\0') break;
-            start = i + 1;
+            filter.filter_count = index + 1;
         }
+        if (*end == '\0') break;
+        start = end + 1;
     }
     return filter;
 }
@@ -498,12 +477,10 @@ inline Filter merge_filter(const Filter& a, const Filter& b) {
         for (int i = 0; i < cur.filter_count && merged.filter_count < Filter::kMaxFilters; i++) {
             const char* sf = cur.suite_filter[i];
             const char* nf = cur.name_filter[i];
-            int slen = 0;
-            int nlen = 0;
-            while (sf && sf[slen]) slen++;
-            while (nf && nf[nlen]) nlen++;
-            merged.set_filter(merged.filter_count, sf, slen, nf, nlen);
-            merged.filter_count++;
+            const int index = merged.filter_count;
+            merged.set_filter(
+                index, sf, sf ? __builtin_strlen(sf) : 0, nf, nf ? __builtin_strlen(nf) : 0);
+            merged.filter_count = index + 1;
         }
     }
     return merged;
@@ -518,8 +495,8 @@ inline uint32_t test_name_hash(const char* suite, const char* name) {
     uint32_t hash = UINT32_C(2166136261);
     const char* parts[] = {suite, ".", name};
     for (const char* part : parts) {
-        for (int i = 0; part[i]; i++) {
-            hash ^= static_cast<unsigned char>(part[i]);
+        for (const char* byte = part; *byte; ++byte) {
+            hash ^= static_cast<unsigned char>(*byte);
             hash *= UINT32_C(16777619);
         }
     }
@@ -542,9 +519,9 @@ struct Shard {
 inline bool parse_uint32(const char* value, uint32_t* result) {
     if (!value || !value[0]) return false;
     uint32_t parsed = 0;
-    for (int i = 0; value[i]; i++) {
-        if (value[i] < '0' || value[i] > '9') return false;
-        const uint32_t digit = static_cast<uint32_t>(value[i] - '0');
+    for (const char* byte = value; *byte; ++byte) {
+        if (*byte < '0' || *byte > '9') return false;
+        const uint32_t digit = static_cast<uint32_t>(*byte - '0');
         if (parsed > (UINT32_MAX - digit) / 10) return false;
         parsed = parsed * 10 + digit;
     }
@@ -635,7 +612,7 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
 
     for (TestCase* tc = g_head; tc; tc = tc->next) {
         if (!selected(tc, filter, shard)) {
-            total_skip++;
+            increment_check_count(total_skip);
             continue;
         }
 
@@ -673,9 +650,9 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
             tc->fn(tc);
             g_current_test_case = nullptr;
         }
-        total_checks += tc->checks_passed;
-        total_check_fail += tc->checks_failed;
-        total_checks += tc->checks_failed;
+        add_check_count(total_checks, tc->checks_passed);
+        add_check_count(total_check_fail, tc->checks_failed);
+        add_check_count(total_checks, tc->checks_failed);
 
         if (tc->skipped) {
             out("  SKIP: ");
@@ -686,12 +663,12 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
                 out(")");
             }
             out("\n");
-            total_skip++;
+            increment_check_count(total_skip);
         } else if (tc->checks_failed == 0) {
             out("  PASS: ");
             out(tc->name);
             out("\n");
-            total_pass++;
+            increment_check_count(total_pass);
         } else {
             out("  FAIL: ");
             out(tc->name);
@@ -705,7 +682,7 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
                 out(")");
             }
             out("\n");
-            total_fail++;
+            increment_check_count(total_fail);
         }
     }
 
