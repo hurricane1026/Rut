@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <openssl/rand.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -97,6 +98,19 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             next.dns_dual_stack = type.eq(lit_str("A+AAAA"));
             if (!next.dns_aaaa && !next.dns_dual_stack && !type.eq(lit_str("A"))) return false;
             fields |= 8192;
+            continue;
+        }
+        if (kKey.eq(lit_str("dnsTransport"))) {
+            json::Writer value{document.other};
+            if (!document.string(entry, value)) return false;
+            const Str transport{document.other, value.len};
+            if (transport.eq(lit_str("udp")))
+                next.dns_transport = DnsTransport::Udp;
+            else if (transport.eq(lit_str("tcp")))
+                next.dns_transport = DnsTransport::Tcp;
+            else
+                return false;
+            fields |= 262144;
             continue;
         }
         if (kKey.eq(lit_str("requireNonEmptyKeys"))) {
@@ -241,7 +255,7 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     } else {
         next.discovery_endpoint = next.endpoint;
     }
-    if ((fields & (256 | 512 | 4096 | 8192)) || next.dns_cache_seconds ||
+    if ((fields & (256 | 512 | 4096 | 8192 | 262144)) || next.dns_cache_seconds ||
         next.dns_timeout_seconds) {
         sockaddr_storage resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
@@ -604,9 +618,18 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
     initialized_ = true;
     return true;
 }
-void JwksFetch::finish_attempt() {
+void JwksFetch::close_dns() {
     if (dns_fd_ >= 0) ::close(dns_fd_);
     dns_fd_ = -1;
+    dns_step_ = DnsStep::None;
+    dns_out_len_ = 0;
+    dns_out_sent_ = 0;
+    dns_length_have_ = 0;
+    dns_in_len_ = 0;
+    dns_in_expected_ = 0;
+}
+void JwksFetch::finish_attempt() {
+    close_dns();
     keys_.cancel();
     discovery_.cancel();
     addresses_ = {};
@@ -749,18 +772,141 @@ bool JwksFetch::start(u64 now,
     const socklen_t length =
         platform::ip_socket_address(configuration_.dns_address, configuration_.dns_port, resolver);
     if (!length) return fail();
-    dns_fd_ = platform::datagram_socket(resolver.ss_family);
-    if (dns_fd_ < 0 ||
-        ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length) != 0)
-        return fail();
+    if (configuration_.dns_transport == RemoteJwks::DnsTransport::Udp) {
+        dns_fd_ = platform::datagram_socket(resolver.ss_family);
+        if (dns_fd_ < 0 ||
+            ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length) != 0)
+            return fail();
+    }
     return send_dns_query(configuration_.dns_aaaa || configuration_.dns_dual_stack);
 }
 bool JwksFetch::send_dns_query(bool aaaa) {
     if (RAND_bytes(query_, 2) != 1) return fail();
     query_[static_cast<i64>(query_length_) - 3] = aaaa ? 28 : 1;
-    if (::send(dns_fd_, query_, query_length_, platform::kSendFlags) != query_length_)
-        return fail();
+    if (configuration_.dns_transport == RemoteJwks::DnsTransport::Udp) {
+        if (::send(dns_fd_, query_, query_length_, platform::kSendFlags) != query_length_)
+            return fail();
+        return true;
+    }
+    close_dns();
+    sockaddr_storage resolver{};
+    const socklen_t length =
+        platform::ip_socket_address(configuration_.dns_address, configuration_.dns_port, resolver);
+    if (!length) return fail();
+    dns_fd_ = platform::stream_socket(resolver.ss_family);
+    if (dns_fd_ < 0) return fail();
+    const int kConnected = ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length);
+    if (kConnected != 0 && errno != EINPROGRESS) return fail();
+    const i64 kOutLength = static_cast<i64>(query_length_) + 2;
+    if (kOutLength > static_cast<i64>(sizeof(dns_out_))) return fail();
+    dns_out_len_ = static_cast<u32>(kOutLength);
+    dns_out_[0] = static_cast<char>(query_length_ >> 8);
+    dns_out_[1] = static_cast<char>(query_length_ & 0xff);
+    __builtin_memcpy(dns_out_ + 2, query_, query_length_);
+    dns_out_sent_ = 0;
+    dns_step_ = kConnected == 0 ? DnsStep::Write : DnsStep::Connect;
     return true;
+}
+bool JwksFetch::advance_dns_stream(u64 now) {
+    for (u32 i = 0; i < 16 && dns_step_ != DnsStep::None; ++i) {
+        if (dns_step_ == DnsStep::Connect) {
+            pollfd ready{dns_fd_, POLLOUT, 0};
+            const int kReady = poll(&ready, 1, 0);
+            if (kReady < 0) {
+                if (errno == EINTR) return true;
+                return fail();
+            }
+            if (!kReady) return true;
+            int error = 0;
+            socklen_t length = sizeof(error);
+            if (getsockopt(dns_fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error)
+                return fail();
+            dns_step_ = DnsStep::Write;
+            continue;
+        }
+        if (dns_step_ == DnsStep::Write) {
+            const i64 kRemaining = static_cast<i64>(dns_out_len_) - static_cast<i64>(dns_out_sent_);
+            if (kRemaining <= 0) return fail();
+            const ssize_t sent = ::send(dns_fd_,
+                                        dns_out_ + static_cast<i64>(dns_out_sent_),
+                                        static_cast<size_t>(kRemaining),
+                                        platform::kSendFlags);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+                return fail();
+            }
+            if (sent == 0) return fail();
+            dns_out_sent_ = static_cast<u32>(static_cast<i64>(dns_out_sent_) + sent);
+            if (dns_out_sent_ == dns_out_len_) dns_step_ = DnsStep::ReadLength;
+            continue;
+        }
+        if (dns_step_ == DnsStep::ReadLength) {
+            const i64 kRemaining = static_cast<i64>(2) - static_cast<i64>(dns_length_have_);
+            if (kRemaining <= 0) return fail();
+            const ssize_t received = ::recv(dns_fd_,
+                                            dns_length_ + static_cast<i64>(dns_length_have_),
+                                            static_cast<size_t>(kRemaining),
+                                            0);
+            if (received < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+                return fail();
+            }
+            if (received == 0) return fail();
+            dns_length_have_ = static_cast<u32>(static_cast<i64>(dns_length_have_) + received);
+            if (dns_length_have_ != 2) continue;
+            const u32 kExpected =
+                (static_cast<u32>(dns_length_[0]) << 8) | static_cast<u32>(dns_length_[1]);
+            if (kExpected < 12 || kExpected > sizeof(dns_in_)) return fail();
+            dns_in_expected_ = kExpected;
+            dns_in_len_ = 0;
+            dns_step_ = DnsStep::ReadBody;
+            continue;
+        }
+        const i64 kRemaining = static_cast<i64>(dns_in_expected_) - static_cast<i64>(dns_in_len_);
+        if (kRemaining <= 0) return fail();
+        const ssize_t received = ::recv(
+            dns_fd_, dns_in_ + static_cast<i64>(dns_in_len_), static_cast<size_t>(kRemaining), 0);
+        if (received < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+            return fail();
+        }
+        if (received == 0) return fail();
+        dns_in_len_ = static_cast<u32>(static_cast<i64>(dns_in_len_) + received);
+        if (dns_in_len_ != dns_in_expected_) continue;
+        JwksDnsAddresses result;
+        if (!jwks_dns_answer({dns_in_, dns_in_len_},
+                             {reinterpret_cast<const char*>(query_), query_length_},
+                             configuration_,
+                             result))
+            return fail();
+        return accept_dns_result(result, now);
+    }
+    return true;
+}
+bool JwksFetch::accept_dns_result(const JwksDnsAddresses& result, u64 now) {
+    if (configuration_.dns_dual_stack && query_[static_cast<i64>(query_length_) - 3] == 28) {
+        addresses_ = result;
+        return send_dns_query(false);
+    }
+    if (static_cast<i64>(result.count) >
+        static_cast<i64>(RemoteJwks::kMaxDnsAddresses) - static_cast<i64>(addresses_.count))
+        return fail();
+    for (u32 i = 0; i < result.count; ++i)
+        __builtin_memcpy(
+            addresses_.values[addresses_.count++], result.values[i], sizeof(result.values[i]));
+    if (!addresses_.ttl_seconds || result.ttl_seconds < addresses_.ttl_seconds)
+        addresses_.ttl_seconds = result.ttl_seconds;
+    close_dns();
+    if (configuration_.dns_cache_seconds) {
+        const u32 kTtl = addresses_.ttl_seconds < configuration_.dns_cache_seconds
+                             ? addresses_.ttl_seconds
+                             : configuration_.dns_cache_seconds;
+        cached_addresses_ = addresses_;
+        dns_cached_at_ = now;
+        dns_cache_deadline_ =
+            jwks_refresh_deadline(configuration_.dns_dual_stack ? started_ : now, kTtl);
+    }
+    return begin_http(now);
 }
 bool JwksFetch::accept_discovery(u64 now) {
     if (discovery_.status() == 304) {
@@ -806,12 +952,8 @@ void JwksFetch::advance(u64 now) {
         (void)fail();
         return;
     }
-    if (dns_fd_ >= 0) {
-        u64 elapsed = 0;
-        if (__builtin_sub_overflow(now, started_, &elapsed)) {
-            (void)fail();
-            return;
-        }
+    const bool kDnsActive = dns_step_ != DnsStep::None || dns_fd_ >= 0;
+    if (kDnsActive) {
         u64 dns_timeout_wide = 0;
         u32 kDnsTimeout = 0;
         if (__builtin_mul_overflow(static_cast<u64>(configuration_.dns_timeout_seconds),
@@ -825,6 +967,10 @@ void JwksFetch::advance(u64 now) {
             (void)fail();
             return;
         }
+        if (dns_step_ != DnsStep::None) {
+            (void)advance_dns_stream(now);
+            return;
+        }
         char packet[513];
         const auto count = ::recv(dns_fd_, packet, sizeof(packet), 0);
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
@@ -836,33 +982,7 @@ void JwksFetch::advance(u64 now) {
             (void)fail();
             return;
         }
-        if (configuration_.dns_dual_stack && query_[static_cast<i64>(query_length_) - 3] == 28) {
-            addresses_ = result;
-            (void)send_dns_query(false);
-            return;
-        }
-        if (static_cast<i64>(result.count) >
-            static_cast<i64>(RemoteJwks::kMaxDnsAddresses) - static_cast<i64>(addresses_.count)) {
-            (void)fail();
-            return;
-        }
-        for (u32 i = 0; i < result.count; ++i)
-            __builtin_memcpy(
-                addresses_.values[addresses_.count++], result.values[i], sizeof(result.values[i]));
-        if (!addresses_.ttl_seconds || result.ttl_seconds < addresses_.ttl_seconds)
-            addresses_.ttl_seconds = result.ttl_seconds;
-        ::close(dns_fd_);
-        dns_fd_ = -1;
-        if (configuration_.dns_cache_seconds) {
-            const u32 kTtl = addresses_.ttl_seconds < configuration_.dns_cache_seconds
-                                 ? addresses_.ttl_seconds
-                                 : configuration_.dns_cache_seconds;
-            cached_addresses_ = addresses_;
-            dns_cached_at_ = now;
-            dns_cache_deadline_ =
-                jwks_refresh_deadline(configuration_.dns_dual_stack ? started_ : now, kTtl);
-        }
-        (void)begin_http(now);
+        (void)accept_dns_result(result, now);
         return;
     }
     auto& fetch = discovering_ ? discovery_ : keys_;
