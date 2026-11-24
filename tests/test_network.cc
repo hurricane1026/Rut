@@ -2,6 +2,7 @@
 #include "route_config_fixture.h"
 // Mock tests — no real sockets. Ported from libuv/libevent scenarios.
 #include "fault_injection.h"
+#include "fixtures/hpack.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/compile_to_config.h"
@@ -54,18 +55,6 @@ using rut::test_fault::ScopedMemoryFault;
 using rut::test_fault::ScopedRecvData;
 using rut::test_fault::ScopedSyscallFault;
 using rut::test_fault::SyscallFaultConfig;
-
-static rut::ConnectionBase::RespHeaderMutation& append_test_response_mutation(
-    rut::ConnectionBase& connection) {
-    const rut::u8 index = connection.resp_header_mutation_count;
-    static_assert(rut::ConnectionBase::kMaxRespHeaderMutations <= UINT8_MAX);
-    if (index >= rut::ConnectionBase::kMaxRespHeaderMutations) {
-        rut::test::out("test response header mutation capacity exceeded\n");
-        _exit(1);
-    }
-    connection.resp_header_mutation_count = index + 1;
-    return connection.resp_header_mutations[index];
-}
 
 static i32 count_open_fds() {
 #ifdef __APPLE__
@@ -8603,7 +8592,7 @@ TEST(timer, self_restart) {
     int fires = 0;
     // tick: cursor=0, fires at slot 0. Callback re-adds at (0+1)&63=1. cursor→1.
     w.tick([&](Connection* conn) {
-        fires++;
+        increment_fixture_value(fires);
         if (fires < 3) {
             conn->timer_node.init();
             w.add(conn, 1);
@@ -8612,7 +8601,7 @@ TEST(timer, self_restart) {
     CHECK_EQ(fires, 1);
     // tick: cursor=1, checks slot 1 → fires. Re-adds at (1+1)=2. cursor→2.
     w.tick([&](Connection* conn) {
-        fires++;
+        increment_fixture_value(fires);
         if (fires < 3) {
             conn->timer_node.init();
             w.add(conn, 1);
@@ -8620,7 +8609,7 @@ TEST(timer, self_restart) {
     });
     CHECK_EQ(fires, 2);
     // tick: cursor=2, checks slot 2 → fires. fires=3, no re-add. cursor→3.
-    w.tick([&](Connection*) { fires++; });
+    w.tick([&](Connection*) { increment_fixture_value(fires); });
     CHECK_EQ(fires, 3);
 }
 
@@ -8830,7 +8819,7 @@ TEST(concurrent, all_conns_recv_simultaneously) {
             REQUIRE(dispatch_complete_http1_test_request(loop, loop.conns[i]));
     int sending = 0;
     for (u32 i = 0; i < SmallLoop::kMaxConns; i++)
-        if (loop.conns[i].state == ConnState::Sending) sending++;
+        if (loop.conns[i].state == ConnState::Sending) increment_fixture_value(sending);
     CHECK_EQ(sending, 10);
 }
 
@@ -10722,7 +10711,8 @@ TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
     u8 block[256]{};
     u32 block_len = 0;
     for (const auto& header : request)
-        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+        REQUIRE(rut::test::hpack_fixture::append_field(
+            block, block_len, header.name, header.value, hpack::encode_header));
 
     auto append_frame =
         [&](Http2FrameType type, u8 flags, u32 stream_id, const u8* payload, u32 payload_len) {
@@ -12121,7 +12111,8 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     u8 block[256]{};
     u32 block_len = 0;
     for (const auto& header : request)
-        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+        REQUIRE(rut::test::hpack_fixture::append_field(
+            block, block_len, header.name, header.value, hpack::encode_header));
     u8 input[512]{};
     Http2FrameHeader reset_header{};
     reset_header.length = 4;
@@ -12219,7 +12210,8 @@ TEST(http2, window_update_owner_processes_next_headers_after_local_reset) {
     u8 block[256]{};
     u32 block_len = 0;
     for (const auto& header : request)
-        block_len += hpack::encode_header(block + block_len, header.name, header.value);
+        REQUIRE(rut::test::hpack_fixture::append_field(
+            block, block_len, header.name, header.value, hpack::encode_header));
     u8 input[512]{};
     Http2FrameHeader reset_header{};
     reset_header.length = 4;
@@ -12511,7 +12503,9 @@ TEST(http2, bodyless_then_bodyful_coalesced_h2_responses) {
     CHECK(saw_data);
     CHECK(saw_data_end);
     CHECK_EQ(data_bytes, 9000u);
-    CHECK_EQ(h2.conn_send_window, initial_conn_window - 9000);
+    i64 expected_conn_window;
+    REQUIRE(!__builtin_sub_overflow(initial_conn_window, 9000, &expected_conn_window));
+    CHECK_EQ(h2.conn_send_window, expected_conn_window);
     CHECK_EQ(stream3->send_window, initial_stream_window - 9000);
     CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 3u);
     CHECK(conn->fd >= 0);
@@ -14347,7 +14341,7 @@ TEST(tls_iouring, strict_completion_validator_authenticates_tls_logical_tombston
         CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
         conn.response_read_deadline_send_owner_generation = owner_generation;
         const i32 owner_fd = conn.response_read_deadline_send_fd;
-        conn.response_read_deadline_send_fd++;
+        increment_fixture_value(conn.response_read_deadline_send_fd);
         CHECK_FALSE(loop.response_read_deadline_send_completion_is_valid(conn, completion, kind));
         conn.response_read_deadline_send_fd = owner_fd;
         const u8* const owner_src = conn.response_read_deadline_send_src;
@@ -15234,7 +15228,7 @@ TEST(tls_iouring, current_token_bad_raw_identity_fails_closed_before_logical_com
         IoEvent bad = tls_send_event(conn.id, sizeof(kCiphertext), raw_generation);
         switch (corruption) {
             case Corruption::Fd:
-                conn.tls_out_inflight_fd++;
+                increment_fixture_value(conn.tls_out_inflight_fd);
                 break;
             case Corruption::Source:
                 conn.tls_out_inflight_src = kPlaintext;
@@ -45682,8 +45676,9 @@ struct RawDownstreamRecvBatch {
     bool append_recv(
         Connection& conn, const u8* bytes, u32 len, bool more, u16 forced_buf_id = UINT16_MAX) {
         if (bytes == nullptr || len == 0 || len > kProvidedBufSize) return false;
-        const u16 buf_id = forced_buf_id == UINT16_MAX ? next_buf_id++ : forced_buf_id;
+        const u16 buf_id = forced_buf_id == UINT16_MAX ? next_buf_id : forced_buf_id;
         if (buf_id >= kProvidedBufCount) return false;
+        if (forced_buf_id == UINT16_MAX) increment_fixture_value(next_buf_id);
         __builtin_memcpy(
             guard.loop->backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize, bytes, len);
         u32 cursor = tail();
@@ -51583,7 +51578,7 @@ TEST(http1_pipeline_generation_activation,
                 conn.response_read_deadline_upload.request_policy_id = 0;
                 break;
             case Forgery::ProofUpstream:
-                ++conn.response_read_deadline_upload.upstream_id;
+                increment_fixture_value(conn.response_read_deadline_upload.upstream_id);
                 break;
             case Forgery::DeadlineState:
                 conn.response_read_deadline_state = ResponseReadDeadlineState::None;
@@ -58791,7 +58786,7 @@ TEST(response_read_deadline, timeout_header_only_head_live_proof_is_strict) {
     rejects_live_copy([](auto& value) { ++value.handler_generation; });
     rejects_live_copy([](auto& value) { value.route_index = 0xffffu; });
     rejects_live_copy([](auto& value) { value.route_fn = nullptr; });
-    rejects_live_copy([](auto& value) { ++value.upstream_id; });
+    rejects_live_copy([](auto& value) { increment_fixture_value(value.upstream_id); });
     rejects_live_copy([](auto& value) { ++value.upload_episode; });
     rejects_live_copy([](auto& value) { ++value.raw_header_end; });
     rejects_live_copy([](auto& value) { ++value.raw_content_length; });
@@ -62400,7 +62395,7 @@ TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
                 conn.response_read_deadline_upload.route_fn = nullptr;
                 break;
             case Mutation::Upstream:
-                ++conn.response_read_deadline_upload.upstream_id;
+                increment_fixture_value(conn.response_read_deadline_upload.upstream_id);
                 break;
             case Mutation::UploadLength:
                 --conn.response_read_deadline_upload.expected_upload_length;
@@ -62500,7 +62495,7 @@ TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
                     Http1PrebuiltResponseLayout::FullContentLengthNonHead;
                 break;
             case Forgery::Status:
-                ++conn.http1_prebuilt_status;
+                increment_fixture_value(conn.http1_prebuilt_status);
                 break;
             case Forgery::DeclaredLength:
                 ++conn.http1_prebuilt_body_len;
@@ -63734,7 +63729,7 @@ TEST(response_read_deadline_fixed_upload_head_unreachable,
                 conn.response_read_deadline_upload.route_fn = nullptr;
                 break;
             case OwnerForgery::Upstream:
-                ++conn.response_read_deadline_upload.upstream_id;
+                increment_fixture_value(conn.response_read_deadline_upload.upstream_id);
                 break;
             case OwnerForgery::RawLength:
                 --conn.response_read_deadline_upload.raw_content_length;
@@ -81527,7 +81522,7 @@ TEST(state_invariant, jit_forward_direct_paired_head_connect_submit_serializes_n
     char* date = strstr(normalized, "Date: ");
     REQUIRE(date != nullptr);
     REQUIRE(date[6 + 29] == '\r');
-    for (u32 i = 0; i < 29; i++) normalized[(date - normalized) + 6 + i] = 'X';
+    for (u32 i = 0; i < 29; i++) (date + 6)[i] = 'X';
     static constexpr char kExpected[] =
         "HTTP/1.1 502 Bad Gateway\r\n"
         "Server: nginx/1.29.7\r\n"
@@ -90110,7 +90105,7 @@ TEST(iouring_accept_rearm, transient_error_rearms_immediately) {
     const i32 errs[] = {ECONNABORTED, EINTR, EAGAIN, EPROTO, ENETDOWN, EHOSTUNREACH};
     u32 expect = 0;
     for (i32 e : errs) {
-        g.accept_cqe(-e, /*more=*/false);
+        g.accept_cqe(reverse_kernel_error(e), /*more=*/false);
         expect++;
         CHECK_EQ(g.sq_tail, expect);
         CHECK_FALSE(g.loop->accept_rearm_pending);
@@ -90154,7 +90149,7 @@ TEST(iouring_accept_rearm, resource_exhaustion_defers_to_timer_tick) {
     for (i32 e : errs) {
         ScopedAcceptRearmLoop g;
         REQUIRE(g.init());
-        g.accept_cqe(-e, /*more=*/false);
+        g.accept_cqe(reverse_kernel_error(e), /*more=*/false);
         CHECK_EQ(g.sq_tail, 0u);  // no immediate re-arm (would spin)
         CHECK(g.loop->accept_rearm_pending);
         g.tick();
@@ -90170,7 +90165,7 @@ TEST(iouring_accept_rearm, permanent_error_does_not_rearm) {
     for (i32 e : errs) {
         ScopedAcceptRearmLoop g;
         REQUIRE(g.init());
-        g.accept_cqe(-e, /*more=*/false);
+        g.accept_cqe(reverse_kernel_error(e), /*more=*/false);
         g.tick();
         CHECK_EQ(g.sq_tail, 0u);
         CHECK_FALSE(g.loop->accept_rearm_pending);
@@ -90933,7 +90928,10 @@ static u64 ready_wait_chain(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) 
         ctx->resume_event_result != 0)
         return jit::HandlerResult::make_status(500).pack();
     if (ctx->state == 256) return jit::HandlerResult::make_status(204).pack();
-    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+    u16 next_state;
+    if (__builtin_add_overflow(ctx->state, 1, &next_state))
+        return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_yield(next_state, jit::YieldKind::Send).pack();
 }
 
 TEST(state_invariant, ready_wait_chain_yields_each_turn_without_recursion) {

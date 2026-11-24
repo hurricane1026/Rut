@@ -3,24 +3,13 @@
 // official examples in RFC 7541 Appendix C plus structural round-trips that
 // exercise every Huffman symbol.
 
+#include "fixtures/hpack.h"
 #include "rut/runtime/hpack.h"
 #include "test.h"
 
 using namespace rut;
 
 namespace {
-template <size_t Capacity, typename Encode>
-bool append_field(u8 (&block)[Capacity], u32& offset, Str name, Str value, Encode encode) {
-    // Literal fields can use at most three six-byte HPACK integer prefixes.
-    // Huffman encoding is selected only when it reduces the string size.
-    const u64 bound = static_cast<u64>(name.len) + value.len + 18u;
-    if (offset > Capacity || bound > Capacity - offset) return false;
-    const i64 size = encode(block + offset, name, value);
-    u32 next;
-    if (size < 0 || __builtin_add_overflow(offset, size, &next) || next > Capacity) return false;
-    offset = next;
-    return true;
-}
 bool bytes_eq(const u8* a, const u8* b, u32 n) {
     for (u32 i = 0; i < n; i++)
         if (a[i] != b[i]) return false;
@@ -470,7 +459,8 @@ TEST(hpack_fuzz, encode_decode_roundtrip) {
         for (u32 i = 0; i < nh; i++) {
             const Str name{reinterpret_cast<const char*>(src + noff[i]), nlen[i]};
             const Str value{reinterpret_cast<const char*>(src + voff[i]), vlen[i]};
-            REQUIRE(append_field(block, bp, name, value, hpack::encode_header));
+            REQUIRE(rut::test::hpack_fixture::append_field(
+                block, bp, name, value, hpack::encode_header));
         }
 
         hpack::DynamicTable dyn;
@@ -544,8 +534,8 @@ TEST(hpack_encoder, shrink_then_grow_signals_minimum_size) {
     u32 bp = enc.emit_pending_size_update(block);
     REQUIRE(bp >= 2u);                // two §6.3 updates: 0 then 4096
     CHECK_EQ(block[0] & 0xe0, 0x20);  // first instruction is a size update
-    REQUIRE(
-        append_field(block, bp, cstr(":status"), cstr("200"), [&enc](u8* out, Str name, Str value) {
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        block, bp, cstr(":status"), cstr("200"), [&enc](u8* out, Str name, Str value) {
             return enc.encode(out, name, value);
         }));
     n = 0;
@@ -583,8 +573,8 @@ TEST(hpack_encoder, honors_peer_table_size_with_size_update) {
     REQUIRE(bp >= 1u);
     CHECK_EQ(block[0] & 0xe0, 0x20);        // 001xxxxx
     CHECK_EQ(enc.pending_size_update, -1);  // disarmed after emit
-    REQUIRE(
-        append_field(block, bp, cstr(":status"), cstr("200"), [&enc](u8* out, Str name, Str value) {
+    REQUIRE(rut::test::hpack_fixture::append_field(
+        block, bp, cstr(":status"), cstr("200"), [&enc](u8* out, Str name, Str value) {
             return enc.encode(out, name, value);
         }));
     u8 scratch[256];
@@ -625,7 +615,7 @@ TEST(hpack_encoder, sequence_stays_in_sync_with_decoder) {
         u8 block[512];
         u32 bp = 0;
         for (u32 i = 0; i < 4; i++) {
-            REQUIRE(append_field(
+            REQUIRE(rut::test::hpack_fixture::append_field(
                 block, bp, cstr(names[i]), cstr(values[i]), [&enc](u8* out, Str name, Str value) {
                     return enc.encode(out, name, value);
                 }));

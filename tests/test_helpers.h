@@ -34,6 +34,26 @@
 
 using namespace rut;
 
+inline rut::ConnectionBase::RespHeaderMutation& append_test_response_mutation(
+    rut::ConnectionBase& connection) {
+    const rut::u8 index = connection.resp_header_mutation_count;
+    static_assert(rut::ConnectionBase::kMaxRespHeaderMutations <= UINT8_MAX);
+    if (index >= rut::ConnectionBase::kMaxRespHeaderMutations) {
+        rut::test::out("test response header mutation capacity exceeded\n");
+        _exit(1);
+    }
+    connection.resp_header_mutation_count = index + 1;
+    return connection.resp_header_mutations[index];
+}
+
+template <typename T>
+void increment_fixture_value(T& value) {
+    if (__builtin_add_overflow(value, 1, &value)) {
+        rut::test::out("fixture counter exceeds its integer range\n");
+        _exit(1);
+    }
+}
+
 // ---- Mock event loop (64 conns, for unit tests) ----
 
 struct SmallLoop : EventLoopCRTP<SmallLoop> {

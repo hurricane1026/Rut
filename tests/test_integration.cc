@@ -2177,7 +2177,7 @@ TEST(http2_synth, combines_split_cookie_fields) {
                     m = false;
                     break;
                 }
-            if (m) c++;
+            if (m) rut::test::increment_check_count(c);
         }
         return c;
     };
@@ -14049,7 +14049,7 @@ TEST(route, static_404_real_socket) {
     CHECK_GT(n, 0);
     // Should contain "404"
     bool found_404 = false;
-    for (i32 i = 0; i < n - 2; i++) {
+    for (i64 i = 0; i + 2 < static_cast<i64>(n); ++i) {
         if (buf[i] == '4' && buf[i + 1] == '0' && buf[i + 2] == '4') {
             found_404 = true;
             break;
@@ -14102,7 +14102,7 @@ TEST(route, multiple_status_codes_real_socket) {
         i32 n = recv_timeout(c, buf, sizeof(buf), 500);
         CHECK_GT(n, 0);
         bool found = false;
-        for (i32 i = 0; i < n - 2; i++) {
+        for (i64 i = 0; i + 2 < static_cast<i64>(n); ++i) {
             if (buf[i] == tc.expect[0] && buf[i + 1] == tc.expect[1] &&
                 buf[i + 2] == tc.expect[2]) {
                 found = true;
@@ -14151,7 +14151,7 @@ TEST(route, post_put_patch_method_filter_real_socket) {
         i32 n = recv_timeout(c, buf, sizeof(buf), 500);
         CHECK_GT(n, 0);
         bool found = false;
-        for (i32 i = 0; i < n - 2; i++) {
+        for (i64 i = 0; i + 2 < static_cast<i64>(n); ++i) {
             if (buf[i] == tc.expect[0] && buf[i + 1] == tc.expect[1] &&
                 buf[i + 2] == tc.expect[2]) {
                 found = true;
@@ -15880,7 +15880,7 @@ static u64 forward_with_response_mutations_handler(
                    u32 name_len,
                    const char* value,
                    u32 value_len) {
-        auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+        auto& mutation = append_test_response_mutation(*conn);
         mutation.mode = mode;
         mutation.name = {name, name_len};
         mutation.value = {value, value_len};
@@ -15909,7 +15909,7 @@ static u64 forward_with_param_mutation_handler(
     if (ctx == nullptr || ctx->route_param_count != 1)
         return rut::jit::HandlerResult::make_status(500).pack();
     auto* conn = static_cast<rut::Connection*>(raw_conn);
-    auto& mutation = conn->resp_header_mutations[conn->resp_header_mutation_count++];
+    auto& mutation = append_test_response_mutation(*conn);
     mutation.mode = rut::ConnectionBase::RespHeaderMutationMode::Set;
     mutation.name = {"X-Param", 7};
     mutation.value = {ctx->route_params[0].value, ctx->route_params[0].value_len};
@@ -26836,7 +26836,9 @@ TEST(proxy_iouring_request_body, single_write_ceiling_is_the_recv_buf_slice) {
             char tail[16];
             const i64 t0 = test_mono_ms();
             CHECK(recv_timeout(fd, tail, sizeof(tail), 5000) <= 0);
-            CHECK(test_mono_ms() - t0 < 4000);
+            i64 elapsed;
+            REQUIRE(!__builtin_sub_overflow(test_mono_ms(), t0, &elapsed));
+            CHECK(elapsed < 4000);
             close(fd);
         }
     }
@@ -54248,7 +54250,10 @@ static u64 event_loop_ready_wait_handler(void*, jit::HandlerCtx* ctx, const u8*,
                             ctx->resume_event_result != 0))
         return jit::HandlerResult::make_status(500).pack();
     if (ctx->state == 256) return jit::HandlerResult::make_status(204).pack();
-    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+    u16 next_state;
+    if (__builtin_add_overflow(ctx->state, 1, &next_state))
+        return jit::HandlerResult::make_status(500).pack();
+    return jit::HandlerResult::make_yield(next_state, jit::YieldKind::Send).pack();
 }
 
 template <typename Loop>
