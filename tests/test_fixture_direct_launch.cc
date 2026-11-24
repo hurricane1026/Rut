@@ -51,7 +51,7 @@ ProcIdentity identity(LaunchStage stage, pid_t pid = kDirectPid) {
     ProcIdentity result;
     result.pid = pid;
     result.ppid = pid == kDirectPid ? 4000 : kDirectPid;
-    result.start = pid == kDirectPid ? 9001 : static_cast<std::uint64_t>(9001 + pid);
+    result.start = pid == kDirectPid ? 9001 : static_cast<std::uint64_t>(pid) + 9001;
     result.pgid = kLaunchPgid;
     result.uid = uid;
     result.gid = gid;
@@ -182,8 +182,8 @@ bool run_checks(std::string& error) {
     for (const char* mutation : {"pid", "start", "pgid", "argv", "exe", "uid", "netns"}) {
         DirectLaunch changed = make_launch();
         ProcIdentity value = sudo;
-        if (std::string(mutation) == "pid") ++value.pid;
-        if (std::string(mutation) == "start") ++value.start;
+        if (std::string(mutation) == "pid") value.pid = intermediary.pid;
+        if (std::string(mutation) == "start" && value.start != UINT64_MAX) ++value.start;
         if (std::string(mutation) == "pgid") value.pgid = 1;
         if (std::string(mutation) == "argv") value.cmdline += "altered";
         if (std::string(mutation) == "exe") ++value.exe_ino;
@@ -262,7 +262,7 @@ bool run_checks(std::string& error) {
                 error))
         return false;
     DirectLaunch broken_link = make_launch();
-    wrapper_launcher.ppid++;
+    wrapper_launcher.ppid = 4000;
     if (!expect(!validate_launcher_ancestry(
                     broken_link, wrapper_launcher, {intermediary, wrapper_sudo}, reason),
                 "broken ancestry link",
@@ -380,7 +380,7 @@ bool run_checks(std::string& error) {
                 error))
         return false;
     DirectLaunchAnchor unsafe_anchor = signal.anchor;
-    unsafe_anchor.pgid = unsafe_anchor.pid + 1;
+    unsafe_anchor.pgid = 1;
     DirectLaunch unsafe_anchor_launch(unsafe_anchor, signal.allowed);
     if (!expect(!observe_direct(unsafe_anchor_launch, sudo, reason),
                 "unsafe immutable anchor rejection",

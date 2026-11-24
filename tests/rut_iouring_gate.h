@@ -265,11 +265,15 @@ static inline int rut_iouring_gate_lock_identity(struct rut_iouring_gate* gate, 
         return 0;
     struct timespec deadline;
     if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
-    deadline.tv_sec += timeout_ms / 1000;
-    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (__builtin_add_overflow(deadline.tv_sec, timeout_ms / 1000, &deadline.tv_sec)) return 0;
+    long nanos = 0;
+    if (__builtin_mul_overflow((long)(timeout_ms % 1000), 1000000L, &nanos) ||
+        __builtin_add_overflow(deadline.tv_nsec, nanos, &deadline.tv_nsec))
+        return 0;
     if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
+        if (__builtin_add_overflow(deadline.tv_sec, 1, &deadline.tv_sec) ||
+            __builtin_sub_overflow(deadline.tv_nsec, 1000000000L, &deadline.tv_nsec))
+            return 0;
     }
     const int result = pthread_mutex_timedlock(&gate->identity_mutex, &deadline);
     if (result == 0) return 1;
@@ -292,7 +296,8 @@ static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
                                               int timeout_ms) {
     const int64_t start = rut_downstream_gate_now_ms();
     if (start < 0) return 0;
-    const int64_t deadline = start + timeout_ms;
+    int64_t deadline = 0;
+    if (__builtin_add_overflow(start, timeout_ms, &deadline)) return 0;
     for (;;) {
         const uint32_t current = rut_downstream_gate_load(&gate->state);
         if (current == wanted) return 1;

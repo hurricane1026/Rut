@@ -1426,7 +1426,7 @@ struct LoopThread {
             for (u32 i = 0; i < n; i++) lp->dispatch(events[i]);
             if (timed) {
                 if (test_mono_ms() >= deadline) break;
-            } else if (++iters >= lt->max_iters) {
+            } else if (__builtin_add_overflow(iters, 1, &iters) || iters >= lt->max_iters) {
                 break;
             }
         }

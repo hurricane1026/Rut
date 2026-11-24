@@ -458,7 +458,8 @@ static void close_launcher_bundle_handoff() {
 
 static bool install_launcher_bundle_handoff(const identity_bundle::RoleBundle& launcher_role) {
     for (size_t i = 0; i != identity_bundle::kFdsPerRole; ++i) {
-        const int destination = kLauncherBundleFdBase + static_cast<int>(i);
+        const int destination =
+            static_cast<int>(static_cast<int64_t>(kLauncherBundleFdBase) + static_cast<int64_t>(i));
         errno = 0;
         const int flags = fcntl(destination, F_GETFD);
         if (flags >= 0) {
@@ -484,7 +485,8 @@ static bool install_launcher_bundle_handoff(const identity_bundle::RoleBundle& l
     }
     bool installed = true;
     for (size_t i = 0; i != temporary.size(); ++i) {
-        const int destination = kLauncherBundleFdBase + static_cast<int>(i);
+        const int destination =
+            static_cast<int>(static_cast<int64_t>(kLauncherBundleFdBase) + static_cast<int64_t>(i));
         if (dup3(temporary[i], destination, 0) != destination) installed = false;
     }
     for (int fd : temporary) close(fd);
@@ -986,13 +988,15 @@ struct GroupLease {
         ProcIdentity current;
         return pid > 1 && pgid == pid && sid > 1 && start != 0 &&
                stable_proc_identity(pid, current) && current.pid == pid && current.start == start &&
-               current.pgid == pgid && current.sid == sid && kill(-pgid, 0) == 0;
+               current.pgid == pgid && current.sid == sid &&
+               pgid != std::numeric_limits<int>::min() && kill(-pgid, 0) == 0;
     }
 
     bool gone() const {
         if (pgid <= 1) return false;
         errno = 0;
-        if (kill(-pgid, 0) < 0 && errno == ESRCH) return true;
+        if (pgid != std::numeric_limits<int>::min() && kill(-pgid, 0) < 0 && errno == ESRCH)
+            return true;
         // A direct child remains a zombie until its owning parent waitpid()s it;
         // Linux keeps that zombie's process group addressable.  WNOWAIT plus a
         // /proc group scan is the safe pre-reap equivalent of ESRCH here.
@@ -1012,7 +1016,8 @@ struct GroupLease {
         pid_t sole_member = -1;
         std::uint64_t sole_start = 0;
         errno = 0;
-        const bool esrch = kill(-pgid, 0) < 0 && errno == ESRCH;
+        const bool esrch =
+            pgid != std::numeric_limits<int>::min() && kill(-pgid, 0) < 0 && errno == ESRCH;
         return pgid > 1 && esrch &&
                scan_group_stat(pgid, count, live, -1, sole_member, sole_start) ==
                    GroupScanResult::Exact &&
@@ -9597,7 +9602,8 @@ static bool safe_signal_direct_child(DirectLaunch& child, int signal_number) {
         return false;
     }
     if (!observe_direct(child, current, reason)) return false;
-    if (geteuid() == 0) return kill(-child.anchor.pgid, signal_number) == 0;
+    if (geteuid() == 0 && child.anchor.pgid != std::numeric_limits<int>::min())
+        return kill(-child.anchor.pgid, signal_number) == 0;
     if (current.uid != getuid() || current.gid != getgid()) {
         child.reason = "ordinary parent lacked exact direct-child credentials";
         return false;
@@ -10039,7 +10045,7 @@ static GroupScanResult scan_group_stat(pid_t pgid,
         }
         if (result == GroupScanResult::Unreadable) break;
         if (process_group == pgid) {
-            ++count;
+            if (count != std::numeric_limits<int>::max()) ++count;
             sole_member = pid;
             sole_start = start;
         }

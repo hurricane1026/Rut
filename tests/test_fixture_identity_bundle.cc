@@ -733,7 +733,8 @@ int main() {
         waitpid(foreign_child, nullptr, 0);
     }
     std::vector<unsigned char> bad_pid = wire;
-    ++bad_pid[kHeaderBytes + 8];
+    if (bad_pid[kHeaderBytes + 8] != std::numeric_limits<unsigned char>::max())
+        ++bad_pid[kHeaderBytes + 8];
     ok &= check(bad_pid != wire, "manifest pid mutation differs");
     ok &= check(receive_fails(bad_pid, fds, CmsgShape::Exact, bad_pid.size()),
                 "manifest pid mutation rejected");

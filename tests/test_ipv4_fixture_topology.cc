@@ -30,11 +30,14 @@ const timespec kPhaseClockStart = phase_clock_start();
 void log_phase(const char* name, const char* event) {
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_sec = now.tv_sec - kPhaseClockStart.tv_sec;
-    long elapsed_nsec = now.tv_nsec - kPhaseClockStart.tv_nsec;
+    long elapsed_sec = 0;
+    long elapsed_nsec = 0;
+    if (__builtin_sub_overflow(now.tv_sec, kPhaseClockStart.tv_sec, &elapsed_sec) ||
+        __builtin_sub_overflow(now.tv_nsec, kPhaseClockStart.tv_nsec, &elapsed_nsec))
+        return;
     if (elapsed_nsec < 0) {
         elapsed_nsec += 1000000000L;
-        elapsed_sec -= 1;
+        if (elapsed_sec > 0) --elapsed_sec;
     }
     if (elapsed_sec < 0) {
         elapsed_sec = 0;

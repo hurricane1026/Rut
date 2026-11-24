@@ -2223,13 +2223,15 @@ route "/empty-config" {
             segmented->recv_buf.write(reinterpret_cast<const u8*>(prefix.data()), prefix.size()),
             prefix.size());
         const u32 conn_id = segmented->id;
+        const size_t recv_len = head.size() + prefix.size();
+        REQUIRE_LE(recv_len, static_cast<size_t>(std::numeric_limits<i32>::max()));
         {
             test_fault::ScopedSyscallFault clock(
                 test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
             on_header_received<SmallLoop>(
                 loop.get(),
                 *segmented,
-                make_ev(conn_id, IoEventType::Recv, head.size() + prefix.size()));
+                make_ev(conn_id, IoEventType::Recv, static_cast<i32>(recv_len)));
         }
         CHECK(segmented->on_recv == &on_jit_request_body_recvd<SmallLoop>);
         CHECK_EQ(segmented->req_body_remaining, body.size() - prefix.size());
@@ -2496,13 +2498,15 @@ route "/partial" {
         capture_request_metadata(*conn);
         conn->request_config = program.config.get();
         const u32 conn_id = conn->id;
+        const size_t recv_len = head.size() + prefix.size();
+        REQUIRE_LE(recv_len, static_cast<size_t>(std::numeric_limits<i32>::max()));
         {
             test_fault::ScopedSyscallFault clock(
                 test_fault::fixed_clock_gettime(CLOCK_REALTIME, kNow, 0));
             on_header_received<SmallLoop>(
                 loop.get(),
                 *conn,
-                make_ev(conn_id, IoEventType::Recv, head.size() + prefix.size()));
+                make_ev(conn_id, IoEventType::Recv, static_cast<i32>(recv_len)));
         }
         CHECK(conn->on_recv == &on_jit_request_body_recvd<SmallLoop>);
         CHECK_EQ(conn->req_body_remaining, body.size() - prefix.size());

@@ -398,7 +398,8 @@ struct SelectedSigningKey {
     bool append_jwk(json::Writer& out, Str kid) const {
         const BIGNUM* modulus = nullptr;
         RSA_get0_key(rsa, &modulus, nullptr, nullptr);
-        const int size = BN_num_bytes(modulus);
+        const int bits = BN_num_bits(modulus);
+        const int size = static_cast<int>((static_cast<i64>(bits) + 7) / 8);
         if (size <= 0 || size > 512) return false;
         unsigned char bytes[512];
         if (BN_bn2bin(modulus, bytes) != size) return false;

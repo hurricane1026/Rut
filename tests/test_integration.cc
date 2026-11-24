@@ -8536,7 +8536,7 @@ struct TlsIouringHarness : SmallLoop {
             else
                 conn.tls_in_buf.reset();
             conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
-            --tls_overflow_control_flights_to_emit;
+            if (tls_overflow_control_flights_to_emit > 0) --tls_overflow_control_flights_to_emit;
             if (conn.tls_out_buf.write(reinterpret_cast<const u8*>("ctl"), 3) != 3u ||
                 !submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3)) {
                 close_conn(conn);

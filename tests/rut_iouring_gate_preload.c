@@ -989,7 +989,9 @@ static int witness_request_two(void) {
     uint32_t copied = 0;
     uint32_t fragments = 0;
     int timer_seen = 0;
-    const int64_t deadline = rut_downstream_gate_now_ms() + 5000;
+    const int64_t now = rut_downstream_gate_now_ms();
+    int64_t deadline = 0;
+    if (now < 0 || __builtin_add_overflow(now, INT64_C(5000), &deadline)) return -1;
     while (copied < gate->request_two_length && rut_downstream_gate_now_ms() < deadline) {
         if (__atomic_load_n(head, __ATOMIC_ACQUIRE) != initial_head) {
             fail(RUT_IOURING_GATE_ERROR_CQ);

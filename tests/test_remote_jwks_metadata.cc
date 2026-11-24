@@ -325,7 +325,7 @@ struct DnsPacket {
         word(static_cast<u16>(ttl));
         const u32 size = length;
         word(0);
-        ++answers;
+        answers = static_cast<u16>(static_cast<i64>(answers) + 1);
         bytes[6] = static_cast<u8>(answers >> 8);
         bytes[7] = static_cast<u8>(answers);
         return size;

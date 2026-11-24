@@ -69,7 +69,8 @@ struct CloseHookState {
 int close_after_real_close(int fd, void* opaque) {
     auto* state = static_cast<CloseHookState*>(opaque);
     const int result = close(fd);
-    if (result == 0 && state != nullptr) ++state->calls;
+    if (result == 0 && state != nullptr && state->calls != std::numeric_limits<int>::max())
+        ++state->calls;
     if (result == 0 && state != nullptr &&
         ((state->fail_fd >= 0 && fd == state->fail_fd) ||
          (state->fail_fd < 0 && state->fail_call > 0 && state->calls == state->fail_call)) &&
@@ -83,7 +84,8 @@ int close_after_real_close(int fd, void* opaque) {
 
 volatile sig_atomic_t signal_count = 0;
 void count_signal(int) {
-    signal_count = static_cast<sig_atomic_t>(signal_count + 1);
+    sig_atomic_t next = 0;
+    if (!__builtin_add_overflow(signal_count, 1, &next)) signal_count = next;
 }
 
 void check(bool value, const char* message) {

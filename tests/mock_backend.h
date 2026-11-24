@@ -148,7 +148,7 @@ struct MockBackend {
 
     // Find last op of given type.
     const MockOp* last_op(MockOp::Type type) const {
-        for (i32 i = static_cast<i32>(op_count) - 1; i >= 0; i--) {
+        for (size_t i = op_count; i-- > 0;) {
             if (ops[i].type == type) return &ops[i];
         }
         return nullptr;

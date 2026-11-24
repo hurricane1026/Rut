@@ -2679,6 +2679,8 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         CHECK_NE(methods[0].ids[0].bundle, methods[1].ids[0].bundle);
         CHECK_NE(methods[0].ids[0].bundle, methods[2].ids[0].bundle);
         CHECK_NE(methods[1].ids[0].bundle, methods[2].ids[0].bundle);
+        REQUIRE(methods[0].ids[0].bundle > 0 && methods[1].ids[0].bundle > 0 &&
+                methods[2].ids[0].bundle > 0);
         const auto& head_bundle = program.config.policy_bundles[methods[0].ids[0].bundle - 1];
         const auto& get_bundle = program.config.policy_bundles[methods[1].ids[0].bundle - 1];
         const auto& any_bundle = program.config.policy_bundles[methods[2].ids[0].bundle - 1];

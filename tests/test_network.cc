@@ -68249,7 +68249,7 @@ TEST(response_buffering_runtime, bounded_chain_send_retains_precise_read_timer_o
     REQUIRE_EQ(conn.upstream_recv_buf.write(body, prefix), prefix);
     REQUIRE(conn.response_body_tail.append(loop->pool, body, sizeof(body)));
     const IoEvent data = response_read_copy_event(
-        conn, prefix + sizeof(body), true, begin, conn.buffered_response_len());
+        conn, static_cast<i32>(prefix + sizeof(body)), true, begin, conn.buffered_response_len());
     loop->dispatch_batch(&data, 1);
     REQUIRE_GE(conn.fd, 0);
     REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,

@@ -753,7 +753,9 @@ bool test_fail_iouring_submit(u8 operation) noexcept {
 extern "C" void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     pthread_once(&rut::test_fault::g_syscall_once, rut::test_fault::resolve_syscalls);
     auto& state = rut::test_fault::state();
-    if (state.mmap_fail_call > 0 && ++state.mmap_call_count == state.mmap_fail_call) {
+    int mmap_call = 0;
+    if (state.mmap_fail_call > 0 && !__builtin_add_overflow(state.mmap_call_count, 1, &mmap_call) &&
+        (state.mmap_call_count = mmap_call) == state.mmap_fail_call) {
         errno = ENOMEM;
         return MAP_FAILED;
     }

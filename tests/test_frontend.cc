@@ -30535,6 +30535,20 @@ route GET "/users" {
     CHECK_EQ(static_cast<u8>(ast.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
     CHECK(ast.error().detail.eq(lit("placeholder index must be between _1 and _10")));
 }
+TEST(frontend, parse_rejects_placeholder_index_beyond_i32) {
+    const auto src = R"(
+func id(x: i32) -> i32 => x
+route GET "/users" {
+    let code = 200 | id(_4294967297)
+    return 200
+}
+)";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(ast.has_value());
+    CHECK(ast.error().detail.eq(lit("placeholder index must be between _1 and _10")));
+}
 TEST(frontend, source_pipe_runtime_optional_lhs_flows_via_any) {
     const auto src = R"(
 func id(x: str) -> str => x
@@ -39643,7 +39657,8 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
     REQUIRE(bundle_constant.imm.i32_val > 0);
     REQUIRE_LE(static_cast<u32>(bundle_constant.imm.i32_val), rir.module.policy_bundle_count);
     CHECK_EQ(bundle_constant.imm.i32_val, 1);
-    const u32 bundle_index = static_cast<u32>(bundle_constant.imm.i32_val - 1);
+    CHECK_GT(bundle_constant.imm.i32_val, 0);
+    const u32 bundle_index = static_cast<u32>(bundle_constant.imm.i32_val) - 1;
     u32 matching_bundle_count = 0;
     u32 matching_bundle_index = 0;
     for (u32 i = 0; i < rir.module.policy_bundle_count; ++i) {

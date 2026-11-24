@@ -739,13 +739,14 @@ TEST(Corpus, InvalidRequests) {
             rut::test::out("  FAIL invalid[");
             // Print index
             char idx[8];
-            int n = 0;
+            u32 n = 0;
             u32 tmp = i;
             do {
-                idx[n++] = static_cast<char>('0' + tmp % 10);
+                idx[n++] = static_cast<char>('0' + static_cast<int>(tmp % 10));
                 tmp /= 10;
             } while (tmp > 0);
-            for (int j = n - 1; j >= 0; j--) {
+            for (u32 j = n; j != 0;) {
+                --j;
                 char buf[2] = {idx[j], 0};
                 rut::test::out(buf);
             }

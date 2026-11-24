@@ -251,7 +251,9 @@ struct TrimRig {
     template <typename Pred>
     bool pump(Pred pred, i64 max_ms = 8000) {
         IoEvent events[kMaxEventsPerWait];
-        const i64 deadline = test_mono_ms() + max_ms;
+        const i64 now = test_mono_ms();
+        i64 deadline = 0;
+        if (__builtin_add_overflow(now, max_ms, &deadline)) deadline = INT64_MAX;
         while (!pred()) {
             if (test_mono_ms() > deadline) return false;
             const u32 n = loop->backend.wait(

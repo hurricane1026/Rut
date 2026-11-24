@@ -171,7 +171,7 @@ struct ParentCloseHookState {
 int fail_second_parent_close_after_real_close(int fd, void* opaque) {
     auto& state = *static_cast<ParentCloseHookState*>(opaque);
     const int result = close(fd);
-    if (result == 0) ++state.calls;
+    if (result == 0 && state.calls != std::numeric_limits<int>::max()) ++state.calls;
     if (result == 0 && state.calls == 2 && !state.fired) {
         state.fired = true;
         errno = EINTR;

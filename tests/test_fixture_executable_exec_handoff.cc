@@ -53,7 +53,8 @@ int open_fd_count() {
     while (const dirent* entry = readdir(directory)) {
         char* end = nullptr;
         const long value = std::strtol(entry->d_name, &end, 10);
-        if (end != entry->d_name && *end == '\0' && value >= 0 && value != own_fd) ++count;
+        if (end != entry->d_name && *end == '\0' && value >= 0 && value != own_fd && count != INT_MAX)
+            ++count;
     }
     if (closedir(directory) != 0) return -1;
     return count;
@@ -1314,7 +1315,7 @@ void mutate_argc(child_fixture::ChildContinuation& continuation) {
     continuation.arguments.argc = 0;
 }
 void mutate_encoded(child_fixture::ChildContinuation& continuation) {
-    --continuation.arguments.encoded_bytes;
+    if (continuation.arguments.encoded_bytes != 0) --continuation.arguments.encoded_bytes;
 }
 void mutate_offset_zero(child_fixture::ChildContinuation& continuation) {
     continuation.arguments.offsets[0] = 1;
@@ -1323,7 +1324,8 @@ void mutate_boundary(child_fixture::ChildContinuation& continuation) {
     continuation.arguments.offsets[1] = 0;
 }
 void mutate_terminal_offset(child_fixture::ChildContinuation& continuation) {
-    --continuation.arguments.offsets[continuation.arguments.argc];
+    if (continuation.arguments.offsets[continuation.arguments.argc] != 0)
+        --continuation.arguments.offsets[continuation.arguments.argc];
 }
 void mutate_terminal_nul(child_fixture::ChildContinuation& continuation) {
     continuation.arguments.arena[continuation.arguments.encoded_bytes - 1] = 'x';

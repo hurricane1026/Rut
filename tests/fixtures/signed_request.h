@@ -33,6 +33,8 @@ inline std::string format_date(long long unix_seconds) {
     static constexpr const char* kMonths[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     if (utc.tm_wday < 0 || utc.tm_wday >= 7 || utc.tm_mon < 0 || utc.tm_mon >= 12) return {};
+    int year = 0;
+    if (__builtin_add_overflow(utc.tm_year, 1900, &year)) return {};
     char value[30]{};
     const int length = __builtin_snprintf(value,
                                           sizeof(value),
@@ -40,7 +42,7 @@ inline std::string format_date(long long unix_seconds) {
                                           kWeekdays[utc.tm_wday],
                                           utc.tm_mday,
                                           kMonths[utc.tm_mon],
-                                          utc.tm_year + 1900,
+                                          year,
                                           utc.tm_hour,
                                           utc.tm_min,
                                           utc.tm_sec);

@@ -142,8 +142,12 @@ bool wait_bounded(pid_t child, int* status) {
         if (waited < 0) return false;
         timespec now{};
         clock_gettime(CLOCK_MONOTONIC, &now);
-        const time_t elapsed_seconds = now.tv_sec - started.tv_sec;
-        const long elapsed_nanoseconds = now.tv_nsec - started.tv_nsec;
+        time_t elapsed_seconds = 0;
+        if (__builtin_sub_overflow(now.tv_sec, started.tv_sec, &elapsed_seconds) ||
+            elapsed_seconds < 0)
+            continue;
+        long elapsed_nanoseconds = 0;
+        if (__builtin_sub_overflow(now.tv_nsec, started.tv_nsec, &elapsed_nanoseconds)) continue;
         if (elapsed_seconds > 5 || (elapsed_seconds == 5 && elapsed_nanoseconds >= 0)) {
             kill(child, SIGKILL);
             while (waitpid(child, status, 0) < 0 && errno == EINTR) {
@@ -760,10 +764,10 @@ std::vector<RutNode> parse_rut_route_nodes(const std::string& rut_text) {
 
         const size_t body_start = text_end + std::string("\" {\n").size();
         size_t i = body_start;
-        int depth = 1;
+        size_t depth = 1;
         for (; i < rut_text.size() && depth > 0; i++) {
             if (rut_text[i] == '{')
-                depth++;
+                ++depth;
             else if (rut_text[i] == '}')
                 depth--;
         }
@@ -2673,7 +2677,9 @@ TEST(envoy_convert, capacity_covers_worst_case_node_arm_duplication) {
     for (size_t i = 0; i < prefixes.size(); i++) {
         const std::string cluster_name = "backend" + std::to_string(i);
         routes.push_back(prefix_route_json(prefixes[i], cluster_name));
-        clusters.push_back(cluster_json(cluster_name, 9000 + static_cast<int>(i)));
+        int port = 0;
+        REQUIRE(!__builtin_add_overflow(9000, i, &port));
+        clusters.push_back(cluster_json(cluster_name, port));
     }
 
     const std::string text = route_list_json(json_array(routes), json_array(clusters));

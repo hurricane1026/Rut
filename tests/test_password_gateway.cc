@@ -332,7 +332,9 @@ struct PasswordH2Client {
         return count != 0 && send_all(fd, reinterpret_cast<const char*>(out), count);
     }
     bool receive_status(u32 stream, u16 status) {
-        const i64 deadline = test_mono_ms() + 10000;
+        const i64 now = test_mono_ms();
+        i64 deadline = 0;
+        if (__builtin_add_overflow(now, INT64_C(10000), &deadline)) return false;
         for (;;) {
             Http2FrameHeader header{};
             if (parse_frame_header(input, used, &header) == ParseStatus::Complete &&
@@ -370,11 +372,13 @@ struct PasswordH2Client {
                 if (statuses[stream] != 0) return statuses[stream] == status;
                 continue;
             }
-            if (used == sizeof(input) || test_mono_ms() >= deadline) return false;
-            const i32 got = recv_timeout(fd,
-                                         reinterpret_cast<char*>(input + used),
-                                         sizeof(input) - used,
-                                         static_cast<i32>(deadline - test_mono_ms()));
+            const i64 now_ms = test_mono_ms();
+            i32 remaining_ms = 0;
+            if (used == sizeof(input) || now_ms >= deadline ||
+                __builtin_sub_overflow(deadline, now_ms, &remaining_ms))
+                return false;
+            const i32 got = recv_timeout(
+                fd, reinterpret_cast<char*>(input + used), sizeof(input) - used, remaining_ms);
             if (got <= 0) return false;
             used += static_cast<u32>(got);
         }

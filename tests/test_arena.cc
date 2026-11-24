@@ -288,7 +288,9 @@ TEST(arena, many_blocks) {
     REQUIRE(a.init(256).has_value());
     for (int i = 0; i < 100; i++) CHECK(a.alloc(200) != nullptr);
     int blocks = 0;
-    for (MmapArena::Block* b = a.current; b; b = b->prev) blocks++;
+    for (MmapArena::Block* b = a.current; b; b = b->prev) {
+        REQUIRE(!__builtin_add_overflow(blocks, 1, &blocks));
+    }
     CHECK_GT(blocks, 1);
     a.destroy();
 }
@@ -581,7 +583,9 @@ TEST(arena, stress_large_allocs_across_blocks) {
     // Each alloc forces a new block
     for (int i = 0; i < 50; i++) CHECK(a.alloc(4000) != nullptr);
     int blocks = 0;
-    for (MmapArena::Block* b = a.current; b; b = b->prev) blocks++;
+    for (MmapArena::Block* b = a.current; b; b = b->prev) {
+        REQUIRE(!__builtin_add_overflow(blocks, 1, &blocks));
+    }
     CHECK_GE(blocks, 50);
     a.destroy();
 }

@@ -592,7 +592,8 @@ struct Recorder {
 };
 WsFrameAction record(void* c, WsOpcode op, const u8* payload, u64 len, bool from_client) {
     auto* r = static_cast<Recorder*>(c);
-    r->calls++;
+    int calls = 0;
+    if (!__builtin_add_overflow(r->calls, 1, &calls)) r->calls = calls;
     r->last_op = op;
     r->last_len = len;
     r->last_first = len ? payload[0] : 0;

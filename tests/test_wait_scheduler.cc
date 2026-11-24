@@ -51,7 +51,9 @@ u64 rewait(void* raw, jit::HandlerCtx* ctx, const u8*, u32, void*) {
             replacing_owner = fresh;
         }
     }
-    return jit::HandlerResult::make_yield(ctx->state + 1, jit::YieldKind::Send).pack();
+    if (ctx->state == UINT16_MAX) return jit::HandlerResult::make_status(500).pack();
+    const u16 state = static_cast<u16>(static_cast<i64>(ctx->state) + 1);
+    return jit::HandlerResult::make_yield(state, jit::YieldKind::Send).pack();
 }
 
 void publish(SmallLoop& loop, Connection& c, u32 id) {
@@ -294,7 +296,7 @@ TEST(wait_scheduler, epoll_ready_responses_survive_prefilled_completion_ring) {
                                        sizeof(response) - static_cast<size_t>(received),
                                        0);
                 if (n <= 0) break;
-                received += n;
+                if (__builtin_add_overflow(received, n, &received)) break;
                 if (static_cast<size_t>(received) == sizeof(response)) break;
             }
             CHECK_GT(received, 0);
@@ -379,7 +381,8 @@ TEST(wait_scheduler, generation_or_continuation_change_invalidates_queued_resume
         if (change_generation)
             ++owners.nodes[0].handler_gen;
         else
-            ++owners.nodes[0].handler_state;
+            owners.nodes[0].handler_state =
+                static_cast<u16>(static_cast<i64>(owners.nodes[0].handler_state) + 1);
         owners.loop.drain_ready_jit_handlers();
         CHECK_EQ(calls, 0u);
         CHECK(!owners.loop.has_ready_jit_handlers());

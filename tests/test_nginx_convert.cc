@@ -73,8 +73,12 @@ bool wait_bounded(pid_t child, int* status) {
         if (waited < 0) return false;
         timespec now{};
         clock_gettime(CLOCK_MONOTONIC, &now);
-        const time_t elapsed_seconds = now.tv_sec - started.tv_sec;
-        const long elapsed_nanoseconds = now.tv_nsec - started.tv_nsec;
+        time_t elapsed_seconds = 0;
+        if (__builtin_sub_overflow(now.tv_sec, started.tv_sec, &elapsed_seconds) ||
+            elapsed_seconds < 0)
+            continue;
+        long elapsed_nanoseconds = 0;
+        if (__builtin_sub_overflow(now.tv_nsec, started.tv_nsec, &elapsed_nanoseconds)) continue;
         if (elapsed_seconds > 5 || (elapsed_seconds == 5 && elapsed_nanoseconds >= 0)) {
             kill(child, SIGKILL);
             while (waitpid(child, status, 0) < 0 && errno == EINTR) {
@@ -443,18 +447,20 @@ TEST(nginx_convert, nginx_http_output_matches_complete_api_and_rejects_unsupport
         "proxy_buffering on; proxy_pass http://127.0.0.1:9000; } } }\n";
     const std::string path = directory + "/complete.conf";
     REQUIRE(write_file(path, source));
-    const auto diagnostic_prefix = [](const std::string& filename,
-                                      const std::string& input,
-                                      const std::string& token) {
-        const size_t offset = input.find(token);
-        if (offset == std::string::npos) return std::string{};
-        const size_t line_start =
-            input.rfind('\n', offset) == std::string::npos ? 0u : input.rfind('\n', offset) + 1u;
-        const unsigned line = static_cast<unsigned>(
-            std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n') + 1u);
-        const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
-        return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
-    };
+    const auto diagnostic_prefix =
+        [](const std::string& filename, const std::string& input, const std::string& token) {
+            const size_t offset = input.find(token);
+            if (offset == std::string::npos) return std::string{};
+            const size_t line_start = input.rfind('\n', offset) == std::string::npos
+                                          ? 0u
+                                          : input.rfind('\n', offset) + 1u;
+            const unsigned line = static_cast<unsigned>(
+                static_cast<size_t>(std::count(
+                    input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n')) +
+                1u);
+            const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
+            return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
+        };
     const auto parsed =
         rut::nginx::parse_nginx_http_config({source.data(), static_cast<rut::u32>(source.size())});
     REQUIRE(parsed);
@@ -583,7 +589,9 @@ TEST(nginx_convert_issue621, converts_explicit_buffering_custom_hide_timeout_cli
         const size_t line_start =
             input.rfind('\n', offset) == std::string::npos ? 0u : input.rfind('\n', offset) + 1u;
         const unsigned line = static_cast<unsigned>(
-            std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n') + 1u);
+            static_cast<size_t>(
+                std::count(input.begin(), input.begin() + static_cast<ptrdiff_t>(offset), '\n')) +
+            1u);
         const unsigned col = static_cast<unsigned>(offset - line_start + 1u);
         return filename + ":" + std::to_string(line) + ":" + std::to_string(col) + ": ";
     };

@@ -435,9 +435,14 @@ void child_main(int ready_fd,
                 continue;
             if (fd == injected_close_failure_fd) {
                 const int close_result = close(fd);  // Exactly one real attempt.
-                if (prepared && close_attempt_evidence != nullptr)
+                if (prepared && close_attempt_evidence != nullptr) {
+                    int attempts = 0;
                     *close_attempt_evidence =
-                        close_result == 0 ? static_cast<int>(*close_attempt_evidence + 1) : -1;
+                        close_result == 0 &&
+                                !__builtin_add_overflow(*close_attempt_evidence, 1, &attempts)
+                            ? attempts
+                            : -1;
+                }
                 errno = EINTR;
                 _exit(126);
             }

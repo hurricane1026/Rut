@@ -732,7 +732,10 @@ TEST(native_program, jwt_lifetime_policy_survives_native_artifact_source_removal
     timespec now{};
     REQUIRE(clock_gettime(CLOCK_REALTIME, &now) == 0);
     REQUIRE(now.tv_sec > 1000);
-    const auto claims = ::rut::test::jwt_lifetime::claims(now.tv_sec - 30, now.tv_sec + 1800);
+    time_t issued_at = 0, expires_at = 0;
+    REQUIRE(!__builtin_sub_overflow(now.tv_sec, 30, &issued_at));
+    REQUIRE(!__builtin_add_overflow(now.tv_sec, 1800, &expires_at));
+    const auto claims = ::rut::test::jwt_lifetime::claims(issued_at, expires_at);
     const auto token = ::rut::test::jwt_lifetime::make_token(claims);
     REQUIRE(!token.empty());
     SlicePool pool;
@@ -752,7 +755,9 @@ TEST(native_program, jwt_lifetime_policy_survives_native_artifact_source_removal
                                          &arena));
     };
     CHECK_EQ(invoke_token(token).status_code, 204u);
-    const auto old_claims = ::rut::test::jwt_lifetime::claims(now.tv_sec - 400, now.tv_sec + 1800);
+    time_t old_issued_at = 0;
+    REQUIRE(!__builtin_sub_overflow(now.tv_sec, 400, &old_issued_at));
+    const auto old_claims = ::rut::test::jwt_lifetime::claims(old_issued_at, expires_at);
     const auto old_token = ::rut::test::jwt_lifetime::make_token(old_claims);
     REQUIRE(!old_token.empty());
     CHECK_EQ(invoke_token(old_token).status_code, 401u);

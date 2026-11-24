@@ -507,7 +507,7 @@ bool run_ready_case(const std::string& executable, std::string& error, const cha
                 for (const char* label : {"peer PID", "peer uid", "peer gid"}) {
                     Peer peer_mutation = peer;
                     if (strcmp(label, "peer PID") == 0)
-                        ++peer_mutation.pid;
+                        peer_mutation.pid = peer.pid == 1 ? 2 : 1;
                     else if (strcmp(label, "peer uid") == 0)
                         ++peer_mutation.uid;
                     else

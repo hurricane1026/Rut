@@ -22,8 +22,8 @@ bool reference(Str text, bool wide, i64& output) {
         if (digit > 9 || value > (limit - digit) / 10) return false;
         value = value * 10 + digit;
     }
-    output =
-        negative ? -static_cast<i64>(value - (value != 0)) - (value != 0) : static_cast<i64>(value);
+    const auto magnitude = static_cast<__int128_t>(value);
+    output = static_cast<i64>(negative ? -magnitude : magnitude);
     return true;
 }
 void compare(rut::test::TestCase* _tc, Str text) {

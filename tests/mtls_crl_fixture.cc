@@ -227,7 +227,9 @@ int main(int argc, char** argv) {
     if (in) fclose(in);
     bool ok = issuer && key;
     if (argc == 4) {
-        const time_t kDeadline = time(nullptr) + 30;
+        const time_t now = time(nullptr);
+        time_t kDeadline = 0;
+        if (__builtin_add_overflow(now, static_cast<time_t>(30), &kDeadline)) kDeadline = now;
         ok = ok && strcmp(argv[3], "--short") == 0 &&
              crl(issuer, key, argv[2], "short.pem", false, -60, 30);
         if (ok) printf("%lld\n", static_cast<long long>(kDeadline));
