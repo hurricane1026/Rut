@@ -52,12 +52,13 @@ static void write_str(const char* s) {
 
 static void write_u64(u64 val) {
     char buf[21];
-    i32 n = 0;
+    const char* end = buf + sizeof(buf);
+    char* digit = buf + sizeof(buf);
     do {
-        buf[n++] = static_cast<char>('0' + val % 10);
+        *--digit = static_cast<char>('0' + val % 10);
         val /= 10;
     } while (val);
-    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
+    while (digit != end) (void)write(2, digit++, 1);
 }
 
 static void write_u32(u32 val) {
@@ -1183,10 +1184,16 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 i++;
-                access_log_level = 0;
+                u64 level = 0;
+                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++) {
+                    level = level * 10 + static_cast<u64>(*p - '0');
+                    if (level > static_cast<u64>(__INT32_MAX__)) {
+                        write_str("--access-log-level exceeds the maximum of 2147483647\n");
+                        return 1;
+                    }
+                }
+                access_log_level = static_cast<i32>(level);
                 cli_access_log_level_present = true;
-                for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
-                    access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
             } else if (str_eq(argv[i], "--opt")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--opt requires a numeric argument (0-3)\n");

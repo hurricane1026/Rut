@@ -41,9 +41,9 @@ namespace rut::test {
 // --- Output ---
 
 inline void out(const char* s) {
-    int len = 0;
-    while (s[len]) len++;
-    (void)::write(1, s, len);
+    const char* end = s;
+    while (*end) ++end;
+    (void)::write(1, s, static_cast<size_t>(end - s));
 }
 
 inline void out_int(int v) {
@@ -54,17 +54,18 @@ inline void out_int(int v) {
     unsigned uv;
     if (v < 0) {
         (void)::write(1, "-", 1);
-        uv = static_cast<unsigned>(-(v + 1)) + 1u;
+        uv = 0u - static_cast<unsigned>(v);
     } else {
         uv = static_cast<unsigned>(v);
     }
     char buf[16];
-    int n = 0;
+    const char* end = buf + sizeof(buf);
+    char* digit = buf + sizeof(buf);
     while (uv > 0) {
-        buf[n++] = static_cast<char>('0' + uv % 10);
+        *--digit = static_cast<char>('0' + uv % 10);
         uv /= 10;
     }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+    while (digit != end) (void)::write(1, digit++, 1);
 }
 
 inline bool str_starts_with(const char* s, const char* prefix) {
@@ -93,15 +94,14 @@ inline bool str_eq_safe(const char* a, const char* b) {
 
 inline bool str_contains(const char* haystack, const char* needle) {
     if (!needle[0]) return true;
-    for (int i = 0; haystack[i]; i++) {
-        bool match = true;
-        for (int j = 0; needle[j]; j++) {
-            if (haystack[i + j] == '\0' || haystack[i + j] != needle[j]) {
-                match = false;
-                break;
-            }
+    for (const char* start = haystack; *start; ++start) {
+        const char* candidate = start;
+        const char* pattern = needle;
+        while (*pattern && *candidate == *pattern) {
+            ++candidate;
+            ++pattern;
         }
-        if (match) return true;
+        if (!*pattern) return true;
     }
     return false;
 }

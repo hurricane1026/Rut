@@ -97,9 +97,21 @@ def smoke(binary, backend):
         proc.stdout.close()
 
 
+def check_access_log_level_overflow(binary):
+    for value in ('2147483648', '999999999999999999999999999999'):
+        result = subprocess.run(
+            [binary, '0', '--access-log-level', value],
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 1, result
+        assert '--access-log-level exceeds the maximum' in result.stderr, result
+        assert 'Listening on port ' not in result.stderr + result.stdout, result
+
+
 def main():
     check_startup_failure_classifier()
     binary = sys.argv[1]
+    check_access_log_level_overflow(binary)
     for options in [['--backend'], ['--backend', ''], ['--backend', '--shards', '1'],
                     ['--backend', 'invalid'], ['--backend', 'EPOLL'],
                     ['--backend', 'epoll', '--backend', 'auto']]:

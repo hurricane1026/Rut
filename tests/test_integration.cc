@@ -146,7 +146,7 @@ ScriptedTlsState* g_scripted_tls = nullptr;
 
 i32 scripted_ssl_accept(SSL* /*ssl*/) {
     if (!g_scripted_tls) return -1;
-    g_scripted_tls->accept_calls++;
+    rut::test::increment_check_count(g_scripted_tls->accept_calls);
     if (g_scripted_tls->accept_calls == 1) {
         g_scripted_tls->last_error = g_scripted_tls->accept_first_error;
         return g_scripted_tls->accept_first_rc;
@@ -157,7 +157,7 @@ i32 scripted_ssl_accept(SSL* /*ssl*/) {
 
 i32 scripted_ssl_read(SSL* /*ssl*/, void* buf, i32 len) {
     if (!g_scripted_tls) return -1;
-    g_scripted_tls->read_calls++;
+    rut::test::increment_check_count(g_scripted_tls->read_calls);
     i32 rc = g_scripted_tls->read_second_rc;
     i32 err = g_scripted_tls->read_second_error;
     if (g_scripted_tls->read_calls == 1) {
@@ -166,7 +166,8 @@ i32 scripted_ssl_read(SSL* /*ssl*/, void* buf, i32 len) {
     }
 
     if (rc > 0 && len >= rc) {
-        for (i32 i = 0; i < rc; i++) static_cast<char*>(buf)[i] = static_cast<char>('A' + i);
+        for (i32 i = 0; i < rc; i++)
+            static_cast<char*>(buf)[i] = static_cast<char>('A' + static_cast<i64>(i));
     }
     g_scripted_tls->last_error = err;
     return rc;
@@ -174,7 +175,7 @@ i32 scripted_ssl_read(SSL* /*ssl*/, void* buf, i32 len) {
 
 i32 scripted_ssl_write(SSL* /*ssl*/, const void* /*buf*/, i32 /*len*/) {
     if (!g_scripted_tls) return -1;
-    g_scripted_tls->write_calls++;
+    rut::test::increment_check_count(g_scripted_tls->write_calls);
     if (g_scripted_tls->write_calls == 1) {
         g_scripted_tls->last_error = g_scripted_tls->write_first_error;
         return g_scripted_tls->write_first_rc;
@@ -185,7 +186,7 @@ i32 scripted_ssl_write(SSL* /*ssl*/, const void* /*buf*/, i32 /*len*/) {
 
 i32 scripted_ssl_shutdown(SSL*) {
     if (!g_scripted_tls) return -1;
-    ++g_scripted_tls->shutdown_calls;
+    rut::test::increment_check_count(g_scripted_tls->shutdown_calls);
     const bool first = g_scripted_tls->shutdown_calls == 1;
     g_scripted_tls->last_error =
         first ? g_scripted_tls->shutdown_first_error : g_scripted_tls->shutdown_second_error;
