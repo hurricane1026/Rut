@@ -48,7 +48,7 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
         while (read < decoded && output[read] == '/') read++;
         const i64 kBegin = read;
         while (read < decoded && output[read] != '/') read++;
-        const i64 kSize = read - kBegin;
+        const i64 kSize = static_cast<i64>(static_cast<__int128_t>(read) - kBegin);
         if (kSize == 0) break;
         const bool kDot = kSize == 1 && output[kBegin] == '.';
         const bool kParent = kSize == 2 && output[kBegin] == '.' && output[kBegin + 1] == '.';

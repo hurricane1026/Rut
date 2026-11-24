@@ -623,8 +623,9 @@ u32 AccessLogFlusher::flush_once() {
                     }
                     batch_len = 0;
                 }
-                for (i64 j = 0; j < static_cast<i64>(n); j++) batch[batch_len + j] = line[j];
-                batch_len += static_cast<i64>(n);
+                for (i64 j = 0; j < static_cast<i64>(n); j++) (batch + batch_len)[j] = line[j];
+                batch_len =
+                    static_cast<i64>(static_cast<__int128_t>(batch_len) + static_cast<i64>(n));
             }
             total++;
         }

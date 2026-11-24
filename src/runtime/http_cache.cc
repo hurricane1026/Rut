@@ -41,7 +41,7 @@ bool decimal(Str text, u32& value) {
         if (result > (static_cast<i64>(UINT32_MAX) - digit) / 10)
             result = 0xffffffffu;
         else
-            result = result * 10 + digit;
+            result = static_cast<i64>(static_cast<__int128_t>(result) * 10 + digit);
     }
     value = static_cast<u32>(result);
     return true;
@@ -189,12 +189,18 @@ bool http_date(Str value, u64& seconds) {
                static_cast<i64>(leap_years(static_cast<u32>(static_cast<i64>(year) - 1))) -
                static_cast<i64>(leap_years(1969));
     for (u32 i = 0; i < month; ++i)
-        days += static_cast<i64>(kDays[i]) + static_cast<i64>(i == 1 && kLeap ? 1u : 0u);
+        days = static_cast<i64>(static_cast<__int128_t>(days) + static_cast<i64>(kDays[i]) +
+                                static_cast<i64>(i == 1 && kLeap ? 1u : 0u));
     days += static_cast<i64>(day) - 1;
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!Str{p, 3}.eq({kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3})) return false;
-    seconds = static_cast<u64>(days * 86400 + static_cast<i64>(hour) * 3600 +
-                               static_cast<i64>(minute) * 60 + static_cast<i64>(second));
+    if (!Str{p, 3}.eq(
+            {kWeekdays +
+                 static_cast<i64>((static_cast<i64>(static_cast<__int128_t>(days) + 4) % 7)) * 3,
+             3}))
+        return false;
+    seconds =
+        static_cast<u64>(static_cast<__int128_t>(days) * 86400 + static_cast<i64>(hour) * 3600 +
+                         static_cast<i64>(minute) * 60 + static_cast<i64>(second));
     return true;
 }
 struct ResponseInfo {

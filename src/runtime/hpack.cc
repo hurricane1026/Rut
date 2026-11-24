@@ -208,7 +208,8 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
         out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
         remainder >>= 7;
     }
-    out[i++] = static_cast<u8>(remainder);
+    out[i] = static_cast<u8>(remainder);
+    i = static_cast<i64>(static_cast<__int128_t>(i) + 1);
     return static_cast<u32>(i);
 }
 
@@ -626,7 +627,7 @@ bool decode_header_block(DynamicTable& dyn,
                 if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += static_cast<i64>(name.len);
+                op = static_cast<i64>(static_cast<__int128_t>(op) + static_cast<i64>(name.len));
             }
             dyn_add(dyn, name, value);
         }
@@ -644,8 +645,12 @@ i64 encode_header(u8* out, Str name, Str value) {
     const i32 kNameIdx = static_find_name(name);
     // Literal without indexing (0000xxxx): name index (0 = literal name).
     i64 o = encode_integer(out, static_cast<u32>(kNameIdx > 0 ? kNameIdx : 0), 4, 0x00);
-    if (kNameIdx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
-    o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
+    if (kNameIdx <= 0)
+        o = static_cast<i64>(
+            static_cast<__int128_t>(o) +
+            encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len));
+    o = static_cast<i64>(static_cast<__int128_t>(o) +
+                         encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len));
     return o;
 }
 
@@ -664,8 +669,12 @@ i64 Encoder::encode(u8* out, Str name, Str value) {
     i32 nidx = static_find_name(name);
     if (nidx == 0) nidx = dyn_find_name(dyn, name);
     i64 o = encode_integer(out, static_cast<u32>(nidx > 0 ? nidx : 0), 6, 0x40);
-    if (nidx <= 0) o += encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len);
-    o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
+    if (nidx <= 0)
+        o = static_cast<i64>(
+            static_cast<__int128_t>(o) +
+            encode_string(out + o, reinterpret_cast<const u8*>(name.ptr), name.len));
+    o = static_cast<i64>(static_cast<__int128_t>(o) +
+                         encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len));
     // Index resolution above used the pre-add table — the same order the peer's
     // decoder sees — so adding now keeps both tables in sync.
     dyn_add(dyn, name, value);

@@ -32,28 +32,32 @@ inline bool transform_string(
     u16 prefix[kStringNeedleLimit]{};
     if (mode == 2) {
         for (i64 i = 1, j = 0; i < static_cast<i64>(needle.len); ++i) {
-            while (j && needle.ptr[i] != needle.ptr[j]) j = prefix[j - 1];
-            if (needle.ptr[i] == needle.ptr[j]) ++j;
+            while (j && needle.ptr[i] != needle.ptr[j]) j = (prefix + j)[-1];
+            if (needle.ptr[i] == needle.ptr[j])
+                j = static_cast<i64>(static_cast<__int128_t>(j) + 1);
             prefix[i] = static_cast<u16>(j);
         }
     }
     // Both passes use KMP: linear work even for adversarial repetitive input.
     const auto scan = [&](auto&& match) {
         for (i64 i = 0, j = 0; i < static_cast<i64>(text.len); ++i) {
-            while (j && text.ptr[i] != needle.ptr[j]) j = prefix[j - 1];
-            if (text.ptr[i] == needle.ptr[j]) ++j;
+            while (j && text.ptr[i] != needle.ptr[j]) j = (prefix + j)[-1];
+            if (text.ptr[i] == needle.ptr[j]) j = static_cast<i64>(static_cast<__int128_t>(j) + 1);
             if (j == needle.len) {
-                match(i + 1 - static_cast<i64>(needle.len));
+                match(static_cast<i64>(static_cast<__int128_t>(i) + 1 -
+                                       static_cast<i64>(needle.len)));
                 j = 0;
             }
         }
     };
     u32 count = 0;
     if (mode == 2) scan([&](u32) { ++count; });
-    const i64 size = static_cast<i64>(text.len) -
-                     static_cast<i64>(count) * static_cast<i64>(needle.len) +
-                     static_cast<i64>(count) * static_cast<i64>(replacement.len);
-    const i64 budget_remaining = static_cast<i64>(kStringArenaBudget) - (size ? size : i64{1});
+    const i64 size =
+        static_cast<i64>(static_cast<__int128_t>(text.len) -
+                         static_cast<__int128_t>(count) * static_cast<i64>(needle.len) +
+                         static_cast<__int128_t>(count) * static_cast<i64>(replacement.len));
+    const i64 budget_remaining =
+        static_cast<i64>(static_cast<__int128_t>(kStringArenaBudget) - (size ? size : i64{1}));
     if (size > static_cast<i64>(kStringOutputLimit) ||
         arena->space_used() > static_cast<u64>(budget_remaining) ||
         (!arena->current && !arena->init(arena->backend.pool)))
@@ -72,16 +76,18 @@ inline bool transform_string(
     } else {
         i64 copied = 0;
         scan([&](i64 start) {
-            const i64 length = start - copied;
+            const i64 length = static_cast<i64>(static_cast<__int128_t>(start) - copied);
             if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
             written += length;
             if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
             written += static_cast<i64>(replacement.len);
-            copied = start + static_cast<i64>(needle.len);
+            copied =
+                static_cast<i64>(static_cast<__int128_t>(start) + static_cast<i64>(needle.len));
         });
         if (static_cast<i64>(text.len) > copied)
-            __builtin_memcpy(
-                data + written, text.ptr + copied, static_cast<i64>(text.len) - copied);
+            __builtin_memcpy(data + written,
+                             text.ptr + copied,
+                             static_cast<i64>(static_cast<__int128_t>(text.len) - copied));
     }
     *output = {data, static_cast<u32>(size)};
     return true;

@@ -65,7 +65,7 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
     i64 i = 0;
     // Skip the request line (up to and past the first CRLF).
     while (i + 1 < end && (p[i] != '\r' || p[i + 1] != '\n')) i++;
-    i += 2;
+    i = static_cast<i64>(static_cast<__int128_t>(i) + 2);
     // Authorization follows req.header's unique-header rule: duplicate fields
     // are ambiguous and therefore map to the missing-value bucket.
     const bool unique = ci_eq(name, name_len, "Authorization", 13);
@@ -77,24 +77,26 @@ inline Str header_value(const RateLimitKeyInput& in, const char* name, u32 name_
         while (colon < end && p[colon] != ':' && p[colon] != '\r') colon++;
         // Advance to end of this line.
         i64 line_end = colon;
-        while (line_end + 1 < end && (p[line_end] != '\r' || p[line_end + 1] != '\n')) line_end++;
+        while (static_cast<i64>(static_cast<__int128_t>(line_end) + 1) < end &&
+               (p[line_end] != '\r' || (p + line_end)[1] != '\n'))
+            line_end = static_cast<i64>(static_cast<__int128_t>(line_end) + 1);
         if (colon < end && p[colon] == ':') {
-            const u32 nlen = static_cast<u32>(colon - line_start);
+            const u32 nlen = static_cast<u32>(static_cast<__int128_t>(colon) - line_start);
             if (ci_eq(p + line_start, nlen, name, name_len)) {
                 i64 vs = colon + 1;
                 if (vs > line_end) {
-                    i = line_end + 2;
+                    i = static_cast<i64>(static_cast<__int128_t>(line_end) + 2);
                     continue;
                 }
                 while (vs < line_end && (p[vs] == ' ' || p[vs] == '\t')) vs++;
                 i64 ve = line_end;
                 while (ve > vs && (p[ve - 1] == ' ' || p[ve - 1] == '\t')) ve--;
-                if (!unique) return {p + vs, static_cast<u32>(ve - vs)};
+                if (!unique) return {p + vs, static_cast<u32>(static_cast<__int128_t>(ve) - vs)};
                 if (first.ptr != nullptr) return {nullptr, 0};
-                first = {p + vs, static_cast<u32>(ve - vs)};
+                first = {p + vs, static_cast<u32>(static_cast<__int128_t>(ve) - vs)};
             }
         }
-        i = line_end + 2;
+        i = static_cast<i64>(static_cast<__int128_t>(line_end) + 2);
     }
     return first;
 }
@@ -133,7 +135,7 @@ inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_l
     while (i < plen && p[i] != '#') {
         const i64 ks = i;
         while (i < plen && p[i] != '=' && p[i] != '&' && p[i] != '#') i++;
-        const u32 klen = static_cast<u32>(i - ks);
+        const u32 klen = static_cast<u32>(static_cast<__int128_t>(i) - ks);
         const char* vp = nullptr;
         u32 vlen = 0;
         if (i < plen && p[i] == '=') {
@@ -141,7 +143,7 @@ inline Str query_value(const RateLimitKeyInput& in, const char* name, u32 name_l
             const i64 vs = i;
             while (i < plen && p[i] != '&' && p[i] != '#') i++;
             vp = p + vs;
-            vlen = static_cast<u32>(i - vs);
+            vlen = static_cast<u32>(static_cast<__int128_t>(i) - vs);
         }
         if (Str{p + ks, klen}.eq(Str{name, name_len})) return {vp ? vp : p + ks, vp ? vlen : 0};
         if (i < plen && p[i] == '&') i++;
@@ -159,16 +161,21 @@ inline Str cookie_value(const RateLimitKeyInput& in, const char* name, u32 name_
     const i64 end = in.req_header_end;
     i64 line = 0;
     while (line + 1 < end && (p[line] != '\r' || p[line + 1] != '\n')) line++;
-    line += 2;
+    line = static_cast<i64>(static_cast<__int128_t>(line) + 2);
     while (line < end) {
         if (line + 1 < end && p[line] == '\r' && p[line + 1] == '\n') break;
         const i64 line_start = line;
         i64 colon = line_start;
         while (colon < end && p[colon] != ':' && p[colon] != '\r') colon++;
         i64 line_end = colon;
-        while (line_end + 1 < end && (p[line_end] != '\r' || p[line_end + 1] != '\n')) line_end++;
+        while (static_cast<i64>(static_cast<__int128_t>(line_end) + 1) < end &&
+               (p[line_end] != '\r' || (p + line_end)[1] != '\n'))
+            line_end = static_cast<i64>(static_cast<__int128_t>(line_end) + 1);
         if (colon < end && p[colon] == ':' &&
-            ci_eq(p + line_start, colon - line_start, "Cookie", 6)) {
+            ci_eq(p + line_start,
+                  static_cast<u32>(static_cast<__int128_t>(colon) - line_start),
+                  "Cookie",
+                  6)) {
             i64 value_start = colon + 1;
             while (value_start < line_end && (p[value_start] == ' ' || p[value_start] == '\t'))
                 value_start++;
@@ -177,7 +184,8 @@ inline Str cookie_value(const RateLimitKeyInput& in, const char* name, u32 name_
                 value_end--;
             i64 i = value_start;
             while (i < value_end) {
-                while (i < value_end && (p[i] == ' ' || p[i] == '\t' || p[i] == ';')) i++;
+                while (i < value_end && (p[i] == ' ' || p[i] == '\t' || p[i] == ';'))
+                    i = static_cast<i64>(static_cast<__int128_t>(i) + 1);
                 const i64 key_start = i;
                 while (i < value_end && p[i] != '=' && p[i] != ';') i++;
                 i64 key_end = i;
@@ -194,12 +202,14 @@ inline Str cookie_value(const RateLimitKeyInput& in, const char* name, u32 name_
                 while (cookie_value_end > value_start &&
                        (p[cookie_value_end - 1] == ' ' || p[cookie_value_end - 1] == '\t'))
                     cookie_value_end--;
-                const u32 key_len = static_cast<u32>(key_end - key_start);
+                const u32 key_len = static_cast<u32>(static_cast<__int128_t>(key_end) - key_start);
                 if (Str{p + key_start, key_len}.eq(Str{name, name_len}))
-                    return {p + value_start, static_cast<u32>(cookie_value_end - value_start)};
+                    return {
+                        p + value_start,
+                        static_cast<u32>(static_cast<__int128_t>(cookie_value_end) - value_start)};
             }
         }
-        line = line_end + 2;
+        line = static_cast<i64>(static_cast<__int128_t>(line_end) + 2);
     }
     return {nullptr, 0};
 }
