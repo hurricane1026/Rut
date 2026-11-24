@@ -203,12 +203,14 @@ Rs256Policy::Refresh Rs256Policy::prepare_refresh(Str jwks, Rs256KeySet& output)
         const Str kValue{ids[count], id.len};
         for (u32 i = 0; i < count; ++i)
             if (kValue.eq({ids[i], lengths[i]})) return Refresh::Invalid;
-        lengths[count++] = id.len;
+        const Str kId{ids[count], id.len};
+        lengths[count] = id.len;
+        ++count;
         if (remote_.admit_new_kids) {
             // The authenticated set defines the trusted inventory. Other
             // algorithms in the same provider set are ignored, not admitted.
             if (member_equals(kty, "RSA") && member_equals(alg, "RS256"))
-                approved[selected++] = {ids[count - 1], id.len};
+                approved[selected++] = kId;
         } else {
             for (u32 i = 0; i < keys_.size(); ++i) {
                 if (kValue.eq(keys_.kid_at(i))) approved[selected++] = keys_.kid_at(i);

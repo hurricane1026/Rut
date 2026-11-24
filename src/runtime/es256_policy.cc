@@ -195,12 +195,13 @@ Es256Policy::Refresh Es256Policy::prepare_refresh(Str jwks, Es256KeySet& output)
         const Str kValue{ids[count], id.len};
         for (u32 i = 0; i < count; ++i)
             if (kValue.eq({ids[i], lengths[i]})) return Refresh::Invalid;
-        lengths[count++] = id.len;
+        const Str kId{ids[count], id.len};
+        lengths[count] = id.len;
+        ++count;
         if (remote_configuration.admit_new_kids) {
             // The authenticated set defines the trusted inventory. Other
             // algorithms in the same provider set are ignored, not admitted.
-            if (member_equals(kty, "EC") && member_equals(alg, "ES256"))
-                approved[selected++] = {ids[count - 1], id.len};
+            if (member_equals(kty, "EC") && member_equals(alg, "ES256")) approved[selected++] = kId;
         } else {
             for (u32 i = 0; i < key_set.size(); ++i) {
                 if (kValue.eq(key_set.kid_at(i))) approved[selected++] = key_set.kid_at(i);
