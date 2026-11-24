@@ -172,6 +172,11 @@ without presenting lossy or per-shard state as exact shared state.
   Values are copied; raw encoding/empty-value semantics are documented, and
   explicit-wait/non-request contexts are rejected. This
   completes the repeated-query read primitive, not general arrays or iteration.
+- [x] Tuple element access: `pair.0` / `pair.1` project a tuple slot (adjacent
+  decimal digits after `.`), including static-loop elements. Literal tuples
+  fold to the element; non-tuple receivers and out-of-range slots are rejected
+  with dedicated diagnostics. Nested tuples and `let (x, y) = pair`
+  destructuring remain pending.
 - [x] Static route-local `for` loops are enabled end to end. The parser accepts
   `for name in <static array> { ... }` (still rejecting `inline for`), analyze
   builds the existing `HirForLoop` subset, and MIR unrolls literals or

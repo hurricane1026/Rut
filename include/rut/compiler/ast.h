@@ -178,6 +178,10 @@ enum class AstExprKind : u8 {
     Call,
     MethodCall,
     Field,
+    // `pair.0` / `t.1` — tuple slot projection. `lhs` is the tuple expression
+    // and `int_value` is the 0-based slot index. Mirrors Swift tuple element
+    // access; destructuring patterns (`let (a, b) = pair`) remain pending.
+    TupleSlot,
     ReqHeader,
     ReqParam,
     ReqCookie,

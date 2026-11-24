@@ -1379,6 +1379,33 @@ struct Parser {
                 break;  // new-line `.x` starts the next match arm's pattern
             }
             if (!take(TokenType::Dot)) break;
+            // `pair.0` — tuple slot projection. The index must be plain decimal
+            // digits written adjacent to the dot, so `pair . 0` and radix forms
+            // stay member-name errors rather than silently selecting a slot.
+            if (cur().type == TokenType::IntLit) {
+                const Token& slot_token = cur();
+                bool plain_decimal = slot_token.start == prev().end && slot_token.text.len != 0 &&
+                                     slot_token.text.len <= 2;
+                for (u32 i = 0; plain_decimal && i < slot_token.text.len; i++) {
+                    const char c = slot_token.text.ptr[i];
+                    if (c < '0' || c > '9') plain_decimal = false;
+                }
+                if (plain_decimal) {
+                    pos++;
+                    auto lhs_ptr = alloc_expr(expr);
+                    if (!lhs_ptr) return core::make_unexpected(lhs_ptr.error());
+                    AstExpr slot{};
+                    slot.kind = AstExprKind::TupleSlot;
+                    slot.lhs = lhs_ptr.value();
+                    slot.int_value = (slot_token.text.ptr[0] - '0');
+                    if (slot_token.text.len == 2)
+                        slot.int_value = slot.int_value * 10 + (slot_token.text.ptr[1] - '0');
+                    slot.span =
+                        Span{expr.span.start, slot_token.end, expr.span.line, expr.span.col};
+                    expr = slot;
+                    continue;
+                }
+            }
             const Token* field_name = nullptr;
             // After `.` the token is a member name, not a statement keyword, so a reserved
             // word there is unambiguous. `func` is already allowed; `forward` is allowed too

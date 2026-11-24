@@ -12117,6 +12117,89 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         // Otherwise fall through to the generic Field path so the
         // user's local / variant / namespace `req` resolves normally.
     }
+    if (expr.kind == AstExprKind::TupleSlot) {
+        if (expr.lhs == nullptr || expr.int_value < 0)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        auto tuple = analyze_expr(*expr.lhs, route, mod, locals, local_count, binding);
+        if (!tuple) return core::make_unexpected(tuple.error());
+        if (tuple->type != HirTypeKind::Tuple)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("tuple element access requires a tuple value"));
+        // The tuple's shape carries the full element shape, which keeps nested
+        // projections (`t.0.1`) and tuple-valued slots resolvable.
+        const HirTypeShape* tuple_shape = tuple->shape_index < mod.type_shapes.len
+                                              ? &mod.type_shapes[tuple->shape_index]
+                                              : nullptr;
+        const u32 tuple_slots = tuple_shape != nullptr && tuple_shape->type == HirTypeKind::Tuple &&
+                                        tuple_shape->tuple_len != 0
+                                    ? tuple_shape->tuple_len
+                                    : tuple->tuple_len;
+        const u32 slot_index = static_cast<u32>(expr.int_value);
+        if (slot_index >= tuple_slots)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("tuple element index is out of range"));
+        // A literal tuple exposes its elements directly, so `(a, b).1` folds
+        // without materializing the tuple.
+        if (tuple->args.len == tuple->tuple_len && tuple->args[slot_index] != nullptr)
+            return *tuple->args[slot_index];
+        u32 elem_shape_index = 0xffffffffu;
+        if (tuple_shape != nullptr && tuple_shape->type == HirTypeKind::Tuple)
+            elem_shape_index = tuple_shape->tuple_elem_shape_indices[slot_index];
+        const HirTypeShape* elem_shape =
+            elem_shape_index < mod.type_shapes.len ? &mod.type_shapes[elem_shape_index] : nullptr;
+        HirExpr out{};
+        out.kind = HirExprKind::TupleSlot;
+        out.type = elem_shape != nullptr ? elem_shape->type : tuple->tuple_types[slot_index];
+        out.generic_index = elem_shape != nullptr ? elem_shape->generic_index
+                                                  : tuple->tuple_struct_indices[slot_index];
+        if (out.type == HirTypeKind::Struct) {
+            out.struct_index = elem_shape != nullptr ? elem_shape->struct_index
+                                                     : tuple->tuple_struct_indices[slot_index];
+        } else if (out.type == HirTypeKind::Variant) {
+            out.variant_index = elem_shape != nullptr ? elem_shape->variant_index
+                                                      : tuple->tuple_variant_indices[slot_index];
+        }
+        if (elem_shape != nullptr && elem_shape->type == HirTypeKind::Tuple) {
+            if (elem_shape->tuple_len > kMaxTupleSlots)
+                return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+            out.tuple_len = elem_shape->tuple_len;
+            for (u32 ti = 0; ti < out.tuple_len; ti++) {
+                const u32 slot_shape_index = elem_shape->tuple_elem_shape_indices[ti];
+                if (slot_shape_index >= mod.type_shapes.len)
+                    return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+                const auto& slot_shape = mod.type_shapes[slot_shape_index];
+                out.tuple_types[ti] = slot_shape.type;
+                out.tuple_variant_indices[ti] = slot_shape.type == HirTypeKind::Variant
+                                                    ? slot_shape.variant_index
+                                                    : 0xffffffffu;
+                out.tuple_struct_indices[ti] =
+                    slot_shape.type == HirTypeKind::Struct
+                        ? slot_shape.struct_index
+                        : (slot_shape.type == HirTypeKind::Generic ? slot_shape.generic_index
+                                                                   : 0xffffffffu);
+            }
+        }
+        auto shape = intern_hir_type_shape(const_cast<HirModule*>(&mod),
+                                           out.type,
+                                           out.generic_index,
+                                           out.variant_index,
+                                           out.struct_index,
+                                           out.tuple_len,
+                                           out.tuple_types,
+                                           out.tuple_variant_indices,
+                                           out.tuple_struct_indices,
+                                           expr.span);
+        if (!shape) return core::make_unexpected(shape.error());
+        out.shape_index = shape.value();
+        out.span = expr.span;
+        out.int_value = static_cast<i32>(slot_index);
+        if (!route->exprs.push(tuple.value()))
+            return frontend_error(FrontendError::OutOfMemory, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        return out;
+    }
     if (expr.kind == AstExprKind::Field) {
         if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
         // `req.params.<name>` — route captures live in the params namespace
