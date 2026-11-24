@@ -59,6 +59,16 @@
 
 namespace {
 
+template <class T>
+T checked_fixture_offset(T value, int delta) {
+    T result;
+    if (__builtin_add_overflow(value, delta, &result)) {
+        std::fputs("process fixture offset exceeds integer range\n", stderr);
+        std::abort();
+    }
+    return result;
+}
+
 using namespace rut::test::fixture_worker_protocol;
 namespace identity_bundle = rut::test::fixture_identity_bundle;
 namespace ancestry_bundle = rut::test::fixture_ancestry_bundle;
@@ -6768,7 +6778,9 @@ static bool exact_custody_ancillary_self_check(std::string& error) {
         token.bytes[0] = 0xa5u;
         ExactCustodyRecord record;
         ExactEscrowRights rights;
-        const pid_t expected = mutation == ExactCustodyMutation::WrongCreds ? sender + 1 : sender;
+        const pid_t expected = mutation == ExactCustodyMutation::WrongCreds
+                                   ? checked_fixture_offset(sender, 1)
+                                   : sender;
         const bool received = receive_exact_custody(sockets[0],
                                                     token,
                                                     expected,
@@ -6992,7 +7004,7 @@ static bool start_exact_child(const Frame& command,
         if ((executable_fd > 3 &&
              syscall(SYS_close_range, 3u, static_cast<unsigned>(executable_fd - 1), 0u) != 0) ||
             syscall(SYS_close_range,
-                    static_cast<unsigned>(executable_fd + 1),
+                    static_cast<unsigned>(executable_fd) + 1u,
                     std::numeric_limits<unsigned>::max(),
                     0u) != 0)
             _exit(125);
@@ -7340,7 +7352,7 @@ static bool prepare_wildcard_attempt(const ExactChildState& exact_owner,
         if ((executable_fd > 3 &&
              syscall(SYS_close_range, 3u, static_cast<unsigned>(executable_fd - 1), 0u) != 0) ||
             syscall(SYS_close_range,
-                    static_cast<unsigned>(executable_fd + 1),
+                    static_cast<unsigned>(executable_fd) + 1u,
                     std::numeric_limits<unsigned>::max(),
                     0u) != 0)
             _exit(125);
@@ -8709,7 +8721,7 @@ static bool exact_adoption_fault_self_check(std::string& error) {
     ExactCustodyRecord correct = wrong;
     correct.child_start = identity.start;
     ProcIdentity transitioned = identity;
-    transitioned.ppid = getpid() + 1;
+    transitioned.ppid = checked_fixture_offset(getpid(), 1);
     ProcIdentity wrong_identity = identity;
     ++wrong_identity.start;
     if (classify_exact_child_observation(false,
@@ -8744,8 +8756,12 @@ static bool exact_adoption_fault_self_check(std::string& error) {
     }
     if (!exact_custody_child_identity_matches(
             identity, correct, getpid(), identity.netns, identity.uid, identity.gid) ||
-        exact_custody_child_identity_matches(
-            identity, correct, getpid() + 1, identity.netns, identity.uid, identity.gid)) {
+        exact_custody_child_identity_matches(identity,
+                                             correct,
+                                             checked_fixture_offset(getpid(), 1),
+                                             identity.netns,
+                                             identity.uid,
+                                             identity.gid)) {
         (void)kill(child, SIGKILL);
         error = "exact Target-exit/adopted-child identity branch failed";
         return false;
@@ -9765,7 +9781,7 @@ static bool retained_anchor_self_check(std::string& error) {
     ok = ok && privileged_ancestry::capture_retained_anchor_evidence(
                    DirectLaunch(anchor, allowed, true), retained_lease(lease), retained, reason);
     ProcIdentity launcher;
-    launcher.pid = child + 100000;
+    launcher.pid = checked_fixture_offset(child, 100000);
     launcher.ppid = child;
     launcher.start = direct_identity.start + 1;
     launcher.pgid = child;
@@ -9835,18 +9851,19 @@ static bool retained_anchor_self_check(std::string& error) {
         mutation(changed);
         return !accepted(retained, changed);
     };
-    ok = ok && rejects_retained([](auto& value) { ++value.start; }) &&
-         rejects_retained([](auto& value) { ++value.pid; }) &&
-         rejects_retained([](auto& value) { ++value.ppid; }) &&
-         rejects_retained([](auto& value) { ++value.pgid; }) &&
-         rejects_retained([](auto& value) { ++value.sid; }) &&
-         rejects_retained([](auto& value) { value.pidfd_live = false; }) &&
-         rejects_retained([](auto& value) { value.state = 'Z'; }) &&
-         rejects_launcher([](auto& value) { value.ppid = 1; }) &&
-         rejects_launcher([](auto& value) { ++value.pgid; }) &&
-         rejects_launcher([](auto& value) { ++value.sid; }) &&
-         rejects_launcher([](auto& value) { ++value.exe_ino; }) &&
-         rejects_launcher([](auto& value) { value.cmdline.push_back('x'); });
+    ok =
+        ok && rejects_retained([](auto& value) { ++value.start; }) &&
+        rejects_retained([](auto& value) { value.pid = checked_fixture_offset(value.pid, 1); }) &&
+        rejects_retained([](auto& value) { value.ppid = checked_fixture_offset(value.ppid, 1); }) &&
+        rejects_retained([](auto& value) { value.pgid = checked_fixture_offset(value.pgid, 1); }) &&
+        rejects_retained([](auto& value) { value.sid = checked_fixture_offset(value.sid, 1); }) &&
+        rejects_retained([](auto& value) { value.pidfd_live = false; }) &&
+        rejects_retained([](auto& value) { value.state = 'Z'; }) &&
+        rejects_launcher([](auto& value) { value.ppid = 1; }) &&
+        rejects_launcher([](auto& value) { value.pgid = checked_fixture_offset(value.pgid, 1); }) &&
+        rejects_launcher([](auto& value) { value.sid = checked_fixture_offset(value.sid, 1); }) &&
+        rejects_launcher([](auto& value) { ++value.exe_ino; }) &&
+        rejects_launcher([](auto& value) { value.cmdline.push_back('x'); });
 
     if (kill(child, SIGKILL) != 0 && errno != ESRCH) ok = false;
     int status = 0;
@@ -10823,15 +10840,19 @@ static MutationDiagnostic dropped_identity_mutation_checks(
         mutate(changed.identity);
         return check(label, !accepted(changed, report, peer, root_peer));
     };
-    result = identity_mutation("identity.pid", [&](auto& value) { value.pid = peer.pid + 1; });
+    result = identity_mutation(
+        "identity.pid", [&](auto& value) { value.pid = checked_fixture_offset(peer.pid, 1); });
     if (!result.success) return result;
     result = identity_mutation("identity.start", [](auto& value) { value.start = 0; });
     if (!result.success) return result;
-    result = identity_mutation("identity.ppid", [](auto& value) { ++value.ppid; });
+    result = identity_mutation(
+        "identity.ppid", [](auto& value) { value.ppid = checked_fixture_offset(value.ppid, 1); });
     if (!result.success) return result;
-    result = identity_mutation("identity.pgid", [](auto& value) { ++value.pgid; });
+    result = identity_mutation(
+        "identity.pgid", [](auto& value) { value.pgid = checked_fixture_offset(value.pgid, 1); });
     if (!result.success) return result;
-    result = identity_mutation("identity.sid", [](auto& value) { ++value.sid; });
+    result = identity_mutation(
+        "identity.sid", [](auto& value) { value.sid = checked_fixture_offset(value.sid, 1); });
     if (!result.success) return result;
     result = identity_mutation("identity.uid", [&](auto& value) { value.uid = distinct_uid(); });
     if (!result.success) return result;
@@ -10893,7 +10914,7 @@ static MutationDiagnostic dropped_identity_mutation_checks(
         if (!result.success) return result;
     }
     Peer changed_root = root_peer;
-    changed_root.pid++;
+    changed_root.pid = checked_fixture_offset(changed_root.pid, 1);
     result = check("root.peer.pid", !accepted(candidate, report, peer, changed_root));
     if (!result.success) return result;
     changed_root = root_peer;
@@ -11245,7 +11266,7 @@ static MutationDiagnostic live_identity_bundle_mutation_checks(
         return !accepted(changed, report, peer);
     };
     Peer changed_peer = peer;
-    ++changed_peer.pid;
+    changed_peer.pid = checked_fixture_offset(changed_peer.pid, 1);
     Report changed_report = report;
     ++changed_report.target_pid;
     Report changed_nnp_report = report;
@@ -11270,7 +11291,7 @@ static MutationDiagnostic live_identity_bundle_mutation_checks(
             ? 1
             : static_cast<gid_t>(changed_launcher_groups.supplementary_groups.back() + 1));
     auto detached = manifests;
-    detached[0].pid += 100000;
+    detached[0].pid = checked_fixture_offset(detached[0].pid, 100000);
     detached[0].ppid = 1;
     detached[1].ppid = detached[0].pid;
     Report detached_report = report;
@@ -11313,13 +11334,21 @@ static MutationDiagnostic live_identity_bundle_mutation_checks(
         !accepted_with_evidence(manifests, report, peer, changed_launcher_groups, root_status),
         group_mutation_detail(report, changed_launcher_groups, root_status));
     if (!diagnostic.success) return diagnostic;
-    diagnostic = check("manifest.root.pid", rejects([](auto& value) { ++value[1].pid; }));
+    diagnostic =
+        check("manifest.root.pid",
+              rejects([](auto& value) { value[1].pid = checked_fixture_offset(value[1].pid, 1); }));
     if (!diagnostic.success) return diagnostic;
-    diagnostic = check("manifest.launcher.pid", rejects([](auto& value) { ++value[0].pid; }));
+    diagnostic =
+        check("manifest.launcher.pid",
+              rejects([](auto& value) { value[0].pid = checked_fixture_offset(value[0].pid, 1); }));
     if (!diagnostic.success) return diagnostic;
-    diagnostic = check("manifest.root.ppid", rejects([](auto& value) { ++value[1].ppid; }));
+    diagnostic = check("manifest.root.ppid", rejects([](auto& value) {
+                           value[1].ppid = checked_fixture_offset(value[1].ppid, 1);
+                       }));
     if (!diagnostic.success) return diagnostic;
-    diagnostic = check("manifest.launcher.ppid", rejects([](auto& value) { ++value[0].ppid; }));
+    diagnostic = check("manifest.launcher.ppid", rejects([](auto& value) {
+                           value[0].ppid = checked_fixture_offset(value[0].ppid, 1);
+                       }));
     if (!diagnostic.success) return diagnostic;
     diagnostic = check("manifest.root.start", rejects([](auto& value) { ++value[1].start; }));
     if (!diagnostic.success) return diagnostic;
@@ -11447,7 +11476,7 @@ static MutationDiagnostic causal_mutation_self_checks(const Report& root_report,
     Report changed_root = root_report;
     changed_root.netns++;
     Peer changed_root_peer = root_peer;
-    changed_root_peer.pid++;
+    changed_root_peer.pid = checked_fixture_offset(changed_root_peer.pid, 1);
     ProcIdentity changed_root_proc = root_proc;
     changed_root_proc.start++;
     DirectLaunchAnchor stale_anchor = sudo_child.anchor;
@@ -11513,7 +11542,7 @@ static MutationDiagnostic causal_mutation_self_checks(const Report& root_report,
     Report changed_broker = broker_report;
     changed_broker.wrapper_pid++;
     Peer changed_broker_peer = broker_peer;
-    changed_broker_peer.pid++;
+    changed_broker_peer.pid = checked_fixture_offset(changed_broker_peer.pid, 1);
     ProcIdentity changed_broker_proc = broker_proc;
     changed_broker_proc.start++;
     const bool broker_mutations =
@@ -11803,13 +11832,13 @@ static bool ancestry_probe_validation_self_check(std::string& error) {
     changed.nodes[0].stage = ProbeNodeStage::Nsenter;
     rejected.push_back(changed);
     changed = direct;
-    changed.peer_pid++;
+    changed.peer_pid = checked_fixture_offset(changed.peer_pid, 1);
     rejected.push_back(changed);
     changed = direct;
-    changed.root_ppid++;
+    changed.root_ppid = checked_fixture_offset(changed.root_ppid, 1);
     rejected.push_back(changed);
     changed = direct;
-    changed.anchor_pid++;
+    changed.anchor_pid = checked_fixture_offset(changed.anchor_pid, 1);
     rejected.push_back(changed);
     changed = direct;
     changed.lease_start++;
@@ -11818,7 +11847,7 @@ static bool ancestry_probe_validation_self_check(std::string& error) {
     changed.lease_pidfd_live = false;
     rejected.push_back(changed);
     changed = direct;
-    changed.ordinary_parent++;
+    changed.ordinary_parent = checked_fixture_offset(changed.ordinary_parent, 1);
     rejected.push_back(changed);
     changed = direct;
     changed.nodes[0].live = false;
@@ -12129,8 +12158,8 @@ static bool formal_authorization_policy_self_check(std::string& error) {
                          pid_t pid) {
         evidence.identity.role = role;
         evidence.identity.pid = pid;
-        evidence.identity.start = static_cast<u64>(pid + 1000);
-        evidence.identity.ppid = pid - 1;
+        evidence.identity.start = static_cast<u64>(static_cast<rut::i64>(pid) + 1000);
+        evidence.identity.ppid = checked_fixture_offset(pid, -1);
         evidence.identity.pgid = 101;
         evidence.identity.sid = 10;
         evidence.identity.uid = 0;
@@ -12162,11 +12191,18 @@ static bool formal_authorization_policy_self_check(std::string& error) {
         mutate(candidate);
         return !same_authorization_snapshot(baseline, candidate);
     };
-    if (!rejected([](auto& value) { ++value.anchor.identity.pid; }) ||
-        !rejected([](auto& value) { ++value.anchor.identity.start; }) ||
-        !rejected([](auto& value) { ++value.anchor.identity.ppid; }) ||
-        !rejected([](auto& value) { ++value.anchor.identity.pgid; }) ||
-        !rejected([](auto& value) { ++value.anchor.identity.sid; }) ||
+    if (!rejected([](auto& value) {
+            value.anchor.identity.pid = checked_fixture_offset(value.anchor.identity.pid, 1);
+        }) ||
+        !rejected([](auto& value) { ++value.anchor.identity.start; }) || !rejected([](auto& value) {
+            value.anchor.identity.ppid = checked_fixture_offset(value.anchor.identity.ppid, 1);
+        }) ||
+        !rejected([](auto& value) {
+            value.anchor.identity.pgid = checked_fixture_offset(value.anchor.identity.pgid, 1);
+        }) ||
+        !rejected([](auto& value) {
+            value.anchor.identity.sid = checked_fixture_offset(value.anchor.identity.sid, 1);
+        }) ||
         !rejected([](auto& value) { ++value.anchor.identity.netns; }) ||
         !rejected([](auto& value) { ++value.anchor.identity.exe_dev; }) ||
         !rejected([](auto& value) { ++value.anchor.identity.exe_ino; }) ||
@@ -12179,7 +12215,9 @@ static bool formal_authorization_policy_self_check(std::string& error) {
         !rejected([](auto& value) { value.anchor.cmdline.push_back('x'); }) ||
         !rejected([](auto& value) { value.anchor.state = 'Z'; }) ||
         !rejected([](auto& value) { value.anchor.pidfd_live = false; }) ||
-        !rejected([](auto& value) { ++value.root.identity.pid; }) ||
+        !rejected([](auto& value) {
+            value.root.identity.pid = checked_fixture_offset(value.root.identity.pid, 1);
+        }) ||
         !rejected([](auto& value) { ++value.launcher.status.cap_bnd; })) {
         error = "formal authorization identity/security drift mutation was accepted";
         return false;
@@ -12191,7 +12229,8 @@ static bool formal_authorization_policy_self_check(std::string& error) {
         return false;
     }
     AuthorizationSnapshot rejected_snapshot = baseline;
-    ++rejected_snapshot.anchor.identity.pid;
+    rejected_snapshot.anchor.identity.pid =
+        checked_fixture_offset(rejected_snapshot.anchor.identity.pid, 1);
     const bool rejected_authorization = same_authorization_snapshot(baseline, rejected_snapshot);
     const AuthorizationEmission emission =
         emit_authorization_frames(sockets[0],

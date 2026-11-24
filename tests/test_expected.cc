@@ -20,13 +20,13 @@ static int g_move_count = 0;
 
 struct Tracked {
     int val;
-    Tracked(int v) : val(v) { ++g_ctor_count; }
-    Tracked(const Tracked& o) : val(o.val) { ++g_copy_count; }
+    Tracked(int v) : val(v) { rut::test::increment_check_count(g_ctor_count); }
+    Tracked(const Tracked& o) : val(o.val) { rut::test::increment_check_count(g_copy_count); }
     Tracked(Tracked&& o) : val(o.val) {
         o.val = -1;
-        ++g_move_count;
+        rut::test::increment_check_count(g_move_count);
     }
-    ~Tracked() { ++g_dtor_count; }
+    ~Tracked() { rut::test::increment_check_count(g_dtor_count); }
 };
 
 static void reset_counters() {
@@ -45,9 +45,9 @@ struct ErrInfo {
 
 static Expected<int, Err> parse(const char* s) {
     if (s == nullptr) return Unexpected(Err::BadInput);
-    int len = 0;
-    while (s[len]) ++len;
-    return len;
+    const auto length = __builtin_strlen(s);
+    if (length > INT_MAX) return Unexpected(Err::Overflow);
+    return static_cast<int>(length);
 }
 
 static Expected<int, Err> checked_double(int v) {
@@ -237,9 +237,9 @@ TEST(try_macro, three_steps) {
 
 static Expected<int, ErrInfo> parse_detailed(const char* s) {
     if (s == nullptr) return Unexpected(ErrInfo{Err::BadInput, 42});
-    int len = 0;
-    while (s[len]) ++len;
-    return len;
+    const auto length = __builtin_strlen(s);
+    if (length > INT_MAX) return Unexpected(ErrInfo{Err::Overflow, 0});
+    return static_cast<int>(length);
 }
 
 static Expected<int, ErrInfo> try_detailed(const char* s) {
@@ -340,8 +340,12 @@ TEST(transform, type_change) {
 }
 
 TEST(transform, chain) {
-    auto r =
-        parse("ab").transform([](int v) { return v + 100; }).transform([](int v) { return v * 2; });
+    auto r = parse("ab")
+                 .transform([](int v) {
+                     rut::test::add_check_count(v, 100);
+                     return v;
+                 })
+                 .transform([](int v) { return v * 2; });
     CHECK(r.has_value());
     CHECK_EQ(r.value(), 204);  // (2+100)*2
 }
@@ -373,9 +377,12 @@ TEST(or_else, remap_error) {
 
 TEST(mixed, chain_success) {
     auto r = parse("hi")
-                 .and_then(checked_double)                // 2 -> 4
-                 .transform([](int v) { return v + 1; })  // 4 -> 5
-                 .and_then(checked_add_ten);              // 5 -> 15
+                 .and_then(checked_double)  // 2 -> 4
+                 .transform([](int v) {
+                     rut::test::increment_check_count(v);
+                     return v;
+                 })                           // 4 -> 5
+                 .and_then(checked_add_ten);  // 5 -> 15
     CHECK(r.has_value());
     CHECK_EQ(r.value(), 15);
 }
@@ -385,9 +392,12 @@ TEST(mixed, chain_error_midway) {
     for (int i = 0; i < 1023; ++i) big[i] = 'x';
     big[1023] = '\0';
     auto r = parse(big)
-                 .and_then(checked_double)                // 1023 > 1000, error
-                 .transform([](int v) { return v + 1; })  // skipped
-                 .and_then(checked_add_ten);              // skipped
+                 .and_then(checked_double)  // 1023 > 1000, error
+                 .transform([](int v) {
+                     rut::test::increment_check_count(v);
+                     return v;
+                 })                           // skipped
+                 .and_then(checked_add_ten);  // skipped
     CHECK(!r.has_value());
     CHECK(r.error() == Err::Overflow);
 }
@@ -536,7 +546,10 @@ TEST(const_access, monadic) {
     auto r = v.and_then(checked_double);
     CHECK_EQ(r.value(), 10);
 
-    auto r2 = v.transform([](int x) { return x + 1; });
+    auto r2 = v.transform([](int x) {
+        rut::test::increment_check_count(x);
+        return x;
+    });
     CHECK_EQ(r2.value(), 6);
 
     const Expected<int, Err> e = Unexpected(Err::BadInput);
@@ -560,7 +573,10 @@ TEST(default_ctor, point) {
 // ── 17. TRY on same line (__COUNTER__ uniqueness) ───────────────────
 
 static Expected<int, Err> try_same_line(const char* a, const char* b) {
-    return TRY(parse(a)) + TRY(parse(b));
+    int sum;
+    if (__builtin_add_overflow(TRY(parse(a)), TRY(parse(b)), &sum))
+        return Unexpected(Err::Overflow);
+    return sum;
 }
 
 TEST(try_macro, same_line_success) {

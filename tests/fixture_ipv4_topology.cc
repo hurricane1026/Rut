@@ -209,15 +209,15 @@ static bool run_command_impl(const std::vector<std::string>& arguments,
                              size_t output_limit) {
     ++command_invocation_count;
     const std::int64_t invocation_now = exact_read_monotonic_ns();
+    std::int64_t relative_deadline_ns;
     if (invocation_now <= 0 || timeout_ms <= 0 ||
-        invocation_now > std::numeric_limits<std::int64_t>::max() -
-                             static_cast<std::int64_t>(timeout_ms) * 1000000LL) {
+        __builtin_add_overflow(invocation_now,
+                               static_cast<std::int64_t>(timeout_ms) * 1000000LL,
+                               &relative_deadline_ns)) {
         result = {};
         result.timed_out = true;
         return false;
     }
-    const std::int64_t relative_deadline_ns =
-        invocation_now + static_cast<std::int64_t>(timeout_ms) * 1000000LL;
     const std::int64_t deadline_ns = command_deadline_cap_ns > 0
                                          ? std::min(relative_deadline_ns, command_deadline_cap_ns)
                                          : relative_deadline_ns;
@@ -230,7 +230,8 @@ static bool run_command_impl(const std::vector<std::string>& arguments,
         const std::int64_t now = exact_read_monotonic_ns();
         if (now <= 0 || now >= deadline_ns) return 0;
         const std::int64_t remaining_ns = deadline_ns - now;
-        const std::int64_t remaining_ms = (remaining_ns + 999999LL) / 1000000LL;
+        const std::int64_t remaining_ms =
+            remaining_ns / 1000000LL + (remaining_ns % 1000000LL != 0);
         return static_cast<int>(std::min<std::int64_t>(remaining_ms, INT_MAX));
     };
     result = {};
@@ -612,8 +613,11 @@ static std::int64_t exact_read_monotonic_ns() {
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
     constexpr std::int64_t kBillion = 1000000000LL;
-    if (now.tv_sec > std::numeric_limits<std::int64_t>::max() / kBillion) return -1;
-    return static_cast<std::int64_t>(now.tv_sec) * kBillion + now.tv_nsec;
+    std::int64_t nanoseconds;
+    if (__builtin_mul_overflow(now.tv_sec, kBillion, &nanoseconds) ||
+        __builtin_add_overflow(nanoseconds, now.tv_nsec, &nanoseconds))
+        return -1;
+    return nanoseconds;
 }
 
 static bool make_cloexec_pipe(int descriptors[2]) {
@@ -1557,16 +1561,14 @@ static bool run_exact_read_command(const std::vector<std::string>& arguments,
                                    ExactReadCommandResult& result,
                                    ExactReadRunnerFault fault = ExactReadRunnerFault::None) {
     const std::int64_t now_ns = exact_read_monotonic_ns();
+    std::int64_t deadline_ns;
     if (now_ns <= 0 || timeout_ms <= 0 ||
-        timeout_ms > (std::numeric_limits<std::int64_t>::max() - now_ns) / 1000000LL) {
+        __builtin_add_overflow(
+            now_ns, static_cast<std::int64_t>(timeout_ms) * 1000000LL, &deadline_ns)) {
         result = {};
         return false;
     }
-    return run_exact_read_command_until(arguments,
-                                        stdout_limit,
-                                        now_ns + static_cast<std::int64_t>(timeout_ms) * 1000000LL,
-                                        result,
-                                        fault);
+    return run_exact_read_command_until(arguments, stdout_limit, deadline_ns, result, fault);
 }
 static ExactInputReadOutcome classify_exact_read(const ExactReadCommandResult& result,
                                                  const std::string& expected) {
@@ -6687,7 +6689,7 @@ static int remaining_command_ms(std::int64_t limit_ns) {
     const std::int64_t now = exact_read_monotonic_ns();
     if (now <= 0 || now >= limit_ns) return 0;
     const std::int64_t remaining = limit_ns - now;
-    const std::int64_t rounded = (remaining + 999999LL) / 1000000LL;
+    const std::int64_t rounded = remaining / 1000000LL + (remaining % 1000000LL != 0);
     return static_cast<int>(std::min<std::int64_t>(rounded, 30000LL));
 }
 
@@ -7074,11 +7076,17 @@ static bool strict_exact_nginx_listener(const NginxProcTcpTable& table,
         diagnostic);
 }
 
+static bool nginx_samples_spaced(std::int64_t first_end, std::int64_t second_start) {
+    std::int64_t gap;
+    return first_end > 0 && !__builtin_sub_overflow(second_start, first_end, &gap) &&
+           gap >= 250000000LL;
+}
+
 static bool nginx_samples_stable(const ExactInputNginxProcessSample& first,
                                  const ExactInputNginxProcessSample& second) {
     return first.complete && second.complete && first.bracket_start_nanoseconds > 0 &&
            first.bracket_end_nanoseconds >= first.bracket_start_nanoseconds &&
-           second.bracket_start_nanoseconds - first.bracket_end_nanoseconds >= 250000000LL &&
+           nginx_samples_spaced(first.bracket_end_nanoseconds, second.bracket_start_nanoseconds) &&
            second.bracket_end_nanoseconds >= second.bracket_start_nanoseconds &&
            first.container_identity_verified && first.source_revalidated && first.mount_verified &&
            first.topology_verified && first.cgroup_exact && first.pidfile_exact &&
@@ -11219,7 +11227,12 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
     // second stable LISTEN sample before the request, not after it.
     if (owner->rotated_lifecycle_authority) {
         command_deadline.set(sample_b_deadline);
-        const std::int64_t earliest_b = current.sample_a.bracket_end_nanoseconds + 250000000LL;
+        std::int64_t earliest_b;
+        if (__builtin_add_overflow(
+                current.sample_a.bracket_end_nanoseconds, 250000000LL, &earliest_b))
+            return freeze_failure(ExactInputNginxLifecycleOutcome::DeadlineExceeded,
+                                  "nginx sample separation exceeds clock range",
+                                  EOVERFLOW);
         while (exact_read_monotonic_ns() < earliest_b &&
                remaining_command_ms(sample_b_deadline) > 0)
             (void)poll(nullptr, 0, 10);
@@ -11227,9 +11240,8 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
             owner->options.failure_point == ExactInputMountFailurePoint::NginxRejectSampleB)
             return freeze_failure(ExactInputNginxLifecycleOutcome::SampleFailed,
                                   error.empty() ? "injected/rejected nginx sample B" : error);
-        current.samples_at_least_250ms_apart =
-            current.sample_b.bracket_start_nanoseconds - current.sample_a.bracket_end_nanoseconds >=
-            250000000LL;
+        current.samples_at_least_250ms_apart = nginx_samples_spaced(
+            current.sample_a.bracket_end_nanoseconds, current.sample_b.bracket_start_nanoseconds);
         if (!current.samples_at_least_250ms_apart ||
             !nginx_samples_stable(current.sample_a, current.sample_b))
             return freeze_failure(ExactInputNginxLifecycleOutcome::SampleDrift,
@@ -11259,7 +11271,12 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
 
     if (!owner->rotated_lifecycle_authority) {
         command_deadline.set(sample_b_deadline);
-        const std::int64_t earliest_b = current.sample_a.bracket_end_nanoseconds + 250000000LL;
+        std::int64_t earliest_b;
+        if (__builtin_add_overflow(
+                current.sample_a.bracket_end_nanoseconds, 250000000LL, &earliest_b))
+            return freeze_failure(ExactInputNginxLifecycleOutcome::DeadlineExceeded,
+                                  "nginx sample separation exceeds clock range",
+                                  EOVERFLOW);
         while (exact_read_monotonic_ns() < earliest_b &&
                remaining_command_ms(sample_b_deadline) > 0)
             (void)poll(nullptr, 0, 10);
@@ -11274,9 +11291,8 @@ static bool observe_nginx_lifecycle_impl(ExactInputMountOwner* owner,
                                   "nginx HTTP exchange was not ordered between lifecycle samples");
         if (owner->options.failure_point == ExactInputMountFailurePoint::NginxDriftSampleB)
             ++current.sample_b.worker_start;
-        current.samples_at_least_250ms_apart =
-            current.sample_b.bracket_start_nanoseconds - current.sample_a.bracket_end_nanoseconds >=
-            250000000LL;
+        current.samples_at_least_250ms_apart = nginx_samples_spaced(
+            current.sample_a.bracket_end_nanoseconds, current.sample_b.bracket_start_nanoseconds);
         const bool stable = current.samples_at_least_250ms_apart &&
                             nginx_samples_stable(current.sample_a, current.sample_b);
         if (!stable)
