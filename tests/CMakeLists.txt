@@ -1364,7 +1364,9 @@ target_include_directories(test_frontend PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/testing
 )
-# Keep Debug CI frontend shards below the per-test timeout.
+# Frontend shards grow with the language surface; Debug CI runners can take
+# substantially longer than local runs. Keep the test-level timeout above the
+# workflow's 120s default so the suite is not killed mid-shard.
 add_test(NAME test_frontend.shard_0_of_4
     COMMAND test_frontend --shard-index=0 --shard-count=4)
 add_test(NAME test_frontend.shard_1_of_4
@@ -1373,14 +1375,10 @@ add_test(NAME test_frontend.shard_2_of_4
     COMMAND test_frontend --shard-index=2 --shard-count=4)
 add_test(NAME test_frontend.shard_3_of_4
     COMMAND test_frontend --shard-index=3 --shard-count=4)
-if(RUT_SANITIZE)
-    # Recent sanitizer CI runs completed shard 0 in 112.5s once and exceeded
-    # 120s twice. The test-level timeout overrides the workflow timeout, so
-    # allow headroom on slower sanitizer runners.
-    set(_RUT_FRONTEND_TEST_TIMEOUT 300)
-else()
-    set(_RUT_FRONTEND_TEST_TIMEOUT 120)
-endif()
+# Recent sanitizer runs completed a shard in 112.5s once and exceeded 120s
+# twice; Debug runs can also cross 120s as the language surface grows. The
+# test-level timeout overrides the workflow's default, so allow real headroom.
+set(_RUT_FRONTEND_TEST_TIMEOUT 300)
 set_tests_properties(
     test_frontend.shard_0_of_4
     test_frontend.shard_1_of_4

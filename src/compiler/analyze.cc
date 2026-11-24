@@ -7849,6 +7849,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
     if (stmt.kind == AstStmtKind::Expr)
         return analyze_function_expr(stmt.expr, locals, local_count, binding);
 
+    if (stmt.kind == AstStmtKind::For)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("static for loops are supported only in route bodies"));
+
     if (stmt.kind == AstStmtKind::If) {
         if (stmt.then_stmt == nullptr || stmt.else_stmt == nullptr)
             return frontend_error(FrontendError::UnsupportedSyntax, stmt.span);
@@ -20413,6 +20418,98 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     return {};
 }
 
+// Loop unrolling substitutes a body-local initializer at each use instead of
+// materializing it once per iteration. Only repeatable, non-allocating values
+// can be re-evaluated safely; allocating builtins would multiply hot-path work
+// and can exhaust the request arena after the original check succeeded.
+static bool static_for_init_repeatable(const HirExpr& expr) {
+    switch (expr.kind) {
+        case HirExprKind::BoolLit:
+        case HirExprKind::IntLit:
+        case HirExprKind::StrLit:
+        case HirExprKind::BytesLit:
+        case HirExprKind::Nil:
+        case HirExprKind::Error:
+        case HirExprKind::LocalRef:
+        case HirExprKind::ReqHeader:
+        case HirExprKind::ReqUniqueHeader:
+        case HirExprKind::ReqCookie:
+        case HirExprKind::ReqUniqueCookie:
+        case HirExprKind::ReqParam:
+        case HirExprKind::ReqQuery:
+        case HirExprKind::ReqQueryString:
+        case HirExprKind::ReqPath:
+        case HirExprKind::ReqPathOnly:
+        case HirExprKind::ReqBody:
+        case HirExprKind::ReqKeepAlive:
+        case HirExprKind::ReqChunked:
+        case HirExprKind::ReqHasContentLength:
+        case HirExprKind::ReqHttp10:
+        case HirExprKind::ReqHttp11:
+        case HirExprKind::ReqHttpVersion:
+        case HirExprKind::ReqContentLength:
+        case HirExprKind::ReqRemoteAddr:
+        case HirExprKind::ReqMethod:
+        case HirExprKind::ReqHeaderCount:
+        case HirExprKind::ReqTlsClientCertSha256:
+        case HirExprKind::ReqRoutingString:
+        case HirExprKind::ReqConnectionScalar:
+        case HirExprKind::ConstMethod:
+        case HirExprKind::ConstWsCase:
+        case HirExprKind::TimeNowMicros:
+        case HirExprKind::BytesCount:
+        case HirExprKind::TupleSlot:
+        case HirExprKind::VariantTag:
+        case HirExprKind::MatchPayload:
+        case HirExprKind::VariantCase:
+        case HirExprKind::Eq:
+        case HirExprKind::Lt:
+        case HirExprKind::Gt:
+        case HirExprKind::BitAnd:
+        case HirExprKind::BitOr:
+        case HirExprKind::BitXor:
+        case HirExprKind::BitShl:
+        case HirExprKind::BitShr:
+        case HirExprKind::Add:
+        case HirExprKind::Sub:
+        case HirExprKind::Mul:
+        case HirExprKind::Div:
+        case HirExprKind::Mod:
+        case HirExprKind::WidenI64:
+        case HirExprKind::MaxInt:
+        case HirExprKind::MinInt:
+        case HirExprKind::Or:
+        case HirExprKind::NoError:
+        case HirExprKind::HasValue:
+        case HirExprKind::ValueOf:
+        case HirExprKind::MissingOf:
+        case HirExprKind::StringPredicate:
+        case HirExprKind::StringTrim:
+        case HirExprKind::IpParse:
+        case HirExprKind::RegexMatch:
+        case HirExprKind::Tuple:
+        case HirExprKind::StructInit:
+        case HirExprKind::Field:
+        case HirExprKind::IfElse:
+        case HirExprKind::LetIn:
+        case HirExprKind::BoundValue:
+            break;
+        default:
+            return false;
+    }
+    if (expr.lhs != nullptr && !static_for_init_repeatable(*expr.lhs)) return false;
+    if (expr.rhs != nullptr && !static_for_init_repeatable(*expr.rhs)) return false;
+    for (u32 i = 0; i < expr.args.len; i++) {
+        if (expr.args[i] != nullptr && !static_for_init_repeatable(*expr.args[i])) return false;
+    }
+    for (u32 i = 0; i < expr.field_inits.len; i++) {
+        if (expr.field_inits[i].value != nullptr &&
+            !static_for_init_repeatable(*expr.field_inits[i].value))
+            return false;
+    }
+    return true;
+}
+
 static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                             HirRoute* route,
                                             HirModule& mod) {
@@ -20537,6 +20634,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (!init) return core::make_unexpected(init.error());
             auto typed = apply_declared_type_to_expr(&init.value(), mod, bstmt);
             if (!typed) return core::make_unexpected(typed.error());
+            if (!static_for_init_repeatable(init.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop body bindings must be non-allocating; bind the "
+                            "value before the loop"));
             local.type = init->type;
             local.is_wait_result = init->is_wait_result;
             local.wait_event_kind = init->wait_event_kind;
@@ -20591,6 +20694,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
+            if (bstmt.bind_value && !static_for_init_repeatable(bound.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop body bindings must be non-allocating; bind the "
+                            "value before the loop"));
             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                        bstmt.expr.span,
                                                        route,
@@ -20669,10 +20778,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                 local.generic_protocol_count = bound->generic_protocol_count;
                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                     local.generic_protocol_indices[cpi] = bound->generic_protocol_indices[cpi];
-                // Success path: HasValue conds (error-capable sources) rule out both
-                // channels. Only the known-nil case (cond folded false, body
-                // unreachable) still binds a may_nil value.
-                local.may_nil = bound->may_nil && !bound->may_error;
+                // Success path: HasValue conds rule out both missing channels,
+                // so the bound value is usable regardless of the source kind.
+                local.may_nil = false;
                 local.may_error = false;
                 local.variant_index = bound->variant_index;
                 local.struct_index = bound->struct_index;
@@ -20720,15 +20828,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             continue;
         }
         if (bstmt.kind == AstStmtKind::If) {
-            // `if let` inside a static for-loop body is currently unreachable —
-            // the parser rejects for-loops wholesale ("for loops are unsupported
-            // in Rut Core"), so no AstStmtKind::For is ever produced and this
-            // analyzer is dead code. Reject the binding form explicitly (fail
-            // loud) rather than fall through: this handler analyzes the cond with
-            // analyze_expr (plain bool), NOT analyze_guard_cond, so it would
-            // mis-treat an if-let's usable-value test as the condition. If static
-            // for-loops are ever enabled, the binding's per-iteration
-            // materialization must be designed before this rejection is lifted.
+            // Static for-loop bodies analyze the cond with analyze_expr (plain
+            // bool), NOT analyze_guard_cond, so an `if let` usable-value test
+            // would be mis-treated as a condition. Reject the binding form
+            // explicitly until per-iteration binding materialization is
+            // designed.
             if (bstmt.bind_value)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
@@ -20787,6 +20891,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             if (!subject) return core::make_unexpected(subject.error());
             if (subject->may_nil || subject->may_error)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.expr.span);
+            if (!static_for_init_repeatable(subject.value()))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    bstmt.expr.span,
+                    lit_str("static for-loop body bindings must be non-allocating; bind the "
+                            "value before the loop"));
             if (subject->type == HirTypeKind::I64)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, bstmt.expr.span, kMatchI64Detail);
@@ -20893,6 +21003,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span);
+                    if (!static_for_init_repeatable(inner_subject.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            nested_match_stmt->expr.span,
+                            lit_str("static for-loop body bindings must be non-allocating; "
+                                    "bind the value before the loop"));
                     if (inner_subject->type == HirTypeKind::I64)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               nested_match_stmt->expr.span,
@@ -20999,6 +21115,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             inner_seen_wildcard = true;
                         }
                         if (inner_arm.stmt->kind == AstStmtKind::If) {
+                            if (inner_arm.stmt->bind_value)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_arm.stmt->span,
+                                    lit_str("if-let is not supported inside a static for-loop "
+                                            "body"));
                             const auto simple_branch = [](const AstStatement& branch) {
                                 return is_ast_hir_terminator(branch);
                             };
@@ -21188,6 +21310,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             if (!init) return core::make_unexpected(init.error());
                             auto typed = apply_declared_type_to_expr(&init.value(), mod, inner);
                             if (!typed) return core::make_unexpected(typed.error());
+                            if (!static_for_init_repeatable(init.value()))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("static for-loop body bindings must be non-allocating; "
+                                            "bind the value before the loop"));
                             local.type = init->type;
                             local.is_wait_result = init->is_wait_result;
                             local.wait_event_kind = init->wait_event_kind;
@@ -21241,6 +21369,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                       arm_scoped_locals.len,
                                                       arm_binding_ptr);
                             if (!bound) return core::make_unexpected(bound.error());
+                            if (inner.bind_value && !static_for_init_repeatable(bound.value()))
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner.expr.span,
+                                    lit_str("static for-loop body bindings must be non-allocating; "
+                                            "bind the value before the loop"));
                             auto cond = build_guard_cond_from_analyzed(bound.value(),
                                                                        inner.expr.span,
                                                                        route,
@@ -21323,11 +21457,9 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                 for (u32 cpi = 0; cpi < local.generic_protocol_count; cpi++)
                                     local.generic_protocol_indices[cpi] =
                                         bound->generic_protocol_indices[cpi];
-                                // Success path: HasValue conds (error-capable sources) rule out
-                                // both
-                                // channels; pure-optional runtime values keep may_nil (see
-                                // analyze_guard_cond — their carrier is not lowerable yet).
-                                local.may_nil = bound->may_nil && !bound->may_error;
+                                // Success path: HasValue conds rule out both missing
+                                // channels, so the bound value is usable.
+                                local.may_nil = false;
                                 local.may_error = false;
                                 local.variant_index = bound->variant_index;
                                 local.struct_index = bound->struct_index;
@@ -21370,10 +21502,13 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     if (inner_subject->may_nil || inner_subject->may_error)
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               arm_stmt->expr.span);
+                    if (!static_for_init_repeatable(inner_subject.value()))
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->expr.span,
+                            lit_str("static for-loop body bindings must be non-allocating; "
+                                    "bind the value before the loop"));
                     // Same i64-subject gate as the other nested-match paths.
-                    // Currently unreachable from the surface (the parser
-                    // rejects `for` wholesale), but this expansion path must
-                    // not become the bypass when for-loops are enabled.
                     if (inner_subject->type == HirTypeKind::I64)
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, arm_stmt->expr.span, kMatchI64Detail);
@@ -21519,6 +21654,12 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                             inner_seen_wildcard = true;
                         }
                         if (inner_ast_arm.stmt->kind == AstStmtKind::If) {
+                            if (inner_ast_arm.stmt->bind_value)
+                                return frontend_error(
+                                    FrontendError::UnsupportedSyntax,
+                                    inner_ast_arm.stmt->span,
+                                    lit_str("if-let is not supported inside a static for-loop "
+                                            "body"));
                             const auto simple_branch = [](const AstStatement& branch) {
                                 return is_ast_hir_terminator(branch);
                             };
@@ -21566,6 +21707,11 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     continue;
                 }
                 if (arm_stmt->kind == AstStmtKind::If) {
+                    if (arm_stmt->bind_value)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            arm_stmt->span,
+                            lit_str("if-let is not supported inside a static for-loop body"));
                     const auto simple_branch = [](const AstStatement& branch) {
                         return is_ast_hir_terminator(branch);
                     };

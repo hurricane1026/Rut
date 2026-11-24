@@ -25,8 +25,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
 - [x] Lexer: `&&` `||` `!` `!=` `<=` `>=` emitted; `and`/`or`/`not` lex to
   fix-it errors; lone `&`/`^`/`~` → bitwise.* fix-it; `?` → if-let fix-it
   (commit: slice 1). `respond` is implemented as a contextual statement word
-  so user declarations and members may still use that name; `break`/`continue`
-  remain pending with runtime `for` loops.
+  so user declarations and members may still use that name. Static route-local
+  `for` loops are now enabled (array literal or alias, compile-time unrolled);
+  runtime iterables plus `break`/`continue` remain pending.
 - [x] Parser: `!`/`!=`/`<=`/`>=` desugar to Eq/Lt/Gt (+ `== false` wrap);
   `&&` binds tighter than `||` (slice 1). Caseless match arms at all five
   sites with `case`/`:` fix-its + cross-line-dot arm boundary rule
@@ -99,8 +100,9 @@ each item should land with fix-it diagnostics matching DESIGN.md §3.6.
   arms; [x] middleware status-`return` and handler `respond` context errors
   with canonical replacement guidance.
 - Tests/examples: migrate `examples/*.rut`, test fixtures, and docs/ topic
-  pages (match.md, pipe.md, decorators.md, for-loops.md, ...) to the new
-  surface once the front-end accepts it.
+  pages (match.md, pipe.md, decorators.md, ...) to the new surface once the
+  front-end accepts it. `for-loops.md` is current as of the static-loop
+  enablement.
 
 **Acceptance**: language-card examples all parse and type-check; old forms
 produce the documented fix-its; `./dev.sh test` green.
@@ -170,6 +172,15 @@ without presenting lossy or per-shard state as exact shared state.
   Values are copied; raw encoding/empty-value semantics are documented, and
   explicit-wait/non-request contexts are rejected. This
   completes the repeated-query read primitive, not general arrays or iteration.
+- [x] Static route-local `for` loops are enabled end to end. The parser accepts
+  `for name in <static array> { ... }` (still rejecting `inline for`), analyze
+  builds the existing `HirForLoop` subset, and MIR unrolls literals or
+  route-local aliases for direct/if/match route control. Coverage includes
+  element substitution, guards, nested loops, body `let`/`if`/`match`, typed
+  empty arrays, route-level guard ordering, JIT execution, and the documented
+  rejects (`wait`, non-array/dynamic/field iterators, shadowing, post-terminator
+  statements, `if let`, helper bodies). `break`/`continue` and runtime iterables
+  remain future work.
 
 - [x] Reject a fifth stacked `@rateLimit` decorator with a capacity diagnostic at
   that decorator, instead of silently omitting the rule. Boundary regression

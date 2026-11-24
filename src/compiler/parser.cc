@@ -3574,10 +3574,29 @@ struct Parser {
                                   span_from(cur()),
                                   lit_str("use 'for', not 'inline for'"));
         }
-        if (cur().type == TokenType::KwFor) {
-            return frontend_error(FrontendError::UnsupportedSyntax,
-                                  span_from(cur()),
-                                  lit_str("for loops are unsupported in Rut Core"));
+        if (take(TokenType::KwFor)) {
+            auto var_name = expect(TokenType::Ident);
+            if (!var_name) return core::make_unexpected(var_name.error());
+            auto in_kw = take(TokenType::KwIn);
+            if (!in_kw)
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      span_from(*var_name.value()),
+                                      lit_str("for loop expects 'in' after iterator name"));
+            auto iter_expr = parse_expr();
+            if (!iter_expr) return core::make_unexpected(iter_expr.error());
+            auto lbrace = expect(TokenType::LBrace);
+            if (!lbrace) return core::make_unexpected(lbrace.error());
+            auto body = parse_braced_stmt_body(*lbrace.value());
+            if (!body) return core::make_unexpected(body.error());
+            auto body_ptr = alloc_stmt(body.value());
+            if (!body_ptr) return core::make_unexpected(body_ptr.error());
+            AstStatement stmt{};
+            stmt.kind = AstStmtKind::For;
+            stmt.name = var_name.value()->text;
+            stmt.expr = iter_expr.value();
+            stmt.then_stmt = body_ptr.value();
+            stmt.span = Span{start.start, body->span.end, start.line, start.col};
+            return stmt;
         }
         if (take(TokenType::KwMatch)) {
             const bool is_const = take(TokenType::KwConst) != nullptr;
@@ -4358,6 +4377,10 @@ struct Parser {
 
     FrontendResult<AstStatement> parse_func_body_stmt() {
         if (ws_lifecycle_body && cur().type == TokenType::KwReturn) return parse_stmt();
+        if (cur().type == TokenType::KwFor)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(cur()),
+                                  lit_str("static for loops are supported only in route bodies"));
         if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   span_from(cur()),
@@ -4487,6 +4510,11 @@ struct Parser {
             AstStatement block{};
             block.kind = AstStmtKind::Block;
             while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
+                if (cur().type == TokenType::KwFor)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax,
+                        span_from(cur()),
+                        lit_str("static for loops are supported only in route bodies"));
                 if (cur().type == TokenType::KwReturn && peek().type == TokenType::IntLit)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(cur()),
