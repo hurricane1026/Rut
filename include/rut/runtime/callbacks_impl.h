@@ -2476,6 +2476,13 @@ inline bool build_h1_forward_response_headers(Connection& conn,
 template <typename Loop>
 bool try_http_cache_response(Loop* loop, Connection& conn, u16 upstream) {
     if (!conn.http_cache_ttl) return false;
+    // A pinned response-mutation snapshot owns send_buf until the exchange ends,
+    // and its length is the send_buf prefix pipeline_stash must append after. The
+    // lookup below already reports Bypass here (mutations without CORS admission),
+    // but its reset would zero send_buf.len(); reserve_response_mutation_snapshot
+    // would then record 0 and a pipelined successor would be stashed at offset 0
+    // over the borrowed values. Return before that side effect.
+    if (conn.response_mutations_snapshotted) return false;
     conn.send_buf.reset();
     conn.http_cache_route = (conn.http_cache_route << 16) | upstream;
     const bool keep_alive = conn.keep_alive && conn.req_keep_alive;
