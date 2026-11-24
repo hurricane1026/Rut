@@ -914,9 +914,9 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   write or cleanup failure.
 - [x] Opt-in local AOF-confirmed replay claims with a bounded same-connection
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL recovery tests.
-- [x] Bounded A/AAAA DNS, CNAME, issuer/JWKS-URI discovery, optional separately
-  trusted fixed discovery origin and configured IP allowlists for RS256/ES256
-  refresh, with existing monotonic cache expiry.
+- [x] Bounded A/AAAA DNS over UDP or explicit TCP, CNAME, issuer/JWKS-URI
+  discovery, optional separately trusted fixed discovery origin and configured
+  IP allowlists for RS256/ES256 refresh, with existing monotonic cache expiry.
 - [x] Opt-in authenticated RS256/ES256 new-kid admission from the configured
   refresh set, with an empty bootstrap inventory, mixed-algorithm filtering,
   fixed key-profile validation and existing cache/retry bounds.
@@ -936,7 +936,7 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [ ] Remaining #1072 interfaces include online administrative management and
   online scheduling/revocation publication.
 - [ ] Replicated persistence/failover verification for the replay authority beyond
-  the tested single-instance intact-AOF recovery profile; broader DNS
+  the tested single-instance intact-AOF recovery profile; DNS-over-TLS/HTTPS
   transports remain separately scoped.
 - [ ] Online signing-key refresh and replicated key coordination remain separate.
 

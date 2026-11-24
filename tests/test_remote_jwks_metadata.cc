@@ -82,6 +82,41 @@ int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
 
+TEST(remote_jwks_metadata, dns_transport_is_explicit_and_bounded) {
+    const char* base =
+        R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+        R"("path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":1)";
+    const char* dns = R"(,"dnsAddress":"192.0.2.53","allowedAddresses":["192.0.2.1"])";
+    const auto load = [&](const char* transport) {
+        char bytes[1024];
+        const int size = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, dns, transport);
+        if (size <= 0 || static_cast<u32>(size) >= sizeof(bytes)) return false;
+        json::Document document;
+        RemoteJwks configuration;
+        return document.parse({bytes, static_cast<u32>(size)}) && configuration.load(document, 0);
+    };
+    CHECK(load(""));
+    CHECK(load(R"(,"dnsTransport":"udp")"));
+    CHECK(load(R"(,"dnsTransport":"tcp")"));
+    CHECK(!load(R"(,"dnsTransport":"tls")"));
+    CHECK(!load(R"(,"dnsTransport":1)"));
+
+    char bytes[1024];
+    const int size = snprintf(bytes, sizeof(bytes), "{%s%s,\"dnsTransport\":\"tcp\"}", base, dns);
+    REQUIRE(size > 0 && static_cast<u32>(size) < sizeof(bytes));
+    json::Document document;
+    RemoteJwks configuration;
+    REQUIRE(document.parse({bytes, static_cast<u32>(size)}));
+    REQUIRE(configuration.load(document, 0));
+    CHECK(configuration.dns_transport == RemoteJwks::DnsTransport::Tcp);
+
+    const int no_dns = snprintf(bytes, sizeof(bytes), "{%s,\"dnsTransport\":\"tcp\"}", base);
+    REQUIRE(no_dns > 0 && static_cast<u32>(no_dns) < sizeof(bytes));
+    RemoteJwks rejected;
+    REQUIRE(document.parse({bytes, static_cast<u32>(no_dns)}));
+    CHECK(!rejected.load(document, 0));
+}
+
 TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     const char* invalid[] = {"http://issuer.example",
                              "https://user@issuer.example",

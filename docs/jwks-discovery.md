@@ -15,6 +15,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "admitNewKids": true,
   "discoveryCacheSeconds": 30,
   "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
+  "dnsTransport": "tcp",
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
   "discoveryIssuer": "https://issuer.example",
@@ -83,6 +84,16 @@ original `address` remains mandatory and is **never a fallback** in DNS mode.
 By default each attempt resolves the configured TLS hostname through one
 connected nonblocking UDP socket to the configured resolver. No blocking libc
 resolver, system search list, request-selected name or new library is used.
+
+Optional `dnsTransport` selects `"udp"` (default) or `"tcp"`. TCP uses the
+RFC 7766 two-byte length prefix on one connected nonblocking stream per query;
+it never falls back to UDP, and UDP never falls back to TCP. Both transports
+use the same configured resolver literal, query construction, response
+validation, address allowlist, timeout and retry rules. The client reads
+exactly one framed response and then closes the connection; short, oversized,
+zero-length, malformed or abruptly closed frames fail the attempt. TCP is not
+encrypted and is not claimed to be DNSSEC-authenticated; use the configured
+TLS/issuer bounds for the JWKS origin and keep the resolver address trusted.
 
 Each query uses a fresh random ID and one IN A or IN AAAA question without EDNS.
 Dual-stack attempts require a positive, fully validated reply to both queries
@@ -301,7 +312,9 @@ Linux backends. The existing fixed-endpoint tests remain registered separately.
 No new keyword, dependency, dynamic trust source or per-request resolver is added.
 The IPv6 fixture uses an IPv6 resolver and HTTPS origin, a CNAME-to-AAAA answer,
 a disallowed destination and recovery with rotated keys on both Linux backends.
-Other DNS transports and full OIDC workflows remain
+A TCP resolver fixture checks RFC 7766 framing, a short frame, cache expiry and
+recovery after a resolver fault on both Linux backends.
+DNS-over-TLS/HTTPS and full OIDC workflows remain
 open under #1077. New-kid admission is opt-in and limited to algorithm-matching
 entries from the authenticated set; it does not expand the destination or
 algorithm trust boundary. A discovery origin with a rotating DNS name is not part

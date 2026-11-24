@@ -3030,8 +3030,9 @@ inventory; remote
 mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a bare IPv4 or IPv6
-literal. Optional `dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded UDP
-DNS with CNAME chains. The default `dnsRecordType` is `"A"`. Choose `"AAAA"`
+literal. Optional `dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded
+UDP or TCP DNS with CNAME chains; `dnsTransport` accepts `"udp"` (default) or
+`"tcp"` and never falls back between them. The default `dnsRecordType` is `"A"`. Choose `"AAAA"`
 to use an IPv6 allowlist. Duplicate addresses, including equivalent IPv6 spellings, fail
 configuration validation. Optional `requireNonEmptyKeys` rejects refreshes
 with no approved keys and keeps the last snapshot only within its original maximum
