@@ -213,6 +213,9 @@ Static `for` loops are intentionally narrow:
 - `if let` inside a loop body is rejected
 - loop-body `let` and `guard let` initializers must be non-allocating; bind
   allocating values (for example `req.path.lower()`) before the loop
+- loop-body initializers are re-evaluated at each use, so they must also be
+  repeatable; `time.nowMicros()` stays allowed because it is latched once per
+  invocation (see the language card), so every use observes the same value
 - routes that combine `wait(...)` and static for-loop lowering are rejected
 - `for` is accepted only in route bodies, not helper/function bodies
 - `break` and `continue` are not implemented yet
