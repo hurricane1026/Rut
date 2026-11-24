@@ -49742,6 +49742,15 @@ TEST(frontend, mir_unrolls_for_loop_break_and_continue) {
         // guard-let loop control keeps the binding on the success path only.
         "route GET \"/x\" { for n in [1] { guard let p = req.query(\"x\") else { continue } "
         "guard p != \"a\" else { return 404 } } return 200 }\n",
+        // A continue guard bypasses the direct break, so later iterations stay
+        // reachable and the break keeps its own exit edge.
+        "route GET \"/x\" { for n in [false, true] { guard n else { continue } "
+        "guard false else { return 405 } break } return 200 }\n",
+        "route GET \"/x\" { for n in [0, 1, 2] { guard n != 0 else { continue } "
+        "guard n != 2 else { return 406 } break } return 200 }\n",
+        "route GET \"/x\" { for a in [1] { for b in [0, 1, 2] { "
+        "guard b != 0 else { continue } guard b != 2 else { return 407 } break } "
+        "guard a != 1 else { return 408 } } return 200 }\n",
     };
     for (const char* src : sources) {
         auto lexed = lex(lit(src));

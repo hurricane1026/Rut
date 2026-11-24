@@ -1757,6 +1757,22 @@ TEST(jit, frontend_static_for_loop_break_continue_execute) {
         {"route GET \"/users\" { for n in [1, 2, 3] { guard n != 2 else { break } } "
          "guard req.method == GET else { return 508 } return 200 }\n",
          200},
+        // A continue guard bypasses the direct break, so the later iteration
+        // must still be emitted (and can terminate the route).
+        {"route GET \"/users\" { for n in [false, true] { guard n else { continue } "
+         "guard false else { return 509 } break } return 200 }\n",
+         509},
+        // ... and the bypassed break still exits the loop instead of falling
+        // through into the following iteration.
+        {"route GET \"/users\" { for n in [0, 1, 2] { guard n != 0 else { continue } "
+         "guard n != 2 else { return 510 } break } return 200 }\n",
+         200},
+        // The same bypass rules apply to a nested loop, whose break still only
+        // leaves the inner loop.
+        {"route GET \"/users\" { for a in [1] { for b in [0, 1, 2] { "
+         "guard b != 0 else { continue } guard b != 2 else { return 511 } break } "
+         "guard a != 1 else { return 512 } } return 200 }\n",
+         512},
     };
     const char* request = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
 

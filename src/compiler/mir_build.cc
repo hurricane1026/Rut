@@ -2509,6 +2509,11 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     If,
                     Match,
                     Term,
+                    // Direct `break`: an unconditional branch to the step after
+                    // the innermost loop. Needed when an earlier `continue`
+                    // guard can bypass the break, so later iterations stay
+                    // reachable and still have to leave the loop.
+                    Break,
                 };
                 Kind kind = Kind::Guard;
                 const HirGuard* guard = nullptr;
@@ -2542,7 +2547,12 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             FixedVec<RouteStep, kMaxForRouteSteps> steps{};
             std::vector<ForLoopCtx> step_contexts;
             step_contexts.reserve(kMaxForRouteSteps);
-            std::vector<IterSlot> iter_slots;
+            // Upper bound: one slot per iteration of the top-level loop plus one
+            // per iteration of every nested instance (nesting is capped at two
+            // levels by HirRoute::kMaxForLoops).
+            constexpr u32 kMaxLoopIterSlots =
+                HirExpr::kMaxArgs + HirExpr::kMaxArgs * HirExpr::kMaxArgs;
+            FixedVec<IterSlot, kMaxLoopIterSlots> iter_slots{};
             u32 route_step_seq = 0;
             auto set_step_ctx = [&](RouteStep* step,
                                     const ForLoopCtx& ctx) -> FrontendResult<void> {
@@ -2608,8 +2618,11 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                 // can target the next iteration's first step. Positions are
                 // recorded relative to the top-level loop run, which keeps them
                 // valid after the global source-order sort below.
-                const u32 slot_base = static_cast<u32>(iter_slots.size());
-                for (u32 ai = 0; ai < iter_count; ai++) iter_slots.push_back(IterSlot{});
+                const u32 slot_base = iter_slots.len;
+                for (u32 ai = 0; ai < iter_count; ai++) {
+                    if (!iter_slots.push(IterSlot{}))
+                        return frontend_error(FrontendError::TooManyItems, fl.span);
+                }
                 for (u32 ai = 0; ai < iter_count; ai++) {
                     if (ai + 1 < iter_count)
                         iter_slots[slot_base + ai].next_slot = slot_base + ai + 1;
@@ -2627,17 +2640,32 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         step->iter_slot = slot_base + ai;
                     };
                     bool loop_done = false;
+                    // A `continue` guard earlier in this iteration can bypass a
+                    // direct `break`, so later iterations stay reachable and the
+                    // break must branch to the loop exit instead of falling
+                    // through into the next iteration.
+                    bool continue_can_bypass_break = false;
                     for (u32 bi = 0; bi < fl.body.steps.len; bi++) {
                         const auto& body_step = fl.body.steps[bi];
-                        // Compile-time loop control: `break` stops this loop's
-                        // remaining iterations, `continue` only skips the rest
-                        // of the current iteration. Both leave already-emitted
-                        // steps untouched, so no runtime branch is needed.
+                        // Compile-time loop control: `continue` skips the rest of
+                        // the current iteration (its fallthrough already lands on
+                        // the next iteration's first step).
+                        if (body_step.kind == HirForLoopBody::Step::Kind::Continue) break;
                         if (body_step.kind == HirForLoopBody::Step::Kind::Break) {
-                            loop_done = true;
+                            RouteStep step{};
+                            step.kind = RouteStep::Kind::Break;
+                            step.span = body_step.span;
+                            step.order_start = order_start;
+                            step.order_seq = route_step_seq++;
+                            stamp(&step);
+                            if (!steps.push(step))
+                                return frontend_error(FrontendError::TooManyItems, fl.span);
+                            // Without a bypassing continue the later iterations
+                            // are unreachable; dropping them keeps the unrolled
+                            // graph free of dead blocks.
+                            loop_done = !continue_can_bypass_break;
                             break;
                         }
-                        if (body_step.kind == HirForLoopBody::Step::Kind::Continue) break;
                         if (body_step.kind == HirForLoopBody::Step::Kind::Let) {
                             if (body_step.index >= fl.body.locals.len)
                                 return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2660,6 +2688,8 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                             step.span = fl.body.guards[body_step.index].span;
                             step.order_start = order_start;
                             step.order_seq = route_step_seq++;
+                            if (step.guard->fail_kind == HirGuard::FailKind::LoopContinue)
+                                continue_can_bypass_break = true;
                             stamp(&step);
                             auto ctx_set = set_step_ctx(&step, ctx);
                             if (!ctx_set) return core::make_unexpected(ctx_set.error());
@@ -2933,7 +2963,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             auto loop_control_target = [&](const RouteStep& step, bool want_break) -> u32 {
                 const u32 top = step.top_loop;
-                if (top >= HirRoute::kMaxForLoops || step.iter_slot >= iter_slots.size() ||
+                if (top >= HirRoute::kMaxForLoops || step.iter_slot >= iter_slots.len ||
                     top_block_start[top] == 0xffffffffu)
                     return terminal_index;
                 const auto& slot = iter_slots[step.iter_slot];
@@ -3092,6 +3122,19 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                                                     ? body_match_extra_test_index[1]
                                                     : body_match_fallthrough_target(0);
                     }
+                    if (!fn.blocks.push(block))
+                        return frontend_error(FrontendError::TooManyItems, fn.span);
+                    continue;
+                }
+                if (steps[si].kind == RouteStep::Kind::Break) {
+                    const u32 target = loop_control_target(steps[si], true);
+                    block.term.kind = MirTerminatorKind::Branch;
+                    block.term.span = steps[si].span;
+                    block.term.cond.kind = MirValueKind::BoolConst;
+                    block.term.cond.type = MirTypeKind::Bool;
+                    block.term.cond.bool_value = true;
+                    block.term.then_block = target;
+                    block.term.else_block = target;
                     if (!fn.blocks.push(block))
                         return frontend_error(FrontendError::TooManyItems, fn.span);
                     continue;
