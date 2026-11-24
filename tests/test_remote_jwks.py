@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--require-non-empty-keys", action="store_true")
     parser.add_argument("--ipv6", action="store_true")
     parser.add_argument("--dual-stack", action="store_true")
+    parser.add_argument("--admit-new-kids", action="store_true")
     args = parser.parse_args()
     assert not (args.dual_stack and args.ipv6)
     if args.ipv6 or args.dual_stack:
@@ -259,6 +260,10 @@ def main():
                                 "serverName": "localhost", "path": "/keys",
                                 "ca": str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
                                 "refreshSeconds": 1, "maxAgeSeconds": 3, "timeoutSeconds": 1}
+        if args.admit_new_kids:
+            policy["kids"] = []
+            policy["jwks"] = {"keys": []}
+            policy["remoteJwks"].update(admitNewKids=True)
         if args.require_non_empty_keys:
             policy["remoteJwks"].update(requireNonEmptyKeys=True, maxAgeSeconds=6)
         if args.conditional:
@@ -445,7 +450,17 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.ipv6:
+            if args.admit_new_kids:
+                # No bootstrap keys: the first authenticated set installs trust.
+                wait_status(fixture["a"], 200)
+                mixed = list(fixture["second"]["jwks"]["keys"])
+                mixed.append({"kid": "unrelated", "kty": "oct", "alg": "HS256", "k": "AA"})
+                publish(json.dumps({"keys": mixed}).encode())
+                wait_status(fixture["a"], 401)
+                wait_status(fixture["b"], 200)
+                publish(b'{"keys":[]}')
+                wait_status(fixture["b"], 401)
+            elif args.ipv6:
                 wait_status(fixture["a"], 200)
                 with lock:
                     assert state["locals"] and all(address == "::1" for address in state["locals"])

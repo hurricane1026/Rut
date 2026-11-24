@@ -73,7 +73,8 @@ The example modulus is a placeholder; replace it with the real public key for
 denies tokens until an authenticated fetch succeeds. DNS and discovery fields
 are optional trusted configuration and follow the bounded rules in
 [JWKS DNS/discovery](jwks-discovery.md). Future IDs must be preapproved in
-`kids` and the initial JWKS before remote rotation can use them.
+`kids` and the initial JWKS before remote rotation can use them, unless the
+profile opts into `admitNewKids` from the authenticated refresh set.
 
 Run either remote example with the corresponding policy environment variable,
 for example `JWT_ACCESS_RS256_POLICY`, plus `JWT_ACCESS_CLIENT_ID` and
