@@ -83,32 +83,34 @@ func webhookValidFor(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
 }
 func signedRequestKeyRegistry(_ first: SigningKeyPair, _ second: SigningKeyPair,
                               _ third: SigningKeyPair, _ fourth: SigningKeyPair) -> auth.Identity {
-    let keyId = regexCapture(req.authorization.or(""), re"keyId=\"([^\"]+)\"", 1).or("")
-    if keyId == first.keyIdA && signedValid(first.keyIdA, first.keyA) {
-        auth.Identity(consumerId: first.consumerIdA, credentialId: first.credentialIdA, method: "signedRequest")
-    } else {
-        if keyId == first.keyIdB && signedValid(first.keyIdB, first.keyB) {
-            auth.Identity(consumerId: first.consumerIdB, credentialId: first.credentialIdB, method: "signedRequest")
+    if validSigningKeyPairs(first, second, third, fourth) {
+        let keyId = regexCapture(req.authorization.or(""), re"keyId=\"([^\"]+)\"", 1).or("")
+        if keyId == first.keyIdA && signedValid(first.keyIdA, first.keyA) {
+            auth.Identity(consumerId: first.consumerIdA, credentialId: first.credentialIdA, method: "signedRequest")
         } else {
-            if keyId == second.keyIdA && signedValid(second.keyIdA, second.keyA) {
-                auth.Identity(consumerId: second.consumerIdA, credentialId: second.credentialIdA, method: "signedRequest")
+            if keyId == first.keyIdB && signedValid(first.keyIdB, first.keyB) {
+                auth.Identity(consumerId: first.consumerIdB, credentialId: first.credentialIdB, method: "signedRequest")
             } else {
-                if keyId == second.keyIdB && signedValid(second.keyIdB, second.keyB) {
-                    auth.Identity(consumerId: second.consumerIdB, credentialId: second.credentialIdB, method: "signedRequest")
+                if keyId == second.keyIdA && signedValid(second.keyIdA, second.keyA) {
+                    auth.Identity(consumerId: second.consumerIdA, credentialId: second.credentialIdA, method: "signedRequest")
                 } else {
-                    if keyId == third.keyIdA && signedValid(third.keyIdA, third.keyA) {
-                        auth.Identity(consumerId: third.consumerIdA, credentialId: third.credentialIdA, method: "signedRequest")
+                    if keyId == second.keyIdB && signedValid(second.keyIdB, second.keyB) {
+                        auth.Identity(consumerId: second.consumerIdB, credentialId: second.credentialIdB, method: "signedRequest")
                     } else {
-                        if keyId == third.keyIdB && signedValid(third.keyIdB, third.keyB) {
-                            auth.Identity(consumerId: third.consumerIdB, credentialId: third.credentialIdB, method: "signedRequest")
+                        if keyId == third.keyIdA && signedValid(third.keyIdA, third.keyA) {
+                            auth.Identity(consumerId: third.consumerIdA, credentialId: third.credentialIdA, method: "signedRequest")
                         } else {
-                            if keyId == fourth.keyIdA && signedValid(fourth.keyIdA, fourth.keyA) {
-                                auth.Identity(consumerId: fourth.consumerIdA, credentialId: fourth.credentialIdA, method: "signedRequest")
+                            if keyId == third.keyIdB && signedValid(third.keyIdB, third.keyB) {
+                                auth.Identity(consumerId: third.consumerIdB, credentialId: third.credentialIdB, method: "signedRequest")
                             } else {
-                                if keyId == fourth.keyIdB && signedValid(fourth.keyIdB, fourth.keyB) {
-                                    auth.Identity(consumerId: fourth.consumerIdB, credentialId: fourth.credentialIdB, method: "signedRequest")
+                                if keyId == fourth.keyIdA && signedValid(fourth.keyIdA, fourth.keyA) {
+                                    auth.Identity(consumerId: fourth.consumerIdA, credentialId: fourth.credentialIdA, method: "signedRequest")
                                 } else {
-                                    auth.Identity(consumerId: "", credentialId: "", method: "signedRequest")
+                                    if keyId == fourth.keyIdB && signedValid(fourth.keyIdB, fourth.keyB) {
+                                        auth.Identity(consumerId: fourth.consumerIdB, credentialId: fourth.credentialIdB, method: "signedRequest")
+                                    } else {
+                                        auth.Identity(consumerId: "", credentialId: "", method: "signedRequest")
+                                    }
                                 }
                             }
                         }
@@ -116,36 +118,41 @@ func signedRequestKeyRegistry(_ first: SigningKeyPair, _ second: SigningKeyPair,
                 }
             }
         }
+    } else {
+        auth.Identity(consumerId: "", credentialId: "", method: "signedRequest")
     }
 }
+
 func standardWebhookKeyRegistry(_ id: str, _ timestamp: str, _ signature: str, _ body: str,
                                 _ first: SigningKeyPair, _ second: SigningKeyPair,
                                 _ third: SigningKeyPair, _ fourth: SigningKeyPair) -> auth.Identity {
-    if first.keyA != "" && webhookValidFor(id, timestamp, signature, body, first.keyA) {
-        auth.Identity(consumerId: first.consumerIdA, credentialId: first.credentialIdA, method: "standardWebhook")
-    } else {
-        if first.keyB != "" && webhookValidFor(id, timestamp, signature, body, first.keyB) {
-            auth.Identity(consumerId: first.consumerIdB, credentialId: first.credentialIdB, method: "standardWebhook")
+    if validSigningKeyPairs(first, second, third, fourth) {
+        if first.keyA != "" && webhookValidFor(id, timestamp, signature, body, first.keyA) {
+            auth.Identity(consumerId: first.consumerIdA, credentialId: first.credentialIdA, method: "standardWebhook")
         } else {
-            if second.keyA != "" && webhookValidFor(id, timestamp, signature, body, second.keyA) {
-                auth.Identity(consumerId: second.consumerIdA, credentialId: second.credentialIdA, method: "standardWebhook")
+            if first.keyB != "" && webhookValidFor(id, timestamp, signature, body, first.keyB) {
+                auth.Identity(consumerId: first.consumerIdB, credentialId: first.credentialIdB, method: "standardWebhook")
             } else {
-                if second.keyB != "" && webhookValidFor(id, timestamp, signature, body, second.keyB) {
-                    auth.Identity(consumerId: second.consumerIdB, credentialId: second.credentialIdB, method: "standardWebhook")
+                if second.keyA != "" && webhookValidFor(id, timestamp, signature, body, second.keyA) {
+                    auth.Identity(consumerId: second.consumerIdA, credentialId: second.credentialIdA, method: "standardWebhook")
                 } else {
-                    if third.keyA != "" && webhookValidFor(id, timestamp, signature, body, third.keyA) {
-                        auth.Identity(consumerId: third.consumerIdA, credentialId: third.credentialIdA, method: "standardWebhook")
+                    if second.keyB != "" && webhookValidFor(id, timestamp, signature, body, second.keyB) {
+                        auth.Identity(consumerId: second.consumerIdB, credentialId: second.credentialIdB, method: "standardWebhook")
                     } else {
-                        if third.keyB != "" && webhookValidFor(id, timestamp, signature, body, third.keyB) {
-                            auth.Identity(consumerId: third.consumerIdB, credentialId: third.credentialIdB, method: "standardWebhook")
+                        if third.keyA != "" && webhookValidFor(id, timestamp, signature, body, third.keyA) {
+                            auth.Identity(consumerId: third.consumerIdA, credentialId: third.credentialIdA, method: "standardWebhook")
                         } else {
-                            if fourth.keyA != "" && webhookValidFor(id, timestamp, signature, body, fourth.keyA) {
-                                auth.Identity(consumerId: fourth.consumerIdA, credentialId: fourth.credentialIdA, method: "standardWebhook")
+                            if third.keyB != "" && webhookValidFor(id, timestamp, signature, body, third.keyB) {
+                                auth.Identity(consumerId: third.consumerIdB, credentialId: third.credentialIdB, method: "standardWebhook")
                             } else {
-                                if fourth.keyB != "" && webhookValidFor(id, timestamp, signature, body, fourth.keyB) {
-                                    auth.Identity(consumerId: fourth.consumerIdB, credentialId: fourth.credentialIdB, method: "standardWebhook")
+                                if fourth.keyA != "" && webhookValidFor(id, timestamp, signature, body, fourth.keyA) {
+                                    auth.Identity(consumerId: fourth.consumerIdA, credentialId: fourth.credentialIdA, method: "standardWebhook")
                                 } else {
-                                    auth.Identity(consumerId: "", credentialId: "", method: "standardWebhook")
+                                    if fourth.keyB != "" && webhookValidFor(id, timestamp, signature, body, fourth.keyB) {
+                                        auth.Identity(consumerId: fourth.consumerIdB, credentialId: fourth.credentialIdB, method: "standardWebhook")
+                                    } else {
+                                        auth.Identity(consumerId: "", credentialId: "", method: "standardWebhook")
+                                    }
                                 }
                             }
                         }
@@ -153,5 +160,7 @@ func standardWebhookKeyRegistry(_ id: str, _ timestamp: str, _ signature: str, _
                 }
             }
         }
+    } else {
+        auth.Identity(consumerId: "", credentialId: "", method: "standardWebhook")
     }
 }

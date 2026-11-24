@@ -2521,7 +2521,9 @@ signed Authorization `keyId` and verifies the original request fields;
 third, fourth)` tries the enabled webhook keys in declaration order. Both return
 the matched configured Identity. Configuration errors must be checked with
 `validSigningKeyPairs` first (503); an empty returned `consumerId` is the
-authentication-failure sentinel, after which the route returns 401. See
+authentication-failure sentinel, after which the route returns 401. The
+helpers also validate internally and fail closed with that sentinel, so a direct
+caller cannot authenticate through an invalid snapshot. See
 [signing-key-registry.rut](../examples/signing-key-registry.rut).
 
 This is an immutable trusted snapshot adopted by loading a new program. It adds

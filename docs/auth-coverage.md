@@ -185,8 +185,9 @@ ID; fully empty slots are unused. Configuration validation rejects partial
 slots, duplicate key IDs/secrets, empty identity metadata and a registry with no
 enabled key. The signed-request helper selects by the signed Authorization key
 ID and verifies the original request; the webhook helper tries enabled keys in
-declaration order. Routes must validate the snapshot first and treat the empty
-returned Consumer ID as 401. This is a trusted immutable snapshot adopted by
+declaration order. Routes must validate the snapshot first (503) and treat the empty
+returned Consumer ID as 401; the helpers also validate internally and fail
+closed with that sentinel. This is a trusted immutable snapshot adopted by
 loading a new program: it adds no per-request key loading, remote refresh or new
 syntax. See [signing-key-registry.rut](../examples/signing-key-registry.rut).
 

@@ -11268,7 +11268,8 @@ fully empty slots are unused. Configuration validation rejects partial slots,
 duplicate key IDs or secrets, empty identity metadata and an empty registry.
 The signed-request path selects by the signed Authorization key ID; the webhook
 path tries enabled keys in declaration order. Routes validate the snapshot for
-503 and treat the empty returned Consumer as 401. The snapshot is replaced by
+503 and treat the empty returned Consumer as 401; the helpers themselves also
+validate internally and return that sentinel for an invalid snapshot. The snapshot is replaced by
 loading a new program; no per-request key loading, network refresh or new
 keyword is introduced. Online key refresh and distributed coordination remain
 separate. See [the registry example](examples/signing-key-registry.rut).
