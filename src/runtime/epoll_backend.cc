@@ -1618,8 +1618,10 @@ u32 EpollBackend::wait(
                     if (nw > 0) {
                         // send() returned at most the requested remaining byte count.
                         const u32 sent = static_cast<u32>(nw);
-                        ss.offset += sent;
-                        ss.remaining -= sent;
+                        ss.offset =
+                            static_cast<u32>(static_cast<i64>(ss.offset) + static_cast<i64>(sent));
+                        ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) -
+                                                        static_cast<i64>(sent));
                         made_progress = true;
                     } else if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         pending_retry = true;

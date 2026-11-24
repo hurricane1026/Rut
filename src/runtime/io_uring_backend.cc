@@ -275,7 +275,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     ring_fd = io_uring_setup(sizes.sq_entries, &params);
     if (ring_fd < 0) {
-        i32 err = -ring_fd;
+        i32 err = reverse_kernel_error(ring_fd);
         last_init_failure_detail = IoUringInitFailureDetail::QueueSetup;
         if (err == EINVAL) {
             struct io_uring_params baseline_params;
@@ -487,7 +487,7 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
         if (rc == -EINVAL && registration_is_valid)
             last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingUnsupported;
         shutdown();
-        return core::make_unexpected(Error::make(-rc, Error::Source::IoUring));
+        return core::make_unexpected(Error::make(reverse_kernel_error(rc), Error::Source::IoUring));
     }
 
     // Fill the ring with buffer entries
@@ -2124,8 +2124,12 @@ u32 IoUringBackend::wait(
                         off_t pos = static_cast<off_t>(pos_wide);
                         const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
                         if (n > 0) {
-                            ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + n);
-                            ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - n);
+                            // sendfile() advances by at most the requested count.
+                            const u32 sent = static_cast<u32>(n);
+                            ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) +
+                                                         static_cast<i64>(sent));
+                            ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) -
+                                                            static_cast<i64>(sent));
                         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                             result = -errno;
                         }

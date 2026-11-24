@@ -172,7 +172,7 @@ constexpr HuffFsm kFsm = build_fsm();
 
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     if (len == 0) return 0;
-    const u32 kMask = static_cast<u32>((u64{1} << prefix_bits) - u64{1});
+    const u32 kMask = static_cast<u32>(~(UINT64_MAX << prefix_bits));
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
@@ -196,7 +196,7 @@ u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
 }
 
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
-    const u32 kMask = static_cast<u32>((u64{1} << prefix_bits) - u64{1});
+    const u32 kMask = static_cast<u32>(~(UINT64_MAX << prefix_bits));
     if (value < kMask) {
         out[0] = static_cast<u8>(prefix_top | value);
         return 1;
