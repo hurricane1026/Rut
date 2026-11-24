@@ -21,7 +21,7 @@ using namespace rut;
 namespace {
 
 // A representative browser request header set.
-const hpack::Header kReqHeaders[] = {
+constexpr hpack::Header kReqHeaders[] = {
     {{":method", 7}, {"GET", 3}},
     {{":scheme", 7}, {"https", 5}},
     {{":authority", 10}, {"www.example.com", 15}},
@@ -40,7 +40,7 @@ const hpack::Header kReqHeaders[] = {
 constexpr u32 kReqHeaderCount = sizeof(kReqHeaders) / sizeof(kReqHeaders[0]);
 
 // A typical response header set.
-const hpack::Header kRespHeaders[] = {
+constexpr hpack::Header kRespHeaders[] = {
     {{":status", 7}, {"200", 3}},
     {{"content-type", 12}, {"text/html; charset=utf-8", 24}},
     {{"content-length", 14}, {"4096", 4}},
@@ -49,6 +49,22 @@ const hpack::Header kRespHeaders[] = {
     {{"cache-control", 13}, {"max-age=3600", 12}},
 };
 constexpr u32 kRespHeaderCount = sizeof(kRespHeaders) / sizeof(kRespHeaders[0]);
+
+template <size_t Count>
+consteval u64 max_wire_bytes(const hpack::Header (&headers)[Count]) {
+    u64 maximum = 0;
+    for (const auto& header : headers) {
+        // Up to six bytes each for the field index and the two string lengths.
+        // String encoding uses Huffman only when that reduces the wire size.
+        maximum += static_cast<u64>(header.name.len) + header.value.len + 18u;
+    }
+    return maximum;
+}
+
+constexpr u32 kRequestBlockCapacity = 4096;
+constexpr u32 kResponseBlockCapacity = 1024;
+static_assert(max_wire_bytes(kReqHeaders) <= kRequestBlockCapacity);
+static_assert(max_wire_bytes(kRespHeaders) <= kResponseBlockCapacity);
 
 u32 header_bytes(const hpack::Header* hs, u32 n) {
     u32 t = 0;
@@ -62,11 +78,11 @@ int main() {
     bench::out("\n");
 
     // Encode the request header block once (this is what a peer sends us).
-    static u8 req_block[4096];
+    static u8 req_block[kRequestBlockCapacity];
     u32 req_block_len = 0;
     for (u32 i = 0; i < kReqHeaderCount; i++)
-        req_block_len += hpack::encode_header(
-            req_block + req_block_len, kReqHeaders[i].name, kReqHeaders[i].value);
+        req_block_len += static_cast<u32>(hpack::encode_header(
+            req_block + req_block_len, kReqHeaders[i].name, kReqHeaders[i].value));
 
     const char* const kLongValue =
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -184,10 +200,11 @@ int main() {
         b.print_header();
         // Stateless encoder (re-encodes every literal each call).
         b.run("rut encode_header (stateless)", [&] {
-            u8 out[1024];
+            u8 out[kResponseBlockCapacity];
             u32 o = 0;
             for (u32 i = 0; i < kRespHeaderCount; i++)
-                o += hpack::encode_header(out + o, kRespHeaders[i].name, kRespHeaders[i].value);
+                o += static_cast<u32>(
+                    hpack::encode_header(out + o, kRespHeaders[i].name, kRespHeaders[i].value));
             bench::do_not_optimize(&o);
             bench::do_not_optimize(out);
         });
@@ -198,10 +215,11 @@ int main() {
         hpack::Encoder renc;
         renc.init(4096);
         b.run("rut Encoder (indexing)", [&] {
-            u8 out[1024];
+            u8 out[kResponseBlockCapacity];
             u32 o = 0;
             for (u32 i = 0; i < kRespHeaderCount; i++)
-                o += renc.encode(out + o, kRespHeaders[i].name, kRespHeaders[i].value);
+                o += static_cast<u32>(
+                    renc.encode(out + o, kRespHeaders[i].name, kRespHeaders[i].value));
             bench::do_not_optimize(&o);
             bench::do_not_optimize(out);
         });

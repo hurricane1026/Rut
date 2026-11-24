@@ -47,9 +47,13 @@ inline void clobber() {
 // ============================================================================
 
 inline void out(const char* s) {
-    int len = 0;
-    while (s[len]) len++;
-    (void)::write(1, s, len);
+    (void)::write(1, s, __builtin_strlen(s));
+}
+
+inline void out_padded_name(const char* name) {
+    const size_t length = __builtin_strlen(name);
+    (void)::write(1, name, length);
+    for (size_t i = length; i < 24; ++i) out(" ");
 }
 
 inline void out_u64(u64 v) {
@@ -58,28 +62,33 @@ inline void out_u64(u64 v) {
         return;
     }
     char buf[24];
-    int n = 0;
+    char* digit = buf + sizeof(buf);
     while (v > 0) {
-        buf[n++] = static_cast<char>('0' + v % 10);
+        *--digit = static_cast<char>('0' + v % 10);
         v /= 10;
     }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+    while (digit != buf + sizeof(buf)) (void)::write(1, digit++, 1);
 }
 
 // Print u64 with commas: 1,234,567
 inline void out_u64_comma(u64 v) {
-    char buf[32];
-    int n = 0;
     if (v == 0) {
         out("0");
         return;
     }
+    char buf[32];
+    char* digit = buf + sizeof(buf);
+    u32 group = 0;
     while (v > 0) {
-        if (n > 0 && n % 3 == 0) buf[n++] = ',';
-        buf[n++] = static_cast<char>('0' + v % 10);
+        if (group == 3) {
+            *--digit = ',';
+            group = 0;
+        }
+        *--digit = static_cast<char>('0' + v % 10);
         v /= 10;
+        ++group;
     }
-    for (int i = n - 1; i >= 0; i--) (void)::write(1, &buf[i], 1);
+    while (digit != buf + sizeof(buf)) (void)::write(1, digit++, 1);
 }
 
 // Print fixed-point: val is in nanoseconds, print as "X ns" or "X.YY us" or "X.YY ms"
@@ -232,11 +241,7 @@ struct Bench {
 
         // Print result
         out("  ");
-        // Pad name to 24 chars
-        int name_len = 0;
-        while (name[name_len]) name_len++;
-        out(name);
-        for (int i = name_len; i < 24; i++) out(" ");
+        out_padded_name(name);
 
         out("  median: ");
         out_duration_ns(r.median_ns);
@@ -276,10 +281,7 @@ struct Bench {
 
         for (u32 i = 0; i < result_count_; i++) {
             out("  ");
-            int name_len = 0;
-            while (results_[i].name[name_len]) name_len++;
-            out(results_[i].name);
-            for (int j = name_len; j < 24; j++) out(" ");
+            out_padded_name(results_[i].name);
 
             if (i == 0) {
                 out("  baseline\n");
