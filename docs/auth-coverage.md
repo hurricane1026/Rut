@@ -19,7 +19,7 @@ whether a competing open-source edition includes them.
 | Password/JWT login | Fixed-account Rut composition: strict terminal-result Identity mapping, process-shared peer-IP admission before KDF, UUID jti, short-lived HS256 token with a trusted single- or multi-scope list and strict protected-route policy; native-loaded two-shard TLS tests | User/account registry, durable registration/reset/change, account policies, refresh/logout and persistent session/revocation state |
 | Bearer and multi-auth | Basic/Bearer OR for one Consumer or a bounded pair; required header-key AND Basic policy and a required pair of distinct custom-header keys; disabled slots and ambiguous ownership rejection; absence-only guest access for the bounded pair without invalid-credential downgrade | Dynamic Consumer registry and credential lifecycle |
 | JWT verification and issuance | HS256/384/512 policy helpers with static two-secret rotation; configured RS256/JWKS and ES256/P-256 verification through Rut, JIT and native programs; approved kid selection, bounded remote TLS refresh, bounded A/AAAA DNS with CNAME support and exact issuer/JWKS-URI discovery; static rotation and policy revocation snapshots; strict claims policy through Rut, JIT and native programs with mandatory `iat` and bounded age/lifetime; RFC 9068-inspired bounded RS256/ES256 resource profile with exact protected-header type, `client_id`, `jti`, scope and revocation checks composed with remote JWKS; two-ID static JWT revocation helper; exact scope and `groups` authorization after verification, including two-group union/intersection policies; fixed-profile native and Rut/JIT HS256 issuance with five, six or seven claims and request-owned Rut/JIT results | Other EC profiles, other DNS transports, automatic key admission, live/durable token revocation; arbitrary claims and non-HS256 signing |
-| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest` and static two-key `auth.rotatingSignedRequest` policies; authoritative Redis atomic replay claims for bounded signed-message profiles, plus GitHub signed-body digest claims, opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, dynamic signing-key registry/refresh and replicated persistence/failover |
+| HMAC and webhooks | Generic MD5/SHA-1/SHA-2 digest/HMAC primitives, fixed SHA-256 verification, exact binary bytes, two-key rotation including the strict GitHub sha256 profile; native bounded Standard Webhooks v1 verification and freshness; fixed APISIX-style HMAC-SHA256 signed-request native verifier plus Rut/JIT `auth.signedRequest`, static two-key `auth.rotatingSignedRequest` and a bounded eight-key signed-request/Standard Webhooks registry snapshot; authoritative Redis atomic replay claims for bounded signed-message profiles, plus GitHub signed-body digest claims, opt-in local AOF confirmation and single-instance crash recovery | Full Kong/APISIX plugin compatibility, online signing-key refresh and replicated persistence/failover |
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny; optional exact static Consumer-ID-to-route-tenant binding before RBAC | Larger policy sets, intrinsic tenant claims/ownership and storage isolation, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
@@ -177,6 +177,18 @@ against one captured request, and returns the matched configured credential
 ID. Clearing the previous slot revokes it. This does not add dynamic key
 refresh or replay persistence. See
 [`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
+
+`middleware/signing_keys.rut` provides a bounded eight-key registry grouped as
+four two-key snapshots for both the signed-request and Standard Webhooks
+profiles. Enabled slots require a stable key ID, secret, Consumer and credential
+ID; fully empty slots are unused. Configuration validation rejects partial
+slots, duplicate key IDs/secrets, empty identity metadata and a registry with no
+enabled key. The signed-request helper selects by the signed Authorization key
+ID and verifies the original request; the webhook helper tries enabled keys in
+declaration order. Routes must validate the snapshot first and treat the empty
+returned Consumer ID as 401. This is a trusted immutable snapshot adopted by
+loading a new program: it adds no per-request key loading, remote refresh or new
+syntax. See [signing-key-registry.rut](../examples/signing-key-registry.rut).
 
 ## Bounded multi-Consumer authentication
 
@@ -1692,6 +1704,12 @@ JIT tests also cover the 1024/1025-byte bound. See
   Static current/previous key rotation preserves existing durable claims for
   Standard Webhooks and fixed POST signed requests across provider key changes
   and single-instance Redis recovery.
+- [Signing-key registry](../examples/signing-key-registry.rut): eight enabled
+  slots across four two-key snapshots for signed requests and Standard
+  Webhooks, stable key/credential IDs, duplicate key-ID/secret rejection and
+  per-key identity mapping. The snapshot is adopted by loading a new program;
+  no remote refresh or per-request key loading is added (#1076 online refresh
+  remains open).
 - [JWKS DNS/discovery](jwks-discovery.md) provides bounded nonblocking A or AAAA
   resolution with CNAME support, an opt-in dual-stack policy that validates both
   families and prefers IPv6, a finite address allowlist, sequential failover

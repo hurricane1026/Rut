@@ -1,0 +1,59 @@
+import "middleware/signing_keys.rut"
+
+listen :8080
+
+// Bounded eight-key registry, grouped as four two-key snapshots. Enable any
+// subset; unused slots are fully empty. A new snapshot is adopted by loading a
+// new program, so key rotation does not change route code.
+func first() -> signing_keys.SigningKeyPair {
+    signing_keys.SigningKeyPair(
+        keyIdA: env("KEY_ID_1"), keyA: env("KEY_1"),
+        consumerIdA: env("CONSUMER_1"), credentialIdA: env("CREDENTIAL_1"),
+        keyIdB: env("KEY_ID_2"), keyB: env("KEY_2"),
+        consumerIdB: env("CONSUMER_2"), credentialIdB: env("CREDENTIAL_2"))
+}
+func second() -> signing_keys.SigningKeyPair {
+    signing_keys.SigningKeyPair(
+        keyIdA: env("KEY_ID_3"), keyA: env("KEY_3"),
+        consumerIdA: env("CONSUMER_3"), credentialIdA: env("CREDENTIAL_3"),
+        keyIdB: env("KEY_ID_4"), keyB: env("KEY_4"),
+        consumerIdB: env("CONSUMER_4"), credentialIdB: env("CREDENTIAL_4"))
+}
+func third() -> signing_keys.SigningKeyPair {
+    signing_keys.SigningKeyPair(
+        keyIdA: env("KEY_ID_5"), keyA: env("KEY_5"),
+        consumerIdA: env("CONSUMER_5"), credentialIdA: env("CREDENTIAL_5"),
+        keyIdB: env("KEY_ID_6"), keyB: env("KEY_6"),
+        consumerIdB: env("CONSUMER_6"), credentialIdB: env("CREDENTIAL_6"))
+}
+func fourth() -> signing_keys.SigningKeyPair {
+    signing_keys.SigningKeyPair(
+        keyIdA: env("KEY_ID_7"), keyA: env("KEY_7"),
+        consumerIdA: env("CONSUMER_7"), credentialIdA: env("CREDENTIAL_7"),
+        keyIdB: env("KEY_ID_8"), keyB: env("KEY_8"),
+        consumerIdB: env("CONSUMER_8"), credentialIdB: env("CREDENTIAL_8"))
+}
+
+route POST "/signed" {
+    guard signing_keys.validSigningKeyPairs(first(), second(), third(), fourth()) else { return 503 }
+    guard !req.chunked else { return response(401, headers: {"WWW-Authenticate": "Signature"}) }
+    let identity = signing_keys.signedRequestKeyRegistry(first(), second(), third(), fourth())
+    guard identity.consumerId != "" else { return response(401, headers: {"WWW-Authenticate": "Signature"}) }
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+route POST "/webhook" {
+    guard signing_keys.validSigningKeyPairs(first(), second(), third(), fourth()) else { return 503 }
+    let identity = signing_keys.standardWebhookKeyRegistry(
+        req.uniqueHeader("webhook-id").or(""),
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""),
+        req.body, first(), second(), third(), fourth())
+    guard identity.consumerId != "" else { return 401 }
+    let consumerId = identity.consumerId
+    return response(200, body: consumerId)
+}
+
+route GET "/ready" { return 204 }
+route "/" { return 404 }

@@ -904,6 +904,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   remaining fields and the owned forwarding target effect.
 - [x] Explicit bounded form-body replacement for proxy routes using the verified
   `remaining` fields and `forward(..., set_body: body)` on H1/H2.
+- [x] Bounded eight-key signed-request / Standard Webhooks registry snapshot with
+  stable key and credential IDs, duplicate rejection and per-key identity.
 - [x] Opt-in legacy access logging without query fields, including denied
   requests and admitted HTTP/2 gRPC targets.
 - [ ] Remaining #1072 interfaces include online administrative management and
@@ -911,6 +913,7 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [ ] Replicated persistence/failover verification for the replay authority beyond
   the tested single-instance intact-AOF recovery profile;
   broad DNS profiles/automatic kid onboarding remain separately scoped.
+- [ ] Online signing-key refresh and replicated key coordination remain separate.
 
 Contracts and executable coverage: `docs/consumer-registry.md`,
 `docs/auth-replay.md`, `docs/jwks-discovery.md`. These checkboxes describe the named

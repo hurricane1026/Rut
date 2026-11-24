@@ -2505,6 +2505,30 @@ challenge. Both enabled slots verify the same captured request fields, and the
 matching credential ID is returned. Clearing the previous pair revokes it.
 This policy has no remote key refresh or replay store. See
 [`signed-request-rotation.rut`](../examples/signed-request-rotation.rut).
+
+### Bounded multi-key signing registry (implemented)
+
+`middleware/signing_keys.rut` extends the static current/previous window to an
+eight-key registry grouped as four `SigningKeyPair` snapshots. Each enabled slot
+contains a stable `keyId`, secret, `consumerId` and `credentialId`; a fully empty
+slot is unused. `validSigningKeyPairs(first, second, third, fourth)` rejects
+partially filled slots, empty identity metadata, duplicate key IDs, duplicate
+secrets, no enabled key and bounds violations before request verification.
+
+`signedRequestKeyRegistry(first, second, third, fourth)` selects the slot by the
+signed Authorization `keyId` and verifies the original request fields;
+`standardWebhookKeyRegistry(id, timestamp, signature, body, first, second,
+third, fourth)` tries the enabled webhook keys in declaration order. Both return
+the matched configured Identity. Configuration errors must be checked with
+`validSigningKeyPairs` first (503); an empty returned `consumerId` is the
+authentication-failure sentinel, after which the route returns 401. See
+[signing-key-registry.rut](../examples/signing-key-registry.rut).
+
+This is an immutable trusted snapshot adopted by loading a new program. It adds
+no per-request key loading, network refresh, new keyword or external dependency;
+online key refresh and dynamic collection syntax remain separate. The registry
+does not change replay identity, so keep the replay namespace stable when keys
+rotate.
 The [durable rotation example](../examples/signed-request-durable-rotation-replay-auth.rut)
 composes it with `redisReplayDurableClaim` and retains claims from the fixed-key
 durable POST profile under the same namespace and Redis database.

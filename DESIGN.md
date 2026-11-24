@@ -11261,6 +11261,18 @@ Validated snapshots publish as new private files using synced no-replace links;
 activation and RCU retirement remain the configuration host's responsibility.
 See [the schema, administration and host publication boundary](docs/consumer-registry.md).
 
+The signed-request and Standard Webhooks profiles also have a bounded eight-key
+Rut registry in `middleware/signing_keys.rut`, grouped as four two-key snapshots.
+Each enabled slot binds a stable key ID, secret, Consumer and credential ID;
+fully empty slots are unused. Configuration validation rejects partial slots,
+duplicate key IDs or secrets, empty identity metadata and an empty registry.
+The signed-request path selects by the signed Authorization key ID; the webhook
+path tries enabled keys in declaration order. Routes validate the snapshot for
+503 and treat the empty returned Consumer as 401. The snapshot is replaced by
+loading a new program; no per-request key loading, network refresh or new
+keyword is introduced. Online key refresh and distributed coordination remain
+separate. See [the registry example](examples/signing-key-registry.rut).
+
 Offline `rut-consumers check-policy` evaluates a bounded private policy object
 against a validated private registry snapshot. An explicit Unix-second argument
 makes preflight decisions reproducible. Checks consume metadata and emit only

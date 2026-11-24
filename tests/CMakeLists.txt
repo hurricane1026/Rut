@@ -4492,6 +4492,12 @@ if(RUT_ENABLE_JIT)
                         --backend ${auth_free_backend})
                 set_tests_properties(test_github_webhook_replay_${auth_free_backend} PROPERTIES
                     LABELS "integration;auth" TIMEOUT 120 SKIP_RETURN_CODE 77)
+                add_test(NAME test_signing_key_registry_${auth_free_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_signing_key_registry.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/signing-key-registry.rut
+                        --backend ${auth_free_backend})
+                set_tests_properties(test_signing_key_registry_${auth_free_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
                 foreach(replay_tls plain tls)
                     set(replay_tls_flag)
                     if(replay_tls STREQUAL "tls")
