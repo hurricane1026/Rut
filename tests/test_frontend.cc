@@ -49636,6 +49636,90 @@ TEST(frontend, analyze_rejects_allocating_for_loop_body_bindings) {
     }
 }
 
+TEST(frontend, parse_tuple_slot_projection) {
+    const auto source =
+        lit("route GET \"/x\" { let pair = (200, 1) let code = pair.0 return 200 }\n");
+    auto tokens = lex(source);
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& route = ast->items[0].route;
+    REQUIRE_EQ(route.statements.len, 3u);
+    REQUIRE(route.statements[1] != nullptr);
+    const auto& let_stmt = *route.statements[1];
+    REQUIRE_EQ(static_cast<u8>(let_stmt.kind), static_cast<u8>(AstStmtKind::Let));
+    const auto& slot = let_stmt.expr;
+    REQUIRE_EQ(static_cast<u8>(slot.kind), static_cast<u8>(AstExprKind::TupleSlot));
+    CHECK_EQ(slot.int_value, 0);
+    REQUIRE(slot.lhs != nullptr);
+    CHECK(slot.lhs->kind == AstExprKind::Ident);
+    CHECK(slot.lhs->name.eq(lit("pair")));
+
+    // The index must be plain decimal digits adjacent to the dot.
+    const char* bad[] = {
+        "route GET \"/x\" { let pair = (200, 1) let code = pair . 0 return 200 }\n",
+        "route GET \"/x\" { let pair = (200, 1) let code = pair.0x1 return 200 }\n",
+    };
+    for (const char* src : bad) {
+        auto bad_tokens = lex(lit(src));
+        REQUIRE(bad_tokens);
+        CHECK_FALSE(parse_file_heap(bad_tokens.value()).has_value());
+    }
+}
+
+TEST(frontend, analyze_tuple_slot_projection) {
+    const char* sources[] = {
+        "route GET \"/x\" { let pair = (200, 1) guard pair.0 == 200 else { return 400 } "
+        "return 200 }\n",
+        "route GET \"/x\" { let pair = (200, \"ok\") guard pair.1 == \"ok\" else { return 400 } "
+        "return 200 }\n",
+        // Literal tuples fold to the element directly.
+        "route GET \"/x\" { guard (200, 1).0 == 200 else { return 401 } return 200 }\n",
+        // Tuple slots work on loop elements too.
+        "route GET \"/x\" { for pair in [(200, 1), (204, 2)] { "
+        "guard pair.0 != 204 else { return 402 } } return 200 }\n",
+    };
+    for (const char* src : sources) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) fprintf(stderr, "tuple slot source: %s\n", src);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, analyze_rejects_invalid_tuple_slot_projection) {
+    const char* sources[] = {
+        "route GET \"/x\" { let x = 1 let y = x.0 return 200 }\n",
+        "route GET \"/x\" { let pair = (200, 1) let y = pair.2 return 200 }\n",
+        "route GET \"/x\" { let pair: (i32, i32) = nil let y = pair.0 return 200 }\n",
+    };
+    const char* details[] = {
+        "tuple element access requires a tuple value",
+        "tuple element index is out of range",
+        "tuple element access requires a narrowed tuple value; guard the optional or "
+        "fallible tuple first",
+    };
+    for (u32 i = 0; i < 3; i++) {
+        auto lexed = lex(lit(sources[i]));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir);
+        CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+        CHECK(hir.error().detail.eq(lit(details[i])));
+    }
+}
+
 TEST(frontend, parse_for_loop_break_continue_statements) {
     const auto source =
         lit("route GET \"/x\" { for n in [1] { guard n != 2 else { break } "

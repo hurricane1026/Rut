@@ -1894,6 +1894,68 @@ TEST(jit, frontend_static_for_loop_conditional_control_execute) {
     }
 }
 
+TEST(jit, frontend_tuple_slot_projection_executes) {
+    struct Case {
+        const char* src;
+        u16 status;
+    };
+    const Case cases[] = {
+        // Runtime tuple values project by slot index.
+        {"route GET \"/users\" { let pair = (100 + 100, 1 + 1) "
+         "guard pair.0 == 200 else { return 500 } guard pair.1 == 2 else { return 501 } "
+         "return 200 }\n",
+         200},
+        {"route GET \"/users\" { let pair = (100 + 100, 1 + 1) "
+         "guard pair.0 == 201 else { return 502 } return 200 }\n",
+         502},
+        // String slots keep their type.
+        {"route GET \"/users\" { let pair = (\"ok\", 3) "
+         "guard pair.0 == \"ok\" else { return 503 } return 200 }\n",
+         200},
+        // Projection applies to static loop elements.
+        {"route GET \"/users\" { for pair in [(200, 1), (500, 2)] { "
+         "guard pair.0 != 500 else { return 504 } } return 200 }\n",
+         504},
+    };
+    const char* request = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    for (const auto& item : cases) {
+        auto lexed = lex(lit(item.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(request),
+                                               static_cast<u32>(__builtin_strlen(request)),
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(r.status_code, item.status);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
 TEST(jit, frontend_arith_div_mod_guards_execute) {
     // Runtime operands (locals don't fold at use sites), so the codegen
     // select guards — not the analyze fold — produce these results.

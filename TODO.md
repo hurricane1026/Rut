@@ -172,6 +172,16 @@ without presenting lossy or per-shard state as exact shared state.
   Values are copied; raw encoding/empty-value semantics are documented, and
   explicit-wait/non-request contexts are rejected. This
   completes the repeated-query read primitive, not general arrays or iteration.
+- [x] Tuple element access: `pair.0` / `pair.1` project a tuple slot (adjacent
+  decimal digits after `.`), including static-loop elements. Literal tuples
+  fold to the element; non-tuple receivers and out-of-range slots are rejected
+  with dedicated diagnostics. Nullable/fallible receivers must be narrowed
+  before projection. Nested tuples and `let (x, y) = pair` destructuring remain
+  pending. Projecting a *generic* element does not carry its type parameter's
+  Eq/Ord/Error/custom-protocol constraints (they are function-scoped and are not
+  represented per tuple element), so constrained uses must pass the element
+  through a helper parameter of type `T`; extending the type system with
+  per-element constraint metadata is a follow-up.
 - [x] Static route-local `for` loops are enabled end to end. The parser accepts
   `for name in <static array> { ... }` (still rejecting `inline for`), analyze
   builds the existing `HirForLoop` subset, and MIR unrolls literals or
