@@ -41,8 +41,8 @@ struct TlsClientContext {
     SSL_CTX* ssl_ctx;
     BIO_METHOD* socket_bio_method;
     BIO_METHOD* bridge_bio_method;
-    bool http2 = true;
-    bool offer_alpn = true;
+    bool http2;
+    bool offer_alpn;
 };
 core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
                                                     const UpstreamTlsSpec& spec,

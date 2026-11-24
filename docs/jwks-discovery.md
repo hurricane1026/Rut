@@ -14,7 +14,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "conditionalRequests": true, "conditionalDiscovery": true,
   "admitNewKids": true,
   "discoveryCacheSeconds": 30,
-  "dnsAddress": "192.0.2.53", "dnsPort": 53, "dnsCacheSeconds": 15,
+  "dnsAddress": "192.0.2.53", "dnsCacheSeconds": 15,
   "dnsTransport": "tls", "dnsTlsPort": 853,
   "dnsTlsServerName": "resolver.example", "dnsTlsCa": "/etc/rut/resolver-ca.pem",
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
