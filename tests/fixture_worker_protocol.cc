@@ -566,13 +566,14 @@ bool safe_cleanup(Child& child,
                                  true,
                                  false))
         return false;
-    if (kill(-static_cast<pid_t>(report.pgid), 0) != 0) return false;
-    if (kill(-static_cast<pid_t>(report.pgid), SIGTERM) != 0) return false;
+    const pid_t group = static_cast<pid_t>(-static_cast<int64_t>(child.target_pid));
+    if (kill(group, 0) != 0) return false;
+    if (kill(group, SIGTERM) != 0) return false;
     if (reap_bounded(child, kCleanupMs)) return target_gone_or_reused(before);
     // Never escalate to KILL after identity has gone stale or disappeared.
     ProcIdentity after;
     if (!read_proc(child.target_pid, after) || !same_process_identity(before, after)) return false;
-    if (kill(-static_cast<pid_t>(report.pgid), SIGKILL) != 0) return false;
+    if (kill(group, SIGKILL) != 0) return false;
     return reap_bounded(child, kCleanupMs) && target_gone_or_reused(before);
 }
 
@@ -592,13 +593,14 @@ bool safe_cleanup_unready(Child& child,
         current.exe_dev != expected.exe_dev || current.exe_ino != expected.exe_ino ||
         current.cmdline != expected_argv || !current.no_new_privs || !current.capabilities_clear)
         return false;
-    if (kill(-expected.pgid, 0) != 0) return false;
-    if (kill(-expected.pgid, SIGTERM) != 0) return false;
+    const pid_t group = static_cast<pid_t>(-static_cast<int64_t>(expected.pgid));
+    if (kill(group, 0) != 0) return false;
+    if (kill(group, SIGTERM) != 0) return false;
     if (reap_bounded(child, kCleanupMs)) return true;
     if (!read_proc(child.target_pid, current) || !same_process_identity(expected, current) ||
         current.cmdline != expected_argv)
         return false;
-    if (kill(-expected.pgid, SIGKILL) != 0) return false;
+    if (kill(group, SIGKILL) != 0) return false;
     return reap_bounded(child, kCleanupMs);
 }
 
@@ -608,14 +610,15 @@ bool safe_cleanup_orphan_target(pid_t target_pid, const ProcIdentity& expected, 
         return false;
     ProcIdentity current;
     if (!read_proc(target_pid, current) || !same_process_identity(expected, current)) return false;
-    if (kill(-expected.pgid, 0) != 0 || kill(-expected.pgid, SIGTERM) != 0) return false;
+    const pid_t group = static_cast<pid_t>(-static_cast<int64_t>(target_pid));
+    if (kill(group, 0) != 0 || kill(group, SIGTERM) != 0) return false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);
     while (std::chrono::steady_clock::now() < deadline) {
         if (target_gone_or_reused(expected)) return true;
         poll(nullptr, 0, 5);
     }
     if (!read_proc(target_pid, current) || !same_process_identity(expected, current) ||
-        kill(-expected.pgid, 0) != 0 || kill(-expected.pgid, SIGKILL) != 0)
+        kill(group, 0) != 0 || kill(group, SIGKILL) != 0)
         return false;
     const auto kill_deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kCleanupMs);

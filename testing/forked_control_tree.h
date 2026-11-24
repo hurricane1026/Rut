@@ -32,11 +32,15 @@ inline ControlProcfsCapability control_procfs_capability_from_errno(int error) {
     return error == ENOENT ? ControlProcfsCapability::Unsupported : ControlProcfsCapability::Error;
 }
 
+inline bool take_control_failure(volatile sig_atomic_t& failures) {
+    const sig_atomic_t remaining = failures;
+    if (remaining <= 0) return false;
+    failures = remaining - 1;
+    return true;
+}
+
 inline bool control_rewind(FILE* file) {
-    if (control_seek_failures > 0) {
-        control_seek_failures = control_seek_failures - 1;
-        return false;
-    }
+    if (take_control_failure(control_seek_failures)) return false;
     return fseek(file, 0, SEEK_SET) == 0;
 }
 
@@ -112,13 +116,14 @@ public:
 };
 
 inline long long control_now_ms() {
-    if (control_clock_failures > 0) {
-        control_clock_failures = control_clock_failures - 1;
-        return -1;
-    }
+    if (take_control_failure(control_clock_failures)) return -1;
     timespec now{};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return static_cast<long long>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
+    long long ms;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        __builtin_mul_overflow(now.tv_sec, 1000, &ms) ||
+        __builtin_add_overflow(ms, now.tv_nsec / 1000000, &ms))
+        return -1;
+    return ms;
 }
 
 inline bool control_parse_child_pid(const char* token, pid_t self, pid_t& child_pid) {
@@ -136,8 +141,7 @@ inline bool control_parse_child_pid(const char* token, pid_t self, pid_t& child_
 }
 
 inline bool control_next_child_token(FILE* children, char (&token)[32], bool& has_token) {
-    if (control_read_failures > 0) {
-        control_read_failures = control_read_failures - 1;
+    if (take_control_failure(control_read_failures)) {
         // Test seam: model a persistent retained-stream read error; this is not stdio I/O.
         errno = EIO;
         has_token = false;
@@ -197,9 +201,12 @@ inline void fallback_control_cleanup(FILE* children,
                                      pid_t worker,
                                      bool worker_reaped,
                                      bool worker_group_owned) {
-    if (!worker_reaped) {
+    if (!worker_reaped && worker > 1) {
         (void)kill(worker, SIGKILL);
-        if (worker_group_owned) (void)kill(-worker, SIGKILL);
+        if (worker_group_owned) {
+            const pid_t group = static_cast<pid_t>(-static_cast<long long>(worker));
+            (void)kill(group, SIGKILL);
+        }
     }
     // Keep retrying enumeration for a fixed number of passes. A broken clock
     // must not turn cleanup into an unbounded wait, and a broken procfs must
@@ -212,8 +219,7 @@ inline void fallback_control_cleanup(FILE* children,
             if (result <= 0) break;
         }
         if (children != nullptr) {
-            const bool scan_failed = control_scan_failures > 0;
-            if (scan_failed) control_scan_failures = control_scan_failures - 1;
+            const bool scan_failed = take_control_failure(control_scan_failures);
             unsigned count = 0;
             bool ignored_leftovers = false;
             // A permanent read/parse failure means unknown descendants remain undiscovered;
@@ -243,10 +249,9 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
              sizeof(children_path),
              "/proc/self/task/%ld/children",
              static_cast<long>(supervisor));
-    ScopedControlFile children_owner(control_proc_open_failures > 0 ? nullptr
-                                                                    : fopen(children_path, "r"));
+    ScopedControlFile children_owner(
+        take_control_failure(control_proc_open_failures) ? nullptr : fopen(children_path, "r"));
     FILE* children = children_owner.get();
-    if (control_proc_open_failures > 0) control_proc_open_failures = control_proc_open_failures - 1;
     if (children == nullptr) return 125;
     unsigned preflight_count = 0;
     if (!control_validate_children(children, supervisor, preflight_count)) {
@@ -282,11 +287,11 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
     const bool stopped = control_stop_requested != 0;
     bool leftovers = false;
     const long long started = control_now_ms();
-    if (started < 0) {
+    long long deadline;
+    if (started < 0 || __builtin_add_overflow(started, kControlCleanupDeadlineMs, &deadline)) {
         fallback_control_cleanup(children, worker, reaped, worker_group_owned);
         return 125;
     }
-    const long long deadline = started + kControlCleanupDeadlineMs;
     for (;;) {
         int descendant_status = 0;
         const pid_t result = waitpid(-1, &descendant_status, WNOHANG);
@@ -334,8 +339,7 @@ inline int supervise_forked_control(int (*run)(void*), void* context, int expect
         // Do not reap during this scan: each PID remains reserved by a child
         // until the next wait, so signals cannot hit an unrelated reused PID.
         bool ok = true;
-        const bool scan_failed = control_scan_failures > 0;
-        if (scan_failed) control_scan_failures = control_scan_failures - 1;
+        const bool scan_failed = take_control_failure(control_scan_failures);
         unsigned count = 0;
         if (scan_failed || !control_validate_children(children, supervisor, count) ||
             !control_signal_children(children, supervisor, worker, reaped, leftovers))
