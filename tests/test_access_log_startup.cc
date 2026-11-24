@@ -82,7 +82,7 @@ i32 open_fd_count() {
         if (entry->d_name[0] == '.' &&
             (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
             continue;
-        count++;
+        rut::test::increment_check_count(count);
     }
     closedir(dir);
     return count;
@@ -501,13 +501,29 @@ bool transact_loopback(u16 port,
 
 i64 monotonic_ns() {
     struct timespec now{};
-    (void)clock_gettime(CLOCK_MONOTONIC, &now);
-    return static_cast<i64>(now.tv_sec) * 1'000'000'000LL + static_cast<i64>(now.tv_nsec);
+    i64 value;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        __builtin_mul_overflow(now.tv_sec, 1'000'000'000LL, &value) ||
+        __builtin_add_overflow(value, now.tv_nsec, &value))
+        return -1;
+    return value;
+}
+
+i64 deadline_after_ns(i64 budget) {
+    const i64 now = monotonic_ns();
+    i64 deadline;
+    return now < 0 || __builtin_add_overflow(now, budget, &deadline) ? 0 : deadline;
+}
+
+i64 remaining_until_ns(i64 deadline) {
+    const i64 now = monotonic_ns();
+    i64 remaining;
+    return now < 0 || __builtin_sub_overflow(deadline, now, &remaining) ? 0 : remaining;
 }
 
 // Milliseconds to wait in one poll step: at most 100, 0 once the deadline has passed.
 i32 poll_wait_ms(i64 deadline_ns) {
-    const i64 remaining_ns = deadline_ns - monotonic_ns();
+    const i64 remaining_ns = remaining_until_ns(deadline_ns);
     if (remaining_ns <= 0) return 0;
     if (remaining_ns >= 100'000'000LL) return 100;
     return static_cast<i32>(remaining_ns / 1'000'000LL) + 1;
@@ -553,7 +569,7 @@ ProcessResult run_rut(const std::vector<std::string>& args,
     // precede the child becoming reapable; once EOF is seen, poll(2) on the pipe
     // returns immediately, so a wakeup-count budget could be spent in microseconds
     // and SIGKILL a child that was already exiting 1.
-    const i64 deadline_ns = monotonic_ns() + 5'000'000'000LL;
+    const i64 deadline_ns = deadline_after_ns(5'000'000'000LL);
     while (!reaped) {
         const i32 wait_ms = poll_wait_ms(deadline_ns);
         if (wait_ms <= 0) break;
@@ -635,7 +651,10 @@ struct SourceLiveProxyResult {
 };
 
 i64 ms_since(i64 origin_ns, i64 at_ns) {
-    return at_ns == 0 ? -1 : (at_ns - origin_ns) / 1'000'000LL;
+    i64 elapsed;
+    if (at_ns <= 0 || origin_ns < 0 || __builtin_sub_overflow(at_ns, origin_ns, &elapsed))
+        return -1;
+    return elapsed / 1'000'000LL;
 }
 
 // Reachability recheck, run while the child is still alive: one fresh loopback
@@ -662,15 +681,15 @@ i32 recheck_loopback_reachable(u16 port, i64 deadline_ns) {
     if (connect(fd, reinterpret_cast<const struct sockaddr*>(&address), sizeof(address)) != 0) {
         result = errno;
         if (result == EINPROGRESS || result == EINTR) {
-            const i64 cap_ns = monotonic_ns() + 500'000'000LL;
+            const i64 cap_ns = deadline_after_ns(500'000'000LL);
             const i64 until_ns = deadline_ns < cap_ns ? deadline_ns : cap_ns;
             result = ETIMEDOUT;
             for (;;) {
-                const i64 remaining_ns = until_ns - monotonic_ns();
+                const i64 remaining_ns = remaining_until_ns(until_ns);
                 if (remaining_ns <= 0) break;
                 struct pollfd ready{fd, POLLOUT, 0};
                 const i32 polled =
-                    poll(&ready, 1, static_cast<i32>(remaining_ns / 1'000'000LL) + 1);
+                    poll(&ready, 1, static_cast<i32>(remaining_ns / 1'000'000LL + 1));
                 if (polled < 0 && errno == EINTR) continue;
                 if (polled < 0) {
                     result = errno;
@@ -858,7 +877,7 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
     bool termination_sent = false;
     bool output_eof = false;
     // Wall-clock budget; see run_rut for why a wakeup-count budget is unsound.
-    const i64 deadline_ns = monotonic_ns() + 8'000'000'000LL;
+    const i64 deadline_ns = deadline_after_ns(8'000'000'000LL);
     while (!reaped) {
         const i32 wait_ms = poll_wait_ms(deadline_ns);
         if (wait_ms <= 0) break;
