@@ -20912,18 +20912,34 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     FrontendError::UnsupportedSyntax,
                     bstmt.span,
                     lit_str("static for-loop body cannot continue after a route terminator"));
-            const auto simple_branch = [](const AstStatement& branch) {
-                return is_ast_hir_terminator(branch);
+            // Each branch must end the iteration: a route terminator, `break`,
+            // or `continue`. Loop control in a branch is resolved to unrolled
+            // block targets by mir_build; only the all-terminator form ends the
+            // route (and with it every later iteration).
+            const auto branch_kind = [](const AstStatement& branch,
+                                        HirForLoopIf::BranchKind* kind) {
+                if (is_ast_hir_terminator(branch)) {
+                    *kind = HirForLoopIf::BranchKind::Term;
+                    return true;
+                }
+                if (branch.kind == AstStmtKind::Break) {
+                    *kind = HirForLoopIf::BranchKind::Break;
+                    return true;
+                }
+                if (branch.kind == AstStmtKind::Continue) {
+                    *kind = HirForLoopIf::BranchKind::Continue;
+                    return true;
+                }
+                return false;
             };
-            if ((bstmt.then_stmt != nullptr && ast_contains_loop_control(*bstmt.then_stmt)) ||
-                (bstmt.else_stmt != nullptr && ast_contains_loop_control(*bstmt.else_stmt)))
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, bstmt.span, kForLoopNestedLoopControlDetail);
-            if (bstmt.then_stmt == nullptr || bstmt.else_stmt == nullptr ||
-                !simple_branch(*bstmt.then_stmt) || !simple_branch(*bstmt.else_stmt))
+            if (bstmt.then_stmt == nullptr || bstmt.else_stmt == nullptr)
                 return frontend_error(FrontendError::UnsupportedSyntax, bstmt.span);
             HirForLoopIf body_if{};
             body_if.span = bstmt.span;
+            if (!branch_kind(*bstmt.then_stmt, &body_if.then_kind) ||
+                !branch_kind(*bstmt.else_stmt, &body_if.else_kind))
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, bstmt.span, kForLoopNestedLoopControlDetail);
             auto cond = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!cond) return core::make_unexpected(cond.error());
@@ -20933,16 +20949,27 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                     bstmt.expr.span,
                     lit_str("static for-loop if condition must be a non-fallible bool"));
             body_if.cond = cond.value();
-            auto then_term = analyze_term(*bstmt.then_stmt, mod);
-            if (!then_term) return core::make_unexpected(then_term.error());
-            auto else_term = analyze_term(*bstmt.else_stmt, mod);
-            if (!else_term) return core::make_unexpected(else_term.error());
-            body_if.then_term = then_term.value();
-            body_if.else_term = else_term.value();
+            if (body_if.then_kind == HirForLoopIf::BranchKind::Term) {
+                auto then_term = analyze_term(*bstmt.then_stmt, mod);
+                if (!then_term) return core::make_unexpected(then_term.error());
+                body_if.then_term = then_term.value();
+            }
+            if (body_if.else_kind == HirForLoopIf::BranchKind::Term) {
+                auto else_term = analyze_term(*bstmt.else_stmt, mod);
+                if (!else_term) return core::make_unexpected(else_term.error());
+                body_if.else_term = else_term.value();
+            }
             const u32 if_index = loop.body.ifs.len;
             if (!loop.body.ifs.push(body_if))
                 return frontend_error(FrontendError::TooManyItems, bstmt.span);
-            loop.body.has_term = true;
+            // Only an all-terminator branch pair ends the route; loop control in
+            // either branch still ends this iteration, so nothing may follow it.
+            if (body_if.then_kind == HirForLoopIf::BranchKind::Term &&
+                body_if.else_kind == HirForLoopIf::BranchKind::Term) {
+                loop.body.has_term = true;
+            } else {
+                body_exited = true;
+            }
             HirForLoopBody::Step step{};
             step.kind = HirForLoopBody::Step::Kind::If;
             step.index = if_index;

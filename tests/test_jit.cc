@@ -1813,6 +1813,87 @@ TEST(jit, frontend_static_for_loop_break_continue_execute) {
     }
 }
 
+TEST(jit, frontend_static_for_loop_conditional_control_execute) {
+    // Loop-body `if` branches may terminate the route or leave/shorten the
+    // iteration (break/continue); the unroller resolves each branch to its own
+    // block target.
+    struct Case {
+        const char* src;
+        u16 status;
+    };
+    const Case cases[] = {
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 2 { break } "
+         "else { continue } } return 200 }\n",
+         200},
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 2 { return 511 } "
+         "else { continue } } return 200 }\n",
+         511},
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 1 { continue } "
+         "else { return 512 } } return 200 }\n",
+         512},
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 3 { break } "
+         "else { continue } } return 200 }\n",
+         200},
+        // A preceding continue guard keeps iterations reachable past a mixed if.
+        {"route GET \"/users\" { for n in [0, 1, 2] { guard n != 0 else { continue } "
+         "if n == 1 { break } else { return 513 } } return 200 }\n",
+         200},
+        // Either branch order works: a break taken first skips the later
+        // terminator branch, and vice versa.
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 2 { return 514 } "
+         "else { break } } return 200 }\n",
+         200},
+        {"route GET \"/users\" { for n in [1, 2, 3] { if n == 1 { return 516 } "
+         "else { break } } return 200 }\n",
+         516},
+        // Loop control in an inner if still only leaves the inner loop.
+        {"route GET \"/users\" { for a in [1, 2] { for b in [1, 2] { "
+         "if b == 1 { break } else { continue } } guard a != 2 else { return 515 } } "
+         "return 200 }\n",
+         515},
+        {"route GET \"/users\" { for a in [1] { for b in [1, 2] { "
+         "if b == 1 { continue } else { break } } } return 200 }\n",
+         200},
+    };
+    const char* request = "GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    for (const auto& item : cases) {
+        auto lexed = lex(lit(item.src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+
+        FrontendRirModule rir{};
+        auto lowered = lower_to_rir(mir.value(), rir);
+        REQUIRE(lowered);
+
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+
+        auto r = HandlerResult::unpack(handler(nullptr,
+                                               nullptr,
+                                               reinterpret_cast<const u8*>(request),
+                                               static_cast<u32>(__builtin_strlen(request)),
+                                               nullptr));
+        CHECK(r.action == HandlerAction::ReturnStatus);
+        CHECK_EQ(r.status_code, item.status);
+
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
 TEST(jit, frontend_arith_div_mod_guards_execute) {
     // Runtime operands (locals don't fold at use sites), so the codegen
     // select guards — not the analyze fold — produce these results.

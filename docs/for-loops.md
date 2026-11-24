@@ -116,7 +116,8 @@ The supported loop body surface is route-oriented:
 - `let` bindings scoped to the loop body
 - `guard` and `guard let`
 - direct route terminators such as `return`
-- terminal `if`
+- `if` whose branches each end the iteration: a route terminator, `break`, or
+  `continue`
 - terminal `match`
 - nested static `for` loops
 - `break` and `continue` loop control (see [Loop Control](#loop-control))
@@ -216,12 +217,25 @@ route GET "/x" {
 For conditional control prefer `guard`, as above: a direct `break`/`continue`
 always runs and therefore also makes every later step of the body unreachable.
 
-Loop control is not yet accepted inside loop-body `if` or `match` arms: those
-steps are lowered as terminal route branches, and a conditional iteration exit
-would need a partial-iteration control graph. A loop body that uses
-`break`/`continue` also cannot contain a route terminator (`return`, terminal
-`if`, terminal `match`); keep the loop body free of route exits and put them
-after the loop.
+A conditional exit can also be written as an `if`: each branch must end the
+iteration with a route terminator, `break`, or `continue`.
+
+```rut
+route GET "/x" {
+    for n in [1, 2, 3] {
+        if n == 2 { break } else { continue }
+    }
+    return 200
+}
+```
+
+A branch that terminates the route keeps its own block, while `break`/`continue`
+branches jump to the loop-exit or next-iteration step. Loop control is still
+rejected inside loop-body `match` arms: those arm bodies lower as terminal route
+branches and would need a per-arm partial-iteration graph. A loop body that uses
+`break`/`continue` also cannot contain an unconditional route terminator
+(`return`, an all-terminator `if`, or a terminal `match`); that shape ends the
+route and would truncate the loop-control target blocks.
 
 ## Ordering
 
@@ -265,7 +279,9 @@ Static `for` loops are intentionally narrow:
   invocation (see the language card), so every use observes the same value
 - routes that combine `wait(...)` and static for-loop lowering are rejected
 - `for` is accepted only in route bodies, not helper/function bodies
-- `break`/`continue` are accepted as direct loop-body statements and as a
-  `guard ... else` failure path; loop-body `if`/`match` arms reject them for now
-- a loop body that uses `break`/`continue` cannot also contain route terminators
+- `break`/`continue` are accepted as direct loop-body statements, as a
+  `guard ... else` failure path, and as loop-body `if` branches; loop-body
+  `match` arms still reject them
+- a loop body that uses `break`/`continue` cannot also contain an unconditional
+  route terminator
 - block-budget overflow reports the overflowing loop step, guard, or arm
