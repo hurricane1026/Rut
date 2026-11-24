@@ -24,11 +24,7 @@ namespace rut::jit {
 // ── Error logging (no stdlib) ──────────────────────────────────────
 
 static void log_error(const char* prefix, LLVMErrorRef err) {
-    auto write_str = [](const char* s) {
-        int len = 0;
-        while (s[len]) len++;
-        (void)::write(2, s, len);
-    };
+    auto write_str = [](const char* s) { (void)::write(2, s, __builtin_strlen(s)); };
     write_str(prefix);
     if (err) {
         char* msg = LLVMGetErrorMessage(err);
@@ -387,11 +383,7 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     // LLVM may populate OutMessage even when verification succeeds (observed as a
     // 1-byte empty strdup on LLVM 22), so it must always be disposed when set.
     if (verify_failed && verify_msg) {
-        auto write_str = [](const char* s) {
-            int len = 0;
-            while (s[len]) len++;
-            (void)::write(2, s, len);
-        };
+        auto write_str = [](const char* s) { (void)::write(2, s, __builtin_strlen(s)); };
         write_str("jit: module verification failed: ");
         write_str(verify_msg);
         write_str("\n");

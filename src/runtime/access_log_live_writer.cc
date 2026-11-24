@@ -410,7 +410,8 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
                     line + static_cast<i64>(written),
                     static_cast<size_t>(static_cast<i64>(line_length) - static_cast<i64>(written)));
         if (result > 0) {
-            written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(result));
+            written = static_cast<u32>(static_cast<i64>(written) +
+                                       static_cast<i64>(static_cast<u32>(result)));
             continue;
         }
         if (result < 0 && errno == EINTR) continue;

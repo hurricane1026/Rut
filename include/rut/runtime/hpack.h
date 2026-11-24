@@ -25,8 +25,9 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top);
 
 // Number of octets src[0..len) encodes to. The i64 result is exact for every
 // u32 input length; callers must check it before narrowing for a u32 field.
+// The bit count is at most 30 * UINT32_MAX, so rounding fits in i64 as well.
 constexpr i64 huffman_encoded_bytes_from_bits(i64 bits) {
-    return (bits + 7) / 8;
+    return static_cast<i64>(static_cast<__int128_t>(bits) + 7) / 8;
 }
 
 i64 huffman_encoded_len(const u8* src, u32 len);

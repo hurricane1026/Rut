@@ -781,7 +781,7 @@ bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
         if (!policy_enabled(doc, record)) continue;
         const i64 start = policy_time(doc, record, lit_str("notBefore"));
         const i64 end = policy_time(doc, record, lit_str("expiresAt"));
-        if (!start || !end || end - start > maximum) return false;
+        if (!start || !end || static_cast<__int128_t>(end) - start > maximum) return false;
     }
     return true;
 }
@@ -793,7 +793,8 @@ bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
     for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
          record = doc.nodes[record].next) {
         if (policy_enabled(doc, record) &&
-            policy_time(doc, record, lit_str("expiresAt")) - snapshot.now < minimum)
+            static_cast<__int128_t>(policy_time(doc, record, lit_str("expiresAt"))) - snapshot.now <
+                minimum)
             return false;
     }
     return true;

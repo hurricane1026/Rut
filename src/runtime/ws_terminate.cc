@@ -397,7 +397,7 @@ bool emit_frame(u8* out,
                 u32* produced,
                 WsOpcode op,
                 const u8* payload,
-                u64 len,
+                u32 len,
                 bool masked,
                 u64& mask_rng,
                 Str prefix = {},
@@ -407,8 +407,8 @@ bool emit_frame(u8* out,
     (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
-    const u64 output_len = static_cast<u64>(
-        static_cast<__int128_t>(len) + static_cast<i64>(prefix.len) + static_cast<i64>(suffix.len));
+    const i64 output_len =
+        static_cast<i64>(len) + static_cast<i64>(prefix.len) + static_cast<i64>(suffix.len);
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
@@ -738,7 +738,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
                                      static_cast<__int128_t>(st.message_len)))
                     return WsInspectStatus::Error;
-                const u32 message_total = static_cast<u32>(static_cast<i64>(st.message_len) +
+                const u32 message_total = static_cast<u32>(static_cast<__int128_t>(st.message_len) +
                                                            static_cast<i64>(payload_len));
                 if (message_total > msg_cap) return WsInspectStatus::Error;
                 if (st.max_message_size != 0 &&
@@ -749,9 +749,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
-        const u64 frame_total =
-            static_cast<u64>(static_cast<i64>(header_len) + static_cast<i64>(h.payload_len) -
-                             static_cast<i64>(st.partial_payload_len));
+        const u64 frame_total = static_cast<u64>(static_cast<__int128_t>(header_len) +
+                                                 static_cast<__int128_t>(h.payload_len) -
+                                                 static_cast<__int128_t>(st.partial_payload_len));
         if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
         if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
         // A completed fragmented message can be larger than this input chunk. Flush
@@ -833,7 +833,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             produced,
                             h.opcode,
                             cbuf,
-                            h.payload_len,
+                            static_cast<u32>(h.payload_len),
                             st.masked,
                             st.mask_rng)) {
                 return WsInspectStatus::Error;
@@ -909,7 +909,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
                                      static_cast<__int128_t>(st.message_len)))
                 return WsInspectStatus::Error;
-            st.message_len = static_cast<u32>(static_cast<i64>(st.message_len) +
+            st.message_len = static_cast<u32>(static_cast<__int128_t>(st.message_len) +
                                               static_cast<i64>(h.payload_len));
         }
 
@@ -953,8 +953,14 @@ WsInspectStatus ws_inspect(WsInspector& st,
         const u32 kOutputBegin = *produced;
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
-            if (!emit_frame(
-                    out, out_cap, produced, msg_op, msg_buf, total, st.masked, st.mask_rng)) {
+            if (!emit_frame(out,
+                            out_cap,
+                            produced,
+                            msg_op,
+                            msg_buf,
+                            static_cast<u32>(total),
+                            st.masked,
+                            st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
         } else if (action == WsFrameAction::ForwardDynamic) {
@@ -1049,7 +1055,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                                              ? WsOpcode::Binary
                                              : WsOpcode::Text,
                                          msg_buf,
-                                         kPayloadSize,
+                                         static_cast<u32>(kPayloadSize),
                                          st.masked,
                                          st.mask_rng,
                                          rewrite.prefix,

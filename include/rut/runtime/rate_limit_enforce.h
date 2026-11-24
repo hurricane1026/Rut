@@ -99,7 +99,8 @@ inline RateLimitDecision rate_limit_decision_with_limiters(RateLimiter& rate_lim
         const RateLimitRule& rule = rules.rules[ri];
         if (rule.emit_interval_us == 0) continue;
         const u32 scope = rule.scope == RateLimitScope::Global ? 1u : 0u;
-        out.rules_evaluated_by_scope[scope]++;
+        out.rules_evaluated_by_scope[scope] =
+            static_cast<u8>(static_cast<i64>(out.rules_evaluated_by_scope[scope]) + 1);
         const u64 key = rate_limit_key(rate_limit_ids[ri], rule.key.comps, rule.key.count, key_in);
         const RateLimitDecision current =
             rule.scope == RateLimitScope::Global
@@ -110,7 +111,8 @@ inline RateLimitDecision rate_limit_decision_with_limiters(RateLimiter& rate_lim
         if (!current.retry_known) out.retry_known = false;
         if (!current.allowed) {
             const u32 reason = rate_limit_reason_index(current.reject_reason);
-            out.rules_rejected_by_scope_reason[scope][reason]++;
+            out.rules_rejected_by_scope_reason[scope][reason] = static_cast<u16>(
+                static_cast<i64>(out.rules_rejected_by_scope_reason[scope][reason]) + 1);
             out.allowed = false;
             if (out.reject_reason == RateLimitRejectReason::None ||
                 rate_limit_reason_precedes(current.reject_reason, out.reject_reason))

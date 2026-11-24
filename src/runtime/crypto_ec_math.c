@@ -91,7 +91,8 @@ static int verify_digest(EVP_PKEY* key,
     for (int bit = 255; bit >= 0; --bit) {
         const int kIndex = BN_is_bit_set(u, bit) | (BN_is_bit_set(v, bit) << 1);
         if (!EC_POINT_dbl(group, points[3], points[3], scratch) ||
-            (kIndex && !EC_POINT_add(group, points[3], points[3], points[kIndex - 1], scratch)))
+            (kIndex &&
+             !EC_POINT_add(group, points[3], points[3], points[(int64_t)kIndex - 1], scratch)))
             return -1;
     }
     if (EC_POINT_is_at_infinity(group, points[3])) return 0;

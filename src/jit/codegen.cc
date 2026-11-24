@@ -4899,8 +4899,8 @@ bool emit_ws_handler(LLVMModuleRef mod,
             const u32 kCount = guards[i].accessor == 37 ? 3u : 2u;
             for (u32 j = 0; j < kCount; ++j) {
                 const u32 kChild = kChildren[j];
-                if (kChild >= i || !guards[kChild].is_operand || ++parents[kChild] != 1)
-                    return false;
+                if (kChild >= i || !guards[kChild].is_operand || parents[kChild] != 0) return false;
+                parents[kChild] = 1;
             }
         }
         // Source clauses remain bounded by the frontend. Explicit forward roots

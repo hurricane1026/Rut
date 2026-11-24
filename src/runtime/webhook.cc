@@ -42,11 +42,13 @@ bool standard_webhook_valid(Str id,
         const i64 signed_seconds = static_cast<i64>(seconds);
         if (signed_seconds > (static_cast<i64>(kMaxTime) - static_cast<i64>(digit)) / 10)
             return false;
-        seconds = static_cast<u64>(signed_seconds * 10 + static_cast<i64>(digit));
+        seconds = static_cast<u64>(static_cast<__int128_t>(signed_seconds) * 10 +
+                                   static_cast<i64>(digit));
     }
     const u64 now = static_cast<u64>(unix_seconds);
-    const i64 delta = seconds > now ? static_cast<i64>(seconds) - static_cast<i64>(now)
-                                    : static_cast<i64>(now) - static_cast<i64>(seconds);
+    const i64 delta =
+        seconds > now ? static_cast<i64>(static_cast<__int128_t>(seconds) - static_cast<i64>(now))
+                      : static_cast<i64>(static_cast<__int128_t>(now) - static_cast<i64>(seconds));
     if (delta > static_cast<i64>(tolerance_seconds)) return false;
 
     static constexpr u8 kDot[] = {'.'};

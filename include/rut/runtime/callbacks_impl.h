@@ -239,7 +239,8 @@ inline void record_active_probe_result(u16 upstream_id,
     if (h == nullptr) return;
     if (healthy) {
         h->active_failures = 0;
-        if (h->active_successes < thresholds.successes) h->active_successes++;
+        if (h->active_successes < thresholds.successes)
+            h->active_successes = static_cast<u8>(static_cast<i64>(h->active_successes) + 1);
         if (h->active_successes >= thresholds.successes) {
             h->active_down = false;
             h->passive_down = false;
@@ -251,7 +252,8 @@ inline void record_active_probe_result(u16 upstream_id,
         return;
     }
     h->active_successes = 0;
-    if (h->active_failures < thresholds.failures) h->active_failures++;
+    if (h->active_failures < thresholds.failures)
+        h->active_failures = static_cast<u8>(static_cast<i64>(h->active_failures) + 1);
     if (h->active_failures >= thresholds.failures) h->active_down = true;
     if (h->fails < 0xffff) h->fails++;
 }
@@ -6217,7 +6219,7 @@ bool try_connect_next_backend_impl(Loop* loop,
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
-    conn.upstream_attempts++;
+    conn.upstream_attempts = static_cast<u8>(static_cast<i64>(conn.upstream_attempts) + 1);
     conn.release_backend_active();
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, on_connected);
@@ -8995,7 +8997,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         return false;
 
     char authority[32];
-    i64 authority_len = 0;
+    u32 authority_len = 0;
     const u32 ip = ntohl(endpoint.sin_addr.s_addr);
     const u8 octets[4] = {static_cast<u8>(ip >> 24),
                           static_cast<u8>(ip >> 16),
@@ -9005,7 +9007,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         if (oi != 0) authority[authority_len++] = '.';
         u32 v = octets[oi];
         char digits[3];
-        i64 dn = 0;
+        u32 dn = 0;
         do {
             digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));
             v /= 10;
@@ -9016,7 +9018,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (port != 80) {
         authority[authority_len++] = ':';
         char digits[5];
-        i64 dn = 0;
+        u32 dn = 0;
         u32 v = port;
         do {
             digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));

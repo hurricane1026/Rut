@@ -40,9 +40,7 @@ namespace {
 
 // Tiny error-print helper — matches jit_engine.cc style (no stdlib).
 void log_err(const char* msg) {
-    int len = 0;
-    while (msg[len]) len++;
-    (void)::write(2, msg, len);
+    (void)::write(2, msg, __builtin_strlen(msg));
     (void)::write(2, "\n", 1);
 }
 

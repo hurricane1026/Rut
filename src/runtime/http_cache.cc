@@ -191,7 +191,7 @@ bool http_date(Str value, u64& seconds) {
     for (u32 i = 0; i < month; ++i)
         days = static_cast<i64>(static_cast<__int128_t>(days) + static_cast<i64>(kDays[i]) +
                                 static_cast<i64>(i == 1 && kLeap ? 1u : 0u));
-    days += static_cast<i64>(day) - 1;
+    days = static_cast<i64>(static_cast<__int128_t>(days) + (static_cast<i64>(day) - 1));
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
     if (!Str{p, 3}.eq(
             {kWeekdays +

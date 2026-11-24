@@ -148,7 +148,8 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             if (n.child_count < 4) {
                 n.keys[n.child_count] = b;
                 n.children[n.child_count] = child;
-                n.child_count++;
+                n.child_count =
+                    static_cast<decltype(n.child_count)>(static_cast<i64>(n.child_count) + 1);
                 return parent;
             }
             // Upgrade to Node16. Allocate fresh, copy state.
@@ -170,7 +171,8 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             if (n.child_count < 16) {
                 n.keys[n.child_count] = b;
                 n.children[n.child_count] = child;
-                n.child_count++;
+                n.child_count =
+                    static_cast<decltype(n.child_count)>(static_cast<i64>(n.child_count) + 1);
                 return parent;
             }
             const ArtChildRef new_ref = alloc_n48();
@@ -192,7 +194,8 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
                 const u8 slot = n.child_count;
                 n.children[slot] = child;
                 n.child_index[b] = static_cast<u8>(static_cast<i64>(slot) + 1);
-                n.child_count++;
+                n.child_count =
+                    static_cast<decltype(n.child_count)>(static_cast<i64>(n.child_count) + 1);
                 return parent;
             }
             const ArtChildRef new_ref = alloc_n256();
@@ -214,7 +217,8 @@ ArtChildRef ArtTrie::add_child(ArtChildRef parent, u8 b, ArtChildRef child) {
             // Caller guarantees b is unseen, so this is always an
             // append (no overwrite of an existing child slot).
             n.children[b] = child;
-            n.child_count++;
+            n.child_count =
+                static_cast<decltype(n.child_count)>(static_cast<i64>(n.child_count) + 1);
             return parent;
         }
     }

@@ -105,7 +105,7 @@ inline void sim_extract_request_info(const CaptureEntry& entry, SimResult& resul
 inline u32 elapsed_us(const struct timespec& t0, const struct timespec& t1) {
     u64 sec_diff;
     if (__builtin_sub_overflow(t1.tv_sec, t0.tv_sec, &sec_diff)) return 0;
-    i64 nsec_diff = static_cast<i64>(t1.tv_nsec) - static_cast<i64>(t0.tv_nsec);
+    i64 nsec_diff = static_cast<i64>(static_cast<__int128_t>(t1.tv_nsec) - t0.tv_nsec);
     if (nsec_diff < 0) {
         if (sec_diff == 0) return 0;
         --sec_diff;

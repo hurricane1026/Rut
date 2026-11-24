@@ -871,8 +871,10 @@ public:
                 return;
             }
             if (writing) {
-                r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
-                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) + n);
+                r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) +
+                                                  static_cast<i64>(static_cast<u32>(n)));
+                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) +
+                                                    static_cast<i64>(static_cast<u32>(n)));
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;

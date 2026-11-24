@@ -153,7 +153,7 @@ bool parse_http_date(Str value, u64& seconds) {
     for (u32 i = 0; i < month; ++i)
         days = static_cast<i64>(static_cast<__int128_t>(days) + static_cast<i64>(kDays[i]) +
                                 (i == 1 && kLeap ? 1 : 0));
-    days += static_cast<i64>(day) - 1;
+    days = static_cast<i64>(static_cast<__int128_t>(days) + (static_cast<i64>(day) - 1));
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
     if (!equal({p, 3},
                kWeekdays +

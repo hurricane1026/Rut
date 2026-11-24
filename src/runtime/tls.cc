@@ -65,7 +65,8 @@ bool load_client_crl(SSL_CTX* ctx, const char* path, bool verify_issuer) {
         if (kRead < 0 && errno == EINTR) continue;
         if (kRead < 0) ok = false;
         if (kRead <= 0) break;
-        length = static_cast<u32>(static_cast<i64>(length) + static_cast<i64>(kRead));
+        length =
+            static_cast<u32>(static_cast<i64>(length) + static_cast<i64>(static_cast<u32>(kRead)));
     }
     char extra;
     ssize_t remaining;
@@ -99,7 +100,7 @@ bool load_client_crl(SSL_CTX* ctx, const char* path, bool verify_issuer) {
     }
     if (ok && verify_issuer) {
         X509* issuer = nullptr;
-        int matches = 0;
+        u32 matches = 0;
         const X509_NAME* name = X509_CRL_get_issuer(crl);
         for (int i = 0; i < sk_X509_OBJECT_num(objects); ++i) {
             X509_OBJECT* object = sk_X509_OBJECT_value(objects, i);

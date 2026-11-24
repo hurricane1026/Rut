@@ -1273,7 +1273,8 @@ struct Parser {
                     all_digits = false;
                     break;
                 }
-                index = index * 10 + static_cast<i32>(ch - '0');
+                if (index <= 10)
+                    index = static_cast<i32>(static_cast<i64>(index) * 10 + (ch - '0'));
             }
             if (all_digits && index > 0) {
                 if (index > 10)

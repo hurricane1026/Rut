@@ -592,7 +592,7 @@ inline bool integer(Str s, i64& out) {
         if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
             n = limit;
         else
-            n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
+            n = static_cast<u64>(static_cast<__int128_t>(n) * 10 + static_cast<i64>(d));
     }
     if (!negative) {
         out = static_cast<i64>(n);

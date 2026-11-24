@@ -93,18 +93,18 @@ static constexpr u32 kCancelConnId = 0xFFFFFD;
 
 static i32 io_uring_setup(u32 entries, struct io_uring_params* p) {
     i32 ret = static_cast<i32>(syscall(__NR_io_uring_setup, static_cast<long>(entries), p));
-    return ret >= 0 ? ret : -errno;
+    return ret >= 0 ? ret : reverse_kernel_error(errno);
 }
 
 static i32 io_uring_enter(i32 fd, u32 to_submit, u32 min_complete, u32 flags) {
     i32 ret = static_cast<i32>(
         syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, nullptr, 0));
-    return ret >= 0 ? ret : -errno;
+    return ret >= 0 ? ret : reverse_kernel_error(errno);
 }
 
 static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
     i32 ret = static_cast<i32>(syscall(__NR_io_uring_register, fd, opcode, arg, nr_args));
-    return ret >= 0 ? ret : -errno;
+    return ret >= 0 ? ret : reverse_kernel_error(errno);
 }
 
 // --- user_data encoding ---
@@ -2131,7 +2131,7 @@ u32 IoUringBackend::wait(
                             ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) -
                                                             static_cast<i64>(sent));
                         } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                            result = -errno;
+                            result = reverse_kernel_error(errno);
                         }
                     }
                 }

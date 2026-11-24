@@ -47,16 +47,17 @@ struct BufferedSendVector {
         while (n && message.msg_iovlen) {
             auto& part = *message.msg_iov;
             const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
-            part.iov_len =
-                static_cast<u64>(static_cast<i64>(part.iov_len) - static_cast<i64>(kStep));
+            part.iov_len = static_cast<u64>(static_cast<i64>(static_cast<u32>(part.iov_len)) -
+                                            static_cast<i64>(kStep));
             const bool kFirst = &part == parts;
             const u8* source = kFirst ? first_source : second_source;
             const u32 kSize =
                 kFirst
                     ? first_size
                     : static_cast<u32>(static_cast<i64>(total_size) - static_cast<i64>(first_size));
-            part.iov_base = const_cast<u8*>(
-                source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len)));
+            part.iov_base =
+                const_cast<u8*>(source + (static_cast<i64>(kSize) -
+                                          static_cast<i64>(static_cast<u32>(part.iov_len))));
             n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));
             if (part.iov_len == 0) {
                 ++message.msg_iov;

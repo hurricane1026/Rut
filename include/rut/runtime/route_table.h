@@ -629,7 +629,9 @@ struct RouteConfig {
         // zeroed configs never name fd 0). Set by the loader for large bodies
         // so plaintext responses can sendfile() them instead of copying.
         u32 file_ref = 0;
-        [[nodiscard]] i32 file_fd() const { return static_cast<i32>(file_ref) - 1; }
+        [[nodiscard]] i32 file_fd() const {
+            return static_cast<i32>(static_cast<i64>(file_ref) - 1);
+        }
     };
     ResponseBody response_bodies[kMaxResponseBodies];
     u32 response_body_count = 0;
@@ -2189,7 +2191,7 @@ private:
             return false;
         if (!parse_ipv4_dotted({s.ptr, slash_idx}, out_ip)) return false;
         u32 prefix = 0;
-        for (u32 i = static_cast<i64>(slash_idx) + 1; i < s.len; i++) {
+        for (u32 i = static_cast<u32>(static_cast<i64>(slash_idx) + 1); i < s.len; i++) {
             const char c = s.ptr[i];
             if (c < '0' || c > '9') return false;
             prefix = static_cast<u32>(static_cast<i64>(prefix) * 10 + (static_cast<i64>(c) - '0'));

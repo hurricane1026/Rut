@@ -266,7 +266,7 @@ static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, 
         // `chunked` must be the final coding, and a comma must introduce a
         // non-empty next token.
         if (is_chunked) return RequestTransferEncoding::Unsupported;
-        i++;
+        i = static_cast<i64>(static_cast<__int128_t>(i) + 1);
     }
 }
 
@@ -353,7 +353,7 @@ static inline ParseStatus apply_semantic_header(
                     str_ci_eq(val + start, "websocket", 9))
                     req->upgrade_is_websocket = true;
                 if (i == static_cast<i64>(vlen)) break;
-                i++;
+                i = static_cast<i64>(static_cast<__int128_t>(i) + 1);
             }
             return ParseStatus::Complete;
         }

@@ -65,7 +65,7 @@ inline u64 consistent_hash_cost(u64 hash) {
         x = y;
     }
     const i64 kWhole = static_cast<i64>(64) - static_cast<i64>(n);
-    return static_cast<u64>((kWhole << 32) - static_cast<i64>(fraction));
+    return static_cast<u64>((static_cast<__int128_t>(kWhole) << 32) - static_cast<i64>(fraction));
 }
 
 inline bool consistent_hash_score(const u8 (&digest)[32], const sockaddr_in& address, u64& cost) {

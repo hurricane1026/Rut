@@ -405,7 +405,7 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
         if (!is_http_tchar(static_cast<u8>(name[i]))) return -1;
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return -1;
-    i32 count = 0;
+    u32 count = 0;
     for (u32 i = 0; i < pc.req.header_count; ++i) {
         const auto& header = pc.req.headers[i];
         if (http_header_name_eq_ci(header.name.ptr, header.name.len, name, name_len)) ++count;
@@ -2911,7 +2911,7 @@ bool jwt_decode_claims(Str token,
     }
     if (first == nullptr || second == nullptr) return false;
     const u32 header_b64_len = static_cast<u32>(first - token.ptr);
-    const u32 payload_b64_len = static_cast<u32>(second - first - 1);
+    const u32 payload_b64_len = static_cast<u32>(second - (first + 1));
     const u32 signature_b64_len = token.len - static_cast<u32>(second - token.ptr) - 1;
     if (header_b64_len == 0 || payload_b64_len == 0 || signature_b64_len == 0) return false;
 

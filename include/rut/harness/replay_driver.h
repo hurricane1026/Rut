@@ -168,7 +168,8 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
     }
 
     CaptureEntry entry{};
-    i32 fake_fd = 10000;
+    constexpr i32 kFirstFakeFd = 10000;
+    i32 fake_fd = kFirstFakeFd;
     u64 input_bytes = 0;
     bool stopped_by_observer = false;
     while (reader.next(entry) == 0) {
@@ -183,7 +184,8 @@ ReplayDriverResult drive_replay_file(Loop& loop, ReplayReader& reader, const Har
         input_bytes += entry.raw_header_len;
         out.harness.input_bytes = input_bytes;
 
-        const ReplayResult replay = replay_one(loop, entry, fake_fd++);
+        const ReplayResult replay = replay_one(loop, entry, fake_fd);
+        fake_fd = fake_fd == 2147483647 ? kFirstFakeFd : fake_fd + 1;
         const Outcome item_outcome = detail::replay_outcome(replay);
         detail::merge_outcome(item_outcome, out.harness.outcome);
         if (replay.replayed) {

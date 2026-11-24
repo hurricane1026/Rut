@@ -144,7 +144,7 @@ struct RateLimitRuleSet {
 // separately-supplied request path (RateLimitKeyInput::path) only when its
 // producer marks that path trusted (for example a validated HTTP/2 :path).
 inline bool rate_limit_needs_req_buf(const RateLimitRuleSet& rs) {
-    for (u8 i = 0; i < rs.count; i++) {
+    for (u32 i = 0; i < rs.count; i++) {
         const RateLimitKeySpec& k = rs.rules[i].key;
         for (u8 j = 0; j < k.count; j++) {
             switch (k.comps[j].kind) {

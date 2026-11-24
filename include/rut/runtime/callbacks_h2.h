@@ -330,7 +330,8 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
                      n);
     h2.outbound_body_offset =
         static_cast<u32>(static_cast<i64>(h2.outbound_body_offset) + static_cast<i64>(n));
-    h2.conn_send_window -= static_cast<i64>(n);
+    h2.conn_send_window =
+        static_cast<i64>(static_cast<__int128_t>(h2.conn_send_window) - static_cast<i64>(n));
     stream->send_window =
         static_cast<i32>(static_cast<i64>(stream->send_window) - static_cast<i64>(n));
     h2.outbound_final_staged = n == kRemaining;
@@ -641,8 +642,8 @@ inline u32 h2_reanchor_route_params(const hpack::Header* headers,
         if (path.ptr == nullptr || p.value < path.ptr ||
             p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
             continue;
-        const u32 kOff =
-            static_cast<u32>(static_cast<i64>(kPathStart) + static_cast<i64>(p.value - path.ptr));
+        const u32 kOff = static_cast<u32>(static_cast<i64>(kPathStart) +
+                                          static_cast<i64>(static_cast<u32>(p.value - path.ptr)));
         out[stored] = {p.name,
                        p.name_len,
                        reinterpret_cast<const char*>(synth + static_cast<i64>(kOff)),
@@ -778,7 +779,9 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
             break;
         }
         const u32 need = static_cast<u32>(need_wide);
-        auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
+        auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count];
+        h2.pending_local_mutation_count =
+            static_cast<u8>(static_cast<i64>(h2.pending_local_mutation_count) + 1);
         u8* storage = h2.pending_synth + static_cast<i64>(h2.pending_local_mutation_bytes);
         dst.name_offset = static_cast<u16>(h2.pending_local_mutation_bytes);
         dst.name_len = static_cast<u16>(src.name.len);
@@ -915,8 +918,9 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
             if (path.ptr == nullptr || p.value < path.ptr ||
                 p.value + static_cast<i64>(p.value_len) > path.ptr + static_cast<i64>(path.len))
                 continue;
-            const u32 kOff = static_cast<u32>(static_cast<i64>(kPathStart) +
-                                              static_cast<i64>(p.value - path.ptr));
+            const u32 kOff =
+                static_cast<u32>(static_cast<i64>(kPathStart) +
+                                 static_cast<i64>(static_cast<u32>(p.value - path.ptr)));
             h2->pending_route_params[stored] = {
                 p.name,
                 p.name_len,

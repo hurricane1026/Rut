@@ -3783,7 +3783,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
-        const u32 slot_index = static_cast<u32>(arg.int_value - 1);
+        const u32 slot_index = static_cast<u32>(static_cast<__int128_t>(arg.int_value) - 1);
         if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
             return *pipe_lhs->args[slot_index];
         HirExpr slot{};
@@ -7538,7 +7538,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         HirExpr result{};
         bool have_result = false;
 
-        for (i32 ai = static_cast<i32>(ast_arms.len) - 1; ai >= 0; ai--) {
+        for (i32 ai = static_cast<i32>(static_cast<i64>(ast_arms.len) - 1); ai >= 0; ai--) {
             const auto& arm = ast_arms[static_cast<u32>(ai)];
             if (arm.is_wildcard) {
                 if (seen_wildcard)
@@ -8177,7 +8177,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return cond;
         };
 
-        for (i32 ai = static_cast<i32>(stmt.match_arms.len) - 1; ai >= 0; ai--) {
+        for (i32 ai = static_cast<i32>(static_cast<i64>(stmt.match_arms.len) - 1); ai >= 0; ai--) {
             const auto& arm = stmt.match_arms[static_cast<u32>(ai)];
             if (arm.is_wildcard) {
                 if (arm.has_guard)
@@ -14325,7 +14325,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
-        const u32 slot_index = static_cast<u32>(arg.int_value - 1);
+        const u32 slot_index = static_cast<u32>(static_cast<__int128_t>(arg.int_value) - 1);
         if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
             return *source->args[slot_index];
         HirExpr out{};

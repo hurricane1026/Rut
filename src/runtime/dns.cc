@@ -246,7 +246,8 @@ int DnsResolver::resolve(
         q.close();
         q.sent = q.received = q.size = 0;
         q.phase = 1;
-        return ++q.server < kAvailable ? 0 : -1;
+        q.server = static_cast<u8>(static_cast<i64>(q.server) + 1);
+        return q.server < kAvailable ? 0 : -1;
     };
     if (!kAvailable) return -1;
     u64 attempt_age = 0;
@@ -351,7 +352,8 @@ int DnsResolver::resolve(
     if (kValidUntil < q.valid_until) q.valid_until = kValidUntil;
     if (result.ttl < q.result.ttl) q.result.ttl = result.ttl;
     if (kAnswer == DnsAnswer::Alias) {
-        if (++q.aliases > 8) {
+        q.aliases = static_cast<u8>(static_cast<i64>(q.aliases) + 1);
+        if (q.aliases > 8) {
             q.close();
             return -1;
         }

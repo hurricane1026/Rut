@@ -20,14 +20,14 @@ u32 find_header_end(const u8* buf, u32 len, u32 from) {
                 buf[idx + 3] == '\n') {
                 return static_cast<u32>(idx + 4);
             }
-            mask &= mask - 1;
+            mask &= static_cast<int>(static_cast<i64>(mask) - 1);
         }
         pos += 16;
     }
     for (; pos + 3 < static_cast<i64>(len); pos++) {
         if (buf[pos] == '\r' && buf[pos + 1] == '\n' && buf[pos + 2] == '\r' &&
             buf[pos + 3] == '\n')
-            return static_cast<u32>(pos + 4);
+            return static_cast<u32>(static_cast<i64>(static_cast<u32>(pos)) + 4);
     }
     return 0;
 }
@@ -54,7 +54,7 @@ u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
         if (cr_mask | bad_mask) {
             if (cr_mask) {
                 u32 cr_pos = static_cast<u32>(__builtin_ctz(static_cast<u32>(cr_mask)));
-                int real_bad = (bad_mask & ((1 << cr_pos) - 1)) & ~cr_mask;
+                int real_bad = (bad_mask & (static_cast<int>((i64{1} << cr_pos) - 1))) & ~cr_mask;
                 if (real_bad) return static_cast<u32>(-1);
                 return static_cast<u32>(pos + static_cast<i64>(cr_pos));
             }
@@ -90,7 +90,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
 
         if (sp_mask) {
             u32 sp_pos = static_cast<u32>(__builtin_ctz(static_cast<u32>(sp_mask)));
-            int pre_sp = (1 << sp_pos) - 1;
+            int pre_sp = static_cast<int>((i64{1} << sp_pos) - 1);
             int real_bad = (bad_mask & pre_sp) & ~sp_mask;
             if (real_bad) return static_cast<u32>(-1);
             if (canon_end == end) {

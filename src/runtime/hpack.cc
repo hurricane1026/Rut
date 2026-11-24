@@ -214,11 +214,14 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
 }
 
 i64 huffman_encoded_len(const u8* src, u32 len) {
-    // The longest HPACK code is 30 bits, so the full u32 input range fits in
-    // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
+    if (len == 0) return 0;
+    // There are at most UINT32_MAX terms, each stored as a u8.
     i64 bits = 0;
-    for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
-
+    for (u32 i = 0; i < len; i++) {
+        if (bits > INT64_MAX - UINT8_MAX) __builtin_unreachable();
+        bits += static_cast<i64>(kHuff[src[i]].bits);
+    }
+    if (bits < 0 || bits > static_cast<i64>(UINT32_MAX) * UINT8_MAX) __builtin_unreachable();
     return huffman_encoded_bytes_from_bits(bits);
 }
 
@@ -232,7 +235,8 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
         nbits += static_cast<i64>(kEntry.bits);
         while (nbits >= 8) {
             nbits -= 8;
-            out[o++] = static_cast<u8>((acc >> nbits) & 0xff);
+            out[o] = static_cast<u8>((acc >> nbits) & 0xff);
+            o = static_cast<i64>(static_cast<__int128_t>(o) + 1);
         }
     }
     if (nbits > 0) {
@@ -240,7 +244,8 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
         const i64 kPad = 8 - nbits;
         const i64 kMask = (i64{1} << kPad) - i64{1};
         acc = (acc << kPad) | static_cast<u64>(kMask);
-        out[o++] = static_cast<u8>(acc & 0xff);
+        out[o] = static_cast<u8>(acc & 0xff);
+        o = static_cast<i64>(static_cast<__int128_t>(o) + 1);
     }
     return o;
 }
@@ -624,6 +629,8 @@ bool decode_header_block(DynamicTable& dyn,
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
+                // op counts bytes already written into the u32-capacity output.
+                if (op > INT64_MAX - UINT32_MAX) __builtin_unreachable();
                 if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};

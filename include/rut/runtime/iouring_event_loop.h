@@ -4557,7 +4557,8 @@ public:
             close_conn(c);
             return;
         }
-        r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
+        r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) +
+                                          static_cast<i64>(static_cast<u32>(n)));
         relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
         __builtin_add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
         if (study_inside_cq)
@@ -7668,8 +7669,9 @@ public:
         const bool file_send =
             send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
             c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
-            send.file_base == static_cast<i64>(c.local_body_cursor - c.local_body_base) +
-                                  static_cast<i64>(c.send_progress);
+            send.file_base ==
+                static_cast<i64>(static_cast<u32>(c.local_body_cursor - c.local_body_base)) +
+                    static_cast<i64>(c.send_progress);
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
                send.remaining ==
@@ -9388,7 +9390,7 @@ private:
             rearm_accept();
             return;
         }
-        switch (-result) {
+        switch (reverse_kernel_error(result)) {
             // Immediate: the failing connection was consumed from the backlog,
             // so the next accept makes progress.
             case ECONNABORTED:

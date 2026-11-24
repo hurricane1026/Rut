@@ -1070,7 +1070,7 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
     if (type == MirTypeKind::Tuple) {
         auto result = b.emit_const_bool(false, {span.line, span.col});
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
-        for (i32 i = static_cast<i32>(tuple_len) - 1; i >= 0; i--) {
+        for (i32 i = static_cast<i32>(static_cast<i64>(tuple_len) - 1); i >= 0; i--) {
             Str field_name{};
             if (!build_tuple_field_name(*b.mod->arena, static_cast<u32>(i), &field_name))
                 return frontend_error(FrontendError::OutOfMemory, span);
@@ -1132,7 +1132,7 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
         auto result = b.emit_const_bool(false, {span.line, span.col});
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         const auto& st = mir.structs[struct_index];
-        for (i32 i = static_cast<i32>(st.fields.len) - 1; i >= 0; i--) {
+        for (i32 i = static_cast<i32>(static_cast<i64>(st.fields.len) - 1); i >= 0; i--) {
             const auto& field = st.fields[static_cast<u32>(i)];
             const auto field_shape = resolved_shape(mir, field);
             if (field.is_error_type) return frontend_error(FrontendError::UnsupportedSyntax, span);
@@ -1209,7 +1209,7 @@ static FrontendResult<rir::ValueId> emit_ord_for_shape(
         if (!initial) return frontend_error(FrontendError::OutOfMemory, span);
         auto result = initial.value();
         const auto& variant = mir.variants[variant_index];
-        for (i32 i = static_cast<i32>(variant.cases.len) - 1; i >= 0; i--) {
+        for (i32 i = static_cast<i32>(static_cast<i64>(variant.cases.len) - 1); i >= 0; i--) {
             const auto& c = variant.cases[static_cast<u32>(i)];
             if (!c.has_payload) continue;
             const auto payload_shape = resolved_shape(mir, c);

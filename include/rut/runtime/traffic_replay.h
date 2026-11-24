@@ -221,11 +221,13 @@ template <typename Loop>
 ReplaySummary replay_file(Loop& loop, ReplayReader& reader) {
     ReplaySummary summary{};
     CaptureEntry entry{};
-    i32 fake_fd = 10000;  // start with high fd to avoid collisions
+    constexpr i32 kFirstFakeFd = 10000;
+    i32 fake_fd = kFirstFakeFd;  // start with high fd to avoid collisions
 
     while (reader.next(entry) == 0) {
         summary.total++;
-        ReplayResult result = replay_one(loop, entry, fake_fd++);
+        ReplayResult result = replay_one(loop, entry, fake_fd);
+        fake_fd = fake_fd == 2147483647 ? kFirstFakeFd : fake_fd + 1;
         if (result.replayed) {
             summary.replayed++;
             if (result.status_match)
