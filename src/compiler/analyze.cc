@@ -12126,6 +12126,14 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("tuple element access requires a tuple value"));
+        // The slot path extracts a field directly; it is not an unwrap, so a
+        // nil/error carrier must be narrowed first.
+        if (tuple->may_nil || tuple->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("tuple element access requires a narrowed tuple value; guard the "
+                        "optional or fallible tuple first"));
         // The tuple's shape carries the full element shape, which keeps nested
         // projections (`t.0.1`) and tuple-valued slots resolvable.
         const HirTypeShape* tuple_shape = tuple->shape_index < mod.type_shapes.len

@@ -49645,12 +49645,15 @@ TEST(frontend, analyze_rejects_invalid_tuple_slot_projection) {
     const char* sources[] = {
         "route GET \"/x\" { let x = 1 let y = x.0 return 200 }\n",
         "route GET \"/x\" { let pair = (200, 1) let y = pair.2 return 200 }\n",
+        "route GET \"/x\" { let pair: (i32, i32) = nil let y = pair.0 return 200 }\n",
     };
     const char* details[] = {
         "tuple element access requires a tuple value",
         "tuple element index is out of range",
+        "tuple element access requires a narrowed tuple value; guard the optional or "
+        "fallible tuple first",
     };
-    for (u32 i = 0; i < 2; i++) {
+    for (u32 i = 0; i < 3; i++) {
         auto lexed = lex(lit(sources[i]));
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
