@@ -3872,6 +3872,7 @@ struct Parser {
             // we've consumed it.
             item.upstream.addr_span = span_from(*lbrace.value());
             bool seen_minimum_healthy_weight_percent = false;
+            bool seen_connect_attempts = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -3997,6 +3998,19 @@ struct Parser {
                     item.upstream.port_lit = static_cast<u32>(kV);
                     item.upstream.port_is_set = true;
                     seen_port = true;
+                } else if (field_name.eq({"connect_attempts", 16})) {
+                    if (seen_connect_attempts)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_connect_attempts = true;
+                    auto lit = expect(TokenType::IntLit);
+                    if (!lit) return core::make_unexpected(lit.error());
+                    auto attempts = parse_integer_literal(*lit.value(), 8);
+                    if (!attempts) return core::make_unexpected(attempts.error());
+                    if (attempts.value() == 0)
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(*lit.value()), field_name);
+                    item.upstream.connect_attempts = static_cast<u8>(attempts.value());
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
                     if (seen_minimum_healthy_weight_percent)
                         return frontend_error(
@@ -4317,7 +4331,7 @@ struct Parser {
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
                         item.upstream.passive_health.enabled ||
-                        seen_minimum_healthy_weight_percent)) {
+                        seen_minimum_healthy_weight_percent || seen_connect_attempts)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

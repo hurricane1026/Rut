@@ -560,6 +560,8 @@ bool load_native_program(const char* source,
         const auto& target = c.upstreams[i];
         if (target.addr_count == 0 || target.addr_count > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream backend count");
+        if (target.connect_attempts == 0 || target.connect_attempts > UpstreamTarget::kMaxBackends)
+            return fail("invalid native upstream connect attempts");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
         if (!target.passive_health.valid() || (target.passive_health.enabled && target.http2))

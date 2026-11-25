@@ -60,6 +60,8 @@ def main():
         source = ''.join(f'upstream {name} {{ backends: [{addresses}] }}\n'
                          for name in ('rr', 'least', 'hashed', 'post_pool')) + f'''
 upstream cap {{ backends: [{capped}] }}
+upstream cap_two {{ connect_attempts: 2, backends: [{capped}] }}
+upstream cap_four {{ connect_attempts: 4, backends: [{capped}] }}
 upstream origins {{ backends: ["127.0.0.1:{live[0]}", "127.0.0.1:{live[1]}"] }}
 route GET "/rr" {{ return forward(rr, load_balance: .roundRobin) }}
 route GET "/least" {{ return forward(least, load_balance: .leastRequests) }}
@@ -68,6 +70,8 @@ route GET "/hash-close" {{ return forward(hashed, load_balance: .consistentHash,
 route POST "/post" {{ return forward(post_pool, load_balance: .roundRobin,
     target_transform: {{ strip_prefix: "/", replace_prefix: "/", mode: .rawPrefix }}) }}
 route GET "/cap" {{ return forward(cap, load_balance: .roundRobin) }}
+route GET "/cap-two" {{ return forward(cap_two, load_balance: .roundRobin) }}
+route GET "/cap-four" {{ return forward(cap_four, load_balance: .roundRobin) }}
 route POST "/status" {{ return forward(origins, load_balance: .roundRobin,
     target_transform: {{ strip_prefix: "/", replace_prefix: "/", mode: .rawPrefix }}) }}
 route POST "/reset" {{ return forward(origins, load_balance: .roundRobin,
@@ -112,9 +116,22 @@ route POST "/reset" {{ return forward(origins, load_balance: .roundRobin,
                 reply = h2_request(port, '/post', [], body, 'POST')
                 assert reply == (200, body), (reply, received[before:], i)
                 assert received[before:] == [(live[0], '/post', body)]
+            for i in range(4):
+                body = f'h1-post-body-{i}'.encode()
+                before = len(received)
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
+                try:
+                    connection.request('POST', '/post', body)
+                    response = connection.getresponse()
+                    assert (response.status, response.read()) == (200, body)
+                finally:
+                    connection.close()
+                assert received[before:] == [(live[0], '/post', body)]
             before = len(received)
             assert h2_request(port, '/cap', [])[0] == 502
             assert len(received) == before  # The fourth target is outside the budget.
+            assert h2_request(port, '/cap-two', [])[0] == 502
+            assert h2_request(port, '/cap-four', []) == (200, b'ok')
             for path, status in (('/status', 503), ('/reset', 502)):
                 before = len(received)
                 assert h2_request(port, path, [], b'once', 'POST')[0] == status
