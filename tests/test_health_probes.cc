@@ -739,3 +739,38 @@ TEST(health_probe, epoll_tls_reload_during_handshake) {
 TEST(health_probe, iouring_tls_reload_during_handshake) {
     tls_reload_during_handshake<IoUringEventLoop>(_tc);
 }
+
+template <typename Loop>
+void tls_probe_slot_reserve(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& tls = rig.owner.config->upstreams[0].tls;
+    tls.enabled = true;
+    static constexpr char kCa[] = RUT_TLS_FIXTURES "/localhost_cert.pem";
+    static constexpr char kName[] = "localhost";
+    for (u32 i = 0; i < sizeof(kCa); ++i) tls.ca[i] = kCa[i];
+    for (u32 i = 0; i < sizeof(kName); ++i) tls.server_name[i] = kName[i];
+    Connection* held[63]{};
+    for (Connection*& c : held) {
+        c = rig.loop->alloc_conn();
+        REQUIRE(c);
+    }
+    CHECK_EQ(rig.loop->free_conn_slots(), 65u);
+    CHECK_FALSE(start_health_probe(rig.loop, 0, 0));
+    CHECK_FALSE(probe_in_flight(0, 0));
+    rig.loop->free_conn(*held[0]);
+    held[0] = nullptr;
+    CHECK_EQ(rig.loop->free_conn_slots(), 66u);
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    rig.loop->force_close_all();
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    for (Connection* c : held)
+        if (c) rig.loop->free_conn(*c);
+}
+
+TEST(health_probe, epoll_tls_probe_slot_reserve) {
+    tls_probe_slot_reserve<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_tls_probe_slot_reserve) {
+    tls_probe_slot_reserve<IoUringEventLoop>(_tc);
+}
