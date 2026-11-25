@@ -201,6 +201,7 @@ void h1_tls_read(void* lp, Connection& transport, IoEvent ev) {
     if (!state) return;
     if (!state->ready) {
         if (ev.result < 0) {
+            if (ev.aux == kLocalSubmitFailureAux) state->local_setup_failure = true;
             loop->close_conn(transport);
             return;
         }
@@ -227,6 +228,7 @@ void h1_tls_sent(void* lp, Connection& transport, IoEvent ev) {
     auto* state = transport.h1_tls_transport;
     if (!state || !state->owner) return;
     if (ev.result <= 0) {
+        if (ev.aux == kLocalSubmitFailureAux) state->local_setup_failure = true;
         loop->close_conn(transport);
         return;
     }
@@ -293,7 +295,10 @@ void h1_tls_connected(void* lp, Connection& transport, IoEvent ev) {
         transport.tls = ssl.value();
         transport.tls_active = true;
         transport.on_recv = &h1_tls_read<Loop>;
-        if (!loop->submit_recv(transport)) loop->close_conn(transport);
+        if (!loop->submit_recv(transport)) {
+            state->local_setup_failure = true;
+            loop->close_conn(transport);
+        }
     }
 }
 

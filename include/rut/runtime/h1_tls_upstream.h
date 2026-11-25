@@ -21,6 +21,10 @@ struct H1TlsUpstream {
     bool eof = false;
 };
 
+inline void h1_tls_mark_local_setup_failure(Connection& transport) {
+    if (transport.h1_tls_transport) transport.h1_tls_transport->local_setup_failure = true;
+}
+
 template <typename Loop>
 bool h1_tls_connect(Loop*, Connection&, const void*, u32);
 template <typename Loop>

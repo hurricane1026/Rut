@@ -129,7 +129,9 @@ bool tls_send_retry_has_driver(Self* loop, Connection& c, TlsFill status) {
     if (c.tls_send_owner_generation == 0 && !c.tls_proxy_stream) return false;
     if (status == TlsFill::NeedRead) {
         c.tls_pending_on_recv = &tls_resume_pending_send_recv<Self>;
-        return loop->submit_recv(c);
+        const bool submitted = loop->submit_recv(c);
+        if (!submitted) h1_tls_mark_local_setup_failure(c);
+        return submitted;
     }
     if (!c.tls_out_inflight) return false;
     if constexpr (requires { loop->tls_ciphertext_send_is_current(c); })
@@ -208,7 +210,9 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
     if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
     const u32 kN = tls_drain_submission_len<Self>(c, kAvail);
-    return loop->submit_tls_ciphertext_send(c, c.tls_out_buf.data(), kN);
+    const bool submitted = loop->submit_tls_ciphertext_send(c, c.tls_out_buf.data(), kN);
+    if (!submitted) h1_tls_mark_local_setup_failure(c);
+    return submitted;
 }
 
 // Encrypt plaintext src[0..len) into the owned tls_out_buf, keeping a send
@@ -277,6 +281,7 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         c.tls_out_inflight_src == nullptr || c.tls_out_inflight_src != c.tls_out_buf.data() ||
         c.tls_out_inflight_len == 0 || c.tls_out_inflight_len > c.tls_out_buf.len() ||
         c.tls_out_inflight_fd < 0) {
+        if (ev.aux == kLocalSubmitFailureAux) h1_tls_mark_local_setup_failure(c);
         loop->close_conn(c);
         return;
     }
@@ -502,7 +507,10 @@ void tls_process(Self* loop, Connection& c) {
             return;
         }
         if (!c.tls_engine.handshake_done) {
-            if (!c.tls_out_inflight) loop->submit_recv(c);  // await the client's next flight
+            if (!c.tls_out_inflight && !loop->submit_recv(c)) {
+                h1_tls_mark_local_setup_failure(c);  // await the client's next flight
+                if (c.h1_tls_transport) loop->close_conn(c);
+            }
             return;
         }
         if (tls_negotiated_protocol(c.tls_engine.ssl) == AlpnProtocol::H2) {
@@ -556,7 +564,10 @@ void tls_process(Self* loop, Connection& c) {
             loop->close_conn(c);
             return;
         }
-        if (!c.recv_armed) loop->submit_recv(c);
+        if (!c.recv_armed && !loop->submit_recv(c)) {
+            h1_tls_mark_local_setup_failure(c);
+            if (c.h1_tls_transport) loop->close_conn(c);
+        }
         return;
     }
 
@@ -775,7 +786,10 @@ void tls_process(Self* loop, Connection& c) {
     // Fail closed if a needed recv can't be armed: reaching here with no armed
     // recv means peer input is required to make progress (e.g. a pending
     // SSL_write WANT_READ), so a failed submit would otherwise hang the conn.
-    if (!c.tls_out_inflight && !c.recv_armed && !loop->submit_recv(c)) loop->close_conn(c);
+    if (!c.tls_out_inflight && !c.recv_armed && !loop->submit_recv(c)) {
+        h1_tls_mark_local_setup_failure(c);
+        loop->close_conn(c);
+    }
 }
 
 // Keep generic callback validation usable by loops that do not implement the

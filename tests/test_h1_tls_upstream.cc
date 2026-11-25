@@ -176,12 +176,14 @@ void h1_tls_plaintext_probe(void*, Connection& owner, IoEvent ev) {
 
 bool g_h1_tls_close_send_failed = false;
 bool g_h1_tls_close_response_preserved = false;
+bool g_h1_tls_close_local_failure = false;
 void h1_tls_close_send_probe(void*, Connection& owner, IoEvent ev) {
     static constexpr char kExpected[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
     g_h1_tls_close_send_failed = ev.type == IoEventType::UpstreamSend && ev.result < 0;
     g_h1_tls_close_response_preserved =
         owner.upstream_recv_buf.len() == sizeof(kExpected) - 1 &&
         memcmp(owner.upstream_recv_buf.data(), kExpected, sizeof(kExpected) - 1) == 0;
+    g_h1_tls_close_local_failure = ev.aux == kLocalSubmitFailureAux;
     owner.on_upstream_send = nullptr;
 }
 
@@ -518,6 +520,30 @@ TEST(h1_tls_upstream, close_preserves_tls_response_before_send_failure) {
     CHECK(g_h1_tls_close_response_preserved);
     CHECK_EQ(owner.h1_tls_upstream, nullptr);
     CHECK_EQ(owner.upstream_recv_buf.len(), sizeof(kResponse) - 1);
+    loop.pool.destroy();
+}
+
+TEST(h1_tls_upstream, local_setup_failure_is_forwarded_as_local_event) {
+    Mapped<EpollEventLoop> mapped;
+    REQUIRE(mapped.value != nullptr);
+    EpollEventLoop& loop = *mapped.value;
+    REQUIRE(loop.pool.init(4).has_value());
+    Connection owner{};
+    Connection transport{};
+    owner.id = 1;
+    owner.on_upstream_send = &h1_tls_close_send_probe;
+    auto* state = reinterpret_cast<H1TlsUpstream*>(loop.pool.alloc());
+    REQUIRE(state != nullptr);
+    ::new (state) H1TlsUpstream{};
+    state->owner = &owner;
+    state->transport = &transport;
+    state->local_setup_failure = true;
+    owner.h1_tls_upstream = state;
+    transport.h1_tls_transport = state;
+    g_h1_tls_close_local_failure = false;
+
+    h1_tls_closed<EpollEventLoop>(&loop, transport);
+    CHECK(g_h1_tls_close_local_failure);
     loop.pool.destroy();
 }
 }  // namespace
