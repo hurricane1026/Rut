@@ -5893,6 +5893,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --server $<TARGET_FILE:rut> --backend ${weighted_backend})
         set_tests_properties(test_consistent_hash_${weighted_backend} PROPERTIES
             LABELS "integration;network;load-balance;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME test_route_request_body_limit_${weighted_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_route_request_body_limit.py
+                --server $<TARGET_FILE:rut> --backend ${weighted_backend})
+        set_tests_properties(test_route_request_body_limit_${weighted_backend} PROPERTIES
+            LABELS "integration;network;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_weighted_upstream_${weighted_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_weighted_upstream.py
                 --server $<TARGET_FILE:rut> --backend ${weighted_backend})

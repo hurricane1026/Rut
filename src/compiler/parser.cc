@@ -194,6 +194,14 @@ struct Parser {
         return expect(type);
     }
 
+    static u64 byte_size_multiplier(Str unit) {
+        if (unit.eq(lit_str("b"))) return 1;
+        if (unit.eq(lit_str("kb"))) return 1024;
+        if (unit.eq(lit_str("mb"))) return 1024ull * 1024;
+        if (unit.eq(lit_str("gb"))) return 1024ull * 1024 * 1024;
+        return 0;
+    }
+
     // Decode source integers once for expressions and bounded configuration
     // fields. Keep the original token text/span for diagnostics. Check before
     // multiplying so arbitrarily long inputs cannot wrap into a valid value.
@@ -1169,15 +1177,7 @@ struct Parser {
                   (tok.text.ptr[1] == 'b' || tok.text.ptr[1] == 'o' || tok.text.ptr[1] == 'x'));
             if (decimal_token && cur().type == TokenType::Ident && cur().start == tok.end) {
                 const Token& unit = cur();
-                u64 mult = 0;
-                if (unit.text.eq({"b", 1}))
-                    mult = 1;
-                else if (unit.text.eq({"kb", 2}))
-                    mult = 1024;
-                else if (unit.text.eq({"mb", 2}))
-                    mult = 1024ull * 1024;
-                else if (unit.text.eq({"gb", 2}))
-                    mult = 1024ull * 1024 * 1024;
+                const u64 mult = byte_size_multiplier(unit.text);
                 if (mult != 0) {
                     auto amount = parse_integer_literal(tok, 0x7fffffffffffffffull / mult);
                     if (!amount) return core::make_unexpected(amount.error());
@@ -5705,6 +5705,27 @@ struct Parser {
             return deco;
         }
 
+        if (deco.name.eq(lit_str("requestBodyLimit"))) {
+            if (!expect(TokenType::LParen))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto label = expect(TokenType::Ident);
+            if (!label || !label.value()->text.eq(lit_str("max")) || !expect(TokenType::Colon))
+                return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
+            auto amount = expect(TokenType::IntLit);
+            if (!amount) return core::make_unexpected(amount.error());
+            auto parsed = parse_integer_literal(*amount.value(), 0xffffffffull);
+            if (!parsed) return core::make_unexpected(parsed.error());
+            auto unit = expect(TokenType::Ident);
+            if (!unit) return core::make_unexpected(unit.error());
+            const Str kUnit = unit.value()->text;
+            const u64 kMult = byte_size_multiplier(kUnit);
+            if (!kMult || !parsed.value() || parsed.value() > 0xffffffffull / kMult ||
+                !expect(TokenType::RParen))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            deco.request_body_limit = static_cast<u32>(parsed.value() * kMult);
+            return deco;
+        }
+
         if (deco.name.eq({"throttle", 8})) {
             // @throttle(downstream: <IntLit><b|kb|mb|gb>, window: <DurLit>)
             if (!expect(TokenType::LParen))
@@ -5723,17 +5744,9 @@ struct Parser {
             // IntLit "5" + Ident "mb"; the duration lexer doesn't claim it).
             auto unit = expect(TokenType::Ident);
             if (!unit) return core::make_unexpected(unit.error());
-            u64 mult = 0;
             const Str kUnit2 = unit.value()->text;
-            if (kUnit2.eq({"b", 1}))
-                mult = 1;
-            else if (kUnit2.eq({"kb", 2}))
-                mult = 1024;
-            else if (kUnit2.eq({"mb", 2}))
-                mult = 1024ull * 1024;
-            else if (kUnit2.eq({"gb", 2}))
-                mult = 1024ull * 1024 * 1024;
-            else
+            const u64 mult = byte_size_multiplier(kUnit2);
+            if (mult == 0)
                 return frontend_error(FrontendError::UnsupportedSyntax, deco.span, kUnit2);
             const u64 kBytes = kAmount * mult;
             if (!expect(TokenType::Comma))

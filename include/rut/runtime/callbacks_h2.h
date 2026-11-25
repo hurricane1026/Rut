@@ -1891,6 +1891,17 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         return;
     }
 
+    if (route->request_body_limit != 0) {
+        const u16 status = req.has_content_length && req.content_length > route->request_body_limit
+                               ? 413
+                           : !req.has_content_length && !end_stream ? 411
+                                                                    : 0;
+        if (status != 0) {
+            h2_emit_status(d, stream_id, status);
+            return;
+        }
+    }
+
     if (route_requires_response_read_timeout_preflight_close(route, config)) {
         d.close_after_process = true;
         d.resp_len = 0;

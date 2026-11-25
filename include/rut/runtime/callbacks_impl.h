@@ -1554,7 +1554,7 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
     const RouteEntry& pinned = config->routes[proof.route_index];
     if (pinned.action != RouteAction::JitHandler || pinned.fn != proof.route_fn ||
         pinned.needs_req_body || pinned.rate_limit.count != 0 || pinned.throttle_down_bps != 0 ||
-        pinned.http_cache_ttl != 0 || pinned.ws_terminate ||
+        pinned.request_body_limit != 0 || pinned.http_cache_ttl != 0 || pinned.ws_terminate ||
         !forward_preflight_mode_can_own_runtime_deadline(pinned.forward_preflight_mode) ||
         pinned.preflight_forward_policy_bundle_id != conn.response_read_deadline_bundle_id ||
         pinned.method != conn.response_read_deadline_route_method ||
@@ -1631,7 +1631,8 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
         if (config == nullptr || conn.request_config != config ||
             !config->policy_bundle_id_is_valid(id) || route->action != RouteAction::JitHandler ||
             route->fn == nullptr || route->needs_req_body || route->rate_limit.count != 0 ||
-            route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
+            route->throttle_down_bps != 0 || route->request_body_limit != 0 ||
+            route->http_cache_ttl != 0 || route->ws_terminate ||
             conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
             loop->close_conn(conn);
             return false;
@@ -2036,7 +2037,8 @@ inline bool deferred_canonical_selection_route_is_valid(const Connection& conn,
     for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
     if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
         route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
-        route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
+        route->throttle_down_bps != 0 || route->request_body_limit != 0 ||
+        route->http_cache_ttl != 0 || route->ws_terminate ||
         route->forward_preflight_mode != ForwardPreflightMode::AfterCanonicalSelection ||
         route->preflight_forward_policy_bundle_id == 0 || route->method == kRouteMethodAny ||
         !complete_content_length_route_method_is_admitted(route->method) ||
@@ -2057,7 +2059,8 @@ inline bool deferred_request_framing_selection_route_is_valid(const Connection& 
     for (u32 i = 0; i < config->route_count; i++) owned = owned || route == &config->routes[i];
     if (!owned || route->action != RouteAction::JitHandler || route->fn == nullptr ||
         route->fn != fn || route->needs_req_body || route->rate_limit.count != 0 ||
-        route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
+        route->throttle_down_bps != 0 || route->request_body_limit != 0 ||
+        route->http_cache_ttl != 0 || route->ws_terminate ||
         route->forward_preflight_mode != ForwardPreflightMode::AfterRequestFramingSelection ||
         route->preflight_forward_policy_bundle_id == 0 ||
         (route->method != kRouteMethodHead && route->method != kRouteMethodGet) ||
@@ -3460,6 +3463,26 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                                         &route_param_count,
                                         kMaxRouteParams,
                                         conn.routing_host());
+    }
+
+    if (route && route->request_body_limit != 0) {
+        const u16 status = conn.req_client_has_transfer_encoding ? 411
+                           : conn.req_client_has_content_length &&
+                                   conn.req_content_length > route->request_body_limit
+                               ? 413
+                               : 0;
+        if (status != 0) {
+            conn.keep_alive = false;
+            conn.resp_status = status;
+            format_static_response(conn,
+                                   status,
+                                   false,
+                                   http1_request_is_head(conn),
+                                   ordinary_local_response_version(conn));
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            send_terminal_response(loop, conn);
+            return;
+        }
     }
 
     // Matched routes always win. Only a genuine miss consults the generic
@@ -5625,8 +5648,8 @@ void handle_jit_outcome(Loop* loop,
                 }
                 if (selected->action != RouteAction::JitHandler || selected->needs_req_body ||
                     selected->rate_limit.count != 0 || selected->throttle_down_bps != 0 ||
-                    selected->http_cache_ttl != 0 || selected->ws_terminate ||
-                    selected->method != kRouteMethodGet ||
+                    selected->request_body_limit != 0 || selected->http_cache_ttl != 0 ||
+                    selected->ws_terminate || selected->method != kRouteMethodGet ||
                     !forward_preflight_mode_can_own_runtime_deadline(
                         selected->forward_preflight_mode) ||
                     selected->preflight_forward_policy_bundle_id != outcome.policy_bundle_id ||
@@ -13978,7 +14001,8 @@ inline bool validated_preconnect_failure_owner_is_stable(Loop* loop,
                 conn.response_read_deadline_route_method);
         if (route == nullptr || route->action != RouteAction::JitHandler || route->fn == nullptr ||
             route->needs_req_body || route->rate_limit.count != 0 ||
-            route->throttle_down_bps != 0 || route->http_cache_ttl != 0 || route->ws_terminate ||
+            route->throttle_down_bps != 0 || route->request_body_limit != 0 ||
+            route->http_cache_ttl != 0 || route->ws_terminate ||
             !forward_preflight_mode_can_own_runtime_deadline(route->forward_preflight_mode) ||
             route->preflight_forward_policy_bundle_id != bundle_id ||
             route->method != conn.response_read_deadline_route_method ||

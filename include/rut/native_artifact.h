@@ -8,8 +8,11 @@ namespace rut::native {
 // Private, same-build ABI. Artifacts contain executable code and are trusted
 // like the source compiler; they are not a portable configuration format.
 constexpr u64 kMagic = 0x5255544e41544956ull;
-// Version 26 adds the pre-send connection attempt budget.
-constexpr u32 kVersion = 26;
+// Version 24 records passive-health metadata; version 25 adds active probe type
+// and deadline metadata to that combined native artifact layout.
+// Version 26 adds the pre-send connection attempt budget; version 27 adds route
+// request-body admission metadata. Version 28 combines both independent layouts.
+constexpr u32 kVersion = 28;
 struct StreamHeader {
     u64 magic;
     u32 version;

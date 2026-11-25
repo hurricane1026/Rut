@@ -351,6 +351,7 @@ inline bool register_verified_jit_routes(RouteConfig& cfg,
                     }
                 }
             }
+            target.routes[target.route_count - 1].request_body_limit = fn.request_body_limit;
             if (!target.set_route_http_cache(target.route_count - 1, fn.http_cache_ttl))
                 return false;
             if (fn.throttle_down_bps > 0 &&
