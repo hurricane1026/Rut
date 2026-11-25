@@ -1,0 +1,45 @@
+import "middleware/auth.rut"
+import "middleware/opa.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+// OPA_BOUND is a fixed HTTPS endpoint returning an allow object. The selected
+// checks bind its decision to this identity, operation and policy revision.
+func boundIdentityStatus(_ decision: Json, _ subject: str) -> i32 {
+    guard opa.revisionStatus(decision, "report-policy-v1") == 200 else { 503 }
+    opa.subjectStatus(decision, subject)
+}
+
+func boundStatus(_ decision: Json, _ subject: str, _ resource: str) -> i32 {
+    let identity = boundIdentityStatus(decision, subject)
+    guard identity == 200 else { identity }
+    let operation = opa.resourceActionStatus(decision, resource, "read")
+    guard operation == 200 else { operation }
+    let permission = opa.delegatedScopesStatus(decision, "reports:read")
+    guard permission == 200 else { permission }
+    opa.freshDecisionStatus(decision)
+}
+
+func boundRequest(_ subject: str, _ resource: str) -> Json {
+    guard let input = json.value({subject: subject, action: "read", resource: resource}) else { nil }
+    opa.request(input)
+}
+
+route GET "/bound/:id" {
+    let identity = auth.apiKey(req.authorization.or(""), env("RUT_API_KEY"), "report-reader", "primary")
+    let resource = req.param("id").or("")
+    guard let request = boundRequest(identity.consumerId, resource) else { return 503 }
+    let pending = httpCall(env("OPA_BOUND"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let allowed = opa.requireDecision(reply)
+    match boundStatus(allowed, identity.consumerId, resource) {
+        200 => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        403 => { return 403 }
+        _ => { return 503 }
+    }
+}

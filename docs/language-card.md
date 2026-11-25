@@ -3683,6 +3683,13 @@ subject validation and exchange authorization; the upstream owns audience checks
 No actor token, cache, refresh, new keyword or dependency is added. See
 [the contract](oauth-token-exchange.md) and [example](../examples/upstream-oauth-exchange.rut).
 
+### Binding an OPA decision to its context
+
+`middleware/opa.rut` can check an accepted structured allow result for its
+revision, authenticated subject, resource/action, delegated scope list and
+expiration. Callers use the returned status before forwarding. See
+[structured decision bindings](opa-authorization.md#optional-structured-decision-bindings).
+
 ### OAuth authorization-server revocation client
 
 `oauth_revocation.revokeRequest(authorization, serviceAuthorization)` builds the

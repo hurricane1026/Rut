@@ -1503,6 +1503,12 @@ execution. See the `/active-reports` route in
 authorization, not live group revocation: token contents remain valid until the
 existing signature/time/revocation policy rejects them.
 
+## Structured OPA decision binding
+
+The OPA Data API example enforces policy revision, subject, resource and action,
+delegated scopes and expiry before forwarding an allowed request. The two Linux
+backends exercise matching and rejected decisions over verified service TLS.
+
 ## Introspection issuer and client restrictions
 
 Opaque-token routes can additionally call `introspection.requireBinding` after
