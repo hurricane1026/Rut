@@ -1,8 +1,25 @@
 // Tests for common/types.h: Str, FixedVec, ListNode
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "test.h"
 
 using namespace rut;
+
+template <typename To, typename From>
+concept CanProveCast = requires(From value) { proven_integer_cast<To>(value); };
+
+template <typename Result, typename Left, typename Right>
+concept CanProveAdd =
+    requires(Left left, Right right) { add_proven_in_range<Result>(left, right); };
+
+static_assert(proven_integer_cast<i64>(u32{UINT32_MAX}) == INT64_C(4294967295));
+static_assert(!CanProveCast<i64, u64>);
+static_assert(!CanProveCast<u64, i64>);
+static_assert(add_proven_in_range<i64>(u32{UINT32_MAX}, u32{UINT32_MAX}) == INT64_C(8589934590));
+static_assert(add_proven_in_range<i64>(i32{INT32_MIN}, i32{INT32_MIN}) == -INT64_C(4294967296));
+static_assert(!CanProveAdd<u32, u32, u32>);
+static_assert(!CanProveAdd<i64, i64, u32>);
+static_assert(!CanProveAdd<i64, i64, i32>);
 
 // === Str ===
 

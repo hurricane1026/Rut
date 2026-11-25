@@ -1,4 +1,5 @@
 #pragma once
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 
 #include <sys/socket.h>
@@ -16,7 +17,7 @@ struct BufferedSendVector {
         first_source = first;
         second_source = second;
         first_size = first_len;
-        const i64 total = static_cast<i64>(first_len) + static_cast<i64>(second_len);
+        const i64 total = add_proven_in_range<i64>(first_len, second_len);
         if (total > static_cast<i64>(UINT32_MAX)) {
             first_source = nullptr;
             second_source = nullptr;
