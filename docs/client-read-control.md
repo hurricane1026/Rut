@@ -79,7 +79,9 @@ is no automatic retry or pooling of partial reply state.
 
 This profile is checked against the
 [pinned Memcached 1.6.45 protocol](https://github.com/memcached/memcached/blob/1.6.45/doc/protocol.txt#meta-get).
-Other meta operations and flags remain outside this helper's contract.
+Other meta operations and flags are outside this GET helper; see
+[Meta commands](memcache-client.md#meta-commands) for acknowledged stores,
+arithmetic, deletion, no-op and diagnostics.
 
 ## Validation
 

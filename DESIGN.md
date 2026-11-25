@@ -11645,6 +11645,24 @@ All profiles keep the existing byte, read and deadline bounds, preserve explicit
 session ownership, and close uncertain handles without retry. See
 [cache reads](docs/client-cache-reads.md).
 
+### Bounded Memcached meta mutations
+
+`memcache-meta.rut` composes acknowledged Meta text stores, CAS-conditional
+stores, increment/decrement with optional create-on-miss, plain and
+CAS-protected deletion, a no-op round trip and item diagnostics over the
+existing TCP/TLS and Bytes facilities. Store modes select set, add, replace,
+append, prepend or an unsigned CAS comparison; append/prepend preserve stored
+metadata. Counter policies select an existing item, a CAS precondition or
+creation with an initial value and expiry. Full-width unsigned flags, CAS
+tokens, deltas and counter values remain validated decimal Bytes. Each command
+has its own reply grammar, so a delete or no-op acknowledgement cannot satisfy a
+read, store or arithmetic result. Replies are published only after complete
+frame validation, and requests and replies stay within 8192 bytes and four
+fixed-deadline receives. Invalid inputs are rejected before I/O. Server,
+transport and framing failures close the handle; no command is replayed. Quiet
+or pipelined commands, stale serving and recache coordination are outside this
+profile. See [Meta commands](docs/memcache-client.md#meta-commands).
+
 Explicit normalized routing properties use the same bounded URI transform as
 normalized prefix forwarding, with request-owned optional strings. Selection is
 opt-in through Rut predicates; raw dispatch retains its existing semantics.

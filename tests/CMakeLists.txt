@@ -5834,6 +5834,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
     endforeach()
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(meta_backend epoll io_uring)
+        set(meta_command ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_memcache_meta.py
+            --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/examples/clients
+            --backend ${meta_backend} --testdata ${RUT_TLS_TESTDATA_DIR})
+        foreach(meta_opt 0 2)
+            add_test(NAME test_memcache_meta_${meta_backend}_opt${meta_opt}
+                COMMAND ${meta_command} --opt ${meta_opt})
+            set_tests_properties(test_memcache_meta_${meta_backend}_opt${meta_opt}
+                PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+        add_test(NAME test_memcache_meta_${meta_backend}_tls
+            COMMAND ${meta_command} --opt 2 --tls)
+        set_tests_properties(test_memcache_meta_${meta_backend}_tls
+            PROPERTIES LABELS "integration;network" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        foreach(meta_transport plain tls)
+            set(meta_tls_args)
+            if(meta_transport STREQUAL "tls")
+                list(APPEND meta_tls_args --tls)
+            endif()
+            add_test(NAME test_memcache_meta_${meta_backend}_real_${meta_transport}
+                COMMAND ${meta_command} --opt 2 --real ${meta_tls_args})
+            set_tests_properties(test_memcache_meta_${meta_backend}_real_${meta_transport}
+                PROPERTIES LABELS "integration;network;docker" TIMEOUT 600 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+    endforeach()
+endif()
+
 # Capability ledger: expected current gaps, with supported controls.
 # Passing these tests does not mean Kong routing parity has been achieved.
 if(RUT_ENABLE_JIT)

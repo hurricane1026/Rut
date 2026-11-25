@@ -104,8 +104,8 @@ Live pinned Redis verifies ordering, duplicate/empty keys and non-string MGET
 semantics. Live pinned Memcached verifies unchanged metadata without a value,
 leading-zero tokens, a changed value after an intervening write, empty values and
 missing keys. CTest registers 20 cases across both backends, O0/O2, TCP/TLS and
-explicit Docker profiles. Existing meta GET and CAS-delete tests cover the shared
-transport modes separately.
+explicit Docker profiles. Existing meta GET and CAS-delete tests and the Meta
+mutation suite cover the shared transport modes separately.
 
 ```sh
 ctest --test-dir build -R '^test_client_cache_reads_' --output-on-failure -j1

@@ -1,7 +1,8 @@
 import "memcache-codec.rut"
 
-// Read-only meta GET profile: value, client flags, CAS and remaining TTL.
-// No quiet, vivify, recache, stale serving or TTL mutation flags are sent.
+// Bounded Meta text client: reads with client flags, CAS and remaining TTL,
+// plus acknowledged stores, arithmetic, deletion, no-op and diagnostics.
+// No quiet, recache or stale-serving flags are sent.
 struct MemcacheMetaItem { data: Bytes flags: Bytes cas: Bytes ttlSeconds: i32 }
 struct MemcacheMetaReply { kind: i32 item: MemcacheMetaItem }
 struct MemcacheMetaStream { bytes: Bytes reply: MemcacheMetaReply mode: i32 }
@@ -122,10 +123,64 @@ func memcacheMetaUnchanged(_ bytes: Bytes) {
     MemcacheMetaReply(kind: 5, item: MemcacheMetaItem(data: b"", flags: header.flags,
         cas: header.cas, ttlSeconds: header.ttlSeconds))
 }
+// Store (3), arithmetic (4), no-op (5), plain delete (6) and debug (7).
+// Each admits only its own response shapes.
+func memcacheMetaCommandStatus(_ line: Bytes, _ mode: i32) -> i32 {
+    if memcacheStatusReply(line).kind == 8 { 8 } else {
+        if mode == 5 {
+            if line == b"MN" { 3 } else { -1 }
+        } else {
+            if mode == 7 {
+                if line == b"EN" { 2 } else { -1 }
+            } else {
+                if (mode == 3 || mode == 6) && line == b"HD" { 3 } else {
+                    if line == b"NF" { 2 } else {
+                        if mode != 6 && line == b"EX" { 4 } else {
+                            if mode != 6 && line == b"NS" { 6 } else { -1 }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+func memcacheMetaArithmeticValue(_ bytes: Bytes, _ line: Bytes, _ offset: i32) {
+    guard let digits = line.slice(3, line.count) else { nil }
+    guard let size = memcacheMetaSize(digits) else { nil }
+    guard size > 0 && size <= 20 else { nil }
+    if bytes.count < offset + size + 2 { memcacheMetaEmpty(0) } else {
+        guard bytes.count == offset + size + 2 else { nil }
+        guard bytes.slice(offset + size, bytes.count) == b"\r\n" else { nil }
+        guard let value = bytes.slice(offset, offset + size) else { nil }
+        guard memcacheUnsignedValid(value) else { nil }
+        MemcacheMetaReply(kind: 1, item: MemcacheMetaItem(data: value, flags: b"", cas: b"", ttlSeconds: -1))
+    }
+}
+func memcacheMetaCommandParse(_ bytes: Bytes, _ mode: i32) {
+    guard bytes.count <= 8192 else { nil }
+    guard let end = bytes.find(b"\r\n") else { memcacheMetaEmpty(0) }
+    guard let line = bytes.slice(0, end) else { nil }
+    guard line.find(b"\r") == nil && line.find(b"\n") == nil else { nil }
+    if mode == 4 && line.slice(0, 3) == b"VA " {
+        memcacheMetaArithmeticValue(bytes, line, end + 2)
+    } else {
+        guard bytes.count == end + 2 else { nil }
+        if mode == 7 && line.slice(0, 3) == b"ME " {
+            guard let value = line.slice(3, line.count) else { nil }
+            MemcacheMetaReply(kind: 1, item: MemcacheMetaItem(data: value, flags: b"", cas: b"", ttlSeconds: -1))
+        } else {
+            let kind = memcacheMetaCommandStatus(line, mode)
+            guard kind > 0 else { nil }
+            memcacheMetaEmpty(kind)
+        }
+    }
+}
 func memcacheMetaParseMode(_ bytes: Bytes, _ mode: i32) {
     if mode == 1 { memcacheMetaDeleteParse(bytes) } else {
-        if mode == 2 && bytes.slice(0, 2) == b"HD" { memcacheMetaUnchanged(bytes) }
-        else { memcacheMetaParse(bytes) }
+        if mode >= 3 { memcacheMetaCommandParse(bytes, mode) } else {
+            if mode == 2 && bytes.slice(0, 2) == b"HD" { memcacheMetaUnchanged(bytes) }
+            else { memcacheMetaParse(bytes) }
+        }
     }
 }
 func memcacheMetaFeed(_ stream: MemcacheMetaStream, _ chunk: Bytes) {
@@ -289,4 +344,173 @@ func memcacheGetCas(_ connection: TcpConnection, _ key: Bytes, _ cas: Bytes) -> 
         let closed = connection.close()
         result
     } else { result }
+}
+
+variant MemcacheMetaStoreMode { set add replace append prepend compare(Bytes) }
+variant MemcacheMetaArithmeticMode { increment decrement }
+struct MemcacheMetaCounterSeed { value: Bytes expiry: MemcacheExpiry }
+variant MemcacheMetaCounterPolicy { existing compare(Bytes) create(MemcacheMetaCounterSeed) }
+variant MemcacheMetaCommandResult {
+    ok value(Bytes) missing notStored exists
+    serverError(Bytes) requestFailure transportFailure(i32) replyFailure
+}
+
+func memcacheMetaArgument(_ prefix: Bytes, _ flag: Bytes, _ value: Bytes) {
+    guard let token = concatBytes(flag, value, 8192) else { nil }
+    memcacheField(prefix, token)
+}
+func memcacheMetaCompareArgument(_ prefix: Bytes, _ cas: Bytes) {
+    guard memcacheUnsignedValid(cas) else { nil }
+    memcacheMetaArgument(prefix, b"C", cas)
+}
+func memcacheMetaStoreModeField(_ prefix: Bytes, _ mode: MemcacheMetaStoreMode) {
+    match mode {
+        .set => memcacheField(prefix, b"MS")
+        .add => memcacheField(prefix, b"ME")
+        .replace => memcacheField(prefix, b"MR")
+        .append => memcacheField(prefix, b"MA")
+        .prepend => memcacheField(prefix, b"MP")
+        .compare(cas) => memcacheMetaCompareArgument(prefix, cas)
+    }
+}
+func memcacheMetaStoreOptions(_ prefix: Bytes, _ mode: MemcacheMetaStoreMode, _ flags: Bytes,
+    _ expiry: MemcacheExpiry) {
+    match mode {
+        .append => prefix
+        .prepend => prefix
+        _ => {
+            guard memcacheFlagsValid(flags) else { nil }
+            guard let seconds = memcacheExpiryField(expiry) else { nil }
+            guard let flagged = memcacheMetaArgument(prefix, b"F", flags) else { nil }
+            memcacheMetaArgument(flagged, b"T", seconds)
+        }
+    }
+}
+func memcacheMetaStoreHeader(_ key: Bytes, _ size: i32, _ mode: MemcacheMetaStoreMode,
+    _ flags: Bytes, _ expiry: MemcacheExpiry) {
+    guard memcacheKeyValid(key) && size >= 0 && size <= 8192 else { nil }
+    guard let named = memcacheField(b"ms", key) else { nil }
+    guard let length = formatInt(size) else { nil }
+    guard let sized = memcacheField(named, Bytes(length)) else { nil }
+    guard let selected = memcacheMetaStoreModeField(sized, mode) else { nil }
+    memcacheMetaStoreOptions(selected, mode, flags, expiry)
+}
+func memcacheMetaStoreRequest(_ key: Bytes, _ data: Bytes, _ mode: MemcacheMetaStoreMode,
+    _ flags: Bytes, _ expiry: MemcacheExpiry) {
+    guard let fields = memcacheMetaStoreHeader(key, data.count, mode, flags, expiry) else { nil }
+    guard let header = concatBytes(fields, b"\r\n", 8192) else { nil }
+    guard let body = concatBytes(header, data, 8192) else { nil }
+    concatBytes(body, b"\r\n", 8192)
+}
+func memcacheMetaSeed(_ prefix: Bytes, _ seed: MemcacheMetaCounterSeed) {
+    guard memcacheUnsignedValid(seed.value) else { nil }
+    guard let expiry = memcacheExpiryField(seed.expiry) else { nil }
+    guard let created = memcacheMetaArgument(prefix, b"N", expiry) else { nil }
+    memcacheMetaArgument(created, b"J", seed.value)
+}
+func memcacheMetaArithmeticPolicy(_ prefix: Bytes, _ policy: MemcacheMetaCounterPolicy) {
+    match policy {
+        .existing => prefix
+        .compare(cas) => memcacheMetaCompareArgument(prefix, cas)
+        .create(seed) => memcacheMetaSeed(prefix, seed)
+    }
+}
+func memcacheMetaArithmeticModeField(_ mode: MemcacheMetaArithmeticMode) -> Bytes {
+    match mode {
+        .increment => b"MI"
+        .decrement => b"MD"
+    }
+}
+func memcacheMetaArithmeticRequest(_ key: Bytes, _ mode: MemcacheMetaArithmeticMode,
+    _ delta: Bytes, _ policy: MemcacheMetaCounterPolicy) {
+    guard memcacheKeyValid(key) && memcacheUnsignedValid(delta) else { nil }
+    guard let named = memcacheField(b"ma", key) else { nil }
+    guard let selected = memcacheField(named, memcacheMetaArithmeticModeField(mode)) else { nil }
+    guard let changed = memcacheMetaArgument(selected, b"D", delta) else { nil }
+    guard let fields = memcacheMetaArithmeticPolicy(changed, policy) else { nil }
+    concatBytes(fields, b" v\r\n", 8192)
+}
+func memcacheMetaDeleteRequest(_ key: Bytes) {
+    guard memcacheKeyValid(key) else { nil }
+    guard let named = memcacheField(b"md", key) else { nil }
+    concatBytes(named, b"\r\n", 8192)
+}
+func memcacheMetaDebugFields(_ reply: Bytes, _ key: Bytes) -> Bytes {
+    guard key.count > 0 && key.count <= 250 else { b"" }
+    guard reply.slice(0, key.count) == key && reply[key.count].or(0) == 32 else { b"" }
+    reply.slice(key.count + 1, reply.count).or(b"")
+}
+func memcacheMetaCommandReply(_ stream: MemcacheMetaStream, _ key: Bytes) -> MemcacheMetaCommandResult {
+    if stream.mode == 7 && stream.reply.kind == 1 {
+        let fields = memcacheMetaDebugFields(stream.reply.item.data, key)
+        if fields.count == 0 { MemcacheMetaCommandResult.replyFailure }
+        else { MemcacheMetaCommandResult.value(fields) }
+    } else {
+        match stream.reply.kind {
+            1 => MemcacheMetaCommandResult.value(stream.reply.item.data)
+            2 => MemcacheMetaCommandResult.missing
+            3 => MemcacheMetaCommandResult.ok
+            4 => MemcacheMetaCommandResult.exists
+            6 => MemcacheMetaCommandResult.notStored
+            8 => MemcacheMetaCommandResult.serverError(stream.bytes.slice(0, stream.bytes.count - 2).or(b""))
+            _ => MemcacheMetaCommandResult.replyFailure
+        }
+    }
+}
+func memcacheMetaCommandFailure(_ code: i32) -> MemcacheMetaCommandResult {
+    if code == 0 { MemcacheMetaCommandResult.replyFailure }
+    else { MemcacheMetaCommandResult.transportFailure(code) }
+}
+func memcacheMetaCommandWire(_ connection: TcpConnection, _ request: Bytes, _ mode: i32,
+    _ key: Bytes) -> MemcacheMetaCommandResult {
+    let sending = connection.send(request, 1000)
+    guard let sent = sending else { MemcacheMetaCommandResult.transportFailure(netError()) }
+    let reading = memcacheMetaRead(connection, mode)
+    guard let stream = reading else { memcacheMetaCommandFailure(netError()) }
+    memcacheMetaCommandReply(stream, key)
+}
+func memcacheMetaCommandMustClose(_ result: MemcacheMetaCommandResult) -> bool {
+    match result { .transportFailure(code) => true
+        .replyFailure => true
+        .serverError(message) => true
+        _ => false }
+}
+func memcacheMetaCommand(_ connection: TcpConnection, _ request: Bytes, _ mode: i32,
+    _ key: Bytes) -> MemcacheMetaCommandResult {
+    let result = memcacheMetaCommandWire(connection, request, mode, key)
+    if memcacheMetaCommandMustClose(result) {
+        let closed = connection.close()
+        result
+    } else { result }
+}
+func memcacheMetaStore(_ connection: TcpConnection, _ key: Bytes, _ data: Bytes,
+    _ mode: MemcacheMetaStoreMode, _ flags: Bytes, _ expiry: MemcacheExpiry) -> MemcacheMetaCommandResult {
+    guard let request = memcacheMetaStoreRequest(key, data, mode, flags, expiry) else {
+        MemcacheMetaCommandResult.requestFailure
+    }
+    memcacheMetaCommand(connection, request, 3, b"")
+}
+func memcacheMetaArithmetic(_ connection: TcpConnection, _ key: Bytes, _ mode: MemcacheMetaArithmeticMode,
+    _ delta: Bytes, _ policy: MemcacheMetaCounterPolicy) -> MemcacheMetaCommandResult {
+    guard let request = memcacheMetaArithmeticRequest(key, mode, delta, policy) else {
+        MemcacheMetaCommandResult.requestFailure
+    }
+    memcacheMetaCommand(connection, request, 4, b"")
+}
+func memcacheMetaDelete(_ connection: TcpConnection, _ key: Bytes) -> MemcacheMetaCommandResult {
+    guard let request = memcacheMetaDeleteRequest(key) else { MemcacheMetaCommandResult.requestFailure }
+    memcacheMetaCommand(connection, request, 6, b"")
+}
+func memcacheMetaNoop(_ connection: TcpConnection) -> MemcacheMetaCommandResult {
+    memcacheMetaCommand(connection, b"mn\r\n", 5, b"")
+}
+
+func memcacheMetaDebugRequest(_ key: Bytes) {
+    guard memcacheKeyValid(key) else { nil }
+    guard let named = memcacheField(b"me", key) else { nil }
+    concatBytes(named, b"\r\n", 8192)
+}
+func memcacheMetaDebug(_ connection: TcpConnection, _ key: Bytes) -> MemcacheMetaCommandResult {
+    guard let request = memcacheMetaDebugRequest(key) else { MemcacheMetaCommandResult.requestFailure }
+    memcacheMetaCommand(connection, request, 7, key)
 }
