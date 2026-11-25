@@ -16505,7 +16505,8 @@ struct ScopedProxyLoop {
     bool setup(const RouteConfig** active,
                i32 iters,
                bool enable_reuse = false,
-               const ListenerSpec* declared_listener = nullptr) {
+               const ListenerSpec* declared_listener = nullptr,
+               TlsServerContext* tls = nullptr) {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
@@ -16520,6 +16521,7 @@ struct ScopedProxyLoop {
             return false;
         }
         loop->config_ptr = active;
+        loop->tls_server = tls;
         if (enable_reuse) {
             pool = new UpstreamPool();
             pool->init();
@@ -26616,7 +26618,7 @@ struct IoUringBodyProxy {
 
     // Returns false only for explicitly unsupported io_uring; all other setup
     // failures are recorded on the current testcase before the caller's SKIP.
-    bool setup(u16 origin_port, bool use_tls = false) {
+    bool setup(u16 origin_port, bool use_tls = false, const RouteConfig* external = nullptr) {
         if (use_tls) {
             auto ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
             if (!ctx.has_value()) {
@@ -26646,11 +26648,15 @@ struct IoUringBodyProxy {
             return false;
         }
         inited = true;
-        auto id = cfg.add_upstream("o", 0x7F000001, origin_port);
-        if (!id.has_value() || !cfg.add_proxy("/post", 0, id.value()) ||
-            !cfg.add_proxy("/next", 0, id.value())) {
-            report_unexpected_test_setup_failure("IoUringBodyProxy route configuration failed");
-            return false;
+        if (external != nullptr) {
+            active = external;
+        } else {
+            auto id = cfg.add_upstream("o", 0x7F000001, origin_port);
+            if (!id.has_value() || !cfg.add_proxy("/post", 0, id.value()) ||
+                !cfg.add_proxy("/next", 0, id.value())) {
+                report_unexpected_test_setup_failure("IoUringBodyProxy route configuration failed");
+                return false;
+            }
         }
         port = get_port(lfd);
         shard.loop->config_ptr = &active;
@@ -54282,4 +54288,101 @@ TEST(wait_event_loop, ready_chain_completes_on_epoll) {
 TEST(wait_event_loop, ready_chain_completes_on_iouring) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
     ready_wait_real_loop_roundtrip<IoUringEventLoop>(_tc);
+}
+
+static void check_preserve_host_connection_proto_tls_to_plain_origin(rut::test::TestCase* _tc,
+                                                                     bool use_iouring) {
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    RecordingUpstream upstream;
+    REQUIRE(upstream.setup());
+    char source[1024];
+    const int source_len = snprintf(
+        source,
+        sizeof(source),
+        "upstream backend at \"127.0.0.1:%u\"\n"
+        "route GET \"/api/:id\" { return forward(backend, load_balance: .roundRobin, "
+        "request_policy: { version: .http11, host: .preserve, connection: .omit, "
+        "header_names: .lowercase, forwarded_proto: .connection, "
+        "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection] }, "
+        "target_transform: { mode: .rawPrefix, strip_prefix: \"/api/\", replace_prefix: \"/v1/\" "
+        "}) }\n",
+        upstream.port);
+    REQUIRE_GT(source_len, 0);
+    auto lexed = lex({source, static_cast<u32>(source_len)});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    REQUIRE(lower_to_rir(*mir_owned, resources.rir));
+    auto cg = jit::codegen(resources.rir.module);
+    REQUIRE(cg.ok);
+    REQUIRE(resources.engine.init());
+    REQUIRE(resources.engine.compile(cg.mod, cg.ctx));
+    auto cfg = std::make_unique<RouteConfig>();
+    REQUIRE(populate_route_config(*cfg, resources.rir.module));
+    REQUIRE(register_jit_routes(*cfg, resources.rir.module, resources.engine));
+    const RouteConfig* active = cfg.get();
+    auto tls = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls.has_value());
+    {
+        auto proxy = std::make_unique<ScopedProxyLoop>();
+        auto uring = std::make_unique<IoUringBodyProxy>();
+        u16 port = 0;
+        if (use_iouring) {
+            if (!uring->setup(upstream.port, true, cfg.get()))
+                SKIP("io_uring unavailable in this environment");
+            port = uring->port;
+        } else {
+            REQUIRE(proxy->setup(&active, 1000, false, nullptr, tls.value()));
+            port = proxy->port;
+        }
+        SSL_CTX* client_ctx = create_test_client_ctx();
+        REQUIRE(client_ctx != nullptr);
+        i32 fd = connect_to(port);
+        REQUIRE_GE(fd, 0);
+        set_socket_timeouts(fd, 5);
+        SSL* ssl = SSL_new(client_ctx);
+        REQUIRE(ssl != nullptr);
+        REQUIRE_EQ(SSL_set_fd(ssl, fd), 1);
+        REQUIRE_EQ(ssl_connect_retry_eintr(ssl), 1);
+        const char request[] =
+            "GET /api/item?q=1 HTTP/1.1\r\nHost: client.example:8443\r\nX-Forwarded-Proto: "
+            "http\r\n\r\n";
+        REQUIRE(ssl_write_retry_eintr(ssl, request, sizeof(request) - 1));
+        char response[1024];
+        CHECK_GT(ssl_read_retry_eintr(ssl, response, sizeof(response)), 0);
+        SSL_free(ssl);
+        SSL_CTX_free(client_ctx);
+        close(fd);
+        for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+            usleep(5000);
+        REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), 0u);
+        const char expected[] =
+            "GET /v1/item?q=1 HTTP/1.1\r\nhost: client.example:8443\r\nx-forwarded-proto: "
+            "https\r\n\r\n";
+        REQUIRE_EQ(upstream.request_history_len[0], sizeof(expected) - 1);
+        CHECK_EQ(memcmp(upstream.request_history[0], expected, sizeof(expected) - 1), 0);
+    }
+    destroy_tls_server_context(tls.value());
+}
+
+TEST(route, preserve_host_connection_proto_tls_to_plain_origin_epoll) {
+    check_preserve_host_connection_proto_tls_to_plain_origin(_tc, false);
+}
+
+TEST(route, preserve_host_connection_proto_tls_to_plain_origin_iouring) {
+    check_preserve_host_connection_proto_tls_to_plain_origin(_tc, true);
 }
