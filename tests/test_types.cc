@@ -1,8 +1,22 @@
 // Tests for common/types.h: Str, FixedVec, ListNode
+#include "rut/common/byte_span.h"
 #include "rut/common/types.h"
 #include "test.h"
 
 using namespace rut;
+
+TEST(byte_span, checks_pool_boundaries) {
+    const char bytes[10]{};
+    const char* pool = bytes + 1;
+    CHECK(byte_span_within(pool, u32{8}, pool, u32{8}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool, u32{9}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool + 1, u32{8}));
+    CHECK(byte_span_within(pool, u32{8}, pool + 8, u32{0}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool + 8, u32{1}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, bytes, u32{1}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, nullptr, u32{0}));
+    CHECK(byte_span_within(pool, u16{8}, pool + 7, u16{1}));
+}
 
 // === Str ===
 

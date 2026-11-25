@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/byte_span.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
@@ -765,14 +766,7 @@ public:
     // True when `value` lies inside the first `used` bytes of `pool` (an empty
     // value may point one past the end, as the builders' copies do).
     static bool pool_bytes_owned(const char* pool, u32 used, Str value) {
-        if (value.ptr == nullptr || value.len > used) return false;
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
-        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        uintptr_t offset = 0;
-        if (__builtin_sub_overflow(ptr, begin, &offset)) return false;
-        const u32 remaining =
-            static_cast<u32>(static_cast<i64>(used) - static_cast<i64>(value.len));
-        return offset <= remaining;
+        return byte_span_within(pool, used, value.ptr, value.len);
     }
 
     bool strict_local_response_bytes_owned(Str value) const {
