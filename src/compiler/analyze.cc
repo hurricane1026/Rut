@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -3783,7 +3784,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
-        if (arg.int_value == INT64_MIN) __builtin_unreachable();
+        assume_integer_range(arg.int_value != INT64_MIN);
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (pipe_lhs->args.len == pipe_lhs->tuple_len && pipe_lhs->args[slot_index] != nullptr)
             return *pipe_lhs->args[slot_index];
@@ -7539,7 +7540,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
         HirExpr result{};
         bool have_result = false;
 
-        if (static_cast<i32>(ast_arms.len) == INT32_MIN) __builtin_unreachable();
+        assume_integer_range(static_cast<i32>(ast_arms.len) != INT32_MIN);
         for (i32 ai = static_cast<i32>(ast_arms.len) - 1; ai >= 0; ai--) {
             const auto& arm = ast_arms[static_cast<u32>(ai)];
             if (arm.is_wildcard) {
@@ -8179,7 +8180,7 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
             return cond;
         };
 
-        if (static_cast<i32>(stmt.match_arms.len) == INT32_MIN) __builtin_unreachable();
+        assume_integer_range(static_cast<i32>(stmt.match_arms.len) != INT32_MIN);
         for (i32 ai = static_cast<i32>(stmt.match_arms.len) - 1; ai >= 0; ai--) {
             const auto& arm = stmt.match_arms[static_cast<u32>(ai)];
             if (arm.is_wildcard) {
@@ -14328,7 +14329,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot exceeds tuple arity"));
-        if (arg.int_value == INT64_MIN) __builtin_unreachable();
+        assume_integer_range(arg.int_value != INT64_MIN);
         const u32 slot_index = static_cast<u32>(arg.int_value - 1);
         if (source->args.len == source->tuple_len && source->args[slot_index] != nullptr)
             return *source->args[slot_index];

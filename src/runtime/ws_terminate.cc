@@ -1,5 +1,6 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
 #include "rut/runtime/http_parser.h"
@@ -413,11 +414,9 @@ bool emit_frame(u8* out,
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
     // All callers serialize a control frame or a message in u32-sized storage.
-    i64 frame_end = 0;
-    if (__builtin_add_overflow(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength),
-                               static_cast<i64>(output_len),
-                               &frame_end))
-        __builtin_unreachable();
+    const i64 frame_end =
+        add_assuming_in_range(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength),
+                              static_cast<i64>(output_len));
     if (frame_end > static_cast<i64>(out_cap)) return false;
     for (u32 i = 0; i < kHeaderLength; i++)
         out[static_cast<i64>(*produced) + static_cast<i64>(i)] = hdr[i];
@@ -741,11 +740,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
                                      static_cast<__int128_t>(st.message_len)))
                     return WsInspectStatus::Error;
-                i64 total_len = 0;
-                if (__builtin_add_overflow(static_cast<i64>(st.message_len),
-                                           static_cast<i64>(payload_len),
-                                           &total_len))
-                    __builtin_unreachable();
+                const i64 total_len = add_assuming_in_range(static_cast<i64>(st.message_len),
+                                                            static_cast<i64>(payload_len));
                 const u32 message_total = static_cast<u32>(total_len);
                 if (message_total > msg_cap) return WsInspectStatus::Error;
                 if (st.max_message_size != 0 &&
@@ -757,13 +753,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
         // The message-size check above bounds both the frame and the pending read.
-        i64 frame_total_signed = 0;
-        if (__builtin_add_overflow(static_cast<i64>(header_len),
-                                   static_cast<i64>(h.payload_len),
-                                   &frame_total_signed) ||
-            __builtin_sub_overflow(
-                frame_total_signed, static_cast<i64>(st.partial_payload_len), &frame_total_signed))
-            __builtin_unreachable();
+        const i64 frame_size =
+            add_assuming_in_range(static_cast<i64>(header_len), static_cast<i64>(h.payload_len));
+        const i64 frame_total_signed =
+            subtract_assuming_in_range(frame_size, static_cast<i64>(st.partial_payload_len));
         const u64 frame_total = static_cast<u64>(frame_total_signed);
         if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
         if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
@@ -922,10 +915,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     static_cast<i64>(static_cast<__int128_t>(UINT32_MAX) -
                                      static_cast<__int128_t>(st.message_len)))
                 return WsInspectStatus::Error;
-            i64 next_len = 0;
-            if (__builtin_add_overflow(
-                    static_cast<i64>(st.message_len), static_cast<i64>(h.payload_len), &next_len))
-                __builtin_unreachable();
+            const i64 next_len = add_assuming_in_range(static_cast<i64>(st.message_len),
+                                                       static_cast<i64>(h.payload_len));
             st.message_len = static_cast<u32>(next_len);
         }
 

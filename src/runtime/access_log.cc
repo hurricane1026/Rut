@@ -1,5 +1,6 @@
 #include "rut/runtime/access_log.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/runtime/access_log_host.h"
 #include <atomic>
 
@@ -84,7 +85,7 @@ static u32 write_u64_dec(char* buf, u64 val) {
     i64 n = 0;
     while (val > 0) {
         // The temporary holds every decimal digit of a u64.
-        if (n == INT64_MAX) __builtin_unreachable();
+        assume_integer_range(n != INT64_MAX);
         tmp[n++] = static_cast<char>('0' + static_cast<i64>(val % 10));
         val /= 10;
     }
@@ -187,7 +188,7 @@ static u32 format_ipv4(char* buf, u32 addr) {
 
 // The formatted records fit their statically sized output arrays.
 static i64 next_log_byte(i64& cursor) {
-    if (cursor == INT64_MAX) __builtin_unreachable();
+    assume_integer_range(cursor != INT64_MAX);
     return cursor++;
 }
 
@@ -394,7 +395,7 @@ u32 format_access_log_downstream_host_line(const AccessLogEntry& entry,
     } else {
         line[next_log_byte(w)] = '-';
     }
-    if (w > INT64_MAX - UINT32_MAX) __builtin_unreachable();
+    assume_integer_range(w <= INT64_MAX - UINT32_MAX);
     w += static_cast<i64>(copy_str(line + w, " upstream_history=unavailable\n"));
     if (w > static_cast<i64>(sizeof(line)) || static_cast<i64>(buf_size) < w) return 0u;
     for (i64 i = 0; i < w; i++) buf[i] = line[i];
@@ -640,7 +641,7 @@ u32 AccessLogFlusher::flush_once() {
             if (n > 0) {
                 // Flush batch if this line won't fit.
                 // Both lengths are bounded by the fixed batch buffer.
-                if (batch_len > INT64_MAX - UINT32_MAX) __builtin_unreachable();
+                assume_integer_range(batch_len <= INT64_MAX - UINT32_MAX);
                 if (batch_len + static_cast<i64>(n) > static_cast<i64>(kBatchSize)) {
                     if (!flush_batch(reinterpret_cast<const u8*>(batch),
                                      static_cast<u32>(batch_len))) {

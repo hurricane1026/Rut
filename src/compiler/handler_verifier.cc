@@ -1,3 +1,4 @@
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/compiler/concurrency_verifier.h"
 #include "rut/compiler/verifier.h"
@@ -78,7 +79,7 @@ VerifyResult failure(const verify::Result& checked,
         const u8 kActor = kAction == verify::kNoIndex ? 0 : model.actions[kAction].actor;
         result.issue.trace_actors[i] = kActor;
         // This counter advances once per trace entry and i is below kMaxTrace.
-        if (result.issue.trace_count >= VerifyIssue::kMaxTrace) __builtin_unreachable();
+        assume_integer_range(result.issue.trace_count < VerifyIssue::kMaxTrace);
         result.issue.trace[result.issue.trace_count++] = checked.trace[i].state.locations[kActor];
         if (i == checked.cycle_start) result.issue.cycle_start = static_cast<u8>(i);
     }

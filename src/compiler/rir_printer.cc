@@ -1,5 +1,6 @@
 #include "rut/compiler/rir_printer.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/runtime/route_method.h"
 
 #include <errno.h>
@@ -61,7 +62,7 @@ void PrintBuf::put_u32(u32 val) {
     char tmp[10];
     i32 i = 0;
     while (val > 0) {
-        if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+        assume_integer_range(i != INT32_MAX);  // At most sizeof(tmp) decimal digits.
         tmp[i++] = static_cast<char>('0' + val % 10);
         val /= 10;
     }
@@ -90,7 +91,7 @@ void PrintBuf::put_i64(i64 val) {
         char tmp[20];
         i32 i = 0;
         while (abs > 0) {
-            if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+            assume_integer_range(i != INT32_MAX);  // At most sizeof(tmp) decimal digits.
             tmp[i++] = static_cast<char>('0' + abs % 10);
             abs /= 10;
         }
@@ -104,7 +105,7 @@ void PrintBuf::put_i64(i64 val) {
         char tmp[20];
         i32 i = 0;
         while (v > 0) {
-            if (i == INT32_MAX) __builtin_unreachable();  // At most sizeof(tmp) decimal digits.
+            assume_integer_range(i != INT32_MAX);  // At most sizeof(tmp) decimal digits.
             tmp[i++] = static_cast<char>('0' + v % 10);
             v /= 10;
         }

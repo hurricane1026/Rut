@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/forward_target.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -27,12 +28,12 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
     while (path_end < static_cast<i64>(input.len) && input.ptr[path_end] != '?') ++path_end;
     // Decoding and compaction only advance within the u32-sized input.
     const auto next_output = [](i64& index) {
-        if (index == INT64_MAX) __builtin_unreachable();
+        assume_integer_range(index != INT64_MAX);
         return index++;
     };
     i64 decoded = 0;
     for (i64 i = 0; i < path_end; ++i) {
-        if (i > INT64_MAX - 3) __builtin_unreachable();
+        assume_integer_range(i <= INT64_MAX - 3);
         if (input.ptr[i] != '%') {
             output[next_output(decoded)] = input.ptr[i];
             continue;
@@ -57,7 +58,7 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
         const i64 kSize = static_cast<i64>(static_cast<__int128_t>(read) - kBegin);
         if (kSize == 0) break;
         const bool kDot = kSize == 1 && output[kBegin] == '.';
-        if (kBegin == INT64_MAX) __builtin_unreachable();
+        assume_integer_range(kBegin != INT64_MAX);
         const bool kParent = kSize == 2 && output[kBegin] == '.' && output[kBegin + 1] == '.';
         if (kDot || kParent) {
             if (read == decoded) trailing_slash = true;
@@ -69,14 +70,13 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
         }
         if (write > 1) output[next_output(write)] = '/';
         __builtin_memmove(output + write, output + kBegin, static_cast<u32>(kSize));
-        if (__builtin_add_overflow(write, kSize, &write)) __builtin_unreachable();
+        write = add_assuming_in_range(write, kSize);
     }
     if (trailing_slash && write > 1) output[next_output(write)] = '/';
     const i64 kQueryLength = static_cast<i64>(input.len) - path_end;
     if (kQueryLength != 0)
         __builtin_memmove(output + write, input.ptr + path_end, static_cast<u32>(kQueryLength));
-    i64 total = 0;
-    if (__builtin_add_overflow(write, kQueryLength, &total)) __builtin_unreachable();
+    const i64 total = add_assuming_in_range(write, kQueryLength);
     *length = static_cast<u32>(total);
     return true;
 }

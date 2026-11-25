@@ -4,6 +4,7 @@
 #include "rut/common/forward_target.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -410,7 +411,7 @@ i32 rut_helper_req_header_count(const u8* req_data, u32 req_len, const char* nam
         const auto& header = pc.req.headers[i];
         if (http_header_name_eq_ci(header.name.ptr, header.name.len, name, name_len)) {
             // The parsed request has at most kMaxHeaders entries.
-            if (count == INT32_MAX) __builtin_unreachable();
+            assume_integer_range(count != INT32_MAX);
             ++count;
         }
     }
@@ -2916,7 +2917,7 @@ bool jwt_decode_claims(Str token,
     if (first == nullptr || second == nullptr) return false;
     const u32 header_b64_len = static_cast<u32>(first - token.ptr);
     const i64 between = second - first;
-    if (between == INT64_MIN) __builtin_unreachable();  // The second dot follows the first.
+    assume_integer_range(between != INT64_MIN);  // The second dot follows the first.
     const u32 payload_b64_len = static_cast<u32>(between - 1);
     const u32 signature_b64_len = token.len - static_cast<u32>(second - token.ptr) - 1;
     if (header_b64_len == 0 || payload_b64_len == 0 || signature_b64_len == 0) return false;

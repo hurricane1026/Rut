@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/integer_range.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -17,8 +18,7 @@ inline Str trim_ascii_string(Str text) {
     while (begin < end && space(static_cast<u8>(text.ptr[begin]))) ++begin;
     while (end > begin && space(static_cast<u8>(text.ptr[end - 1]))) --end;
     // Both positions are inside a u32-sized string.
-    i64 length = 0;
-    if (__builtin_sub_overflow(end, begin, &length)) __builtin_unreachable();
+    const i64 length = subtract_assuming_in_range(end, begin);
     return {text.ptr + begin, static_cast<u32>(length)};
 }
 
@@ -82,10 +82,9 @@ inline bool transform_string(
             const i64 length = static_cast<i64>(static_cast<__int128_t>(start) - copied);
             if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
             // The sizing pass bounds every contribution to written by size.
-            if (__builtin_add_overflow(written, length, &written)) __builtin_unreachable();
+            advance_assuming_in_range(written, length);
             if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-            if (__builtin_add_overflow(written, static_cast<i64>(replacement.len), &written))
-                __builtin_unreachable();
+            advance_assuming_in_range(written, static_cast<i64>(replacement.len));
             copied =
                 static_cast<i64>(static_cast<__int128_t>(start) + static_cast<i64>(needle.len));
         });

@@ -104,6 +104,13 @@ void rut_crypto_rsa_workspace_reset_internal(EVP_PKEY** key,
     *bytes = 0;
 }
 
+// The RSA key loader only accepts moduli between 2048 and 4096 bits.
+static inline int rsa_workspace_modulus_bits(const BIGNUM* modulus) {
+    const int bits = BN_num_bits(modulus);
+    if (bits > INT_MAX - 64) __builtin_unreachable();
+    return bits;
+}
+
 uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
                                                 EVP_PKEY** key,
                                                 const BIGNUM** modulus,
@@ -123,9 +130,7 @@ uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
     *mont = BN_MONT_CTX_new();
     if (!*input || !*output || !*scratch || !*mont || !BN_MONT_CTX_set(*mont, *modulus, *scratch))
         goto fail;
-    const int bits = BN_num_bits(*modulus);
-    // The only caller uses a loaded RsaPublicKey, whose loader admits 2048–4096 bits.
-    if (bits > INT_MAX - 64) __builtin_unreachable();
+    const int bits = rsa_workspace_modulus_bits(*modulus);
     if (!BN_set_bit(*input, bits + 64) || !BN_set_bit(*output, bits + 64) ||
         !BN_copy(*input, *modulus) || !BN_sub_word(*input, 1) ||
         !BN_mod_exp_mont(*output, *input, *exponent, *modulus, *scratch, *mont))

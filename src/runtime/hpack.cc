@@ -1,5 +1,7 @@
 #include "rut/runtime/hpack.h"
 
+#include "rut/common/integer_range.h"
+
 namespace rut::hpack {
 
 namespace {
@@ -218,10 +220,10 @@ i64 huffman_encoded_len(const u8* src, u32 len) {
     // There are at most UINT32_MAX terms, each stored as a u8.
     i64 bits = 0;
     for (u32 i = 0; i < len; i++) {
-        if (bits > INT64_MAX - UINT8_MAX) __builtin_unreachable();
+        assume_integer_range(bits <= INT64_MAX - UINT8_MAX);
         bits += static_cast<i64>(kHuff[src[i]].bits);
     }
-    if (bits < 0 || bits > static_cast<i64>(UINT32_MAX) * UINT8_MAX) __builtin_unreachable();
+    assume_integer_range(bits >= 0 && bits <= static_cast<i64>(UINT32_MAX) * UINT8_MAX);
     return huffman_encoded_bytes_from_bits(bits);
 }
 
@@ -630,7 +632,7 @@ bool decode_header_block(DynamicTable& dyn,
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
                 // op counts bytes already written into the u32-capacity output.
-                if (op > INT64_MAX - UINT32_MAX) __builtin_unreachable();
+                assume_integer_range(op <= INT64_MAX - UINT32_MAX);
                 if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};

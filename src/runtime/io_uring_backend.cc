@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "io_uring_send_target.h"
+#include "rut/common/integer_range.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
@@ -94,7 +95,7 @@ static constexpr u32 kCancelConnId = 0xFFFFFD;
 // libc puts a positive error number in errno for a failed syscall.
 static i32 negative_syscall_errno() {
     const i32 code = errno;
-    if (code == INT32_MIN) __builtin_unreachable();
+    assume_integer_range(code != INT32_MIN);
     return -code;
 }
 

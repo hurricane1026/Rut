@@ -1,5 +1,6 @@
 #include "rut/runtime/route_trie.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
@@ -174,7 +175,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
             for (u32 j = kLast; j > parent.children.param_count; --j)
                 parent.children[j] = parent.children[static_cast<i64>(j) - 1];
             // Insert already reserved a slot in the fixed-size child array.
-            if (parent.children.param_count >= TrieNode::kMaxChildren) __builtin_unreachable();
+            assume_integer_range(parent.children.param_count < TrieNode::kMaxChildren);
             parent.children[parent.children.param_count++] = kChild;
         }
         needs_backtracking_ |= parent.children.param_count != 0 && parent.children.len > 1;

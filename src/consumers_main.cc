@@ -1,3 +1,4 @@
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/auth.h"
 #include "rut/runtime/consumer_registry.h"
@@ -783,8 +784,7 @@ bool policy_max_lifetime(PolicySnapshot& snapshot, u32 value) {
         const i64 end = policy_time(doc, record, lit_str("expiresAt"));
         if (!start || !end) return false;
         // The schema validator accepts only positive Unix seconds.
-        i64 lifetime = 0;
-        if (__builtin_sub_overflow(end, start, &lifetime)) __builtin_unreachable();
+        const i64 lifetime = subtract_assuming_in_range(end, start);
         if (lifetime > maximum) return false;
     }
     return true;
@@ -799,7 +799,7 @@ bool policy_remaining_validity(PolicySnapshot& snapshot, u32 value) {
         if (!policy_enabled(doc, record)) continue;
         const i64 expires_at = policy_time(doc, record, lit_str("expiresAt"));
         // Missing timestamps are zero. The CLI validates the evaluation time.
-        if (expires_at < 0 || snapshot.now < 0) __builtin_unreachable();
+        assume_integer_range(expires_at >= 0 && snapshot.now >= 0);
         if (expires_at - snapshot.now < minimum) return false;
     }
     return true;

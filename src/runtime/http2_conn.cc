@@ -1,6 +1,7 @@
 #include "rut/runtime/http2_conn.h"
 
 #include "rut/common/bounded_int.h"
+#include "rut/common/integer_range.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
 
@@ -249,7 +250,7 @@ u32 http2_write_headers(
                              static_cast<i64>(hs[i].value.len) +
                              hpack_field_overhead(hs[i].name.len, hs[i].value.len));
         // The offset includes the frame header and each encoded length is nonnegative.
-        if (kWorst < INT64_MIN / 2) __builtin_unreachable();
+        assume_integer_range(kWorst >= INT64_MIN / 2);
         if (kWorst > static_cast<i64>(out_cap) ||
             kWorst - static_cast<i64>(kFrameHeaderSize) > static_cast<i64>(kMaxFramePayload))
             return 0;
@@ -257,7 +258,7 @@ u32 http2_write_headers(
         // kWorst is a complete write-before bound for encode_header.
         o = static_cast<i64>(static_cast<__int128_t>(o) + kEncoded);
     }
-    if (o < INT64_MIN / 2) __builtin_unreachable();
+    assume_integer_range(o >= INT64_MIN / 2);
     const i64 kPayload = o - static_cast<i64>(kFrameHeaderSize);
     if (kPayload > static_cast<i64>(kMaxFramePayload)) return 0;
     u8 flags = http2_flag::kEndHeaders;
@@ -339,7 +340,7 @@ static u32 http2_write_response_impl(u8* out,
     const i64 kClReserve = body_len > 0 ? 14 + 10 + hpack_field_overhead(14, 10) : 0;
     for (u32 i = 0; i < nhdrs; i++) {
         // The previous encoded field fit the fixed hblock buffer.
-        if (hb > INT64_MAX / 2) __builtin_unreachable();
+        assume_integer_range(hb <= INT64_MAX / 2);
         const i64 kWorst = static_cast<i64>(hb) + static_cast<i64>(hdrs[i].name.len) +
                            static_cast<i64>(hdrs[i].value.len) +
                            hpack_field_overhead(hdrs[i].name.len, hdrs[i].value.len) + kClReserve;
@@ -374,7 +375,7 @@ static u32 http2_write_response_impl(u8* out,
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
-        if (hb > INT64_MAX / 2) __builtin_unreachable();
+        assume_integer_range(hb <= INT64_MAX / 2);
         const i64 kWorst =
             static_cast<i64>(hb) + 14 + static_cast<i64>(kClLen) + hpack_field_overhead(14, kClLen);
         if (kWorst > static_cast<i64>(sizeof(hblock))) return 0;  // (reserved above)
@@ -400,7 +401,7 @@ static u32 http2_write_response_impl(u8* out,
     h.stream_id = stream_id;
     write_frame_header(out, h);
     for (i64 i = 0; i < hb; i++) (out + static_cast<i64>(kFrameHeaderSize))[i] = hblock[i];
-    if (hb > INT64_MAX / 2) __builtin_unreachable();
+    assume_integer_range(hb <= INT64_MAX / 2);
     i64 o = static_cast<i64>(kFrameHeaderSize) + hb;
     if (!headers_only && body_len > 0)
         o = static_cast<i64>(static_cast<__int128_t>(o) +
@@ -1073,7 +1074,7 @@ static Http2Error handle_frame(Http2Conn& c,
                                                           h.stream_id,
                                                           Http2Error::StreamClosed)));
                 // Still replenish the connection window for the consumed octets.
-                if (c.conn_recv_window > INT64_MAX / 2) __builtin_unreachable();
+                assume_integer_range(c.conn_recv_window <= INT64_MAX / 2);
                 c.conn_recv_window += static_cast<i64>(h.length);
                 if (h.length > 0 &&
                     w.room(static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4)))
@@ -1098,8 +1099,7 @@ static Http2Error handle_frame(Http2Conn& c,
             if (c.client && !s->got_headers) return Http2Error::ProtocolError;
             // A live stream has not spent more credit than it was granted. DATA
             // lengths come from the 24-bit frame field.
-            if (__builtin_sub_overflow(s->recv_window, static_cast<i32>(h.length), &s->recv_window))
-                __builtin_unreachable();
+            s->recv_window = subtract_assuming_in_range(s->recv_window, static_cast<i32>(h.length));
             if (s->recv_window < 0) {
                 const Http2Error kReset =
                     reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
@@ -1132,10 +1132,9 @@ static Http2Error handle_frame(Http2Conn& c,
                 return Http2Error::NoError;
             }
             // Auto-replenish for legacy body-buffering handlers.
-            if (c.conn_recv_window > INT64_MAX / 2) __builtin_unreachable();
+            assume_integer_range(c.conn_recv_window <= INT64_MAX / 2);
             c.conn_recv_window += static_cast<i64>(h.length);
-            if (__builtin_add_overflow(s->recv_window, static_cast<i32>(h.length), &s->recv_window))
-                __builtin_unreachable();
+            s->recv_window = add_assuming_in_range(s->recv_window, static_cast<i32>(h.length));
             if (h.length > 0) {
                 if (w.room(static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + 4)))
                     w.len = static_cast<u32>(static_cast<i64>(w.len) +
@@ -1271,9 +1270,8 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
                         static_cast<i64>(write_window_update(
                             w.out + static_cast<i64>(w.len), s.id, s.recv_credit)));
                     // Receive credit restores previously consumed window bytes.
-                    if (__builtin_add_overflow(
-                            s.recv_window, static_cast<i32>(s.recv_credit), &s.recv_window))
-                        __builtin_unreachable();
+                    s.recv_window =
+                        add_assuming_in_range(s.recv_window, static_cast<i32>(s.recv_credit));
                 }
                 s.recv_credit = 0;
             }

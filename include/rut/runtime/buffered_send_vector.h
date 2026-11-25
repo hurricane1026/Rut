@@ -1,4 +1,5 @@
 #pragma once
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 
 #include <sys/socket.h>
@@ -48,7 +49,7 @@ struct BufferedSendVector {
             auto& part = *message.msg_iov;
             const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
             // Both iovecs start with u32 lengths in bind and only shrink.
-            if (part.iov_len > static_cast<u64>(INT64_MAX)) __builtin_unreachable();
+            assume_integer_range(part.iov_len <= static_cast<u64>(INT64_MAX));
             part.iov_len =
                 static_cast<u64>(static_cast<i64>(part.iov_len) - static_cast<i64>(kStep));
             const bool kFirst = &part == parts;
@@ -57,7 +58,7 @@ struct BufferedSendVector {
                 kFirst
                     ? first_size
                     : static_cast<u32>(static_cast<i64>(total_size) - static_cast<i64>(first_size));
-            if (part.iov_len > static_cast<u64>(INT64_MAX)) __builtin_unreachable();
+            assume_integer_range(part.iov_len <= static_cast<u64>(INT64_MAX));
             part.iov_base = const_cast<u8*>(
                 source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len)));
             n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));

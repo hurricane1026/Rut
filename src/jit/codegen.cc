@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
@@ -4901,7 +4902,7 @@ bool emit_ws_handler(LLVMModuleRef mod,
                 const u32 kChild = kChildren[j];
                 if (kChild >= i || !guards[kChild].is_operand) return false;
                 // The walk returns on the first duplicate, so every prior count is 0 or 1.
-                if (parents[kChild] > 1) __builtin_unreachable();
+                assume_integer_range(parents[kChild] <= 1);
                 if (++parents[kChild] != 1) return false;
             }
         }
