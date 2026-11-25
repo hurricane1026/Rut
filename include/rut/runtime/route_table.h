@@ -105,6 +105,7 @@ struct UpstreamTarget {
     ActiveHealthStatuses hc_healthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};
     PassiveHealthPolicy passive_health{};
+    u8 hc_require_initial_success = 0;
     ActiveHealthType hc_type = ActiveHealthType::Http;
     u32 hc_timeout_ms = 0;  // 0 inherits the host loop upstream timeout
 
@@ -1421,7 +1422,8 @@ public:
                                    ActiveHealthType type = ActiveHealthType::Http,
                                    u32 timeout_ms = 0,
                                    Str host = {},
-                                   ActiveHealthStatuses statuses = {});
+                                   ActiveHealthStatuses statuses = {},
+                                   bool require_initial_success = false);
 
     // Add a static response route. Same failure modes as add_proxy(),
     // minus the upstream-id check that doesn't apply here.

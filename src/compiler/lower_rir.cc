@@ -4519,6 +4519,8 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].hc_healthy_statuses = mir.upstreams[i].hc_healthy_statuses;
         out.module.upstreams[i].hc_thresholds = mir.upstreams[i].hc_thresholds;
         out.module.upstreams[i].passive_health = mir.upstreams[i].passive_health;
+        out.module.upstreams[i].hc_require_initial_success =
+            mir.upstreams[i].hc_require_initial_success;
         out.module.upstreams[i].hc_type = mir.upstreams[i].hc_type;
         out.module.upstreams[i].hc_timeout_ms = mir.upstreams[i].hc_timeout_ms;
         out.module.upstreams[i].minimum_healthy_weight_percent =

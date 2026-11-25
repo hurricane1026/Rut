@@ -22949,6 +22949,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_healthy_statuses = item.upstream.hc_healthy_statuses;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.passive_health = item.upstream.passive_health;
+        up.hc_require_initial_success = item.upstream.hc_require_initial_success;
         up.hc_type = item.upstream.hc_type;
         up.hc_timeout_ms = item.upstream.hc_timeout_ms;
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;

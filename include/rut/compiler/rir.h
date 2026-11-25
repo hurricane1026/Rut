@@ -647,6 +647,7 @@ struct Module {
         ActiveHealthStatuses hc_healthy_statuses{};
         ActiveHealthThresholds hc_thresholds{};
         PassiveHealthPolicy passive_health{};
+        bool hc_require_initial_success = false;
         ActiveHealthType hc_type = ActiveHealthType::Http;
         u32 hc_timeout_ms = 0;  // 0 inherits the host loop upstream timeout
     };
