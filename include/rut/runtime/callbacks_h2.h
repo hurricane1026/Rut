@@ -308,16 +308,14 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
         status = H2PumpStatus::Invalid;
         return 0;
     }
-    if (h2.conn_send_window <= 0 || stream->send_window <= 0) return 0;
     if (static_cast<i64>(cap) < static_cast<i64>(kFrameHeaderSize) + 1) return 0;
     const u32 kRemaining = static_cast<u32>(static_cast<i64>(h2.outbound_body_len) -
                                             static_cast<i64>(h2.outbound_body_offset));
-    u32 n = kRemaining;
-    if (n > h2.peer_settings.max_frame_size) n = h2.peer_settings.max_frame_size;
-    if (static_cast<i64>(n) > h2.conn_send_window) n = static_cast<u32>(h2.conn_send_window);
-    if (static_cast<i64>(n) > stream->send_window) n = static_cast<u32>(stream->send_window);
-    if (static_cast<i64>(n) > static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize))
-        n = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize));
+    u32 requested = kRemaining;
+    if (requested > h2.peer_settings.max_frame_size) requested = h2.peer_settings.max_frame_size;
+    if (static_cast<i64>(requested) > static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize))
+        requested = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(kFrameHeaderSize));
+    const u32 n = h2_consume_send_credit(stream->send_window, h2.conn_send_window, requested);
     if (n == 0) return 0;
     Http2FrameHeader frame{};
     frame.length = n;
@@ -330,10 +328,6 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
                      n);
     h2.outbound_body_offset =
         static_cast<u32>(static_cast<i64>(h2.outbound_body_offset) + static_cast<i64>(n));
-    h2.conn_send_window =
-        static_cast<i64>(static_cast<__int128_t>(h2.conn_send_window) - static_cast<i64>(n));
-    stream->send_window =
-        static_cast<i32>(static_cast<i64>(stream->send_window) - static_cast<i64>(n));
     h2.outbound_final_staged = n == kRemaining;
     status = H2PumpStatus::Produced;
     return static_cast<u32>(static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(n));

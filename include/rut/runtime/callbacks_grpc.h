@@ -947,15 +947,9 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 if (amount > cap) amount = cap;
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
-                if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
-                if (static_cast<i64>(amount) > h.conn_send_window)
-                    amount = static_cast<u32>(h.conn_send_window);
+                amount = h2_consume_send_credit(stream->send_window, h.conn_send_window, amount);
                 n = http2_write_data(out, x->upstream_stream, output, amount, false);
                 grpc_consume_output(*x, true, amount);
-                stream->send_window = static_cast<i32>(static_cast<i64>(stream->send_window) -
-                                                       static_cast<i64>(amount));
-                h.conn_send_window = static_cast<i64>(static_cast<__int128_t>(h.conn_send_window) -
-                                                      static_cast<i64>(amount));
             } else if ((!x->websocket || x->ws_accepted) && !output_len && !x->upload_len &&
                        x->request_end && !x->request_end_sent) {
                 if (x->request_trailers_len) {
@@ -1529,17 +1523,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                                               static_cast<i64>(kFrameHeaderSize));
                 if (amount > h.peer_settings.max_frame_size)
                     amount = h.peer_settings.max_frame_size;
-                if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
-                if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
+                amount = h2_consume_send_credit(stream->send_window, h.conn_send_window, amount);
                 n = http2_write_data(
                     out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
                 (void)__builtin_add_overflow(
                     x->staged_response_bytes, static_cast<u64>(amount), &x->staged_response_bytes);
                 grpc_consume_output(*x, false, amount);
-                stream->send_window = static_cast<i32>(static_cast<i64>(stream->send_window) -
-                                                       static_cast<i64>(amount));
-                h.conn_send_window = static_cast<i64>(static_cast<__int128_t>(h.conn_send_window) -
-                                                      static_cast<i64>(amount));
             } else if (x->websocket && x->response_headers_sent && !output_len &&
                        !x->download_len && x->response_end && !x->response_end_sent &&
                        room >= kFrameHeaderSize) {

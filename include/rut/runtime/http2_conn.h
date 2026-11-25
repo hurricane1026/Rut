@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/bounded_int.h"
 #include "rut/common/positive.h"
 #include "rut/common/types.h"
 #include "rut/runtime/grpc_proxy_state.h"
@@ -47,6 +48,26 @@ struct Http2Stream {
     u32 recv_unconsumed;
     u64 headers_received_us;
 };
+
+// A SETTINGS change can make the stream window negative. Preserve it until
+// more credit arrives. For a send, cap and debit the payload by both windows.
+[[nodiscard]] constexpr u32 h2_consume_send_credit(i32& stream_window,
+                                                   i64& conn_window,
+                                                   u32 requested) {
+    if (conn_window <= 0 || stream_window <= 0) return 0;
+
+    using StreamCredit = BoundedInt<struct StreamSendCreditTag, 0, INT32_MAX>;
+    using ConnectionCredit = BoundedInt<struct ConnectionSendCreditTag, 0, INT64_MAX>;
+    const auto stream = StreamCredit::clamp(stream_window);
+    const auto connection = ConnectionCredit::clamp(conn_window);
+    const i64 request = proven_integer_cast<i64>(requested);
+    const i64 connection_limited = request < connection.value() ? request : connection.value();
+    const auto amount = StreamCredit::clamp(connection_limited < stream.value() ? connection_limited
+                                                                                : stream.value());
+    stream_window = subtract_proven_in_range<i32>(stream, amount);
+    conn_window = subtract_proven_in_range<i64>(connection, amount);
+    return proven_integer_cast<u32>(amount);
+}
 
 struct Http2Conn;
 struct SlicePool;

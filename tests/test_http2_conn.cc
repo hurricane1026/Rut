@@ -22,6 +22,39 @@ void h2_proxy_begin(Loop*, Connection&) {}
 
 namespace {
 
+template <typename Result, typename Left, typename Right>
+concept CanProveWindowSubtract =
+    requires(Left left, Right right) { subtract_proven_in_range<Result>(left, right); };
+
+using TestNonnegativeWindow = BoundedInt<struct TestNonnegativeWindowTag, 0, INT32_MAX>;
+using TestSignedWindow = BoundedInt<struct TestSignedWindowTag, INT32_MIN, INT32_MAX>;
+static_assert(CanProveWindowSubtract<i32, TestNonnegativeWindow, TestNonnegativeWindow>);
+static_assert(!CanProveWindowSubtract<i32, TestSignedWindow, TestNonnegativeWindow>);
+static_assert(!CanProveWindowSubtract<i32, i32, u32>);
+static_assert(subtract_proven_in_range<i32>(TestNonnegativeWindow::constant<0>(),
+                                            TestNonnegativeWindow::constant<INT32_MAX>()) ==
+              -INT32_MAX);
+
+TEST(http2_conn, outbound_credit_caps_data_and_preserves_blocked_windows) {
+    i32 stream = INT32_MAX;
+    i64 connection = INT64_MAX;
+    CHECK_EQ(h2_consume_send_credit(stream, connection, UINT32_MAX), static_cast<u32>(INT32_MAX));
+    CHECK_EQ(stream, 0);
+    CHECK_EQ(connection, INT64_MAX - INT32_MAX);
+
+    stream = 20;
+    connection = 5;
+    CHECK_EQ(h2_consume_send_credit(stream, connection, 10), 5u);
+    CHECK_EQ(stream, 15);
+    CHECK_EQ(connection, 0);
+
+    stream = INT32_MIN;
+    connection = 10;
+    CHECK_EQ(h2_consume_send_credit(stream, connection, 5), 0u);
+    CHECK_EQ(stream, INT32_MIN);
+    CHECK_EQ(connection, 10);
+}
+
 #if RUT_ENABLE_WEBSOCKET
 struct WsH2Observations {
     u32 opened = 0, messages = 0, closed = 0;

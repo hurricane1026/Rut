@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 
 #ifdef __clang__
@@ -34,6 +35,10 @@ public:
         return BoundedInt(value);
     }
 
+    [[nodiscard]] static constexpr BoundedInt clamp(i64 value) {
+        return BoundedInt(value < Minimum ? Minimum : value > Maximum ? Maximum : value);
+    }
+
     constexpr i64 value() const { return value_; }
 
     [[nodiscard]] constexpr bool try_increment() {
@@ -48,6 +53,27 @@ public:
         return true;
     }
 };
+
+template <detail::FixedWidthInteger To, typename Tag, i64 Min, i64 Max>
+    requires(detail::kIntegerMin<To> <= Min && Max <= detail::kIntegerMax<To>)
+constexpr To proven_integer_cast(BoundedInt<Tag, Min, Max> value) {
+    return static_cast<To>(value.value());
+}
+
+template <detail::FixedWidthInteger Result,
+          typename LeftTag,
+          i64 LeftMin,
+          i64 LeftMax,
+          typename RightTag,
+          i64 RightMin,
+          i64 RightMax>
+    requires(detail::kIsSignedInteger<Result> &&
+             detail::kIntegerMin<Result> <= static_cast<__int128_t>(LeftMin) - RightMax &&
+             static_cast<__int128_t>(LeftMax) - RightMin <= detail::kIntegerMax<Result>)
+constexpr Result subtract_proven_in_range(BoundedInt<LeftTag, LeftMin, LeftMax> left,
+                                          BoundedInt<RightTag, RightMin, RightMax> right) {
+    return static_cast<Result>(static_cast<__int128_t>(left.value()) - right.value());
+}
 
 }  // namespace rut
 
