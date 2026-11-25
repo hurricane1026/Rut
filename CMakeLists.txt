@@ -122,6 +122,10 @@ include_directories(include)
 
 add_subdirectory(src)
 add_subdirectory(helpers/envoy)
+option(RUT_ENABLE_GEOIP "Build the standalone GeoIP database tool" OFF)
+if(RUT_ENABLE_GEOIP)
+    add_subdirectory(helpers/geoip)
+endif()
 add_subdirectory(third_party/nghttp2)  # reference lib for h2 diff tests/bench
 add_subdirectory(tests)
 add_subdirectory(bench)

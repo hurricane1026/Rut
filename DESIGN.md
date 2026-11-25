@@ -408,6 +408,15 @@ unwrapped string operand and `Optional<IP>` result. JIT/native compilation share
 that kernel. IPv6 parsing and the remaining IP properties in the target surface
 above are not supplied by this slice.
 
+The GeoIP library in `lib/geoip.rut` uses the generic request-scoped UDP API.
+Its optional build target `rut-geoip` reads the operator's MaxMind database and
+listens on IPv4 loopback. A datagram contains one IPv4 address in dotted decimal.
+The response contains two uppercase ASCII country-code bytes or an empty
+datagram for an invalid address or missing record. The tool shares the existing
+IPv4 parser and uses the pinned static libmaxminddb C library for MMDB decoding.
+Only the tool links this dependency. The database mapping lives for the lifetime
+of the tool process, and request handlers suspend while awaiting the reply.
+
 **CIDR** — network range
 
 ```swift

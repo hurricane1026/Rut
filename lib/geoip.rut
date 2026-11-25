@@ -1,0 +1,24 @@
+func geoipCountryCode(_ reply: Bytes) -> Bytes {
+    guard reply.count == 2 else { nil }
+    let first = reply[0].or(0)
+    let second = reply[1].or(0)
+    if first >= 65 && first <= 90 && second >= 65 && second <= 90 { reply } else { nil }
+}
+
+// The configured UDP endpoint runs rut-geoip with a local MaxMind database.
+func geoipExchange(_ socket: UdpSocket, _ address: str) -> Bytes {
+    let pendingSend = socket.send(address, 1000)
+    guard pendingSend.or(-1) == address.len else { nil }
+    let pendingReply = socket.receive(2, 1000)
+    guard let reply = pendingReply else { nil }
+    geoipCountryCode(reply)
+}
+
+func country(_ address: str) -> Bytes {
+    guard address.len >= 7 && address.len <= 15 else { nil }
+    let pendingSocket = udp(env("GEOIP_ENDPOINT"), 1000)
+    guard let socket = pendingSocket else { nil }
+    let result = geoipExchange(socket, address)
+    let closed = socket.close()
+    result
+}

@@ -390,6 +390,34 @@ User bindings/types/import namespaces named `IP` shadow the builtin namespace.
 Parsing a header does not establish trust in that header; forwarding policies
 must separately decide which peers may supply client addresses.
 
+## GeoIP country lookup library
+
+Build the standalone lookup tool with
+`cmake -S . -B build -DRUT_ENABLE_GEOIP=ON` and
+`cmake --build build --target rut-geoip`. Run it alongside Rut:
+
+```bash
+./build/helpers/geoip/rut-geoip /path/to/GeoLite2-Country.mmdb 9931
+GEOIP_ENDPOINT='{"address":"127.0.0.1","port":9931}' ./build/src/rut gateway.rut
+```
+
+```rut
+import * as geoip from "../lib/geoip.rut"
+
+route POST "/region" {
+    let pending = geoip.country(req.body)
+    guard let country = pending else { return 404 }
+    if country == b"DE" { return 204 } else { return 403 }
+}
+```
+
+`geoip.country(str)` sends a strict IPv4 address over request-scoped UDP and
+returns two ASCII country-code bytes as an optional `Bytes` result. Invalid
+addresses, absent country codes and failed lookups yield `nil`. The endpoint is
+resolved at compilation/load time. The lookup tool binds to IPv4 loopback
+and opens one read-only MaxMind database mapping. Replace the database by
+atomic rename and restart the lookup tool to load the new file.
+
 ## Process access log
 
 ```swift
