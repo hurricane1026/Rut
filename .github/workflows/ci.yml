@@ -270,6 +270,12 @@ jobs:
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_ring_iterator
           python3 scripts/check_ring_iterators.py build/check_ring_iterator build
           python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-22 --clang-check clang-check-22 --inventory runtime-arithmetic.txt
+      - name: Check unsigned to signed 64-bit conversions
+        if: matrix.compiler == 'clang' && matrix.shard == 1
+        run: |
+          clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_u64_to_i64.cc \
+            -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_u64_to_i64.so
+          python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22
       - uses: actions/upload-artifact@v4
         if: always() && matrix.compiler == 'clang' && matrix.shard == 1
         with:

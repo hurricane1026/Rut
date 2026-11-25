@@ -5,6 +5,7 @@
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/integer_conversion.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
@@ -772,7 +773,9 @@ public:
         if (value.len == 0) return value.ptr != nullptr && ptr >= begin && offset <= used;
         if (value.ptr == nullptr || value.len > used) return false;
         if (ptr < begin || offset >= used) return false;
-        return static_cast<i64>(value.len) <= static_cast<i64>(used) - static_cast<i64>(offset);
+        i64 signed_offset;
+        if (!try_u64_to_i64(offset, signed_offset)) return false;
+        return static_cast<i64>(value.len) <= static_cast<i64>(used) - signed_offset;
     }
 
     bool strict_local_response_bytes_owned(Str value) const {
