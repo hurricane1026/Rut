@@ -121,10 +121,9 @@ The [executable example](../examples/memcache-client.rut) uses
 Verified TLS uses the unchanged `tls`, `caFile` and `serverName` policy fields.
 Use a dedicated policy for this unauthenticated basic-text profile. The separate
 [authentication library](client-authentication.md) adds challenge-gated `-Y` text
-sessions. Binary/SASL, meta operations beyond the documented metadata GET and CAS-delete profiles,
-arbitrary pipelining, UDP, failover and
-background sessions are not provided. It is not an implementation of a
-distributed Cache backend.
+sessions. Binary/SASL, quiet or pipelined meta commands, stale serving, recache
+coordination, arbitrary pipelining, UDP, failover and background sessions are
+not provided. It is not an implementation of a distributed Cache backend.
 
 ## CAS, counters and concatenation
 
@@ -185,6 +184,41 @@ invalid flags/length, partial-error suffix or data after END is accepted. A
 multi-key read uses the same four-receive, 8192-byte, fixed-deadline profile as
 single-key reads. There is no implicit pipeline, quiet command or retry.
 
+## Meta commands
+
+Import `clients/memcache-meta.rut` for the bounded Meta text client. The
+existing read helpers fetch values with flags, CAS and remaining TTL.
+`memcacheGetCas` also distinguishes unchanged metadata from a changed value
+or a missing key.
+
+| Call | Wire command and behavior |
+| --- | --- |
+| `memcacheMetaStore(connection, key, data, mode, flags, expiry)` | `ms` with set, add, replace, append, prepend or CAS comparison. Append and prepend preserve stored metadata. |
+| `memcacheMetaArithmetic(connection, key, mode, delta, policy)` | `ma` with increment or decrement. Select an existing counter, a CAS comparison or creation on miss with an initial value and expiry. |
+| `memcacheMetaDelete(connection, key)` / `memcacheDeleteCas(connection, key, cas)` | `md` with an optional version precondition across the two entry points. |
+| `memcacheMetaNoop(connection)` | `mn` round trip on an open connection. |
+| `memcacheMetaDebug(connection, key)` | `me` diagnostic fields as opaque Bytes after checking the echoed key, or a missing result. |
+
+`MemcacheMetaStoreMode` is `set`, `add`, `replace`, `append`, `prepend` or
+`compare(cas)`. `MemcacheMetaCounterPolicy` is `existing`, `compare(cas)` or
+`create(MemcacheMetaCounterSeed(value, expiry))`. The pure builders
+`memcacheMetaStoreRequest`, `memcacheMetaArithmeticRequest`,
+`memcacheMetaDeleteRequest` and `memcacheMetaDebugRequest` expose the same
+encoding without I/O.
+
+Store flags use unsigned 32-bit decimal Bytes. CAS, counter deltas, initial
+values and returned counter values use unsigned 64-bit decimal Bytes.
+`MemcacheMetaCommandResult` distinguishes successful acknowledgement,
+value, missing key, conditional non-storage, CAS conflict, and errors.
+The client sends each operation once, reads at most four times, and caps each
+complete request or reply at 8192 bytes. It closes the handle after a server,
+transport or framing error. Invalid inputs are rejected before sending.
+
+This profile uses acknowledged commands and strict reply framing. Its command
+options cover the storage and arithmetic modes shown above. The server also
+supports additional flags for quiet pipelines, stale serving and recache
+coordination. [Memcached Meta text protocol](https://docs.memcached.org/protocols/meta/).
+
 ## Validation
 
 `test_memcache_client.py` uses an independent Python TCP/TLS peer to check exact
@@ -204,6 +238,12 @@ TCP/TLS/backend matrix for CAS conflicts, full-width unsigned counters,
 append/prepend metadata preservation, multi-key membership/order/bounds,
 GAT/GATS expiration, fragmentation and poisoned aliases. The CAS example runs
 at O2 on both backends. All native tests remove source/import files after startup.
+
+`test_memcache_meta.py` checks exact requests, fragmented responses, full-width
+numbers, conditional outcomes, failure classification and handle invalidation.
+The live profile checks set/replace/append/prepend stores, CAS conflicts,
+deletion, counter creation, CAS-conditioned arithmetic and diagnostics against
+the pinned server.
 
 The focused `test_client_expiry.py` matrix covers explicit expiry encoding,
 relative/absolute discriminator and overflow rejection, exact 8192-byte request

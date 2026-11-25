@@ -4036,6 +4036,13 @@ supports EXAT/PXAT via validated decimal Bytes, including timestamps beyond i32.
 See [Redis SET options](redis-commands.md) and
 [Memcache options, TTL limits and examples](memcache-client.md).
 
+The `clients/memcache-meta.rut` module also provides acknowledged Meta stores,
+CAS-conditional stores, increment/decrement with optional create-on-miss,
+plain and CAS-protected deletion, a no-op round trip, and item diagnostics.
+These ordinary Rut functions share the same TCP/TLS, frame, deadline and
+ownership limits.
+See [Meta commands](memcache-client.md#meta-commands).
+
 ## Client diagnostics
 
 Redis `redisPing`, `redisEcho` and `redisInfo` reuse the scalar RESP2 executor.

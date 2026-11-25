@@ -215,3 +215,6 @@ Redis conditional-expiry module and Memcached CAS-protected deletion.
 
 See [ordered and conditional cache reads](client-cache-reads.md) for typed Redis
 MGET and Memcached retrieval conditional on an existing CAS version.
+
+See [Memcached Meta commands](memcache-client.md#meta-commands) for acknowledged
+stores, CAS-conditioned stores, arithmetic, deletion, no-op and diagnostics.
