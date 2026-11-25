@@ -1,7 +1,5 @@
 #pragma once
 
-#include "rut/common/integer_range.h"
-
 // Included after the bounded exchange pumps. An H1 downstream has one virtual
 // stream in its metadata owner; the physical socket remains an H1/TLS socket.
 #include "rut/runtime/callbacks.h"
@@ -55,15 +53,20 @@ inline u32 h1ws_h2_response(Connection& c,
 }
 
 template <typename Loop>
-void h1ws_h2_complete_http(Loop* loop, Connection& c, GrpcExchange& x) {
+[[nodiscard]] bool h1ws_h2_complete_http(Loop* loop, Connection& c, const GrpcExchange& x) {
     if constexpr (requires { loop->capture_ring; }) {
-        if (!c.req_start_us) return;
+        if (!c.req_start_us) return true;
+        u32 response_bytes;
+        if (__builtin_add_overflow(
+                x.response_headers_len, x.staged_response_bytes, &response_bytes)) {
+            loop->close_conn(c);
+            return false;
+        }
         c.downstream_req_size = c.req_size =
             c.ws_client_header_len ? c.ws_client_header_len : c.req_header_end;
-        const u64 kBytes = saturating_add(x.response_headers_len, x.staged_response_bytes);
-        on_request_complete(
-            loop, c, c.resp_status, kBytes > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kBytes));
+        on_request_complete(loop, c, c.resp_status, response_bytes);
     }
+    return true;
 }
 
 template <typename Loop>
@@ -89,15 +92,15 @@ void h1ws_h2_sent(void* lp, Connection& c, IoEvent ev) {
     c.send_buf.reset();
     auto* x = grpc_find(*c.h2, 1);
     if (x && x->ws_accepted && !x->failure) {
-        c.is_ws_tunnel = true;
         c.resp_status = 101;
-        h1ws_h2_complete_http(loop, c, *x);
+        if (!h1ws_h2_complete_http(loop, c, *x)) return;
+        c.is_ws_tunnel = true;
         if (x->ws) {
             ws_h2_sent(*x, false);
             if (!ws_h2_open(*x)) x->failure = 13;
         }
-    } else if (x && x->failure)
-        h1ws_h2_complete_http(loop, c, *x);
+    } else if (x && x->failure && !h1ws_h2_complete_http(loop, c, *x))
+        return;
     h1ws_h2_received<Loop>(lp, c, {c.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -152,15 +155,19 @@ void h1ws_h2_drive(Loop* loop, Connection& c) {
         const u8* output = grpc_output(*x, false, &length);
         if (length) {
             const u32 kAmount = length < c.send_buf.capacity() ? length : c.send_buf.capacity();
-            c.send_buf.write(output, kAmount);
-            grpc_consume_output(*x, false, kAmount);
-            (void)__builtin_add_overflow(
-                x->staged_response_bytes, static_cast<u64>(kAmount), &x->staged_response_bytes);
-        } else if (!x->download_len && x->response_end && !x->response_end_sent) {
-            if (!x->ws_accepted) {
-                h1ws_h2_complete_http(loop, c, *x);
+            u64 staged;
+            if (__builtin_add_overflow(x->staged_response_bytes, kAmount, &staged)) {
                 g.busy = false;
                 loop->close_conn(c);
+                return;
+            }
+            c.send_buf.write(output, kAmount);
+            grpc_consume_output(*x, false, kAmount);
+            x->staged_response_bytes = staged;
+        } else if (!x->download_len && x->response_end && !x->response_end_sent) {
+            if (!x->ws_accepted) {
+                g.busy = false;
+                if (h1ws_h2_complete_http(loop, c, *x)) loop->close_conn(c);
                 return;
             }
             if (c.tls_active) {

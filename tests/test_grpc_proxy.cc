@@ -5128,6 +5128,41 @@ TEST(http2_websocket, h1_receive_returns_after_pending_send_timer_close) {
     CHECK_NE(down.handler_gen, 0u);
 }
 
+TEST(http2_websocket, h1_response_size_must_fit_access_log) {
+    struct LogLoop : GrpcDriveFixture {
+        CaptureRing* capture_ring = nullptr;
+    } loop;
+    auto ring = std::make_unique<AccessLogRing>();
+    ring->init();
+    loop.access_log = ring.get();
+    auto down = std::make_unique<Connection>();
+    auto exchange = std::make_unique<GrpcExchange>();
+    exchange->init();
+    exchange->response_headers_len = 1;
+
+    down->reset();
+    down->req_start_us = monotonic_us();
+    down->resp_status = 200;
+    exchange->staged_response_bytes = UINT32_MAX - 1;
+    REQUIRE(h1ws_h2_complete_http(&loop, *down, *exchange));
+    AccessLogEntry entry{};
+    REQUIRE(ring->pop(entry));
+    CHECK_EQ(entry.resp_size, UINT32_MAX);
+    CHECK_FALSE(loop.closed);
+
+    for (u64 body_bytes : {u64{UINT32_MAX}, u64{UINT64_MAX}}) {
+        down->reset();
+        down->req_start_us = monotonic_us();
+        down->resp_status = 200;
+        exchange->staged_response_bytes = body_bytes;
+        loop.closed = false;
+        CHECK_FALSE(h1ws_h2_complete_http(&loop, *down, *exchange));
+        CHECK(loop.closed);
+        CHECK_EQ(down->downstream_completed_request_count, 0);
+        CHECK_FALSE(ring->pop(entry));
+    }
+}
+
 TEST(grpc_proxy, live_log_keeps_bytes_only_output) {
     auto ring = std::make_unique<LiveAccessLogRing>();
     ring->init();
