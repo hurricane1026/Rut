@@ -4569,7 +4569,10 @@ public:
         if (study_inside_cq)
             __builtin_add_overflow(
                 study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
-        c.add_response_bytes(sent);
+        if (!c.try_add_response_bytes(sent)) {
+            close_conn(c);
+            return;
+        }
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the

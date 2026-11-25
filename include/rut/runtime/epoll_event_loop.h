@@ -876,7 +876,10 @@ public:
                 // The syscall returned at most the bytes left in this segment.
                 r.segment_sent =
                     static_cast<u32>(static_cast<i64>(r.segment_sent) + static_cast<i64>(sent));
-                c.add_response_bytes(sent);
+                if (!c.try_add_response_bytes(sent)) {
+                    this->close_conn(c);
+                    return;
+                }
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;

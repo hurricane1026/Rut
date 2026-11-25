@@ -85431,6 +85431,27 @@ TEST(coverage, body_sent_pipeline_merge_overflow) {
     CHECK_EQ(loop.conns[cid].fd, -1);  // overflow → close
 }
 
+TEST(coverage, response_byte_overflow_stops_proxy_send) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->resp_body_sent = UINT32_MAX - 1;
+    CHECK_FALSE(c->try_add_response_bytes(2));
+    CHECK_EQ(c->resp_body_sent, UINT32_MAX - 1);
+    CHECK(c->try_add_response_bytes(1));
+    CHECK_EQ(c->resp_body_sent, UINT32_MAX);
+
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 2;
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write_ptr()[0] = 'x';
+    c->upstream_recv_buf.commit(1);
+    const u32 id = c->id;
+    on_response_body_recvd<SmallLoop>(&loop, *c, make_ev(id, IoEventType::UpstreamRecv, 1));
+    CHECK_EQ(loop.conns[id].fd, -1);
+}
+
 // Chunked response body with malformed chunk during streaming. Line 736.
 TEST(coverage, chunked_response_body_error_closes) {
     SmallLoop loop;
@@ -90740,8 +90761,8 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
     REQUIRE_EQ(ready[0].type, IoEventType::RelayRead);
     CHECK_EQ(ready[0].upstream_episode, 1u);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
-    // The byte count can include a header on top of a u32 Content-Length.
-    c->resp_body_sent = UINT32_MAX - 1;
+    // The largest representable byte count is still valid.
+    c->resp_body_sent = UINT32_MAX - kChunk;
     g.loop->dispatch(ready[0]);
     CHECK_EQ(c->resp_body_sent, UINT32_MAX);
     CHECK_EQ(c->resp_body_remaining, 2u * kChunk);
@@ -90762,6 +90783,38 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
     CHECK_EQ(errno, EBADF);
     CHECK_EQ(fcntl(pipe_write, F_GETFD), -1);
     CHECK_EQ(errno, EBADF);
+}
+
+TEST(epoll_splice, response_byte_overflow_closes_relay) {
+    RealEpollEpisodeGuard g;
+    REQUIRE(g.create());
+    REQUIRE(g.init());
+    Connection* c = g.alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2], upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    g.peer_fds[0] = downstream[1];
+    c->fd = downstream[0];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, upstream), 0);
+    g.peer_fds[1] = upstream[1];
+    c->upstream_fd = upstream[0];
+    c->upstream_episode = 1;
+    REQUIRE(g.loop->backend.begin_upstream_episode(c->id, 1));
+    REQUIRE(g.loop->backend.add_recv(c->fd, c->id));
+    REQUIRE(g.loop->backend.add_recv_upstream(c->upstream_fd, c->id, 1));
+    c->state = ConnState::Proxying;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->request_upload_complete = true;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 4 * EpollEventLoop::kResponseSpliceChunkSize;
+    c->resp_body_sent = UINT32_MAX - 1;
+    REQUIRE_EQ(send(upstream[1], "ab", 2, MSG_NOSIGNAL), 2);
+    const u32 cid = c->id;
+    REQUIRE(g.loop->start_response_splice(*c));
+    if (c->fd < 0) g.release_conn(*c, cid);
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_FALSE(c->relay_owner.active());
 }
 
 TEST(epoll_splice, downstream_backpressure_retains_pipe_and_does_not_read_ahead) {

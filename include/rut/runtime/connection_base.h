@@ -1824,12 +1824,14 @@ struct ConnectionBase {
     BodyMode resp_body_mode;
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
-    u32 resp_body_sent;     // response bytes sent, saturated at the access-log field limit
+    u32 resp_body_sent;               // response bytes sent, including any counted header bytes
     u32 upstream_send_len;  // bytes from upstream_recv_buf in current client send
 
-    void add_response_bytes(u32 bytes) {
-        if (__builtin_add_overflow(resp_body_sent, bytes, &resp_body_sent))
-            resp_body_sent = UINT32_MAX;
+    [[nodiscard]] bool try_add_response_bytes(u32 bytes) {
+        u32 total;
+        if (__builtin_add_overflow(resp_body_sent, bytes, &total)) return false;
+        resp_body_sent = total;
+        return true;
     }
 
     // io_uring multishot recv tracking: true while the multishot SQE is

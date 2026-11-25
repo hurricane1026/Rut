@@ -681,6 +681,27 @@ TEST(iouring_splice, eof_and_post_pull_poll_failure_fail_closed) {
     }
 }
 
+TEST(iouring_splice, response_byte_overflow_closes_relay) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    const u8 body[] = {1, 2};
+    REQUIRE(send_all(upstream[1], body, sizeof(body)));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], 64 * 1024);
+    REQUIRE(c != nullptr);
+    c->resp_body_sent = UINT32_MAX - 1;
+    CHECK(loop.test_start_response_splice(*c));
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_EQ(c->relay_owner.pipe_read, -1);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
 TEST(iouring_splice, close_drains_real_read_poll_before_reclaim) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");
