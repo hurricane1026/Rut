@@ -949,6 +949,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
 - [x] Offline Consumer administration with full-record upserts, removal, disabled
   credentials/Consumers, group replacement, redacted inspection/preflight and
   validated atomic no-replace private snapshots (`rut-consumers`).
+- [x] Offline deployment checks for uninterrupted per-Consumer credential
+  coverage across scheduled rotation windows before candidate publication.
 - [x] Opt-in Consumer query credential hiding for proxy routes using verified
   remaining fields and the owned forwarding target effect.
 - [x] Explicit bounded form-body replacement for proxy routes using the verified

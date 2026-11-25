@@ -11350,6 +11350,11 @@ Offline `rut-consumers check-policy` evaluates a bounded private policy object
 against a validated private registry snapshot. An explicit Unix-second argument
 makes preflight decisions reproducible. Checks consume metadata and emit only
 fixed rule names on failure.
+`minimumContinuousValiditySeconds` checks whether each enabled Consumer's
+enabled credential windows jointly cover the requested period. The start is
+inclusive and the end is exclusive, matching request-time credential windows.
+Adjacent windows permit a scheduled handoff at the same Unix second. The check
+uses only the validated candidate snapshot and the supplied time.
 `apply-checked` uses the same evaluator on the in-memory post-transaction
 snapshot before publishing the exact validated bytes. A rejected rule leaves
 input and destination state intact.

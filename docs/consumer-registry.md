@@ -660,6 +660,22 @@ continues to adopt snapshots through its existing deployment path.
 | `minimumRemainingValiditySeconds` | Require an enabled credential record to have a finite expiry at least this many positive seconds after the supplied time. Applies also to future activations and records staged under disabled Consumers. |
 | `minimumActiveCredentials` | Require at least this many active credentials across enabled Consumers, as evaluated at the supplied time. Accepts integers from 0 to 64. |
 | `requireActiveCredentialForEnabledConsumers` | Require every enabled Consumer to own at least one active credential at the supplied time. Disabled Consumers are exempt. |
+| `minimumContinuousValiditySeconds` | Require every enabled Consumer to have at least one enabled credential throughout the interval from the supplied time to the supplied time plus this positive number of seconds. |
+
+The continuous-validity rule is a deployment check for scheduled rotations.
+It tests each enabled Consumer's credential windows independently. The interval
+includes the supplied time and excludes the end. For a check at time 120 with
+`{"minimumContinuousValiditySeconds": 120}`, a credential expiring at 180 and a
+successor starting at 180 and expiring at 240 provide continuous coverage.
+Starting the successor at 181 leaves a gap. Overlapping windows and unbounded
+ends also count. Disabled credentials are ignored, and disabled Consumers are
+exempt. A duration that would place the end past the signed 64-bit Unix-second
+limit is rejected.
+
+Coverage can be provided by any combination of credential methods for the same
+Consumer. Combine the rule with a single-method `allowedMethods` policy when
+checking a snapshot dedicated to that method. The check measures configured
+credential validity. Gateway adoption is a separate deployment step.
 
 ### Targeted credential validity windows
 

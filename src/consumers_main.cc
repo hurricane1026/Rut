@@ -846,6 +846,58 @@ bool policy_each_consumer_active(PolicySnapshot& snapshot, u32) {
     return true;
 }
 
+bool policy_consumer_covers_window(PolicySnapshot& snapshot, u32 consumer, i64 horizon) {
+    struct Window {
+        i64 start;
+        i64 end;
+    };
+    constexpr i32 kMaxWindows = 64;
+    Window windows[kMaxWindows];
+    i32 count = 0;
+    auto& doc = snapshot.registry;
+    const u32 kId = field(doc, consumer, lit_str("id"));
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (!policy_enabled(doc, record) ||
+            !equal(doc, field(doc, record, lit_str("consumerId")), doc, kId))
+            continue;
+        if (count == kMaxWindows) return false;
+        const Window kWindow{policy_time(doc, record, lit_str("notBefore")),
+                             policy_time(doc, record, lit_str("expiresAt"))};
+        // Keep windows in activation order so one scan can find the first gap.
+        i32 slot = count;
+        while (slot > 0 && windows[slot - 1].start > kWindow.start) {
+            windows[slot] = windows[slot - 1];
+            --slot;
+        }
+        windows[slot] = kWindow;
+        ++count;
+    }
+    i64 covered_until = snapshot.now;
+    for (i32 i = 0; i < count; ++i) {
+        const auto& window = windows[i];
+        if (window.start > covered_until) return false;
+        if (!window.end || window.end >= horizon) return true;
+        if (window.end > covered_until) covered_until = window.end;
+    }
+    return false;
+}
+
+bool policy_continuous_validity(PolicySnapshot& snapshot, u32 value) {
+    i64 seconds = 0, horizon = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, seconds) ||
+        __builtin_add_overflow(snapshot.now, seconds, &horizon))
+        return false;
+    auto& doc = snapshot.registry;
+    for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
+         consumer = doc.nodes[consumer].next) {
+        if (policy_enabled(doc, consumer) &&
+            !policy_consumer_covers_window(snapshot, consumer, horizon))
+            return false;
+    }
+    return true;
+}
+
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
@@ -854,6 +906,7 @@ constexpr PolicyRule kPolicyRules[] = {
     {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},
     {lit_str("minimumActiveCredentials"), false, policy_minimum_active},
     {lit_str("requireActiveCredentialForEnabledConsumers"), true, policy_each_consumer_active},
+    {lit_str("minimumContinuousValiditySeconds"), false, policy_continuous_validity},
 };
 
 int evaluate_deployment_policy(json::Document& registry, const char* policy_path, i64 now) {
