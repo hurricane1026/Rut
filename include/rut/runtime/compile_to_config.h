@@ -2,6 +2,7 @@
 
 #include "rut/compiler/password_profile.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/timer_wheel.h"
 
 // Bridge header: copy the RIR module's declarative content (upstreams
 // with addresses, response bodies, response header sets) into a
@@ -561,7 +562,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             !mod.upstreams[i].passive_health.valid() ||
             (mod.upstreams[i].passive_health.enabled && mod.upstreams[i].http2) ||
             mod.upstreams[i].connect_attempts == 0 ||
-            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends)
+            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends ||
+            mod.upstreams[i].connect_timeout_seconds >= TimerWheel::kSlots)
             return false;
 
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
@@ -611,6 +613,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
+            cfg.upstreams[i].connect_timeout_seconds = up.connect_timeout_seconds;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -669,6 +672,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
+            cfg.upstreams[i].connect_timeout_seconds = up.connect_timeout_seconds;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

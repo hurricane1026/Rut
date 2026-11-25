@@ -128,6 +128,7 @@ struct SyncSendCompletionGuard {
 // have been harvested. Includes armed flag management, cancel SQE tracking,
 // deferred accepts, and reclaim_pending/reclaim_slot machinery.
 struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
+    static constexpr bool kSupportsConnectTimeout = true;
     bool study_direct_body = false;
     bool study_selective_vector = false;
     u64 study_direct_body_attempts = 0;
@@ -8560,6 +8561,11 @@ public:
                             resume_jit_handler<IoUringEventLoop>(this, *c);
                         } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
                             grpc_tick<IoUringEventLoop>(this, *c);
+                        } else if (c->connect_timeout_episode != 0 &&
+                                   c->connect_timeout_episode == c->upstream_episode) {
+                            c->connect_timeout_episode = 0;
+                            record_passive_timeout(this, *c);
+                            this->close_conn(*c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
@@ -9146,7 +9152,7 @@ public:
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
                         if (!conn.h1_tls_transport && !conn.throttle_paused &&
-                            !conn.ws_shutdown_deadline_armed &&
+                            conn.connect_timeout_episode == 0 && !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

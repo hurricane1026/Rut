@@ -6,6 +6,7 @@
 #include <new>
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -239,6 +240,128 @@ void timeout_and_reclaim(rut::test::TestCase* _tc) {
     REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
     CHECK_EQ(rig.loop->active_count(), 0u);
     CHECK_EQ(rig.metrics.connections_closed, 0u);
+}
+
+template <typename Loop>
+void connect_timeout_wheel_ownership(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->on_upstream_send = &on_upstream_connected<Loop>;
+    const u32 episode = c->upstream_episode;
+    auto& target = rig.owner.config->upstreams[0];
+    arm_connect_timeout(rig.loop, *c, target);  // Omission leaves the timer alone.
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    target.connect_timeout_seconds = 2;
+    c->is_health_probe = true;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    c->is_health_probe = false;
+    c->tls_active = true;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    c->tls_active = false;
+    target.http2 = true;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    target.http2 = false;
+    c->on_upstream_send = nullptr;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, 0u);
+    c->on_upstream_send = &on_upstream_connected<Loop>;
+    arm_connect_timeout(rig.loop, *c, target);
+    CHECK_EQ(c->connect_timeout_episode, episode);
+    u32 expired = 0;
+    for (u32 i = 0; i < 2; ++i) rig.loop->timer.tick([&](Connection*) { ++expired; });
+    CHECK_EQ(expired, 0u);
+    rig.loop->timer.tick([&](Connection* value) {
+        CHECK(value == c);
+        ++expired;
+    });
+    CHECK_EQ(expired, 1u);
+    c->connect_timeout_episode = 0;
+    rig.loop->free_conn(*c);
+}
+
+TEST(health_probe, epoll_connect_timeout_wheel_ownership) {
+    connect_timeout_wheel_ownership<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_connect_timeout_wheel_ownership) {
+    connect_timeout_wheel_ownership<IoUringEventLoop>(_tc);
+}
+
+template <typename Loop>
+void connect_timeout_closes_and_drains_pending_connect(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.loop->upstream_timeout = 10;
+    auto& target = rig.owner.config->upstreams[0];
+    target.connect_timeout_seconds = 1;
+    reset_backend_health();
+    target.passive_health.enabled = true;
+    target.passive_health.timeouts = 2;
+    target.passive_health.successes = 1;
+    target.passive_health.healthy_statuses[0] = 1;
+    // A full listen queue leaves a real second loopback TCP connect pending.
+    REQUIRE_EQ(listen(rig.listener.fd, 0), 0);
+    Socket filler;
+    filler.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(filler.fd >= 0);
+    REQUIRE_EQ(connect(filler.fd,
+                       reinterpret_cast<const sockaddr*>(&target.addrs[0]),
+                       sizeof(target.addrs[0])),
+               0);
+    Socket peer;
+    int downstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    peer.fd = downstream[1];
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    const u32 id = c->id;
+    c->fd = downstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(c->upstream_fd >= 0);
+    c->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    REQUIRE(rig.loop->submit_connect(*c, &target.addrs[0], sizeof(target.addrs[0])));
+    const u32 episode = c->upstream_episode;
+    arm_connect_timeout(rig.loop, *c, target);
+    rig.pump();  // Submit any queued io_uring SQE and detect unexpected completion.
+    REQUIRE_EQ(c->connect_timeout_episode, episode);
+    pollfd pending{c->upstream_fd, POLLOUT, 0};
+    REQUIRE_EQ(poll(&pending, 1, 0), 0);
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(c->connect_timeout_episode, episode);
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    char byte = 0;
+    CHECK_EQ(recv(peer.fd, &byte, 1, 0), 0);
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health);
+    CHECK_EQ(health->passive_timeouts, 1u);
+    rig.loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
+    CHECK_EQ(health->passive_timeouts, 1u);
+    if constexpr (requires { rig.loop->backend.sq_head; }) {
+        CHECK_EQ(c->upstream_close_episode, episode);
+        CHECK((c->upstream_close_target_owned & kUpstreamOpConnect) != 0);
+    }
+    REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+    CHECK_EQ(rig.loop->conns[id].pending_ops, 0u);
+    reset_backend_health();
+}
+
+TEST(health_probe, epoll_connect_timeout_dispatch) {
+    connect_timeout_closes_and_drains_pending_connect<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_connect_timeout_dispatch) {
+    connect_timeout_closes_and_drains_pending_connect<IoUringEventLoop>(_tc);
 }
 
 template <typename Loop>

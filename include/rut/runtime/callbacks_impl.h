@@ -2718,6 +2718,23 @@ inline bool request_fully_resendable(const Connection& conn) {
 // risks executing it twice. Returns true (a fresh connect was started → caller
 // returns) or false (caller runs its normal failure handling, e.g. 502/close).
 // One-shot: clears upstream_reused so a fresh-connect failure isn't retried again.
+// The connection wheel is owned by this exact TCP attempt until its completion.
+// Other I/O must not refresh it; expiration follows the existing timeout teardown.
+template <typename Loop>
+void arm_connect_timeout(Loop* loop, Connection& conn, const UpstreamTarget& target) {
+    if constexpr (requires { Loop::kSupportsConnectTimeout; }) {
+        if (target.connect_timeout_seconds != 0 && !target.http2 && !target.tls.enabled &&
+            conn.protocol == ConnProtocol::Http11 && !conn.tls_active && !conn.is_health_probe &&
+            conn.state == ConnState::Proxying &&
+            conn.on_upstream_send == &on_upstream_connected<Loop> &&
+            conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+            !conn.failure_policy_suppress_body && conn.timeout_failure_policy_id == 0) {
+            conn.connect_timeout_episode = conn.upstream_episode;
+            loop->timer.refresh(&conn, target.connect_timeout_seconds);
+        }
+    }
+}
+
 template <typename Loop>
 bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!conn.upstream_reused) return false;
@@ -2791,6 +2808,7 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
         (void)detach_upstream_close(loop, conn);
         return false;
     }
+    arm_connect_timeout(loop, conn, target);
     return true;
 }
 
@@ -3738,6 +3756,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
         }
+        arm_connect_timeout(loop, conn, target);
     } else if (route && route->action == RouteAction::Static) {
         conn.resp_status = route->status_code;
         conn.keep_alive =
@@ -6105,6 +6124,7 @@ void handle_jit_outcome(Loop* loop,
                 }
                 return;
             }
+            arm_connect_timeout(loop, conn, target);
             return;
         }
         case JitDispatchOutcome::Kind::Error:
@@ -6250,8 +6270,10 @@ bool try_connect_next_backend_impl(Loop* loop,
     conn.upstream_backend_idx = static_cast<u8>(kBackend);
     conn.upstream_attempted_backends |= static_cast<u8>(1u << kBackend);
     hold_backend_active(conn, config);
-    if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend])))
+    if (loop->submit_connect(conn, &target.addrs[kBackend], sizeof(target.addrs[kBackend]))) {
+        arm_connect_timeout(loop, conn, target);
         return true;
+    }
     (void)detach_upstream_close(loop, conn);
     return false;
 }
@@ -9232,6 +9254,14 @@ inline void drop_response_mutation_snapshot(Connection& conn) {
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+
+    if (conn.connect_timeout_episode != 0 && ev.type == IoEventType::UpstreamConnect &&
+        ev.upstream_episode == conn.connect_timeout_episode &&
+        ev.upstream_episode == conn.upstream_episode) {
+        conn.connect_timeout_episode = 0;
+        if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); })
+            loop->timer.refresh(&conn, loop->upstream_timeout);
+    }
 
     // io_uring accounts a terminal Connect CQE before dispatching this callback.
     // A validated response-read owner needs the pinned configured default-502

@@ -630,6 +630,7 @@ struct Module {
         u16 extra_ports[kMaxExtraBackends] = {};
         u8 minimum_healthy_weight_percent = 0;
         u8 connect_attempts = 3;
+        u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
         u32 weight_count = 0;
         u16 backend_weights[8]{};
         // Active health-check config carried verbatim from MIR (data only; the

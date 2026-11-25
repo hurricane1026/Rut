@@ -1683,6 +1683,13 @@ do not progress these streaks, and config replacement clears them. All-ejected
 fail-open remains the default selection contract. HTTPS and gRPC health
 protocols remain absent. See [scope and tests](docs/kong-active-health.md).
 
+An upstream may set `connect_timeout` to 1–63 whole seconds for fresh
+ordinary plaintext HTTP/1 forwarding connects on Linux epoll and io_uring. Expiry records a passive timeout
+and closes the connection without a response or retry. Completed connect
+failures retain their normal attempt budget. Other protocols and explicit
+connect waits retain existing timing. Native artifact version 29 records the
+setting.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active
