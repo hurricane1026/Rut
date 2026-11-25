@@ -4531,8 +4531,11 @@ public:
             return;
         }
         --relay_budget_calls;
-        const u32 remaining =
-            static_cast<u32>(static_cast<i64>(r.segment_len) - static_cast<i64>(r.segment_sent));
+        u32 remaining = 0;
+        if (__builtin_sub_overflow(r.segment_len, r.segment_sent, &remaining)) {
+            close_conn(c);
+            return;
+        }
         const u32 write_want = remaining < relay_budget_bytes ? remaining : relay_budget_bytes;
         if (study_inside_cq) ++study_cq_splice_calls;
         const bool sampled = (++study_splice_calls[1] & 63u) == 0;
@@ -4552,19 +4555,21 @@ public:
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
-        if (n <= 0 || static_cast<u32>(n) > static_cast<u32>(static_cast<i64>(r.segment_len) -
-                                                             static_cast<i64>(r.segment_sent))) {
+        if (n <= 0 || n > static_cast<i64>(write_want)) {
             close_conn(c);
             return;
         }
-        r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) +
-                                          static_cast<i64>(static_cast<u32>(n)));
-        relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
+        const u32 sent = static_cast<u32>(n);
+        // write_want bounds both the segment progress and the turn budget.
+        r.segment_sent =
+            static_cast<u32>(static_cast<i64>(r.segment_sent) + static_cast<i64>(sent));
+        relay_budget_bytes =
+            static_cast<u32>(static_cast<i64>(relay_budget_bytes) - static_cast<i64>(sent));
         __builtin_add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
         if (study_inside_cq)
             __builtin_add_overflow(
                 study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
-        __builtin_add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
+        c.add_response_bytes(sent);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the

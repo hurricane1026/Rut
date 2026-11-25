@@ -842,11 +842,12 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < 4; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? static_cast<u32>(static_cast<i64>(r.segment_len) -
-                                                        static_cast<i64>(r.segment_sent))
-                                     : (c.resp_body_remaining < kResponseSpliceChunkSize
-                                            ? c.resp_body_remaining
-                                            : kResponseSpliceChunkSize);
+            u32 want = c.resp_body_remaining < kResponseSpliceChunkSize ? c.resp_body_remaining
+                                                                        : kResponseSpliceChunkSize;
+            if (writing && __builtin_sub_overflow(r.segment_len, r.segment_sent, &want)) {
+                this->close_conn(c);
+                return;
+            }
             ssize_t n;
             do {
                 n = writing ? ::splice(r.pipe_read,
@@ -866,15 +867,16 @@ public:
                 if (!arm_epoll_splice(c, writing)) this->close_conn(c);
                 return;
             }
-            if (n <= 0 || static_cast<u32>(n) > want) {
+            if (n <= 0 || n > static_cast<i64>(want)) {
                 this->close_conn(c);
                 return;
             }
             if (writing) {
-                r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) +
-                                                  static_cast<i64>(static_cast<u32>(n)));
-                c.resp_body_sent = static_cast<u32>(static_cast<i64>(c.resp_body_sent) +
-                                                    static_cast<i64>(static_cast<u32>(n)));
+                const u32 sent = static_cast<u32>(n);
+                // The syscall returned at most the bytes left in this segment.
+                r.segment_sent =
+                    static_cast<u32>(static_cast<i64>(r.segment_sent) + static_cast<i64>(sent));
+                c.add_response_bytes(sent);
                 if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
                 if (r.segment_len == 0 && c.resp_body_remaining == 0) {
                     const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;

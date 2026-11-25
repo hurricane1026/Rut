@@ -90740,7 +90740,10 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
     REQUIRE_EQ(ready[0].type, IoEventType::RelayRead);
     CHECK_EQ(ready[0].upstream_episode, 1u);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+    // The byte count can include a header on top of a u32 Content-Length.
+    c->resp_body_sent = UINT32_MAX - 1;
     g.loop->dispatch(ready[0]);
+    CHECK_EQ(c->resp_body_sent, UINT32_MAX);
     CHECK_EQ(c->resp_body_remaining, 2u * kChunk);
     REQUIRE_EQ(recv(downstream[1], received, sizeof(received), 0),
                static_cast<ssize_t>(sizeof(received)));

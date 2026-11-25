@@ -2211,8 +2211,7 @@ inline bool proxy_body_complete(const Connection& conn) {
 // tls_active before touching conn again.
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(newly));
+    conn.add_response_bytes(newly);
     throttle_advance(conn, newly);
     if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
     conn.upstream_send_len = conn.tls_send_len;
@@ -10898,8 +10897,7 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     conn.response_read_deadline_post_commit_inflight_body = available;
     conn.resp_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) - static_cast<i64>(available));
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(available));
+    conn.add_response_bytes(available);
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
@@ -10933,8 +10931,7 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
         conn.upstream_relay_slice = sending;
         conn.upstream_recv_buf.bind(next, loop->relay_buffer_capacity(next));
         conn.upstream_relay_send_len = send_len;
-        conn.resp_body_sent =
-            static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
+        conn.add_response_bytes(send_len);
         conn.state = ConnState::Sending;
         conn.set_slots(
             nullptr, &on_response_body_sent<Loop>, &on_response_body_recvd<Loop>, nullptr);
@@ -11105,8 +11102,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 // the unencrypted tail and pause the upstream read; the drain (and,
                 // for NeedRead, the next client recv) re-encrypt it via
                 // proxy_tls_parked_drained rather than truncating the download.
-                conn.resp_body_sent =
-                    static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(enc));
+                conn.add_response_bytes(enc);
                 throttle_advance(conn, enc);
                 conn.upstream_send_len = enc;
                 consume_upstream_sent(conn);  // shift past encrypted; tail now at front
@@ -11126,9 +11122,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            conn.resp_body_sent =
-                static_cast<u32>(static_cast<i64>(conn.resp_body_sent) +
-                                 static_cast<i64>(enc));  // enc == send_len on Done
+            conn.add_response_bytes(enc);  // enc == send_len on Done
             throttle_advance(conn, enc);
             const bool kBodyDone = proxy_body_complete(conn);
             conn.upstream_send_len = enc;
@@ -11196,8 +11190,7 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(send_len));
+    conn.add_response_bytes(send_len);
     conn.upstream_send_len = send_len;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
     client_send(loop, conn, conn.upstream_recv_buf.data(), send_len);
