@@ -554,7 +554,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
                                    target.hc_expected_status,
                                    target.hc_thresholds,
                                    target.hc_timeout_ms) ||
-        ((target.tls.enabled || target.http2) && target.hc_type != ActiveHealthType::Tcp))
+        (target.http2 && target.hc_type != ActiveHealthType::Tcp))
         return false;
 
     // Reserve a margin of Connection slots for real client traffic. Near
@@ -568,8 +568,9 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // 32-probe sweep burst yet is negligible against kMaxConns (16384), so it
     // never meaningfully reduces real-traffic capacity. Checked before
     // set_probe_in_flight so a deferral leaves no guard to clear.
-    static constexpr u32 kHealthProbeSlotReserve = 64;
-    if (loop->free_conn_slots() <= kHealthProbeSlotReserve) return false;
+    // An HTTPS probe also needs a child TLS transport slot.
+    const u32 kSlotFloor = target.tls.enabled && target.hc_type != ActiveHealthType::Tcp ? 65 : 64;
+    if (loop->free_conn_slots() <= kSlotFloor) return false;
 
     // At most one outstanding probe per backend (see probe_in_flight). A backend
     // that accepts but never responds otherwise accumulates a probe Connection per

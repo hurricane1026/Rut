@@ -444,7 +444,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_health_probes test_health_probes.cc)
     target_link_libraries(test_health_probes PRIVATE rut_runtime)
     target_include_directories(test_health_probes PRIVATE ${PROJECT_SOURCE_DIR}/testing)
-    target_compile_definitions(test_health_probes PRIVATE RUT_TESTING=1)
+    target_compile_definitions(test_health_probes PRIVATE RUT_TESTING=1
+        RUT_TLS_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
     add_test(NAME test_health_probes COMMAND test_health_probes)
     set_tests_properties(test_health_probes PROPERTIES LABELS "unit;network;kong-core" TIMEOUT 60)
     set(HEALTH_PROBE_CHECK_COMMAND COMMAND $<TARGET_FILE:test_health_probes>)
@@ -5897,6 +5898,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_tcp_health.py
                 --server $<TARGET_FILE:rut> --backend ${health_backend})
         set_tests_properties(test_tcp_health_${health_backend} PROPERTIES
+            LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME test_https_health_${health_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_https_health.py
+                --server $<TARGET_FILE:rut> --backend ${health_backend})
+        set_tests_properties(test_https_health_${health_backend} PROPERTIES
             LABELS "integration;network;health;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_active_health_${health_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_active_health.py

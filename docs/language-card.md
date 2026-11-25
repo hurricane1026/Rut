@@ -816,7 +816,7 @@ Each shard/target has at most one probe, including cancellation drain. Weight 0
 suppresses probes and forwarding. Probe capacity is bounded and reserved away
 from client slots; drain starts no new probes. Configuration replacement drops
 old results, including reuse of a configuration address. Existing all-ejected
-fail-open selection remains unchanged. HTTPS and application-level HTTP/2/gRPC probes are absent; TCP probes are described below.
+fail-open selection remains unchanged. HTTP probes on TLS upstreams verify the configured CA and server name before sending HTTP/1.1. Application-level HTTP/2/gRPC probes are absent; TCP probes are described below.
 See [active-health scope and verification](kong-active-health.md).
 
 Active probes also accept `type: .tcp`:

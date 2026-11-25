@@ -11,13 +11,19 @@ namespace rut {
 // ledger, including io_uring CQEs that outlive logical request teardown.
 struct H1TlsUpstream {
     TlsClientContext context{};
+    UpstreamTlsSpec tls_spec{};
     Connection* owner = nullptr;
     Connection* transport = nullptr;
+    bool local_setup_failure = false;
     bool ready = false;
     bool receiving = false;
     bool driving = false;
     bool eof = false;
 };
+
+inline void h1_tls_mark_local_setup_failure(Connection& transport) {
+    if (transport.h1_tls_transport) transport.h1_tls_transport->local_setup_failure = true;
+}
 
 template <typename Loop>
 bool h1_tls_connect(Loop*, Connection&, const void*, u32);
@@ -37,7 +43,7 @@ bool h1_tls_dispatch_owner_event(Loop*, Connection&, IoEvent);
 template <typename Loop>
 void h1_tls_refresh_timer(Loop* loop, Connection& owner) {
     if constexpr (requires { loop->timer.refresh(&owner, loop->upstream_timeout); }) {
-        if (!owner.throttle_paused && !owner.ws_shutdown_deadline_armed)
+        if (!owner.is_health_probe && !owner.throttle_paused && !owner.ws_shutdown_deadline_armed)
             loop->timer.refresh(&owner,
                                 owner.h2 && (owner.h2->grpc.active || owner.h2->grpc.upstream) ? 1
                                 : owner.state == ConnState::Proxying ? loop->upstream_timeout

@@ -161,7 +161,7 @@ public:
                 self().pool.alloc();
                 self().backend.add_send_tls(c, c.send_buf.data(), 1u);
             }) {
-            if (!c.is_health_probe && c.request_config &&
+            if ((!c.is_health_probe || !c.health_probe_tcp) && c.request_config &&
                 c.upstream_idx < c.request_config->upstream_count) {
                 const auto& target = c.request_config->upstreams[c.upstream_idx];
                 if (target.tls.enabled && !target.http2 && !c.h1_tls_transport &&

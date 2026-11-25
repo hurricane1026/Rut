@@ -570,6 +570,7 @@ public:
     }
 
     void free_conn_impl(Connection& c) {
+        if (c.health_probe_guard_inherited) release_health_probe_guard(c);
         u32 cid = c.id;
         timer.remove(&c);
         free_ws_handshake_slice(c.ws_handshake_slice);
@@ -630,6 +631,7 @@ public:
     // side-effects apply. Removes the probe socket from kqueue, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
+        if (c.h1_tls_upstream) h1_tls_detach(this, c);
         release_health_probe_guard(c);
         (void)backend.detach_upstream(c);
         if (c.id < KqueueBackend::kMaxFdMap) {
