@@ -13,14 +13,13 @@ template <typename Size>
                                            Size used,
                                            const char* data,
                                            Size len) {
-    if (data == nullptr || len > used) return false;
+    if (data == nullptr) return false;
+    Size remaining;
+    if (__builtin_sub_overflow(used, len, &remaining)) return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
     uintptr_t offset = 0;
     if (__builtin_sub_overflow(ptr, begin, &offset)) return false;
-    Size remaining;
-    // len <= used above proves the unsigned difference fits in Size.
-    (void)__builtin_sub_overflow(used, len, &remaining);
     return offset <= remaining;
 }
 

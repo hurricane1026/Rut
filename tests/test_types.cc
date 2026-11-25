@@ -29,6 +29,7 @@ TEST(byte_span, checks_64_bit_length_arithmetic) {
     CHECK_FALSE(byte_span_within(pool, kLimit64Signed - 1, pool, kLimit64Signed));
     CHECK(byte_span_within(pool, kLargest, pool, kLargest));
     CHECK_FALSE(byte_span_within(pool, kLargest, pool + 1, kLargest));
+    CHECK_FALSE(byte_span_within(pool + 1, kLargest, pool, u64{0}));
     CHECK(byte_span_within(pool, size_t{3}, pool + 2, size_t{1}));
 }
 
