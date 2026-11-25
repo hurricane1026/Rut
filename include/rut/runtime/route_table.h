@@ -790,9 +790,11 @@ public:
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes ||
             exact_count > kMaxExactStrictLocalResponseBindings)
             return false;
+        const i64 exact_count_signed = static_cast<i64>(exact_count);
         if (!exact_strict_local_response_binding_range_is_neutral(
-                exact_strict_local_response_bindings + exact_count,
-                kMaxExactStrictLocalResponseBindings - exact_count))
+                exact_strict_local_response_bindings + exact_count_signed,
+                static_cast<u32>(static_cast<i64>(kMaxExactStrictLocalResponseBindings) -
+                                 exact_count_signed)))
             return false;
         bool referenced[kMaxStrictLocalResponsePolicies]{};
         for (u32 i = 0; i < strict_local_response_policy_count; i++) {
