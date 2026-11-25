@@ -1751,6 +1751,36 @@ TEST(https_fetch, jwks_discovery_rejects_mismatched_origin_and_uninitialized_fet
     CHECK_EQ(partial.state(), JwksFetch::State::Idle);
 }
 
+TEST(https_fetch, jwks_dns_https_requires_resolver_ca_and_hostname) {
+    signal(SIGPIPE, SIG_IGN);
+    TlsOrigin origin;
+    origin.responses[0] = lit_str("HTTP/1.1 500 Error\r\nContent-Length: 0\r\n\r\n");
+    origin.count = 1;
+    REQUIRE(origin.init());
+    RemoteJwks configuration;
+    configuration.endpoint = origin.endpoint();
+    strcpy(configuration.dns_address, configuration.endpoint.address);
+    strcpy(configuration.allowed_addresses[0], configuration.endpoint.address);
+    configuration.allowed_count = 1;
+    configuration.dns_transport = RemoteJwks::DnsTransport::Https;
+    configuration.dns_https_port = origin.port;
+    strcpy(configuration.dns_https_path, "/dns-query");
+    configuration.dns_tls = configuration.endpoint.tls;
+    strcpy(configuration.dns_tls.server_name, "wrong-resolver.example");
+
+    JwksFetch wrong_name;
+    REQUIRE(wrong_name.init(configuration));
+    REQUIRE(wrong_name.start(jwt_monotonic_ms(), 2000));
+    complete_jwks(wrong_name);
+    CHECK_EQ(wrong_name.state(), JwksFetch::State::Failed);
+    CHECK_EQ(__atomic_load_n(&origin.served, __ATOMIC_ACQUIRE), 0u);
+
+    strcpy(configuration.dns_tls.ca, "/missing/rut-test-ca.pem");
+    JwksFetch missing_ca;
+    CHECK(!missing_ca.init(configuration));
+    CHECK(!missing_ca.start(jwt_monotonic_ms(), 2000));
+}
+
 TEST(https_fetch, jwks_dns_cache_owns_answers_until_cap_and_cancel) {
     signal(SIGPIPE, SIG_IGN);
     DnsOrigin dns;

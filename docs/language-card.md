@@ -3100,11 +3100,14 @@ inventory; remote
 mode **rejects all tokens until its first successful authenticated fetch**. It
 never serves those initial keys as an offline cache. Endpoint fields are trusted
 configuration, never token/HTTP-request data. The address is a bare IPv4 or IPv6
-literal. Optional `dnsAddress`/`dnsPort`/`allowedAddresses` enable bounded
-UDP, TCP or DNS-over-TLS with CNAME chains; `dnsTransport` accepts `"udp"`
-(default), `"tcp"` or `"tls"` and never falls back between them. TLS requires
-`dnsTlsServerName`/`dnsTlsCa` and optional `dnsTlsPort` (default 853). The
-default `dnsRecordType` is `"A"`. Choose `"AAAA"`
+literal. Optional `dnsAddress` and `allowedAddresses` enable bounded
+UDP, TCP, DNS-over-TLS or DNS-over-HTTPS with CNAME chains. `dnsTransport`
+accepts `"udp"` (default), `"tcp"`, `"tls"` or `"https"` with no transport
+fallback. `dnsPort` applies to UDP and TCP. TLS and HTTPS require
+`dnsTlsServerName`/`dnsTlsCa`. For `"tls"`,
+`dnsTlsPort` defaults to 853. For `"https"`, configure `dnsHttpsPath` and
+optionally `dnsHttpsPort` (default 443) for the bounded binary POST profile.
+The default `dnsRecordType` is `"A"`. Choose `"AAAA"`
 to use an IPv6 allowlist. Duplicate addresses, including equivalent IPv6 spellings, fail
 configuration validation. Optional `requireNonEmptyKeys` rejects refreshes
 with no approved keys and keeps the last snapshot only within its original maximum

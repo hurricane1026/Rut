@@ -6,6 +6,7 @@
 #include "rut/runtime/tls.h"
 
 namespace rut {
+inline constexpr u32 kJwksDnsMessageLimit = 512;
 // Trusted, pointer-free HTTP/1.1-over-TLS endpoint. A fixed IP address avoids
 // blocking DNS and request-driven resolution. Hostname/CA always authenticate TLS.
 struct HttpsEndpoint {
@@ -29,6 +30,7 @@ public:
     void reset(bool authorization = false);
     void reset_callout();
     void reset_jwks(bool conditional, bool retry_after = false);
+    void reset_dns();
     u16 status() const { return status_; }
     Str unique_header(Str name) const;
     bool headers(ParsedResponse& response) const;
@@ -48,6 +50,7 @@ private:
     bool callout_ = false;
     bool conditional_jwks_ = false;
     bool retry_after_jwks_ = false;
+    bool dns_ = false;
     u16 status_ = 0;
     bool headers_ = false;
     bool chunked_ = false;
@@ -71,6 +74,8 @@ public:
     // Authorization profile: caller supplies a complete bounded HTTP request.
     bool init_authorization(const HttpsEndpoint& endpoint, Str request);
     bool init_callout(const HttpsEndpoint& endpoint, Str request);
+    bool init_dns(const HttpsEndpoint& endpoint);
+    bool set_dns_query(Str query);
     bool headers(ParsedResponse& response) const { return response_.headers(response); }
     u16 status() const { return state_ == State::Done ? response_.status() : 0; }
     Str unique_header(Str name) const { return response_.unique_header(name); }
@@ -93,6 +98,7 @@ private:
     bool callout_ = false;
     bool conditional_jwks_ = false;
     bool retry_after_jwks_ = false;
+    bool dns_ = false;
     bool connect_failed_ = false;
     char request_[6144]{};
     u32 request_len_ = 0;

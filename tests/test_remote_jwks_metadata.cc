@@ -148,6 +148,41 @@ TEST(remote_jwks_metadata, dns_transport_is_explicit_and_bounded) {
     }
 }
 
+TEST(remote_jwks_metadata, dns_https_requires_a_fixed_authenticated_resolver) {
+    const char* base =
+        R"("address":"192.0.2.1","port":443,"serverName":"issuer.example","ca":"ca.pem",)"
+        R"("path":"/keys","refreshSeconds":1,"maxAgeSeconds":3,"timeoutSeconds":1)";
+    const char* dns = R"(,"dnsAddress":"2001:db8::53","allowedAddresses":["192.0.2.1"])";
+    const char* https =
+        R"(,"dnsTransport":"https","dnsTlsServerName":"resolver.example","dnsTlsCa":"resolver.pem")";
+    RemoteJwks configuration;
+    const auto load = [&](const char* resolver, const char* extra) {
+        char bytes[1024];
+        const int size = snprintf(bytes, sizeof(bytes), "{%s%s%s}", base, resolver, extra);
+        if (size <= 0 || static_cast<u32>(size) >= sizeof(bytes)) return false;
+        json::Document document;
+        return document.parse({bytes, static_cast<u32>(size)}) && configuration.load(document, 0);
+    };
+    char resolver[512];
+    REQUIRE(snprintf(resolver, sizeof(resolver), "%s%s", dns, https) > 0);
+    REQUIRE(load(resolver, R"(,"dnsHttpsPath":"/resolver?tenant=prod")"));
+    CHECK(configuration.dns_transport == RemoteJwks::DnsTransport::Https);
+    CHECK(configuration.dns_tls.enabled);
+    CHECK(configuration.dns_https_port == 443);
+    CHECK(strcmp(configuration.dns_https_path, "/resolver?tenant=prod") == 0);
+    REQUIRE(load(resolver, R"(,"dnsHttpsPath":"/dns-query","dnsHttpsPort":8443)"));
+    CHECK(configuration.dns_https_port == 8443);
+    CHECK(!load(resolver, ""));
+    CHECK(!load(resolver, R"(,"dnsHttpsPath":"https://other.example/dns-query")"));
+    CHECK(!load(resolver, R"(,"dnsHttpsPath":"/dns-query#fragment")"));
+    CHECK(!load(resolver, R"(,"dnsHttpsPath":"/dns-query","dnsPort":443)"));
+    CHECK(!load(resolver, R"(,"dnsHttpsPath":"/dns-query","dnsTlsPort":443)"));
+    CHECK(!load(resolver, R"(,"dnsHttpsPath":"/dns-query","dnsHttpsPort":65536)"));
+    CHECK(!load(dns, R"(,"dnsTransport":"tcp","dnsHttpsPath":"/dns-query")"));
+    CHECK(!load(dns, R"(,"dnsTransport":"https","dnsHttpsPath":"/dns-query")"));
+    CHECK(!load(https, R"(,"dnsHttpsPath":"/dns-query")"));
+}
+
 TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     const char* invalid[] = {"http://issuer.example",
                              "https://user@issuer.example",

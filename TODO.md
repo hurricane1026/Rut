@@ -925,7 +925,7 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   integration; scope/group authorization remains separate from authentication.
 - [x] Bounded remote ES256 JWKS refresh with authenticated fixed endpoints,
   approved-kid rotation, maximum-age expiry, idle maintenance and cancellation.
-- [ ] DNS/discovery, other remote JWKS profiles, other EC profiles and ES signing.
+- [ ] Additional discovery and remote JWKS profiles, other EC profiles and ES signing.
 
 
 ### Free authentication foundation profiles
@@ -937,7 +937,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   write or cleanup failure.
 - [x] Opt-in local AOF-confirmed replay claims with a bounded same-connection
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL recovery tests.
-- [x] Bounded A/AAAA DNS over UDP, explicit TCP or verified DNS-over-TLS,
+- [x] Bounded A/AAAA DNS over UDP, explicit TCP, verified DNS-over-TLS or
+  verified DNS-over-HTTPS POST,
   CNAME, issuer/JWKS-URI discovery, optional separately trusted fixed discovery
   origin and configured IP allowlists for RS256/ES256 refresh, with existing
   monotonic cache expiry.
@@ -959,9 +960,7 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   requests and admitted HTTP/2 gRPC targets.
 - [ ] Remaining #1072 interfaces include online administrative management and
   online scheduling/revocation publication.
-- [ ] Replicated persistence/failover verification for the replay authority beyond
-  the tested single-instance intact-AOF recovery profile; DNS-over-HTTPS
-  remains separately scoped.
+- [ ] Replay-store failover and fencing beyond verified persistence profiles.
 - [ ] Online signing-key refresh and replicated key coordination remain separate.
 
 Contracts and executable coverage: `docs/consumer-registry.md`,
