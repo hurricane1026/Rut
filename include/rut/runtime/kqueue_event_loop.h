@@ -570,6 +570,7 @@ public:
     }
 
     void free_conn_impl(Connection& c) {
+        if (c.health_probe_guard_inherited) release_health_probe_guard(c);
         u32 cid = c.id;
         timer.remove(&c);
         free_ws_handshake_slice(c.ws_handshake_slice);

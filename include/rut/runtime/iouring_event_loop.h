@@ -3208,7 +3208,8 @@ public:
         // Every deferred slot enters pending_free in free_conn_impl. Refusing
         // an unowned reclaim makes duplicate finals idempotent.
         if (!was_pending) return;
-        if (conns[cid].is_health_probe) release_health_probe_guard(conns[cid]);
+        if (conns[cid].is_health_probe || conns[cid].health_probe_guard_inherited)
+            release_health_probe_guard(conns[cid]);
         if (conns[cid].recv_slice) {
             pool.free(conns[cid].recv_slice);
             conns[cid].recv_slice = nullptr;
@@ -3260,7 +3261,8 @@ public:
                 !conns[cid].relay_owner.write_cancel_retry &&
                 !conns[cid].relay_owner.close_pending && conns[cid].relay_owner.segment_len == 0 &&
                 conns[cid].response_read_timer_owner_is_neutral()) {
-                if (conns[cid].is_health_probe) release_health_probe_guard(conns[cid]);
+                if (conns[cid].is_health_probe || conns[cid].health_probe_guard_inherited)
+                    release_health_probe_guard(conns[cid]);
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
                     conns[cid].recv_slice = nullptr;
@@ -3415,7 +3417,7 @@ public:
             if (c.upstream_relay_slice) pool.free(c.upstream_relay_slice);
             if (c.response_header_slice) pool.free(c.response_header_slice);
             c.response_body_tail.release();
-            if (c.is_health_probe) release_health_probe_guard(c);
+            if (c.is_health_probe || c.health_probe_guard_inherited) release_health_probe_guard(c);
             free_tls_in_buf(c);
             free_tls_out_buf(c);
             release_deferred_epoch(c);
@@ -3456,11 +3458,15 @@ public:
             c.response_read_deadline_send_close_cancel_owned;
         const bool epoch_leave_deferred = c.epoch_leave_deferred;
         const bool health_probe_guard_owned = c.is_health_probe;
+        const bool health_probe_guard_transferred = c.health_probe_guard_transferred;
+        const bool health_probe_guard_inherited = c.health_probe_guard_inherited;
         const u16 health_probe_upstream = c.upstream_idx;
         const u8 health_probe_backend = c.upstream_backend_idx;
         c.reset();
-        if (health_probe_guard_owned) {
-            c.is_health_probe = true;
+        if (health_probe_guard_owned || health_probe_guard_inherited) {
+            c.is_health_probe = health_probe_guard_owned;
+            c.health_probe_guard_transferred = health_probe_guard_transferred;
+            c.health_probe_guard_inherited = health_probe_guard_inherited;
             c.set_metrics_client(false);
             c.upstream_idx = health_probe_upstream;
             c.upstream_backend_idx = health_probe_backend;

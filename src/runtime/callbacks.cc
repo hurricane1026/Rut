@@ -1280,8 +1280,10 @@ template void record_probe_if_current<IoUringEventLoop>(IoUringEventLoop*, Conne
 #endif
 
 void release_health_probe_guard(Connection& conn) {
-    if (!conn.is_health_probe) return;
-    set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    if (conn.health_probe_guard_inherited ||
+        (conn.is_health_probe && !conn.health_probe_guard_transferred))
+        set_probe_in_flight(conn.upstream_idx, conn.upstream_backend_idx, false);
+    conn.health_probe_guard_inherited = false;
     conn.is_health_probe = false;
 }
 

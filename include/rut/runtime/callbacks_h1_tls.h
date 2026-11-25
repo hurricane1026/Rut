@@ -61,10 +61,21 @@ bool h1_tls_pause(Loop* loop, Connection& owner) {
         return false;
 }
 
+// Move the probe guard to the transport before either close path can free the
+// owner. It remains with the transport until its kernel operations drain.
+inline void h1_tls_transfer_probe_guard(Connection& owner, Connection& transport) {
+    if (!owner.is_health_probe || owner.health_probe_guard_transferred) return;
+    owner.health_probe_guard_transferred = true;
+    transport.health_probe_guard_inherited = true;
+    transport.upstream_idx = owner.upstream_idx;
+    transport.upstream_backend_idx = owner.upstream_backend_idx;
+}
+
 template <typename Loop>
 void h1_tls_detach(Loop* loop, Connection& owner) {
     auto* state = owner.h1_tls_upstream;
     if (!state) return;
+    h1_tls_transfer_probe_guard(owner, *state->transport);
     owner.h1_tls_upstream = nullptr;
     owner.upstream_fd = -1;
     state->owner = nullptr;
@@ -78,6 +89,7 @@ void h1_tls_closed(void* lp, Connection& transport) {
     auto* state = transport.h1_tls_transport;
     if (!state) return;
     Connection* owner = state->owner;
+    if (owner) h1_tls_transfer_probe_guard(*owner, transport);
     SSL* ssl = transport.tls_engine.ssl ? transport.tls_engine.ssl : transport.tls;
     const bool clean = state->ready && ssl && (SSL_get_shutdown(ssl) & SSL_RECEIVED_SHUTDOWN);
     const bool ready = state->ready;

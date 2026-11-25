@@ -696,6 +696,7 @@ public:
     }
 
     void free_conn_impl(Connection& c) {
+        if (c.health_probe_guard_inherited) release_health_probe_guard(c);
         close_response_splice_pipe(c);
         c.json_arena.destroy();
         u32 cid = c.id;

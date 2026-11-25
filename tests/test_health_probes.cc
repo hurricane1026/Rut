@@ -609,3 +609,86 @@ TEST(health_probe, iouring_tcp_mode_survives_destroyed_configuration) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(health_probe, iouring_tls_guard_survives_transport_reclaim) {
+    ProbeRig<IoUringEventLoop> rig;
+    REQUIRE(rig.init());
+    Connection owner{};
+    owner.is_health_probe = true;
+    owner.upstream_idx = 0;
+    owner.upstream_backend_idx = 0;
+    set_probe_in_flight(0, 0, true);
+    Connection* transport = rig.loop->alloc_conn();
+    REQUIRE(transport != nullptr);
+    const u32 id = transport->id;
+    h1_tls_transfer_probe_guard(owner, *transport);
+    release_health_probe_guard(owner);
+    CHECK(probe_in_flight(0, 0));
+    // Model an outstanding transport CQE: free_conn must retain the guard in
+    // its deferred slot until that CQE is accounted and the slot is reclaimed.
+    transport->pending_ops = 1;
+    rig.loop->free_conn(*transport);
+    CHECK(probe_in_flight(0, 0));
+    CHECK_FALSE(start_health_probe(rig.loop, 0, 0));
+    rig.loop->conns[id].pending_ops = 0;
+    rig.loop->reclaim_pending();
+    CHECK_FALSE(probe_in_flight(0, 0));
+}
+
+TEST(health_probe, tls_transport_close_transfers_guard_before_owner_callback) {
+    ProbeRig<EpollEventLoop> rig;
+    REQUIRE(rig.init());
+    Connection owner{};
+    Connection transport{};
+    owner.is_health_probe = true;
+    owner.upstream_idx = 0;
+    owner.upstream_backend_idx = 0;
+    owner.on_upstream_send = [](void*, Connection& c, IoEvent) { release_health_probe_guard(c); };
+    set_probe_in_flight(0, 0, true);
+    auto* state = reinterpret_cast<H1TlsUpstream*>(rig.loop->pool.alloc());
+    REQUIRE(state != nullptr);
+    *state = {};
+    state->owner = &owner;
+    state->transport = &transport;
+    owner.h1_tls_upstream = state;
+    transport.h1_tls_transport = state;
+    h1_tls_closed<EpollEventLoop>(rig.loop, transport);
+    CHECK(probe_in_flight(0, 0));
+    CHECK(transport.health_probe_guard_inherited);
+    release_health_probe_guard(transport);
+    CHECK_FALSE(probe_in_flight(0, 0));
+}
+
+TEST(health_probe, iouring_tls_detach_keeps_guard_until_recv_cancel_drains) {
+    ProbeRig<IoUringEventLoop> rig;
+    REQUIRE(rig.init());
+    i32 sockets[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
+    Socket peer;
+    peer.fd = sockets[1];
+    Connection owner{};
+    owner.is_health_probe = true;
+    owner.upstream_idx = 0;
+    owner.upstream_backend_idx = 0;
+    Connection* transport = rig.loop->alloc_conn();
+    REQUIRE(transport != nullptr);
+    transport->fd = sockets[0];
+    auto* state = reinterpret_cast<H1TlsUpstream*>(rig.loop->pool.alloc());
+    REQUIRE(state != nullptr);
+    *state = {};
+    state->owner = &owner;
+    state->transport = transport;
+    owner.h1_tls_upstream = state;
+    transport->h1_tls_transport = state;
+    transport->on_close = &h1_tls_closed<IoUringEventLoop>;
+    set_probe_in_flight(0, 0, true);
+    REQUIRE(rig.loop->submit_recv(*transport));
+    rig.pump();  // Submit the receive before detach requests its cancellation.
+    REQUIRE(transport->pending_ops > 0);
+    h1_tls_detach(rig.loop, owner);
+    release_health_probe_guard(owner);
+    CHECK(probe_in_flight(0, 0));
+    CHECK_FALSE(start_health_probe(rig.loop, 0, 0));
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_EQ(rig.loop->active_count(), 0u);
+}
