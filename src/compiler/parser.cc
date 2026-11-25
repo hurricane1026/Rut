@@ -2457,6 +2457,7 @@ struct Parser {
                         bool retained_header_value_trim_sp_preserve_htab = false;
                         bool have_header_names = false;
                         bool have_forwarded_proto = false;
+                        bool connection_forwarded_proto = false;
                         bool host_preserve = false;
                         bool strip_found[6] = {};
                         while (true) {
@@ -2507,10 +2508,11 @@ struct Parser {
                                                           v);
                             } else if (field_name.eq({"forwarded_proto", 15})) {
                                 seen = &have_forwarded_proto;
-                                auto value = expect_policy_case(lit_str(".http"));
+                                auto value = expect_policy_case(lit_str(".http .connection"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
-                                if (!v.eq({"http", 4}))
+                                connection_forwarded_proto = v.eq({"connection", 10});
+                                if (!v.eq({"http", 4}) && !connection_forwarded_proto)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
@@ -2624,7 +2626,9 @@ struct Parser {
                                                   kw_text);
                         }
                         stmt.forward_request_policy_id = static_cast<u16>(
-                            host_preserve ? RequestPolicyId::Http11PreserveHostLowercase
+                            host_preserve && connection_forwarded_proto
+                                ? RequestPolicyId::Http11PreserveHostConnectionProto
+                            : host_preserve ? RequestPolicyId::Http11PreserveHostLowercase
                             : retained_header_value_trim_sp_preserve_htab
                                 ? RequestPolicyId::Http11FixedTrimSpPreserveHtab
                             : have_content_length_position

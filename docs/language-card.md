@@ -1181,7 +1181,7 @@ members allowed for the field. There are no legacy string aliases.
 | `date` | `.current`; response also `.preserveOrCurrent` |
 | `head_mode` | `.reject`, `.suppressBody` |
 | `header_names` | `.lowercase` |
-| Request `forwarded_proto` | `.http` |
+| Request `forwarded_proto` | `.http`, `.connection` |
 | Response `header_order`, `status_reason` | `.upstream`, `.canonical`, respectively |
 | Response/local/failure `connection_header` | `.closeOnly` |
 | Local `header_order` | `.dateServerLength`, `.lengthTypeDateServer` |
@@ -4387,3 +4387,12 @@ nil recovery can accept them; this does not cover C heap exhaustion, which
 aborts in the fork.
 Available in HTTP handlers/helpers, not timers or WebSocket callbacks. Existing
 `matches(re"...")` retains its Vectorscan full-match Boolean behavior.
+
+### Connection-derived forwarding protocol
+
+For the HTTP/1.1 `host: .preserve` request policy, `forwarded_proto: .connection`
+sets `X-Forwarded-Proto` from the accepted connection (`https` for TLS, `http`
+for cleartext), replacing any client-supplied value. The other fields and
+admission rules of the preserve-host profile remain required. The existing
+`forwarded_proto: .http` profile retains its cleartext-only behavior. The
+upstream remains cleartext HTTP/1.1.

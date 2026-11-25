@@ -11773,3 +11773,12 @@ byte-offset `find`, `len`/`isEmpty`, bounded owned `split`, Vectorscan full-matc
 `matches`, and borrowed `regexCapture`. Swift's `Regex.Match` carrier and
 `s.match(re"")` remain absent; use `regexCapture` for participating groups.
 Runnable example: [string-core.rut](examples/string-core.rut).
+
+### Connection-derived forwarding protocol
+
+For the HTTP/1.1 `host: .preserve` request policy, `forwarded_proto: .connection`
+sets `X-Forwarded-Proto` from the accepted connection (`https` for TLS, `http`
+for cleartext), replacing any client-supplied value. The other fields and
+admission rules of the preserve-host profile remain required. The existing
+`forwarded_proto: .http` profile retains its cleartext-only behavior. The
+upstream remains cleartext HTTP/1.1.

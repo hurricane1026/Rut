@@ -91583,3 +91583,40 @@ TEST(passive_health, timer_dispatch_records_pre_response_timeout_and_reclaims_at
     close(client[1]);
     close(origin[1]);
 }
+
+TEST(request_policy, preserve_host_connection_proto_uses_transport) {
+    const u16 policy = static_cast<u16>(RequestPolicyId::Http11PreserveHostConnectionProto);
+    Connection conn{};
+    u8 recv[1024]{};
+    u8 send[1024]{};
+    sockaddr_in endpoint{};
+    auto check = [&](bool tls, const char* wire, const char* expected) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 len = static_cast<u32>(strlen(wire));
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(wire), len), len);
+        capture_request_metadata(conn);
+        conn.tls_active = tls;
+        REQUIRE(apply_request_policy(conn, endpoint, policy));
+        const u32 expected_len = static_cast<u32>(strlen(expected));
+        REQUIRE_EQ(conn.recv_buf.len(), expected_len);
+        CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), expected, expected_len), 0);
+    };
+    check(true,
+          "GET /rewritten?q=1 HTTP/1.1\r\nHost: client.example:8443\r\n"
+          "X-Forwarded-Proto: http\r\n\r\n",
+          "GET /rewritten?q=1 HTTP/1.1\r\nhost: client.example:8443\r\n"
+          "x-forwarded-proto: https\r\n\r\n");
+    check(false,
+          "GET /rewritten?q=1 HTTP/1.1\r\nHost: client.example:8443\r\n"
+          "X-Forwarded-Proto: https\r\n\r\n",
+          "GET /rewritten?q=1 HTTP/1.1\r\nhost: client.example:8443\r\n"
+          "x-forwarded-proto: http\r\n\r\n");
+    check(true,
+          "GET /rewritten?q=1 HTTP/1.1\r\nHost: client.example:8443\r\n\r\n",
+          "GET /rewritten?q=1 HTTP/1.1\r\nhost: client.example:8443\r\n"
+          "x-forwarded-proto: https\r\n\r\n");
+}

@@ -7863,7 +7863,8 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     // determination below, means the response is sent as soon as the
     // headers admit the request, with no dependence on the client ever
     // finishing the body.
-    if (request_policy_preserves_host(policy_id) && conn.tls_active)
+    if (policy_id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) &&
+        conn.tls_active)
         return RequestPolicyBodyState::Invalid;
     const u8* data = conn.recv_buf.data();
     const u32 len = conn.recv_buf.len();
@@ -8277,7 +8278,9 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     // TLS/ID4 request with an incomplete body fails closed immediately
     // rather than waiting for the rest of the body to arrive; the check
     // here is retained too, since this function can be reached directly.
-    if (conn.tls_active) return false;
+    if (policy_id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) &&
+        conn.tls_active)
+        return false;
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
 
@@ -8722,7 +8725,11 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 const bool xfp_scheme_valid =
                     is_xfp && (request_policy_name_eq(value_start, xfp_value_len, "http", 4) ||
                                request_policy_name_eq(value_start, xfp_value_len, "https", 5));
-                const bool xfp_invalid = is_xfp && !xfp_scheme_valid;
+                const bool xfp_invalid =
+                    is_xfp &&
+                    (!xfp_scheme_valid ||
+                     policy_id ==
+                         static_cast<u16>(RequestPolicyId::Http11PreserveHostConnectionProto));
                 if (!drop_fixed && !drop_te && !drop_nominated) {
                     if (is_cl) {
                         // Envoy's HTTP/1 codec forwards every header's
@@ -8753,7 +8760,10 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                     } else if (emit_te_here) {
                         if (!append_lit("te: trailers\r\n", 14)) return false;
                     } else if (xfp_invalid) {
-                        if (!append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+                        if (conn.tls_active) {
+                            if (!append_lit("x-forwarded-proto: https\r\n", 26)) return false;
+                        } else if (!append_lit("x-forwarded-proto: http\r\n", 25))
+                            return false;
                         saw_xfp = true;
                     } else {
                         if (!append_lower(hs, name_len) || !append_lit(": ", 2) ||
@@ -8766,7 +8776,12 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
                 hs = le + 2;
             }
         }
-        if (!saw_xfp && !append_lit("x-forwarded-proto: http\r\n", 25)) return false;
+        if (!saw_xfp) {
+            if (conn.tls_active) {
+                if (!append_lit("x-forwarded-proto: https\r\n", 26)) return false;
+            } else if (!append_lit("x-forwarded-proto: http\r\n", 25))
+                return false;
+        }
         if (!append_lit("\r\n", 2)) return false;
 
         new_header_len = measuring ? measured_len : conn.send_buf.len();
@@ -12859,8 +12874,7 @@ inline bool request_policy_body_response_admitted(const Connection& conn) {
                    ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead
                ? fixed_upload_head_request_policy_is_admitted(conn.request_policy_id)
                : conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
-                     conn.request_policy_id ==
-                         static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+                     request_policy_preserves_host(conn.request_policy_id);
 }
 
 // Check immediately before strict response headers are committed. The body

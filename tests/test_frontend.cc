@@ -39387,6 +39387,27 @@ route GET "/" {
     rir.destroy();
 }
 
+TEST(frontend, request_policy_preserve_host_connection_proto) {
+    const char* source = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, load_balance: .roundRobin, request_policy: {
+        version: .http11, host: .preserve, connection: .omit,
+        header_names: .lowercase, forwarded_proto: .connection,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
+    }, target_transform: { mode: .rawPrefix, strip_prefix: "/api/", replace_prefix: "/v1/" })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->items[1].route.statements[0]->forward_request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11PreserveHostConnectionProto));
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
 TEST(frontend, request_policy_preserve_host_rejects_every_other_combination) {
     const char* invalid[] = {
         // Missing header_names.

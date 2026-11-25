@@ -16444,8 +16444,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
     // proven interaction with it either. Reject explicitly here so the
     // combination fails with a precise message instead of falling through to
     // the generic response-read-timeout/buffering diagnostics below.
-    if (stmt.forward_request_policy_id ==
-            static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) &&
+    if (request_policy_preserves_host(stmt.forward_request_policy_id) &&
         (stmt.has_forward_response_read_timeout || stmt.has_forward_response_buffering ||
          (stmt.has_forward_target_transform &&
           stmt.forward_target_transform.mode == ForwardTargetTransformMode::CleanPrefix)))

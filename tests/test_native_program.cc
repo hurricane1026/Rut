@@ -4367,3 +4367,19 @@ TEST(native_program, integer_literals_execute_at_both_optimization_levels) {
         }
     }
 }
+
+TEST(native_program, preserve_host_connection_proto_policy_survives_compilation) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream backend at \"127.0.0.1:9000\"\n"
+        "route GET \"/\" { return forward(backend, load_balance: .roundRobin, request_policy: { "
+        "version: .http11, host: .preserve, connection: .omit, header_names: .lowercase, "
+        "forwarded_proto: .connection, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade, .proxyConnection] }) }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    const auto result = invoke(owner.p->config.routes[0], "GET / HTTP/1.1\r\nHost: client\r\n\r\n");
+    CHECK_EQ(result.status_code, 5u);
+}

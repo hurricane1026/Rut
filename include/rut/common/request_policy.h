@@ -70,6 +70,8 @@ enum class RequestPolicyId : u16 {
     // include/rut/runtime/callbacks_impl.h) for a direct-RIR/JIT-constructed
     // outcome that bypasses the analyzer entirely.
     Http11PreserveHostLowercase = 4,
+    // Preserve Host while deriving X-Forwarded-Proto from the downstream transport.
+    Http11PreserveHostConnectionProto = 5,
     // Reserved in the 16-bit forward-result slot for invalid direct-RIR values.
     Invalid = 0xffffu,
 };
@@ -78,17 +80,19 @@ inline bool request_policy_is_supported(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
            id == static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost) ||
            id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) ||
-           id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+           id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) ||
+           id == static_cast<u16>(RequestPolicyId::Http11PreserveHostConnectionProto);
 }
 
 inline bool request_policy_trims_sp_preserves_htab(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
 }
 
-// ID4 preserves the client's Host header verbatim instead of writing the
+// Preserve-host policies retain the client's Host header instead of writing the
 // upstream endpoint authority. Every other supported policy writes Host.
 inline bool request_policy_preserves_host(u16 id) {
-    return id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
+    return id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase) ||
+           id == static_cast<u16>(RequestPolicyId::Http11PreserveHostConnectionProto);
 }
 
 // ID3 is intentionally admitted only by the closed bodyless GET + complete-
