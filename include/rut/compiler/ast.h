@@ -418,6 +418,7 @@ struct AstUpstreamDecl {
     Str backend_lits[kMaxBackends]{};
     u8 minimum_healthy_weight_percent = 0;
     u8 connect_attempts = 3;
+    u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
     u32 weight_count = 0;
     u16 backend_weights[kMaxBackends]{};
 

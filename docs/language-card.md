@@ -879,6 +879,15 @@ one-probe-per-target guard, reload generation fencing, disabled-weight behavior,
 and io_uring cancellation drain apply to both modes. Native ABI 28 requires
 recompiling older artifacts. See [tcp-health.rut](../examples/tcp-health.rut).
 
+An upstream can set `connect_timeout: 3s` for each fresh ordinary HTTP/1
+plaintext connect attempt on Linux epoll and io_uring. It accepts whole seconds from 1s through 63s;
+omission retains the global upstream timeout. The one-second wheel may fire a
+tick late and unrelated activity cannot refresh it. On expiry the connection
+is closed, so the client observes EOF without a response; this does not retry.
+Completed connect failures retain their normal retry behavior. TLS, HTTP/2,
+health probes, explicit connect waits and strict timeout-policy owners keep
+their existing timing. Native artifact version 29 requires recompilation.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts

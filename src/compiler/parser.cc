@@ -8,6 +8,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/timer_wheel.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -3877,6 +3878,7 @@ struct Parser {
             item.upstream.addr_span = span_from(*lbrace.value());
             bool seen_minimum_healthy_weight_percent = false;
             bool seen_connect_attempts = false;
+            bool seen_connect_timeout = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -4002,6 +4004,20 @@ struct Parser {
                     item.upstream.port_lit = static_cast<u32>(kV);
                     item.upstream.port_is_set = true;
                     seen_port = true;
+                } else if (field_name.eq({"connect_timeout", 15})) {
+                    if (seen_connect_timeout)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_connect_timeout = true;
+                    auto dur = expect(TokenType::DurLit);
+                    if (!dur) return core::make_unexpected(dur.error());
+                    const u32 ms = dur_lit_to_ms(dur.value()->text);
+                    if (ms == 0 || ms % 1000 != 0 || ms / 1000 >= TimerWheel::kSlots)
+                        return frontend_error(
+                            FrontendError::UnsupportedSyntax,
+                            span_from(*dur.value()),
+                            lit_str("connect_timeout requires whole seconds from 1s to 63s"));
+                    item.upstream.connect_timeout_seconds = static_cast<u8>(ms / 1000);
                 } else if (field_name.eq({"connect_attempts", 16})) {
                     if (seen_connect_attempts)
                         return frontend_error(
@@ -4335,7 +4351,8 @@ struct Parser {
             } else if (!seen_host && !seen_port &&
                        (seen_protocol || item.upstream.hc_enabled ||
                         item.upstream.passive_health.enabled ||
-                        seen_minimum_healthy_weight_percent || seen_connect_attempts)) {
+                        seen_minimum_healthy_weight_percent || seen_connect_attempts ||
+                        seen_connect_timeout)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

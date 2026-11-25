@@ -6,6 +6,7 @@
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
 #include "rut/runtime/slice_pool.h"
+#include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/ws_handshake.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -560,6 +561,8 @@ bool load_native_program(const char* source,
         const auto& target = c.upstreams[i];
         if (target.addr_count == 0 || target.addr_count > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream backend count");
+        if (target.connect_timeout_seconds >= TimerWheel::kSlots)
+            return fail("invalid native upstream connect timeout");
         if (target.connect_attempts == 0 || target.connect_attempts > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream connect attempts");
         if (target.minimum_healthy_weight_percent > 100)

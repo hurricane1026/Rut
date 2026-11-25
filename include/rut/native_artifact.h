@@ -11,8 +11,9 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 24 records passive-health metadata; version 25 adds active probe type
 // and deadline metadata to that combined native artifact layout.
 // Version 26 adds the pre-send connection attempt budget; version 27 adds route
-// request-body admission metadata. Version 28 combines both independent layouts.
-constexpr u32 kVersion = 28;
+// request-body admission metadata; version 28 combines both independent
+// layouts. Version 29 records upstream connect timeouts.
+constexpr u32 kVersion = 29;
 struct StreamHeader {
     u64 magic;
     u32 version;

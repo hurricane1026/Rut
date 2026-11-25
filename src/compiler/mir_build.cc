@@ -1600,6 +1600,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_timeout_ms = module.upstreams[i].hc_timeout_ms;
         up.minimum_healthy_weight_percent = module.upstreams[i].minimum_healthy_weight_percent;
         up.connect_attempts = module.upstreams[i].connect_attempts;
+        up.connect_timeout_seconds = module.upstreams[i].connect_timeout_seconds;
         up.weight_count = module.upstreams[i].weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = module.upstreams[i].backend_weights[b];
