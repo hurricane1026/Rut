@@ -3955,6 +3955,10 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         return {};
     }
     if (term.kind == MirTerminatorKind::ForwardUpstream) {
+        if (term.upstream_index >= mir.upstreams.len ||
+            (term.forward_load_balance.policy == LoadBalancePolicy::ConsistentHash &&
+             mir.upstreams[term.upstream_index].failover_mask != 0))
+            return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         u32 load_balance = 0;
         if (term.forward_load_balance.policy != LoadBalancePolicy::None) {
             if (b.mod->forward_site_count >= kMaxForwardSites)
@@ -4525,6 +4529,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
             mir.upstreams[i].hc_require_initial_success;
         out.module.upstreams[i].hc_type = mir.upstreams[i].hc_type;
         out.module.upstreams[i].hc_timeout_ms = mir.upstreams[i].hc_timeout_ms;
+        out.module.upstreams[i].failover_mask = mir.upstreams[i].failover_mask;
         out.module.upstreams[i].minimum_healthy_weight_percent =
             mir.upstreams[i].minimum_healthy_weight_percent;
         out.module.upstreams[i].connect_attempts = mir.upstreams[i].connect_attempts;

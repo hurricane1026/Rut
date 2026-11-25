@@ -32,7 +32,7 @@ def main():
             class Origin(BaseHTTPRequestHandler):
                 def do_GET(self):
                     with lock:
-                        if self.path in ('/healthz', '/strict-healthz'):
+                        if self.path in ('/healthz', '/strict-healthz', '/backup-healthz'):
                             probes[self.path, label] += 1
                             hosts[self.path, label] = self.headers.get('Host')
                             code = healthy[label]
@@ -66,6 +66,12 @@ upstream api {{
         failure_threshold: 2, success_threshold: 3
     }}
 }}
+upstream backup {{
+    backends: [{entries}]
+    failover: ["127.0.0.1:{servers[1].server_port}"]
+    health_check: {{ path: "/backup-healthz", interval: 1s, healthy_statuses: [200, 302],
+                    failure_threshold: 2, success_threshold: 3 }}
+}}
 upstream strict {{
     backends: [{entries}]
     minimum_healthy_weight_percent: 51
@@ -74,6 +80,12 @@ upstream strict {{
                     failure_threshold: 2, success_threshold: 3 }}
 }}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
+route GET "/backup" {{ return forward(backup, load_balance: .roundRobin) }}
+route GET "/backup-least" {{ return forward(backup, load_balance: .leastRequests) }}
+route GET "/backup-connect" {{
+    let ev = wait(upstream(backup).connect())
+    if ev.ok {{ return 204 }} else {{ return 502 }}
+}}
 route GET "/strict" {{ return forward(strict, load_balance: .roundRobin) }}
 route GET "/strict-connect" {{
     let ev = wait(upstream(strict).connect())
@@ -125,7 +137,7 @@ route GET "/strict-connect" {{
             normal_a = ('/healthz', 'A')
             strict_a = ('/strict-healthz', 'A')
             wait_for(lambda: all(probes[path, label] > 0
-                                 for path in ('/healthz', '/strict-healthz')
+                                 for path in ('/healthz', '/strict-healthz', '/backup-healthz')
                                  for label in ('A', 'B')), 'no periodic health probes')
             with lock:
                 for label, origin in zip(('A', 'B'), servers):
@@ -138,6 +150,9 @@ route GET "/strict-connect" {{
                 initial = Counter(request() for _ in range(20))
                 assert initial == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, initial)
                 assert h1('/strict-connect')[0] == 204
+                assert all(h1('/backup') == (200, b'A') for _ in range(4))
+                assert h1('/backup-least') == (200, b'A')
+                assert h1('/backup-connect')[0] == 204
                 with lock:
                     healthy['A'] = 301
                     before = probes[normal_a]
@@ -148,6 +163,9 @@ route GET "/strict-connect" {{
                 with lock:
                     assert probes[normal_a] - before >= 2, (protocol, probes)
                 assert all(request() == (200, b'B') for _ in range(20)), protocol
+                wait_for(lambda: h1('/backup') == (200, b'B'), 'backup was not selected')
+                assert h1('/backup-least') == (200, b'B')
+                assert h1('/backup-connect')[0] == 204
                 wait_for(lambda: strict()[0] == 503, 'strict capacity did not close')
                 before_requests = sum(data_requests.values())
                 assert strict()[0] == 503
@@ -162,6 +180,8 @@ route GET "/strict-connect" {{
                 wait_for(lambda: request() == (200, b'A'), 'recovered target was not re-enabled')
                 with lock:
                     assert probes[normal_a] - before >= 3, (protocol, probes)
+                wait_for(lambda: h1('/backup') == (200, b'A'), 'regular did not regain preference')
+                assert h1('/backup-least') == (200, b'A')
                 wait_for(lambda: strict()[0] == 200, 'strict capacity did not recover')
                 assert h1('/strict-connect')[0] == 204
                 with lock:

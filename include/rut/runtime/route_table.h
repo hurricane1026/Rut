@@ -84,6 +84,7 @@ struct UpstreamTarget {
     // Enforced cluster-wide via the shared UpstreamConcurrency gauge; over the
     // cap the runtime answers 503 before connecting.
     u32 max_inflight = 0;
+    u8 failover_mask = 0;
     u8 minimum_healthy_weight_percent = 0;
     u8 connect_attempts = 3;
 
@@ -109,6 +110,27 @@ struct UpstreamTarget {
     u8 hc_require_initial_success = 0;
     ActiveHealthType hc_type = ActiveHealthType::Http;
     u32 hc_timeout_ms = 0;  // 0 inherits the host loop upstream timeout
+
+    bool failover_valid() const {
+        if (failover_mask == 0) return true;
+        if (addr_count == 0 || addr_count > kMaxBackends ||
+            (static_cast<u32>(failover_mask) >> addr_count) != 0)
+            return false;
+        for (u32 i = 0; i < addr_count; ++i)
+            for (u32 j = 0; j < i; ++j)
+                if (addrs[i].sin_addr.s_addr == addrs[j].sin_addr.s_addr &&
+                    addrs[i].sin_port == addrs[j].sin_port)
+                    return false;
+        bool regular = false, backup = false;
+        for (u32 i = 0; i < addr_count; ++i) {
+            if (weights[i] == 0) continue;
+            if (failover_mask & (1u << i))
+                backup = true;
+            else
+                regular = true;
+        }
+        return regular && backup;
+    }
 
     void set_name(const char* n) {
         name_len = 0;

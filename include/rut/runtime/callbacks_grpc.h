@@ -1210,7 +1210,8 @@ bool grpc_start_impl(Loop* loop,
         if (__builtin_add_overflow(deadline_base, timeout, &deadline)) return false;
     }
     const u32 backend =
-        target.hc_require_initial_success && !current_health_generation(loop, cfg)
+        (target.hc_require_initial_success || target.failover_mask != 0) &&
+                !current_health_generation(loop, cfg)
             ? target.addr_count
             : select_forward_backend(
                   cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);

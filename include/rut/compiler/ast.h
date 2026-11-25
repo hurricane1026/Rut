@@ -414,6 +414,8 @@ struct AstUpstreamDecl {
     //      so existing single-address readers are unchanged. Mutually
     //      exclusive with host_lit/port_lit (the parser rejects mixing).
     static constexpr u32 kMaxBackends = 8;
+    u32 failover_count = 0;
+    Str failover_lits[kMaxBackends]{};
     u32 backend_count = 0;  // 0 → single-address form via host_lit/port_lit
     Str backend_lits[kMaxBackends]{};
     u8 minimum_healthy_weight_percent = 0;

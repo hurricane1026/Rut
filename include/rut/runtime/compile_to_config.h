@@ -567,6 +567,21 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
              mod.upstreams[i].response_header_timeout_seconds >= TimerWheel::kSlots))
             return false;
 
+    for (u32 i = 0; i < mod.upstream_count; ++i) {
+        const auto& up = mod.upstreams[i];
+        if (up.failover_mask == 0) continue;
+        if (!up.has_address || up.extra_count >= UpstreamTarget::kMaxBackends) return false;
+        UpstreamTarget target{};
+        target.add_addr(up.ip, up.port);
+        for (u32 j = 0; j < up.extra_count; ++j)
+            target.add_addr(up.extra_ips[j], up.extra_ports[j]);
+        target.failover_mask = up.failover_mask;
+        if (up.weight_count != 0 && up.weight_count != target.addr_count) return false;
+        if (up.weight_count != 0)
+            for (u32 j = 0; j < target.addr_count; ++j) target.weights[j] = up.backend_weights[j];
+        if (!target.failover_valid()) return false;
+    }
+
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
     // into the declaration order (0 = first `upstream` decl, 1 = second,
     // …). `RouteConfig::upstreams` is also declaration-order (add_upstream
@@ -611,6 +626,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                 return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            cfg.upstreams[i].failover_mask = up.failover_mask;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
@@ -675,6 +691,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                 return false;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
+            cfg.upstreams[i].failover_mask = up.failover_mask;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
             cfg.upstreams[i].connect_attempts = up.connect_attempts;

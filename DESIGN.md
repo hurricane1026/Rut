@@ -1700,6 +1700,19 @@ readiness, normal ejection and fallback semantics apply; reload resets the latch
 This applies to the supported TCP, HTTP and verified HTTPS probe modes. Native
 artifact version 33 provisionally records the configuration field.
 
+Static backup targets are opt-in: `failover: ["127.0.0.1:9002"]` names a
+nonempty subset of explicit `backends` by normalized IPv4 address and port.
+All configured endpoints must have distinct normalized addresses; duplicate or
+unknown entries are rejected, and each tier must contain at least one
+nonzero-weight target. The healthy-weight floor is evaluated over all enabled
+targets first. Selection uses healthy regular targets while any exist, even if
+already tried; only when none are healthy may healthy backup targets be
+selected. Ejected and zero-weight targets are never used by this policy.
+The existing connection attempt limit applies. Recovery immediately restores
+regular preference. `roundRobin` and `leastRequests` are supported;
+`consistentHash` cannot be combined with failover. The native payload version
+changes with this feature; existing native artifacts must be recompiled.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active

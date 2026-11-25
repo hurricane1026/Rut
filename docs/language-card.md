@@ -903,6 +903,19 @@ Completed connect failures retain their normal retry behavior. TLS, HTTP/2,
 health probes, explicit connect waits and strict timeout-policy owners keep
 their existing timing. Native artifact version 29 requires recompilation.
 
+Static backup targets are opt-in: `failover: ["127.0.0.1:9002"]` names a
+nonempty subset of explicit `backends` by normalized IPv4 address and port.
+All configured endpoints must have distinct normalized addresses; duplicate or
+unknown entries are rejected, and each tier must contain at least one
+nonzero-weight target. The healthy-weight floor is evaluated over all
+enabled targets first. Selection uses healthy regular targets while any exist,
+even if already tried; only when none are healthy may healthy backup targets
+be selected. Ejected and zero-weight targets are never used by this policy.
+The existing connection attempt limit applies. Recovery immediately restores
+regular preference. `roundRobin` and `leastRequests` are supported;
+`consistentHash` cannot be combined with failover. The native payload version
+changes with this feature; existing native artifacts must be recompiled.
+
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
 healthy share of its configured weight. The field accepts integers from 0
 through 100. The default, 0, keeps fail-open selection. A positive value counts

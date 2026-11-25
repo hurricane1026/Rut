@@ -26,6 +26,9 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         ~Cleanup() { a.destroy(); }
     } cleanup{arena};
     auto& c = p.config;
+    if (c.upstream_count > RouteConfig::kMaxUpstreams) return false;
+    for (u32 i = 0; i < c.upstream_count; ++i)
+        if (!c.upstreams[i].failover_valid()) return false;
     // Route relocations are measured from config byte zero.
     if (reinterpret_cast<const void*>(&c) != static_cast<const void*>(c.routes)) return false;
     u32 view_count = 0;
