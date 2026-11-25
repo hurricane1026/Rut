@@ -889,6 +889,10 @@ Online administration and deployment remain open in #1072.
 
 ### Consumer deployment policy checks
 
+Five opt-in guardrails enforce per-owner active credential redundancy, an enabled
+credential cap, owner group presence, explicit per-credential group subsets and a
+future activation ceiling. Validation runs on the candidate before publication.
+
 The private, offline `rut-consumers check-policy` gate validates candidate
 snapshots against opt-in deployment rules at an explicit Unix-second sample.
 The checks do not publish snapshots or carry request-time state.

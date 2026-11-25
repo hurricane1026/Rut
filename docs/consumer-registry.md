@@ -655,6 +655,11 @@ continues to adopt snapshots through its existing deployment path.
 | --- | --- |
 | `requireHashedKeys` | Require a SHA-256 verifier for every bearer or header key, including disabled records. |
 | `allowedMethods` | Allow only the named methods among bearer, header, basic and mtls. The array must be nonempty and unique. The rule checks disabled records too. |
+| `minimumActiveCredentialsPerEnabledConsumer` | Require each enabled Consumer to own at least this many active credentials. The count must be 1–64. |
+| `maximumEnabledCredentialsPerConsumer` | Cap enabled credential records per Consumer at 1–64. Future and expired records count, including records staged under disabled Consumers. |
+| `requireGroupsForEnabledConsumers` | Require a nonempty group array for each enabled Consumer. |
+| `requireExplicitGroupsForEnabledCredentials` | Require each enabled credential to declare its own group subset. An explicit empty subset grants no groups. |
+| `maximumFutureActivationSeconds` | Bound how far ahead enabled credentials may activate. Zero permits starts at or before the supplied time, including unbounded starts. The ceiling is inclusive and applies to staged credentials under disabled Consumers. |
 | `requireExpiryForEnabledCredentials` | Require a positive expiry on every enabled credential record, including records staged under disabled Consumers. |
 | `maxCredentialLifetimeSeconds` | Require finite activation and expiry on every enabled credential. The full window must be no longer than the positive number of seconds configured here. |
 | `minimumRemainingValiditySeconds` | Require an enabled credential record to have a finite expiry at least this many positive seconds after the supplied time. Applies also to future activations and records staged under disabled Consumers. |
