@@ -4,9 +4,11 @@
 
 namespace rut {
 
-// Empty spans may point to the end of the pool. Both lengths fit in i64.
+// Empty spans may point to the end of the pool.
 template <typename Size>
-    requires(__is_same(Size, u8) || __is_same(Size, u16) || __is_same(Size, u32))
+    requires(sizeof(Size) <= sizeof(u64) &&
+             (__is_same(Size, u8) || __is_same(Size, u16) || __is_same(Size, u32) ||
+              __is_same(Size, u64) || __is_same(Size, size_t)))
 [[nodiscard]] inline bool byte_span_within(const char* pool,
                                            Size used,
                                            const char* data,
@@ -17,8 +19,9 @@ template <typename Size>
     uintptr_t offset = 0;
     if (__builtin_sub_overflow(ptr, begin, &offset)) return false;
 
-    // The length guard puts the difference in [0, used], within Size.
-    const Size remaining = static_cast<Size>(static_cast<i64>(used) - static_cast<i64>(len));
+    // Both lengths fit in signed 128 bits. The guard makes the result fit Size.
+    const Size remaining =
+        static_cast<Size>(static_cast<__int128_t>(used) - static_cast<__int128_t>(len));
     return offset <= remaining;
 }
 
