@@ -972,8 +972,9 @@ public:
                         // (least blast radius: no ConnState semantics touched, so
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
-                        if (!conn.h1_tls_transport && !conn.throttle_paused &&
-                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
+                        if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
+                            !conn.throttle_paused && !conn.is_health_probe &&
+                            !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

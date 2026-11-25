@@ -3841,6 +3841,7 @@ upstream api {
     backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
     minimum_healthy_weight_percent: 50
     connect_attempts: 8
+    response_header_timeout: 7s
     health_check: { path: "/healthz", interval: 2s, failure_threshold: 3, success_threshold: 2 }
     connect_timeout: 3s
 }
@@ -3857,6 +3858,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.minimum_healthy_weight_percent, 50u);
     CHECK_EQ(target.connect_attempts, 8u);
     CHECK_EQ(target.connect_timeout_seconds, 3u);
+    CHECK_EQ(target.response_header_timeout_seconds, 7u);
     CHECK(target.hc_enabled);
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK_EQ(target.hc_thresholds.failures, 3u);

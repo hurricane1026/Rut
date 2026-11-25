@@ -2783,6 +2783,11 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     const auto& target = cfg->upstreams[conn.upstream_idx];
     if (conn.upstream_backend_idx >= target.addr_count) return false;
 
+    if (conn.response_header_timeout_armed) {
+        conn.response_header_timeout_armed = false;
+        if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); })
+            loop->timer.refresh(&conn, loop->upstream_timeout);
+    }
     (void)detach_upstream_close(loop, conn);
     // Clear any epoll partial-send bookkeeping for the dead fd before reconnecting:
     // a request send parked on EPOLLOUT leaves upstream_send_state set, which the
@@ -3230,6 +3235,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.resp_header_mutation_count = 0;
     conn.resp_header_mutation_overflow = false;
     if (conn.response_header_buf.valid()) conn.response_header_buf.reset();
+    conn.response_header_timeout_armed = false;
     conn.proxy_resp_started = false;
     conn.upstream_abandoned = false;
     conn.upstream_keep_alive = false;
@@ -6637,6 +6643,7 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    conn.response_header_timeout_armed = false;
     const bool no_upstream_response_bytes = conn.upstream_recv_buf.len() == 0;
     (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
@@ -9850,6 +9857,19 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     conn.upstream_start_us = monotonic_us();
+    if (conn.protocol == ConnProtocol::Http11 && conn.request_config &&
+        conn.upstream_idx < conn.request_config->upstream_count &&
+        conn.request_config->upstreams[conn.upstream_idx].response_header_timeout_seconds != 0 &&
+        conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+        conn.response_policy_id == 0 && conn.failure_policy_id == 0 &&
+        conn.timeout_failure_policy_id == 0 && !conn.req_upgrade_is_websocket &&
+        !conn.is_ws_terminate_route && !conn.req_body_streamed && conn.pipeline_stash_len == 0 &&
+        conn.recv_buf.len() == 0) {
+        conn.response_header_timeout_armed = true;
+        loop->timer.refresh(
+            &conn,
+            conn.request_config->upstreams[conn.upstream_idx].response_header_timeout_seconds);
+    }
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated) {
         if (conn.upstream_recv_buf.len() != 0) {
@@ -15942,6 +15962,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
+        if (conn.response_header_timeout_armed) {
+            conn.response_header_timeout_armed = false;
+            if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); })
+                loop->timer.refresh(&conn, loop->upstream_timeout);
+        }
         if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
@@ -16052,6 +16077,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 return;
             }
         }
+    }
+    if (conn.response_header_timeout_armed &&
+        (ps == ParseStatus::Error || resp.status_code >= 200 || resp.status_code == 101)) {
+        conn.response_header_timeout_armed = false;
+        if constexpr (requires { loop->timer.refresh(&conn, loop->upstream_timeout); })
+            loop->timer.refresh(&conn, loop->upstream_timeout);
     }
     if (ps == ParseStatus::Error) {
         if (try_configured_head_failure(

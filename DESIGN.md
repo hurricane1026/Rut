@@ -1723,6 +1723,17 @@ must fit 1 through 4294967295 bytes. Native artifact version 28 records the
 combined connect-attempt and route metadata layout; older artifacts (including
 version 27) must be rebuilt.
 
+Native artifact version 30 records the upstream response-header timeout. An
+upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For ordinary
+HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at
+send completion, no WebSocket upgrade and no explicit response/failure policy,
+the wheel starts when the upstream request send completes; later successors do
+not cancel it. It covers plaintext and verified HTTPS origins; incomplete header
+fragments and interim 1xx responses do not extend the deadline. After final
+headers the ordinary upstream idle timer resumes. Timeout returns the existing
+504 and closes the upstream. Other profiles and the default retain existing
+timing; the wheel has one-second resolution.
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even
