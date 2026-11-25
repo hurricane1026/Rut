@@ -692,3 +692,50 @@ TEST(health_probe, iouring_tls_detach_keeps_guard_until_recv_cancel_drains) {
     REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
     CHECK_EQ(rig.loop->active_count(), 0u);
 }
+
+template <typename Loop>
+void tls_reload_during_handshake(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& tls = rig.owner.config->upstreams[0].tls;
+    tls.enabled = true;
+    static constexpr char kCa[] = RUT_TLS_FIXTURES "/localhost_cert.pem";
+    static constexpr char kName[] = "localhost";
+    for (u32 i = 0; i < sizeof(kCa); ++i) tls.ca[i] = kCa[i];
+    for (u32 i = 0; i < sizeof(kName); ++i) tls.server_name[i] = kName[i];
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    Socket peer;
+    REQUIRE(rig.until([&] {
+        peer.fd = accept4(rig.listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        return peer.fd >= 0;
+    }));
+    REQUIRE(rig.until([&] { return rig.probe() && rig.probe()->h1_tls_upstream; }));
+    // The child is stalled in TLS negotiation. Replace the identity at the
+    // same address before disconnecting it, so its failure cannot eject the
+    // new target even if the numeric upstream/backend pair is reused.
+    rig.owner.config->http_cache_identity = http_cache_config_identity();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    ::close(peer.fd);
+    peer.fd = -1;
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_FALSE(backend_ejected(0, 0, ~u64{0}));
+    CHECK_EQ(rig.loop->active_count(), 0u);
+
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    REQUIRE(rig.until([&] {
+        peer.fd = accept4(rig.listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        return peer.fd >= 0;
+    }));
+    REQUIRE(rig.until([&] { return rig.probe() && rig.probe()->h1_tls_upstream; }));
+    rig.loop->force_close_all();
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
+    CHECK_EQ(rig.loop->active_count(), 0u);
+    CHECK_EQ(rig.metrics.connections_closed, 0u);
+}
+
+TEST(health_probe, epoll_tls_reload_during_handshake) {
+    tls_reload_during_handshake<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_tls_reload_during_handshake) {
+    tls_reload_during_handshake<IoUringEventLoop>(_tc);
+}

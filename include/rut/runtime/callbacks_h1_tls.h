@@ -93,6 +93,7 @@ void h1_tls_closed(void* lp, Connection& transport) {
     SSL* ssl = transport.tls_engine.ssl ? transport.tls_engine.ssl : transport.tls;
     const bool clean = state->ready && ssl && (SSL_get_shutdown(ssl) & SSL_RECEIVED_SHUTDOWN);
     const bool ready = state->ready;
+    const bool local_setup_failure = state->local_setup_failure;
     const bool send_inflight = transport.on_send == &h1_tls_sent<Loop>;
     bool buffered_response_preserved = true;
     if (owner && ready && send_inflight && transport.recv_buf.len()) {
@@ -118,6 +119,7 @@ void h1_tls_closed(void* lp, Connection& transport) {
     owner->upstream_fd = -1;
     IoEvent failure{};
     failure.conn_id = owner->id;
+    if (local_setup_failure) failure.aux = kLocalSubmitFailureAux;
     failure.type =
         !ready ? IoEventType::UpstreamConnect
         : send_inflight ||
@@ -256,6 +258,7 @@ void h1_tls_connected(void* lp, Connection& transport, IoEvent ev) {
     auto* state = transport.h1_tls_transport;
     if (!state) return;
     if (ev.result < 0) {
+        state->local_setup_failure = ev.aux == kLocalSubmitFailureAux;
         loop->close_conn(transport);
         return;
     }
@@ -271,23 +274,19 @@ void h1_tls_connected(void* lp, Connection& transport, IoEvent ev) {
         transport.upstream_fd = -1;
     }
     transport.on_upstream_send = nullptr;
-    const auto& target = transport.request_config->upstreams[transport.upstream_idx];
-    if (!init_tls_client_context(state->context, target.tls, false)) {
-        loop->close_conn(transport);
-        return;
-    }
-    if constexpr (requires {
-                      loop->tls_setup(transport, &state->context, target.tls.server_name);
-                  }) {
-        if (!loop->tls_setup(transport, &state->context, target.tls.server_name)) {
+    const auto& tls = state->tls_spec;
+    if constexpr (requires { loop->tls_setup(transport, &state->context, tls.server_name); }) {
+        if (!loop->tls_setup(transport, &state->context, tls.server_name)) {
+            state->local_setup_failure = true;
             loop->close_conn(transport);
             return;
         }
         transport.tls_pending_on_recv = &h1_tls_read<Loop>;
         tls_process(loop, transport);
     } else {
-        auto ssl = create_tls_client_ssl(state->context, transport.fd, target.tls.server_name);
+        auto ssl = create_tls_client_ssl(state->context, transport.fd, tls.server_name);
         if (!ssl) {
+            state->local_setup_failure = true;
             loop->close_conn(transport);
             return;
         }
@@ -322,13 +321,22 @@ bool h1_tls_connect(Loop* loop, Connection& owner, const void* addr, u32 addr_le
     *state = {};
     state->owner = &owner;
     state->transport = transport;
+    state->tls_spec = owner.request_config->upstreams[owner.upstream_idx].tls;
+    if (!init_tls_client_context(state->context, state->tls_spec, false)) {
+        loop->pool.free(memory);
+        loop->free_conn(*transport);
+        return false;
+    }
+    // The child connect can outlive its owner, including a probe on reload.
+    transport->send_buf.reset();
+    transport->send_buf.write(static_cast<const u8*>(addr), addr_len);
     owner.h1_tls_upstream = state;
     transport->h1_tls_transport = state;
     transport->on_close = &h1_tls_closed<Loop>;
     transport->set_metrics_client(false);
     transport->state = ConnState::Proxying;
     transport->proxy_resp_started = true;  // its timer closes the transport, not an HTTP response
-    transport->request_config = owner.request_config;
+    transport->request_config = owner.is_health_probe ? nullptr : owner.request_config;
     transport->upstream_idx = owner.upstream_idx;
     transport->upstream_fd = owner.upstream_fd;
     transport->on_upstream_send = &h1_tls_connected<Loop>;
@@ -353,7 +361,7 @@ bool h1_tls_connect(Loop* loop, Connection& owner, const void* addr, u32 addr_le
     }
     h1_tls_refresh_timer(loop, owner);
     // Bypass the logical adapter: the transport owns the actual connect CQE.
-    if (!loop->submit_connect_impl(*transport, addr, addr_len)) {
+    if (!loop->submit_connect_impl(*transport, transport->send_buf.data(), addr_len)) {
         owner.h1_tls_upstream = nullptr;
         state->owner = nullptr;
         owner.upstream_fd = -1;

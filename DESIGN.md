@@ -11707,7 +11707,10 @@ whole-second `timeout` (1–60 seconds) through AST, HIR, MIR, RIR and owned
 RouteConfig/native metadata (ABI 25). Omission retains the host loop timeout.
 No language keyword, library dependency, handler operation or suspension is added.
 
-TCP probes record a successful connect and close without sending application
+HTTP probes on HTTP/1 TLS upstreams use the configured CA and server name
+before sending the request. The TLS transport owns its configuration and connect
+address through asynchronous completion; the original probe deadline remains
+unchanged. TCP probes record a successful connect and close without sending application
 bytes. They can target TLS and HTTP/2/gRPC origins because they do not negotiate
 TLS/HTTP; they prove reachability rather than certificate or application health.
 Normal business TLS validation is unchanged. Each probe owns its launch mode

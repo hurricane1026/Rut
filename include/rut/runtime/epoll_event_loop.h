@@ -977,6 +977,7 @@ public:
     // side-effects apply. Removes the probe socket from epoll, closes it, drops
     // the fd-map + send-state bookkeeping, and returns the slot to the free list.
     void free_health_probe(Connection& c) {
+        if (c.h1_tls_upstream) h1_tls_detach(this, c);
         release_health_probe_guard(c);
         (void)backend.detach_upstream(c);
         if (c.id < connection_capacity) {

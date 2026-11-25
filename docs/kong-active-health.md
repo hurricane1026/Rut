@@ -21,8 +21,8 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 
 - HTTP is the default, optionally spelled `type: .http`. Linux epoll and io_uring
   send an HTTP/1.1 GET to the configured path and compare complete response
-  headers against one expected status. HTTP probes require plaintext HTTP/1
-  origins. The path must be origin-form and cannot inject request-line bytes.
+  headers against one expected status. HTTP/1 TLS upstreams use the configured
+  CA and server name for the handshake before sending the probe. The path must be origin-form and cannot inject request-line bytes.
 - `type: .tcp` requires an interval and forbids both `path` and `status`.
   A successful TCP connect counts as success; failure or deadline expiry counts
   as failure. It sends no application bytes and immediately closes the socket.
@@ -69,8 +69,8 @@ address. Drain starts no probes; force-close and shutdown cancel existing ones.
 selection. Positive values count active and passive health over enabled weights
 and reject new forwarding/explicit upstream connections with 503 below the floor.
 Health remains shard-local. This is a bounded data-plane contract, not complete
-Kong health schema or control-plane compatibility. HTTPS/application-level
-HTTP/2 and gRPC probes, separate healthy/unhealthy intervals, and cross-shard
+Kong health schema or control-plane compatibility. Application-level HTTP/2
+and gRPC probes, separate healthy/unhealthy intervals, and cross-shard
 health synchronization remain outside this implementation.
 
 ## Verification

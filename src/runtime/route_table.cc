@@ -649,7 +649,7 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
     if (path_len >= sizeof(up.hc_path) ||
         !valid_active_health_check(
             type, path, path_len, interval_ms, status, thresholds, timeout_ms) ||
-        ((up.tls.enabled || up.http2) && type != ActiveHealthType::Tcp))
+        (up.http2 && type != ActiveHealthType::Tcp))
         return false;
     for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
     up.hc_path[path_len] = '\0';
