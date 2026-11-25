@@ -264,10 +264,11 @@ jobs:
           ninja -C build
           ccache --show-stats
 
-      - name: Check positive integer contracts with Clang Static Analyzer
+      - name: Check positive integer contracts and overflow fallbacks with Clang
         if: matrix.compiler == 'clang' && matrix.shard == 1
         run: |
           clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_positive_sum.cc \
+            scripts/clang/check_overflow_fallback.cc \
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_positive_sum.so
           python3 scripts/check_positive_sums.py build build/check_positive_sum.so --clang clang-22
 

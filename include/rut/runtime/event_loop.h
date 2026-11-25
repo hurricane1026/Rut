@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -894,9 +895,7 @@ public:
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
                 } else {
-                    u64 deadline = 0;
-                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
-                        deadline = UINT64_MAX;
+                    const u64 deadline = saturating_add(start, period);
                     if (monotonic_secs() < deadline) continue;
                     force_close_all();
                     running_.store(false, std::memory_order_relaxed);

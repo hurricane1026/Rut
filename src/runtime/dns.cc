@@ -1,5 +1,6 @@
 #include "rut/runtime/dns.h"
 
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/platform/socket.h"
 
@@ -236,8 +237,7 @@ int DnsResolver::resolve(
             expires = e.expires;
             return 1;
         }
-        u64 next_valid = 0;
-        q.valid_until = __builtin_add_overflow(now, u64{60000}, &next_valid) ? ~u64{0} : next_valid;
+        q.valid_until = saturating_add(now, 60'000);
         memcpy(q.name, host, static_cast<size_t>(static_cast<__int128_t>(strlen(host)) + 1));
         q.phase = 1;
     }
@@ -347,8 +347,7 @@ int DnsResolver::resolve(
     if (kAnswer != DnsAnswer::Addresses && kAnswer != DnsAnswer::Alias) return retry();
     u64 ttl_ms = 0;
     if (__builtin_mul_overflow(static_cast<u64>(result.ttl), u64{1000}, &ttl_ms)) return retry();
-    u64 kValidUntil = 0;
-    if (__builtin_add_overflow(now, ttl_ms, &kValidUntil)) kValidUntil = ~u64{0};
+    const u64 kValidUntil = saturating_add(now, ttl_ms);
     if (kValidUntil < q.valid_until) q.valid_until = kValidUntil;
     if (result.ttl < q.result.ttl) q.result.ttl = result.ttl;
     if (kAnswer == DnsAnswer::Alias) {

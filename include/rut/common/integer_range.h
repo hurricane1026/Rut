@@ -4,6 +4,13 @@
 
 #include <limits.h>
 
+// Exact counters must publish a checked result without saturation.
+#ifdef __clang__
+#define RUT_EXACT_COUNTER [[clang::annotate("rut_exact_counter")]]
+#else
+#define RUT_EXACT_COUNTER
+#endif
+
 namespace rut {
 namespace detail {
 
@@ -41,6 +48,11 @@ template <detail::FixedWidthInteger Result,
              detail::kIntegerMax<Left> + detail::kIntegerMax<Right> <= detail::kIntegerMax<Result>)
 constexpr Result add_proven_in_range(Left left, Right right) {
     return proven_integer_cast<Result>(left) + proven_integer_cast<Result>(right);
+}
+
+constexpr u64 saturating_add(u64 left, u64 right) {
+    u64 sum;
+    return __builtin_add_overflow(left, right, &sum) ? UINT64_MAX : sum;
 }
 
 // Use only when an existing check or an invariant already establishes the range.

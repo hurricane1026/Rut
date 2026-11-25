@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -477,9 +478,7 @@ private:
     static_assert(kMaxBulkSlices < kDeferredBodyClear);
 
     void clear_bulk_bytes(u8* ptr, u32 dirty) {
-        if (__builtin_add_overflow(
-                study_body_bulk_clear_bytes, static_cast<u64>(dirty), &study_body_bulk_clear_bytes))
-            study_body_bulk_clear_bytes = UINT64_MAX;
+        study_body_bulk_clear_bytes = saturating_add(study_body_bulk_clear_bytes, dirty);
         __builtin_memset(ptr, 0, dirty);
     }
 

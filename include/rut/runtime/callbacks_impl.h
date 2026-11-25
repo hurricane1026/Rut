@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/forward_target.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -100,10 +101,7 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     }
     if (h->fails < 0xffff) h->fails++;
     if (h->fails >= kBackendFailThreshold) {
-        u64 eject_until = 0;
-        h->eject_until_us = __builtin_add_overflow(now_us, kBackendEjectCooldownUs, &eject_until)
-                                ? ~u64{0}
-                                : eject_until;
+        h->eject_until_us = saturating_add(now_us, kBackendEjectCooldownUs);
     }
 }
 
@@ -2185,9 +2183,7 @@ inline void throttle_advance(Connection& conn, u32 len) {
     // truncate to 0 above ~1 GB/s). len*1e9 <= ~4.3e18 for u32 len, within u64.
     const i64 delta_ns = static_cast<i64>(len) * static_cast<i64>(1'000'000'000) /
                          static_cast<i64>(conn.throttle_down_bps);
-    u64 next_tat = 0;
-    if (__builtin_add_overflow(kBase, static_cast<u64>(delta_ns), &next_tat)) next_tat = UINT64_MAX;
-    conn.throttle_tat_ns = next_tat;
+    conn.throttle_tat_ns = saturating_add(kBase, static_cast<u64>(delta_ns));
 }
 
 // True once the whole proxied response body has been read from the upstream

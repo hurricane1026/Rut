@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/route_host.h"
@@ -1824,7 +1825,8 @@ struct ConnectionBase {
     BodyMode resp_body_mode;
     u32 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
-    u32 resp_body_sent;               // response bytes sent, including any counted header bytes
+    u32 resp_body_sent
+        RUT_EXACT_COUNTER;  // response bytes sent, including any counted header bytes
     u32 upstream_send_len;  // bytes from upstream_recv_buf in current client send
 
     [[nodiscard]] bool try_add_response_bytes(u32 bytes) {

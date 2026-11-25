@@ -20,6 +20,7 @@
 // every function takes `page_bytes`: pass sysconf(_SC_PAGESIZE) for an estimate
 // of the running host.
 
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 
 #include <linux/io_uring.h>
@@ -79,11 +80,6 @@ constexpr IoUringRingSizes io_uring_ring_sizes(u32 capacity) {
 }
 
 namespace iouring_memlock_detail {
-constexpr u64 saturating_add(u64 a, u64 b) {
-    u64 result = 0;
-    return __builtin_add_overflow(a, b, &result) ? ~u64(0) : result;
-}
-
 constexpr u64 saturating_mul(u64 a, u64 b) {
     u64 result = 0;
     return __builtin_mul_overflow(a, b, &result) ? ~u64(0) : result;
@@ -102,7 +98,7 @@ constexpr u64 round_up_page(u64 n, u64 page_bytes) {
     if (remainder == 0) return n;
     u64 increment = 0;
     (void)__builtin_sub_overflow(page_bytes, remainder, &increment);
-    return iouring_memlock_detail::saturating_add(n, increment);
+    return saturating_add(n, increment);
 }
 }  // namespace iouring_memlock_detail
 
@@ -138,9 +134,8 @@ constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
                                                    u32 cq_entries,
                                                    u32 pbuf_entries,
                                                    u64 page_bytes) {
-    return iouring_memlock_detail::saturating_add(
-        io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes),
-        io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes));
+    return saturating_add(io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes),
+                          io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes));
 }
 
 // Total per-shard charge with every ring registered: the required charge plus
@@ -152,7 +147,7 @@ constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
 // will say so.
 constexpr u64 io_uring_shard_locked_bytes(
     u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
-    return iouring_memlock_detail::saturating_add(
+    return saturating_add(
         io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes),
         io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes));
 }

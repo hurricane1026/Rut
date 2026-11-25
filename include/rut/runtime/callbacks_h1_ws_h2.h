@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/integer_range.h"
+
 // Included after the bounded exchange pumps. An H1 downstream has one virtual
 // stream in its metadata owner; the physical socket remains an H1/TLS socket.
 #include "rut/runtime/callbacks.h"
@@ -58,9 +60,7 @@ void h1ws_h2_complete_http(Loop* loop, Connection& c, GrpcExchange& x) {
         if (!c.req_start_us) return;
         c.downstream_req_size = c.req_size =
             c.ws_client_header_len ? c.ws_client_header_len : c.req_header_end;
-        u64 kBytes = 0;
-        if (__builtin_add_overflow(x.response_headers_len, x.staged_response_bytes, &kBytes))
-            kBytes = UINT64_MAX;
+        const u64 kBytes = saturating_add(x.response_headers_len, x.staged_response_bytes);
         on_request_complete(
             loop, c, c.resp_status, kBytes > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kBytes));
     }

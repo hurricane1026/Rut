@@ -179,9 +179,9 @@ struct Arena {
             Block* prev = current->prev;
             u64 sz = current->size;
             backend.release(reinterpret_cast<u8*>(current), sz);
-            if (__builtin_sub_overflow(total_allocated, sz, &total_allocated)) total_allocated = 0;
             current = prev;
         }
+        total_allocated = current->size;
         current->used = 0;
     }
 

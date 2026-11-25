@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the positive-sum checker on production compilation commands."""
+"""Check positive sums and overflow fallbacks in production compilation commands."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +23,9 @@ def main():
     analyzer = ['--analyze', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve()),
                 '-Xanalyzer', '-analyzer-checker=rut.PositiveSum',
                 '-Xanalyzer', '-analyzer-config', '-Xanalyzer', 'ipa=basic-inlining']
+    overflow_check = ['-fsyntax-only', '-Werror=unused-result',
+                      '-Xclang', '-load', '-Xclang', str(args.plugin.resolve()),
+                      '-Xclang', '-add-plugin', '-Xclang', 'rut-overflow-fallback']
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / 'report.plist'
         subprocess.run([args.clang, '-fsyntax-only', '-Werror=unused-result', '-Xclang',
@@ -31,6 +34,8 @@ def main():
         subprocess.run([args.clang, *analyzer, '-Xclang', '-verify', '-I', ROOT / 'include',
                         '-std=c++23', ROOT / 'scripts/clang/positive_sum_cases.cc',
                         '-o', report], check=True)
+        subprocess.run([args.clang, *overflow_check, '-Xclang', '-verify', '-I', ROOT / 'include',
+                        '-std=c++23', ROOT / 'scripts/clang/overflow_fallback_cases.cc'], check=True)
         entries = json.loads((args.build / 'compile_commands.json').read_text())
 
         def analyze(item):
@@ -46,8 +51,7 @@ def main():
             output = flags.index('-o')
             del flags[output:output + 2]
             flags.remove('-c')
-            subprocess.run([args.clang, *flags, '-fsyntax-only', '-Werror=unused-result'],
-                           cwd=cwd, check=True)
+            subprocess.run([args.clang, *flags, *overflow_check], cwd=cwd, check=True)
             # Only declarations visible in this build configuration can impose
             # a contract. Preprocess with the actual defines and include paths.
             source = subprocess.check_output([args.clang, *flags, '-E', '-w'], cwd=cwd)

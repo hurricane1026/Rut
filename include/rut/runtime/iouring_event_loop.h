@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/integer_range.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -8029,8 +8030,7 @@ public:
             timer.remove(&conn);
         else if (conn.yield_timeout_armed)
             return true;  // Reuse the existing kernel timespec owner.
-        u64 rounded_ns = 0;
-        if (__builtin_add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
+        const u64 rounded_ns = saturating_add(delay_ns, 999'999);
         const u64 ms_wide = rounded_ns / 1'000'000ull;
         u32 ms = ms_wide > UINT32_MAX ? UINT32_MAX : static_cast<u32>(ms_wide);
         if (ms == 0) ms = 1;
@@ -8467,9 +8467,7 @@ public:
         if (idle_trim_pidfd < 0) return;
         const auto kWindow = idle_trim_window(static_cast<u32>(timer.cursor), keepalive_timeout);
         if (kWindow.begin == kWindow.end) return;
-        u64 deadline_ns = 0;
-        if (__builtin_add_overflow(monotonic_ns(), idle_trim_budget_ns, &deadline_ns))
-            deadline_ns = UINT64_MAX;
+        const u64 deadline_ns = saturating_add(monotonic_ns(), idle_trim_budget_ns);
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {

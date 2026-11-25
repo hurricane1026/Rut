@@ -305,12 +305,14 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Map SQ ring
     const u64 sq_array_bytes = static_cast<u64>(params.sq_entries) * sizeof(u32);
-    if (__builtin_add_overflow(static_cast<u64>(params.sq_off.array), sq_array_bytes, &sq_ring_sz))
-        sq_ring_sz = UINT64_MAX;
-    if (sq_ring_sz > SIZE_MAX) {
+    u64 sq_ring_bytes;
+    if (__builtin_add_overflow(
+            static_cast<u64>(params.sq_off.array), sq_array_bytes, &sq_ring_bytes) ||
+        sq_ring_bytes > SIZE_MAX) {
         shutdown();
         return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
     }
+    sq_ring_sz = sq_ring_bytes;
     sq_ring_ptr = mmap(nullptr,
                        sq_ring_sz,
                        PROT_READ | PROT_WRITE,
@@ -353,12 +355,14 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Map CQ ring
     const u64 cq_entry_bytes = static_cast<u64>(params.cq_entries) * sizeof(io_uring_cqe);
-    if (__builtin_add_overflow(static_cast<u64>(params.cq_off.cqes), cq_entry_bytes, &cq_ring_sz))
-        cq_ring_sz = UINT64_MAX;
-    if (cq_ring_sz > SIZE_MAX) {
+    u64 cq_ring_bytes;
+    if (__builtin_add_overflow(
+            static_cast<u64>(params.cq_off.cqes), cq_entry_bytes, &cq_ring_bytes) ||
+        cq_ring_bytes > SIZE_MAX) {
         shutdown();
         return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
     }
+    cq_ring_sz = cq_ring_bytes;
     cq_ring_ptr = mmap(nullptr,
                        cq_ring_sz,
                        PROT_READ | PROT_WRITE,
