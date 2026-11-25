@@ -411,6 +411,7 @@ struct MirFunction {
     RateLimitRuleSet rate_limit{};
     // @throttle client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    u32 request_body_limit = 0;
     u32 http_cache_ttl = 0;
     // Timer function: a `timer name, every: D {...}` periodic task (path holds the
     // name). Carried to the RIR Function so config registers it into the timer
@@ -439,6 +440,7 @@ struct MirFunction {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          request_body_limit(other.request_body_limit),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_callback(other.is_ws_callback),
           ws_callback_phase(other.ws_callback_phase),
@@ -467,6 +469,7 @@ struct MirFunction {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        request_body_limit = other.request_body_limit;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_callback = other.is_ws_callback;
         ws_callback_phase = other.ws_callback_phase;
@@ -493,6 +496,7 @@ struct MirFunction {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          request_body_limit(other.request_body_limit),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_callback(other.is_ws_callback),
           ws_callback_phase(other.ws_callback_phase),
@@ -521,6 +525,7 @@ struct MirFunction {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        request_body_limit = other.request_body_limit;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_callback = other.is_ws_callback;
         ws_callback_phase = other.ws_callback_phase;

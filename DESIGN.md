@@ -1697,6 +1697,16 @@ replay retains its existing rules; if its fresh reconnect fails, subsequent
 backend selection uses this budget.
 Native artifact version 26 records the upstream connect-attempt budget.
 
+A route may declare `@requestBodyLimit(max: 4kb)` to enforce a positive
+ByteSize limit before executing its handler or contacting an upstream. A validated
+Content-Length above the limit receives 413. HTTP/1 Transfer-Encoding receives
+411 and rejected HTTP/1 connections close. HTTP/2 requests with an open stream and
+no Content-Length receive 411; an END_STREAM request without a length is empty.
+HTTP/2 rejection is stream-local. Omission leaves the route unlimited. Values
+must fit 1 through 4294967295 bytes. Native artifact version 28 records the
+combined connect-attempt and route metadata layout; older artifacts (including
+version 27) must be rebuilt.
+
 The compiler contract is:
 
 - Every `forward` call must supply exactly one `load_balance` argument, even

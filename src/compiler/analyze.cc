@@ -26417,7 +26417,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
         bool has_guarding_decorator = false;
         for (u32 di = 0; di < route_decl.decorators.len; di++) {
             const Str dn = route_decl.decorators[di].name;
-            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) && !dn.eq(lit_str("cache")) &&
+            if (!dn.eq({"rateLimit", 9}) && !dn.eq({"throttle", 8}) &&
+                !dn.eq(lit_str("requestBodyLimit")) && !dn.eq(lit_str("cache")) &&
                 !dn.eq(lit_str("host"))) {
                 has_guarding_decorator = true;
                 break;
@@ -27466,7 +27467,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 route.locals.len == 0 && route.guards.len == 0 && route.waits.len == 0 &&
                 route.for_loops.len == 0 && route_decl.chains.len == 0 &&
                 route_decl.decorators.len == 0 && route.rate_limit.count == 0 &&
-                route.throttle_down_bps == 0 && !route.is_timer;
+                route.throttle_down_bps == 0 && route.request_body_limit == 0 && !route.is_timer;
             const bool direct_canonical =
                 structural_common && timeout_term_count == 1 &&
                 route.control.kind == HirControlKind::Direct && timeout_term == &direct &&
@@ -28064,6 +28065,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                           ast_deco.span,
                                           lit_str("a route supports at most 4 @rateLimit rules"));
                 route.rate_limit.rules[kRuleIdx].key = ast_deco.rate_limit_key;
+                continue;
+            }
+            if (ast_deco.name.eq(lit_str("requestBodyLimit"))) {
+                if (route.request_body_limit != 0)
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, ast_deco.span, ast_deco.name);
+                route.request_body_limit = ast_deco.request_body_limit;
                 continue;
             }
             if (ast_deco.name.eq({"throttle", 8})) {

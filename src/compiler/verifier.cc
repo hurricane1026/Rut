@@ -756,7 +756,7 @@ VerifyResult verify_module_impl(const Module& mod,
                 fn.block_count != 1 || sole_timeout_block != 0 || fn.blocks == nullptr ||
                 fn.blocks[0].inst_count < 4 || fn.yield_count != 0 || fn.state_zero_enters_entry ||
                 fn.has_explicit_resume_blocks || fn.rate_limit.count != 0 ||
-                fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
+                fn.throttle_down_bps != 0 || fn.request_body_limit != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& block = fn.blocks[0];
             for (u32 ii = 0; ii + 1 < block.inst_count; ii++) {
@@ -775,7 +775,8 @@ VerifyResult verify_module_impl(const Module& mod,
                 fn.block_cap < fn.block_count || fn.value_count != 7 ||
                 fn.value_cap < fn.value_count || fn.yield_count != 0 ||
                 fn.state_zero_enters_entry || fn.has_explicit_resume_blocks ||
-                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
+                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 ||
+                fn.request_body_limit != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& entry = fn.blocks[0];
             const Block& then_block = fn.blocks[1];
@@ -878,7 +879,8 @@ VerifyResult verify_module_impl(const Module& mod,
                 fn.block_cap < fn.block_count || fn.value_count != 6 ||
                 fn.value_cap < fn.value_count || fn.yield_count != 0 ||
                 fn.state_zero_enters_entry || fn.has_explicit_resume_blocks ||
-                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 || fn.http_cache_ttl != 0)
+                fn.rate_limit.count != 0 || fn.throttle_down_bps != 0 ||
+                fn.request_body_limit != 0 || fn.http_cache_ttl != 0)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
             const Block& entry = fn.blocks[0];
             const Block& then_block = fn.blocks[1];

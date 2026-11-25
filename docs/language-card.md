@@ -744,7 +744,7 @@ it remaps keys. Backend declaration order, shard count and connection reuse do
 not change selection. Weight zero, health, capacity and retry exclusions apply;
 no eligible target returns 503. Explicit `wait(upstream(...).connect())` retains
 its existing selection policy. WebSocket upgrades are rejected with 503 for this
-policy; `websocket(...)` does not accept these arguments. Native ABI 25 requires
+policy; `websocket(...)` does not accept these arguments. Native ABI 28 requires
 recompiling older artifacts. See [the implementation design](consistent-hash-design.md)
 for the deterministic algorithm and compatibility boundaries.
 
@@ -848,7 +848,7 @@ existing one-second timer wheel bounds the entire probe, not each read; expiry
 may be dispatched up to one tick later. Partial HTTP input does not extend it.
 TCP mode allocates no response receive slice. Slot reserve, submission budget,
 one-probe-per-target guard, reload generation fencing, disabled-weight behavior,
-and io_uring cancellation drain apply to both modes. Native ABI 25 requires
+and io_uring cancellation drain apply to both modes. Native ABI 28 requires
 recompiling older artifacts. See [tcp-health.rut](../examples/tcp-health.rut).
 
 An upstream can set `minimum_healthy_weight_percent: 50` to require a minimum
@@ -870,6 +870,16 @@ health capacity, and existing policy exclusions still apply. This does not alter
 HTTP/2 or gRPC upstream forwarding or explicit `connect()`. Pooled-connection
 replay retains its existing rules; if its fresh reconnect fails, subsequent
 backend selection uses this budget.
+
+A route may declare `@requestBodyLimit(max: 4kb)` to enforce a positive
+ByteSize limit before executing its handler or contacting an upstream. A validated
+Content-Length above the limit receives 413. HTTP/1 Transfer-Encoding receives
+411 and rejected HTTP/1 connections close. HTTP/2 requests with an open stream and
+no Content-Length receive 411; an END_STREAM request without a length is empty.
+HTTP/2 rejection is stream-local. Omission leaves the route unlimited. Values
+must fit 1 through 4294967295 bytes. Native artifact version 28 records the
+combined connect-attempt and route metadata layout; older artifacts (including
+version 27) must be rebuilt.
 
 ## Passive HTTP upstream health checks
 
@@ -922,7 +932,7 @@ downstreams on epoll and io_uring. Native HTTP/2/gRPC upstreams reject the optio
 `grpc-status` is not interpreted as an HTTP status. Explicit socket operations
 through `wait(upstream(...).connect())` use target eligibility but do not report
 business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
-cross-shard health synchronization is implied. Native ABI 26 requires rebuilding
+cross-shard health synchronization is not implied. Native ABI 28 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
 ## Native gRPC forwarding
 

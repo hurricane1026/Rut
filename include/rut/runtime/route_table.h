@@ -163,6 +163,7 @@ struct RouteEntry {
     // Per-route client-send byte rate (bytes/sec, 0 = unlimited). The runtime
     // paces the response so it isn't sent faster than this.
     u32 throttle_down_bps = 0;
+    u32 request_body_limit = 0;
     u32 http_cache_ttl = 0;
     // WebSocket TERMINATE mode (Proxy or guarded JIT routes). When `ws_terminate` is set, a 101
     // upgrade enters frame-inspection mode instead of the raw passthrough tunnel: each

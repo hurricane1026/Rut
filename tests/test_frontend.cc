@@ -50331,3 +50331,45 @@ TEST(frontend, upstream_connect_attempts_bounds_and_prebound) {
     REQUIRE(duplicate);
     CHECK_FALSE(parse_file_heap(duplicate.value()));
 }
+
+TEST(frontend, request_body_limit_decorator_bounds_and_lowering) {
+    for (const char* value : {"4b", "1kb", "0x10 kb"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "@requestBodyLimit(max: %s) route POST \"/\" { return 200 }",
+                 value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        CHECK_EQ(rir.module.functions[0].request_body_limit,
+                 value[0] == '4'   ? 4u
+                 : value[0] == '1' ? 1024u
+                                   : 16384u);
+        rir.destroy();
+    }
+    for (const char* value : {"0b", "4", "5tb", "5gb"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "@requestBodyLimit(max: %s) route POST \"/\" { return 200 }",
+                 value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto duplicate =
+        lex(lit("@requestBodyLimit(max: 1b) @requestBodyLimit(max: 2b) "
+                "route POST \"/\" { return 200 }"));
+    REQUIRE(duplicate);
+    auto ast = parse_file_heap(duplicate.value());
+    REQUIRE(ast);
+    CHECK_FALSE(analyze_file_heap(ast.value()));
+}

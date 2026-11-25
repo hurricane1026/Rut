@@ -4385,3 +4385,18 @@ TEST(native_program, preserve_host_connection_proto_policy_survives_compilation)
     const auto result = invoke(owner.p->config.routes[0], "GET / HTTP/1.1\r\nHost: client\r\n\r\n");
     CHECK_EQ(result.status_code, 5u);
 }
+
+TEST(native_program, route_request_body_limit_survives_native_activation) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+@requestBodyLimit(max: 4kb)
+route POST "/" { return 200 }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    activate_native_program(*owner.p);
+    REQUIRE_EQ(owner.p->config.route_count, 1u);
+    CHECK_EQ(owner.p->config.routes[0].request_body_limit, 4096u);
+}

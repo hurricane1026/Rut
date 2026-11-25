@@ -1457,6 +1457,7 @@ struct HirRoute {
     RateLimitRuleSet rate_limit{};
     // @throttle decorator → client-send byte rate (bytes/sec, 0 = none).
     u32 throttle_down_bps = 0;
+    u32 request_body_limit = 0;
     u32 http_cache_ttl = 0;
     // WebSocket terminate mode: `control.direct_term` is the ordinary HTTP
     // Direct ForwardUpstream to the configured WebSocket backend; `ws_handler`
@@ -1498,6 +1499,7 @@ struct HirRoute {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          request_body_limit(other.request_body_limit),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
@@ -1529,6 +1531,7 @@ struct HirRoute {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        request_body_limit = other.request_body_limit;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
@@ -1560,6 +1563,7 @@ struct HirRoute {
           forward_preflight_mode(other.forward_preflight_mode),
           rate_limit(other.rate_limit),
           throttle_down_bps(other.throttle_down_bps),
+          request_body_limit(other.request_body_limit),
           http_cache_ttl(other.http_cache_ttl),
           is_ws_terminate(other.is_ws_terminate),
           is_ws_callback(other.is_ws_callback),
@@ -1591,6 +1595,7 @@ struct HirRoute {
         forward_preflight_mode = other.forward_preflight_mode;
         rate_limit = other.rate_limit;
         throttle_down_bps = other.throttle_down_bps;
+        request_body_limit = other.request_body_limit;
         http_cache_ttl = other.http_cache_ttl;
         is_ws_terminate = other.is_ws_terminate;
         is_ws_callback = other.is_ws_callback;
