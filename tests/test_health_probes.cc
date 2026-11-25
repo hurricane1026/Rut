@@ -74,9 +74,11 @@ struct ProbeRig {
             loop->retry_strict_upstream_retirement_cancels();
         IoEvent events[32]{};
         const u32 kCount = loop->backend.wait(events, 32, loop->conns, initialized_slots(), 0);
+        u32 kept = 0;
         for (u32 i = 0; i < kCount; ++i) {
-            if (events[i].type != IoEventType::Timeout) loop->dispatch(events[i]);
+            if (events[i].type != IoEventType::Timeout) events[kept++] = events[i];
         }
+        loop->dispatch_batch(events, kept);
         if constexpr (requires { loop->reclaim_pending(); }) loop->reclaim_pending();
     }
 
@@ -327,6 +329,12 @@ void connect_timeout_closes_and_drains_pending_connect(rut::test::TestCase* _tc)
     c->request_config = rig.active;
     c->upstream_idx = 0;
     c->upstream_backend_idx = 0;
+    c->upstream_attempts = 1;
+    c->req_start_us = monotonic_us();
+    rig.loop->epoch_enter();
+    constexpr char request[] = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+    REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1));
+    c->req_initial_send_len = sizeof(request) - 1;
     c->req_method = static_cast<u8>(LogHttpMethod::Get);
     c->upstream_fd = UpstreamPool::create_socket();
     REQUIRE(c->upstream_fd >= 0);
@@ -355,6 +363,171 @@ void connect_timeout_closes_and_drains_pending_connect(rut::test::TestCase* _tc)
     REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
     CHECK_EQ(rig.loop->conns[id].pending_ops, 0u);
     reset_backend_health();
+}
+
+template <typename Loop>
+void connect_timeout_retries_pending_socket(rut::test::TestCase* _tc,
+                                            bool disconnect = false,
+                                            bool reload = false) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& target = rig.owner.config->upstreams[0];
+    target.connect_timeout_seconds = 1;
+    target.passive_health.enabled = true;
+    target.passive_health.timeouts = 2;
+    target.passive_health.successes = 1;
+    target.passive_health.healthy_statuses[0] = 1;
+    reset_backend_health();
+    target.connect_attempts = 2;
+    target.addr_count = 2;
+    Socket alternate;
+    alternate.fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(alternate.fd >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE_EQ(bind(alternate.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    REQUIRE_EQ(listen(alternate.fd, 16), 0);
+    socklen_t len = sizeof(address);
+    REQUIRE_EQ(getsockname(alternate.fd, reinterpret_cast<sockaddr*>(&address), &len), 0);
+    target.addrs[1] = address;
+    REQUIRE_EQ(listen(rig.listener.fd, 0), 0);
+    Socket filler;
+    filler.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(filler.fd >= 0);
+    REQUIRE_EQ(connect(filler.fd,
+                       reinterpret_cast<const sockaddr*>(&target.addrs[0]),
+                       sizeof(target.addrs[0])),
+               0);
+    int downstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    Socket peer;
+    peer.fd = downstream[1];
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->fd = downstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_backend_idx = 0;
+    c->upstream_attempts = 1;
+    c->upstream_attempted_backends = 1;
+    c->req_start_us = monotonic_us();
+    rig.loop->epoch_enter();
+    constexpr char request[] = "GET /retry HTTP/1.1\r\nHost: test\r\n\r\n";
+    constexpr char successor[] = "GET /next HTTP/1.1\r\nHost: test\r\n\r\n";
+    REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1));
+    if (!disconnect)
+        REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(successor), sizeof(successor) - 1));
+    c->req_initial_send_len = sizeof(request) - 1;
+    c->req_header_end = sizeof(request) - 1;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(c->upstream_fd >= 0);
+    c->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+    REQUIRE(rig.loop->submit_connect(*c, &target.addrs[0], sizeof(target.addrs[0])));
+    REQUIRE(rig.loop->submit_recv(*c));
+    arm_connect_timeout(rig.loop, *c, target);
+    rig.pump();
+    pollfd pending{c->upstream_fd, POLLOUT, 0};
+    REQUIRE_EQ(poll(&pending, 1, 0), 0);
+    IoEvent tick{0, 2, 0, 0, IoEventType::Timeout, 0};
+    if (reload) {
+        // A configuration change after retirement starts invalidates the lease
+        // before any successor connect is submitted at the batch boundary.
+        expire_connect_attempt(rig.loop, *c);
+        rig.active = nullptr;
+        rig.loop->dispatch_batch(nullptr, 0);
+        REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+        CHECK_EQ(accept4(alternate.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC), -1);
+        return;
+    }
+    if (disconnect) {
+        REQUIRE_EQ(shutdown(peer.fd, SHUT_WR), 0);
+        IoEvent events[32]{};
+        IoEvent terminal{};
+        bool found = false;
+        for (u32 tries = 0; tries < 3000 && !found; ++tries) {
+            const u32 count =
+                rig.loop->backend.wait(events, 32, rig.loop->conns, rig.initialized_slots(), 0);
+            for (u32 i = 0; i < count; ++i) {
+                if (events[i].type == IoEventType::Recv && events[i].conn_id == c->id &&
+                    events[i].result <= 0) {
+                    terminal = events[i];
+                    found = true;
+                } else if (events[i].type != IoEventType::Timeout) {
+                    rig.loop->dispatch(events[i]);
+                }
+            }
+            if (!found) usleep(1000);
+        }
+        REQUIRE(found);
+        const IoEvent batch[] = {tick, terminal};
+        rig.loop->dispatch_batch(batch, 2);
+        REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+        CHECK_EQ(accept4(alternate.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC), -1);
+        BackendHealth* health = backend_health(0, 0);
+        REQUIRE(health);
+        CHECK_EQ(health->passive_timeouts, 1u);
+        return;
+    }
+    if constexpr (requires { rig.loop->begin_upstream_retirement(*c, kUpstreamOpConnect); }) {
+        rig.loop->dispatch_batch(&tick, 1);
+    } else {
+        // A success already returned by epoll in the timer's batch belongs to
+        // the detached episode and must not send the request to the old peer.
+        const IoEvent late_success{
+            c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode};
+        const IoEvent batch[] = {tick, late_success};
+        rig.loop->dispatch_batch(batch, 2);
+    }
+    Socket origin;
+    char wire[256]{};
+    u32 used = 0;
+    const bool received = rig.until([&] {
+        if (origin.fd < 0)
+            origin.fd = accept4(alternate.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (origin.fd >= 0) {
+            const auto n = recv(origin.fd, wire + used, sizeof(wire) - used, 0);
+            if (n > 0) used += static_cast<u32>(n);
+        }
+        return used >= sizeof(request) - 1;
+    });
+    REQUIRE(received);
+    CHECK_EQ(used, sizeof(request) - 1);
+    CHECK_EQ(memcmp(wire, request, sizeof(request) - 1), 0);
+    CHECK_EQ(c->upstream_attempts, 2u);
+    CHECK_EQ(c->upstream_backend_idx, 1u);
+    REQUIRE(rig.until([&] { return c->pipeline_stash_len == sizeof(successor) - 1; }));
+    CHECK_EQ(memcmp(c->send_buf.data() + c->retry_req_send_len, successor, sizeof(successor) - 1),
+             0);
+    BackendHealth* health = backend_health(0, 0);
+    REQUIRE(health);
+    CHECK_EQ(health->passive_timeouts, 1u);
+    rig.loop->close_conn(*c);
+    REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+}
+
+TEST(health_probe, epoll_connect_timeout_retries_pending_socket) {
+    connect_timeout_retries_pending_socket<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_connect_timeout_retries_pending_socket) {
+    connect_timeout_retries_pending_socket<IoUringEventLoop>(_tc);
+}
+
+TEST(health_probe, epoll_connect_timeout_same_batch_disconnect) {
+    connect_timeout_retries_pending_socket<EpollEventLoop>(_tc, true);
+}
+TEST(health_probe, iouring_connect_timeout_same_batch_disconnect) {
+    connect_timeout_retries_pending_socket<IoUringEventLoop>(_tc, true);
+}
+
+TEST(health_probe, epoll_connect_timeout_reload_before_resume) {
+    connect_timeout_retries_pending_socket<EpollEventLoop>(_tc, false, true);
+}
+TEST(health_probe, iouring_connect_timeout_reload_before_resume) {
+    connect_timeout_retries_pending_socket<IoUringEventLoop>(_tc, false, true);
 }
 
 TEST(health_probe, epoll_connect_timeout_dispatch) {

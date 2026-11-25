@@ -1684,11 +1684,14 @@ fail-open remains the default selection contract. HTTPS and gRPC health
 protocols remain absent. See [scope and tests](docs/kong-active-health.md).
 
 An upstream may set `connect_timeout` to 1–63 whole seconds for fresh
-ordinary plaintext HTTP/1 forwarding connects on Linux epoll and io_uring. Expiry records a passive timeout
-and closes the connection without a response or retry. Completed connect
-failures retain their normal attempt budget. Other protocols and explicit
-connect waits retain existing timing. Native artifact version 29 records the
-setting.
+ordinary plaintext HTTP/1 forwarding connects on Linux epoll and io_uring.
+Expiry records a passive timeout. A fully buffered request can retry a distinct
+eligible backend within its connect attempt budget after the timed-out connect
+is retired. An incomplete request, a disconnected client, exhausted budget,
+failed retirement, or unavailable backend closes without a response. Completed
+connect failures retain their normal attempt budget. Other protocols and
+explicit connect waits retain existing timing. Native artifact version 29
+records the setting.
 
 An active `health_check` may set `require_initial_success: true` (default
 false). Each shard starts every backend pending in a new configuration generation.

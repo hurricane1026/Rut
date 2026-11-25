@@ -929,6 +929,22 @@ struct ConnectionBase {
     u32 passive_response_episode = 0;
     u32 passive_timeout_episode = 0;
     u32 connect_timeout_episode = 0;
+    // Request and transport identity while a timed-out connect is retired.
+    bool connect_retry_pending = false;
+    u32 connect_retry_handler_gen = 0;
+    u32 connect_retry_retired_episode = 0;
+    u32 connect_retry_current_episode = 0;
+    i32 connect_retry_downstream_fd = -1;
+    u64 connect_retry_req_start_us = 0;
+    u64 connect_retry_config_identity = 0;
+    u64 connect_retry_deadline_us = 0;
+    const RouteConfig* connect_retry_config = nullptr;
+    u16 connect_retry_upstream_idx = 0;
+    bool connect_retry_slot_held = false;
+    u16 connect_retry_slot_uid = 0;
+    u8 connect_retry_attempts = 0;
+    u8 connect_retry_backend_idx = 0;
+    u8 connect_retry_attempted_backends = 0;
 
     // Fail-closed terminal state for an exhausted io_uring episode token. Like
     // upstream_episode, this deliberately survives reset(): a quarantined slot
@@ -2197,6 +2213,8 @@ struct ConnectionBase {
         upstream_idx = 0;
         upstream_attempts = 0;
         connect_timeout_episode = 0;
+        connect_retry_pending = false;
+        connect_retry_config = nullptr;
         upstream_backend_idx = 0;
         upstream_attempted_backends = 0;
         response_header_timeout_armed = false;

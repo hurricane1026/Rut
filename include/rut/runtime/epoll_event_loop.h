@@ -1181,7 +1181,10 @@ public:
             dispatch(events[i]);
         }
         dispatching_event_batch_ = was_dispatching;
-        if (!dispatching_event_batch_) drain_deferred_health_sweep();
+        if (!dispatching_event_batch_) {
+            resume_connect_retries(this, connection_capacity);
+            drain_deferred_health_sweep();
+        }
     }
 
     void dispatch(const IoEvent& ev) {
@@ -1258,11 +1261,15 @@ public:
                             resume_jit_handler<EpollEventLoop>(this, *c);
                         } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
                             grpc_tick<EpollEventLoop>(this, *c);
+                        } else if (c->connect_retry_pending) {
+                            connect_retry_scan_pending = true;
+                            if (monotonic_us() >= c->connect_retry_deadline_us)
+                                this->close_conn(*c);
+                            else
+                                timer.refresh(c, 1);
                         } else if (c->connect_timeout_episode != 0 &&
                                    c->connect_timeout_episode == c->upstream_episode) {
-                            c->connect_timeout_episode = 0;
-                            record_passive_timeout(this, *c);
-                            this->close_conn(*c);
+                            expire_connect_attempt(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
@@ -1341,7 +1348,7 @@ public:
                     if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.ws_shutdown_deadline_armed)
+                            !conn.connect_retry_pending && !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
@@ -1365,7 +1372,8 @@ public:
                         // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
+                            !conn.connect_retry_pending && !conn.is_health_probe &&
+                            !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1

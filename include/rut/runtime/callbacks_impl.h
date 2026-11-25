@@ -33,6 +33,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -392,7 +393,10 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         for (u32 i = 0; i < count; ++i)
             if (cfg->upstreams[uid].weights[i] != 1) return count;
         if (strict) return select_strict_backend(target, uid, now, excluded_backends);
-        if (!target.hc_require_initial_success) return select_backend(uid, count, now);
+        if (!target.hc_require_initial_success)
+            return excluded_backends == 0
+                       ? select_backend(uid, count, now)
+                       : select_backend(uid, count, now, nullptr, false, excluded_backends);
         return select_backend(uid, count, now, target.weights, false, excluded_backends, &target);
     }
     if (strict && !upstream_capacity_available(target, uid, now)) return count;
@@ -6299,7 +6303,7 @@ bool try_connect_next_backend_impl(Loop* loop,
     if (conn.upstream_backend_idx < target.addr_count)
         conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);
 
-    if (!detach_upstream_close(loop, conn)) return false;
+    if (conn.upstream_fd >= 0 && !detach_upstream_close(loop, conn)) return false;
     const i32 kFd = UpstreamPool::create_socket();
     if (kFd < 0) return false;
     conn.upstream_fd = kFd;
@@ -6333,6 +6337,145 @@ template <typename Loop>
 bool try_connect_next_backend(Loop* loop, Connection& conn) {
     return try_connect_next_backend_impl(
         loop, conn, conn.request_config, conn.forward_load_balance, &on_upstream_connected<Loop>);
+}
+
+// Any downstream event while the old connect is being retired ends this
+// request. In particular a terminal Recv must not be hidden by an empty slot.
+template <typename Loop>
+void on_connect_retry_downstream(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
+    if (ev.result <= 0) {
+        loop->close_conn(conn);
+    } else if (!ev.more) {
+        // Received bytes remain in recv_buf for the normal request/pipeline path.
+        if constexpr (requires { conn.pending_ops; }) {
+            if (!loop->submit_recv(conn)) loop->close_conn(conn);
+        }
+    }
+}
+
+template <typename Loop>
+bool connect_retry_identity_valid(Loop* loop, const Connection& c) {
+    if (!c.connect_retry_pending || c.fd < 0 || c.fd != c.connect_retry_downstream_fd ||
+        c.handler_gen != c.connect_retry_handler_gen || c.req_start_us == 0 ||
+        c.req_start_us != c.connect_retry_req_start_us || c.state != ConnState::Proxying ||
+        c.protocol != ConnProtocol::Http11 || c.tls_active || c.proxy_resp_started ||
+        c.request_config != c.connect_retry_config || !c.request_config || !loop->config_ptr ||
+        *loop->config_ptr != c.request_config ||
+        c.request_config->http_cache_identity != c.connect_retry_config_identity ||
+        c.upstream_idx != c.connect_retry_upstream_idx ||
+        c.upstream_slot_held != c.connect_retry_slot_held ||
+        c.upstream_slot_uid != c.connect_retry_slot_uid ||
+        c.upstream_attempts != c.connect_retry_attempts ||
+        c.upstream_backend_idx != c.connect_retry_backend_idx ||
+        c.upstream_attempted_backends != c.connect_retry_attempted_backends ||
+        loop->is_draining() || c.upstream_episode != c.connect_retry_current_episode ||
+        c.on_recv != &on_connect_retry_downstream<Loop> || c.on_send || c.on_upstream_recv ||
+        c.on_upstream_send || c.upstream_connect_armed || c.upstream_send_armed ||
+        c.upstream_recv_armed || c.upstream_episode_quarantined ||
+        c.upstream_idx >= c.request_config->upstream_count || !request_resendable_from_recv_buf(c))
+        return false;
+    const auto& target = c.request_config->upstreams[c.upstream_idx];
+    if (target.http2 || target.tls.enabled || c.upstream_attempts >= target.connect_attempts ||
+        c.upstream_attempts >= target.addr_count)
+        return false;
+    return true;
+}
+
+template <typename Loop>
+void resume_connect_retries(Loop* loop, u32 slots) {
+    if (!loop->connect_retry_scan_pending) return;
+    loop->connect_retry_scan_pending = false;
+    for (u32 id = 0; id < slots; ++id) {
+        Connection& c = loop->conns[id];
+        if (!c.connect_retry_pending) continue;
+        if (!connect_retry_identity_valid(loop, c) ||
+            monotonic_us() >= c.connect_retry_deadline_us) {
+            loop->close_conn(c);
+            continue;
+        }
+        if constexpr (requires { loop->begin_upstream_retirement(c, kUpstreamOpConnect); }) {
+            if (c.upstream_fd < 0 ||
+                c.upstream_retiring_episode != c.connect_retry_retired_episode) {
+                loop->close_conn(c);
+                continue;
+            }
+            if (c.upstream_retirement_target_owned || c.upstream_retirement_cancel_owned ||
+                c.upstream_retirement_cancel_retry || c.upstream_retirement_active)
+                continue;
+        }
+#if defined(__linux__)
+        pollfd peer{c.fd, POLLRDHUP, 0};
+        if (::poll(&peer, 1, 0) < 0 ||
+            (peer.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            loop->close_conn(c);
+            continue;
+        }
+#endif
+        c.connect_retry_pending = false;
+        c.connect_retry_config = nullptr;
+        c.on_recv = nullptr;
+        if (!try_connect_next_backend(loop, c)) loop->close_conn(c);
+    }
+}
+
+template <typename Loop>
+void expire_connect_attempt(Loop* loop, Connection& c) {
+    const u32 episode = c.connect_timeout_episode;
+    c.connect_timeout_episode = 0;
+    // Only the live, pre-send connect can contribute a timeout verdict.
+    if (episode == 0 || episode != c.upstream_episode || c.fd < 0 || c.upstream_fd < 0 ||
+        c.state != ConnState::Proxying || c.proxy_resp_started ||
+        c.on_upstream_send != &on_upstream_connected<Loop>) {
+        loop->close_conn(c);
+        return;
+    }
+    record_passive_timeout(loop, c);
+    if (!c.request_config || !loop->config_ptr || *loop->config_ptr != c.request_config ||
+        c.fd < 0 || c.req_start_us == 0 || c.state != ConnState::Proxying ||
+        c.protocol != ConnProtocol::Http11 || c.tls_active || c.proxy_resp_started ||
+        c.on_upstream_send != &on_upstream_connected<Loop> || c.on_recv || c.on_send ||
+        c.on_upstream_recv || c.upstream_idx >= c.request_config->upstream_count ||
+        !request_resendable_from_recv_buf(c) || loop->is_draining()) {
+        loop->close_conn(c);
+        return;
+    }
+    const auto& target = c.request_config->upstreams[c.upstream_idx];
+    if (target.http2 || target.tls.enabled || c.upstream_attempts >= target.connect_attempts ||
+        c.upstream_attempts >= target.addr_count) {
+        loop->close_conn(c);
+        return;
+    }
+    if constexpr (requires { loop->begin_upstream_retirement(c, kUpstreamOpConnect); }) {
+        if (!loop->begin_upstream_retirement(c, kUpstreamOpConnect)) {
+            loop->close_conn(c);
+            return;
+        }
+    } else {
+        if (!detach_upstream_close(loop, c)) {
+            loop->close_conn(c);
+            return;
+        }
+        // The retry helper accepts an already-detached epoll transport.
+    }
+    c.connect_retry_pending = true;
+    loop->connect_retry_scan_pending = true;
+    c.connect_retry_handler_gen = c.handler_gen;
+    c.connect_retry_retired_episode = episode;
+    c.connect_retry_current_episode = c.upstream_episode;
+    c.connect_retry_downstream_fd = c.fd;
+    c.connect_retry_req_start_us = c.req_start_us;
+    c.connect_retry_config = c.request_config;
+    c.connect_retry_config_identity = c.request_config->http_cache_identity;
+    c.connect_retry_upstream_idx = c.upstream_idx;
+    c.connect_retry_slot_held = c.upstream_slot_held;
+    c.connect_retry_slot_uid = c.upstream_slot_uid;
+    c.connect_retry_attempts = c.upstream_attempts;
+    c.connect_retry_backend_idx = c.upstream_backend_idx;
+    c.connect_retry_attempted_backends = c.upstream_attempted_backends;
+    c.connect_retry_deadline_us = monotonic_us() + 3000000u;
+    c.set_slots(&on_connect_retry_downstream<Loop>, nullptr, nullptr, nullptr);
+    loop->timer.refresh(&c, 1);
 }
 
 // Admit only the first bounded timeout-policy runtime slice: a complete,

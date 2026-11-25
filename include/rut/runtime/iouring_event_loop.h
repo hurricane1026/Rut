@@ -2754,6 +2754,7 @@ public:
                 c.upstream_retirement_cancel_owned == 0 &&
                 c.upstream_retirement_cancel_retry == 0) {
                 c.upstream_retirement_active = false;
+                if (c.connect_retry_pending) connect_retry_scan_pending = true;
                 if (c.fd < 0) {
                     // A closed slot has no successor rendezvous to publish.
                     // Clear the boundary owner at the exact final retirement
@@ -7514,6 +7515,7 @@ public:
         // Retirement/header rendezvous owners publish only readiness during
         // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
         // this wait batch, before reclamation or accept reuse.
+        resume_connect_retries(this, slots_initialized);
         resume_deferred_http1_boundaries();
         flush_deferred_relay_reads();
         response_read_batch_pin_count = 0;
@@ -8562,11 +8564,15 @@ public:
                             resume_jit_handler<IoUringEventLoop>(this, *c);
                         } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
                             grpc_tick<IoUringEventLoop>(this, *c);
+                        } else if (c->connect_retry_pending) {
+                            connect_retry_scan_pending = true;
+                            if (monotonic_us() >= c->connect_retry_deadline_us)
+                                this->close_conn(*c);
+                            else
+                                timer.refresh(c, 1);
                         } else if (c->connect_timeout_episode != 0 &&
                                    c->connect_timeout_episode == c->upstream_episode) {
-                            c->connect_timeout_episode = 0;
-                            record_passive_timeout(this, *c);
-                            this->close_conn(*c);
+                            expire_connect_attempt(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
@@ -9154,7 +9160,7 @@ public:
                         // to the keepalive timeout.
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.ws_shutdown_deadline_armed &&
+                            !conn.connect_retry_pending && !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

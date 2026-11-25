@@ -256,6 +256,12 @@ void respond_upstream_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void record_passive_timeout(Loop* loop, Connection& conn);
 
+// Retire timed-out plaintext connects and resume eligible retries at batch end.
+template <typename Loop>
+void expire_connect_attempt(Loop* loop, Connection& conn);
+template <typename Loop>
+void resume_connect_retries(Loop* loop, u32 slots);
+
 // io_uring only: refuse a streamed request whose body overflowed recv_buf (the
 // backend had to drop bytes) with 413 + close instead of a silent close. Invoked
 // from the downstream recv dispatch; defined in callbacks_impl.h.
