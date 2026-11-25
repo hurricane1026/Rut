@@ -642,43 +642,61 @@ func redisReplayClaim(_ connection: TcpConnection, _ username: Bytes, _ password
     } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
 }
 
-// Optional local-AOF replay profile for Redis 7.2+. The SET and same-connection
+// Confirmed AOF replay profiles for Redis 7.2+. The SET and same-connection
 // fsync barrier form a finite pipeline, not a MULTI transaction. Four receives
 // preserve the existing sixteen-operation initialization/cleanup budget.
-func redisReplayDurableRead(_ connection: TcpConnection) -> Bytes {
-    resp2ReadLocalAofReply(connection)
-}
-func redisReplayDurableBarrier(_ barrier: Bytes) -> bool {
-    resp2LocalAofAcknowledged(barrier)
-}
-func redisReplayDurableReply(_ frame: Bytes) -> RedisSessionResult {
+func redisReplayAofReply(_ frame: Bytes, _ requireReplica: bool) -> RedisSessionResult {
     guard let token = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
     guard let barrier = frame.slice(token.next, frame.count) else { RedisSessionResult.replyFailure }
-    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    guard resp2AofAcknowledged(barrier, requireReplica) else { RedisSessionResult.replyFailure }
     redisReplayClaimReply(token)
 }
-func redisReplayDurableExecute(_ connection: TcpConnection, _ key: Bytes) -> RedisSessionResult {
+func redisReplayAofSend(_ connection: TcpConnection, _ key: Bytes, _ requireReplica: bool) -> RedisSessionResult {
     guard let claim = redisReplayClaimRequest(key) else { RedisSessionResult.requestFailure }
-    guard let request = concatBytes(claim,
-        b"*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n0\r\n$3\r\n500\r\n", 8192) else { RedisSessionResult.requestFailure }
+    guard let request = concatBytes(claim, resp2AofBarrier(requireReplica), 8192) else { RedisSessionResult.requestFailure }
     let sending = connection.send(request, 1000)
     guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
-    let reading = redisReplayDurableRead(connection)
-    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
-    redisReplayDurableReply(frame)
+    RedisSessionResult.ok
 }
-// 1 = newly claimed, local AOF confirmed and cleanup acknowledged; 0 = an
-// existing claim with the same barrier/cleanup; -1 = any uncertainty. Never
-// retry or delete an uncertain claim. Replica/failover guarantees are separate.
+func redisReplayDurableExecute(_ connection: TcpConnection, _ key: Bytes) -> RedisSessionResult {
+    let sent = redisReplayAofSend(connection, key, false)
+    guard redisReplayResultStatus(sent) == 1 else { sent }
+    let reading = resp2ReadLocalAofReply(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    redisReplayAofReply(frame, false)
+}
+func redisReplayReplicatedExecute(_ connection: TcpConnection, _ key: Bytes) -> RedisSessionResult {
+    let sent = redisReplayAofSend(connection, key, true)
+    guard redisReplayResultStatus(sent) == 1 else { sent }
+    let reading = resp2ReadReplicatedAofReply(connection)
+    guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
+    redisReplayAofReply(frame, true)
+}
+
+func redisReplayAofFinish(_ connection: TcpConnection, _ result: RedisSessionResult) -> i32 {
+    if redisSessionAlreadyClosed(result) {
+        let closed = connection.close()
+        redisReplayResultStatus(result)
+    } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
+}
+
+// 1 = new claim with AOF and cleanup confirmed; 0 = existing claim with
+// barrier and cleanup confirmed; -1 = uncertainty. Keep uncertain claims.
 func redisReplayDurableClaim(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
            _ database: i32, _ key: Bytes) -> i32 {
     let initialized = redisInitialize(connection, username, password, database)
     guard redisInitializeSucceeded(initialized) else { -1 }
     let result = redisReplayDurableExecute(connection, key)
-    if redisSessionAlreadyClosed(result) {
-        let closed = connection.close()
-        redisReplayResultStatus(result)
-    } else { redisReplayResultStatus(redisSessionFinish(connection, result)) }
+    redisReplayAofFinish(connection, result)
+}
+
+// Require the primary and at least one replica to acknowledge AOF fsync.
+func redisReplayReplicatedClaim(_ connection: TcpConnection, _ username: Bytes, _ password: Bytes,
+           _ database: i32, _ key: Bytes) -> i32 {
+    let initialized = redisInitialize(connection, username, password, database)
+    guard redisInitializeSucceeded(initialized) else { -1 }
+    let result = redisReplayReplicatedExecute(connection, key)
+    redisReplayAofFinish(connection, result)
 }
 
 // Bounded RESP2 diagnostics on an ordinary authenticated, non-subscribed handle.
@@ -736,7 +754,7 @@ func redisDeleteKeys(_ connection: TcpConnection, _ keys: RedisKeys, _ mode: Red
 func sessionRevokeReply(_ frame: Bytes) -> RedisSessionResult {
     guard let reply = resp2Token(frame, 0) else { RedisSessionResult.replyFailure }
     guard let barrier = frame.slice(reply.next, frame.count) else { RedisSessionResult.replyFailure }
-    guard redisReplayDurableBarrier(barrier) else { RedisSessionResult.replyFailure }
+    guard resp2LocalAofAcknowledged(barrier) else { RedisSessionResult.replyFailure }
     if reply.kind == 2 { RedisSessionResult.serverError(reply.data) } else {
         if reply.kind == 1 && reply.data == b"OK" { RedisSessionResult.ok } else { RedisSessionResult.replyFailure }
     }
@@ -747,7 +765,7 @@ func sessionRevokeExecute(_ connection: TcpConnection, _ request: Bytes) -> Redi
     let sending = connection.send(request, 1000)
     guard let sent = sending else { RedisSessionResult.transportFailure(netError()) }
     // Reuse the bounded scalar-plus-barrier reader: 128 bytes, four receives.
-    let reading = redisReplayDurableRead(connection)
+    let reading = resp2ReadLocalAofReply(connection)
     guard let frame = reading else { redisSessionFromGet(redisGetReadFailure(netError())) }
     sessionRevokeReply(frame)
 }

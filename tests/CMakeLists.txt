@@ -4390,6 +4390,18 @@ if(RUT_ENABLE_JIT)
                     LABELS "integration;auth;docker" TIMEOUT 300 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
             foreach(auth_free_backend epoll io_uring)
+                add_test(NAME test_auth_replicated_replay_${auth_free_backend}_tls
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-replicated-replay-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --replicated)
+                set_tests_properties(test_auth_replicated_replay_${auth_free_backend}_tls PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 180 SKIP_RETURN_CODE 77)
+                add_test(NAME test_auth_replicated_replay_live_${auth_free_backend}_tls
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay_durable.py
+                        --server $<TARGET_FILE:rut> --source ${PROJECT_SOURCE_DIR}/examples/webhook-replicated-replay-auth.rut
+                        --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${auth_free_backend} --tls --replicated)
+                set_tests_properties(test_auth_replicated_replay_live_${auth_free_backend}_tls PROPERTIES
+                    LABELS "integration;auth;docker" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
                 foreach(durable_replay_opt 0 2)
                     add_test(NAME test_auth_durable_replay_${auth_free_backend}_opt${durable_replay_opt}
                         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_auth_replay.py

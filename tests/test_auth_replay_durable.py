@@ -3,6 +3,7 @@
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from email.utils import formatdate
 import hashlib
 from pathlib import Path
@@ -19,7 +20,7 @@ from test_redis_commands import REDIS_IMAGE, packet, read_value
 
 
 class DurableStore:
-    def __init__(self, args, disable_reset=False):
+    def __init__(self, args, disable_reset=False, *, network=None, replica_of=None):
         self.name = 'rut-auth-replay-' + uuid.uuid4().hex
         self.context = None
         if args.tls:
@@ -40,10 +41,19 @@ class DurableStore:
                          '--tls-cert-file', '/tmp/localhost_cert.pem',
                          '--tls-key-file', '/tmp/localhost_key.pem',
                          '--tls-ca-cert-file', '/tmp/localhost_cert.pem']
+        network_flags = []
+        if network:
+            network_flags = ['--network', network]
+            settings += ['--repl-diskless-sync-delay', '0']
+            if args.tls:
+                settings += ['--tls-replication', 'yes']
+        if replica_of:
+            settings += ['--replicaof', replica_of.name, '6379',
+                         '--masterauth', 'service-password']
         try:
             self.docker('create', '--name', self.name, '--label',
                         'rut.test.suite=auth-durable-replay', '-p', f'127.0.0.1:{self.port}:6379',
-                        REDIS_IMAGE, 'redis-server', *settings)
+                        *network_flags, REDIS_IMAGE, 'redis-server', *settings)
             if args.tls:
                 for filename in ('localhost_cert.pem', 'localhost_key.pem'):
                     self.docker('cp', str(Path(args.testdata) / filename),
@@ -73,15 +83,19 @@ class DurableStore:
         self.docker('wait', self.name)
 
     def command(self, *arguments):
+        return self.pipeline(arguments)[0]
+
+    def pipeline(self, *commands):
         connection = socket.create_connection(('127.0.0.1', self.port), timeout=2)
         if self.context:
             connection = self.context.wrap_socket(connection, server_hostname='localhost')
         with connection, connection.makefile('rb') as stream:
             connection.sendall(packet([b'AUTH', b'service-password']) +
-                               packet([b'SELECT', b'1']) + packet(list(arguments)))
+                               packet([b'SELECT', b'1']) +
+                               b''.join(packet(list(command)) for command in commands))
             assert read_value(stream) == b'OK'
             assert read_value(stream) == b'OK'
-            return read_value(stream)
+            return [read_value(stream) for _ in commands]
 
     def close(self):
         subprocess.run(['docker', 'rm', '-fv', self.name], capture_output=True, timeout=30)
@@ -89,6 +103,78 @@ class DurableStore:
 
 def key(message):
     return b'replay:billing:' + hashlib.sha256(message.encode()).hexdigest().encode()
+
+
+def wait_replication(store, expected_line):
+    deadline = time.monotonic() + 15
+    while True:
+        info = store.command(b'INFO', b'REPLICATION')
+        if expected_line in info.splitlines():
+            return
+        assert time.monotonic() < deadline, info
+        time.sleep(.05)
+
+
+def wait_replica_fsync(primary):
+    # A newly synchronized replica can report link up before its AOF is ready.
+    deadline = time.monotonic() + 15
+    while True:
+        written, acknowledgements = primary.pipeline(
+            (b'SET', b'rut:test:replica-ready', b'1', b'EX', b'10'),
+            (b'WAITAOF', b'1', b'1', b'1500'))
+        assert written == b'OK'
+        if acknowledgements == [1, 1]:
+            return
+        assert time.monotonic() < deadline, acknowledgements
+        time.sleep(.05)
+
+
+def replicated_recovery(args, source, root):
+    docker = DurableStore.docker
+    network = 'rut-auth-replay-' + uuid.uuid4().hex
+    docker('network', 'create', '--label', 'rut.test.suite=auth-durable-replay', network)
+    with ExitStack() as cleanup:
+        cleanup.callback(docker, 'network', 'rm', network)
+        primary = DurableStore(args, network=network)
+        cleanup.callback(primary.close)
+        replica = DurableStore(args, network=network, replica_of=primary)
+        cleanup.callback(replica.close)
+        wait_replication(replica, b'master_link_status:up')
+        wait_replica_fsync(primary)
+        admitted = 'replicated-before-crash'
+        uncertain = 'local-only-after-replica-loss'
+        with gateway(args, source, primary, root) as port:
+            assert exchange(port, admitted) == 204
+            assert exchange(port, admitted, h2=True) == 409
+            assert replica.command(b'GET', key(admitted)) == b'claimed'
+            original_ttl = replica.command(b'PTTL', key(admitted))
+            assert 590000 < original_ttl <= 601000
+            replica.kill()
+            wait_replication(primary, b'connected_slaves:0')
+            assert exchange(port, uncertain, h2=True) == 503
+            assert primary.command(b'GET', key(uncertain)) == b'claimed'
+            assert exchange(port, admitted) == 503
+
+        # Keep the old writer stopped throughout promotion and verification.
+        primary.kill()
+        replica.start()
+        assert replica.command(b'REPLICAOF', b'NO', b'ONE') == b'OK'
+        assert replica.command(b'GET', key(admitted)) == b'claimed'
+        assert replica.command(b'GET', key(uncertain)) is None
+        recovered_ttl = replica.command(b'PTTL', key(admitted))
+        assert 0 < recovered_ttl < original_ttl
+
+        with gateway(args, source, replica, root) as port:
+            assert exchange(port, admitted, h2=True) == 503
+            standby = DurableStore(args, network=network, replica_of=replica)
+            cleanup.callback(standby.close)
+            wait_replication(standby, b'master_link_status:up')
+            wait_replica_fsync(replica)
+            assert exchange(port, admitted, h2=True) == 409
+            assert 0 < replica.command(b'PTTL', key(admitted)) <= recovered_ttl
+            assert exchange(port, 'after-promotion') == 204
+            assert standby.command(b'GET', key('after-promotion')) == b'claimed'
+    print('PASS: replica fsync, crash recovery, fenced promotion and restored redundancy')
 
 
 def cleanup_failure_recovery(args, root):
@@ -166,8 +252,15 @@ def main():
     rotation = parser.add_mutually_exclusive_group()
     rotation.add_argument('--rotation', action='store_true')
     rotation.add_argument('--signed-rotation', action='store_true')
+    rotation.add_argument('--replicated', action='store_true')
     parser.add_argument('--opt', type=int, choices=(0, 2), default=2)
     args = parser.parse_args()
+    if args.replicated:
+        if not args.tls:
+            parser.error('--replicated requires --tls')
+        with tempfile.TemporaryDirectory(prefix='rut-auth-replicated-') as directory:
+            replicated_recovery(args, Path(args.source).resolve(), Path(directory))
+        return
     if args.signed_rotation:
         if not args.tls:
             parser.error('--signed-rotation requires --tls')

@@ -26,7 +26,7 @@ SIGNED_TIME = int(time.time())
 
 
 class Store:
-    def __init__(self, certificates, tls, durable=False):
+    def __init__(self, certificates, tls, durable=False, replicated=False):
         self.lock = threading.Lock()
         self.claims = {}
         self.mode = 'normal'
@@ -36,6 +36,7 @@ class Store:
         self.workers = []
         self.stopping = threading.Event()
         self.durable = durable
+        self.replicated = replicated
         self.barrier_entered = threading.Event()
         self.release_barrier = threading.Event()
         self.listener = socket.socket()
@@ -70,6 +71,7 @@ class Store:
                 connection = self.context.wrap_socket(connection, server_side=True)
             with connection, connection.makefile('rb') as stream:
                 authenticated, selected = False, False
+                claim_sent = False
                 while True:
                     line = stream.readline(64)
                     if not line:
@@ -99,6 +101,7 @@ class Store:
                         reply = b'+OK\r\n' if selected else b'-ERR\r\n'
                     elif args[0] == b'SET':
                         assert authenticated and selected
+                        claim_sent = True
                         assert args[2:] == [b'claimed', b'NX', b'EX', b'601'], args
                         assert args[1].startswith(b'replay:billing:')
                         assert len(args[1].split(b':')[-1]) == 64
@@ -115,12 +118,16 @@ class Store:
                             self.stopping.wait(1.4)
                             return
                     elif args[0] == b'WAITAOF':
-                        assert self.durable and authenticated and selected
-                        assert args == [b'WAITAOF', b'1', b'0', b'500']
+                        assert self.durable and authenticated and selected and claim_sent
+                        required_replicas = b'1' if self.replicated else b'0'
+                        timeout = b'1500' if self.replicated else b'500'
+                        assert args == [b'WAITAOF', b'1', required_replicas, timeout]
                         assert_ack_boundary(connection, stream, 'cleanup preceded AOF confirmation')
-                        reply = b'*2\r\n:1\r\n:0\r\n'
+                        reply = b'*2\r\n:1\r\n:' + required_replicas + b'\r\n'
                         if mode == 'aof-error': reply = b'-ERR AOF disabled\r\n'
                         if mode == 'aof-timeout': reply = b'*2\r\n:0\r\n:0\r\n'
+                        if mode == 'aof-only-replica': reply = b'*2\r\n:0\r\n:1\r\n'
+                        if mode == 'aof-no-replica': reply = b'*2\r\n:1\r\n:0\r\n'
                         if mode == 'aof-negative': reply = b'*2\r\n:1\r\n:-1\r\n'
                         if mode == 'aof-local': reply = b'*2\r\n:2\r\n:0\r\n'
                         if mode == 'aof-type': reply = b'*2\r\n$1\r\n1\r\n:0\r\n'
@@ -134,7 +141,7 @@ class Store:
                             return
                         if mode == 'aof-eof': return
                         if mode == 'aof-hang':
-                            self.stopping.wait(1.4)
+                            self.stopping.wait(2.4 if self.replicated else 1.4)
                             return
                         if mode == 'aof-held':
                             self.barrier_entered.set()
@@ -146,6 +153,7 @@ class Store:
                             reply = reply[4:]
                     elif args[0] == b'RESET':
                         authenticated, selected = False, False
+                        claim_sent = False
                         reply = b'-ERR\r\n' if mode == 'reset-error' else b'+RESET\r\n'
                     else:
                         raise AssertionError(args)
@@ -286,11 +294,13 @@ def main():
     parser.add_argument('--tls',action='store_true')
     parser.add_argument("--signed",action="store_true")
     parser.add_argument('--durable',action='store_true')
+    parser.add_argument('--replicated', action='store_true')
     parser.add_argument('--opt',type=int,choices=(0,2),default=2)
     args=parser.parse_args()
     global SIGNED
     SIGNED=args.signed
-    store=Store(Path(args.testdata),args.tls,args.durable)
+    args.durable = args.durable or args.replicated
+    store=Store(Path(args.testdata),args.tls,args.durable,args.replicated)
     try:
         with tempfile.TemporaryDirectory(prefix='rut-auth-replay-') as tmp:
             with gateway(args,Path(args.source).resolve(),store,Path(tmp)) as port:
@@ -321,10 +331,13 @@ def main():
                 for name in ['set-eof','set-timeout','reset-error']:
                     assert exchange(port,name)==409,name
                 if args.durable:
-                    uncertain = ['aof-error', 'aof-timeout', 'aof-negative', 'aof-local',
+                    uncertain = ['aof-error', 'aof-timeout', 'aof-only-replica',
+                                 'aof-negative', 'aof-local',
                                  'aof-type', 'aof-arity', 'aof-nested', 'aof-overflow',
                                  'aof-oversized', 'aof-trailing', 'aof-short',
                                  'aof-eof', 'aof-hang']
+                    if args.replicated:
+                        uncertain.append('aof-no-replica')
                     aof_nested_first_status = None
                     for mode in uncertain + ['aof-replicas', 'aof-fragmented']:
                         with store.lock: store.mode=mode
@@ -335,6 +348,9 @@ def main():
                             assert status==expected,(mode,status,durable_replay_diagnostics(store,mode))
                         else:
                             assert status==expected,mode
+                    if args.replicated:
+                        with store.lock: store.mode='aof-no-replica'
+                        assert exchange(port,'one',h2=True)==503
                     with store.lock: store.mode='normal'
                     for name in uncertain:
                         actual = exchange(port,name)
@@ -348,7 +364,7 @@ def main():
                         pending=pool.submit(exchange,port,'barrier-held')
                         assert store.barrier_entered.wait(2)
                         time.sleep(.05)
-                        assert not pending.done(), 'admission preceded local fsync acknowledgement'
+                        assert not pending.done(), 'admission preceded AOF acknowledgement'
                         store.release_barrier.set()
                         assert pending.result(timeout=4)==204
                     store.barrier_entered.clear()

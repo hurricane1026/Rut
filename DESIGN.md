@@ -11480,6 +11480,14 @@ original TTL retention on both backends, including service TLS. This adds no
 runtime operation or syntax, and provides no replica promotion or stale-restore
 fencing. See [the recovery boundary](docs/auth-replay.md#confirmed-local-aof-profile).
 
+`redisReplayReplicatedClaim` uses the same request and reply bounds with
+`WAITAOF 1 1 1500`. It requires one primary and at least one replica AOF
+confirmation before acknowledged cleanup. A controlled test stops the old
+primary, recovers the single acknowledging replica from AOF and promotes it
+explicitly, preserving the original replay claim TTL. Configuration chooses the
+new authority, and the deployment owns promotion and fencing. See
+[the replicated profile](docs/auth-replay.md#confirmed-primary-and-replica-aof-profile).
+
 The durable Standard Webhooks rotation example composes the static two-key verifier
 with confirmed local AOF replay claims. Both keys share one stable signer namespace
 and event identity across Redis and gateway restarts; see [the replay contract](docs/auth-replay.md).

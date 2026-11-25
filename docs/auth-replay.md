@@ -169,5 +169,39 @@ of that uncertain claim across SIGKILL/recovery without renewing its TTL.
 The helper does not inspect or lock the server's eviction configuration. Local
 fsync confirmation does not fence a stale promoted replica, prevent an operator
 from restoring old state, preserve a lost/corrupt volume or repair clock rollback.
-Replica durability, distributed failover and exactly-once business delivery are
-not established by `WAITAOF 1 0 500`; they remain explicit deployment contracts.
+
+## Confirmed primary and replica AOF profile
+
+`redisReplayReplicatedClaim(connection, username, password, database, key) -> i32`
+uses the same authenticated claim and cleanup path with the stronger barrier
+`WAITAOF 1 1 1500`. After a successful `SET ... NX EX 601`, the primary and at
+least one replica must confirm AOF fsync before the gateway allows the request.
+The gateway requires exactly one local acknowledgement and a positive replica
+count, and waits for acknowledged RESET/release. An existing claim also requires
+the configured barrier and cleanup before returning 0/409. Insufficient counts,
+invalid replies and cleanup failures return -1/503. An uncertain claim stays
+in the store if the SET applied. [Redis WAITAOF](https://redis.io/docs/latest/commands/waitaof/)
+
+Use [webhook-replicated-replay-auth.rut](../examples/webhook-replicated-replay-auth.rut)
+with the same namespace, database and credentials as the local AOF example.
+Point `REDIS_ENDPOINT` at the current writable Redis 7.2+ primary using verified
+TLS. Enable AOF on the primary and at least one replica and keep live-key
+eviction disabled. The 1500 ms server wait accommodates asynchronous replica
+acknowledgements. Each client receive has a 2000 ms deadline, with the same
+128-byte, four-node and four-receive bounds. The reference deployment uses
+`appendfsync always` on both nodes.
+
+The pinned Redis 7.2.11 fixture stops the replica and verifies 503 on writes
+that only reach local AOF. It then stops the old primary, restarts the
+acknowledging replica with its original AOF and promotes it explicitly. The
+replica recovers the acknowledged claim with its original expiry. After a new
+standby connects, the gateway rejects the replay and accepts a new event with
+both acknowledgements. Both Linux backends exercise this sequence over
+verified gateway-to-Redis TLS.
+
+Promotion and endpoint selection belong to the deployment. The acknowledgement
+reports a replica count, so operators must fence the old writer and select a
+replica known to hold the acknowledged history. The tested profile uses one
+replica before promotion, normal clocks and intact volumes. Automatic failover,
+arbitrary replica selection and exactly-once business delivery remain outside
+this profile.

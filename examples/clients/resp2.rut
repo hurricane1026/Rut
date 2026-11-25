@@ -252,18 +252,19 @@ func redisRequestValid(_ request: Bytes) -> bool {
     root.kind == 5 && root.children > 0 && root.children == values.count - 1 && last.next == request.count
 }
 
-// Read and validate the bounded SET / WAITAOF pipeline frame.
+// One SET result, one array and two integer children are the entire frame.
+func resp2AofAppend(_ stream: Resp2Stream, _ chunk: Bytes) {
+    guard chunk.count > 0 else { nil }
+    guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
+    guard let steps = collectBytes(bytes, stream.cursor, 4, resp2StreamStep) else { nil }
+    guard let cursor = steps.get(steps.count - 1) else { nil }
+    resp2StreamFinish(bytes, cursor)
+}
 func redisReplayDurableReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
     if stream.cursor.status == 0 {
         let reading = connection.receive(stream.cursor.limit - stream.bytes.count, 1000)
         guard let chunk = reading else { nil }
-        guard chunk.count > 0 else { nil }
-        guard let bytes = concatBytes(stream.bytes, chunk, stream.cursor.limit) else { nil }
-        // One SET result, one array and two integer children are the entire
-        // supported response. Do not instantiate a generic 64-node pipeline.
-        guard let steps = collectBytes(bytes, stream.cursor, 4, resp2StreamStep) else { nil }
-        guard let cursor = steps.get(steps.count - 1) else { nil }
-        resp2StreamFinish(bytes, cursor)
+        resp2AofAppend(stream, chunk)
     } else { stream }
 }
 func redisReplayDurableReadTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
@@ -273,21 +274,53 @@ func redisReplayDurableReadTwice(_ connection: TcpConnection, _ stream: Resp2Str
     guard let second = readingSecond else { nil }
     second
 }
-func resp2ReadLocalAofReply(_ connection: TcpConnection) -> Bytes {
-    let initial = Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 2, nodes: 0,
+func resp2AofInitial() -> Resp2Stream {
+    Resp2Stream(bytes: b"", cursor: Resp2Cursor(offset: 0, pending: 2, nodes: 0,
         status: 0, search: 1, bulkEnd: -1, limit: 128))
-    let readingFirst = redisReplayDurableReadTwice(connection, initial)
+}
+func resp2ReadLocalAofReply(_ connection: TcpConnection) -> Bytes {
+    let readingFirst = redisReplayDurableReadTwice(connection, resp2AofInitial())
     guard let first = readingFirst else { nil }
     let readingSecond = redisReplayDurableReadTwice(connection, first)
     guard let stream = readingSecond else { nil }
     guard resp2Finished(stream) else { nil }
     stream.bytes
 }
-func resp2LocalAofAcknowledged(_ barrier: Bytes) -> bool {
+
+// Literal deadlines and four receive sites keep each profile within its I/O budget.
+func resp2ReplicatedAofReceive(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    if stream.cursor.status == 0 {
+        let reading = connection.receive(stream.cursor.limit - stream.bytes.count, 2000)
+        guard let chunk = reading else { nil }
+        resp2AofAppend(stream, chunk)
+    } else { stream }
+}
+func resp2ReplicatedAofReadTwice(_ connection: TcpConnection, _ stream: Resp2Stream) {
+    let readingFirst = resp2ReplicatedAofReceive(connection, stream)
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp2ReplicatedAofReceive(connection, first)
+    guard let second = readingSecond else { nil }
+    second
+}
+func resp2ReadReplicatedAofReply(_ connection: TcpConnection) -> Bytes {
+    let readingFirst = resp2ReplicatedAofReadTwice(connection, resp2AofInitial())
+    guard let first = readingFirst else { nil }
+    let readingSecond = resp2ReplicatedAofReadTwice(connection, first)
+    guard let stream = readingSecond else { nil }
+    guard resp2Finished(stream) else { nil }
+    stream.bytes
+}
+
+func resp2AofAcknowledged(_ barrier: Bytes, _ requireReplica: bool) -> bool {
     guard let root = resp2Token(barrier, 0) else { false }
     guard root.kind == 5 && root.children == 2 else { false }
     guard let local = resp2Token(barrier, root.next) else { false }
     guard let replicas = resp2Token(barrier, local.next) else { false }
-    local.kind == 3 && local.data == b"1" && replicas.kind == 3 &&
-        parseInt64(replicas.data).or(-1) > -1 && replicas.next == barrier.count
+    guard local.kind == 3 && local.data == b"1" && replicas.kind == 3 &&
+        replicas.next == barrier.count else { false }
+    let count = parseInt64(replicas.data).or(-1)
+    count > -1 && (!requireReplica || count > 0)
+}
+func resp2LocalAofAcknowledged(_ barrier: Bytes) -> bool {
+    resp2AofAcknowledged(barrier, false)
 }
