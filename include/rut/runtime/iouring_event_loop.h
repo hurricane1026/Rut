@@ -7671,16 +7671,12 @@ public:
         // the kernel recycle) the memfd under a pending continuation.
         const bool memory_send =
             send.src == c.local_body_cursor + static_cast<i64>(c.send_progress);
+        // Compare the cursor with the file offset before this chunk's progress.
         const bool file_send =
             send.src == nullptr && send.file_fd >= 0 && send.file_fd == c.local_body_file_fd &&
-            c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base && [&] {
-                // The cursor and base are within the same u32-sized route body.
-                const i64 base = c.local_body_cursor - c.local_body_base;
-                i64 offset = 0;
-                if (__builtin_add_overflow(base, static_cast<i64>(c.send_progress), &offset))
-                    __builtin_unreachable();
-                return send.file_base == offset;
-            }();
+            c.local_body_base != nullptr && c.local_body_cursor >= c.local_body_base &&
+            c.local_body_cursor - c.local_body_base ==
+                static_cast<i64>(send.file_base) - static_cast<i64>(c.send_progress);
         return send.type == IoEventType::Send && send.fd == c.fd && send.generation == 0 &&
                (memory_send || file_send) && send.offset <= remaining &&
                send.remaining ==
