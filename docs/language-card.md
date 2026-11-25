@@ -390,6 +390,29 @@ User bindings/types/import namespaces named `IP` shadow the builtin namespace.
 Parsing a header does not establish trust in that header; forwarding policies
 must separately decide which peers may supply client addresses.
 
+## GeoIP country lookup
+
+```swift
+import * as geoip from "../lib/geoip.rut"
+
+route GET "/region" {
+    guard let country = geoip.country(req.remoteAddr) else { return 404 }
+    if country == "DE" { return 204 } else { return 403 }
+}
+```
+
+Start the server with `rut gateway.rut --geoip-db /path/to/GeoLite2-Country.mmdb`.
+`geoip.country(IP) -> str?` wraps the `geoIpCountry(IP)` builtin. It accepts an
+unwrapped IPv4 address and reads `country.iso_code` from a MaxMind DB file such
+as GeoLite2 Country or City. Results are two uppercase ASCII letters. A missing
+database configuration, an unmatched address, or an unavailable or invalid
+country code yields `nil`. If a database path is supplied and the file cannot
+be opened as MMDB, server startup fails.
+
+The process shares one read-only mapping across shards. Replace database files
+by atomic rename and restart Rut to load the replacement. Keep the mapped file
+immutable while the server is running. `req.remoteAddr` is the connection peer.
+
 ## Process access log
 
 ```swift

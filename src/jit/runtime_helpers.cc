@@ -22,6 +22,7 @@
 #include "rut/runtime/consumer_registry.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/format_integer.h"
+#include "rut/runtime/geoip.h"
 #include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/http_call.h"
@@ -3547,6 +3548,10 @@ extern "C" rut::u8 rut_helper_ip_parse(const char* data, rut::u32 length, rut::u
     if (!output) return 0;
     *output = 0;
     return rut::parse_ipv4_address({data, length}, *output) ? 1u : 0u;
+}
+
+extern "C" const char* rut_helper_geoip_country(rut::u32 address) {
+    return rut::geoip_country(address);
 }
 
 extern "C" rut::u8 rut_helper_parse_int(const char* data,

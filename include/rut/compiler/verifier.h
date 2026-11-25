@@ -231,11 +231,11 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
                type->inner->kind == TypeKind::Str && !type->inner->inner &&
                !type->inner->struct_def;
     }
-    if (inst.op != Opcode::IpParse && inst.op != Opcode::StrPredicate &&
-        inst.op != Opcode::StrInterpolate && inst.op != Opcode::StrTrimPrefix &&
-        inst.op != Opcode::StrTrimSuffix && inst.op != Opcode::StrTrimAscii &&
-        inst.op != Opcode::ReqSetPath && inst.op != Opcode::ReqSetBody &&
-        inst.op != Opcode::ReqSetHash)
+    if (inst.op != Opcode::IpParse && inst.op != Opcode::GeoIpCountry &&
+        inst.op != Opcode::StrPredicate && inst.op != Opcode::StrInterpolate &&
+        inst.op != Opcode::StrTrimPrefix && inst.op != Opcode::StrTrimSuffix &&
+        inst.op != Opcode::StrTrimAscii && inst.op != Opcode::ReqSetPath &&
+        inst.op != Opcode::ReqSetBody && inst.op != Opcode::ReqSetHash)
         return true;
     if (inst.operand_count <= kMaxInlineOperands && inst.extra_operands) return false;
     const auto kExact = [&](ValueId id, TypeKind kind) {
@@ -243,14 +243,16 @@ inline bool valid_string_instruction(const Function& fn, const Instruction& inst
         const Type* type = fn.values[id.id].type;
         return type && type->kind == kind && !type->inner && !type->struct_def;
     };
-    if (inst.op == Opcode::IpParse) {
-        if (inst.operand_count != 1 || !kExact(inst.operand(0), TypeKind::Str) ||
+    if (inst.op == Opcode::IpParse || inst.op == Opcode::GeoIpCountry) {
+        const bool parse = inst.op == Opcode::IpParse;
+        if (inst.operand_count != 1 ||
+            !kExact(inst.operand(0), parse ? TypeKind::Str : TypeKind::IP) ||
             inst.result == kNoValue || inst.result.id >= fn.value_count || !fn.values)
             return false;
         const Type* result = fn.values[inst.result.id].type;
         return result && result->kind == TypeKind::Optional && !result->struct_def &&
-               result->inner && result->inner->kind == TypeKind::IP && !result->inner->inner &&
-               !result->inner->struct_def;
+               result->inner && result->inner->kind == (parse ? TypeKind::IP : TypeKind::Str) &&
+               !result->inner->inner && !result->inner->struct_def;
     }
     if (inst.op == Opcode::ReqSetHash) {
         if (inst.result != kNoValue || inst.operand_count != 2 ||

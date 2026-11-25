@@ -1,0 +1,4 @@
+// Reads country.iso_code from the database configured with rut --geoip-db.
+func country(_ address: IP) -> str {
+    geoIpCountry(address)
+}

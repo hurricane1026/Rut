@@ -5443,6 +5443,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 LABELS "integration;network" TIMEOUT 240 SKIP_RETURN_CODE 77)
         endforeach()
         foreach(parsing_opt 0 2)
+            add_test(NAME test_geoip_${backend}_opt${parsing_opt}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_geoip.py
+                    --server $<TARGET_FILE:rut> --library ${PROJECT_SOURCE_DIR}/lib/geoip.rut
+                    --backend ${backend} --opt ${parsing_opt})
+            set_tests_properties(test_geoip_${backend}_opt${parsing_opt} PROPERTIES
+                LABELS "integration;network" TIMEOUT 120 SKIP_RETURN_CODE 77)
             add_test(NAME test_ip_parse_${backend}_opt${parsing_opt}
                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ip_parse.py
                     --server $<TARGET_FILE:rut> --backend ${backend} --opt ${parsing_opt})

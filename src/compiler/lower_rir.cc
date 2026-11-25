@@ -1612,6 +1612,29 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
+    if (value.kind == MirValueKind::GeoIpCountry) {
+        if (!value.lhs || value.lhs->type != MirTypeKind::IP || value.lhs->may_nil ||
+            value.lhs->may_error || value.type != MirTypeKind::Str || !value.may_nil ||
+            value.may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, span);
+        auto address = materialize_value(*value.lhs,
+                                         mir,
+                                         variant_infos,
+                                         tuple_infos,
+                                         tuple_info_count,
+                                         error_scalar_infos,
+                                         error_variant_infos,
+                                         error_struct_infos,
+                                         user_struct_defs,
+                                         b,
+                                         locals,
+                                         local_count,
+                                         span);
+        if (!address) return core::make_unexpected(address.error());
+        auto result = b.emit_geoip_country(address.value(), {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::RegexMatch || value.kind == MirValueKind::RegexCapture) {
         auto lhs = materialize_value(*value.lhs,
                                      mir,
