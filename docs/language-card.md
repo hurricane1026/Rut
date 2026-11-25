@@ -3959,6 +3959,18 @@ No command replay or application-state reset is performed. See
 
 ### Requiring a complete scope list
 
+`middleware/jwt_scopes.rut` adds five set policies for an authenticated document.
+`requireNone` excludes a forbidden list. `requireOnly` allows a subset of a
+configured list. `requireExact` requires set equality. `requireAnyWithout` and
+`requireAllWithout` combine an allowed list with a forbidden list that vetoes a
+positive match. Policies use the existing case-sensitive list grammar and
+1–1024 byte configuration limit. The first three checks require a valid,
+nonempty grant within the same bound. The combined checks use the existing
+full-claim validation. Malformed policy returns 503. Missing, malformed or
+insufficient scope returns challenged 403. See
+[jwt-scope-lists-auth.rut](../examples/jwt-scope-lists-auth.rut).
+
+
 `jwtHasAnyScope(verifiedDocument, candidateScopes) -> bool` permits any exact
 permission from a nonempty configured OAuth scope list, bounded to 1024 bytes.
 It shares the grammar and whole-list validation below with `jwtHasAllScopes`.

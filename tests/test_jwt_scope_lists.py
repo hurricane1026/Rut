@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 import time
 
+from auth_h2_fixture import request as h2_request
+
 KEY = "scope-list-test-key-0123456789abcdef0123456789abcdef"
 
 
@@ -78,7 +80,8 @@ def main():
     ]
     profiles = [("valid", "admin orders:write orders:read"),
                 ("malformed", "orders:read  admin"),
-                ("oversized", "orders:read " + "a" * 1024)]
+                ("oversized", "orders:read " + "a" * 1024),
+                ("bad-forbidden", "admin orders:write orders:read")]
     source = Path(args.source).resolve()
     checks = 0
     with tempfile.TemporaryDirectory(prefix="rut-jwt-scope-lists-") as directory:
@@ -92,7 +95,8 @@ def main():
                 port = probe.getsockname()[1]
             program = root / "scopes.rut"
             program.write_text(source.read_text().replace("listen :8080", f"listen :{port}"))
-            env = dict(os.environ, JWT_SECRET=KEY, JWT_REQUIRED_SCOPES=scopes)
+            env = dict(os.environ, JWT_SECRET=KEY, JWT_REQUIRED_SCOPES=scopes,
+                       JWT_FORBIDDEN_SCOPES="banned  blocked" if profile == "bad-forbidden" else "banned blocked")
             with (root / "gateway.log").open("w+") as log:
                 proc = subprocess.Popen([args.server, str(program), "--backend", args.backend,
                                          "--shards", "1", "--drain", "0"],
@@ -119,7 +123,7 @@ def main():
                         for path in ("/any", "/all"):
                             for credential, duplicate, any_status, all_status in cases:
                                 expected = any_status if path == "/any" else all_status
-                                if profile != "valid" and expected != 401:
+                                if profile in ("malformed", "oversized") and expected != 401:
                                     expected = 503
                                 status, challenges = request(port, path, version, credential, duplicate)
                                 context = (args.backend, profile, version, path, status, expected)
@@ -128,6 +132,34 @@ def main():
                                     ['Bearer error="insufficient_scope"'] if expected == 403 else [])
                                 assert challenges == expected_challenge, (context, challenges)
                                 checks += 1
+                        for grant, expected_row in [
+                            ("orders:read", (204, 204, 403, 204, 403)),
+                            ("orders:read orders:write admin", (204, 204, 204, 204, 204)),
+                            ("admin orders:write orders:read orders:read", (204, 204, 204, 204, 204)),
+                            ("orders:read implicit-extra", (204, 403, 403, 204, 403)),
+                            ("orders:read banned", (403, 403, 403, 403, 403)),
+                            ("admin orders:write orders:read blocked", (403, 403, 403, 403, 403)),
+                            ("Banned", (204, 403, 403, 403, 403)),
+                            ("orders:read a\t", (403, 403, 403, 403, 403)),
+                            (["orders:read"], (403, 403, 403, 403, 403)),
+                            (None, (403, 403, 403, 403, 403)),
+                        ]:
+                            credential = token(base if grant is None else dict(base, scope=grant))
+                            for path, expected in zip(
+                                ("/none", "/only", "/exact", "/any-without", "/all-without"), expected_row
+                            ):
+                                if (profile in ("malformed", "oversized") and path != "/none") or (
+                                    profile == "bad-forbidden" and path in ("/none", "/any-without", "/all-without")
+                                ):
+                                    expected = 503
+                                status, challenges = request(port, path, version, credential)
+                                assert status == expected, (profile, version, path, grant, status)
+                                assert challenges == (['Bearer error="insufficient_scope"'] if expected == 403 else [])
+                                assert request(port, path, version, tampered)[0] == 401
+                                if version == "HTTP/1.1":
+                                    h2 = h2_request(port, path, [("authorization", "Bearer " + credential)])
+                                    assert h2[0] == expected, (profile, path, grant, h2)
+                                checks += 2
                 finally:
                     if proc.poll() is None:
                         proc.terminate()

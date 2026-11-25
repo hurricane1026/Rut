@@ -22,4 +22,40 @@ route GET "/all" {
     return 204
 }
 
+// JWT_FORBIDDEN_SCOPES uses the same list grammar.
+route GET "/none" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireNone(document, env("JWT_FORBIDDEN_SCOPES"))
+    return 204
+}
+
+route GET "/only" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireOnly(document, env("JWT_REQUIRED_SCOPES"))
+    return 204
+}
+
+route GET "/exact" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireExact(document, env("JWT_REQUIRED_SCOPES"))
+    return 204
+}
+
+route GET "/any-without" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireAnyWithout(document, env("JWT_REQUIRED_SCOPES"), env("JWT_FORBIDDEN_SCOPES"))
+    return 204
+}
+
+route GET "/all-without" {
+    let document = auth.jwtDocumentHs256(req.authorization.or(""), env("JWT_SECRET"))
+    let identity = auth.jwtIdentity(document, "https://issuer.example", "orders", "issuer-key")
+    let allowed = jwt_scopes.requireAllWithout(document, env("JWT_REQUIRED_SCOPES"), env("JWT_FORBIDDEN_SCOPES"))
+    return 204
+}
+
 route "/" { return 404 }
