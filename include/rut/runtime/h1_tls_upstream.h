@@ -43,7 +43,8 @@ bool h1_tls_dispatch_owner_event(Loop*, Connection&, IoEvent);
 template <typename Loop>
 void h1_tls_refresh_timer(Loop* loop, Connection& owner) {
     if constexpr (requires { loop->timer.refresh(&owner, loop->upstream_timeout); }) {
-        if (!owner.is_health_probe && !owner.throttle_paused && !owner.ws_shutdown_deadline_armed)
+        if (!owner.is_health_probe && !owner.response_header_timeout_armed &&
+            !owner.throttle_paused && !owner.ws_shutdown_deadline_armed)
             loop->timer.refresh(&owner,
                                 owner.h2 && (owner.h2->grpc.active || owner.h2->grpc.upstream) ? 1
                                 : owner.state == ConnState::Proxying ? loop->upstream_timeout

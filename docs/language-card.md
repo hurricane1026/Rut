@@ -971,6 +971,16 @@ through `wait(upstream(...).connect())` use target eligibility but do not report
 business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
 cross-shard health synchronization is not implied. Native ABI 28 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
+An upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For
+ordinary HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at send completion,
+no WebSocket upgrade and no explicit response/failure policy, the wheel starts
+when the upstream request send completes; a successor arriving later does not cancel
+the deadline. It covers plaintext and verified HTTPS
+origins; incomplete header fragments and interim 1xx responses do not extend it.
+After final headers the ordinary upstream idle timer resumes. Timeout returns the
+existing 504 and closes the upstream. Other profiles and the default retain their
+existing timing. The wheel has one-second resolution.
+
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

@@ -88,6 +88,7 @@ struct UpstreamTarget {
     u8 connect_attempts = 3;
 
     u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
+    u8 response_header_timeout_seconds = 0;
 
     // Active HTTP health-check config. hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe

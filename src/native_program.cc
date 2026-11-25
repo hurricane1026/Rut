@@ -567,6 +567,8 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream connect attempts");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
+        if (target.response_header_timeout_seconds >= TimerWheel::kSlots)
+            return fail("invalid native upstream response header timeout");
         if (!target.passive_health.valid() || (target.passive_health.enabled && target.http2))
             return fail("invalid native upstream passive health policy");
         if (target.hc_enabled && !target.hc_thresholds.valid())

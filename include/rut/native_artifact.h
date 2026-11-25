@@ -13,7 +13,8 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 26 adds the pre-send connection attempt budget; version 27 adds route
 // request-body admission metadata; version 28 combines both independent
 // layouts. Version 29 records upstream connect timeouts.
-constexpr u32 kVersion = 29;
+// Version 30 records upstream response-header timeouts.
+constexpr u32 kVersion = 30;
 struct StreamHeader {
     u64 magic;
     u32 version;

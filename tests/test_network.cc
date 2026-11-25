@@ -18671,7 +18671,9 @@ TEST(upstream_reuse, fallback_retries_idempotent_method) {
     REQUIRE(c->upstream_fd >= 0);
     loop.backend.clear_ops();
 
+    c->response_header_timeout_armed = true;
     CHECK(rut::retry_reused_upstream(&loop, *c));
+    CHECK_FALSE(c->response_header_timeout_armed);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);  // fresh connect submitted
     CHECK(!c->upstream_reused);                             // one-shot
     if (c->upstream_fd >= 0) close(c->upstream_fd);
@@ -18935,11 +18937,13 @@ TEST(upstream_reuse, post_first_response_eof_publishes_failure_without_retry) {
     c->upstream_fd = dup(STDERR_FILENO);
     REQUIRE(c->upstream_fd >= 0);
     c->on_upstream_recv = &on_upstream_response<SmallLoop>;
+    c->response_header_timeout_armed = true;
     loop.backend.clear_ops();
     on_upstream_response<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_FALSE(c->response_header_timeout_armed);
     CHECK_FALSE(c->keep_alive);
     CHECK(buf_has(c->send_buf.data(), c->send_buf.len(), "HTTP/1.1 502 Bad Gateway\r\n"));
     CHECK_EQ(c->upstream_fd, -1);
@@ -19885,6 +19889,12 @@ TEST(upstream_reuse, retry_preserves_pipelined_bytes) {
     auto* c = loop.alloc_conn();
     REQUIRE(c != nullptr);
     REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+    cfg.upstreams[0].response_header_timeout_seconds = 1;
+    c->request_config = &cfg;
+    c->upstream_idx = 0;
+    c->protocol = ConnProtocol::Http11;
     c->req_method = static_cast<u8>(LogHttpMethod::Get);
     c->req_body_mode = BodyMode::None;
     // On the retry path: the original request lives in send_buf (replayed already),
@@ -19913,6 +19923,7 @@ TEST(upstream_reuse, retry_preserves_pipelined_bytes) {
     // recv_buf preserved byte-for-byte; nothing stashed (no mis-slice, no drop).
     CHECK_EQ(c->recv_buf.len(), pl_len);
     CHECK_EQ(c->pipeline_stash_len, 0);
+    CHECK_FALSE(c->response_header_timeout_armed);
     CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), pipelined, pl_len), 0);
 }
 
