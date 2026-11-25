@@ -679,6 +679,21 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             for (u32 j = 0; j < up.name.len; j++) {
                 if (cfg.upstreams[i].name[j] != up.name.ptr[j]) return false;
             }
+            if (up.failover_mask != 0) {
+                auto target = cfg.upstreams[i];
+                if (target.addr_count != up.extra_count + 1) return false;
+                for (u32 j = 0; j < target.addr_count; ++j) {
+                    const u32 ip = j == 0 ? up.ip : up.extra_ips[j - 1];
+                    const u16 port = j == 0 ? up.port : up.extra_ports[j - 1];
+                    if (target.addrs[j].sin_family != AF_INET ||
+                        target.addrs[j].sin_addr.s_addr != htonl(ip) ||
+                        target.addrs[j].sin_port != htons(port))
+                        return false;
+                    if (up.weight_count != 0) target.weights[j] = up.backend_weights[j];
+                }
+                target.failover_mask = up.failover_mask;
+                if (!target.failover_valid()) return false;
+            }
         }
         // Attach active health-check config onto the pre-bound upstreams too —
         // the caller bound only addresses, so without this the hc fields stay at
