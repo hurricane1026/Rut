@@ -18,10 +18,9 @@ template <typename Size>
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
     uintptr_t offset = 0;
     if (__builtin_sub_overflow(ptr, begin, &offset)) return false;
-
-    // Both lengths fit in signed 128 bits. The guard makes the result fit Size.
-    const Size remaining =
-        static_cast<Size>(static_cast<__int128_t>(used) - static_cast<__int128_t>(len));
+    Size remaining;
+    // len <= used above proves the unsigned difference fits in Size.
+    (void)__builtin_sub_overflow(used, len, &remaining);
     return offset <= remaining;
 }
 
