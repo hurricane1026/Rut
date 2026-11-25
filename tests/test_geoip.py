@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the pure Rut client against the standalone MaxMind database tool."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import http.client
 import os
@@ -19,6 +20,16 @@ route POST "/country" {
     let pending = geoip.country(req.body)
     guard let code = pending else { return 404 }
     return response(200, body: code)
+}
+route POST "/capacity" {
+    let lookup = geoip.country(req.body)
+    guard let code = lookup else { return 404 }
+    let opening = udp(env("HOLD_ENDPOINT"), 1000)
+    guard let socket = opening else { return 503 }
+    let marker = socket.send("x", 1000)
+    guard marker.or(-1) == 1 else { return 503 }
+    let receiving = socket.receive(1, 5000)
+    if receiving == nil { return 204 } else { return 409 }
 }
 '''
 
@@ -116,25 +127,46 @@ def main():
                     assert peer.recv(2) == b'', query
             env = os.environ.copy()
             env['GEOIP_ENDPOINT'] = f'{{"address":"127.0.0.1","port":{lookup_port}}}'
-            command = [args.server, '0', str(source), '--backend', args.backend,
-                       '--opt', str(args.opt), '--no-pin', '--shards', '1', '--drain', '0']
-            with listener(command, root / 'server.log', rb'Listening on port ([0-9]+) with',
-                          env=env, skip_unavailable=args.backend == 'io_uring') as port:
-                if port is None:
-                    return 77
-                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
-                try:
-                    for address, expected in (
-                        ('1.2.3.200', 200), ('129.0.0.1', 404), ('200.3.2.1', 404), ('::1', 404),
-                    ):
-                        connection.request('POST', '/country', body=address)
-                        response = connection.getresponse()
-                        body = response.read()
-                        assert response.status == expected, (address, response.status, body)
-                        if expected == 200:
-                            assert body == b'DE', body
-                finally:
-                    connection.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as hold:
+                hold.bind(('127.0.0.1', 0))
+                hold.settimeout(2)
+                env['HOLD_ENDPOINT'] = f'{{"address":"127.0.0.1","port":{hold.getsockname()[1]}}}'
+                command = [args.server, '0', str(source), '--backend', args.backend,
+                           '--opt', str(args.opt), '--no-pin', '--shards', '1', '--drain', '0']
+                with listener(command, root / 'server.log', rb'Listening on port ([0-9]+) with',
+                              env=env, skip_unavailable=args.backend == 'io_uring') as port:
+                    if port is None:
+                        return 77
+                    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
+                    try:
+                        for address, expected in (
+                            ('1.2.3.200', 200), ('129.0.0.1', 404), ('200.3.2.1', 404), ('::1', 404),
+                        ):
+                            connection.request('POST', '/country', body=address)
+                            response = connection.getresponse()
+                            body = response.read()
+                            assert response.status == expected, (address, response.status, body)
+                            if expected == 200:
+                                assert body == b'DE', body
+
+                        def capacity_request():
+                            connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
+                            try:
+                                connection.request('POST', '/capacity', body='1.2.3.200')
+                                result = connection.getresponse()
+                                return result.status, result.read()
+                            finally:
+                                connection.close()
+
+                        with ThreadPoolExecutor(max_workers=9) as pool:
+                            requests = []
+                            for _ in range(9):
+                                requests.append(pool.submit(capacity_request))
+                                hold.recvfrom(1)
+                            capacity = [request.result() for request in requests]
+                        assert capacity == [(204, b'')] * 9, capacity
+                    finally:
+                        connection.close()
     return 0
 
 

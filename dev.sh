@@ -108,6 +108,9 @@ tidy() {
         ! -path '*/simd/neon.cc' \
         ! -path '*/simd/sve.cc' | \
         grep -v third_party)
+    if ! grep -q '^RUT_ENABLE_GEOIP:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+        src_cc=$(printf '%s\n' "$src_cc" | grep -v '/helpers/geoip/main.cc$')
+    fi
     if [[ "$(uname -s)" == Darwin ]]; then
         src_cc=$(printf '%s\n' "$src_cc" | grep -v -E '/(epoll_backend|io_uring_backend)\.cc$')
     else
