@@ -1692,16 +1692,20 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     if (auto* stream = d.conn->h2->find_stream(stream_id))
         stream->headers_received_us = monotonic_us();
     const RouteConfig* config = d.conn->request_config;
-    const bool has_strict_inventory =
-        config != nullptr && config->has_strict_local_response_table_inventory();
     const bool has_exact_inventory =
         config != nullptr && config->has_exact_strict_local_response_inventory();
-    const bool has_pre_route_inventory = config != nullptr && config->has_pre_route_metadata();
+    const bool has_strict_inventory =
+        has_exact_inventory ||
+        (config != nullptr && config->has_non_exact_strict_local_response_inventory());
     // Public metadata integrity is global and precedes malformed-header 400,
     // firewall, or any frame publication. Exact H2 serialization is not yet an
     // admitted capability: a valid raw match closes with zero bytes below,
     // while an unambiguous nonmatch continues through the legacy selector.
-    if (has_strict_inventory && !config->strict_local_response_table_is_valid()) {
+    // Header parsing, mutation-log reset and these selectors are synchronous
+    // and do not publish or invoke configuration callbacks before selection.
+    const auto strict_view =
+        RouteConfig::strict_local_response_view(has_strict_inventory ? config : nullptr);
+    if (has_strict_inventory && !strict_view.valid_for(config)) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
@@ -1711,7 +1715,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // where the strict parser supplies a checked full raw-target witness. H2
     // must not silently ignore this inventory or reinterpret it as Raw.
     if (has_exact_inventory &&
-        config->has_slash_normalized_exact_strict_local_response_inventory()) {
+        strict_view.has_slash_normalized_exact_strict_local_response_inventory()) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
@@ -1728,7 +1732,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         const bool pending_headers_valid = h2_headers_to_request(headers, nheaders, &pending_req);
         if (pending_headers_valid) {
             const u8 pending_method_key = route_method_key(pending_req.method);
-            if (config != nullptr && config->pre_route_policy_id(pending_method_key) != 0) {
+            if (strict_view.pre_route_policy_id(pending_method_key) != 0) {
                 d.close_after_process = true;
                 d.resp_len = 0;
                 d.overflow = false;
@@ -1788,7 +1792,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     }
     const bool kIsHead = req.method == HttpMethod::HEAD;
     const u8 kMethodKey = route_method_key(req.method);
-    const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
+    const u16 pre_route_policy_id = strict_view.pre_route_policy_id(kMethodKey);
     const bool kOriginFormConnect = !kWebsocket && req.method == HttpMethod::CONNECT &&
                                     req.path.len != 0 && req.path.ptr[0] == '/';
     if ((has_exact_inventory || pre_route_policy_id != 0) &&
@@ -1838,14 +1842,14 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // Phase 1 has no H2 strict serializer. A concrete match is therefore a
     // protocol fail-close with no staged frame; an unambiguous nonmatch retains
     // the exact legacy route/unmatched behavior.
-    if (has_pre_route_inventory && pre_route_policy_id != 0) {
+    if (pre_route_policy_id != 0) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
         return;
     }
     if (has_exact_inventory &&
-        config->match_exact_strict_local_response(req.path, kMethodKey) != 0) {
+        strict_view.match_exact_strict_local_response(req.path, kMethodKey) != 0) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;

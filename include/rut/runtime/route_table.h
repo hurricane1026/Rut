@@ -758,9 +758,14 @@ private:
     }
 
 public:
-    bool has_strict_local_response_table_inventory() const {
+    bool has_non_exact_strict_local_response_inventory() const {
         return has_strict_local_response_policy_inventory() || has_pre_route_metadata() ||
-               has_unmatched_metadata() || has_exact_strict_local_response_inventory();
+               has_unmatched_metadata();
+    }
+
+    bool has_strict_local_response_table_inventory() const {
+        return has_non_exact_strict_local_response_inventory() ||
+               has_exact_strict_local_response_inventory();
     }
 
     // True when `value` lies inside the first `used` bytes of `pool` (an empty
@@ -780,9 +785,14 @@ public:
     // Validate counts/mappings before indexing, then require every byte view
     // and exact path to live inside this RouteConfig.
     bool strict_local_response_table_is_valid() const {
+        const u32 exact_count = exact_strict_local_response_binding_count;
         if (strict_local_response_policy_count > kMaxStrictLocalResponsePolicies ||
             strict_local_response_bytes_used > kStrictLocalResponseBytesPoolBytes ||
-            exact_strict_local_response_binding_count > kMaxExactStrictLocalResponseBindings)
+            exact_count > kMaxExactStrictLocalResponseBindings)
+            return false;
+        if (!exact_strict_local_response_binding_range_is_neutral(
+                exact_strict_local_response_bindings + exact_count,
+                kMaxExactStrictLocalResponseBindings - exact_count))
             return false;
         bool referenced[kMaxStrictLocalResponsePolicies]{};
         for (u32 i = 0; i < strict_local_response_policy_count; i++) {
@@ -825,12 +835,8 @@ public:
             strict_local_response_policies[static_cast<i64>(head_id) - 1].head_mode !=
                 StrictLocalResponseHeadMode::SuppressBody)
             return false;
-        for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++) {
+        for (u32 i = 0; i < exact_count; i++) {
             const auto& binding = exact_strict_local_response_bindings[i];
-            if (i >= exact_strict_local_response_binding_count) {
-                if (!exact_strict_local_response_binding_is_neutral(binding)) return false;
-                continue;
-            }
             if (!exact_strict_local_response_binding_shape_valid(binding) ||
                 binding.policy_id > strict_local_response_policy_count)
                 return false;
@@ -860,8 +866,9 @@ public:
     class StrictLocalResponseView {
         friend struct RouteConfig;
         const RouteConfig* config_;
-        explicit StrictLocalResponseView(const RouteConfig& config)
-            : config_(config.strict_local_response_table_is_valid() ? &config : nullptr) {}
+        explicit StrictLocalResponseView(const RouteConfig* config)
+            : config_(config && config->strict_local_response_table_is_valid() ? config : nullptr) {
+        }
 
     public:
         StrictLocalResponseView(const StrictLocalResponseView&) = delete;
@@ -889,7 +896,11 @@ public:
     };
 
     StrictLocalResponseView strict_local_response_view() const {
-        return StrictLocalResponseView(*this);
+        return StrictLocalResponseView(this);
+    }
+
+    static StrictLocalResponseView strict_local_response_view(const RouteConfig* config) {
+        return StrictLocalResponseView(config);
     }
 
     bool unmatched_policy_table_is_valid() const {
