@@ -9480,7 +9480,15 @@ sequential snapshots sharing one store test grace, retirement, current-only
 signing and fail-closed malformed configurations; in-process RCU is not newly
 claimed. See `docs/jwt-sessions.md`.
 
+### Additional checks on verified JWT claims
+
+A caller can also apply ordinary assurance predicates to verified JWT claims.
+The predicates pin the authentication context, method reference, verified email
+or signed session ID, and can impose an authentication-age limit from
+`auth_time` without using the token issuance time as a freshness substitute.
+
 ### Scope-authorized online sessions
+
 
 Online issuance pins a trusted 1–1024-byte `SESSION_SCOPES` list into the existing
 seven-claim HS256 profile. Empty/malformed/oversize grant configuration returns

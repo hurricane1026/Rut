@@ -1,0 +1,49 @@
+// Apply only after signature, issuer, audience and time verification.
+// Expected values come from trusted route configuration.
+func selectorValid(_ value: str) -> bool {
+    value != "" && Bytes(value).count <= 256
+}
+
+func requireAcr(_ document: Json, _ expected: str) -> Json {
+    guard selectorValid(expected) else { respond 503 }
+    guard json.string(json.get(document, "/acr").or(document)).or("") == expected else { respond 403 }
+    document
+}
+
+func requireAmr(_ document: Json, _ expected: str) -> Json {
+    guard selectorValid(expected) else { respond 503 }
+    guard let methods = json.get(document, "/amr") else { respond 403 }
+    guard let projection = json.value({groups: methods}) else { respond 403 }
+    guard jwtHasGroup(projection, expected) else { respond 403 }
+    document
+}
+
+func authenticationAgeMatches(_ document: Json, _ maxAge: i32) -> bool {
+    let authTime = json.int(json.get(document, "/auth_time").or(document)).or(0)
+    let issued = json.int(json.get(document, "/iat").or(document)).or(0)
+    let expiry = json.int(json.get(document, "/exp").or(document)).or(0)
+    guard authTime > 0 && authTime <= issued else { false }
+    guard let times = json.value({iss: "rut", aud: "rut", sub: "rut",
+                                  iat: authTime, exp: expiry}) else { false }
+    let limit = parseInt64("9223372036854775807").or(0)
+    jwtClaimsValidWithLifetime(times, "rut", "rut", i64(maxAge), limit)
+}
+
+func requireAuthenticationAge(_ document: Json, _ maxAge: i32) -> Json {
+    guard maxAge > 0 else { respond 503 }
+    guard authenticationAgeMatches(document, maxAge) else { respond 403 }
+    document
+}
+
+func requireVerifiedEmail(_ document: Json, _ expected: str) -> Json {
+    guard selectorValid(expected) else { respond 503 }
+    guard json.bool(json.get(document, "/email_verified").or(document)).or(false) &&
+        json.string(json.get(document, "/email").or(document)).or("") == expected else { respond 403 }
+    document
+}
+
+func requireSession(_ document: Json, _ expected: str) -> Json {
+    guard selectorValid(expected) else { respond 503 }
+    guard json.string(json.get(document, "/sid").or(document)).or("") == expected else { respond 403 }
+    document
+}
