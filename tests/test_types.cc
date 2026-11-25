@@ -1,8 +1,37 @@
 // Tests for common/types.h: Str, FixedVec, ListNode
+#include "rut/common/byte_span.h"
 #include "rut/common/types.h"
 #include "test.h"
 
 using namespace rut;
+
+TEST(byte_span, checks_pool_boundaries) {
+    const char bytes[10]{};
+    const char* pool = bytes + 1;
+    CHECK(byte_span_within(pool, u32{8}, pool, u32{8}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool, u32{9}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool + 1, u32{8}));
+    CHECK(byte_span_within(pool, u32{8}, pool + 8, u32{0}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, pool + 8, u32{1}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, bytes, u32{1}));
+    CHECK_FALSE(byte_span_within(pool, u32{8}, nullptr, u32{0}));
+    CHECK(byte_span_within(pool, u16{8}, pool + 7, u16{1}));
+}
+
+TEST(byte_span, checks_64_bit_length_arithmetic) {
+    const char pool[3]{};
+    constexpr u64 kLimit32 = u64{1} << 32;
+    constexpr u64 kLimit64Signed = u64{1} << 63;
+    constexpr u64 kLargest = UINT64_MAX;
+    CHECK(byte_span_within(pool, kLimit32, pool + 1, kLimit32 - 1));
+    CHECK_FALSE(byte_span_within(pool, kLimit32, pool + 2, kLimit32 - 1));
+    CHECK(byte_span_within(pool, kLimit64Signed, pool + 1, u64{1}));
+    CHECK_FALSE(byte_span_within(pool, kLimit64Signed - 1, pool, kLimit64Signed));
+    CHECK(byte_span_within(pool, kLargest, pool, kLargest));
+    CHECK_FALSE(byte_span_within(pool, kLargest, pool + 1, kLargest));
+    CHECK_FALSE(byte_span_within(pool + 1, kLargest, pool, u64{0}));
+    CHECK(byte_span_within(pool, size_t{3}, pool + 2, size_t{1}));
+}
 
 // === Str ===
 

@@ -1,3 +1,4 @@
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/auth.h"
 #include "rut/runtime/consumer_registry.h"
@@ -641,7 +642,9 @@ bool parse_positive_unix_seconds(const char* text, i64& cutoff) {
         if (value > (kMax - digit) / 10) return false;
         value = value * 10 + digit;
     }
-    cutoff = static_cast<i64>(value);
+    range_int<1, INT64_MAX> seconds;
+    if (!decltype(seconds)::try_from_u64(value, seconds)) return false;
+    cutoff = seconds.value();
     return true;
 }
 

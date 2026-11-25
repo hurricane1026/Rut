@@ -81,15 +81,26 @@ inline bool exact_strict_local_response_binding_shape_valid(
     return true;
 }
 
+inline bool exact_strict_local_response_binding_range_is_neutral(
+    const ExactStrictLocalResponseBinding* bindings, u32 binding_count) {
+    if (binding_count == 0) return true;
+    if (binding_count <= kMaxExactStrictLocalResponseBindings) {
+        static constexpr ExactStrictLocalResponseBinding
+            kNeutral[kMaxExactStrictLocalResponseBindings]{};
+        return __builtin_memcmp(bindings, kNeutral, sizeof(*bindings) * binding_count) == 0;
+    }
+    for (u32 i = 0; i < binding_count; i++)
+        if (!exact_strict_local_response_binding_is_neutral(bindings[i])) return false;
+    return true;
+}
+
 inline bool exact_strict_local_response_inventory_present(
     const ExactStrictLocalResponseBinding* bindings,
     u32 binding_count,
     u32 binding_capacity = kMaxExactStrictLocalResponseBindings) {
-    if (binding_count != 0) return true;
-    if (bindings == nullptr) return false;
-    for (u32 i = 0; i < binding_capacity; i++)
-        if (!exact_strict_local_response_binding_is_neutral(bindings[i])) return true;
-    return false;
+    return binding_count != 0 ||
+           (bindings != nullptr &&
+            !exact_strict_local_response_binding_range_is_neutral(bindings, binding_capacity));
 }
 
 enum class StrictLocalResponseVersion : u8 { Invalid = 0, Http11 = 1 };

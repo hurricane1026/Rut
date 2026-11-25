@@ -3251,19 +3251,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // different upstream table.
     const RouteConfig* config = loop->config_ptr ? *loop->config_ptr : nullptr;
     conn.request_config = config;
-    const bool has_strict_inventory =
-        config != nullptr && config->has_strict_local_response_table_inventory();
     const bool has_exact_inventory =
         config != nullptr && config->has_exact_strict_local_response_inventory();
+    const bool has_strict_inventory =
+        has_exact_inventory ||
+        (config != nullptr && config->has_non_exact_strict_local_response_inventory());
     // Invalid/partial public metadata is globally terminal before request
     // accounting or any response publication.  An active exact table also
     // requires a complete origin-form HTTP/1.1 request and the full-target
     // fragment witness before either exact selection or canonical fallback.
     const u8 request_method_key = route_method_key(static_cast<LogHttpMethod>(conn.req_method));
     u16 pre_route_policy_id = 0;
-    if (config != nullptr) {
+    if (has_strict_inventory) {
         const auto entry_view = config->strict_local_response_view();
-        if (has_strict_inventory && !entry_view.valid_for(config)) {
+        if (!entry_view.valid_for(config)) {
             conn.req_start_us = 0;
             loop->close_conn(conn);
             return;
@@ -3429,7 +3430,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             // Request accounting/firewall/metrics above may call out. Revalidate
             // here; reuse only through synchronous exact selection and publication.
             const auto exact_view = config->strict_local_response_view();
-            if (has_strict_inventory && !exact_view.valid_for(config)) {
+            if (!exact_view.valid_for(config)) {
                 loop->close_conn(conn);
                 return;
             }
@@ -13796,7 +13797,8 @@ bool handle_configured_strict_local_response_in_scope(
 template <typename Loop>
 bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config) {
     if (config == nullptr || !config->has_unmatched_metadata()) return false;
-    if (!config->strict_local_response_table_is_valid()) {
+    const auto view = config->strict_local_response_view();
+    if (!view.valid_for(config)) {
         loop->close_conn(conn);
         return true;
     }
@@ -13810,7 +13812,7 @@ bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const Ro
     u16 policy_id = config->unmatched_policy_ids[method_key];
     if (policy_id == 0) policy_id = config->unmatched_policy_ids[kRouteMethodAny];
     if (policy_id == 0) return false;
-    return handle_configured_strict_local_response(loop, conn, config, policy_id);
+    return handle_configured_strict_local_response_in_scope(loop, conn, config, policy_id, view);
 }
 
 inline bool build_failure_policy_response(const Connection& conn,
