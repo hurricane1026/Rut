@@ -13,9 +13,8 @@ template <typename Size>
                                            Size used,
                                            const char* data,
                                            Size len) {
-    if (data == nullptr) return false;
     Size remaining;
-    if (__builtin_sub_overflow(used, len, &remaining)) return false;
+    if (data == nullptr || __builtin_sub_overflow(used, len, &remaining)) return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
     uintptr_t offset = 0;
