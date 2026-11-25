@@ -646,7 +646,8 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             u32 timeout_ms,
                                             Str host,
                                             ActiveHealthStatuses statuses,
-                                            bool require_initial_success) {
+                                            bool require_initial_success,
+                                            u32 unhealthy_interval_ms) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
     if ((host.len && (!active_health_host_valid(host) || type == ActiveHealthType::Tcp)) ||
@@ -662,6 +663,7 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
     up.hc_path[path_len] = '\0';
     up.hc_path_len = path_len;
     up.hc_interval_ms = interval_ms;
+    up.hc_unhealthy_interval_ms = unhealthy_interval_ms;
     up.hc_expected_status = status;
     up.hc_healthy_statuses = statuses;
     up.hc_thresholds = thresholds;

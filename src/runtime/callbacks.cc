@@ -1298,6 +1298,11 @@ void reset_backend_health() {
         }
 }
 
+bool probe_backend_latched_down(u16 upstream_id, u32 backend_idx) {
+    const BackendHealth* h = backend_health(upstream_id, backend_idx);
+    return h && (h->active_down || h->passive_down);
+}
+
 bool probe_in_flight(u16 upstream_id, u32 backend_idx) {
     const bool* s = probe_in_flight_slot(upstream_id, backend_idx);
     return s != nullptr && *s;

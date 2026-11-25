@@ -608,8 +608,13 @@ TEST(health_probe, iouring_submit_failure_and_queue_budget) {
     ProbeRig<IoUringEventLoop> rig;
     REQUIRE(rig.init());
     const u32 kFreeSlots = rig.loop->free_conn_slots();
+    auto& target = rig.owner.config->upstreams[0];
+    target.hc_unhealthy_interval_ms = 1000;
+    rig.loop->health_probe_last_issue_ns[0][0] = 0;
     fail_connect_submit = true;
-    CHECK_FALSE(start_health_probe(rig.loop, 0, 0));
+    rig.loop->sweep_health_probes();
+    CHECK_EQ(rig.loop->health_probe_last_issue_ns[0][0], 0u);
+    CHECK_FALSE(rig.loop->health_probe_issued[0][0]);
     fail_connect_submit = false;
     CHECK_FALSE(probe_in_flight(0, 0));
     CHECK_FALSE(backend_ejected(0, 0, 0));
@@ -923,4 +928,100 @@ TEST(health_probes, active_status_sets_validate_canonical_bits) {
     CHECK_FALSE(
         valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0, statuses));
     CHECK_FALSE(valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0));
+}
+
+template <typename Loop>
+void unhealthy_cadence(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_interval_ms = 10000;
+    up.hc_unhealthy_interval_ms = 1000;
+    up.addr_count = 2;
+    up.addrs[1] = up.addrs[0];
+    up.weights[1] = 1;
+    record_active_probe_result(0, 1, false, 0);
+    BackendHealth* healthy = backend_health(0, 0);
+    REQUIRE(healthy);
+    healthy->eject_until_us = UINT64_MAX;
+    CHECK_FALSE(probe_backend_latched_down(0, 0));
+    healthy->passive_down = true;
+    CHECK(probe_backend_latched_down(0, 0));
+    healthy->passive_down = false;
+    const u64 old = monotonic_ns() - 2'000'000'000ull;
+    rig.loop->health_probe_last_issue_ns[0][0] = old;
+    rig.loop->health_probe_last_issue_ns[0][1] = old;
+    // Even a latched-down target's first issue uses the ordinary interval.
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 0));
+    CHECK_FALSE(probe_in_flight(0, 1));
+    rig.loop->health_probe_issued[0][0] = true;
+    rig.loop->health_probe_issued[0][1] = true;
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 0));
+    CHECK(probe_in_flight(0, 1));
+    CHECK_EQ(rig.loop->health_probe_last_issue_ns[0][0], old);
+    CHECK(rig.loop->health_probe_last_issue_ns[0][1] > old);
+    const u64 issued = rig.loop->health_probe_last_issue_ns[0][1];
+    rig.loop->sweep_health_probes();
+    CHECK_EQ(rig.loop->health_probe_last_issue_ns[0][1], issued);
+    rig.owner.config->http_cache_identity = http_cache_config_identity();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    CHECK_FALSE(rig.loop->health_probe_issued[0][1]);
+    CHECK(rig.loop->health_probe_last_issue_ns[0][1] >= issued);
+}
+TEST(health_probe, epoll_unhealthy_cadence) {
+    unhealthy_cadence<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_unhealthy_cadence) {
+    unhealthy_cadence<IoUringEventLoop>(_tc);
+}
+
+TEST(health_probe, epoll_unhealthy_cadence_rotates_under_small_budget) {
+    ProbeRig<EpollEventLoop> rig;
+    REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_unhealthy_interval_ms = 1000;
+    up.addr_count = 3;
+    for (u32 b = 0; b < up.addr_count; ++b) {
+        up.addrs[b] = up.addrs[0];
+        up.weights[b] = 1;
+        rig.loop->health_probe_issued[0][b] = true;
+        rig.loop->health_probe_last_issue_ns[0][b] = 0;
+    }
+    for (u32 expected = 0; expected < up.addr_count; ++expected) {
+        rig.loop->backend.pending_count = rig.loop->backend.kPendingCap - 17;
+        rig.loop->sweep_health_probes();
+        CHECK(probe_in_flight(0, expected));
+        Connection* c = rig.probe();
+        REQUIRE(c);
+        CHECK_EQ(c->upstream_backend_idx, expected);
+        free_probe_conn(rig.loop, *c);
+        rig.loop->backend.pending_count = 0;
+        // A short interval can make an earlier target due again before the next sweep.
+        rig.loop->health_probe_last_issue_ns[0][expected] = 0;
+    }
+}
+
+TEST(health_probe, epoll_unhealthy_cadence_rotates_upstreams_under_small_budget) {
+    ProbeRig<EpollEventLoop> rig;
+    REQUIRE(rig.init());
+    REQUIRE(rig.owner.config->add_upstream("second", 0x7f000001u, rig.port));
+    REQUIRE(rig.owner.config->set_upstream_health_check(1, "/healthz", 8, 1000, 200));
+    for (u32 u = 0; u < 2; ++u) {
+        rig.owner.config->upstreams[u].hc_unhealthy_interval_ms = 1000;
+        rig.loop->health_probe_issued[u][0] = true;
+        rig.loop->health_probe_last_issue_ns[u][0] = 0;
+    }
+    for (u32 expected = 0; expected < 2; ++expected) {
+        rig.loop->backend.pending_count = rig.loop->backend.kPendingCap - 17;
+        rig.loop->sweep_health_probes();
+        CHECK(probe_in_flight(static_cast<u16>(expected), 0));
+        Connection* c = rig.probe();
+        REQUIRE(c);
+        CHECK_EQ(c->upstream_idx, expected);
+        free_probe_conn(rig.loop, *c);
+        rig.loop->backend.pending_count = 0;
+        rig.loop->health_probe_last_issue_ns[expected][0] = 0;
+    }
 }

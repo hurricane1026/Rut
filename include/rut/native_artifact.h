@@ -17,7 +17,8 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 31 records the active probe Host authority.
 // Version 32 records active probe status sets.
 // Version 33 records active probe initial-readiness gating.
-constexpr u32 kVersion = 33;
+// Version 34 records the unhealthy probe cadence.
+constexpr u32 kVersion = 34;
 struct StreamHeader {
     u64 magic;
     u32 version;

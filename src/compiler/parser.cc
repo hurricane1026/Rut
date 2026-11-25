@@ -4182,6 +4182,7 @@ struct Parser {
                     bool seen_path = false;
                     bool hc_seen_host = false;
                     bool seen_interval = false;
+                    bool seen_unhealthy_interval = false;
                     bool seen_status = false;
                     bool seen_statuses = false;
                     bool seen_type = false;
@@ -4299,6 +4300,20 @@ struct Parser {
                                                       dur.value()->text);
                             item.upstream.hc_interval_ms = kIntervalMs;
                             seen_interval = true;
+                        } else if (hc_key.eq({"unhealthy_interval", 18})) {
+                            if (seen_unhealthy_interval)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto dur = expect(TokenType::DurLit);
+                            if (!dur) return core::make_unexpected(dur.error());
+                            const u32 interval = dur_lit_to_ms(dur.value()->text);
+                            if (interval == 0)
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*dur.value()),
+                                                      dur.value()->text);
+                            item.upstream.hc_unhealthy_interval_ms = interval;
+                            seen_unhealthy_interval = true;
                         } else if (hc_key.eq({"status", 6})) {
                             if (seen_status || seen_statuses)
                                 return frontend_error(FrontendError::UnexpectedToken,

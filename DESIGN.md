@@ -1737,6 +1737,17 @@ must fit 1 through 4294967295 bytes. Native artifact version 28 records the
 combined connect-attempt and route metadata layout; older artifacts (including
 version 27) must be rebuilt.
 
+An active `health_check` may also set `unhealthy_interval: 2s` using the same
+positive duration bounds as `interval`. The first check uses `interval`.
+After each issued probe, the next due time uses `unhealthy_interval` while
+that backend has a latched active or passive unhealthy verdict, and `interval`
+otherwise. The legacy timed connect cooldown alone does not select the unhealthy
+interval. Zero-weight, in-flight, and locally deferred probes do not advance the
+per-backend schedule. Probe issuance remains subject to the per-sweep budget and
+one-second sweep resolution. Omission preserves the existing upstream-wide
+schedule. Reload resets schedules and verdicts. Native artifact version 34
+requires rebuilding older artifacts.
+
 Native artifact version 30 records the upstream response-header timeout. An
 upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For ordinary
 HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at
