@@ -558,7 +558,9 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
     for (u32 i = 0; i < mod.upstream_count; ++i)
         if (mod.upstreams[i].minimum_healthy_weight_percent > 100 ||
             !mod.upstreams[i].passive_health.valid() ||
-            (mod.upstreams[i].passive_health.enabled && mod.upstreams[i].http2))
+            (mod.upstreams[i].passive_health.enabled && mod.upstreams[i].http2) ||
+            mod.upstreams[i].connect_attempts == 0 ||
+            mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends)
             return false;
 
     // Upstreams: the compiler emits `forward(name)` as a 0-based index
@@ -607,6 +609,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].http2 = up.http2;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
+            cfg.upstreams[i].connect_attempts = up.connect_attempts;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -664,6 +667,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].http2 = up.http2;
             cfg.upstreams[i].minimum_healthy_weight_percent = up.minimum_healthy_weight_percent;
             cfg.upstreams[i].passive_health = up.passive_health;
+            cfg.upstreams[i].connect_attempts = up.connect_attempts;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

@@ -6134,12 +6134,6 @@ void resume_jit_handler(Loop* loop, Connection& conn) {
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev);
 
-// Maximum upstream connect attempts per request (initial + retries), capped by
-// the upstream's backend count. Retrying here is safe regardless of HTTP method:
-// the connect failed before any request bytes were sent upstream, so no
-// non-idempotent side effect can have occurred.
-inline constexpr u32 kMaxConnectAttempts = 3;
-
 inline bool fixed_upload_head_timeout_response_is_stable(const Connection& conn,
                                                          const ForwardFailurePolicySpec& policy,
                                                          const u8* response,
@@ -6205,7 +6199,7 @@ bool try_connect_next_backend_impl(Loop* loop,
     if (target.minimum_healthy_weight_percent != 0 && !current_health_generation(loop, config))
         return false;
     const u32 kBudget =
-        target.addr_count < kMaxConnectAttempts ? target.addr_count : kMaxConnectAttempts;
+        target.addr_count < target.connect_attempts ? target.addr_count : target.connect_attempts;
     if (conn.upstream_attempts >= kBudget) return false;  // budget exhausted
     if (conn.upstream_backend_idx < target.addr_count)
         conn.upstream_attempted_backends |= static_cast<u8>(1u << conn.upstream_backend_idx);

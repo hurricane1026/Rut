@@ -50296,3 +50296,38 @@ TEST(frontend, mir_unrolls_for_loop_break_and_continue) {
         rir.destroy();
     }
 }
+
+TEST(frontend, upstream_connect_attempts_bounds_and_prebound) {
+    for (const char* value : {"1", "3", "8", "0x8", "0b1"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { connect_attempts: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("api", 0x7f000001, 9001));
+        REQUIRE(populate_route_config(cfg, rir.module));
+        CHECK_EQ(cfg.upstreams[0].connect_attempts,
+                 value[0] == '0' ? (value[1] == 'x' ? 8u : 1u) : static_cast<u32>(value[0] - '0'));
+        rir.module.upstreams[0].connect_attempts = 0;
+        CHECK_FALSE(populate_route_config(cfg, rir.module));
+        rir.destroy();
+    }
+    for (const char* value : {"0", "9", "99", "999999999999999999999", "-1"}) {
+        char source[160];
+        snprintf(source, sizeof(source), "upstream api { connect_attempts: %s }", value);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto duplicate = lex(lit("upstream api { connect_attempts: 1, connect_attempts: 2 }"));
+    REQUIRE(duplicate);
+    CHECK_FALSE(parse_file_heap(duplicate.value()));
+}

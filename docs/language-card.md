@@ -861,6 +861,16 @@ explicit `wait(upstream(api).connect())` requests receive 503. A retry that
 cannot select another target retains its earlier failure result. Health verdicts
 start fresh on each shard after a configuration reload.
 
+An upstream may set `connect_attempts: N` to allow 1 through 8 fresh TCP
+connection attempts for HTTP/1 upstream forwarding, including the first attempt.
+This applies to both HTTP/1 and HTTP/2 downstream clients.
+The default is 3; attempts are also limited by available distinct backends.
+Only failed connects before sending a request are retried. Backend eligibility,
+health capacity, and existing policy exclusions still apply. This does not alter
+HTTP/2 or gRPC upstream forwarding or explicit `connect()`. Pooled-connection
+replay retains its existing rules; if its fresh reconnect fails, subsequent
+backend selection uses this budget.
+
 ## Passive HTTP upstream health checks
 
 ```swift
@@ -912,9 +922,8 @@ downstreams on epoll and io_uring. Native HTTP/2/gRPC upstreams reject the optio
 `grpc-status` is not interpreted as an HTTP status. Explicit socket operations
 through `wait(upstream(...).connect())` use target eligibility but do not report
 business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
-cross-shard health synchronization is implied. Native ABI 25 requires rebuilding
+cross-shard health synchronization is implied. Native ABI 26 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
-
 ## Native gRPC forwarding
 
 Use the currently implemented upstream declaration below (the upstream binding

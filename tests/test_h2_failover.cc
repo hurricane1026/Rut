@@ -124,6 +124,22 @@ TEST(h2_failover, distinct_targets_and_three_attempt_limit) {
     for (u32 i = 0; i < 4; ++i) CHECK_EQ(rig.owner.config->backend_selection[0].active[0][i], 0u);
 }
 
+TEST(h2_failover, configured_budget_releases_each_backend) {
+    constexpr u32 kBudgets[] = {1u, 2u, 4u};
+    for (u32 budget : kBudgets) {
+        RetryRig rig;
+        REQUIRE(rig.init(4));
+        rig.owner.config->upstreams[0].connect_attempts = static_cast<u8>(budget);
+        for (u32 attempt = 0; attempt < budget; ++attempt) rig.fail();
+        CHECK_EQ(rig.loop.backend.count_ops(MockOp::Connect), budget - 1);
+        CHECK_EQ(rig.conn->upstream_fd, -1);
+        CHECK_EQ(rig.h2.async_stream, 0u);
+        CHECK_FALSE(rig.conn->epoch_held);
+        for (u32 i = 0; i < 4; ++i)
+            CHECK_EQ(rig.owner.config->backend_selection[0].active[0][i], 0u);
+    }
+}
+
 TEST(h2_failover, exhausted_or_disabled_targets_do_not_reconnect) {
     for (u32 count = 1; count <= 2; ++count) {
         RetryRig rig;
