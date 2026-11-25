@@ -4,7 +4,10 @@
 #include "rut/platform/socket.h"
 
 #include <arpa/inet.h>
+#include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509_vfy.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -108,6 +111,8 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
                 next.dns_transport = DnsTransport::Udp;
             else if (transport.eq(lit_str("tcp")))
                 next.dns_transport = DnsTransport::Tcp;
+            else if (transport.eq(lit_str("tls")))
+                next.dns_transport = DnsTransport::Tls;
             else
                 return false;
             fields |= 262144;
@@ -155,6 +160,14 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             target = next.dns_address;
             capacity = sizeof(next.dns_address);
             fields |= 512;
+        } else if (kKey.eq(lit_str("dnsTlsServerName"))) {
+            target = next.dns_tls.server_name;
+            capacity = sizeof(next.dns_tls.server_name);
+            fields |= 524288;
+        } else if (kKey.eq(lit_str("dnsTlsCa"))) {
+            target = next.dns_tls.ca;
+            capacity = sizeof(next.dns_tls.ca);
+            fields |= 1048576;
         } else if (kKey.eq(lit_str("discoveryPath"))) {
             target = next.discovery_path;
             capacity = sizeof(next.discovery_path);
@@ -196,6 +209,10 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_port = static_cast<u16>(value);
             fields |= 4096;
+        } else if (kKey.eq(lit_str("dnsTlsPort"))) {
+            if (value > 65535) return false;
+            next.dns_tls_port = static_cast<u16>(value);
+            fields |= 2097152;
         } else if (kKey.eq(lit_str("discoveryPort"))) {
             if (value > 65535) return false;
             next.discovery_endpoint.port = static_cast<u16>(value);
@@ -255,8 +272,8 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     } else {
         next.discovery_endpoint = next.endpoint;
     }
-    if ((fields & (256 | 512 | 4096 | 8192 | 262144)) || next.dns_cache_seconds ||
-        next.dns_timeout_seconds) {
+    if ((fields & (256 | 512 | 4096 | 8192 | 262144 | 524288 | 1048576 | 2097152)) ||
+        next.dns_cache_seconds || next.dns_timeout_seconds) {
         sockaddr_storage resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
             !platform::ip_socket_address(next.dns_address, next.dns_port, resolver))
@@ -281,6 +298,15 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         }
         if (next.dns_dual_stack && !(has_ipv4 && has_ipv6)) return false;
     }
+    constexpr u32 kDnsTlsMask = 524288 | 1048576 | 2097152;
+    if (fields & kDnsTlsMask) {
+        if (next.dns_transport != DnsTransport::Tls ||
+            (fields & (524288 | 1048576)) != (524288 | 1048576) || (fields & 4096))
+            return false;
+        next.dns_tls.enabled = true;
+        if (!valid_upstream_tls(next.dns_tls)) return false;
+    }
+    if (next.dns_transport == DnsTransport::Tls && !(fields & kDnsTlsMask)) return false;
     if (next.discovery_cache_seconds > next.max_age_seconds) return false;
     if ((fields & (1024 | 2048 | kDiscoveryOriginMask)) || next.discovery_timeout_seconds ||
         next.conditional_discovery || next.discovery_cache_seconds) {
@@ -601,10 +627,14 @@ bool jwks_dns_answer(Str packet,
 
 JwksFetch::~JwksFetch() {
     cancel();
+    destroy_tls_client_context(dns_tls_context_);
 }
 bool JwksFetch::init(const RemoteJwks& configuration) {
     if (initialized_ || state_ == State::Busy ||
         !keys_.init(configuration.endpoint, configuration.max_retry_after_seconds != 0))
+        return false;
+    if (configuration.dns_transport == RemoteJwks::DnsTransport::Tls &&
+        !init_tls_client_context(dns_tls_context_, configuration.dns_tls, false, false))
         return false;
     if (configuration.discovery_path[0]) {
         HttpsEndpoint endpoint = configuration.discovery_endpoint;
@@ -619,6 +649,8 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
     return true;
 }
 void JwksFetch::close_dns() {
+    if (dns_ssl_) SSL_free(dns_ssl_);
+    dns_ssl_ = nullptr;
     if (dns_fd_ >= 0) ::close(dns_fd_);
     dns_fd_ = -1;
     dns_step_ = DnsStep::None;
@@ -769,8 +801,11 @@ bool JwksFetch::start(u64 now,
     query_[query_length_++] = 0;
     query_[query_length_++] = 1;
     sockaddr_storage resolver{};
+    const u16 kDnsPort = configuration_.dns_transport == RemoteJwks::DnsTransport::Tls
+                             ? configuration_.dns_tls_port
+                             : configuration_.dns_port;
     const socklen_t length =
-        platform::ip_socket_address(configuration_.dns_address, configuration_.dns_port, resolver);
+        platform::ip_socket_address(configuration_.dns_address, kDnsPort, resolver);
     if (!length) return fail();
     if (configuration_.dns_transport == RemoteJwks::DnsTransport::Udp) {
         dns_fd_ = platform::datagram_socket(resolver.ss_family);
@@ -779,6 +814,13 @@ bool JwksFetch::start(u64 now,
             return fail();
     }
     return send_dns_query(configuration_.dns_aaaa || configuration_.dns_dual_stack);
+}
+bool JwksFetch::begin_dns_tls() {
+    auto ssl = create_tls_client_ssl(dns_tls_context_, dns_fd_, configuration_.dns_tls.server_name);
+    if (!ssl) return false;
+    dns_ssl_ = ssl.value();
+    dns_step_ = DnsStep::TlsHandshake;
+    return true;
 }
 bool JwksFetch::send_dns_query(bool aaaa) {
     if (RAND_bytes(query_, 2) != 1) return fail();
@@ -790,8 +832,11 @@ bool JwksFetch::send_dns_query(bool aaaa) {
     }
     close_dns();
     sockaddr_storage resolver{};
+    const u16 kDnsPort = configuration_.dns_transport == RemoteJwks::DnsTransport::Tls
+                             ? configuration_.dns_tls_port
+                             : configuration_.dns_port;
     const socklen_t length =
-        platform::ip_socket_address(configuration_.dns_address, configuration_.dns_port, resolver);
+        platform::ip_socket_address(configuration_.dns_address, kDnsPort, resolver);
     if (!length) return fail();
     dns_fd_ = platform::stream_socket(resolver.ss_family);
     if (dns_fd_ < 0) return fail();
@@ -804,7 +849,12 @@ bool JwksFetch::send_dns_query(bool aaaa) {
     dns_out_[1] = static_cast<char>(query_length_ & 0xff);
     __builtin_memcpy(dns_out_ + 2, query_, query_length_);
     dns_out_sent_ = 0;
-    dns_step_ = kConnected == 0 ? DnsStep::Write : DnsStep::Connect;
+    if (kConnected != 0) {
+        dns_step_ = DnsStep::Connect;
+        return true;
+    }
+    if (configuration_.dns_transport == RemoteJwks::DnsTransport::Tls) return begin_dns_tls();
+    dns_step_ = DnsStep::Write;
     return true;
 }
 bool JwksFetch::advance_dns_stream(u64 now) {
@@ -821,19 +871,50 @@ bool JwksFetch::advance_dns_stream(u64 now) {
             socklen_t length = sizeof(error);
             if (getsockopt(dns_fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error)
                 return fail();
+            if (configuration_.dns_transport == RemoteJwks::DnsTransport::Tls) {
+                if (!begin_dns_tls()) return fail();
+            } else {
+                dns_step_ = DnsStep::Write;
+            }
+            continue;
+        }
+        if (dns_step_ == DnsStep::TlsHandshake) {
+            ERR_clear_error();
+            const int kResult = SSL_connect(dns_ssl_);
+            if (kResult != 1) {
+                const int kError = SSL_get_error(dns_ssl_, kResult);
+                if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE) return true;
+                return fail();
+            }
+            if (SSL_get_verify_result(dns_ssl_) != X509_V_OK) return fail();
             dns_step_ = DnsStep::Write;
             continue;
         }
         if (dns_step_ == DnsStep::Write) {
             const i64 kRemaining = static_cast<i64>(dns_out_len_) - static_cast<i64>(dns_out_sent_);
             if (kRemaining <= 0) return fail();
-            const ssize_t sent = ::send(dns_fd_,
-                                        dns_out_ + static_cast<i64>(dns_out_sent_),
-                                        static_cast<size_t>(kRemaining),
-                                        platform::kSendFlags);
-            if (sent < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-                return fail();
+            ssize_t sent = 0;
+            if (dns_ssl_) {
+                ERR_clear_error();
+                const int kResult = SSL_write(dns_ssl_,
+                                              dns_out_ + static_cast<i64>(dns_out_sent_),
+                                              static_cast<int>(kRemaining));
+                if (kResult <= 0) {
+                    const int kError = SSL_get_error(dns_ssl_, kResult);
+                    if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE)
+                        return true;
+                    return fail();
+                }
+                sent = kResult;
+            } else {
+                sent = ::send(dns_fd_,
+                              dns_out_ + static_cast<i64>(dns_out_sent_),
+                              static_cast<size_t>(kRemaining),
+                              platform::kSendFlags);
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+                    return fail();
+                }
             }
             if (sent == 0) return fail();
             dns_out_sent_ = static_cast<u32>(static_cast<i64>(dns_out_sent_) + sent);
@@ -843,13 +924,28 @@ bool JwksFetch::advance_dns_stream(u64 now) {
         if (dns_step_ == DnsStep::ReadLength) {
             const i64 kRemaining = static_cast<i64>(2) - static_cast<i64>(dns_length_have_);
             if (kRemaining <= 0) return fail();
-            const ssize_t received = ::recv(dns_fd_,
-                                            dns_length_ + static_cast<i64>(dns_length_have_),
-                                            static_cast<size_t>(kRemaining),
-                                            0);
-            if (received < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-                return fail();
+            ssize_t received = 0;
+            if (dns_ssl_) {
+                ERR_clear_error();
+                const int kResult = SSL_read(dns_ssl_,
+                                             dns_length_ + static_cast<i64>(dns_length_have_),
+                                             static_cast<int>(kRemaining));
+                if (kResult <= 0) {
+                    const int kError = SSL_get_error(dns_ssl_, kResult);
+                    if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE)
+                        return true;
+                    return fail();
+                }
+                received = kResult;
+            } else {
+                received = ::recv(dns_fd_,
+                                  dns_length_ + static_cast<i64>(dns_length_have_),
+                                  static_cast<size_t>(kRemaining),
+                                  0);
+                if (received < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+                    return fail();
+                }
             }
             if (received == 0) return fail();
             dns_length_have_ = static_cast<u32>(static_cast<i64>(dns_length_have_) + received);
@@ -864,11 +960,26 @@ bool JwksFetch::advance_dns_stream(u64 now) {
         }
         const i64 kRemaining = static_cast<i64>(dns_in_expected_) - static_cast<i64>(dns_in_len_);
         if (kRemaining <= 0) return fail();
-        const ssize_t received = ::recv(
-            dns_fd_, dns_in_ + static_cast<i64>(dns_in_len_), static_cast<size_t>(kRemaining), 0);
-        if (received < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
-            return fail();
+        ssize_t received = 0;
+        if (dns_ssl_) {
+            ERR_clear_error();
+            const int kResult = SSL_read(
+                dns_ssl_, dns_in_ + static_cast<i64>(dns_in_len_), static_cast<int>(kRemaining));
+            if (kResult <= 0) {
+                const int kError = SSL_get_error(dns_ssl_, kResult);
+                if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE) return true;
+                return fail();
+            }
+            received = kResult;
+        } else {
+            received = ::recv(dns_fd_,
+                              dns_in_ + static_cast<i64>(dns_in_len_),
+                              static_cast<size_t>(kRemaining),
+                              0);
+            if (received < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+                return fail();
+            }
         }
         if (received == 0) return fail();
         dns_in_len_ = static_cast<u32>(static_cast<i64>(dns_in_len_) + received);

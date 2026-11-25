@@ -158,7 +158,7 @@ core::Expected<void, Error> tls_engine_init_client(TlsEngine& eng,
     }
     BIO_set_data(bio, &eng);
     SSL_set_bio(ssl, bio, bio);
-    if (!configure_tls_client_ssl(ssl, server_name, ctx.http2)) {
+    if (!configure_tls_client_ssl(ssl, server_name, ctx.http2, ctx.offer_alpn)) {
         SSL_free(ssl);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }
