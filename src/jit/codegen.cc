@@ -10,7 +10,6 @@
 #include "rut/compiler/verifier.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/cache_table.h"
-#include "rut/runtime/geoip.h"
 #include "rut/runtime/hash.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/net_client.h"
@@ -2026,28 +2025,6 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             auto result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
             result = LLVMBuildInsertValue(c.builder, result, kHas, 0, "");
             result = LLVMBuildInsertValue(c.builder, result, kPayload, 1, "");
-            c.set_value(inst.result, result);
-            break;
-        }
-        case rir::Opcode::GeoIpCountry: {
-            LLVMTypeRef params[] = {c.i32_ty};
-            const auto type = LLVMFunctionType(c.ptr_ty, params, 1, 0);
-            const char* name = "rut_helper_geoip_country";
-            auto helper = LLVMGetNamedFunction(c.llvm_mod, name);
-            if (!helper) helper = LLVMAddFunction(c.llvm_mod, name, type);
-            LLVMValueRef args[] = {c.get_value(inst.operand(0))};
-            const auto code = LLVMBuildCall2(c.builder, type, helper, args, 1, "geoip.code");
-            const auto found = LLVMBuildIsNotNull(c.builder, code, "geoip.found");
-            const auto length = LLVMBuildSelect(c.builder,
-                                                found,
-                                                LLVMConstInt(c.i32_ty, kGeoIpCountryCodeLength, 0),
-                                                LLVMConstInt(c.i32_ty, 0, 0),
-                                                "geoip.length");
-            auto result = LLVMGetUndef(c.opt_str_ty);
-            result = LLVMBuildInsertValue(
-                c.builder, result, LLVMBuildZExt(c.builder, found, c.i8_ty, ""), 0, "");
-            result = LLVMBuildInsertValue(c.builder, result, code, 1, "");
-            result = LLVMBuildInsertValue(c.builder, result, length, 2, "");
             c.set_value(inst.result, result);
             break;
         }

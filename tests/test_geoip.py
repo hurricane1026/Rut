@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Test an operator-supplied MMDB through the normal Rut server entry point."""
+"""Exercise the pure Rut client against the standalone MaxMind database tool."""
 import argparse
+from contextlib import contextmanager
 import http.client
+import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -13,13 +16,9 @@ import time
 PROGRAM = '''import * as geoip from "geoip.rut"
 
 route POST "/country" {
-    guard let ip = IP.parse(req.body) else { return 400 }
-    guard let code = geoip.country(ip) else { return 404 }
-    if code == "DE" { return 204 } else { return 409 }
-}
-
-route GET "/peer" {
-    if geoip.country(req.remoteAddr).or("") == "DE" { return 204 } else { return 404 }
+    let pending = geoip.country(req.body)
+    guard let code = pending else { return 404 }
+    return response(200, body: code)
 }
 '''
 
@@ -55,39 +54,25 @@ def mmdb_fixture():
     return tree + bytes(16) + country + no_country + b'\xab\xcd\xefMaxMind.com' + metadata
 
 
-def run_server(command, log, backend, has_database):
+@contextmanager
+def listener(command, log, pattern, env=None, skip_unavailable=False):
     with log.open('wb') as output:
-        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, env=env)
     try:
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             data = log.read_bytes()
-            match = re.search(rb'Listening on port ([0-9]+) with', data)
+            match = re.search(pattern, data)
             if match:
-                break
+                yield int(match[1])
+                return
             if process.poll() is not None:
-                if backend == 'io_uring' and b'io_uring is unavailable' in data:
-                    return 77
+                if skip_unavailable and b'io_uring is unavailable' in data:
+                    yield None
+                    return
                 raise AssertionError(data.decode(errors='replace'))
             time.sleep(.025)
-        else:
-            raise AssertionError(log.read_text(errors='replace'))
-
-        connection = http.client.HTTPConnection('127.0.0.1', int(match[1]), timeout=8)
-        try:
-            for method, path, body, expected in (
-                ('POST', '/country', '1.2.3.200', 204 if has_database else 404),
-                ('POST', '/country', '129.0.0.1', 404),
-                ('POST', '/country', '200.3.2.1', 404),
-                ('POST', '/country', '::1', 400),
-                ('GET', '/peer', None, 204 if has_database else 404),
-            ):
-                connection.request(method, path, body=body)
-                response = connection.getresponse()
-                response.read()
-                assert response.status == expected, (method, path, body, response.status)
-        finally:
-            connection.close()
+        raise AssertionError(log.read_text(errors='replace'))
     finally:
         if process.poll() is None:
             process.terminate()
@@ -96,12 +81,12 @@ def run_server(command, log, backend, has_database):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-    return 0
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--server', required=True)
+    parser.add_argument('--geoip', required=True)
     parser.add_argument('--library', type=Path, required=True)
     parser.add_argument('--backend', required=True, choices=('epoll', 'io_uring'))
     parser.add_argument('--opt', type=int, required=True, choices=(0, 2))
@@ -110,24 +95,47 @@ def main():
     with tempfile.TemporaryDirectory(prefix='rut-geoip-') as directory:
         root = Path(directory)
         shutil.copyfile(args.library, root / 'geoip.rut')
-        source, log = root / 'gateway.rut', root / 'server.log'
+        source, db, invalid_db = root / 'gateway.rut', root / 'country.mmdb', root / 'invalid.mmdb'
         source.write_text(PROGRAM)
-        db, invalid_db = root / 'country.mmdb', root / 'invalid.mmdb'
         db.write_bytes(mmdb_fixture())
         invalid_db.write_bytes(b'invalid database')
-        command = [args.server, '0', str(source), '--backend', args.backend,
-                   '--opt', str(args.opt), '--no-pin', '--shards', '1', '--drain', '0']
 
         for path in (invalid_db, root / 'missing.mmdb'):
-            rejected = subprocess.run(command + ['--geoip-db', str(path)],
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                      timeout=8, check=False)
-            assert rejected.returncode == 1 and b'Failed to open --geoip-db' in rejected.stdout, (
+            rejected = subprocess.run([args.geoip, str(path), '0'], stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, timeout=8, check=False)
+            assert rejected.returncode == 1 and b'Failed to open GeoIP database' in rejected.stdout, (
                 rejected.returncode, rejected.stdout)
-        result = run_server(command + ['--geoip-db', str(db)], log, args.backend, True)
-        if result:
-            return result
-        return run_server(command, log, args.backend, False)
+
+        with listener([args.geoip, str(db), '0'], root / 'geoip.log',
+                      rb'Listening on 127[.]0[.]0[.]1:([0-9]+)') as lookup_port:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
+                peer.settimeout(3)
+                peer.connect(('127.0.0.1', lookup_port))
+                for query in (b'', b'1.2.3.4\x00', b'127.100.100.100x', b'1.2.3.4' * 20):
+                    peer.send(query)
+                    assert peer.recv(2) == b'', query
+            env = os.environ.copy()
+            env['GEOIP_ENDPOINT'] = f'{{"address":"127.0.0.1","port":{lookup_port}}}'
+            command = [args.server, '0', str(source), '--backend', args.backend,
+                       '--opt', str(args.opt), '--no-pin', '--shards', '1', '--drain', '0']
+            with listener(command, root / 'server.log', rb'Listening on port ([0-9]+) with',
+                          env=env, skip_unavailable=args.backend == 'io_uring') as port:
+                if port is None:
+                    return 77
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=8)
+                try:
+                    for address, expected in (
+                        ('1.2.3.200', 200), ('129.0.0.1', 404), ('200.3.2.1', 404), ('::1', 404),
+                    ):
+                        connection.request('POST', '/country', body=address)
+                        response = connection.getresponse()
+                        body = response.read()
+                        assert response.status == expected, (address, response.status, body)
+                        if expected == 200:
+                            assert body == b'DE', body
+                finally:
+                    connection.close()
+    return 0
 
 
 if __name__ == '__main__':

@@ -464,7 +464,6 @@ if(RUT_ENABLE_JIT)
     file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
         "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
     list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/cmake/RutRE2.cmake"
-        "${PROJECT_SOURCE_DIR}/cmake/RutMaxMindDB.cmake"
         "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt"
         "${PROJECT_SOURCE_DIR}/cmake/RutWebSocketZlib.cmake")
@@ -479,18 +478,13 @@ if(RUT_ENABLE_JIT)
     configure_file("${PROJECT_SOURCE_DIR}/include/rut/native_build_id.h.in"
         "${PROJECT_BINARY_DIR}/generated/rut/native_build_id.h" @ONLY)
 
-    include(${PROJECT_SOURCE_DIR}/cmake/RutMaxMindDB.cmake)
-    add_library(rut_geoip STATIC runtime/geoip.cc)
-    target_include_directories(rut_geoip PUBLIC ${PROJECT_SOURCE_DIR}/include)
-    target_link_libraries(rut_geoip PRIVATE maxminddb::maxminddb)
-
     # Native handler helpers are shared by the compiler and LLVM-free server.
     add_library(rut_native_helpers STATIC jit/runtime_helpers.cc jit/native_helper_symbols.cc)
     target_include_directories(rut_native_helpers PUBLIC ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
         ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include)
-    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime rut_regex_capture rut_geoip)
+    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime rut_regex_capture)
 
     # JIT library — LLVM ORC JIT integration via C API.
     # Only this library links LLVM. rut_runtime stays LLVM-free so shard

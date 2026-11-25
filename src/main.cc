@@ -18,7 +18,6 @@
 
 #ifdef RUT_ENABLE_JIT
 #include "rut/native_program.h"
-#include "rut/runtime/geoip.h"
 #include "rut/runtime/mapped_array.h"
 #endif
 
@@ -973,7 +972,6 @@ int main(int argc, char** argv) {
     const char* tls_client_crl_path = nullptr;
     bool tls_client_crl_verify_issuer = false;
     const char* config_path = nullptr;
-    const char* geoip_db_path = nullptr;
     ListenerSpec source_listener{};
     bool source_listener_present = false;
     AccessLogSinkSpec source_access_log{};
@@ -1005,25 +1003,12 @@ int main(int argc, char** argv) {
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
     //                      [--tls-client-crl PATH] [--tls-client-crl-verify-issuer]
     //                      [--access-log PATH] [--access-log-compress] [--access-log-path-only]
-    //                      [--geoip-db PATH]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
     //   NOTE: this RESERVES the /metrics path — GET /metrics (and /metrics/,
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
-        if (str_eq(argv[i], "--geoip-db")) {
-            if (geoip_db_path) {
-                write_str("--geoip-db specified twice\n");
-                return 1;
-            }
-            if (i + 1 >= argc || !argv[i + 1][0] || starts_with_dash_dash(argv[i + 1])) {
-                write_str("--geoip-db requires a MaxMind database path\n");
-                return 1;
-            }
-            geoip_db_path = argv[++i];
-            continue;
-        }
         if (str_eq(argv[i], "--backend")) {
             if (backend_specified) {
                 write_str("--backend specified twice\n");
@@ -1263,25 +1248,6 @@ int main(int argc, char** argv) {
         }
 #endif
     }
-
-#ifdef RUT_ENABLE_JIT
-    GeoIpDatabase geoip_database;
-    if (geoip_db_path && !ebpf_plan_requested) {
-        if (const char* error = geoip_database.open(geoip_db_path)) {
-            write_str("Failed to open --geoip-db ");
-            write_str(geoip_db_path);
-            write_str(": ");
-            write_str(error);
-            write_str("\n");
-            return 1;
-        }
-    }
-#else
-    if (geoip_db_path) {
-        write_str("--geoip-db requires a build with RUT_ENABLE_JIT=ON\n");
-        return 1;
-    }
-#endif
 
     // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
     // getenv without stdlib — scan environ directly.

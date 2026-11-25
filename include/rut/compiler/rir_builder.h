@@ -1359,16 +1359,6 @@ struct Builder {
         return vid;
     }
 
-    Result<ValueId> emit_geoip_country(ValueId address, SourceLoc loc = {}) {
-        if (!val_has_type(address, TypeKind::IP)) return err(RirError::InvalidState);
-        auto* inner = TRY(make_type(TypeKind::Str));
-        auto* ty = TRY(make_type(TypeKind::Optional, inner));
-        auto [inst, vid] = TRY(emit(Opcode::GeoIpCountry, ty, loc));
-        inst->operands[0] = address;
-        inst->operand_count = 1;
-        return vid;
-    }
-
     Result<ValueId> emit_ip_in_cidr(ValueId ip, Str cidr_lit, SourceLoc loc = {}) {
         if (!val_has_type(ip, TypeKind::IP)) return err(RirError::InvalidState);
         auto* ty = TRY(make_type(TypeKind::Bool));

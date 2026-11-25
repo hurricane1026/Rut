@@ -306,9 +306,6 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::IpParse:
             buf.put_cstr("ip.parse");
             break;
-        case Opcode::GeoIpCountry:
-            buf.put_cstr("geoip.country");
-            break;
         case Opcode::StrConstantTimeEqual:
             buf.put_cstr("str.constant_time_equal");
             break;
@@ -1006,7 +1003,6 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             print_quoted_str(buf, inst.imm.str_val);
             break;
         case Opcode::StrTrimAscii:
-        case Opcode::GeoIpCountry:
         case Opcode::OptWrap:
         case Opcode::OptIsNil:
         case Opcode::OptUnwrap:

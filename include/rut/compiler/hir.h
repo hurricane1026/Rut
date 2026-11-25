@@ -148,7 +148,6 @@ enum class HirExprKind : u8 {
     StringPredicate,
     StringTrim,       // byte-exact prefix/suffix removal; borrowed result
     IpParse,          // strict IPv4 text -> optional IP
-    GeoIpCountry,     // IPv4 -> optional country code
     StringSplit,      // request-owned bounded string fields
     StringTransform,  // owned upper/lower/literal replacement, optional str
     RegexReplace,     // owned bounded RE2 replacement, optional str

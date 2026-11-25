@@ -13866,25 +13866,6 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
-    if (expr.name.eq(lit_str("geoIpCountry")) &&
-        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
-        constexpr auto detail = lit_str("geoIpCountry expects one unwrapped IPv4 IP");
-        if (!route || expr.args.len != 1 || pipe_lhs || first_arg_override)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
-        auto address = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
-        if (!address) return core::make_unexpected(address.error());
-        if (address->type != HirTypeKind::IP || address->may_nil || address->may_error)
-            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, detail);
-        if (!route->exprs.push(address.value()))
-            return frontend_error(FrontendError::OutOfMemory, expr.span);
-        HirExpr out{};
-        out.kind = HirExprKind::GeoIpCountry;
-        out.type = HirTypeKind::Str;
-        out.may_nil = true;
-        out.span = expr.span;
-        out.lhs = &route->exprs[route->exprs.len - 1];
-        return out;
-    }
     if (expr.name.eq(lit_str("regexCapture")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
         constexpr auto detail = lit_str(
@@ -20660,7 +20641,6 @@ static bool static_for_init_repeatable(const HirExpr& expr) {
         case HirExprKind::StringPredicate:
         case HirExprKind::StringTrim:
         case HirExprKind::IpParse:
-        case HirExprKind::GeoIpCountry:
         case HirExprKind::RegexMatch:
         case HirExprKind::Tuple:
         case HirExprKind::StructInit:

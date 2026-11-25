@@ -408,19 +408,14 @@ unwrapped string operand and `Optional<IP>` result. JIT/native compilation share
 that kernel. IPv6 parsing and the remaining IP properties in the target surface
 above are not supplied by this slice.
 
-The GeoIP library `lib/geoip.rut` exposes `country(IP) -> str?` over
-`geoIpCountry(IP)`. The server opens the operator-supplied MaxMind DB file once
-at startup via `--geoip-db`. The read-only mapping is shared across shards and
-outlives all handlers and pending responses. The JIT and native loader share the
-same helper. It takes the network-order IPv4 carrier and returns a bounded view
-of `country.iso_code` or `nil`. Lookup performs no per-request allocation or
-file open. The external file stays separate from the compiled program.
-
-The existing IP parser supplies typed addresses but has no binary database
-decoder. The pinned static libmaxminddb C library handles MMDB tree and record
-decoding, including IPv4 lookups in IPv6 database files. This adds a build-time
-dependency and avoids maintaining a second MMDB parser. Database replacement
-uses an atomic rename followed by a process restart.
+The GeoIP library in `lib/geoip.rut` uses the generic request-scoped UDP API.
+Its optional build target `rut-geoip` reads the operator's MaxMind database and
+listens on IPv4 loopback. A datagram contains one IPv4 address in dotted decimal.
+The response contains two uppercase ASCII country-code bytes or an empty
+datagram for an invalid address or missing record. The tool shares the existing
+IPv4 parser and uses the pinned static libmaxminddb C library for MMDB decoding.
+Only the tool links this dependency. The database mapping lives for the lifetime
+of the tool process, and request handlers suspend while awaiting the reply.
 
 **CIDR** — network range
 

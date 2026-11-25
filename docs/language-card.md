@@ -390,28 +390,33 @@ User bindings/types/import namespaces named `IP` shadow the builtin namespace.
 Parsing a header does not establish trust in that header; forwarding policies
 must separately decide which peers may supply client addresses.
 
-## GeoIP country lookup
+## GeoIP country lookup library
 
-```swift
+Build the standalone lookup tool with
+`cmake -S . -B build -DRUT_ENABLE_GEOIP=ON` and
+`cmake --build build --target rut-geoip`. Run it alongside Rut:
+
+```bash
+./build/helpers/geoip/rut-geoip /path/to/GeoLite2-Country.mmdb 9931
+GEOIP_ENDPOINT='{"address":"127.0.0.1","port":9931}' ./build/src/rut gateway.rut
+```
+
+```rut
 import * as geoip from "../lib/geoip.rut"
 
-route GET "/region" {
-    guard let country = geoip.country(req.remoteAddr) else { return 404 }
-    if country == "DE" { return 204 } else { return 403 }
+route POST "/region" {
+    let pending = geoip.country(req.body)
+    guard let country = pending else { return 404 }
+    if country == b"DE" { return 204 } else { return 403 }
 }
 ```
 
-Start the server with `rut gateway.rut --geoip-db /path/to/GeoLite2-Country.mmdb`.
-`geoip.country(IP) -> str?` wraps the `geoIpCountry(IP)` builtin. It accepts an
-unwrapped IPv4 address and reads `country.iso_code` from a MaxMind DB file such
-as GeoLite2 Country or City. Results are two uppercase ASCII letters. A missing
-database configuration, an unmatched address, or an unavailable or invalid
-country code yields `nil`. If a database path is supplied and the file cannot
-be opened as MMDB, server startup fails.
-
-The process shares one read-only mapping across shards. Replace database files
-by atomic rename and restart Rut to load the replacement. Keep the mapped file
-immutable while the server is running. `req.remoteAddr` is the connection peer.
+`geoip.country(str)` sends a strict IPv4 address over request-scoped UDP and
+returns two ASCII country-code bytes as an optional `Bytes` result. Invalid
+addresses, absent country codes and failed lookups yield `nil`. The endpoint is
+resolved at compilation/load time. The lookup tool binds to IPv4 loopback
+and opens one read-only MaxMind database mapping. Replace the database by
+atomic rename and restart the lookup tool to load the new file.
 
 ## Process access log
 
