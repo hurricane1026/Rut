@@ -96,6 +96,8 @@ struct UpstreamTarget {
     UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
+    char hc_host[261]{};
+    u32 hc_host_len = 0;
     char hc_path[64];
     u32 hc_path_len = 0;
     u32 hc_interval_ms = 0;
@@ -1416,7 +1418,8 @@ public:
                                    u16 status,
                                    ActiveHealthThresholds thresholds = {},
                                    ActiveHealthType type = ActiveHealthType::Http,
-                                   u32 timeout_ms = 0);
+                                   u32 timeout_ms = 0,
+                                   Str host = {});
 
     // Add a static response route. Same failure modes as add_proxy(),
     // minus the upstream-id check that doesn't apply here.

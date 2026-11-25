@@ -4177,6 +4177,7 @@ struct Parser {
                     auto hc_lbrace = expect(TokenType::LBrace);
                     if (!hc_lbrace) return core::make_unexpected(hc_lbrace.error());
                     bool seen_path = false;
+                    bool hc_seen_host = false;
                     bool seen_interval = false;
                     bool seen_status = false;
                     bool seen_type = false;
@@ -4221,6 +4222,19 @@ struct Parser {
                                                       hc_key);
                             item.upstream.hc_timeout_ms = kTimeout;
                             seen_timeout = true;
+                        } else if (hc_key.eq({"host", 4})) {
+                            if (hc_seen_host)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto host = expect(TokenType::StringLit);
+                            if (!host) return core::make_unexpected(host.error());
+                            if (!active_health_host_valid(host.value()->text))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*host.value()),
+                                                      host.value()->text);
+                            item.upstream.hc_host_lit = host.value()->text;
+                            hc_seen_host = true;
                         } else if (hc_key.eq({"path", 4})) {
                             if (seen_path)
                                 return frontend_error(FrontendError::UnexpectedToken,
@@ -4329,7 +4343,7 @@ struct Parser {
                     if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
                     const bool kTcp = item.upstream.hc_type == ActiveHealthType::Tcp;
                     if (!seen_interval || (!kTcp && !seen_path) ||
-                        (kTcp && (seen_path || seen_status))) {
+                        (kTcp && (seen_path || seen_status || hc_seen_host))) {
                         const Str kDetail = !seen_interval ? Str{"interval", 8}
                                             : kTcp         ? Str{"type", 4}
                                                            : Str{"path", 4};

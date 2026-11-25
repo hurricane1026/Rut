@@ -643,14 +643,19 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             u16 status,
                                             ActiveHealthThresholds thresholds,
                                             ActiveHealthType type,
-                                            u32 timeout_ms) {
+                                            u32 timeout_ms,
+                                            Str host) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
-    if (path_len >= sizeof(up.hc_path) ||
+    if ((host.len && (!active_health_host_valid(host) || type == ActiveHealthType::Tcp)) ||
+        path_len >= sizeof(up.hc_path) ||
         !valid_active_health_check(
             type, path, path_len, interval_ms, status, thresholds, timeout_ms) ||
         (up.http2 && type != ActiveHealthType::Tcp))
         return false;
+    for (u32 i = 0; i < host.len; ++i) up.hc_host[i] = host.ptr[i];
+    up.hc_host[host.len] = '\0';
+    up.hc_host_len = host.len;
     for (u32 i = 0; i < path_len; i++) up.hc_path[i] = path[i];
     up.hc_path[path_len] = '\0';
     up.hc_path_len = path_len;

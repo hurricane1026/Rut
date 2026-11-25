@@ -23,6 +23,7 @@ def main():
     lock = threading.Lock()
     healthy = {'A': True, 'B': True, 'disabled': True}
     probes = Counter()
+    hosts = {}
     data_requests = Counter()
     servers, threads = [], []
     process = None
@@ -33,6 +34,7 @@ def main():
                     with lock:
                         if self.path in ('/healthz', '/strict-healthz'):
                             probes[self.path, label] += 1
+                            hosts[self.path, label] = self.headers.get('Host')
                             code = 200 if healthy[label] else 500
                         else:
                             data_requests[label] += 1
@@ -67,7 +69,7 @@ upstream api {{
 upstream strict {{
     backends: [{entries}]
     minimum_healthy_weight_percent: 51
-    health_check: {{ path: "/strict-healthz", interval: 1s, status: 200,
+    health_check: {{ path: "/strict-healthz", interval: 1s, status: 200, host: "Probe.Example:8080",
                     failure_threshold: 2, success_threshold: 3 }}
 }}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
@@ -124,6 +126,10 @@ route GET "/strict-connect" {{
             wait_for(lambda: all(probes[path, label] > 0
                                  for path in ('/healthz', '/strict-healthz')
                                  for label in ('A', 'B')), 'no periodic health probes')
+            with lock:
+                for label, origin in zip(('A', 'B'), servers):
+                    assert hosts['/healthz', label] == f'127.0.0.1:{origin.server_port}', hosts
+                    assert hosts['/strict-healthz', label] == 'Probe.Example:8080', hosts
             for protocol, request, strict in [
                     ('H1', h1, lambda: h1('/strict')),
                     ('H2', lambda: h2_request(port, '/', []),

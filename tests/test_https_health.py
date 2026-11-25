@@ -18,11 +18,12 @@ def main():
     parser.add_argument('--backend', required=True)
     args = parser.parse_args()
     fixtures = Path(__file__).resolve().parent / 'fixtures'
-    state = {'stall': False, 'probes': 0}
+    state = {'stall': False, 'probes': 0, 'hosts': set(), 'sni': set()}
 
     class Origin(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             state['probes'] += 1
+            state['hosts'].add(self.headers.get('Host'))
             if state['stall']:
                 time.sleep(4)
             try:
@@ -39,6 +40,7 @@ def main():
     origin.daemon_threads = True
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(fixtures / 'localhost_cert.pem', fixtures / 'localhost_key.pem')
+    context.set_servername_callback(lambda sock, name, ctx: state['sni'].add(name))
     origin.socket = context.wrap_socket(origin.socket, server_side=True)
     thread = threading.Thread(target=origin.serve_forever, daemon=True)
     thread.start()
@@ -52,12 +54,13 @@ def main():
                 f'upstream {name} {{ host: "127.0.0.1", port: {origin.server_port}, '
                 f'tls: {{ ca: "{ca}", server_name: "{hostname}" }}, '
                 'minimum_healthy_weight_percent: 100, '
-                'health_check: { path: "/health", interval: 1s, timeout: 1s } }\n'
+                f'health_check: {{ path: "/health", interval: 1s, timeout: 1s{host} }} }}\n'
                 f'route GET "/{name}" {{ let ev = wait(upstream({name}).connect()) '
                 'if ev.ok { return 204 } else { return 502 } }\n'
-                for name, ca, hostname in [('good', cert, 'localhost'),
-                                           ('wrong', cert, 'wrong.example'),
-                                           ('untrusted', other, 'localhost')]))
+                for name, ca, hostname, host in [('good', cert, 'localhost', ', host: "Tenant.Example:8443"'),
+                                           ('default', cert, 'localhost', ''),
+                                           ('wrong', cert, 'wrong.example', ''),
+                                           ('untrusted', other, 'localhost', '')]))
             log = root / 'gateway.log'
             with log.open('w') as output:
                 process = subprocess.Popen([args.server, '0', str(source), '--backend', args.backend,
@@ -93,6 +96,10 @@ def main():
                     finally:
                         connection.close()
                 wait(lambda: state['probes'] > 0 and request('/good') == 204, 'trusted probe failed')
+                wait(lambda: request('/default') == 204 and
+                     f'127.0.0.1:{origin.server_port}' in state['hosts'] and
+                     'Tenant.Example:8443' in state['hosts'], 'probe Host mismatch')
+                assert 'localhost' in state['sni']
                 wait(lambda: request('/wrong') == 503 and request('/untrusted') == 503,
                      'invalid TLS identity or trust did not eject')
                 state['stall'] = True

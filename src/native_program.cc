@@ -571,6 +571,12 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream response header timeout");
         if (!target.passive_health.valid() || (target.passive_health.enabled && target.http2))
             return fail("invalid native upstream passive health policy");
+        if (target.hc_host_len >= sizeof(target.hc_host) ||
+            (target.hc_host_len &&
+             (!target.hc_enabled ||
+              !active_health_host_valid({target.hc_host, target.hc_host_len}) ||
+              target.hc_type == ActiveHealthType::Tcp)))
+            return fail("invalid native upstream health host");
         if (target.hc_enabled && !target.hc_thresholds.valid())
             return fail("invalid native upstream health thresholds");
         if (target.hc_enabled && (target.hc_path_len >= sizeof(target.hc_path) ||

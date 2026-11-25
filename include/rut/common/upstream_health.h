@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/route_host.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -9,6 +10,18 @@ enum class ActiveHealthType : u8 { Http, Tcp };
 constexpr bool valid_active_health_timeout(u32 milliseconds) {
     return milliseconds == 0 ||
            (milliseconds >= 1000 && milliseconds <= 60000 && milliseconds % 1000 == 0);
+}
+
+// Preserve the configured spelling while reusing the existing authority parser.
+inline bool active_health_host_valid(Str authority) {
+    if (!authority.ptr || authority.len == 0 || authority.len > 260) return false;
+    for (u32 i = 0; i < authority.len; ++i) {
+        const auto c = static_cast<unsigned char>(authority.ptr[i]);
+        if (c <= 0x20 || c == 0x7f || c == ',' || c == '*') return false;
+    }
+    char normalized[254];
+    u16 length = 0;
+    return route_host_from_authority(authority, normalized, &length);
 }
 
 struct ActiveHealthThresholds {

@@ -1701,6 +1701,10 @@ drain established requests. A current target with an enabled threshold ignores
 late connect results from a retired configuration. The default of 0 preserves
 fail-open selection and the existing handling of passive results.
 Native artifact version 22 records the minimum healthy weight percentage.
+An optional health-check `host` specifies a validated HTTP authority of at most
+260 bytes, preserved on the wire; syntactic port 0 is accepted. Omission uses the selected numeric backend
+address and port. It is rejected for TCP probes and does not affect TLS SNI or
+certificate verification. Native artifact version 31 owns and records this authority.
 
 An upstream may set `connect_attempts: N` to allow 1 through 8 fresh TCP
 connection attempts for HTTP/1 upstream forwarding, including the first attempt.
