@@ -6473,7 +6473,9 @@ void expire_connect_attempt(Loop* loop, Connection& c) {
     c.connect_retry_attempts = c.upstream_attempts;
     c.connect_retry_backend_idx = c.upstream_backend_idx;
     c.connect_retry_attempted_backends = c.upstream_attempted_backends;
-    c.connect_retry_deadline_us = monotonic_us() + 3000000u;
+    const u64 now_us = monotonic_us();
+    if (__builtin_add_overflow(now_us, u64{3'000'000}, &c.connect_retry_deadline_us))
+        c.connect_retry_deadline_us = ~u64{0};
     c.set_slots(&on_connect_retry_downstream<Loop>, nullptr, nullptr, nullptr);
     loop->timer.refresh(&c, 1);
 }
