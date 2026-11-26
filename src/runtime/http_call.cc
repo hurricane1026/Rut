@@ -174,15 +174,18 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
     for (auto allowed : methods)
         if (allowed.eq(verb)) valid = true;
     if (!valid || !(seen & 1)) return false;
+    char port_suffix[7]{};
+    if (endpoint.port != 443)
+        snprintf(port_suffix, sizeof(port_suffix), ":%u", static_cast<unsigned>(endpoint.port));
     const int prefix = snprintf(out,
                                 cap,
-                                "%.*s %s HTTP/1.1\r\nHost: %s:%u\r\nAccept-Encoding: "
+                                "%.*s %s HTTP/1.1\r\nHost: %s%s\r\nAccept-Encoding: "
                                 "identity\r\nConnection: close\r\nContent-Length: %u\r\n",
                                 static_cast<int>(method_len),
                                 method,
                                 endpoint.path,
                                 endpoint.tls.server_name,
-                                endpoint.port,
+                                port_suffix,
                                 body_len);
     if (prefix <= 0 || static_cast<u32>(prefix) >= cap) return false;
     json::Writer wire{out, cap, static_cast<u32>(prefix)};

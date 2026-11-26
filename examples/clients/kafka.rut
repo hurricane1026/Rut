@@ -1,0 +1,153 @@
+// One in-flight request per connection. Each I/O step has a 1-second deadline.
+// The caller owns the connection and must close it after any failed exchange.
+variant KafkaResult {
+    reply(Bytes)
+    brokerError(i32)
+    transportFailure(i32)
+    invalidRequest
+    invalidReply
+}
+
+func octet(_ value: i32) -> Bytes {
+    let octets = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+    let index = bitwise.and(value, 255)
+    octets.slice(index, index + 1)
+}
+
+func join(_ left: Bytes, _ right: Bytes) -> Bytes {
+    concatBytes(left, right, 8192)
+}
+
+func be16(_ value: i32) -> Bytes {
+    guard let hi = octet(bitwise.shiftRight(value, 8)) else { nil }
+    guard let lo = octet(value) else { nil }
+    join(hi, lo)
+}
+
+func be32(_ value: i32) -> Bytes {
+    guard let hi = be16(bitwise.shiftRight(value, 16)) else { nil }
+    guard let lo = be16(value) else { nil }
+    join(hi, lo)
+}
+
+func topicField(_ name: Bytes) -> Bytes {
+    guard name.count > 0 && name.count <= 249 else { nil }
+    guard let length = be16(name.count) else { nil }
+    join(length, name)
+}
+
+func request(_ apiAndVersion: Bytes, _ correlation: i32, _ body: Bytes) -> Bytes {
+    guard let size = be32(body.count + 13) else { nil }
+    guard let prefix = join(size, apiAndVersion) else { nil }
+    guard let id = be32(correlation) else { nil }
+    guard let header = join(prefix, id) else { nil }
+    guard let withClient = join(header, b"\x00\x03rut") else { nil }
+    join(withClient, body)
+}
+
+func readPayload(_ conn: TcpConnection, _ correlation: i32, _ length: i32) -> KafkaResult {
+    let reading = conn.readExactly(length, 1000)
+    guard let data = reading else { KafkaResult.transportFailure(netError()) }
+    guard data.readI32BE(0).or(-1) == correlation else { KafkaResult.invalidReply }
+    guard let body = data.slice(4, length) else { KafkaResult.invalidReply }
+    KafkaResult.reply(body)
+}
+
+func readReply(_ conn: TcpConnection, _ correlation: i32) -> KafkaResult {
+    let reading = conn.readExactly(4, 1000)
+    guard let prefix = reading else { KafkaResult.transportFailure(netError()) }
+    guard let length = prefix.readI32BE(0) else { KafkaResult.invalidReply }
+    guard length >= 4 && length <= 8192 else { KafkaResult.invalidReply }
+    let result = readPayload(conn, correlation, length)
+    result
+}
+
+func exchange(_ conn: TcpConnection, _ frame: Bytes, _ correlation: i32) -> KafkaResult {
+    let sending = conn.send(frame, 1000)
+    guard let sent = sending else { KafkaResult.transportFailure(netError()) }
+    let result = readReply(conn, correlation)
+    result
+}
+
+func execute(_ conn: TcpConnection, _ apiAndVersion: Bytes, _ id: i32, _ body: Bytes) -> KafkaResult {
+    guard id >= 0 else { KafkaResult.invalidRequest }
+    guard let frame = request(apiAndVersion, id, body) else { KafkaResult.invalidRequest }
+    let result = exchange(conn, frame, id)
+    result
+}
+
+func decodeVersions(_ data: Bytes) -> KafkaResult {
+    guard let code = data.readI16BE(0) else { KafkaResult.invalidReply }
+    let count = data.readI32BE(2).or(-1)
+    guard count >= 0 && count <= 1364 && data.count == 6 + count * 6 else { KafkaResult.invalidReply }
+    if code == 0 { KafkaResult.reply(data) } else { KafkaResult.brokerError(code) }
+}
+
+func versions(_ conn: TcpConnection, _ id: i32) -> KafkaResult {
+    let result = execute(conn, b"\x00\x12\x00\x00", id, b"")
+    match result {
+        .reply(data) => decodeVersions(data)
+        _ => result
+    }
+}
+
+// Metadata v4 wire body. The caller can decode the broker/topic arrays with Bytes.
+func metadata(_ conn: TcpConnection, _ id: i32, _ topic: Bytes) -> KafkaResult {
+    guard let name = topicField(topic) else { KafkaResult.invalidRequest }
+    guard let oneTopic = join(b"\x00\x00\x00\x01", name) else { KafkaResult.invalidRequest }
+    guard let body = join(oneTopic, b"\x00") else { KafkaResult.invalidRequest }
+    let result = execute(conn, b"\x00\x03\x00\x04", id, body)
+    result
+}
+
+func offsetsBody(_ topic: Bytes, _ partition: i32, _ earliest: bool) -> Bytes {
+    guard partition >= 0 else { nil }
+    guard let name = topicField(topic) else { nil }
+    guard let group = join(b"\xff\xff\xff\xff\x00\x00\x00\x01", name) else { nil }
+    guard let number = be32(partition) else { nil }
+    guard let partitions = join(b"\x00\x00\x00\x01", number) else { nil }
+    guard let prefix = join(group, partitions) else { nil }
+    if earliest { join(prefix, b"\xff\xff\xff\xff\xff\xff\xff\xfe") } else {
+        join(prefix, b"\xff\xff\xff\xff\xff\xff\xff\xff")
+    }
+}
+
+variant KafkaOffset {
+    offset(str)
+    brokerError(i32)
+    transportFailure(i32)
+    invalidRequest
+    invalidReply
+}
+
+func decodePartition(_ body: Bytes, _ end: i32, _ partition: i32) -> KafkaOffset {
+    guard body.readI32BE(end).or(-1) == 1 && body.readI32BE(end + 4).or(-1) == partition else { KafkaOffset.invalidReply }
+    guard let code = body.readI16BE(end + 8) else { KafkaOffset.invalidReply }
+    if code != 0 { KafkaOffset.brokerError(code) } else {
+        guard let offset = body.readI64BE(end + 18) else { KafkaOffset.invalidReply }
+        guard offset >= 0 else { KafkaOffset.invalidReply }
+        guard let value = formatInt(offset) else { KafkaOffset.invalidReply }
+        KafkaOffset.offset(value)
+    }
+}
+
+func decodeOffset(_ body: Bytes, _ topic: Bytes, _ partition: i32) -> KafkaOffset {
+    let length = body.readI16BE(4).or(-1)
+    guard body.readI32BE(0).or(-1) == 1 && length == topic.count else { KafkaOffset.invalidReply }
+    let end = 6 + length
+    guard let name = body.slice(6, end) else { KafkaOffset.invalidReply }
+    guard name == topic && body.count == end + 26 else { KafkaOffset.invalidReply }
+    decodePartition(body, end, partition)
+}
+
+func listOffset(_ conn: TcpConnection, _ id: i32, _ topic: Bytes, _ partition: i32, _ earliest: bool) -> KafkaOffset {
+    guard let body = offsetsBody(topic, partition, earliest) else { KafkaOffset.invalidRequest }
+    let result = execute(conn, b"\x00\x02\x00\x01", id, body)
+    match result {
+        .reply(data) => decodeOffset(data, topic, partition)
+        .brokerError(code) => KafkaOffset.brokerError(code)
+        .transportFailure(code) => KafkaOffset.transportFailure(code)
+        .invalidRequest => KafkaOffset.invalidRequest
+        .invalidReply => KafkaOffset.invalidReply
+    }
+}

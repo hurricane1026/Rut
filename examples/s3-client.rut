@@ -1,0 +1,36 @@
+import "clients/s3.rut"
+
+// Local demonstration. Authenticate and authorize callers before exposing it.
+route GET "/ready" { return 204 }
+
+route GET "/object" {
+    let pending = s3.getObject()
+    guard let reply = pending else { return 502 }
+    guard !s3.hasStatus(reply, 404) else { return 404 }
+    guard s3.hasStatus(reply, 200) else { return 502 }
+    guard let body = s3.body(reply) else { return 502 }
+    return response(200, body: body)
+}
+
+route PUT "/object" {
+    guard req.body.len <= 4096 else { return 413 }
+    let pending = s3.putObject(req.body)
+    guard let reply = pending else { return 502 }
+    guard s3.hasStatus(reply, 200) else { return 502 }
+    return 204
+}
+
+route DELETE "/object" {
+    let pending = s3.deleteObject()
+    guard let reply = pending else { return 502 }
+    guard s3.hasStatus(reply, 204) else { return 502 }
+    return 204
+}
+
+route GET "/objects" {
+    let pending = s3.listObjects()
+    guard let reply = pending else { return 502 }
+    guard s3.hasStatus(reply, 200) else { return 502 }
+    guard let body = s3.body(reply) else { return 502 }
+    return response(200, body: body)
+}

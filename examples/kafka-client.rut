@@ -1,0 +1,40 @@
+import "clients/kafka.rut"
+
+func payload(_ result: KafkaResult) -> Bytes {
+    match result { .reply(data) => data _ => nil }
+}
+
+func offsetValue(_ result: KafkaOffset) -> str {
+    match result { .offset(value) => value _ => nil }
+}
+
+route GET "/ready" { return 204 }
+
+route GET "/versions" {
+    let connecting = tcp(env("KAFKA_ENDPOINT"), 1000)
+    guard let conn = connecting else { return 502 }
+    let result = kafka.versions(conn, 1)
+    let closed = conn.close()
+    guard let data = payload(result) else { return 502 }
+    return response(200, body: data)
+}
+
+route GET "/metadata" {
+    let connecting = tcp(env("KAFKA_ENDPOINT"), 1000)
+    guard let conn = connecting else { return 502 }
+    let result = kafka.metadata(conn, 2, Bytes(env("KAFKA_TOPIC")))
+    let closed = conn.close()
+    guard let data = payload(result) else { return 502 }
+    return response(200, body: data)
+}
+
+route GET "/offset/:partition" {
+    guard let partition = parseInt(req.params.partition) else { return 400 }
+    guard partition >= 0 else { return 400 }
+    let connecting = tcp(env("KAFKA_ENDPOINT"), 1000)
+    guard let conn = connecting else { return 502 }
+    let result = kafka.listOffset(conn, 3, Bytes(env("KAFKA_TOPIC")), partition, false)
+    let closed = conn.close()
+    guard let value = offsetValue(result) else { return 502 }
+    return response(200, body: value)
+}
