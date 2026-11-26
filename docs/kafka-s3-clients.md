@@ -2,7 +2,7 @@
 
 ## Kafka
 
-The [Kafka library](../examples/clients/kafka.rut) implements ApiVersions v0,
+The [Kafka library](../lib/clients/kafka.rut) implements ApiVersions v0,
 single-topic Metadata v4, and single-partition ListOffsets v1. Metadata skips
 automatic topic creation. The library returns binary response bodies for
 ApiVersions and Metadata. For ListOffsets it checks the returned topic and
@@ -31,7 +31,7 @@ groups, SASL and automatic leader selection are outside its scope.
 
 ## S3
 
-The [S3 library](../examples/clients/s3.rut) sends GetObject, PutObject,
+The [S3 library](../lib/clients/s3.rut) sends GetObject, PutObject,
 DeleteObject and ListObjectsV2 requests over verified HTTPS. Provide one fixed
 endpoint policy per operation through `S3_GET_ENDPOINT`, `S3_PUT_ENDPOINT`,
 `S3_DELETE_ENDPOINT` and `S3_LIST_ENDPOINT`. Generate the presigned URLs with

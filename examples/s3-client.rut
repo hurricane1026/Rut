@@ -1,4 +1,4 @@
-import "clients/s3.rut"
+import "../lib/clients/s3.rut"
 
 // Local demonstration. Authenticate and authorize callers before exposing it.
 route GET "/ready" { return 204 }

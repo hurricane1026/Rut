@@ -1,4 +1,4 @@
-import "clients/kafka.rut"
+import "../lib/clients/kafka.rut"
 
 func payload(_ result: KafkaResult) -> Bytes {
     match result { .reply(data) => data _ => nil }
