@@ -840,7 +840,10 @@ address and port. TCP probes reject this field. It does not change TLS SNI,
 certificate verification, or forwarding requests.
 
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
-A complete response with the expected status counts as success. Connect/read
+A complete response with the expected status counts as success. `status` defaults to
+200 and accepts 100–599. Alternatively, `healthy_statuses: [200, 302]` accepts a
+nonempty, duplicate-free list of codes in 200–599 and matches exactly; it cannot
+be combined with `status`. Connect/read
 errors, malformed responses, unexpected status and timeouts count as failures.
 `failure_threshold` ejects after that many consecutive failures, and
 `success_threshold` restores after that many consecutive successes. Each
@@ -866,7 +869,7 @@ upstream greeter {
 ```
 
 `type` defaults to `.http`; `.http` may also be explicit. HTTP mode requires
-`path` and accepts an optional `status`. TCP mode forbids both fields, including
+`path` and accepts an optional `status` or `healthy_statuses`. TCP mode forbids these fields, including
 empty paths: a completed TCP connect is success, connection failure/timeout is
 failure. TCP probes send no HTTP request, HTTP/2 preface, TLS handshake or other
 application bytes, and close immediately after recording the connect result.

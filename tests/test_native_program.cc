@@ -4405,3 +4405,20 @@ route POST "/" { return 200 }
     REQUIRE_EQ(owner.p->config.route_count, 1u);
     CHECK_EQ(owner.p->config.routes[0].request_body_limit, 4096u);
 }
+
+TEST(native_program, active_healthy_statuses_round_trip) {
+    Source source;
+    REQUIRE(source.append(R"rut(
+upstream api { backends: ["127.0.0.1:9001"]
+    health_check: { path: "/health" interval: 1s healthy_statuses: [200, 302] } }
+route GET "/" { return forward(api, load_balance: .roundRobin) }
+)rut"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK_EQ(target.hc_expected_status, 0u);
+    CHECK(target.hc_healthy_statuses.contains(200));
+    CHECK(target.hc_healthy_statuses.contains(302));
+    CHECK_FALSE(target.hc_healthy_statuses.contains(301));
+}

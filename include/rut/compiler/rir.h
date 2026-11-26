@@ -644,6 +644,7 @@ struct Module {
         Str hc_path;
         u32 hc_interval_ms = 0;
         u16 hc_expected_status = 200;
+        ActiveHealthStatuses hc_healthy_statuses{};
         ActiveHealthThresholds hc_thresholds{};
         PassiveHealthPolicy passive_health{};
         ActiveHealthType hc_type = ActiveHealthType::Http;

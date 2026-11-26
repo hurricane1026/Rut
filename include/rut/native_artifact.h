@@ -15,7 +15,8 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // layouts. Version 29 records upstream connect timeouts.
 // Version 30 records upstream response-header timeouts.
 // Version 31 records the active probe Host authority.
-constexpr u32 kVersion = 31;
+// Version 32 records active probe status sets.
+constexpr u32 kVersion = 32;
 struct StreamHeader {
     u64 magic;
     u32 version;

@@ -560,7 +560,8 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
                                    target.hc_interval_ms,
                                    target.hc_expected_status,
                                    target.hc_thresholds,
-                                   target.hc_timeout_ms) ||
+                                   target.hc_timeout_ms,
+                                   target.hc_healthy_statuses) ||
         (target.http2 && target.hc_type != ActiveHealthType::Tcp))
         return false;
 
@@ -749,8 +750,10 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
     // comparison — after a swap the response is meaningless, so free without
     // recording (the stale result must not touch the new backend at this index).
     if (const auto* target = current_probe_target(loop, conn)) {
-        const bool kHealthy =
-            kStatus == ParseStatus::Complete && resp.status_code == target->hc_expected_status;
+        const bool kHealthy = kStatus == ParseStatus::Complete &&
+                              (target->hc_healthy_statuses.empty()
+                                   ? resp.status_code == target->hc_expected_status
+                                   : target->hc_healthy_statuses.contains(resp.status_code));
         record_active_probe_result(
             conn.upstream_idx, conn.upstream_backend_idx, kHealthy, kNowUs, target->hc_thresholds);
     }

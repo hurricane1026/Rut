@@ -3834,6 +3834,26 @@ struct Parser {
         return item;
     }
 
+    FrontendResult<bool> parse_health_status_array(u64* statuses, Str name) {
+        auto bracket = expect(TokenType::LBracket);
+        if (!bracket) return core::make_unexpected(bracket.error());
+        while (cur().type != TokenType::RBracket) {
+            auto literal = expect(TokenType::IntLit);
+            if (!literal) return core::make_unexpected(literal.error());
+            auto parsed = parse_integer_literal(*literal.value(), 599);
+            if (!parsed) return core::make_unexpected(parsed.error());
+            const u32 kStatus = static_cast<u32>(parsed.value());
+            if (kStatus < 200 || PassiveHealthPolicy::contains(statuses, kStatus))
+                return frontend_error(
+                    FrontendError::InvalidInteger, span_from(*literal.value()), name);
+            statuses[(kStatus - 200) / 64] |= u64{1} << ((kStatus - 200) % 64);
+            if (!take(TokenType::Comma)) break;
+        }
+        auto end = expect(TokenType::RBracket);
+        if (!end) return core::make_unexpected(end.error());
+        return true;
+    }
+
     FrontendResult<AstItem> parse_upstream() {
         auto kw = expect(TokenType::KwUpstream);
         if (!kw) return core::make_unexpected(kw.error());
@@ -4137,27 +4157,10 @@ struct Parser {
                             if (index == 2) policy.http_failures = static_cast<u8>(kValue);
                             if (index == 3) policy.successes = static_cast<u8>(kValue);
                         } else {
-                            auto bracket = expect(TokenType::LBracket);
-                            if (!bracket) return core::make_unexpected(bracket.error());
                             auto* statuses =
                                 index == 4 ? policy.healthy_statuses : policy.unhealthy_statuses;
-                            while (cur().type != TokenType::RBracket) {
-                                auto literal = expect(TokenType::IntLit);
-                                if (!literal) return core::make_unexpected(literal.error());
-                                auto parsed_status = parse_integer_literal(*literal.value(), 599);
-                                if (!parsed_status)
-                                    return core::make_unexpected(parsed_status.error());
-                                const u32 kStatus = static_cast<u32>(parsed_status.value());
-                                if (kStatus < 200 ||
-                                    PassiveHealthPolicy::contains(statuses, kStatus))
-                                    return frontend_error(FrontendError::InvalidInteger,
-                                                          span_from(*literal.value()),
-                                                          kName);
-                                statuses[(kStatus - 200) / 64] |= u64{1} << ((kStatus - 200) % 64);
-                                if (!take(TokenType::Comma)) break;
-                            }
-                            auto end = expect(TokenType::RBracket);
-                            if (!end) return core::make_unexpected(end.error());
+                            auto parsed = parse_health_status_array(statuses, kName);
+                            if (!parsed) return core::make_unexpected(parsed.error());
                         }
                         (void)take(TokenType::Comma);
                     }
@@ -4180,6 +4183,7 @@ struct Parser {
                     bool hc_seen_host = false;
                     bool seen_interval = false;
                     bool seen_status = false;
+                    bool seen_statuses = false;
                     bool seen_type = false;
                     bool seen_timeout = false;
                     bool seen_failure_threshold = false;
@@ -4282,7 +4286,7 @@ struct Parser {
                             item.upstream.hc_interval_ms = kIntervalMs;
                             seen_interval = true;
                         } else if (hc_key.eq({"status", 6})) {
-                            if (seen_status)
+                            if (seen_status || seen_statuses)
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*hc_field.value()),
                                                       hc_key);
@@ -4309,6 +4313,19 @@ struct Parser {
                                                       lit.value()->text);
                             item.upstream.hc_expected_status = static_cast<u16>(kSv);
                             seen_status = true;
+                        } else if (hc_key.eq({"healthy_statuses", 16})) {
+                            if (seen_statuses || seen_status)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto& statuses = item.upstream.hc_healthy_statuses;
+                            auto parsed = parse_health_status_array(statuses.words, hc_key);
+                            if (!parsed) return core::make_unexpected(parsed.error());
+                            if (statuses.empty())
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            seen_statuses = true;
                         } else if (hc_key.eq({"failure_threshold", 17}) ||
                                    hc_key.eq({"success_threshold", 17})) {
                             const bool kFailure = hc_key.eq({"failure_threshold", 17});
@@ -4343,14 +4360,14 @@ struct Parser {
                     if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
                     const bool kTcp = item.upstream.hc_type == ActiveHealthType::Tcp;
                     if (!seen_interval || (!kTcp && !seen_path) ||
-                        (kTcp && (seen_path || seen_status || hc_seen_host))) {
+                        (kTcp && (seen_path || seen_status || hc_seen_host || seen_statuses))) {
                         const Str kDetail = !seen_interval ? Str{"interval", 8}
                                             : kTcp         ? Str{"type", 4}
                                                            : Str{"path", 4};
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, span_from(*field.value()), kDetail);
                     }
-                    if (kTcp) item.upstream.hc_expected_status = 0;
+                    if (kTcp || seen_statuses) item.upstream.hc_expected_status = 0;
                     item.upstream.hc_enabled = true;
                 } else {
                     return frontend_error(

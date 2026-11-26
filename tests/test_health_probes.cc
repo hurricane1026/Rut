@@ -901,3 +901,18 @@ TEST(health_probe, epoll_tls_probe_slot_reserve) {
 TEST(health_probe, iouring_tls_probe_slot_reserve) {
     tls_probe_slot_reserve<IoUringEventLoop>(_tc);
 }
+
+TEST(health_probes, active_status_sets_validate_canonical_bits) {
+    ActiveHealthStatuses statuses{};
+    statuses.words[(200 - 200) / 64] |= u64{1} << ((200 - 200) % 64);
+    statuses.words[(302 - 200) / 64] |= u64{1} << ((302 - 200) % 64);
+    CHECK(valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0, statuses));
+    CHECK_FALSE(
+        valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 200, {}, 0, statuses));
+    CHECK_FALSE(
+        valid_active_health_check(ActiveHealthType::Tcp, nullptr, 0, 1000, 0, {}, 0, statuses));
+    statuses.words[6] |= u64{1} << 16;
+    CHECK_FALSE(
+        valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0, statuses));
+    CHECK_FALSE(valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0));
+}

@@ -435,6 +435,7 @@ struct AstUpstreamDecl {
     Str hc_path_lit{};             // raw `path:` string literal
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
+    ActiveHealthStatuses hc_healthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};
     PassiveHealthPolicy passive_health{};
     ActiveHealthType hc_type = ActiveHealthType::Http;
