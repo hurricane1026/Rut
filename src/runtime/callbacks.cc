@@ -1270,6 +1270,8 @@ template void on_jit_request_body_recvd<NativeReactorEventLoop>(void*, Connectio
 template void resume_jit_handler<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void respond_upstream_timeout<NativeReactorEventLoop>(NativeReactorEventLoop*,
                                                                Connection&);
+template void expire_upstream_write_idle<NativeReactorEventLoop>(NativeReactorEventLoop*,
+                                                                 Connection&);
 template void h2_proxy_fail<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&, u16);
 template void h2_proxy_timeout<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void grpc_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
@@ -1356,6 +1358,7 @@ template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, Io
 template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void record_passive_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void expire_upstream_write_idle<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_request_body_overflow<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
 template void h2_proxy_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);

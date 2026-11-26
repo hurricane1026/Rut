@@ -250,6 +250,8 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 // before responding — invoked from timer.tick. Defined in callbacks_impl.h.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
+template <typename Loop>
+void expire_upstream_write_idle(Loop* loop, Connection& conn);
 
 // Record a pre-response upstream timeout before an explicit io_uring deadline
 // enters its deferred expiry path. Defined in callbacks_impl.h.

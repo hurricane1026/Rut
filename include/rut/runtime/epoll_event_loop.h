@@ -1202,6 +1202,7 @@ public:
         dispatching_event_batch_ = was_dispatching;
         if (!dispatching_event_batch_) {
             resolve_response_body_idle_expiries();
+            this->resolve_upstream_write_idle_expiries(connection_capacity);
             resume_connect_retries(this, connection_capacity);
             drain_deferred_health_sweep();
         }
@@ -1263,6 +1264,12 @@ public:
                             c->response_body_idle_armed = false;
                             c->response_body_idle_expiry_pending = true;
                             this->response_body_idle_expiries_pending = true;
+                            return;
+                        }
+                        if (c->upstream_write_idle_armed) {
+                            c->upstream_write_idle_armed = false;
+                            c->upstream_write_idle_expiry_pending = true;
+                            this->upstream_write_idle_scan_pending = true;
                             return;
                         }
                         if (c->is_health_probe) {
@@ -1375,6 +1382,8 @@ public:
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.response_body_idle_armed &&
                             !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            !conn.upstream_write_idle_armed &&
+                            !conn.upstream_write_idle_expiry_pending &&
                             conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
                             !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
@@ -1401,6 +1410,8 @@ public:
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.response_body_idle_armed &&
                             !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            !conn.upstream_write_idle_armed &&
+                            !conn.upstream_write_idle_expiry_pending &&
                             conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
                             !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
@@ -1448,6 +1459,7 @@ public:
         }
         if (!dispatching_event_batch_) {
             resolve_response_body_idle_expiries();
+            this->resolve_upstream_write_idle_expiries(connection_capacity);
             drain_deferred_health_sweep();
         }
     }

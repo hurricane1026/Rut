@@ -5997,6 +5997,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "integration;network;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
 
+    foreach(write_timeout_backend epoll io_uring)
+        add_test(NAME test_upstream_write_timeout_${write_timeout_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_upstream_write_timeout.py
+                --server $<TARGET_FILE:rut> --backend ${write_timeout_backend})
+        set_tests_properties(test_upstream_write_timeout_${write_timeout_backend} PROPERTIES
+            LABELS "integration;network;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+
     foreach(header_timeout_backend epoll io_uring)
         add_test(NAME test_response_header_timeout_${header_timeout_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_response_header_timeout.py

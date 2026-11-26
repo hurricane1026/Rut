@@ -3844,6 +3844,7 @@ upstream api {
     connect_attempts: 8
     response_header_timeout: 7s
     response_body_idle_timeout: 6s
+    write_timeout: 6s
     health_check: { path: "/healthz", interval: 2s, unhealthy_interval: 7s, host: "Probe.Example:8080", failure_threshold: 3, success_threshold: 2, require_initial_success: true }
     connect_timeout: 3s
 }
@@ -3863,6 +3864,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     CHECK_EQ(target.connect_timeout_seconds, 3u);
     CHECK_EQ(target.response_header_timeout_seconds, 7u);
     CHECK_EQ(target.response_body_idle_timeout_seconds, 6u);
+    CHECK_EQ(target.write_timeout_seconds, 6u);
     CHECK(target.hc_enabled);
     CHECK_EQ(target.hc_interval_ms, 2000u);
     CHECK((Str{target.hc_host, target.hc_host_len}.eq(lit_str("Probe.Example:8080"))));

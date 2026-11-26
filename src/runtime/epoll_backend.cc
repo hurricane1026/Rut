@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/send_progress.h"
 #include "rut/runtime/tls.h"
@@ -1613,6 +1614,15 @@ u32 EpollBackend::wait(
                         ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + nw);
                         ss.remaining = static_cast<u32>(static_cast<i64>(ss.remaining) - nw);
                         made_progress = true;
+                        if (ss.type == IoEventType::UpstreamSend && conns && conn_id < max_conns) {
+                            Connection& c = conns[conn_id];
+                            if ((c.upstream_write_idle_armed ||
+                                 c.upstream_write_idle_expiry_pending) &&
+                                c.upstream_write_idle_episode == upstream_episode &&
+                                c.upstream_episode == upstream_episode && c.upstream_fd == ss.fd &&
+                                c.recv_buf.data() == ss.src)
+                                c.upstream_write_idle_progress_us = monotonic_us();
+                        }
                     } else if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         pending_retry = true;
                         break;

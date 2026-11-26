@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/integer_conversion.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -114,6 +115,115 @@ public:
             self().timer.refresh(&c,
                                  c.state == ConnState::Proxying ? self().upstream_timeout
                                                                 : self().keepalive_timeout);
+    }
+
+    bool upstream_write_idle_scan_pending = false;
+
+    bool upstream_write_idle_candidate(const Connection& c, const u8* src, u32 len) const {
+        // Only an active business upload pins request_config through the shard epoch.
+        // Health probes can outlive their launching config.
+        if (c.is_health_probe || !src || len == 0 ||
+            (c.on_upstream_send != &on_upstream_request_sent<Derived> &&
+             c.on_upstream_send != &on_request_body_sent<Derived>) ||
+            c.req_start_us == 0 || c.epoch_held || c.tls_active || c.h1_tls_upstream ||
+            c.protocol != ConnProtocol::Http11 || c.h2 || c.state != ConnState::Proxying ||
+            c.req_body_mode != BodyMode::ContentLength || c.req_content_length == 0 ||
+            c.request_policy_id != 0 || c.response_policy_id != 0 || c.failure_policy_id != 0 ||
+            c.timeout_failure_policy_id != 0 || c.resp_header_mutation_count != 0 ||
+            c.resp_header_mutation_overflow ||
+            c.response_read_deadline_state != ResponseReadDeadlineState::None ||
+            c.req_wants_upgrade || c.is_ws_tunnel || c.is_ws_terminate_route || c.is_ws_terminate ||
+            c.upstream_abandoned || c.proxy_resp_started || c.fd < 0 || c.upstream_fd < 0 ||
+            c.retry_req_send_len != 0 || src != c.recv_buf.data())
+            return false;
+        if (c.on_upstream_send == &on_upstream_request_sent<Derived> &&
+            (c.req_header_end == 0 || len <= c.req_header_end))
+            return false;
+        const RouteConfig* cfg = c.request_config;
+        if (!cfg || c.upstream_idx >= cfg->upstream_count) return false;
+        const auto& up = cfg->upstreams[c.upstream_idx];
+        return up.write_timeout_seconds != 0 && !up.tls.enabled && !up.http2;
+    }
+
+    void arm_upstream_write_idle(Connection& c, const u8* src, u32 len) {
+        if (!upstream_write_idle_candidate(c, src, len)) return;
+        if constexpr (requires {
+                          self().backend.upstream_send_state[c.id];
+                          self().timer;
+                      }) {
+            const auto& send = self().backend.upstream_send_state[c.id];
+            if (send.src != src || send.fd != c.upstream_fd || send.remaining == 0 ||
+                send.upstream_episode != c.upstream_episode)
+                return;
+            c.upstream_write_idle_armed = true;
+            c.upstream_write_idle_expiry_pending = false;
+            c.upstream_write_idle_episode = c.upstream_episode;
+            c.upstream_write_idle_progress_us = monotonic_us();
+            self().timer.refresh(&c,
+                                 c.request_config->upstreams[c.upstream_idx].write_timeout_seconds);
+        }
+    }
+
+    void disarm_upstream_write_idle(Connection& c) {
+        if (!c.upstream_write_idle_armed && !c.upstream_write_idle_expiry_pending) return;
+        c.upstream_write_idle_armed = false;
+        c.upstream_write_idle_expiry_pending = false;
+        c.upstream_write_idle_episode = 0;
+        c.upstream_write_idle_progress_us = 0;
+        if constexpr (requires {
+                          self().timer.refresh(&c, self().upstream_timeout);
+                          self().keepalive_timeout;
+                      })
+            self().timer.refresh(&c,
+                                 c.state == ConnState::Proxying ? self().upstream_timeout
+                                                                : self().keepalive_timeout);
+    }
+
+    void resolve_upstream_write_idle_expiries(u32 count) {
+        if (!upstream_write_idle_scan_pending) return;
+        upstream_write_idle_scan_pending = false;
+        if constexpr (requires {
+                          self().backend.upstream_send_state[0];
+                          self().timer;
+                      }) {
+            for (u32 i = 0; i < count; ++i) {
+                Connection& c = self().conns[i];
+                if (!c.upstream_write_idle_expiry_pending) continue;
+                const auto& send = self().backend.upstream_send_state[i];
+                if (c.fd < 0 || c.upstream_fd < 0 || c.req_start_us == 0 || c.epoch_held ||
+                    c.upstream_episode != c.upstream_write_idle_episode ||
+                    send.fd != c.upstream_fd || send.src != c.recv_buf.data() ||
+                    send.upstream_episode != c.upstream_write_idle_episode || send.remaining == 0 ||
+                    !c.request_config || c.upstream_idx >= c.request_config->upstream_count) {
+                    disarm_upstream_write_idle(c);
+                    continue;
+                }
+                const i64 limit =
+                    static_cast<i64>(
+                        c.request_config->upstreams[c.upstream_idx].write_timeout_seconds) *
+                    1'000'000;
+                const u64 now = monotonic_us();
+                u64 elapsed = 0;
+                (void)__builtin_sub_overflow(now, c.upstream_write_idle_progress_us, &elapsed);
+                if (now < c.upstream_write_idle_progress_us) elapsed = 0;
+                i64 elapsed_signed = 0;
+                if (!try_u64_to_i64(elapsed, elapsed_signed)) {
+                    disarm_upstream_write_idle(c);
+                    expire_upstream_write_idle(&self(), c);
+                    continue;
+                }
+                if (elapsed_signed < limit) {
+                    const i64 remaining = limit - elapsed_signed;
+                    const u32 seconds = static_cast<u32>((remaining + 999'999) / 1'000'000);
+                    c.upstream_write_idle_expiry_pending = false;
+                    c.upstream_write_idle_armed = true;
+                    self().timer.refresh(&c, seconds);
+                } else {
+                    disarm_upstream_write_idle(c);
+                    expire_upstream_write_idle(&self(), c);
+                }
+            }
+        }
     }
 
     static constexpr u32 kJitReadyBatchLimit = 64;
@@ -278,7 +388,9 @@ public:
     // Upstream I/O: send/recv on upstream_fd instead of fd.
     bool submit_send_upstream(Connection& c, const u8* buf, u32 len) {
         if (c.h1_tls_upstream) return h1_tls_send(&self(), c, buf, len);
-        return self().submit_send_upstream_impl(c, buf, len);
+        const bool submitted = self().submit_send_upstream_impl(c, buf, len);
+        if (submitted) arm_upstream_write_idle(c, buf, len);
+        return submitted;
     }
     bool submit_recv_upstream(Connection& c) {
         if (c.h1_tls_upstream) return h1_tls_recv(&self(), c);
@@ -342,6 +454,9 @@ public:
                 break;
             case IoEventType::UpstreamSend:
             case IoEventType::UpstreamConnect:
+                if (ev.type == IoEventType::UpstreamSend && ev.aux == 0 && !ev.more &&
+                    ev.upstream_episode == conn.upstream_write_idle_episode)
+                    disarm_upstream_write_idle(conn);
                 if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
                 break;
             case IoEventType::RelayRead:

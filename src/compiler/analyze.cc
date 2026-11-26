@@ -23024,6 +23024,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.connect_timeout_seconds = item.upstream.connect_timeout_seconds;
         up.response_header_timeout_seconds = item.upstream.response_header_timeout_seconds;
         up.response_body_idle_timeout_seconds = item.upstream.response_body_idle_timeout_seconds;
+        up.write_timeout_seconds = item.upstream.write_timeout_seconds;
         up.weight_count = item.upstream.weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = item.upstream.backend_weights[b];
