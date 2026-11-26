@@ -26,6 +26,19 @@ bool fits_i64(ASTContext& context, const Expr* expr, bool allow_first_out_of_ran
     expr = expr->IgnoreParens();
     while (expr->getType()->isUnsignedIntegerType()) {
         if (context.getIntWidth(expr->getType()) < 64) return true;
+        if (const auto* op = dyn_cast<BinaryOperator>(expr); op && op->getOpcode() == BO_Rem) {
+            // A constant unsigned divisor at most 2^63 bounds every remainder to i64.
+            const auto divisor = op->getRHS()->getIntegerConstantExpr(context);
+            return divisor && !divisor->isZero() && !divisor->isNegative() &&
+                   (divisor->getActiveBits() < 64 ||
+                    (divisor->getActiveBits() == 64 && divisor->isPowerOf2()));
+        }
+        if (const auto* op = dyn_cast<BinaryOperator>(expr);
+            op && op->getOpcode() == BO_Div && context.getIntWidth(expr->getType()) == 64) {
+            const auto divisor = op->getRHS()->getIntegerConstantExpr(context);
+            // UINT64_MAX / 2 == INT64_MAX.
+            return divisor && !divisor->isNegative() && divisor->getActiveBits() >= 2;
+        }
         const auto* cast = dyn_cast<ImplicitCastExpr>(expr);
         if (!cast) break;
         expr = cast->getSubExpr()->IgnoreParens();
@@ -129,6 +142,8 @@ public:
     bool VisitCastExpr(CastExpr* cast) {
         if (cast->getCastKind() != CK_IntegralCast) return true;
         const Expr* input = cast->getSubExpr();
+        // The visitor checks template instantiations after their values are known.
+        if (input->isValueDependent()) return true;
         const QualType source = input->getType();
         const QualType target = cast->getType();
         if (!source->isUnsignedIntegerType() || !target->isSignedIntegerType() ||
@@ -244,8 +259,124 @@ class SignedConversionAction : public PluginASTAction {
         return true;
     }
 };
+class OverflowResultVisitor : public RecursiveASTVisitor<OverflowResultVisitor> {
+    ASTContext& context;
+    const FunctionDecl* function = nullptr;
+
+public:
+    explicit OverflowResultVisitor(ASTContext& context) : context(context) {}
+
+    bool TraverseFunctionDecl(FunctionDecl* decl) {
+        return traverse_function(decl,
+                                 [&] { return RecursiveASTVisitor::TraverseFunctionDecl(decl); });
+    }
+
+    bool TraverseCXXMethodDecl(CXXMethodDecl* decl) {
+        return traverse_function(decl,
+                                 [&] { return RecursiveASTVisitor::TraverseCXXMethodDecl(decl); });
+    }
+
+    bool TraverseLambdaExpr(LambdaExpr* lambda) {
+        return traverse_function(lambda->getCallOperator(),
+                                 [&] { return RecursiveASTVisitor::TraverseLambdaExpr(lambda); });
+    }
+
+    bool VisitCallExpr(CallExpr* call) {
+        const auto* callee = call->getDirectCallee();
+        if (!callee || !callee->getBuiltinID() ||
+            context.getSourceManager().isInSystemHeader(call->getExprLoc()))
+            return true;
+        const auto name = callee->getName();
+        if (name != "__builtin_add_overflow" && name != "__builtin_sub_overflow" &&
+            name != "__builtin_mul_overflow")
+            return true;
+        if (function && function->hasAttr<WarnUnusedResultAttr>() && returns_status(*call))
+            return true;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(
+            DiagnosticsEngine::Warning,
+            "checked arithmetic requires an explicit return from a nodiscard function");
+        diagnostics.Report(call->getExprLoc(), id);
+        return true;
+    }
+
+private:
+    template <typename Traverse>
+    bool traverse_function(const FunctionDecl* decl, Traverse traverse) {
+        const auto* previous = function;
+        function = decl;
+        const bool ok = traverse();
+        function = previous;
+        return ok;
+    }
+
+    static const ReturnStmt* exit_return(const Stmt* branch) {
+        if (const auto* block = dyn_cast_or_null<CompoundStmt>(branch)) {
+            if (block->body_empty()) return nullptr;
+            branch = block->body_back();
+            for (const auto* statement : block->body())
+                if (statement != branch && !isa<Expr, DeclStmt>(statement)) return nullptr;
+        }
+        return dyn_cast_or_null<ReturnStmt>(branch);
+    }
+
+    bool returns_status(const CallExpr& call) {
+        // Follow the truth value determined by the overflow flag. In a
+        // short-circuit guard, only expressions forced by that flag qualify.
+        const Stmt* expression = &call;
+        bool overflow_value = true;
+        while (true) {
+            const auto parents = context.getParents(*expression);
+            if (parents.size() != 1) return false;
+            const auto& parent = parents[0];
+            if (const auto* branch = parent.get<IfStmt>()) {
+                if (branch->getCond() != expression) return false;
+                const auto* result =
+                    exit_return(overflow_value ? branch->getThen() : branch->getElse());
+                if (!result || !result->getRetValue()) return false;
+                if (function->getReturnType()->isBooleanType()) {
+                    bool value;
+                    if (result->getRetValue()->EvaluateAsBooleanCondition(value, context))
+                        return !value;
+                }
+                return true;
+            }
+            if (const auto* result = parent.get<ReturnStmt>())
+                return result->getRetValue() == expression &&
+                       function->getReturnType()->isBooleanType();
+            if (const auto* op = parent.get<UnaryOperator>()) {
+                if (op->getOpcode() != UO_LNot) return false;
+                overflow_value = !overflow_value;
+            } else if (const auto* op = parent.get<BinaryOperator>()) {
+                if (op->getOpcode() != (overflow_value ? BO_LOr : BO_LAnd)) return false;
+            } else if (!parent.get<ParenExpr>() && !parent.get<ImplicitCastExpr>()) {
+                return false;
+            }
+            expression = parent.get<Stmt>();
+        }
+    }
+};
+
+class OverflowResultConsumer : public ASTConsumer {
+    void HandleTranslationUnit(ASTContext& context) override {
+        OverflowResultVisitor(context).TraverseDecl(context.getTranslationUnitDecl());
+    }
+};
+
+class OverflowResultAction : public PluginASTAction {
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
+        return std::make_unique<OverflowResultConsumer>();
+    }
+
+    bool ParseArgs(const CompilerInstance&, const std::vector<std::string>&) override {
+        return true;
+    }
+};
 }  // namespace
 
 static FrontendPluginRegistry::Add<SignedConversionAction> registration(
     "rut-u64-to-i64",
     "Require range proofs for conversions from unsigned to signed 64-bit integers");
+
+static FrontendPluginRegistry::Add<OverflowResultAction> overflow_registration(
+    "rut-overflow-result", "Require explicit error returns for checked arithmetic");
