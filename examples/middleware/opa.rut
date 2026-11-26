@@ -95,3 +95,43 @@ func freshDecisionStatus(_ decision: Json) -> i32 {
     guard jwtClaimsValid(times, "rut", "rut") else { 503 }
     200
 }
+
+func decisionFieldStatus(_ decision: Json, _ field: str, _ expected: str, _ limit: i32) -> i32 {
+    guard expected != "" && Bytes(expected).count <= limit else { 503 }
+    guard let actual = json.string(json.get(decision, field).or(decision)) else { 503 }
+    guard actual != "" && Bytes(actual).count <= limit else { 503 }
+    if actual == expected { 200 } else { 403 }
+}
+
+// Callers supply trusted expectations and a gateway-generated per-request ID.
+func requestIdStatus(_ decision: Json, _ expected: str) -> i32 {
+    decisionFieldStatus(decision, "/request_id", expected, 128)
+}
+
+func audienceStatus(_ decision: Json, _ expected: str) -> i32 {
+    decisionFieldStatus(decision, "/audience", expected, 256)
+}
+
+func policyIdStatus(_ decision: Json, _ expected: str) -> i32 {
+    guard decisionFieldStatus(decision, "/policy_id", expected, 256) == 200 else { 503 }
+    200
+}
+
+// Select the same path representation the caller includes in the OPA input.
+func httpTargetStatus(_ decision: Json, _ method: str, _ path: str) -> i32 {
+    let methodStatus = decisionFieldStatus(decision, "/method", method, 32)
+    let pathStatus = decisionFieldStatus(decision, "/path", path, 2048)
+    guard methodStatus != 503 && pathStatus != 503 else { 503 }
+    guard methodStatus == 200 && pathStatus == 200 else { 403 }
+    200
+}
+
+// Require a decision issued in the configured recent window with a bounded lifetime.
+func decisionLifetimeStatus(_ decision: Json, _ maxAge: i32, _ maxLifetime: i32) -> i32 {
+    guard maxAge > 0 && maxLifetime > 0 else { 503 }
+    guard let issued = json.int(json.get(decision, "/issued_at").or(decision)) else { 503 }
+    guard let expires = json.int(json.get(decision, "/expires_at").or(decision)) else { 503 }
+    guard let times = json.value({iss: "rut", aud: "rut", sub: "rut", iat: issued, exp: expires}) else { 503 }
+    guard jwtClaimsValidWithLifetime(times, "rut", "rut", i64(maxAge), i64(maxLifetime)) else { 503 }
+    200
+}
