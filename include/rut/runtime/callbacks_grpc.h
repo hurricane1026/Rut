@@ -11,6 +11,8 @@
 #include "rut/runtime/ws_handshake.h"
 
 namespace rut {
+template <typename Loop>
+inline bool current_health_generation(Loop*, const RouteConfig*);
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
 inline u32 select_forward_backend(
     const RouteConfig*, u32, ForwardLoadBalance, u16, u32, u64, u8 = 0);
@@ -1207,8 +1209,11 @@ bool grpc_start_impl(Loop* loop,
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
         if (__builtin_add_overflow(deadline_base, timeout, &deadline)) return false;
     }
-    const u32 backend = select_forward_backend(
-        cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
+    const u32 backend =
+        target.hc_require_initial_success && !current_health_generation(loop, cfg)
+            ? target.addr_count
+            : select_forward_backend(
+                  cfg, down.shard_id, down.forward_load_balance, uid, target.addr_count, now);
     if (backend >= target.addr_count) return false;
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {

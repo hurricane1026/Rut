@@ -5992,3 +5992,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
             LABELS "integration;network;timeout" TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(readiness_backend epoll io_uring)
+        add_test(NAME test_upstream_initial_readiness_${readiness_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_upstream_initial_readiness.py
+                --server $<TARGET_FILE:rut> --backend ${readiness_backend})
+        set_tests_properties(test_upstream_initial_readiness_${readiness_backend} PROPERTIES
+            LABELS "integration;network;health" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+endif()

@@ -389,21 +389,28 @@ template <typename Loop>
 void same_address_reload(rut::test::TestCase* _tc) {
     ProbeRig<Loop> rig;
     REQUIRE(rig.init());
+    auto& target = rig.owner.config->upstreams[0];
+    target.hc_require_initial_success = 1;
+    record_active_probe_result(0, 0, true, 0);
+    REQUIRE(backend_initially_ready(target, 0, 0));
     REQUIRE(start_health_probe(rig.loop, 0, 0));
     Socket peer;
     char request[512]{};
     REQUIRE(rig.receive_request(peer, request, sizeof(request)));
     rig.owner.config->http_cache_identity = http_cache_config_identity();
     REQUIRE(rig.loop->arm_health_on_config_change());
+    CHECK_FALSE(backend_initially_ready(target, 0, 0));
     record_active_probe_result(0, 0, false, 0);
     REQUIRE(rig.respond(peer, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
     CHECK(backend_ejected(0, 0, ~u64{0}));
+    CHECK_FALSE(backend_initially_ready(target, 0, 0));
     REQUIRE(start_health_probe(rig.loop, 0, 0));
     Socket next;
     request[0] = '\0';
     REQUIRE(rig.receive_request(next, request, sizeof(request)));
     REQUIRE(rig.respond(next, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
     CHECK_FALSE(backend_ejected(0, 0, 0));
+    CHECK(backend_initially_ready(target, 0, 0));
 }
 template <typename Loop>
 void sweep_respects_disabled_interval_and_drain(rut::test::TestCase* _tc) {
@@ -429,7 +436,7 @@ void tcp_health_and_recovery(rut::test::TestCase* _tc) {
     ProbeRig<Loop> rig;
     REQUIRE(rig.init());
     REQUIRE(rig.owner.config->set_upstream_health_check(
-        0, nullptr, 0, 1000, 0, {2, 2}, ActiveHealthType::Tcp, 1000));
+        0, nullptr, 0, 1000, 0, {2, 2}, ActiveHealthType::Tcp, 1000, {}, {}, true));
     const u32 kFreeSlots = rig.loop->free_conn_slots();
     ::close(rig.listener.fd);
     rig.listener.fd = -1;
@@ -468,6 +475,7 @@ void tcp_health_and_recovery(rut::test::TestCase* _tc) {
         char data[64]{};
         CHECK_EQ(recv(peer.fd, data, sizeof(data), MSG_DONTWAIT), 0);  // EOF, no application bytes
         CHECK_EQ(backend_ejected(0, 0, 0), i == 0);
+        CHECK_EQ(backend_initially_ready(rig.owner.config->upstreams[0], 0, 0), i == 1);
         CHECK_EQ(rig.loop->free_conn_slots(), kFreeSlots);
     }
     CHECK_EQ(rig.loop->active_count(), 0u);

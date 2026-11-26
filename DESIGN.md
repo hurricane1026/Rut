@@ -1690,6 +1690,16 @@ failures retain their normal attempt budget. Other protocols and explicit
 connect waits retain existing timing. Native artifact version 29 records the
 setting.
 
+An active `health_check` may set `require_initial_success: true` (default
+false). Each shard starts every backend pending in a new configuration generation.
+Only a consecutive active probe success streak reaching `success_threshold` latches
+readiness; business connects never do. Pending backends are excluded from selection,
+retries, explicit connects and fail-open fallback. Their configured weight remains
+in the capacity denominator but is excluded from its healthy numerator. After
+readiness, normal ejection and fallback semantics apply; reload resets the latch.
+This applies to the supported TCP, HTTP and verified HTTPS probe modes. Native
+artifact version 33 provisionally records the configuration field.
+
 An upstream can set `minimum_healthy_weight_percent` from 0 to 100. A positive
 threshold requires the sum of healthy enabled weights, multiplied by 100, to
 meet or exceed the total enabled weight multiplied by the percentage. Active

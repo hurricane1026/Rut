@@ -838,6 +838,12 @@ HTTP Host authority sent on HTTP and HTTPS probes. It accepts a nonempty, valid
 authority up to 260 bytes, including port 0; omission uses the probed IPv4
 address and port. TCP probes reject this field. It does not change TLS SNI,
 certificate verification, or forwarding requests.
+Set `require_initial_success: true` in `health_check` to exclude each backend
+until its active probes reach the configured consecutive `success_threshold` on
+that shard and configuration generation. Business connections do not satisfy the
+requirement. Pending endpoints cannot enter fail-open selection; with no eligible
+endpoint the request receives 503. Reload resets the latch. The option defaults
+to false and applies to supported TCP, HTTP and verified HTTPS probes.
 
 Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstreams.
 A complete response with the expected status counts as success. `status` defaults to
