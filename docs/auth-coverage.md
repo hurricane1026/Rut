@@ -1858,3 +1858,13 @@ than ceiling `expires_in`. Apply it only to a document from a verified HTTPS
 token response, along with the usual token and scope validation before forwarding.
 The bound is an inclusive number of seconds, limited to positive i32 values.
 Existing grant helpers remain unchanged; no token caching or clock is involved.
+
+### JWT assurance alternatives and session principal
+
+The [JWT assurance example](../examples/jwt-assurance-auth.rut) also exposes
+`requireAnyAcr`, `requireAnyAmr`, `requireAllAmr`, `requireAmrWithout` and
+`requireSessionPrincipal`. After JWT verification, routes can accept either of
+two authentication classes, accept either authentication method, require both
+methods, require one method while excluding another, or bind a session ID to an
+exact signed subject. Each AMR lookup validates the full array. Unusable route
+selectors return 503. A missing or mismatched claim returns 403.

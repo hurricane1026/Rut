@@ -44,4 +44,34 @@ route GET "/session" {
     return 204
 }
 
+route GET "/acr-any" {
+    let document = checkedDocument(req.authorization.or(""))
+    let allowed = jwt_assurance.requireAnyAcr(document, env("JWT_REQUIRED_ACR"), env("JWT_ALTERNATE_ACR"))
+    return 204
+}
+
+route GET "/amr-any" {
+    let document = checkedDocument(req.authorization.or(""))
+    let allowed = jwt_assurance.requireAnyAmr(document, env("JWT_REQUIRED_AMR"), env("JWT_ALTERNATE_AMR"))
+    return 204
+}
+
+route GET "/amr-all" {
+    let document = checkedDocument(req.authorization.or(""))
+    let allowed = jwt_assurance.requireAllAmr(document, env("JWT_REQUIRED_AMR"), env("JWT_ALTERNATE_AMR"))
+    return 204
+}
+
+route GET "/amr-without" {
+    let document = checkedDocument(req.authorization.or(""))
+    let allowed = jwt_assurance.requireAmrWithout(document, env("JWT_REQUIRED_AMR"), env("JWT_FORBIDDEN_AMR"))
+    return 204
+}
+
+route GET "/session-principal" {
+    let document = checkedDocument(req.authorization.or(""))
+    let allowed = jwt_assurance.requireSessionPrincipal(document, env("JWT_REQUIRED_SESSION"), env("JWT_REQUIRED_SUBJECT"))
+    return 204
+}
+
 route "/" { return 404 }
