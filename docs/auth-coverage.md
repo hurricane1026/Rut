@@ -1366,6 +1366,11 @@ checks continue to compose. Persistent replay state remains outstanding.
 
 ## Fixed JWT client authorization
 
+The separate `jwt_assurance` module adds exact `acr`, bounded `amr`,
+`auth_time` age, verified email and `sid` checks on verified JWT claims.
+The executable HS256 example covers HTTP/1 and HTTP/2 on both Linux backends.
+
+
 `auth.jwtClientIdentity` applies the existing standard claims policy to verified
 JWT JSON and requires an exact nonempty signed payload `client_id` matching
 trusted configuration. It preserves the verified subject as consumerId and the

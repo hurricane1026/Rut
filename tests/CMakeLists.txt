@@ -4318,6 +4318,13 @@ if(RUT_ENABLE_JIT)
                     LABELS "integration;auth;docker" TIMEOUT 180 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             endforeach()
             foreach(scope_backend epoll io_uring)
+                add_test(NAME test_jwt_assurance_${scope_backend}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_assurance.py
+                        --server $<TARGET_FILE:rut>
+                        --source ${PROJECT_SOURCE_DIR}/examples/jwt-assurance-auth.rut
+                        --backend ${scope_backend})
+                set_tests_properties(test_jwt_assurance_${scope_backend} PROPERTIES
+                    LABELS "integration;auth" TIMEOUT 90 SKIP_RETURN_CODE 77)
                 add_test(NAME test_jwt_scope_lists_${scope_backend}
                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_jwt_scope_lists.py
                         --server $<TARGET_FILE:rut>

@@ -3008,6 +3008,23 @@ guarantee. It can be composed before the existing role/resource/action policy;
 see `examples/consumer-tenant-rbac-auth.rut`.
 
 
+### Additional checks on verified JWT claims
+
+`middleware/jwt_assurance.rut` provides independent checks on verified JWT
+claims. `requireAcr` and `requireSession` pin exact `acr` and `sid` strings.
+`requireAmr` requires one exact method in a fully valid string array.
+`requireVerifiedEmail` requires a case-sensitive `email` plus boolean true
+`email_verified`. String selectors must contain 1–256 bytes.
+`requireAuthenticationAge` requires positive integer `auth_time`, a signed
+`iat` at or after it, and an age no greater than the positive configured
+number of seconds at the gateway clock. These route policies return 403 when a
+verified claim fails the check and 503 for invalid configured limits or
+selectors. They consume the document from signature, issuer, audience and time
+verification. The session pin concerns the signed claim. See
+[jwt-assurance-auth.rut](../examples/jwt-assurance-auth.rut) and
+[OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0-errata2.html).
+
+
 ### RS256 with a configured trust policy
 
 `jwtVerifyRs256(token, policy) -> Json?` verifies RS256 and claims together.
