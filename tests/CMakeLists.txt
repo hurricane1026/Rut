@@ -5564,6 +5564,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
                 --additional-policies)
         set_tests_properties(test_oauth_introspection_policies_${backend} PROPERTIES
             LABELS "integration" TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME test_oauth_introspection_active_restrictions_${backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_oauth_introspection.py
+                --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend}
+                --active-token-restrictions)
+        set_tests_properties(test_oauth_introspection_active_restrictions_${backend} PROPERTIES
+            LABELS "integration;auth" TIMEOUT 60 SKIP_RETURN_CODE 77)
         add_test(NAME test_opa_auth_${backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_opa_auth.py
                 --server $<TARGET_FILE:rut> --testdata ${RUT_TLS_TESTDATA_DIR} --backend ${backend})

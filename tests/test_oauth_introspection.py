@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--testdata', required=True)
     parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
     parser.add_argument('--additional-policies', action='store_true')
+    parser.add_argument("--active-token-restrictions", action="store_true")
     args = parser.parse_args()
     received, forwarded = [], []
     lock = threading.Lock()
@@ -44,8 +45,16 @@ def main():
             now = int(time.time())
             body = dict(active=True, exp=now + 3600, aud=['other-api', 'reports-api'],
                         scope='reports:read reports:write', sub='subject-' + token,
-                        iss='https://issuer.example', client_id='reports-client')
+                        iss='https://issuer.example', client_id='reports-client',
+                        token_type='Bearer', username='reports-user', sid='session-one', jti='token-one')
             updates = {
+                'lowercase-type': dict(token_type='bearer'),
+                'other-username': dict(username='other'),
+                'other-session': dict(sid='session-two'),
+                'other-token-id': dict(jti='token-two'),
+                'typed-session': dict(sid=7),
+                'typed-token-id': dict(jti=['token-one']),
+                'typed-username': dict(username=['reports-user']),
                 'inactive': dict(active=False), 'revoked': dict(active=not revoked.is_set()),
                 'expired': dict(exp=now - 1), 'future-nbf': dict(nbf=now + 3600),
                 'future-iat': dict(iat=now + 3600), 'wrong-audience': dict(aud='another-api'),
@@ -88,6 +97,9 @@ def main():
                 'typed-subject': dict(sub=True), 'unsafe-subject': dict(sub='alice\r\nInjected: yes'),
             }
             body.update(updates.get(token, {}))
+            if token == 'no-profile-metadata':
+                for field in ('token_type', 'username', 'sid', 'jti'):
+                    del body[field]
             if token == 'no-expiry':
                 del body['exp']
             if token == 'no-scope':
@@ -246,7 +258,7 @@ route GET "/same-scope-{helper}" {{
     return 204
 }}
 '''
-            if args.additional_policies:
+            if args.additional_policies or args.active_token_restrictions:
                 source = 'import "middleware/introspection.rut"\n'
                 policies = (
                     ('any-scope-list', 'requireAnyScope', 'reports:read reports:write reports:audit'),
@@ -260,6 +272,16 @@ route GET "/same-scope-{helper}" {{
                     ('bounded-lifetime', 'requireLifetime', '"https://issuer.example", "reports-api", 60, 120'),
                     ('invalid-lifetime', 'requireLifetime', '"https://issuer.example", "reports-api", 0, 120'),
                 )
+                if args.active_token_restrictions:
+                    policies = (
+                        ('token-type', 'requireTokenType', '"Bearer"'),
+                        ('username', 'requireUsername', '"reports-user"'),
+                        ('session-id', 'requireSessionId', '"session-one"'),
+                        ('token-id', 'requireTokenId', '"token-one"'),
+                        ('only-scopes', 'requireOnlyScopes', '"reports:read reports:write"'),
+                        ('invalid-only-scopes', 'requireOnlyScopes', '"reports:read  reports:write"'),
+                        ('invalid-token-id', 'requireTokenId', '""'),
+                    )
                 for path, helper, policy in policies:
                     if helper in ('requireAnyScope', 'requireAllScopes'):
                         policy = json.dumps(policy)
@@ -352,6 +374,36 @@ route GET "/{path}" {{
                                 if kind in (0, 1) and flags & 1:
                                     break
                             return headers, data
+
+                    if args.active_token_restrictions:
+                        for path in ('/invalid-only-scopes', '/invalid-token-id'):
+                            status, headers, _ = request('valid', path)
+                            assert status == 503 and 'WWW-Authenticate' not in headers
+                        for path, denials in (
+                                ('/token-type', ('wrong-type', 'lowercase-type')),
+                                ('/username', ('other-username', 'typed-username')),
+                                ('/session-id', ('other-session', 'typed-session')),
+                                ('/token-id', ('other-token-id', 'typed-token-id'))):
+                            assert request('valid', path)[0] == 204
+                            for token in (*denials, 'no-profile-metadata', 'inactive'):
+                                status, headers, _ = request(token, path)
+                                assert status == 401, (path, token, status)
+                                assert headers['WWW-Authenticate'] == 'Bearer error="invalid_token"'
+                        for token in ('valid', 'read-only', 'write-only'):
+                            assert request(token, '/only-scopes')[0] == 204
+                        for token in ('wrong-scope', 'all-scopes', 'no-scope'):
+                            status, headers, _ = request(token, '/only-scopes')
+                            assert status == 403, (token, status)
+                            assert headers['WWW-Authenticate'] == 'Bearer error="insufficient_scope"'
+                        for path, token in (
+                                ('/token-type', 'valid'), ('/username', 'valid'),
+                                ('/session-id', 'valid'), ('/token-id', 'valid'), ('/only-scopes', 'read-only'),
+                        ):
+                            headers, data = h2_request(path, token)
+                            assert headers.startswith(b'\x89') and not data, (path, headers, data)
+                        assert not forwarded
+                        print(f'PASS: {args.backend} active-token restrictions')
+                        return 0
 
                     if args.additional_policies:
                         for token in ('read-only', 'write-only', 'audit-only', 'all-scopes'):

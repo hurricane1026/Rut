@@ -242,3 +242,21 @@ HTTP/1 and HTTP/2, two certificates sharing a key but having different DER,
 source/module removal, spoofed identity/certificate headers, absent TLS client
 identity, malformed confirmation metadata, authorization failures, AS errors,
 timeout/disconnect cleanup, concurrent connection isolation and revocation.
+
+### Optional active-token restrictions
+
+Call these helpers with the document returned by `requireActive` from the
+authenticated authorization server. `requireTokenType` requires an explicitly
+reported `token_type` with the route's exact spelling, such as `"Bearer"`.
+The core active-token check retains its case-insensitive Bearer comparison and
+accepts omission. `requireUsername`, `requireSessionId` and `requireTokenId`
+compare `username`, `sid` and `jti` respectively. Use `sub` for stable subject
+identity. Expected metadata values are nonempty and at most 256 bytes.
+An invalid expectation returns 503. Missing, mistyped or mismatched metadata
+returns 401 with an `invalid_token` challenge.
+
+`requireOnlyScopes(document, "reports:read reports:write")` accepts a nonempty
+grant whose scopes are all in the configured list. Extra or absent scopes
+return 403 with an `insufficient_scope` challenge. Use it with `requireScope`
+when a route also needs a specific minimum permission. All successful
+restrictions return the original active-token document.
