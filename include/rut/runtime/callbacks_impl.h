@@ -7612,9 +7612,10 @@ inline void strip_ws_extensions(Connection& conn) {
         return false;
     auto& arena = conn.json_arena;
     auto allocate = [&] [[nodiscard]] (u32 bytes) -> char* {
-        if (bytes > 262144 || arena.backend.pool == nullptr ||
-            (!arena.current && !arena.init(arena.backend.pool)) ||
-            arena.space_used() > static_cast<u64>(i64{262144} - i64{bytes}))
+        u32 remaining;
+        if (__builtin_sub_overflow(u32{262144}, bytes, &remaining)) return nullptr;
+        if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > remaining)
             return nullptr;
         return static_cast<char*>(arena.alloc(bytes));
     };
@@ -15056,10 +15057,10 @@ inline bool redirect_legacy_authority_matches_listener(const RedirectAuthorityVi
     const uintptr_t base = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
     uintptr_t path_offset = 0;
-    if (path_addr < base || __builtin_sub_overflow(path_addr, base, &path_offset) ||
-        path_offset > conn.recv_buf.len() ||
-        i64{out_req->path.len} >
-            i64{conn.recv_buf.len()} - i64{static_cast<u32>(path_offset)})
+    u32 remaining;
+    if (__builtin_sub_overflow(path_addr, base, &path_offset) ||
+        __builtin_sub_overflow(conn.recv_buf.len(), path_offset, &remaining) ||
+        out_req->path.len > remaining)
         return false;
     const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;

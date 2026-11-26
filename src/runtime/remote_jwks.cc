@@ -777,8 +777,10 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
         sent_discovery_validator_ = kTag.len != 0;
     }
     u64 elapsed = 0;
-    if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) return fail();
-    u32 stage_timeout = static_cast<u32>(static_cast<i64>(timeout_) - i64{static_cast<u32>(elapsed)});
+    u32 stage_timeout;
+    if (__builtin_sub_overflow(now, started_, &elapsed) ||
+        __builtin_sub_overflow(timeout_, elapsed, &stage_timeout) || stage_timeout == 0)
+        return fail();
     u64 discovery_timeout_wide = 0;
     u32 kDiscoveryTimeout = 0;
     if (__builtin_mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),

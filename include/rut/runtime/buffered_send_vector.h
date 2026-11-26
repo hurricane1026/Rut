@@ -40,14 +40,13 @@ struct BufferedSendVector {
         return true;
     }
     [[nodiscard]] constexpr bool matches(const u8* first, u32 total) const {
+        u32 second_size;
         return first != nullptr && first_source == first && first_size == parts[0].iov_len &&
                second_source == parts[1].iov_base && total_size == total &&
                message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
                parts[0].iov_len != 0 && parts[1].iov_base != nullptr && parts[1].iov_len != 0 &&
-               parts[0].iov_len <= total &&
-               parts[1].iov_len == static_cast<u64>(
-                                       (range_int(total) -
-                                        range_int(static_cast<u32>(parts[0].iov_len))).value());
+               !__builtin_sub_overflow(total, parts[0].iov_len, &second_size) &&
+               parts[1].iov_len == second_size;
     }
     [[nodiscard]] constexpr bool advance(u32 n) {
         while (n && message.msg_iovlen) {
@@ -58,11 +57,12 @@ struct BufferedSendVector {
             const u32 kSize =
                 kFirst ? first_size
                        : static_cast<u32>((range_int(total_size) - range_int(first_size)).value());
-            const auto remaining =
-                static_cast<__int128_t>(part.iov_len) - static_cast<__int128_t>(kStep);
-            if (remaining < 0 || remaining > kSize) return false;
-            const u32 offset = static_cast<u32>(static_cast<__int128_t>(kSize) - remaining);
-            part.iov_len = static_cast<size_t>(remaining);
+            size_t remaining;
+            u32 offset;
+            if (__builtin_sub_overflow(part.iov_len, kStep, &remaining) ||
+                __builtin_sub_overflow(kSize, remaining, &offset))
+                return false;
+            part.iov_len = remaining;
             part.iov_base = const_cast<u8*>(source + range_int(offset).value());
             n = static_cast<u32>((range_int(n) - range_int(kStep)).value());
             if (part.iov_len == 0) {

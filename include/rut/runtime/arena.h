@@ -93,18 +93,8 @@ struct Arena {
             return (kBlockSize + 15) / 16 * 16;
         }();
         u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
-        i64 capacity() const {
-            i64 result;
-            return size >= kHeaderSize && !__builtin_sub_overflow(size, kHeaderSize, &result)
-                       ? result
-                       : 0;
-        }
-        i64 remaining() const {
-            const i64 available = capacity();
-            i64 result;
-            return used <= available && !__builtin_sub_overflow(available, used, &result) ? result
-                                                                                          : 0;
-        }
+        i64 capacity() const { return size - kHeaderSize; }
+        i64 remaining() const { return capacity() - used; }
     };
 
     Block* current = nullptr;
@@ -180,9 +170,7 @@ struct Arena {
         if (!current) return;
         while (current->prev) {
             Block* prev = current->prev;
-            const u64 sz = static_cast<u64>(current->size);
-            backend.release(reinterpret_cast<u8*>(current), sz);
-            if (__builtin_sub_overflow(total_allocated, sz, &total_allocated)) total_allocated = 0;
+            backend.release(reinterpret_cast<u8*>(current), static_cast<u64>(current->size));
             current = prev;
         }
         current->used = 0;

@@ -446,8 +446,8 @@ namespace {
                                             u8* scratch,
                                             u32 scratch_capacity) {
     if (!st.encoder || *produced == begin) return true;
-    if (*produced < begin) return false;
-    const u32 frame_len = static_cast<u32>((range_int(*produced) - range_int(begin)).value());
+    u32 frame_len;
+    if (__builtin_sub_overflow(*produced, begin, &frame_len)) return false;
     WsFrameHeader header{};
     if (ws_parse_header(out + range_int(begin).value(), frame_len, st.masked, &header) !=
             ParseStatus::Complete ||
@@ -728,10 +728,11 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if ((h.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented)
                 return WsInspectStatus::Error;
             if (kCompressed) {
-                const u32 wire_limit = ws_deflate_wire_limit(kDecodedLimit);
-                if (!st.decoder || h.payload_len < 0 || h.payload_len > wire_limit ||
-                    st.assembler.accumulated_len >
-                        static_cast<u64>(i64{wire_limit} - h.payload_len))
+                u32 remaining_wire;
+                if (!st.decoder ||
+                    __builtin_sub_overflow(
+                        ws_deflate_wire_limit(kDecodedLimit), h.payload_len, &remaining_wire) ||
+                    st.assembler.accumulated_len > remaining_wire)
                     return WsInspectStatus::Error;
             } else {
                 if (st.message_len > kDecodedLimit) return WsInspectStatus::Error;
@@ -744,12 +745,10 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
-        if (st.partial_payload_len < 0 || st.partial_payload_len > h.payload_len)
+        u32 remain;
+        if (__builtin_sub_overflow(h.payload_len, st.partial_payload_len, &remain))
             return WsInspectStatus::Error;
-        const i64 frame_remaining = h.payload_len - st.partial_payload_len;
-        if (frame_remaining > UINT32_MAX) return WsInspectStatus::Error;
-        const u32 remaining_payload = static_cast<u32>(frame_remaining);
-        const auto frame_size = range_int(header_len) + range_int(remaining_payload);
+        const auto frame_size = range_int(header_len) + range_int(remain);
         const i64 frame_total = frame_size.value();
         if (ws_opcode_is_control(h.opcode) && avail < frame_total) break;
         if (!ws_opcode_is_control(h.opcode) && avail < frame_total && *produced != 0) break;
@@ -757,9 +756,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // already-produced frames first when the next output might not fit; leave this
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
-            if (*produced > out_cap) return WsInspectStatus::Error;
-            const u32 available_output =
-                static_cast<u32>((range_int(out_cap) - range_int(*produced)).value());
+            u32 available_output;
+            if (__builtin_sub_overflow(out_cap, *produced, &available_output))
+                return WsInspectStatus::Error;
             if (ws_opcode_is_control(h.opcode)) {
                 if (frame_total > available_output) break;
             } else if (h.fin) {
@@ -848,11 +847,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // checked above), then ask the reassembler whether the message is complete.
         const u32 available_payload =
             static_cast<u32>(static_cast<i64>(avail) - static_cast<i64>(header_len));
-        u64 remain = 0;
-        if (__builtin_sub_overflow(
-                h.payload_len, static_cast<u64>(st.partial_payload_len), &remain))
-            return WsInspectStatus::Error;
-        const u32 chunk = remaining_payload < available_payload ? remaining_payload : available_payload;
+        const u32 chunk = remain < available_payload ? remain : available_payload;
         if (!st.partial_data_frame && h.opcode != WsOpcode::Continuation) {
             st.compressed_message = kCompressed;
 #if RUT_ENABLE_WEBSOCKET
@@ -877,7 +872,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
 #endif
         } else {
             // message_total includes this entire frame, so it is at least remain.
-            u8* dst = msg_buf + (message_total - static_cast<i64>(remaining_payload));
+            u8* dst = msg_buf + (message_total - static_cast<i64>(remain));
             for (u32 i = 0; i < chunk; i++) dst[i] = payload[i];
             if (st.masked)
                 ws_unmask_chunk(dst, chunk, h.mask_key, static_cast<u64>(st.partial_payload_len));
@@ -1181,15 +1176,16 @@ WsClosingRead ws_read_closing(
                                       ? static_cast<u32>(st.max_message_size)
                                       : kWsMaxMessageCapacity;
         const u32 kLimit = kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : kDecodedLimit;
+        u32 remaining_wire;
         if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
-            header.payload_len < 0 || header.payload_len > kLimit ||
-            st.assembler.accumulated_len > static_cast<u64>(i64{kLimit} - header.payload_len))
+            __builtin_sub_overflow(kLimit, header.payload_len, &remaining_wire) ||
+            st.assembler.accumulated_len > remaining_wire)
             return WsClosingRead::Error;
         st.compressed_message = kCompressed;
         const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
-        if (st.partial_payload_len < 0 || st.partial_payload_len > header.payload_len)
+        u32 remaining;
+        if (__builtin_sub_overflow(header.payload_len, st.partial_payload_len, &remaining))
             return WsClosingRead::Error;
-        const u32 remaining = static_cast<u32>(header.payload_len - st.partial_payload_len);
         const u32 kAvailablePayload =
             static_cast<u32>(static_cast<i64>(kAvailable) - static_cast<i64>(kHeaderLen));
         const u32 kTake = remaining < kAvailablePayload ? remaining : kAvailablePayload;

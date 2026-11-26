@@ -186,8 +186,9 @@ NetReply NetClientWorker::call(u32 owner,
                 return reply;
             }
             u64 elapsed = 0;
-            if (now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
-                elapsed >= s.timeout) {
+            u64 remaining;
+            if (__builtin_sub_overflow(now, s.started, &elapsed) ||
+                __builtin_sub_overflow(s.timeout, elapsed, &remaining) || remaining == 0) {
                 __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
                 reply.status = -2;
                 return reply;
@@ -203,8 +204,6 @@ NetReply NetClientWorker::call(u32 owner,
                 return reply;
             }
             reply.status = NetReply::kPending;
-            const auto remaining =
-                static_cast<__int128_t>(s.timeout) - static_cast<__int128_t>(elapsed);
             reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
             return reply;
         }

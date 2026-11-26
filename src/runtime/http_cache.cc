@@ -276,9 +276,8 @@ struct ResponseInfo {
     u64 kAge = 0;
     if (__builtin_add_overflow(age_us, delay, &kAge)) return false;
     const u64 kInitial = kApparent > kAge ? kApparent : kAge;
-    if (kInitial >= kLifetimeUs) return false;
-    info.remaining_us =
-        static_cast<u64>(static_cast<__int128_t>(kLifetimeUs) - static_cast<__int128_t>(kInitial));
+    if (__builtin_sub_overflow(kLifetimeUs, kInitial, &info.remaining_us) || info.remaining_us == 0)
+        return false;
     info.age_us = kInitial;
     return true;
 }
