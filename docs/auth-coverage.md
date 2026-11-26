@@ -891,7 +891,10 @@ Online administration and deployment remain open in #1072.
 
 The private, offline `rut-consumers check-policy` gate validates candidate
 snapshots against opt-in deployment rules at an explicit Unix-second sample.
-The checks do not publish snapshots or carry request-time state.
+The continuous-validity rule checks each enabled Consumer for gaps between
+enabled credentials over a requested interval, including credential rotations
+scheduled at exact expiry boundaries. `apply-checked` validates the complete
+candidate before publishing its private snapshot.
 See [deployment policy checks](consumer-registry.md#deployment-policy-checks).
 
 ## Configured OAuth client Basic construction

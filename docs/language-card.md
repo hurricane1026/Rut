@@ -4263,7 +4263,9 @@ sample and fails closed if the read is invalid; unbounded-only snapshots preserv
 the old no-clock behavior. The Rut API never accepts request time. Clock changes
 can change window decisions, and no monotonic rollback pin or scheduler is added.
 The offline `rut-consumers check-policy` command evaluates candidate snapshots
-against explicit [deployment rules](consumer-registry.md#deployment-policy-checks).
+against explicit deployment rules. `minimumContinuousValiditySeconds` verifies
+that each enabled Consumer has uninterrupted credential coverage over a
+specified period, including scheduled handoffs. See [deployment rules](consumer-registry.md#deployment-policy-checks).
 
 The offline `rut-consumers` executable validates, previews redacted replacements,
 inspects and transactionally updates immutable private snapshot files; it adds no Rut syntax or automatic

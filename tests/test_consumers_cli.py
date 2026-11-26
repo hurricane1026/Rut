@@ -118,6 +118,34 @@ def test_deployment_policy(tool, root):
           records=[key, dict(parked, consumerId='disabled', enabled=True, groups=[])], ok=True)
     check({each_active: True}, now=200, rule=each_active)
 
+    continuous = 'minimumContinuousValiditySeconds'
+    successor = dict(raw, id='successor', notBefore=200, expiresAt=250)
+    bridge = dict(basic, id='bridge', notBefore=170, expiresAt=210)
+    check({continuous: 80}, ok=True)
+    check({continuous: 81}, rule=continuous)
+    check({continuous: 130}, records=[successor, key], ok=True)
+    check({continuous: 130}, records=[dict(successor, notBefore=201), key], rule=continuous)
+    check({continuous: 130}, records=[successor, bridge, dict(key, expiresAt=175)], ok=True)
+    check({continuous: 130}, records=[successor, dict(key, expiresAt=175),
+                                     dict(bridge, enabled=False)], rule=continuous)
+    check({continuous: 130}, records=[successor, dict(bridge, consumerId='disabled', groups=[]),
+                                     dict(key, expiresAt=175)], rule=continuous)
+    check({continuous: 130}, records=[successor, key], consumers=[alice, enabled_owner],
+          rule=continuous)
+    check({continuous: 1}, records=[key], now=99, rule=continuous)
+    check({continuous: 1}, records=[key], now=200, rule=continuous)
+    check({continuous: 1}, records=[], consumers=[disabled], ok=True)
+    check({continuous: 131}, records=[dict(successor, expiresAt=0), key], ok=True)
+    check({continuous: 131}, records=[dict(successor, notBefore=201, expiresAt=0), key],
+          rule=continuous)
+    max_time = 9223372036854775807
+    check({continuous: max_time - 1}, records=[dict(key, notBefore=0, expiresAt=0)], now=1,
+          ok=True)
+    check({continuous: 1}, records=[dict(key, expiresAt=max_time)], now=max_time - 1, ok=True)
+    check({continuous: 1}, records=[dict(key, expiresAt=0)], now=max_time, rule=continuous)
+    for invalid in (0, -1, True, None, 1.5, '1', max_time + 1):
+        check({continuous: invalid}, rule=continuous)
+
 
 def changes(consumers=(), credentials=(), remove_consumers=(), remove_credentials=()):
     return dict(consumers=list(consumers), credentials=list(credentials),
@@ -175,10 +203,21 @@ def test_apply_checked(tool, root):
     private(patch, changes(credentials=[hashed], remove_credentials=[raw['id']]))
     assert b'requireActiveCredentialForEnabledConsumers' in apply_checked(now=121).stderr
     assert not output.exists()
+    private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
+                         requireExpiryForEnabledCredentials=True,
+                         requireActiveCredentialForEnabledConsumers=True,
+                         minimumContinuousValiditySeconds=10))
+    successor = dict(hashed, id='checked-successor', notBefore=122, expiresAt=130,
+                     secretSha256=hashlib.sha256(b'checked-successor-fixture').hexdigest())
+    private(patch, changes(credentials=[hashed, successor], remove_credentials=[raw['id']]))
+    assert apply_checked().stderr.endswith(b'minimumContinuousValiditySeconds\n')
+    assert not output.exists()
+    successor['notBefore'] = 121
+    private(patch, changes(credentials=[hashed, successor], remove_credentials=[raw['id']]))
     assert not apply_checked(expected=0).stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert json.loads(output.read_bytes()) == dict(version=1, consumers=[consumer],
-                                                  credentials=[hashed])
+                                                  credentials=[hashed, successor])
     assert run(tool, 'check-policy', output, policy, 120).returncode == 0
     published = output.read_bytes()
     apply_checked()
