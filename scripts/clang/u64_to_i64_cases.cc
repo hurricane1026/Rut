@@ -96,28 +96,28 @@ concept CanAdd = requires(Left left, Right right) { left + right; };
 template <typename Left, typename Right>
 concept CanSubtract = requires(Left left, Right right) { left - right; };
 
-using Count = range_int<0, 100>;
-using Step = range_int<1, 3>;
+using Count = range_int<0, 101>;
+using Step = range_int<1, 4>;
 static_assert(sizeof(Count) == sizeof(i64));
-static_assert(__is_same(decltype(Count{} + Step{}), range_int<1, 103>));
-static_assert(__is_same(decltype(Count{} - Step{}), range_int<-3, 99>));
+static_assert(__is_same(decltype(Count{} + Step{}), range_int<1, 104>));
+static_assert(__is_same(decltype(Count{} - Step{}), range_int<-3, 100>));
 static_assert((Count::constant<99>() + Step::constant<3>()).value() == 102);
 static_assert((Count::constant<0>() - Step::constant<3>()).value() == -3);
-static_assert(!CanAdd<range_int<0, INT64_MAX>, Step>);
-static_assert(!CanAdd<range_int<INT64_MIN, 0>, range_int<-1, 0>>);
-static_assert(!CanSubtract<range_int<INT64_MIN, 0>, Step>);
-static_assert(!CanSubtract<range_int<0, INT64_MAX>, range_int<-1, 0>>);
-static_assert(range_int<0, UINT32_MAX>::from_u32(UINT32_MAX).value() == UINT32_MAX);
+static_assert(!CanAdd<range_int<0>, Step>);
+static_assert(!CanAdd<range_int<INT64_MIN, 1>, range_int<-1, 1>>);
+static_assert(!CanSubtract<range_int<INT64_MIN, 1>, Step>);
+static_assert(!CanSubtract<range_int<0>, range_int<-1, 1>>);
+static_assert(range_int(u32{UINT32_MAX}).value() == UINT32_MAX);
 static_assert([] {
     Count count;
-    return Count::try_from_u64(100, count) && !Count::try_from_u64(UINT64_MAX, count) &&
-           !Count::try_from_i64(-1, count) && !Count::try_from_i64(101, count) &&
+    return Count::try_from_u64(100, &count) && !Count::try_from_u64(UINT64_MAX, &count) &&
+           !Count::try_from_i64(-1, &count) && !Count::try_from_i64(101, &count) &&
            count.value() == 100;
 }());
 
 static_assert([] {
     i64 out = -1;
-    return try_u64_to_i64(0, out) && out == 0 && try_u64_to_i64(u64{INT64_MAX}, out) &&
-           out == INT64_MAX && !try_u64_to_i64(u64{INT64_MAX} + 1, out) && out == INT64_MAX &&
-           !try_u64_to_i64(UINT64_MAX, out) && out == INT64_MAX;
+    return try_u64_to_i64(0, &out) && out == 0 && try_u64_to_i64(u64{INT64_MAX}, &out) &&
+           out == INT64_MAX && !try_u64_to_i64(u64{INT64_MAX} + 1, &out) && out == INT64_MAX &&
+           !try_u64_to_i64(UINT64_MAX, &out) && out == INT64_MAX;
 }());

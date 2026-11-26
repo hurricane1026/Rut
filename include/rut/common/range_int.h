@@ -4,62 +4,164 @@
 
 namespace rut {
 
-// An i64 with a closed interval known to callers and to arithmetic templates.
-template <i64 Begin, i64 End>
-class range_int {
-    static_assert(Begin <= End);
+// One past INT64_MAX is a valid bound, even though it is not an i64 value.
+inline constexpr __int128_t kI64ExclusiveEnd = __int128_t{INT64_MAX} + 1;
 
-    template <i64, i64>
+namespace detail {
+
+template <typename T>
+concept RangeSource =
+    __is_same(T, i8) || __is_same(T, u8) || __is_same(T, i16) || __is_same(T, u16) ||
+    __is_same(T, i32) || __is_same(T, u32) || __is_same(T, i64);
+
+template <RangeSource T>
+inline constexpr bool kRangeSourceSigned = static_cast<T>(-1) < T{0};
+
+template <RangeSource T>
+inline constexpr __int128_t kRangeSourceEnd =
+    __int128_t{1} << (sizeof(T) * __CHAR_BIT__ - kRangeSourceSigned<T>);
+
+template <RangeSource T>
+inline constexpr i64 kRangeSourceBegin =
+    kRangeSourceSigned<T> ? static_cast<i64>(-kRangeSourceEnd<T>) : 0;
+
+struct RangeProof {};
+inline constexpr RangeProof kRangeProof{};
+
+}  // namespace detail
+
+// An i64 in the half-open interval [Begin, End). Omitting End leaves the
+// value bounded above only by the underlying i64 type.
+template <i64 Begin, __int128_t End = kI64ExclusiveEnd>
+class range_int {
+    static_assert(Begin < End && End <= kI64ExclusiveEnd);
+
+    template <i64, __int128_t>
     friend class range_int;
 
+    template <u64 Divisor>
+        requires(Divisor > 0 && Divisor <= (u64{1} << 63))
+    friend constexpr auto bounded_remainder(u64 value);
+
+    template <u64 Divisor>
+        requires(Divisor >= 2)
+    friend constexpr auto bounded_quotient(u64 value);
+
     i64 value_ = Begin;
-    explicit constexpr range_int(i64 value) : value_(value) {}
+    constexpr range_int(detail::RangeProof, i64 value) : value_(value) {}
 
 public:
     constexpr range_int() = default;
 
+    template <detail::RangeSource T>
+        requires(Begin <= detail::kRangeSourceBegin<T> && detail::kRangeSourceEnd<T> <= End)
+    explicit constexpr range_int(T value) : value_(value) {}
+
     template <i64 Value>
-        requires(Begin <= Value && Value <= End)
+        requires(Begin <= Value && Value < End)
     static consteval range_int constant() {
-        return range_int(Value);
+        return range_int(detail::kRangeProof, Value);
     }
 
-    template <i64 OtherBegin, i64 OtherEnd>
+    template <i64 OtherBegin, __int128_t OtherEnd>
         requires(Begin <= OtherBegin && OtherEnd <= End)
     constexpr range_int(range_int<OtherBegin, OtherEnd> other) : value_(other.value()) {}
 
-    static constexpr range_int from_u32(u32 value)
-        requires(Begin <= 0 && End >= UINT32_MAX)
+    static constexpr range_int count_leading_zeros(u64 value)
+        requires(Begin <= 0 && End > 64)
     {
-        return range_int(value);
+        return range_int(detail::kRangeProof, value == 0 ? 64 : __builtin_clzll(value));
     }
 
-    [[nodiscard]] static constexpr bool try_from_i64(i64 value, range_int& out) {
-        if (value < Begin || value > End) return false;
-        out.value_ = value;
+    template <typename T, size_t N>
+        requires(Begin >= 0 && End <= N)
+    constexpr T& at(T (&array)[N]) const {
+        return array[value_];
+    }
+
+    template <i64 Factor>
+        requires(Factor >= 0 && static_cast<__int128_t>(Begin) * Factor >= INT64_MIN &&
+                 (End - 1) * Factor <= INT64_MAX)
+    constexpr auto scaled_by() const {
+        return range_int<Begin * Factor, (End - 1) * Factor + 1>(detail::kRangeProof,
+                                                                 value_ * Factor);
+    }
+
+    // The conversion functions require a writable output and write only on success.
+    [[nodiscard]] static constexpr bool try_from_i64(i64 value, range_int* out) {
+        if (value < Begin || value >= End) return false;
+        out->value_ = value;
         return true;
     }
 
-    [[nodiscard]] static constexpr bool try_from_u64(u64 value, range_int& out) {
-        i64 converted;
-        return try_u64_to_i64(value, converted) && try_from_i64(converted, out);
+    [[nodiscard]] static constexpr bool try_from_u64(u64 value, range_int* out) {
+        if constexpr (End <= 0) {
+            return false;
+        } else {
+            constexpr u64 kMax = static_cast<u64>(End - 1);
+            if (value > kMax) return false;
+            if constexpr (Begin > 0) {
+                if (value < static_cast<u64>(Begin)) return false;
+            }
+            return try_u64_to_i64(value, &out->value_);
+        }
     }
 
     constexpr i64 value() const { return value_; }
 
-    template <i64 OtherBegin, i64 OtherEnd>
-        requires(static_cast<__int128_t>(Begin) + OtherBegin >= INT64_MIN &&
-                 static_cast<__int128_t>(End) + OtherEnd <= INT64_MAX)
-    constexpr auto operator+(range_int<OtherBegin, OtherEnd> other) const {
-        return range_int<Begin + OtherBegin, End + OtherEnd>(value_ + other.value());
+    constexpr u64 to_u64() const
+        requires(Begin >= 0)
+    {
+        return static_cast<u64>(value_);
     }
 
-    template <i64 OtherBegin, i64 OtherEnd>
-        requires(static_cast<__int128_t>(Begin) - OtherEnd >= INT64_MIN &&
-                 static_cast<__int128_t>(End) - OtherBegin <= INT64_MAX)
+    // out must point to writable storage. Write only if the ABI type can hold the value.
+    template <typename T>
+        requires(__is_same(T, signed char) || __is_same(T, short) || __is_same(T, int) ||
+                 __is_same(T, long) || __is_same(T, long long))
+    [[nodiscard]] constexpr bool try_to_signed(T* out) const {
+        constexpr auto kLimit = __int128_t{1} << (sizeof(T) * __CHAR_BIT__ - 1);
+        if constexpr (Begin < -kLimit || End > kLimit) {
+            constexpr i64 kMin = static_cast<i64>(-kLimit);
+            constexpr i64 kMax = static_cast<i64>(kLimit - 1);
+            if (value_ < kMin || value_ > kMax) return false;
+        }
+        *out = static_cast<T>(value_);
+        return true;
+    }
+
+    template <i64 OtherBegin, __int128_t OtherEnd>
+        requires(static_cast<__int128_t>(Begin) + OtherBegin >= INT64_MIN &&
+                 End + OtherEnd - 1 <= kI64ExclusiveEnd)
+    constexpr auto operator+(range_int<OtherBegin, OtherEnd> other) const {
+        return range_int<Begin + OtherBegin, End + OtherEnd - 1>(detail::kRangeProof,
+                                                                 value_ + other.value());
+    }
+
+    template <i64 OtherBegin, __int128_t OtherEnd>
+        requires(Begin - (OtherEnd - 1) >= INT64_MIN && End - OtherBegin <= kI64ExclusiveEnd)
     constexpr auto operator-(range_int<OtherBegin, OtherEnd> other) const {
-        return range_int<Begin - OtherEnd, End - OtherBegin>(value_ - other.value());
+        return range_int<Begin - (OtherEnd - 1), End - OtherBegin>(detail::kRangeProof,
+                                                                   value_ - other.value());
     }
 };
+
+// Constructing from a native integer carries exactly the source type's range.
+template <detail::RangeSource T>
+range_int(T) -> range_int<detail::kRangeSourceBegin<T>, detail::kRangeSourceEnd<T>>;
+
+// A nonzero divisor bounds the unsigned remainder to [0, Divisor).
+template <u64 Divisor>
+    requires(Divisor > 0 && Divisor <= (u64{1} << 63))
+constexpr auto bounded_remainder(u64 value) {
+    return range_int<0, Divisor>(detail::kRangeProof, value % Divisor);
+}
+
+// Division by two or more makes even the largest u64 quotient fit in i64.
+template <u64 Divisor>
+    requires(Divisor >= 2)
+constexpr auto bounded_quotient(u64 value) {
+    return range_int<0, UINT64_MAX / Divisor + 1>(detail::kRangeProof, value / Divisor);
+}
 
 }  // namespace rut

@@ -642,8 +642,8 @@ bool parse_positive_unix_seconds(const char* text, i64& cutoff) {
         if (value > (kMax - digit) / 10) return false;
         value = value * 10 + digit;
     }
-    range_int<1, INT64_MAX> seconds;
-    if (!decltype(seconds)::try_from_u64(value, seconds)) return false;
+    range_int<1> seconds;
+    if (!decltype(seconds)::try_from_u64(value, &seconds)) return false;
     cutoff = seconds.value();
     return true;
 }
