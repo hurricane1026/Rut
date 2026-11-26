@@ -895,13 +895,16 @@ and io_uring cancellation drain apply to both modes. Native ABI 28 requires
 recompiling older artifacts. See [tcp-health.rut](../examples/tcp-health.rut).
 
 An upstream can set `connect_timeout: 3s` for each fresh ordinary HTTP/1
-plaintext connect attempt on Linux epoll and io_uring. It accepts whole seconds from 1s through 63s;
-omission retains the global upstream timeout. The one-second wheel may fire a
-tick late and unrelated activity cannot refresh it. On expiry the connection
-is closed, so the client observes EOF without a response; this does not retry.
-Completed connect failures retain their normal retry behavior. TLS, HTTP/2,
-health probes, explicit connect waits and strict timeout-policy owners keep
-their existing timing. Native artifact version 29 requires recompilation.
+plaintext connect attempt on Linux epoll and io_uring. It accepts whole seconds
+from 1s through 63s; omission retains the global upstream timeout. The one-second
+wheel may fire a tick late and unrelated activity cannot refresh it. On expiry
+the connection retries a distinct eligible backend within the connect attempt
+budget when the complete request is buffered and the client is still connected.
+Incomplete requests, disconnected or half-closed clients, exhausted budgets,
+and failed retirement close without a response. Completed connect failures
+retain their normal retry behavior. TLS, HTTP/2, health probes, explicit connect
+waits and strict timeout-policy owners keep their existing timing. Native
+artifact version 29 requires recompilation.
 
 Static backup targets are opt-in: `failover: ["127.0.0.1:9002"]` names a
 nonempty subset of explicit `backends` by normalized IPv4 address and port.

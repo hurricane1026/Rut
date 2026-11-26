@@ -41,6 +41,12 @@ template void h1_tls_detach<NativeReactorEventLoop>(NativeReactorEventLoop*, Con
 template bool h1_tls_dispatch_owner_event<NativeReactorEventLoop>(NativeReactorEventLoop*,
                                                                   Connection&,
                                                                   IoEvent);
+#ifdef __linux__
+template void resume_connect_retries<NativeReactorEventLoop>(NativeReactorEventLoop*, u32);
+template void expire_connect_attempt<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template void resume_connect_retries<IoUringEventLoop>(IoUringEventLoop*, u32);
+template void expire_connect_attempt<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+#endif
 
 bool h2_apply_forward_request_overrides(Connection& conn, const RouteConfig* config) {
     if (conn.target_transform_recorded &&

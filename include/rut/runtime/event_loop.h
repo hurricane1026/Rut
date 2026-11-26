@@ -75,6 +75,7 @@ public:
     // threads accept connections. It is copied into each allocated connection.
     ListenerContext listener_context{};
     Connection* grpc_upstreams = nullptr;
+    bool connect_retry_scan_pending = false;
 
     // An already-completed wait still suspends: never call its continuation
     // recursively from handler dispatch. One node per connection, no allocation.
