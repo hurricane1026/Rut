@@ -1199,9 +1199,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // of alignment padding. The passive response/timeout episode markers add
     // another 8 bytes. The 64-bit completed-request count and its alignment add
     // 8 bytes. The bounded request-body override carries two flags plus one Str
-    // view and alignment padding (+24 bytes), bringing the 64-bit layout to 6304
-    // bytes with or without WebSocket.
-    CHECK_EQ(sizeof(Connection), 6304u);
+    // view and alignment padding (+24 bytes). The parked connect-retry identity
+    // state adds one bounded 64-byte owner block, bringing the 64-bit layout to
+    // 6368 bytes with or without WebSocket.
+    CHECK_EQ(sizeof(Connection), 6368u);
 }
 
 TEST(iouring_idle_trim,
