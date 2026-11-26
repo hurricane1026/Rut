@@ -147,8 +147,8 @@ def main():
         for before, after in [
             ("completed > remaining", "completed >= remaining"),
             ("total <= INT32_MAX", "total <= UINT32_MAX"),
-            ("remaining = static_cast<u32>(static_cast<i64>(remaining) - "
-             "static_cast<i64>(completed));", "remaining = 0;"),
+            ("remaining = static_cast<u32>((range_int(remaining) - kDelta).value());",
+             "remaining = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/send_progress.h", before, after)
             check(compiler, root, overlay, "Partial send violates byte accounting contract",
