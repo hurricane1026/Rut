@@ -1824,6 +1824,17 @@ fixtures. No external dependency or language surface is added. See
 [the supported contract](keycloak-roles.md); this is not live-provider or full
 OIDC/Casdoor conformance.
 
+### Additional Keycloak role combinations
+
+The [Keycloak role example](../examples/keycloak-role-auth.rut) includes
+`requireAnyRealmRole`, `requireAllRealmRoles`, `requireAllRealmRolesWithout`,
+`requireAnyClientRole` and `requireAnyClientRoleWithout`. These policies apply
+after signature, issuer, audience, time and Bearer token-use checks.
+Realm policies use only `realm_access.roles`. Client policies use only the
+selected client under `resource_access`. The selected array is validated in
+full. Role values are exact and case-sensitive. An invalid route selector
+returns 503. Missing, malformed or disallowed roles return 403.
+
 ### Casdoor DefaultJWT claim adapter
 
 The free `casdoor` Rut module supports the pinned Casdoor v4.27.1 DefaultJWT

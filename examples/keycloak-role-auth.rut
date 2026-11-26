@@ -54,4 +54,39 @@ route GET "/subject" {
     return 204
 }
 
+route GET "/realm-any" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAnyRealmRole(access, env("KEYCLOAK_REALM_ROLE"), "auditor")
+    return 204
+}
+
+route GET "/realm-all" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAllRealmRoles(access, env("KEYCLOAK_REALM_ROLE"), "auditor")
+    return 204
+}
+
+route GET "/realm-all-without" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAllRealmRolesWithout(access, env("KEYCLOAK_REALM_ROLE"), "auditor", env("KEYCLOAK_FORBIDDEN_ROLE"))
+    return 204
+}
+
+route GET "/client-any" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAnyClientRole(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"), "write")
+    return 204
+}
+
+route GET "/client-any-without" {
+    let document = auth.jwtDocumentRs256(req.authorization.or(""), env("JWT_RS256_POLICY"))
+    let access = keycloak.requireBearerAccessToken(document)
+    let allowed = keycloak.requireAnyClientRoleWithout(access, env("KEYCLOAK_CLIENT"), env("KEYCLOAK_CLIENT_ROLE"), "write", env("KEYCLOAK_FORBIDDEN_ROLE"))
+    return 204
+}
+
 route "/" { return 404 }

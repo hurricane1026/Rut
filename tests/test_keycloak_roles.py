@@ -203,6 +203,22 @@ def main():
                         actual = request(port, path, credential, version)
                         assert actual == expected, (version, path, claims, actual, expected)
                         checks += 1
+                for realm_roles, client_roles, expected in (
+                    (['auditor'], ['write'], (204, 403, 403, 204, 204)),
+                    (['member', 'auditor'], ['read'], (204, 204, 204, 204, 204)),
+                    (['member', 'auditor', 'suspended'], ['write', 'suspended'],
+                     (204, 204, 403, 204, 403)),
+                    (['member', 'auditor', 7], ['read', 'write', 7], (403, 403, 403, 403, 403)),
+                    (['members'], ['writer'], (403, 403, 403, 403, 403)),
+                ):
+                    claims = dict(valid, realm_access=dict(roles=realm_roles),
+                                  resource_access=dict(orders=dict(roles=client_roles)))
+                    paths = ('/realm-any', '/realm-all', '/realm-all-without',
+                             '/client-any', '/client-any-without')
+                    for path, status in zip(paths, expected):
+                        assert request(port, path, signed(claims), version) == status, (path, claims)
+                        assert request(port, path, signed(dict(claims, typ='Refresh')), version) == 401
+                        checks += 2
                 for party, status in (('storefront', 204), ('Storefront', 401),
                                       ('storefront-extra', 401), ('orders', 401), ('', 401),
                                       (None, 401), (['storefront'], 401), (7, 401)):

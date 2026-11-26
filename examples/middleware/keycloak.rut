@@ -122,3 +122,38 @@ func requireAllClientRoles(_ document: Json, _ client: str, _ first: str, _ seco
     guard clientRolesMatch(document, client, first, second, false) else { respond 403 }
     document
 }
+
+func requireAnyRealmRole(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard roleValid(first) && roleValid(second) else { respond 503 }
+    guard hasRealmRole(document, first) || hasRealmRole(document, second) else { respond 403 }
+    document
+}
+
+func requireAllRealmRoles(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard roleValid(first) && roleValid(second) && first != second else { respond 503 }
+    guard hasRealmRole(document, first) && hasRealmRole(document, second) else { respond 403 }
+    document
+}
+
+func requireAllRealmRolesWithout(_ document: Json, _ first: str, _ second: str, _ forbidden: str) -> Json {
+    guard roleValid(first) && roleValid(second) && roleValid(forbidden) &&
+        first != second && first != forbidden && second != forbidden else { respond 503 }
+    guard hasRealmRole(document, first) && hasRealmRole(document, second) &&
+        !hasRealmRole(document, forbidden) else { respond 403 }
+    document
+}
+
+func requireAnyClientRole(_ document: Json, _ client: str, _ first: str, _ second: str) -> Json {
+    guard clientValid(client) && roleValid(first) && roleValid(second) else { respond 503 }
+    guard hasClientRole(document, client, first) || hasClientRole(document, client, second) else { respond 403 }
+    document
+}
+
+func requireAnyClientRoleWithout(_ document: Json, _ client: str, _ first: str,
+                                 _ second: str, _ forbidden: str) -> Json {
+    guard clientValid(client) && roleValid(first) && roleValid(second) && roleValid(forbidden) &&
+        first != forbidden && second != forbidden else { respond 503 }
+    guard (hasClientRole(document, client, first) || hasClientRole(document, client, second)) &&
+        !hasClientRole(document, client, forbidden) else { respond 403 }
+    document
+}
