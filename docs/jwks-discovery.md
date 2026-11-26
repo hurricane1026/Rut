@@ -15,7 +15,7 @@ remain supported. New fields are all trusted compile/load-time configuration:
   "admitNewKids": true,
   "discoveryCacheSeconds": 30,
   "dnsAddress": "192.0.2.53", "dnsCacheSeconds": 15,
-  "dnsTransport": "tls", "dnsTlsPort": 853,
+  "dnsTransport": "https", "dnsHttpsPath": "/dns-query",
   "dnsTlsServerName": "resolver.example", "dnsTlsCa": "/etc/rut/resolver-ca.pem",
   "allowedAddresses": ["192.0.2.10", "192.0.2.11"],
   "discoveryPath": "/.well-known/openid-configuration",
@@ -86,9 +86,9 @@ By default each attempt resolves the configured TLS hostname through one
 connected nonblocking UDP socket to the configured resolver. No blocking libc
 resolver, system search list, request-selected name or new library is used.
 
-Optional `dnsTransport` selects `"udp"` (default), `"tcp"` or `"tls"`. TCP and
-TLS use the RFC 7766 two-byte length prefix on one connected nonblocking stream
-per query; they never fall back to UDP, and UDP never falls back to a stream.
+Optional `dnsTransport` selects `"udp"` (default), `"tcp"`, `"tls"` or `"https"`.
+TCP and TLS use the RFC 7766 two-byte length prefix on one connected nonblocking
+stream per query. The configured transport applies to the entire attempt.
 All transports share the configured resolver literal, query construction,
 response validation, address allowlist, timeout and retry rules. The client
 reads exactly one framed response and then closes the connection; short,
@@ -99,16 +99,30 @@ optional `dnsTlsPort` defaulting to 853. The resolver certificate is verified
 against that CA and exact server name with the pinned OpenSSL client; the DNS
 profile sends no ALPN and does not fall back to plaintext. `dnsPort` is reserved
 for UDP/TCP and is rejected with TLS. These fields are trusted configuration,
-never request data. Plain TCP is not encrypted, and neither TCP nor TLS is
-claimed to be DNSSEC-authenticated; keep the resolver address trusted and use
-the configured TLS/issuer bounds for the JWKS origin.
+never request data. Plain TCP is unencrypted. The resolver transports rely on
+the configured trust settings, and JWKS origin authentication retains its own
+TLS and issuer checks.
 
-Each query uses a fresh random ID and one IN A or IN AAAA question without EDNS.
+`"https"` selects the bounded DNS-over-HTTPS POST profile. Configure
+`dnsTlsServerName`, `dnsTlsCa`, `dnsHttpsPath` (an explicit origin-form target such
+as `/dns-query`), and optionally `dnsHttpsPort` (default 443). The connection uses
+the literal `dnsAddress` and HTTP/1.1 over verified TLS. `dnsPort` and
+`dnsTlsPort` are rejected in this mode. The request and response use binary
+`application/dns-message` without the TCP length prefix. Rut requires HTTP 200,
+one matching Content-Type, and a correctly framed body of at most 512 bytes.
+Redirects, compression and transport fallback are rejected. Rut sends
+`Cache-Control: no-cache`, deducts a singleton decimal HTTP `Age` from the
+shortest DNS TTL, and rejects expired answers or malformed/duplicate ages.
+The remaining TTL determines eligibility for the existing optional DNS cache.
+See [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484.html).
+
+Each query carries one IN A or IN AAAA question without EDNS. HTTPS uses a zero
+DNS ID, and UDP, TCP and TLS use a fresh random ID.
 Dual-stack attempts require a positive, fully validated reply to both queries
 within the shared DNS and attempt deadlines. The gateway queries AAAA first and
 uses the validated IPv6 candidates before the IPv4 candidates. Both replies
 together may supply at most eight unique addresses. A rejected, empty or missing
-second response prevents the attempt from opening an HTTPS connection. If both
+second response blocks the discovery and JWKS requests. If both
 replies pass, the existing TCP connection failover may continue to the other
 family. The DNS cache uses the shorter TTL measured from the attempt start. The
 response must echo the question and contain 1–8 total answers within 512 bytes.
@@ -323,8 +337,11 @@ a disallowed destination and recovery with rotated keys on both Linux backends.
 TCP and DNS-over-TLS resolver fixtures check RFC 7766 framing, a short frame,
 cache expiry and recovery after a resolver fault on both Linux backends. A
 missing TLS trust file prevents remote activation.
-DNS-over-HTTPS and full OIDC workflows remain
-open under #1077. New-kid admission is opt-in and limited to algorithm-matching
+The DNS-over-HTTPS fixtures cover binary POST, resolver hostname and CA checks,
+chunked and fixed-length bodies, HTTP and DNS rejection, cache expiry and
+recovery with rotated keys for both algorithms. Full OIDC workflows remain open
+under #1077.
+New-kid admission is opt-in and limited to algorithm-matching
 entries from the authenticated set; it does not expand the destination or
 algorithm trust boundary. A discovery origin with a rotating DNS name is not part
 of the separately configured fixed-address profile.

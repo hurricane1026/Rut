@@ -64,6 +64,7 @@ void BoundedJsonResponse::reset(bool authorization) {
     callout_ = false;
     conditional_jwks_ = false;
     retry_after_jwks_ = false;
+    dns_ = false;
     status_ = 0;
     wire_len_ = body_len_ = offset_ = expected_ = 0;
     headers_ = chunked_ = sized_ = false;
@@ -78,6 +79,10 @@ void BoundedJsonResponse::reset_jwks(bool conditional, bool retry_after) {
     reset();
     conditional_jwks_ = conditional;
     retry_after_jwks_ = retry_after;
+}
+void BoundedJsonResponse::reset_dns() {
+    reset();
+    dns_ = true;
 }
 
 bool strong_etag_valid(Str value) {
@@ -101,6 +106,7 @@ BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::consume() {
+    const u32 kBodyLimit = dns_ ? kJwksDnsMessageLimit : kMaxBody;
     if (!headers_) {
         HttpResponseParser parser{};
         ParsedResponse response{};
@@ -112,13 +118,13 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         const bool kNotModified = conditional_jwks_ && response.status_code == 304;
         const bool kThrottled =
             retry_after_jwks_ && (response.status_code == 429 || response.status_code == 503);
-        const bool kNeedsJson = !authorization_ && !kNotModified && !kThrottled;
-        if (parser.header_end > 8192 || (kNeedsJson && response.status_code != 200) ||
+        const bool kNeedsType = !authorization_ && !kNotModified && !kThrottled;
+        if (parser.header_end > 8192 || (kNeedsType && response.status_code != 200) ||
             (callout_ && (response.status_code < 200 || response.status_code > 599)) ||
             (authorization_ && !callout_ && response.status_code != 200 &&
              response.status_code != 401 && response.status_code != 403) ||
             response.headers_truncated || response.content_length_count > 1 ||
-            (response.content_length > kMaxBody &&
+            (response.content_length > kBodyLimit &&
              !((callout_ || conditional_jwks_) && response.status_code == 304)))
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
@@ -142,12 +148,14 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                                header.value.ptr[static_cast<i64>(end) - 1] == '\t'))
                     end = static_cast<u32>(static_cast<i64>(end) - 1);
                 const Str kType{header.value.ptr, end};
-                if (kNeedsJson && !equal_ci(kType, lit_str("application/json")) &&
+                if (dns_ && !equal_ci(header.value, lit_str("application/dns-message")))
+                    return Result::Error;
+                if (kNeedsType && !dns_ && !equal_ci(kType, lit_str("application/json")) &&
                     !equal_ci(kType, lit_str("application/jwk-set+json")))
                     return Result::Error;
             }
         }
-        if ((kNeedsJson && type_count != 1) || (transfer_count && response.has_content_length))
+        if ((kNeedsType && type_count != 1) || (transfer_count && response.has_content_length))
             return Result::Error;
         status_ = response.status_code;
         headers_ = true;
@@ -173,7 +181,8 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                 &consumed,
                 &start,
                 &length);
-            if (static_cast<i64>(length) > static_cast<i64>(kMaxBody) - static_cast<i64>(body_len_))
+            if (static_cast<i64>(length) >
+                static_cast<i64>(kBodyLimit) - static_cast<i64>(body_len_))
                 return Result::Error;
             if (length)
                 __builtin_memcpy(body_ + static_cast<i64>(body_len_),
@@ -191,7 +200,7 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
     }
     const u32 kAvailable =
         static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_));
-    if (static_cast<i64>(kAvailable) > static_cast<i64>(kMaxBody) - static_cast<i64>(body_len_) ||
+    if (static_cast<i64>(kAvailable) > static_cast<i64>(kBodyLimit) - static_cast<i64>(body_len_) ||
         (sized_ &&
          static_cast<i64>(kAvailable) > static_cast<i64>(expected_) - static_cast<i64>(body_len_)))
         return Result::Error;
@@ -292,7 +301,7 @@ bool HttpsFetch::prepare_jwks_request(Str entity_tag) {
     return true;
 }
 bool HttpsFetch::set_jwks_condition(Str entity_tag) {
-    if (!context_.ssl_ctx || state_ == State::Busy || authorization_ ||
+    if (!context_.ssl_ctx || state_ == State::Busy || authorization_ || dns_ ||
         (entity_tag.len && !strong_etag_valid(entity_tag)) || !prepare_jwks_request(entity_tag))
         return false;
     conditional_jwks_ = true;
@@ -312,6 +321,34 @@ bool HttpsFetch::init_callout(const HttpsEndpoint& endpoint, Str request) {
     callout_ = true;
     return true;
 }
+bool HttpsFetch::init_dns(const HttpsEndpoint& endpoint) {
+    if (context_.ssl_ctx || !endpoint.valid() || !init_tls_client_context(context_, endpoint.tls))
+        return false;
+    endpoint_ = endpoint;
+    dns_ = true;
+    return true;
+}
+bool HttpsFetch::set_dns_query(Str query) {
+    if (!dns_ || state_ == State::Busy || !query.ptr || !query.len ||
+        query.len > kJwksDnsMessageLimit)
+        return false;
+    request_len_ = 0;
+    const int kHeaderLength = snprintf(
+        request_,
+        sizeof(request_),
+        "POST %s HTTP/1.1\r\nHost: %s:%u\r\nAccept: application/dns-message\r\n"
+        "Content-Type: application/dns-message\r\nContent-Length: %u\r\n"
+        "Accept-Encoding: identity\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        endpoint_.path,
+        endpoint_.tls.server_name,
+        endpoint_.port,
+        query.len);
+    const i64 kLength = static_cast<i64>(kHeaderLength) + static_cast<i64>(query.len);
+    if (kHeaderLength <= 0 || kLength > static_cast<i64>(sizeof(request_))) return false;
+    __builtin_memcpy(request_ + kHeaderLength, query.ptr, query.len);
+    request_len_ = static_cast<u32>(kLength);
+    return true;
+}
 bool HttpsFetch::set_address(Str address) {
     if (!context_.ssl_ctx || state_ == State::Busy || !address.ptr || !address.len ||
         address.len >= sizeof(endpoint_.address))
@@ -327,10 +364,12 @@ bool HttpsFetch::set_address(Str address) {
 }
 
 bool HttpsFetch::start(u64 monotonic_ms, u32 timeout_ms) {
-    if (!context_.ssl_ctx || state_ == State::Busy || !monotonic_ms || !timeout_ms) return false;
+    if (!context_.ssl_ctx || state_ == State::Busy || !request_len_ || !monotonic_ms || !timeout_ms)
+        return false;
     close();
     response_.reset(authorization_);
     if (callout_) response_.reset_callout();
+    if (dns_) response_.reset_dns();
     if (conditional_jwks_ || retry_after_jwks_)
         response_.reset_jwks(conditional_jwks_, retry_after_jwks_);
     started_ = monotonic_ms;

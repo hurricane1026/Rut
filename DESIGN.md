@@ -11497,8 +11497,10 @@ kid/algorithm inventory remain configuration-owned. The validated terminal
 addresses are tried in answer order after definitive TCP establishment failures.
 Each address runs its own discovery and key exchange within the shared deadline.
 The resolver supports bare IPv4 or IPv6 literals over UDP (default), explicit
-TCP with RFC 7766 length framing, or verified DNS-over-TLS with a configured CA
-and server name; there is no transport fallback. The HTTPS endpoint also supports bare IPv4 or IPv6 literals.
+TCP with RFC 7766 length framing, verified DNS-over-TLS, or verified
+DNS-over-HTTPS via a fixed HTTP/1.1 POST target. Both encrypted modes use a
+configured resolver CA and server name. The transport is selected explicitly
+and has no fallback. The JWKS HTTPS origin also supports bare IPv4 or IPv6 literals.
 The allowlist rejects duplicate binary addresses at configuration load. Optional
 `requireNonEmptyKeys` treats a zero-approved-key refresh as failure, retaining
 last-good keys only within their original maximum age; the default removes keys.

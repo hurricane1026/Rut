@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--admit-new-kids", action="store_true")
     parser.add_argument("--dns-tcp", action="store_true")
     parser.add_argument("--dns-tls", action="store_true")
+    parser.add_argument("--dns-https", action="store_true")
     args = parser.parse_args()
     assert not (args.dual_stack and args.ipv6)
     if args.ipv6 or args.dual_stack:
@@ -66,6 +67,52 @@ def main():
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            assert args.dns_https and self.server is https_dns and self.path == "/resolver"
+            assert self.headers.get_all("Content-Type") == ["application/dns-message"]
+            assert self.headers.get_all("Accept") == ["application/dns-message"]
+            assert self.headers.get_all("Cache-Control") == ["no-cache"]
+            assert self.headers.get_all("Host") == [f"localhost:{self.server.server_port}"]
+            length = int(self.headers["Content-Length"])
+            assert 17 <= length <= 272
+            query = self.rfile.read(length)
+            assert query == b"\0\0\1\0\0\1\0\0\0\0\0\0\x09localhost\0\0\1\0\1"
+            with lock:
+                mode = state["dns"]
+            body = answer(query)
+            if mode == "hold":
+                release_response.wait(timeout=5)
+            if body is None:
+                self.close_connection = True
+                return
+            if mode == "oversized":
+                body = body.ljust(513, b"\0")
+            if mode == "wrong-id":
+                body = b"\0\1" + body[2:]
+            try:
+                self.send_response(302 if mode == "redirect" else 200)
+                if mode == "redirect":
+                    self.send_header("Location", f"https://localhost:{origin.server_port}/keys")
+                media_type = "application/json" if mode == "wrong-type" else "application/dns-message"
+                self.send_header("Content-Type", media_type)
+                if mode == "duplicate-type":
+                    self.send_header("Content-Type", media_type)
+                age = {"stale": "30", "invalid-age": "x"}.get(mode, "29")
+                self.send_header("Age", age)
+                self.send_header("Connection", "close")
+                if mode == "cname-chunked":
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    for part in (body[:13], body[13:]):
+                        self.wfile.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                    self.wfile.write(b"0\r\n\r\n")
+                else:
+                    self.send_header("Content-Length", str(len(body) + (mode == "short")))
+                    self.end_headers()
+                    self.wfile.write(body)
+            except (BrokenPipeError, ConnectionError, ssl.SSLError):
+                pass
 
         def do_GET(self):
             if self.path == "/.well-known/openid-configuration" and args.discovery_dns:
@@ -246,8 +293,15 @@ def main():
 
     dns = None
     tcp_dns = None
+    https_dns = None
     dns_port = 0
-    if args.dns_tcp or args.dns_tls:
+    if args.dns_https:
+        state["dns"] = "cname-chunked"
+        https_dns = origin_type((loopback, 0), Handler)
+        https_dns.socket = context.wrap_socket(https_dns.socket, server_side=True)
+        dns_port = https_dns.server_port
+        resolve = https_dns.serve_forever
+    elif args.dns_tcp or args.dns_tls:
         tcp_dns = socket.socket(family, socket.SOCK_STREAM)
         tcp_dns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_dns.bind((loopback, 0))
@@ -359,6 +413,12 @@ def main():
                 dnsAddress=loopback, dnsTlsPort=dns_port, allowedAddresses=[loopback],
                 dnsTransport="tls", dnsTlsServerName="localhost",
                 dnsTlsCa=str(pathlib.Path(args.testdata) / "localhost_cert.pem"))
+        elif args.dns_https:
+            policy["remoteJwks"].update(
+                dnsAddress=loopback, dnsHttpsPort=dns_port, dnsHttpsPath="/resolver",
+                allowedAddresses=[loopback], dnsTransport="https", dnsTlsServerName="localhost",
+                dnsTlsCa=str(pathlib.Path(args.testdata) / "localhost_cert.pem"),
+                timeoutSeconds=4, dnsTimeoutSeconds=2, retrySeconds=1, dnsCacheSeconds=20)
         elif args.discovery_dns:
             # Reserve the allowlisted first address without listening on it.
             refusing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -513,7 +573,26 @@ def main():
                 # finish just after the tick and miss the first eligible tick.
                 assert expected - .15 <= got <= expected + 1.5, (got, expected)
 
-            if args.dns_tcp or args.dns_tls:
+            if args.dns_https:
+                wait_status(fixture["a"], 200)
+                with lock:
+                    previous_origin = state["requests"]
+                for mode in ("wrong-type", "duplicate-type", "short", "oversized", "wrong-id",
+                             "redirect", "stale", "invalid-age", "rebind"):
+                    with lock:
+                        state["dns"] = mode
+                        previous_dns = state["dnsRequests"]
+                    wait_for_dns_request(previous_dns + 1, limit=8)
+                    with lock:
+                        assert state["requests"] == previous_origin, mode
+                wait_status(fixture["a"], 401)
+                with lock:
+                    state["dns"] = "valid"
+                publish(json.dumps(fixture["second"]["jwks"]).encode())
+                wait_status(fixture["b"], 200)
+                assert request(fixture["a"]) == 401
+                assert h2_request(port, "/", [("authorization", "Bearer " + fixture["b"])])[0] == 200
+            elif args.dns_tcp or args.dns_tls:
                 wait_status(fixture["a"], 200)
                 with lock:
                     state["dns"] = "tcp-short"
@@ -1042,22 +1121,31 @@ def main():
             # retiring the gateway, exercising in-flight refresh cancellation.
             with lock:
                 requests_before_shutdown = state["requests"]
+                dns_before_shutdown = state["dnsRequests"]
                 state["hold"] = True
-            wait_for_origin_request(requests_before_shutdown)
+                if args.dns_https:
+                    state["dns"] = "hold"
+            if args.dns_https:
+                wait_for_dns_request(dns_before_shutdown)
+            else:
+                wait_for_origin_request(requests_before_shutdown)
             process.terminate()
             output = process.communicate(timeout=5)[0].decode(errors="replace")
             assert process.returncode == 0, output
             release_response.set()
             print(f"PASS: {args.algorithm} {args.backend} remote {'access-token ' if args.access_profile else ''}JWKS rotation, empty set, outage, malformed refresh and shutdown")
     finally:
+        cold_release.set()
+        release_response.set()
         if refusing is not None:
             refusing.close()
         dns_stop.set()
         if dns is not None: dns.close()
         if tcp_dns is not None: tcp_dns.close()
+        if https_dns is not None:
+            https_dns.shutdown()
+            https_dns.server_close()
         dns_worker.join(timeout=2)
-        cold_release.set()
-        release_response.set()
         if process is not None and process.poll() is None:
             process.kill()
             process.communicate(timeout=5)

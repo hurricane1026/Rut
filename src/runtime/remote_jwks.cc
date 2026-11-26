@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/platform/socket.h"
+#include <new>
 
 #include <arpa/inet.h>
 #include <openssl/err.h>
@@ -14,6 +15,16 @@
 
 namespace rut {
 namespace {
+HttpsEndpoint dns_https_endpoint(const RemoteJwks& policy) {
+    HttpsEndpoint endpoint;
+    __builtin_memcpy(endpoint.address, policy.dns_address, sizeof(endpoint.address));
+    __builtin_memcpy(endpoint.path, policy.dns_https_path, sizeof(endpoint.path));
+    endpoint.port = policy.dns_https_port;
+    endpoint.tls = policy.dns_tls;
+    endpoint.allow_ipv6 = true;
+    return endpoint;
+}
+
 bool discovery_issuer_valid(const char* value) {
     const u32 length = static_cast<u32>(strlen(value));
     if (length <= 8 || memcmp(value, "https://", 8) != 0) return false;
@@ -113,6 +124,8 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
                 next.dns_transport = DnsTransport::Tcp;
             else if (transport.eq(lit_str("tls")))
                 next.dns_transport = DnsTransport::Tls;
+            else if (transport.eq(lit_str("https")))
+                next.dns_transport = DnsTransport::Https;
             else
                 return false;
             fields |= 262144;
@@ -168,6 +181,10 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             target = next.dns_tls.ca;
             capacity = sizeof(next.dns_tls.ca);
             fields |= 1048576;
+        } else if (kKey.eq(lit_str("dnsHttpsPath"))) {
+            target = next.dns_https_path;
+            capacity = sizeof(next.dns_https_path);
+            fields |= 4194304;
         } else if (kKey.eq(lit_str("discoveryPath"))) {
             target = next.discovery_path;
             capacity = sizeof(next.discovery_path);
@@ -213,6 +230,10 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
             if (value > 65535) return false;
             next.dns_tls_port = static_cast<u16>(value);
             fields |= 2097152;
+        } else if (kKey.eq(lit_str("dnsHttpsPort"))) {
+            if (value > 65535) return false;
+            next.dns_https_port = static_cast<u16>(value);
+            fields |= 8388608;
         } else if (kKey.eq(lit_str("discoveryPort"))) {
             if (value > 65535) return false;
             next.discovery_endpoint.port = static_cast<u16>(value);
@@ -272,7 +293,9 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
     } else {
         next.discovery_endpoint = next.endpoint;
     }
-    if ((fields & (256 | 512 | 4096 | 8192 | 262144 | 524288 | 1048576 | 2097152)) ||
+    constexpr u32 kDnsTrustMask = 524288 | 1048576;
+    constexpr u32 kDnsHttpsMask = 4194304 | 8388608;
+    if ((fields & (256 | 512 | 4096 | 8192 | 262144 | kDnsTrustMask | 2097152 | kDnsHttpsMask)) ||
         next.dns_cache_seconds || next.dns_timeout_seconds) {
         sockaddr_storage resolver{};
         if (!(fields & 256) || !(fields & 512) || !next.allowed_count ||
@@ -298,15 +321,17 @@ bool RemoteJwks::load(json::Document& document, u32 node) {
         }
         if (next.dns_dual_stack && !(has_ipv4 && has_ipv6)) return false;
     }
-    constexpr u32 kDnsTlsMask = 524288 | 1048576 | 2097152;
-    if (fields & kDnsTlsMask) {
-        if (next.dns_transport != DnsTransport::Tls ||
-            (fields & (524288 | 1048576)) != (524288 | 1048576) || (fields & 4096))
-            return false;
+    const bool kDnsHttps = next.dns_transport == DnsTransport::Https;
+    const bool kDnsTls = next.dns_transport == DnsTransport::Tls;
+    if (kDnsTls || kDnsHttps) {
+        if ((fields & kDnsTrustMask) != kDnsTrustMask || (fields & 4096)) return false;
         next.dns_tls.enabled = true;
         if (!valid_upstream_tls(next.dns_tls)) return false;
+    } else if (fields & kDnsTrustMask) {
+        return false;
     }
-    if (next.dns_transport == DnsTransport::Tls && !(fields & kDnsTlsMask)) return false;
+    if ((!kDnsTls && (fields & 2097152)) || (!kDnsHttps && (fields & kDnsHttpsMask))) return false;
+    if (kDnsHttps && !dns_https_endpoint(next).valid()) return false;
     if (next.discovery_cache_seconds > next.max_age_seconds) return false;
     if ((fields & (1024 | 2048 | kDiscoveryOriginMask)) || next.discovery_timeout_seconds ||
         next.conditional_discovery || next.discovery_cache_seconds) {
@@ -516,8 +541,8 @@ bool jwks_dns_answer(Str packet,
                      Str query,
                      const RemoteJwks& configuration,
                      JwksDnsAddresses& addresses) {
-    if (!packet.ptr || !query.ptr || query.len < 17 || query.len > 272 || packet.len > 512 ||
-        packet.len < query.len)
+    if (!packet.ptr || !query.ptr || query.len < 17 || query.len > 272 ||
+        packet.len > kJwksDnsMessageLimit || packet.len < query.len)
         return false;
     const auto* bytes = reinterpret_cast<const u8*>(packet.ptr);
     if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa4f) != 0x8000 ||
@@ -627,6 +652,8 @@ bool jwks_dns_answer(Str packet,
 
 JwksFetch::~JwksFetch() {
     cancel();
+    if (dns_https_) dns_https_->~HttpsFetch();
+    dns_https_arena_.destroy();
     destroy_tls_client_context(dns_tls_context_);
 }
 bool JwksFetch::init(const RemoteJwks& configuration) {
@@ -644,11 +671,25 @@ bool JwksFetch::init(const RemoteJwks& configuration) {
         }
         if (!discovery_.init(endpoint)) return false;
     }
+    if (configuration.dns_transport == RemoteJwks::DnsTransport::Https) {
+        // Allocate the extra HTTP buffers only for activated DoH policies.
+        constexpr i64 kArenaSize =
+            static_cast<i64>(sizeof(HttpsFetch)) + static_cast<i64>(MmapArena::Block::kHeaderSize);
+        if (!dns_https_arena_.init(static_cast<u64>(kArenaSize))) return false;
+        dns_https_ = dns_https_arena_.alloc_t<HttpsFetch>();
+        if (!dns_https_ || !dns_https_->init_dns(dns_https_endpoint(configuration))) {
+            if (dns_https_) dns_https_->~HttpsFetch();
+            dns_https_ = nullptr;
+            dns_https_arena_.destroy();
+            return false;
+        }
+    }
     configuration_ = configuration;
     initialized_ = true;
     return true;
 }
 void JwksFetch::close_dns() {
+    if (dns_https_) dns_https_->cancel();
     if (dns_ssl_) SSL_free(dns_ssl_);
     dns_ssl_ = nullptr;
     if (dns_fd_ >= 0) ::close(dns_fd_);
@@ -800,20 +841,17 @@ bool JwksFetch::start(u64 now,
     query_[query_length_++] = 0;
     query_[query_length_++] = 0;
     query_[query_length_++] = 1;
-    sockaddr_storage resolver{};
-    const u16 kDnsPort = configuration_.dns_transport == RemoteJwks::DnsTransport::Tls
-                             ? configuration_.dns_tls_port
-                             : configuration_.dns_port;
-    const socklen_t length =
-        platform::ip_socket_address(configuration_.dns_address, kDnsPort, resolver);
-    if (!length) return fail();
     if (configuration_.dns_transport == RemoteJwks::DnsTransport::Udp) {
+        sockaddr_storage resolver{};
+        const socklen_t length = platform::ip_socket_address(
+            configuration_.dns_address, configuration_.dns_port, resolver);
+        if (!length) return fail();
         dns_fd_ = platform::datagram_socket(resolver.ss_family);
         if (dns_fd_ < 0 ||
             ::connect(dns_fd_, reinterpret_cast<const sockaddr*>(&resolver), length) != 0)
             return fail();
     }
-    return send_dns_query(configuration_.dns_aaaa || configuration_.dns_dual_stack);
+    return send_dns_query(configuration_.dns_aaaa || configuration_.dns_dual_stack, now);
 }
 bool JwksFetch::begin_dns_tls() {
     auto ssl = create_tls_client_ssl(dns_tls_context_, dns_fd_, configuration_.dns_tls.server_name);
@@ -822,9 +860,14 @@ bool JwksFetch::begin_dns_tls() {
     dns_step_ = DnsStep::TlsHandshake;
     return true;
 }
-bool JwksFetch::send_dns_query(bool aaaa) {
-    if (RAND_bytes(query_, 2) != 1) return fail();
+bool JwksFetch::send_dns_query(bool aaaa, u64 now) {
     query_[static_cast<i64>(query_length_) - 3] = aaaa ? 28 : 1;
+    if (dns_https_) {
+        const Str kQuery{reinterpret_cast<const char*>(query_), query_length_};
+        if (!dns_https_->set_dns_query(kQuery) || !dns_https_->start(now, timeout_)) return fail();
+        return true;
+    }
+    if (RAND_bytes(query_, 2) != 1) return fail();
     if (configuration_.dns_transport == RemoteJwks::DnsTransport::Udp) {
         if (::send(dns_fd_, query_, query_length_, platform::kSendFlags) != query_length_)
             return fail();
@@ -994,19 +1037,47 @@ bool JwksFetch::advance_dns_stream(u64 now) {
     }
     return true;
 }
+bool JwksFetch::advance_dns_https(u64 now) {
+    dns_https_->advance(now);
+    if (dns_https_->state() == State::Busy) return true;
+    JwksDnsAddresses result;
+    const Str kQuery{reinterpret_cast<const char*>(query_), query_length_};
+    ParsedResponse response{};
+    if (dns_https_->state() != State::Done || !dns_https_->headers(response) ||
+        !jwks_dns_answer(dns_https_->body(), kQuery, configuration_, result))
+        return fail();
+
+    // RFC 8484: an HTTP cache's age consumes the DNS record lifetime.
+    bool seen_age = false;
+    for (u32 i = 0; i < response.header_count; ++i) {
+        const auto& header = response.headers[i];
+        if (!http_header_name_eq_ci(header.name.ptr, header.name.len, "Age", 3)) continue;
+        if (seen_age || !header.value.len || header.value.len > 10) return fail();
+        i64 age = 0;
+        for (u32 j = 0; j < header.value.len; ++j) {
+            const char digit = header.value.ptr[j];
+            if (digit < '0' || digit > '9') return fail();
+            age = age * 10 + static_cast<i64>(digit - '0');
+        }
+        if (age && age >= result.ttl_seconds) return fail();
+        result.ttl_seconds = static_cast<u32>(static_cast<i64>(result.ttl_seconds) - age);
+        seen_age = true;
+    }
+    return accept_dns_result(result, now);
+}
 bool JwksFetch::accept_dns_result(const JwksDnsAddresses& result, u64 now) {
     if (configuration_.dns_dual_stack && query_[static_cast<i64>(query_length_) - 3] == 28) {
         addresses_ = result;
-        return send_dns_query(false);
+        return send_dns_query(false, now);
     }
     if (static_cast<i64>(result.count) >
         static_cast<i64>(RemoteJwks::kMaxDnsAddresses) - static_cast<i64>(addresses_.count))
         return fail();
+    if (!addresses_.count || result.ttl_seconds < addresses_.ttl_seconds)
+        addresses_.ttl_seconds = result.ttl_seconds;
     for (u32 i = 0; i < result.count; ++i)
         __builtin_memcpy(
             addresses_.values[addresses_.count++], result.values[i], sizeof(result.values[i]));
-    if (!addresses_.ttl_seconds || result.ttl_seconds < addresses_.ttl_seconds)
-        addresses_.ttl_seconds = result.ttl_seconds;
     close_dns();
     if (configuration_.dns_cache_seconds) {
         const u32 kTtl = addresses_.ttl_seconds < configuration_.dns_cache_seconds
@@ -1063,7 +1134,8 @@ void JwksFetch::advance(u64 now) {
         (void)fail();
         return;
     }
-    const bool kDnsActive = dns_step_ != DnsStep::None || dns_fd_ >= 0;
+    const bool kDnsHttpsActive = dns_https_ && dns_https_->state() == State::Busy;
+    const bool kDnsActive = kDnsHttpsActive || dns_step_ != DnsStep::None || dns_fd_ >= 0;
     if (kDnsActive) {
         u64 dns_timeout_wide = 0;
         u32 kDnsTimeout = 0;
@@ -1076,6 +1148,10 @@ void JwksFetch::advance(u64 now) {
             kDnsTimeout = static_cast<u32>(dns_timeout_wide);
         if (kDnsTimeout && elapsed >= kDnsTimeout) {
             (void)fail();
+            return;
+        }
+        if (kDnsHttpsActive) {
+            (void)advance_dns_https(now);
             return;
         }
         if (dns_step_ != DnsStep::None) {

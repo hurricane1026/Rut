@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/runtime/arena.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/json.h"
 
@@ -8,7 +9,7 @@ namespace rut {
 // Parsing occurs before configuration publication, never from token metadata.
 struct RemoteJwks {
     static constexpr u32 kMaxDnsAddresses = 8;
-    enum class DnsTransport : u8 { Udp, Tcp, Tls };
+    enum class DnsTransport : u8 { Udp, Tcp, Tls, Https };
     HttpsEndpoint endpoint{};
     char dns_address[HttpsEndpoint::kAddressCapacity]{};
     bool dns_aaaa = false;
@@ -17,6 +18,8 @@ struct RemoteJwks {
     UpstreamTlsSpec dns_tls{};
     u16 dns_port = 53;
     u16 dns_tls_port = 853;
+    u16 dns_https_port = 443;
+    char dns_https_path[1024]{};
     u32 dns_cache_seconds = 0;
     u32 dns_timeout_seconds = 0;
     char allowed_addresses[kMaxDnsAddresses][HttpsEndpoint::kAddressCapacity]{};
@@ -106,6 +109,8 @@ private:
     u32 retry_after_seconds_ = 0;
     HttpsFetch keys_;
     HttpsFetch discovery_;
+    MmapArena dns_https_arena_{};
+    HttpsFetch* dns_https_ = nullptr;
     State state_ = State::Idle;
     enum class DnsStep : u8 { None, Connect, TlsHandshake, Write, ReadLength, ReadBody };
     TlsClientContext dns_tls_context_{};
@@ -131,9 +136,10 @@ private:
     u32 address_index_ = 0;
     bool discovering_ = false;
     bool initialized_ = false;
-    bool send_dns_query(bool aaaa);
+    bool send_dns_query(bool aaaa, u64 now);
     bool begin_dns_tls();
     bool advance_dns_stream(u64 now);
+    bool advance_dns_https(u64 now);
     bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
     void close_dns();
     bool begin_http(u64 now);
