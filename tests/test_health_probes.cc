@@ -975,6 +975,12 @@ TEST(health_probe, tls_transport_close_transfers_guard_before_owner_callback) {
 TEST(health_probe, iouring_tls_detach_keeps_guard_until_recv_cancel_drains) {
     ProbeRig<IoUringEventLoop> rig;
     REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_concurrency = 1;
+    up.addr_count = 2;
+    up.addrs[1] = up.addrs[0];
+    up.weights[1] = 1;
+    rig.loop->health_probe_last_issue_ns[0][1] = 0;
     i32 sockets[2];
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets), 0);
     Socket peer;
@@ -1002,8 +1008,12 @@ TEST(health_probe, iouring_tls_detach_keeps_guard_until_recv_cancel_drains) {
     release_health_probe_guard(owner);
     CHECK(probe_in_flight(0, 0));
     CHECK_FALSE(start_health_probe(rig.loop, 0, 0));
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 1));
     REQUIRE(rig.until([&] { return !probe_in_flight(0, 0); }));
     CHECK_EQ(rig.loop->active_count(), 0u);
+    rig.loop->sweep_health_probes();
+    CHECK(probe_in_flight(0, 1));
 }
 
 template <typename Loop>
@@ -1197,4 +1207,64 @@ TEST(health_probe, epoll_unhealthy_cadence_rotates_upstreams_under_small_budget)
         rig.loop->backend.pending_count = 0;
         rig.loop->health_probe_last_issue_ns[expected][0] = 0;
     }
+}
+
+template <typename Loop>
+void concurrency_limit(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_concurrency = 1;
+    up.addr_count = 2;
+    up.addrs[1] = up.addrs[0];
+    up.weights[1] = 1;
+    REQUIRE(rig.owner.config->add_upstream("second", 0x7f000001u, rig.port));
+    REQUIRE(rig.owner.config->set_upstream_health_check(1, "/healthz", 8, 1000, 200));
+    rig.loop->health_probe_last_issue_ns[0][0] = 0;
+    rig.loop->health_probe_last_issue_ns[0][1] = 0;
+    rig.loop->health_probe_deadline_ns[1] = 0;
+    rig.loop->sweep_health_probes();
+    CHECK(probe_in_flight(0, 0));
+    CHECK_FALSE(probe_in_flight(0, 1));
+    CHECK(probe_in_flight(1, 0));
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 1));
+    rig.loop->force_close_all();
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 0) && !probe_in_flight(1, 0); }));
+    rig.loop->sweep_health_probes();
+    CHECK(probe_in_flight(0, 1));
+}
+TEST(health_probe, epoll_concurrency_limit) {
+    concurrency_limit<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_concurrency_limit) {
+    concurrency_limit<IoUringEventLoop>(_tc);
+}
+
+template <typename Loop>
+void concurrency_old_guard(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    auto& up = rig.owner.config->upstreams[0];
+    up.hc_concurrency = 1;
+    up.addr_count = 2;
+    up.addrs[1] = up.addrs[0];
+    up.weights[1] = 1;
+    REQUIRE(start_health_probe(rig.loop, 0, 1));
+    up.addr_count = 1;
+    rig.owner.config->http_cache_identity = http_cache_config_identity();
+    REQUIRE(rig.loop->arm_health_on_config_change());
+    rig.loop->health_probe_last_issue_ns[0][0] = 0;
+    rig.loop->sweep_health_probes();
+    CHECK_FALSE(probe_in_flight(0, 0));
+    rig.loop->force_close_all();
+    REQUIRE(rig.until([&] { return !probe_in_flight(0, 1); }));
+    rig.loop->sweep_health_probes();
+    CHECK(probe_in_flight(0, 0));
+}
+TEST(health_probe, epoll_concurrency_old_guard) {
+    concurrency_old_guard<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_concurrency_old_guard) {
+    concurrency_old_guard<IoUringEventLoop>(_tc);
 }

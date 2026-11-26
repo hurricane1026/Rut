@@ -21,7 +21,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
 
 - HTTP is the default, optionally spelled `type: .http`. Linux epoll and io_uring
   send an HTTP/1.1 GET to the configured path and compare complete response
-  headers against one expected status. HTTP/1 TLS upstreams use the configured
+  headers against the configured expected status or healthy status set. HTTP/1 TLS upstreams use the configured
   CA and server name for the handshake before sending the probe. The path must be origin-form and cannot inject request-line bytes.
 - `type: .tcp` requires an interval and forbids both `path` and `status`.
   A successful TCP connect counts as success; failure or deadline expiry counts
@@ -48,6 +48,11 @@ upstream greeter {
 ## Ownership and resource limits
 
 Each shard/target owns at most one in-flight probe, including cancellation drain.
+`health_check: { ..., concurrency: 1 }` optionally limits an upstream to 1–8
+in-flight probes per shard, also counting cancellation drain. Deferred targets
+remain due and rotate fairly; other upstreams can still issue probes. Omission
+retains existing scheduling. This shard-local bound and its default differ from
+[Kong 3.9.1](https://github.com/Kong/kong/blob/3.9.1/kong/db/schema/entities/upstreams.lua).
 Zero-weight targets receive neither probes nor business traffic. A sweep issues
 at most 32 probes, retains 64 free connection slots for business traffic and, on
 io_uring, reserves 16 SQ entries. Resource/submission failures are local errors,
@@ -69,9 +74,9 @@ address. Drain starts no probes; force-close and shutdown cancel existing ones.
 selection. Positive values count active and passive health over enabled weights
 and reject new forwarding/explicit upstream connections with 503 below the floor.
 Health remains shard-local. This is a bounded data-plane contract, not complete
-Kong health schema or control-plane compatibility. Application-level HTTP/2
-and gRPC probes, separate healthy/unhealthy intervals, and cross-shard
-health synchronization remain outside this implementation.
+Kong health schema or control-plane compatibility. Application-level HTTP/2 and gRPC probes and cross-shard health synchronization
+remain outside this implementation. An optional `unhealthy_interval` sets a
+separate cadence for latched unhealthy targets.
 
 ## Verification
 
@@ -94,6 +99,6 @@ floor and recovery. Existing HTTP live tests remain registered independently.
 macOS execution, production soak/throughput and a live Kong comparison are not
 claimed by these checks.
 
-Native artifact ABI 24 carries probe type and deadline. Old artifacts must be
+Native artifact ABI 36 carries the concurrency bound. Old artifacts must be
 rebuilt; the source/configuration fingerprint additionally prevents mixing
 compiler and server builds from different source trees.

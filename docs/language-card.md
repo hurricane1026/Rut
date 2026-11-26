@@ -855,7 +855,9 @@ errors, malformed responses, unexpected status and timeouts count as failures.
 `success_threshold` restores after that many consecutive successes. Each
 threshold accepts 1–255 and defaults to 1. An opposite result resets the streak,
 and successful business connections cannot restore an actively ejected target.
-Each shard/target has at most one probe, including cancellation drain. Weight 0
+An optional `concurrency: 1` limits in-flight probes for this upstream on each
+shard to 1–8, including cancellation drain. Omission retains the existing
+scheduling behavior. Each shard/target has at most one probe, including cancellation drain. Weight 0
 suppresses probes and forwarding. Probe capacity is bounded and reserved away
 from client slots; drain starts no new probes. Configuration replacement drops
 old results, including reuse of a configuration address. Existing all-ejected
