@@ -564,7 +564,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             mod.upstreams[i].connect_attempts == 0 ||
             mod.upstreams[i].connect_attempts > UpstreamTarget::kMaxBackends ||
             (mod.upstreams[i].connect_timeout_seconds >= TimerWheel::kSlots ||
-             mod.upstreams[i].response_header_timeout_seconds >= TimerWheel::kSlots))
+             mod.upstreams[i].response_header_timeout_seconds >= TimerWheel::kSlots ||
+             mod.upstreams[i].response_body_idle_timeout_seconds >= TimerWheel::kSlots))
             return false;
 
     for (u32 i = 0; i < mod.upstream_count; ++i) {
@@ -632,6 +633,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
             cfg.upstreams[i].connect_timeout_seconds = up.connect_timeout_seconds;
             cfg.upstreams[i].response_header_timeout_seconds = up.response_header_timeout_seconds;
+            cfg.upstreams[i].response_body_idle_timeout_seconds =
+                up.response_body_idle_timeout_seconds;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)
@@ -713,6 +716,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             cfg.upstreams[i].connect_attempts = up.connect_attempts;
             cfg.upstreams[i].connect_timeout_seconds = up.connect_timeout_seconds;
             cfg.upstreams[i].response_header_timeout_seconds = up.response_header_timeout_seconds;
+            cfg.upstreams[i].response_body_idle_timeout_seconds =
+                up.response_body_idle_timeout_seconds;
             if (up.weight_count != 0) {
                 if (up.weight_count > UpstreamTarget::kMaxBackends ||
                     up.weight_count != cfg.upstreams[i].addr_count)

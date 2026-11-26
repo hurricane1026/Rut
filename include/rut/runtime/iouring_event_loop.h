@@ -2355,8 +2355,9 @@ public:
         c.send_armed = false;
         // These are generic terminal Send-dispatch side effects. Apply them
         // before either the TLS continuation or fail-closed error handling.
-        if (!c.h1_tls_transport && !c.response_header_timeout_armed && !c.throttle_paused &&
-            !c.ws_shutdown_deadline_armed &&
+        if (!c.h1_tls_transport && !c.response_header_timeout_armed &&
+            !c.response_body_idle_armed && !c.response_body_idle_expiry_pending &&
+            !c.throttle_paused && !c.ws_shutdown_deadline_armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
             c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -4804,6 +4805,7 @@ public:
             c.pending_ops++;
             c.upstream_recv_armed = true;
             c.upstream_recv_pause_rearm_pending = false;
+            this->arm_response_body_idle(c);
             return true;
         }
         return false;
@@ -7455,6 +7457,23 @@ public:
 
     // Public deterministic seam used by the production run loop and focused
     // same-batch arbitration tests.
+    void resolve_response_body_idle_expiries() {
+        if (!this->response_body_idle_expiries_pending) return;
+        this->response_body_idle_expiries_pending = false;
+        for (u32 i = 0; i < slots_initialized; ++i) {
+            Connection& c = conns[i];
+            if (!c.response_body_idle_expiry_pending) continue;
+            if (c.fd >= 0 && c.upstream_fd >= 0 && c.upstream_recv_armed &&
+                c.response_body_idle_episode == c.upstream_episode &&
+                c.on_upstream_recv == &on_response_body_recvd<Self>) {
+                c.response_body_idle_expiry_pending = false;
+                close_conn(c);
+            } else {
+                this->disarm_response_body_idle(c);
+            }
+        }
+    }
+
     void dispatch_batch(const IoEvent* events, u32 count) {
         study_turn_started_ns = monotonic_ns();
         study_inside_cq = true;
@@ -7499,6 +7518,7 @@ public:
         u64 cq_phase_ns = 0;
         if (!__builtin_sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
             __builtin_add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
+        resolve_response_body_idle_expiries();
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {
@@ -8533,6 +8553,12 @@ public:
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
                     timer.tick([this](Connection* c) {
+                        if (c->response_body_idle_armed) {
+                            c->response_body_idle_armed = false;
+                            c->response_body_idle_expiry_pending = true;
+                            this->response_body_idle_expiries_pending = true;
+                            return;
+                        }
                         if (c->is_health_probe && c->upstream_fd >= 0) {
                             record_probe_if_current(this, *c, false, monotonic_us());
                             free_health_probe(*c);
@@ -9159,8 +9185,10 @@ public:
                         // @throttle-paused connection's byte-rate-window timer back
                         // to the keepalive timeout.
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
-                            !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.connect_retry_pending && !conn.ws_shutdown_deadline_armed &&
+                            !conn.response_body_idle_armed &&
+                            !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
+                            !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::ExpiryPending &&

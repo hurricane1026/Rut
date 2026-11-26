@@ -965,7 +965,9 @@ public:
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
-        return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+        const bool submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
+        if (submitted) this->arm_response_body_idle(c);
+        return submitted;
     }
 
     void pause_upstream_recv_impl(Connection& c) {
@@ -1174,6 +1176,23 @@ public:
         if (!is_draining()) this->sweep_health_probes();
     }
 
+    void resolve_response_body_idle_expiries() {
+        if (!this->response_body_idle_expiries_pending) return;
+        this->response_body_idle_expiries_pending = false;
+        for (u32 i = 0; i < connection_capacity; ++i) {
+            Connection& c = conns[i];
+            if (!c.response_body_idle_expiry_pending) continue;
+            if (c.fd >= 0 && c.upstream_fd >= 0 &&
+                c.response_body_idle_episode == c.upstream_episode &&
+                c.on_upstream_recv == &on_response_body_recvd<EpollEventLoop>) {
+                c.response_body_idle_expiry_pending = false;
+                this->close_conn(c);
+            } else {
+                this->disarm_response_body_idle(c);
+            }
+        }
+    }
+
     void dispatch_batch(const IoEvent* events, u32 count) {
         const bool was_dispatching = dispatching_event_batch_;
         dispatching_event_batch_ = true;
@@ -1182,6 +1201,7 @@ public:
         }
         dispatching_event_batch_ = was_dispatching;
         if (!dispatching_event_batch_) {
+            resolve_response_body_idle_expiries();
             resume_connect_retries(this, connection_capacity);
             drain_deferred_health_sweep();
         }
@@ -1239,6 +1259,12 @@ public:
                         // reload frees without recording against the wrong
                         // upstream; free_probe_conn clears probe_in_flight so the
                         // next sweep re-probes.
+                        if (c->response_body_idle_armed) {
+                            c->response_body_idle_armed = false;
+                            c->response_body_idle_expiry_pending = true;
+                            this->response_body_idle_expiries_pending = true;
+                            return;
+                        }
                         if (c->is_health_probe) {
                             record_probe_if_current(this, *c, /*healthy=*/false, monotonic_us());
                             free_probe_conn(this, *c);
@@ -1347,8 +1373,10 @@ public:
                     }
                     if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
-                            !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.connect_retry_pending && !conn.ws_shutdown_deadline_armed)
+                            !conn.response_body_idle_armed &&
+                            !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
+                            !conn.ws_shutdown_deadline_armed)
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
@@ -1371,9 +1399,10 @@ public:
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
-                            !conn.throttle_paused && conn.connect_timeout_episode == 0 &&
-                            !conn.connect_retry_pending && !conn.is_health_probe &&
-                            !conn.ws_shutdown_deadline_armed) {
+                            !conn.response_body_idle_armed &&
+                            !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
+                            !conn.is_health_probe && !conn.ws_shutdown_deadline_armed) {
                             timer.refresh(
                                 &conn,
                                 conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1
@@ -1417,7 +1446,10 @@ public:
                 // These io_uring-only cases are inert for epoll too.
                 break;
         }
-        if (!dispatching_event_batch_) drain_deferred_health_sweep();
+        if (!dispatching_event_batch_) {
+            resolve_response_body_idle_expiries();
+            drain_deferred_health_sweep();
+        }
     }
 
 private:

@@ -1186,6 +1186,104 @@ TEST(health_probe, epoll_unhealthy_cadence_rotates_under_small_budget) {
     }
 }
 
+static bool body_idle_loopback_pair(i32 pair[2]) {
+    Socket listener;
+    listener.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener.fd < 0) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ||
+        listen(listener.fd, 1))
+        return false;
+    socklen_t len = sizeof(addr);
+    if (getsockname(listener.fd, reinterpret_cast<sockaddr*>(&addr), &len)) return false;
+    pair[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (pair[0] < 0 || connect(pair[0], reinterpret_cast<sockaddr*>(&addr), sizeof(addr)))
+        return false;
+    pair[1] = accept4(listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (pair[1] < 0) return false;
+    const int flags = fcntl(pair[0], F_GETFL, 0);
+    return flags >= 0 && fcntl(pair[0], F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+template <typename Loop>
+void body_idle_same_batch_progress(rut::test::TestCase* _tc, bool timeout_first) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.owner.config->upstreams[0].response_body_idle_timeout_seconds = 1;
+    i32 upstream[2]{-1, -1};
+    i32 downstream[2]{-1, -1};
+    REQUIRE(body_idle_loopback_pair(upstream));
+    REQUIRE(body_idle_loopback_pair(downstream));
+    Socket origin;
+    origin.fd = upstream[1];
+    Socket client;
+    client.fd = downstream[1];
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_attempts = 1;
+    c->req_start_us = monotonic_us();
+    c->request_upload_complete = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 2;
+    c->proxy_resp_started = true;
+    c->upstream_recv_slice = rig.loop->pool.alloc();
+    REQUIRE(c->upstream_recv_slice);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, SlicePool::kSliceSize);
+    c->set_slots(nullptr, nullptr, &on_response_body_recvd<Loop>, nullptr);
+    rig.loop->epoch_enter();
+    if constexpr (requires { rig.loop->backend.active_upstream_episode[c->id]; })
+        rig.loop->backend.active_upstream_episode[c->id] = c->upstream_episode;
+    REQUIRE(rig.loop->submit_recv_upstream(*c));
+    REQUIRE(c->response_body_idle_armed);
+    REQUIRE_EQ(send(origin.fd, "x", 1, MSG_NOSIGNAL), 1);
+    IoEvent events[32]{};
+    IoEvent progress{};
+    bool found = false;
+    for (u32 tries = 0; tries < 3000 && !found; ++tries) {
+        const u32 count =
+            rig.loop->backend.wait(events, 32, rig.loop->conns, rig.initialized_slots(), 0);
+        for (u32 i = 0; i < count; ++i) {
+            if (events[i].type == IoEventType::UpstreamRecv && events[i].conn_id == c->id &&
+                events[i].result > 0) {
+                progress = events[i];
+                found = true;
+            } else if (events[i].type != IoEventType::Timeout) {
+                rig.loop->dispatch(events[i]);
+            }
+        }
+        if (!found) usleep(1000);
+    }
+    REQUIRE(found);
+    rig.loop->timer.remove(c);
+    rig.loop->timer.add(c, 0);
+    const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+    const IoEvent batch[] = {timeout_first ? tick : progress, timeout_first ? progress : tick};
+    rig.loop->dispatch_batch(batch, 2);
+    CHECK(c->fd >= 0);
+    CHECK_FALSE(c->response_body_idle_expiry_pending);
+    char byte = 0;
+    REQUIRE(rig.until([&] { return recv(client.fd, &byte, 1, MSG_DONTWAIT) == 1; }));
+    CHECK_EQ(byte, 'x');
+}
+
+TEST(body_idle, epoll_same_batch_progress) {
+    body_idle_same_batch_progress<EpollEventLoop>(_tc, true);
+    body_idle_same_batch_progress<EpollEventLoop>(_tc, false);
+}
+TEST(body_idle, iouring_same_batch_progress) {
+    body_idle_same_batch_progress<IoUringEventLoop>(_tc, true);
+    body_idle_same_batch_progress<IoUringEventLoop>(_tc, false);
+}
+
 TEST(health_probe, epoll_unhealthy_cadence_rotates_upstreams_under_small_budget) {
     ProbeRig<EpollEventLoop> rig;
     REQUIRE(rig.init());
