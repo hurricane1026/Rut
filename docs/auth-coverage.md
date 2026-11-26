@@ -23,6 +23,7 @@ whether a competing open-source edition includes them.
 | ACL / Consumer restriction | Exact Consumer allow/deny and two-Consumer allow union; static two-Consumer/two-group membership, single/either/both-group allow, single/either-group deny, deny-before-allow composition and unknown-Consumer default deny; bounded verified-Consumer role to tenant/resource/action rules with exact matching, deny override and default deny; optional exact static Consumer-ID-to-route-tenant binding before RBAC | Larger policy sets, intrinsic tenant claims/ownership and storage isolation, administrative membership management; bounded registry snapshots can replace memberships |
 | JWE | Pending | Algorithm/enc allowlists, authenticated decryption, nested JWT policy, malformed/truncated ciphertext vectors |
 | JWT signing / re-signing | Fixed-profile five-claim HS256 issuance through native and Rut/JIT APIs; six-claim `jti` variant through native and Rut/JIT; static two-ID revocation helper | General token re-signing, arbitrary claims, non-HS256 signing, live or durable revocation |
+| Replicated webhook replay | Opt-in primary and replica AOF confirmation with controlled recovery and promotion of an acknowledging replica. Both Linux backends are tested. | Automatic failover and stale-replica fencing |
 | Forward auth / OPA | **Bounded profiles implemented** | `forwardAuthHeader` retains its specialized fixed HTTPS prefix. Composable `httpCall` plus `opa.request`, `opa.requireAllow` and `opa.requireDecision` implement OPA Data API Boolean/structured authorization, explicit JSON input and decision-field consumption, fail-closed deny/undefined/error handling and native-loaded two-backend TLS tests. See [OPA authorization](opa-authorization.md). Embedded Rego, automatic arbitrary field mapping and distributed decision caching are outside this slice. |
 | OAuth2 introspection | **Bounded per-request profile implemented** | Authenticated RFC 7662 form POST over fixed verified HTTPS; exact active/expiry/audience and optional time/scope/token-type/subject checks; explicit single/either/both and bounded any/all/deny scope policy, exact principal binding and optional token age/lifetime limits; no cached allows, so remote revocation applies on the next request; fail-closed outage and native-loaded two-backend HTTP/1 + HTTP/2 tests. See [the contract](oauth-introspection.md). Cached refresh/invalidation, discovery and other endpoint client-auth methods remain outside this profile. |
 | OAuth2 revocation client | **Bounded AS-client profile implemented** | Configured authenticated RFC 7009 form POST, status-only 200 acknowledgement, identical known/unknown-token client success, no-store logout response and end-to-end introspection refusal after AS revocation. See [the contract](oauth-revocation.md). AS ownership/durability/replication, public clients and local JWT invalidation remain separate. |
@@ -1708,8 +1709,11 @@ JIT tests also cover the 1024/1025-byte bound. See
   cleanup-before-allow, two-shard concurrency and gateway-restart retention. The
   opt-in local-AOF profile adds a confirmed
   WAITAOF barrier and pinned Redis SIGKILL/restart/TTL tests with verified TLS on
-  both backends. Eviction policy, volume integrity and replicated failover remain
-  deployment responsibilities (#1076).
+  both backends. The opt-in replicated profile waits for primary and replica
+  AOF fsync. Its pinned Redis fixture verifies fail-closed replica loss and
+  controlled recovery/promotion of the acknowledging replica on both backends.
+  Eviction policy, volume integrity and automatic failover remain deployment
+  responsibilities (#1076).
   Static current/previous key rotation preserves existing durable claims for
   Standard Webhooks and fixed POST signed requests across provider key changes
   and single-instance Redis recovery.

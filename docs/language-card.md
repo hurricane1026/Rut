@@ -4320,8 +4320,13 @@ RESET/release must succeed before status 1/0. A missing acknowledgement,
 unsupported command, disabled AOF, malformed reply or cleanup failure returns -1;
 it never falls back to the ordinary claim. The bounded pipeline fits sixteen I/O
 operations and leaves uncertain claims in place. See the
-[local persistence/recovery contract](auth-replay.md#confirmed-local-aof-profile);
-replica failover and exactly-once work are separate.
+[local persistence/recovery contract](auth-replay.md#confirmed-local-aof-profile).
+
+`redisReplayReplicatedClaim(connection, username, password, database, key) -> i32`
+uses `WAITAOF 1 1 1500` and requires one local AOF confirmation plus at least
+one replica confirmation. It uses the same 1/0/-1 statuses and waits for the
+same acknowledged cleanup. The endpoint is the configured writable primary.
+See [primary and replica AOF replay claims](auth-replay.md#confirmed-primary-and-replica-aof-profile).
 
 
 ### Explicit Consumer query/form sources

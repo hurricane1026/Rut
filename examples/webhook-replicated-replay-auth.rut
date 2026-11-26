@@ -1,0 +1,24 @@
+// Require the Redis primary and at least one replica to confirm AOF fsync.
+import "clients/redis-client.rut"
+import Crypto
+import "middleware/replay.rut"
+
+listen :8080
+
+route POST "/webhook" {
+    let id = req.uniqueHeader("webhook-id").or("")
+    guard env("STANDARD_WEBHOOK_RAW_KEY") != "" else { return 503 }
+    guard Crypto.webhookValid(id,
+        req.uniqueHeader("webhook-timestamp").or(""),
+        req.uniqueHeader("webhook-signature").or(""), req.body,
+        env("STANDARD_WEBHOOK_RAW_KEY")) else { return 401 }
+    guard let key = replay.key(env("REPLAY_NAMESPACE"), id) else { return 503 }
+    let opening = tcp(env("REDIS_ENDPOINT"), 1000)
+    guard let connection = opening else { return 503 }
+    let status = redisReplayReplicatedClaim(connection, Bytes(env("REDIS_USERNAME")),
+        Bytes(env("REDIS_PASSWORD")), parseInt(env("REDIS_DATABASE")).or(-1), key)
+    let admitted = replay.requireClaimed(status)
+    return response(204, headers: {"Cache-Control": "no-store"})
+}
+
+route "/" { return 404 }

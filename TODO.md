@@ -964,6 +964,8 @@ M5 的消息日志适配等待 M7 对应协议；M9 的资源模型设计可提�
   online scheduling/revocation publication.
 - [ ] Replay-store failover and fencing beyond verified persistence profiles.
 - [ ] Online signing-key refresh and replicated key coordination remain separate.
+- [x] Primary and one-replica AOF replay claims, with fail-closed loss of
+  redundancy and controlled recovery/promotion of the acknowledging replica.
 
 Contracts and executable coverage: `docs/consumer-registry.md`,
 `docs/auth-replay.md`, `docs/jwks-discovery.md`. These checkboxes describe the named
