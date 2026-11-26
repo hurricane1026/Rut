@@ -127,11 +127,25 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
             return out;
         }
     }
+    constexpr u64 kMaxHandlerTimeUs = u64{INT64_MAX};
+    if (driver.initial_virtual_time_us > kMaxHandlerTimeUs) {
+        out.harness.outcome = Outcome::Invalid;
+        copy_detail(out.harness.detail,
+                    sizeof(out.harness.detail),
+                    "initial virtual time exceeds the signed handler clock");
+        return out;
+    }
     environment.now_us = driver.initial_virtual_time_us;
-    const u64 virtual_deadline_us =
-        harness.limits.max_virtual_time_us > ~u64{0} - driver.initial_virtual_time_us
-            ? ~u64{0}
-            : driver.initial_virtual_time_us + harness.limits.max_virtual_time_us;
+    u64 virtual_deadline_us;
+    if (__builtin_add_overflow(
+            environment.now_us, harness.limits.max_virtual_time_us, &virtual_deadline_us)) {
+        out.harness.outcome = Outcome::Invalid;
+        copy_detail(out.harness.detail,
+                    sizeof(out.harness.detail),
+                    "virtual deadline overflows the handler clock");
+        return out;
+    }
+    if (virtual_deadline_us > kMaxHandlerTimeUs) virtual_deadline_us = kMaxHandlerTimeUs;
     const u64* previous_virtual_clock = rut_helper_time_set_virtual_clock(&environment.now_us);
     struct VirtualClockRestore {
         const u64* previous;

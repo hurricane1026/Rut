@@ -702,14 +702,14 @@ inline bool verify_valid_block_target(const Function& fn, BlockId target) {
 }
 
 inline u8 verify_yield_timer_kind(const Instruction& inst) {
-    const u64 packed = static_cast<u64>(inst.imm.i64_val);
+    const i64 packed = inst.imm.i64_val;
     u8 kind = static_cast<u8>((packed >> 48) & 0xffu);
     if (kind == 0) kind = static_cast<u8>(jit::YieldKind::Timer);
     return kind;
 }
 
 inline u16 verify_yield_timer_next_state(const Instruction& inst) {
-    const u64 packed = static_cast<u64>(inst.imm.i64_val);
+    const i64 packed = inst.imm.i64_val;
     return static_cast<u16>((packed >> 32) & 0xffffu);
 }
 

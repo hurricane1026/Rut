@@ -292,6 +292,24 @@ TEST(RirBuilder, Terminators) {
     ctx.destroy();
 }
 
+TEST(RirBuilder, RetStatusPacksOnlyTheThreeLowFields) {
+    TestContext ctx;
+    REQUIRE(ctx.init());
+
+    Builder b;
+    b.init(&ctx.mod);
+    auto* fn = V(b.create_function(lit("test_fn"), lit("/test"), 1));
+    auto entry = V(b.create_block(fn, lit("entry")));
+    b.set_insert_point(fn, entry);
+    VOK(b.emit_ret_status(0x12345, {}, 0xffff, 0xffff));
+
+    auto* term = fn->entry()->terminator();
+    REQUIRE(term != nullptr);
+    CHECK_EQ(term->imm.i64_val, 0x0000ffffffff2345LL);
+
+    ctx.destroy();
+}
+
 TEST(RirBuilder, YieldCountsStates) {
     TestContext ctx;
     REQUIRE(ctx.init());

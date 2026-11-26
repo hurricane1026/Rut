@@ -1226,6 +1226,17 @@ TEST(harness_scenario, handler_clock_and_timer_deadline_start_at_scenario_time) 
     REQUIRE(timer_result.has_terminal);
     CHECK_EQ(timer_result.terminal.status_code, 205);
     CHECK_EQ(timer_result.harness.virtual_time_us, 128456u);
+
+    scenario.now_us = u64{INT64_MAX};
+    const auto limit_result = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(limit_result.harness.outcome, harness::Outcome::Failed);
+    REQUIRE(limit_result.harness.has_reached_limit);
+    CHECK_EQ(limit_result.harness.reached_limit, harness::LimitKind::VirtualDuration);
+    CHECK_EQ(limit_result.harness.virtual_time_us, u64{INT64_MAX});
+
+    ++scenario.now_us;
+    const auto invalid_clock = harness::drive_scenario(scenario, spec);
+    CHECK_EQ(invalid_clock.harness.outcome, harness::Outcome::Invalid);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/common/route_host.h"
 #include "rut/common/types.h"  // RUT_ENABLE_WEBSOCKET gate for the websocket() builder
 #include "rut/common/upstream_health.h"
@@ -950,7 +951,7 @@ struct Parser {
         return parse_expr();
     }
 
-    FrontendResult<AstExpr> parse_primary_atom() {
+    [[nodiscard]] FrontendResult<AstExpr> parse_primary_atom() {
         if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
             peek().type == TokenType::StringLit) {
             const Token kStart = cur();
@@ -1184,18 +1185,22 @@ struct Parser {
                     if (!amount) return core::make_unexpected(amount.error());
                     pos++;  // consume the unit
                     expr.kind = AstExprKind::ByteSizeLit;
-                    expr.int_value = static_cast<i64>(amount.value() * mult);
+                    if (__builtin_mul_overflow(amount.value(), mult, &expr.int_value))
+                        return frontend_error(
+                            FrontendError::InvalidInteger, span_from(tok), tok.text);
                     expr.span = Span{tok.start, unit.end, tok.line, tok.col};
                     return expr;
                 }
             }
             // Literals accumulate to i64 (cap INT64_MAX); analyze types the
             // result I32 when it fits i32, else I64 (oversized auto-widening).
-            auto parsed_value = parse_integer_literal(tok, 0x7fffffffffffffffull);
+            auto parsed_value = parse_integer_literal(tok, u64{INT64_MAX});
             if (!parsed_value) return core::make_unexpected(parsed_value.error());
-            const i64 kValue = static_cast<i64>(parsed_value.value());
+            range_int<0> value;
+            if (!decltype(value)::try_from_u64(parsed_value.value(), &value))
+                return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
             expr.kind = AstExprKind::IntLit;
-            expr.int_value = kValue;
+            expr.int_value = value.value();
             expr.span = span_from(tok);
             return expr;
         }
@@ -1606,7 +1611,7 @@ struct Parser {
     // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
     // caller has consumed the `-`; cur() must be the IntLit. The magnitude
     // accumulates in u64 with cap 2^63 so INT64_MIN is representable;
-    // `(i64)(0ull - mag)` wraps correctly for mag == 2^63.
+    // Form its two's-complement bits in u64, including INT64_MIN.
     FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
         const Token tok = cur();
         pos++;
@@ -1615,7 +1620,7 @@ struct Parser {
         const u64 kMag = parsed_mag.value();
         AstExpr lit{};
         lit.kind = AstExprKind::IntLit;
-        lit.int_value = static_cast<i64>(0ull - kMag);
+        lit.int_value = __builtin_bit_cast(i64, u64{0} - kMag);
         lit.span = Span{minus.start, tok.end, minus.line, minus.col};
         return lit;
     }

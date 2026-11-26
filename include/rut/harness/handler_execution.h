@@ -56,7 +56,7 @@ struct HandlerExecutionResult {
     u32 consumed_events = 0;
 };
 
-HandlerExecutionResult drive_handler_deterministically(const DeterministicHandlerSpec& driver,
-                                                       const HarnessSpec& harness);
+[[nodiscard]] HandlerExecutionResult drive_handler_deterministically(
+    const DeterministicHandlerSpec& driver, const HarnessSpec& harness);
 
 }  // namespace rut::harness

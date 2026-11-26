@@ -3736,7 +3736,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                 status = LLVMBuildAnd(
                     c.builder, status, LLVMConstInt(c.i32_ty, 0xffffu, 0), "code.mask");
             } else {
-                const u64 packed = static_cast<u64>(inst.imm.i64_val);
+                const i64 packed = inst.imm.i64_val;
                 const u32 status_u = static_cast<u32>(packed & 0xffffu);
                 body_idx_imm = static_cast<u32>((packed >> 16) & 0xffffu);
                 headers_idx_imm = static_cast<u32>((packed >> 32) & 0xffffu);
@@ -3940,7 +3940,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
         case rir::Opcode::YieldTimer: {
-            const u64 packed = static_cast<u64>(inst.imm.i64_val);
+            const i64 packed = inst.imm.i64_val;
             const u32 payload = static_cast<u32>(packed & 0xffffffffu);
             const u16 next_state = static_cast<u16>((packed >> 32) & 0xffffu);
             u8 yield_kind = static_cast<u8>((packed >> 48) & 0xffu);
