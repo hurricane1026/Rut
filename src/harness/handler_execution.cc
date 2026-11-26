@@ -1,5 +1,6 @@
 #include "rut/harness/handler_execution.h"
 
+#include "rut/common/range_int.h"
 #include "rut/jit/runtime_helpers.h"
 
 namespace rut::harness {
@@ -128,24 +129,28 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         }
     }
     constexpr u64 kMaxHandlerTimeUs = u64{INT64_MAX};
-    if (driver.initial_virtual_time_us > kMaxHandlerTimeUs) {
+    range_int<0> initial_time;
+    if (!decltype(initial_time)::try_from_u64(driver.initial_virtual_time_us, &initial_time)) {
         out.harness.outcome = Outcome::Invalid;
         copy_detail(out.harness.detail,
                     sizeof(out.harness.detail),
                     "initial virtual time exceeds the signed handler clock");
         return out;
     }
-    environment.now_us = driver.initial_virtual_time_us;
-    u64 virtual_deadline_us;
-    if (__builtin_add_overflow(
-            environment.now_us, harness.limits.max_virtual_time_us, &virtual_deadline_us)) {
+    environment.now_us = initial_time.to_u64();
+    // The signed start time and the full u64 duration fit together in i128.
+    const __int128_t requested_deadline =
+        static_cast<__int128_t>(initial_time.value()) + harness.limits.max_virtual_time_us;
+    if (requested_deadline > UINT64_MAX) {
         out.harness.outcome = Outcome::Invalid;
         copy_detail(out.harness.detail,
                     sizeof(out.harness.detail),
                     "virtual deadline overflows the handler clock");
         return out;
     }
-    if (virtual_deadline_us > kMaxHandlerTimeUs) virtual_deadline_us = kMaxHandlerTimeUs;
+    const u64 virtual_deadline_us = requested_deadline > kMaxHandlerTimeUs
+                                        ? kMaxHandlerTimeUs
+                                        : static_cast<u64>(requested_deadline);
     const u64* previous_virtual_clock = rut_helper_time_set_virtual_clock(&environment.now_us);
     struct VirtualClockRestore {
         const u64* previous;

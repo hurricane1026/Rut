@@ -244,6 +244,24 @@ TEST(harness_handler, advances_virtual_time_for_timer_yield) {
     CHECK_EQ(result.harness.virtual_time_us, 25000u);
 }
 
+TEST(harness_handler, deadline_input_must_fit_before_applying_the_signed_clock_cap) {
+    harness::HandlerExecution execution{};
+    execution.init(&immediate_handler, nullptr, nullptr, 0);
+    harness::DeterministicHandlerSpec driver{execution};
+    driver.initial_virtual_time_us = 1;
+    harness::HarnessSpec spec{};
+    spec.layer = harness::ExecutionLayer::Handler;
+    spec.limits.max_virtual_time_us = UINT64_MAX - 1;
+
+    const auto at_limit = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(at_limit.harness.outcome, harness::Outcome::Passed);
+
+    spec.limits.max_virtual_time_us = UINT64_MAX;
+    const auto over_limit = harness::drive_handler_deterministically(driver, spec);
+    CHECK_EQ(over_limit.harness.outcome, harness::Outcome::Invalid);
+    CHECK_FALSE(over_limit.has_terminal);
+}
+
 TEST(harness_handler, rejects_wrong_execution_layer) {
     harness::HandlerExecution execution{};
     execution.init(&immediate_handler, nullptr, nullptr, 0);
