@@ -153,3 +153,41 @@ func requireMtls(_ document: Json) -> Json {
     guard jwtCertificateBound(document, req.tlsClientCertSha256.or("")) else { respond denied }
     document
 }
+
+// Compare optional metadata only after the authenticated AS reply passed requireActive.
+func requireMetadataValue(_ document: Json, _ field: str, _ expected: str) -> Json {
+    guard expected != "" && Bytes(expected).count <= 256 else { respond 503 }
+    let denied = response(401)
+    denied.set("WWW-Authenticate", "Bearer error=\"invalid_token\"")
+    guard json.string(json.get(document, field).or(document)).or("") == expected else { respond denied }
+    document
+}
+
+// Exact comparison for AS profiles that publish a configured token_type spelling.
+func requireTokenType(_ document: Json, _ expected: str) -> Json {
+    requireMetadataValue(document, "/token_type", expected)
+}
+
+// A username is an additional restriction, while /sub remains the stable identifier.
+func requireUsername(_ document: Json, _ expected: str) -> Json {
+    requireMetadataValue(document, "/username", expected)
+}
+
+func requireSessionId(_ document: Json, _ expected: str) -> Json {
+    requireMetadataValue(document, "/sid", expected)
+}
+
+func requireTokenId(_ document: Json, _ expected: str) -> Json {
+    requireMetadataValue(document, "/jti", expected)
+}
+
+// Require a nonempty scope grant with no privileges outside the route allowlist.
+func requireOnlyScopes(_ document: Json, _ allowed: str) -> Json {
+    guard let policy = json.value({scope: allowed}) else { respond 503 }
+    guard jwtHasAnyScope(policy, allowed) else { respond 503 }
+    let denied = response(403)
+    denied.set("WWW-Authenticate", "Bearer error=\"insufficient_scope\"")
+    let grant = json.string(json.get(document, "/scope").or(document)).or("")
+    guard jwtHasAllScopes(policy, grant) else { respond denied }
+    document
+}
