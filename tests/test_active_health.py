@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--backend', choices=('epoll', 'io_uring'), required=True)
     args = parser.parse_args()
     lock = threading.Lock()
-    healthy = {'A': True, 'B': True, 'disabled': True}
+    healthy = {'A': 200, 'B': 200, 'disabled': 200}
     probes = Counter()
     hosts = {}
     data_requests = Counter()
@@ -35,7 +35,7 @@ def main():
                         if self.path in ('/healthz', '/strict-healthz'):
                             probes[self.path, label] += 1
                             hosts[self.path, label] = self.headers.get('Host')
-                            code = 200 if healthy[label] else 500
+                            code = healthy[label]
                         else:
                             data_requests[label] += 1
                             code = 200  # Health endpoint controls eligibility independently.
@@ -62,14 +62,15 @@ def main():
 upstream api {{
     backends: [{entries}]
     health_check: {{
-        path: "/healthz", interval: 1s, status: 200,
+        path: "/healthz", interval: 1s, healthy_statuses: [200, 302],
         failure_threshold: 2, success_threshold: 3
     }}
 }}
 upstream strict {{
     backends: [{entries}]
     minimum_healthy_weight_percent: 51
-    health_check: {{ path: "/strict-healthz", interval: 1s, status: 200, host: "Probe.Example:8080",
+    health_check: {{ path: "/strict-healthz", interval: 1s, host: "Probe.Example:8080",
+                     healthy_statuses: [200, 302],
                     failure_threshold: 2, success_threshold: 3 }}
 }}
 route GET "/" {{ return forward(api, load_balance: .roundRobin) }}
@@ -138,7 +139,7 @@ route GET "/strict-connect" {{
                 assert initial == {(200, b'A'): 10, (200, b'B'): 10}, (protocol, initial)
                 assert h1('/strict-connect')[0] == 204
                 with lock:
-                    healthy['A'] = False
+                    healthy['A'] = 301
                     before = probes[normal_a]
                     strict_before = probes[strict_a]
                 wait_for(lambda: probes[normal_a] > before, 'unhealthy endpoint was not probed')
@@ -154,7 +155,7 @@ route GET "/strict-connect" {{
                 assert sum(data_requests.values()) == before_requests
                 with lock:
                     assert probes[strict_a] - strict_before >= 2, (protocol, probes)
-                    healthy['A'] = True
+                    healthy['A'] = 302
                     before = probes[normal_a]
                     strict_before = probes[strict_a]
                 wait_for(lambda: probes[normal_a] > before, 'disabled-by-health target was not reprobed')

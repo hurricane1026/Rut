@@ -11808,7 +11808,10 @@ and [verification and compatibility boundaries](docs/passive-health.md).
 
 `health_check.type` is a contextual configuration field, with `.http` (the
 existing default) and `.tcp` variants. TCP mode forbids HTTP path/status fields;
-HTTP mode retains its existing path/status contract. Both modes carry optional
+HTTP mode accepts either the existing scalar status (100–599, default 200) or a
+nonempty unique set of status codes (200–599). A fixed bitset records exact
+membership; a gap is a failure. TCP rejects both status forms. Native ABI 32
+encodes the set and validates canonical unused bits. Both modes carry optional
 whole-second `timeout` (1–60 seconds) through AST, HIR, MIR, RIR and owned
 RouteConfig/native metadata (ABI 25). Omission retains the host loop timeout.
 No language keyword, library dependency, handler operation or suspension is added.

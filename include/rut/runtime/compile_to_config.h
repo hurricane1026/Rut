@@ -633,7 +633,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_thresholds,
                                                    up.hc_type,
                                                    up.hc_timeout_ms,
-                                                   up.hc_host))
+                                                   up.hc_host,
+                                                   up.hc_healthy_statuses))
                     return false;
             }
         }
@@ -694,7 +695,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_thresholds,
                                                    up.hc_type,
                                                    up.hc_timeout_ms,
-                                                   up.hc_host))
+                                                   up.hc_host,
+                                                   up.hc_healthy_statuses))
                     return false;
             }
         }

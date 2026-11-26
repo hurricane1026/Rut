@@ -22946,6 +22946,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_path = item.upstream.hc_path_lit;
         up.hc_interval_ms = item.upstream.hc_interval_ms;
         up.hc_expected_status = item.upstream.hc_expected_status;
+        up.hc_healthy_statuses = item.upstream.hc_healthy_statuses;
         up.hc_thresholds = item.upstream.hc_thresholds;
         up.passive_health = item.upstream.passive_health;
         up.hc_type = item.upstream.hc_type;

@@ -50514,3 +50514,42 @@ TEST(frontend, tcp_health_rejects_host_authority) {
         CHECK_FALSE(parse_file_heap(tokens.value()));
     }
 }
+
+TEST(frontend, active_healthy_statuses_exact_and_invalid) {
+    const char* valid =
+        "upstream api { health_check: { path: \"/h\" interval: 1s healthy_statuses: [200, 302, "
+        "599] } }";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    const auto& up = ast->items[0].upstream;
+    CHECK_EQ(up.hc_expected_status, 0u);
+    CHECK(up.hc_healthy_statuses.contains(200));
+    CHECK(up.hc_healthy_statuses.contains(302));
+    CHECK(up.hc_healthy_statuses.contains(599));
+    CHECK_FALSE(up.hc_healthy_statuses.contains(301));
+    auto tcp_tokens = lex(
+        lit("upstream api { health_check: { type: .tcp interval: 1s healthy_statuses: [200] } }"));
+    REQUIRE(tcp_tokens);
+    CHECK_FALSE(parse_file_heap(tcp_tokens.value()));
+    for (const char* value : {"healthy_statuses: []",
+                              "healthy_statuses: [200, 200]",
+                              "healthy_statuses: [199]",
+                              "healthy_statuses: [600]",
+                              "healthy_statuses: [4294967496]",
+                              "healthy_statuses: [200 302]",
+                              "healthy_statuses: [200] status: 200",
+                              "status: 200 healthy_statuses: [200]",
+                              "healthy_statuses: [200] healthy_statuses: [302]",
+                              "type: .tcp healthy_statuses: [200]"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/h\" interval: 1s %s } }",
+                 value);
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        CHECK_FALSE(parse_file_heap(lexed.value()));
+    }
+}

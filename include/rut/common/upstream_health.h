@@ -63,18 +63,36 @@ struct PassiveHealthPolicy {
         return healthy && (!http_failures || unhealthy);
     }
 };
+struct ActiveHealthStatuses {
+    static constexpr u32 kWords = 7;  // final HTTP statuses 200..599
+    u64 words[kWords]{};
+
+    constexpr bool contains(u16 status) const {
+        return status >= 200 && status <= 599 &&
+               (words[(static_cast<i64>(status) - 200) / 64] &
+                (u64{1} << ((static_cast<i64>(status) - 200) % 64))) != 0;
+    }
+    constexpr bool empty() const {
+        for (u32 i = 0; i < kWords; ++i)
+            if (words[i]) return false;
+        return true;
+    }
+    constexpr bool valid() const { return (words[6] >> 16) == 0; }
+};
 inline bool valid_active_health_check(ActiveHealthType type,
                                       const char* path,
                                       u32 path_len,
                                       u32 interval_ms,
                                       u16 status,
                                       ActiveHealthThresholds thresholds,
-                                      u32 timeout_ms) {
+                                      u32 timeout_ms,
+                                      ActiveHealthStatuses statuses = {}) {
     if (!interval_ms || !thresholds.valid() || !valid_active_health_timeout(timeout_ms))
         return false;
-    if (type == ActiveHealthType::Tcp) return path_len == 0 && status == 0;
-    if (type != ActiveHealthType::Http || !path || !path_len || path[0] != '/' || status < 100 ||
-        status > 599)
+    if (!statuses.valid()) return false;
+    if (type == ActiveHealthType::Tcp) return path_len == 0 && status == 0 && statuses.empty();
+    if (type != ActiveHealthType::Http || !path || !path_len || path[0] != '/' ||
+        (statuses.empty() ? (status < 100 || status > 599) : status != 0))
         return false;
     for (u32 i = 0; i < path_len; ++i) {
         const auto kCh = static_cast<unsigned char>(path[i]);

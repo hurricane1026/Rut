@@ -1595,6 +1595,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_path = module.upstreams[i].hc_path;
         up.hc_interval_ms = module.upstreams[i].hc_interval_ms;
         up.hc_expected_status = module.upstreams[i].hc_expected_status;
+        up.hc_healthy_statuses = module.upstreams[i].hc_healthy_statuses;
         up.hc_thresholds = module.upstreams[i].hc_thresholds;
         up.passive_health = module.upstreams[i].passive_health;
         up.hc_type = module.upstreams[i].hc_type;

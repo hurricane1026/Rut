@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--backend', required=True)
     args = parser.parse_args()
     fixtures = Path(__file__).resolve().parent / 'fixtures'
-    state = {'stall': False, 'probes': 0, 'hosts': set(), 'sni': set()}
+    state = {'stall': False, 'probes': 0, 'hosts': set(), 'sni': set(), 'status': 302}
 
     class Origin(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -27,7 +27,7 @@ def main():
             if state['stall']:
                 time.sleep(4)
             try:
-                self.send_response(200)
+                self.send_response(state['status'])
                 self.send_header('Content-Length', '0')
                 self.end_headers()
             except OSError:
@@ -54,7 +54,8 @@ def main():
                 f'upstream {name} {{ host: "127.0.0.1", port: {origin.server_port}, '
                 f'tls: {{ ca: "{ca}", server_name: "{hostname}" }}, '
                 'minimum_healthy_weight_percent: 100, '
-                f'health_check: {{ path: "/health", interval: 1s, timeout: 1s{host} }} }}\n'
+                f'health_check: {{ path: "/health", interval: 1s, timeout: 1s{host}, '
+                'healthy_statuses: [200, 302] } }\n'
                 f'route GET "/{name}" {{ let ev = wait(upstream({name}).connect()) '
                 'if ev.ok { return 204 } else { return 502 } }\n'
                 for name, ca, hostname, host in [('good', cert, 'localhost', ', host: "Tenant.Example:8443"'),
@@ -102,6 +103,10 @@ def main():
                 assert 'localhost' in state['sni']
                 wait(lambda: request('/wrong') == 503 and request('/untrusted') == 503,
                      'invalid TLS identity or trust did not eject')
+                state['status'] = 301
+                wait(lambda: request('/good') == 503, 'status gap did not eject')
+                state['status'] = 200
+                wait(lambda: request('/good') == 204, 'listed status did not recover')
                 state['stall'] = True
                 wait(lambda: request('/good') == 503, 'stalled probe did not time out')
                 state['stall'] = False

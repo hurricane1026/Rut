@@ -4516,6 +4516,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].hc_path = {hc_path_buf, src_hc_path.len};
         out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
+        out.module.upstreams[i].hc_healthy_statuses = mir.upstreams[i].hc_healthy_statuses;
         out.module.upstreams[i].hc_thresholds = mir.upstreams[i].hc_thresholds;
         out.module.upstreams[i].passive_health = mir.upstreams[i].passive_health;
         out.module.upstreams[i].hc_type = mir.upstreams[i].hc_type;
