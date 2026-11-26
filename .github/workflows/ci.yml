@@ -288,6 +288,11 @@ jobs:
             audit_args+=(--overflow-base "$OVERFLOW_BASE")
           fi
           python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 "${audit_args[@]}"
+      - name: Compare range_int code generation with native integers
+        if: matrix.compiler == 'clang' && matrix.shard == 1
+        run: |
+          python3 scripts/check_range_int_codegen.py --compiler clang++-22
+          python3 scripts/check_range_int_codegen.py --compiler clang++-22 --target aarch64-linux-gnu
       - uses: actions/upload-artifact@v4
         if: always() && matrix.compiler == 'clang' && matrix.shard == 1
         with:
