@@ -493,9 +493,13 @@ inline void build_probe_request(Connection& conn, const UpstreamTarget& target, 
         buf.write(reinterpret_cast<const u8*>("/"), 1);
     static const char kProto[] = " HTTP/1.1\r\nHost: ";
     buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
-    char host[24];
-    const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
-    buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    if (target.hc_host_len) {
+        buf.write(reinterpret_cast<const u8*>(target.hc_host), target.hc_host_len);
+    } else {
+        char host[24];
+        const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
+        buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+    }
     static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
     buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
 }
@@ -547,6 +551,9 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     const UpstreamTarget& target = config->upstreams[upstream_idx];
     if (backend_idx >= target.addr_count || target.weights[backend_idx] == 0 ||
         !target.hc_enabled || target.hc_path_len >= sizeof(target.hc_path) ||
+        target.hc_host_len >= sizeof(target.hc_host) ||
+        (target.hc_host_len && (!active_health_host_valid({target.hc_host, target.hc_host_len}) ||
+                                target.hc_type == ActiveHealthType::Tcp)) ||
         !valid_active_health_check(target.hc_type,
                                    target.hc_path,
                                    target.hc_path_len,

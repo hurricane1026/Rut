@@ -4496,6 +4496,15 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].tls = mir.upstreams[i].tls;
         out.module.upstreams[i].http2 = mir.upstreams[i].http2;
         out.module.upstreams[i].hc_enabled = mir.upstreams[i].hc_enabled;
+        const Str src_hc_host = mir.upstreams[i].hc_host;
+        char* hc_host_buf = nullptr;
+        if (src_hc_host.len > 0) {
+            hc_host_buf = out.module.arena->alloc_array<char>(src_hc_host.len);
+            if (!hc_host_buf)
+                return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+            for (u32 k = 0; k < src_hc_host.len; k++) hc_host_buf[k] = src_hc_host.ptr[k];
+        }
+        out.module.upstreams[i].hc_host = {hc_host_buf, src_hc_host.len};
         const Str src_hc_path = mir.upstreams[i].hc_path;
         char* hc_path_buf = nullptr;
         if (src_hc_path.len > 0) {

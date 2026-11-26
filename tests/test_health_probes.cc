@@ -714,6 +714,10 @@ TEST(health_probe, public_health_api_rejects_ambiguous_or_invalid_modes) {
         cfg.set_upstream_health_check(0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 61000));
     CHECK_FALSE(cfg.set_upstream_health_check(
         0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 0xffffffffu));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, nullptr, 0, 1000, 0, {}, ActiveHealthType::Tcp, 0, {"tenant", 6}));
+    CHECK_FALSE(cfg.set_upstream_health_check(
+        0, "/", 1, 1000, 200, {}, ActiveHealthType::Http, 0, {"bad,host", 8}));
     CHECK_FALSE(cfg.upstreams[0].hc_enabled);
     cfg.upstreams[0].http2 = true;
     CHECK_FALSE(cfg.set_upstream_health_check(0, "/", 1, 1000, 200));

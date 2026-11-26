@@ -640,6 +640,7 @@ struct Module {
         UpstreamTlsSpec tls{};
         bool http2 = false;
         bool hc_enabled = false;
+        Str hc_host{};
         Str hc_path;
         u32 hc_interval_ms = 0;
         u16 hc_expected_status = 200;
