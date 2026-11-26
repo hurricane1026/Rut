@@ -1,6 +1,8 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
+#include "rut/runtime/parse_integer.h"
 
 namespace rut::json {
 
@@ -576,49 +578,7 @@ struct Document {
 };
 
 inline bool integer(Str s, i64& out) {
-    u32 p = 0;
-    const bool negative = s.len && s.ptr[0] == '-';
-    if (negative) ++p;
-    if (p == s.len) return false;
-    u64 n = 0;
-    const u64 limit = negative ? (u64(1) << 63) : ((u64(1) << 63) - 1);
-    for (; p < s.len; ++p) {
-        if (s.ptr[p] < '0' || s.ptr[p] > '9') return false;
-        const u32 d = static_cast<u32>(s.ptr[p] - '0');
-        if (n > limit / 10 || (n == limit / 10 && static_cast<u64>(d) > limit % 10)) return false;
-        // The range check above makes the ordinary path fit in i64. Handle
-        // exactly INT64_MIN's magnitude separately, since it has no positive
-        // signed counterpart for the widened multiplication.
-        if (negative && n == limit / 10 && static_cast<u64>(d) == limit % 10)
-            n = limit;
-        else
-            n = static_cast<u64>(static_cast<i64>(n) * 10 + static_cast<i64>(d));
-    }
-    if (!negative) {
-        out = static_cast<i64>(n);
-    } else if (n == (u64{1} << 63)) {
-        out = -9223372036854775807LL - 1;
-    } else {
-        out = -static_cast<i64>(n);
-    }
-    return true;
-}
-inline void write_integer(i64 value, Writer& w) {
-    u64 n = 0;
-    if (value == (-9223372036854775807LL - 1))
-        n = u64{1} << 63;
-    else if (value < 0)
-        n = static_cast<u64>(-value);
-    else
-        n = static_cast<u64>(value);
-    char digits[20];
-    u32 count = 0;
-    do {
-        digits[count++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(n % 10));
-        n /= 10;
-    } while (n);
-    if (value < 0) w.put('-');
-    while (count) w.put(digits[--count]);
+    return s.ptr && s.len && s.ptr[0] != '+' && parse_integer<true>(s, out);
 }
 
 // All updates are immutable. Set/remove require an existing RFC 6901 target;
@@ -628,7 +588,8 @@ inline bool apply(
     view = {};
     if (op == Op::Quote) return quote(a, w);
     if (op == Op::Integer) {
-        write_integer(number, w);
+        char buffer[kFormatIntegerBufferSize];
+        w.text(format_integer(number, buffer));
         return w.ok;
     }
     if (op == Op::Boolean) {

@@ -174,6 +174,31 @@ TEST(json, resource_limits_fail_closed) {
     CHECK(!w.ok);
 }
 
+TEST(json, integer_encoding_covers_signed_limits) {
+    json::Document document;
+    const struct {
+        i64 value;
+        Str text;
+    } cases[] = {{INT64_MIN, lit_str("-9223372036854775808")},
+                 {INT64_MAX, lit_str("9223372036854775807")},
+                 {0, lit_str("0")},
+                 {-9, lit_str("-9")}};
+    for (const auto& c : cases) {
+        char buffer[kFormatIntegerBufferSize];
+        json::Writer writer{buffer, c.text.len};
+        Str view;
+        i64 scalar = 0;
+        REQUIRE(
+            json::apply(document, json::Op::Integer, {}, {}, {}, c.value, writer, view, scalar));
+        CHECK((Str{buffer, writer.len}.eq(c.text)));
+
+        json::Writer short_writer{buffer, c.text.len - 1};
+        CHECK_FALSE(json::apply(
+            document, json::Op::Integer, {}, {}, {}, c.value, short_writer, view, scalar));
+        CHECK_EQ(short_writer.len, 0u);
+    }
+}
+
 TEST(json, scalar_conversions_reject_coercion_and_integer_overflow) {
     json::Document document;
     char output[json::kMaxBytes];

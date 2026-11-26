@@ -204,7 +204,7 @@ NetReply NetClientWorker::call(u32 owner,
             }
             reply.status = NetReply::kPending;
             const auto remaining =
-                static_cast<u64>(static_cast<i64>(s.timeout) - static_cast<i64>(elapsed));
+                static_cast<__int128_t>(s.timeout) - static_cast<__int128_t>(elapsed);
             reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
             return reply;
         }

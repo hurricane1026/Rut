@@ -508,7 +508,7 @@ TEST_F(MetricsLoopF, 502_response_records_correct_status) {
 TEST(prometheus, counters_and_histogram) {
     ShardMetrics m;
     m.init();
-    m.requests_total = 5;
+    m.requests_total = UINT64_MAX;
     m.connections_active = 3;
     m.rate_limit_attempts_total = 8;
     m.rate_limit_rejected_total = 2;
@@ -526,7 +526,7 @@ TEST(prometheus, counters_and_histogram) {
     const u32 n = format_prometheus(m, buf, sizeof(buf));
     REQUIRE(n > 0);
     CHECK(prom_contains(buf, n, "# TYPE rut_requests_total counter\n"));
-    CHECK(prom_contains(buf, n, "rut_requests_total 5\n"));
+    CHECK(prom_contains(buf, n, "rut_requests_total 18446744073709551615\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_attempts_total 8\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_rejected_reason_total{reason=\"budget\"} 1\n"));
     CHECK(prom_contains(buf, n, "rut_rate_limit_rules_evaluated_total{scope=\"shard\"} 3\n"));

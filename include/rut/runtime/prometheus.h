@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/metrics.h"
 
 // Prometheus text-format (v0.0.4) serializer for aggregated ShardMetrics.
@@ -38,7 +39,7 @@ struct Writer {
             return;
         }
         while (v > 0) {
-            tmp[n++] = static_cast<char>('0' + static_cast<i64>(v % 10));
+            tmp[n++] = last_decimal_digit(v);
             v /= 10;
         }
         while (n > 0) ch(tmp[--n]);
@@ -51,7 +52,7 @@ struct Writer {
         // Zero-pad to 6 digits.
         char d[6];
         for (i32 i = 5; i >= 0; i--) {
-            d[i] = static_cast<char>('0' + static_cast<i64>(frac % 10));
+            d[i] = last_decimal_digit(frac);
             frac /= 10;
         }
         for (u32 i = 0; i < 6; i++) ch(d[i]);

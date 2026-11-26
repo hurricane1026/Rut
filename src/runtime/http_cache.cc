@@ -1,6 +1,8 @@
 #include "rut/runtime/http_cache.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 
 #include <time.h>
@@ -149,7 +151,7 @@ bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
 }
 // IMF-fixdate only. Unsupported/invalid date syntax is a cache bypass, never a
 // guess at freshness. No locale, timezone configuration or wall-clock mutation.
-bool http_date(Str value, u64& seconds) {
+bool http_date(Str value, i64* seconds) {
     if (value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' || value.ptr[7] != ' ' ||
         value.ptr[11] != ' ' || value.ptr[16] != ' ' || value.ptr[19] != ':' ||
         value.ptr[22] != ':' || value.ptr[25] != ' ' || !Str{value.ptr + 26, 3}.eq(lit_str("GMT")))
@@ -181,29 +183,32 @@ bool http_date(Str value, u64& seconds) {
     if (day == 0 || static_cast<i64>(day) > static_cast<i64>(kDays[month]) +
                                                 static_cast<i64>(month == 1 && kLeap ? 1u : 0u))
         return false;
-    auto leap_years = [](u32 y) -> u64 {
-        return static_cast<u64>(static_cast<i64>(y / 4) - static_cast<i64>(y / 100) +
-                                static_cast<i64>(y / 400));
+    constexpr auto kEpochYear = range_int<1970, 1971>::constant<1970>();
+    constexpr auto kOne = range_int<1, 2>::constant<1>();
+    auto leap_years = [](u32 y) {
+        return range_int(y / 4) - range_int(y / 100) + range_int(y / 400);
     };
-    i64 days = (static_cast<i64>(year) - 1970) * 365 +
-               static_cast<i64>(leap_years(static_cast<u32>(static_cast<i64>(year) - 1))) -
-               static_cast<i64>(leap_years(1969));
-    for (u32 i = 0; i < month; ++i)
-        days += static_cast<i64>(kDays[i]) + static_cast<i64>(i == 1 && kLeap ? 1u : 0u);
-    days += static_cast<i64>(day) - 1;
+    const auto last_year = range_int(year) - kOne;
+    const auto year_days = (range_int(year) - kEpochYear).scaled_by<365>();
+    const auto leap_days = leap_years(static_cast<u32>(last_year.value())) - leap_years(1969u);
+    u32 days_in_year = day - 1;
+    for (u32 i = 0; i < month; ++i) days_in_year += kDays[i] + (i == 1 && kLeap ? 1u : 0u);
+    const auto days = year_days + leap_days + range_int(days_in_year);
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
-    if (!Str{p, 3}.eq({kWeekdays + static_cast<i64>((days + 4) % 7) * 3, 3})) return false;
-    seconds = static_cast<u64>(days * 86400 + static_cast<i64>(hour) * 3600 +
-                               static_cast<i64>(minute) * 60 + static_cast<i64>(second));
+    if (!Str{p, 3}.eq({kWeekdays + ((days.value() + 4) % 7) * 3, 3})) return false;
+    *seconds = (days.scaled_by<86400>() + range_int(hour).scaled_by<3600>() +
+                range_int(minute).scaled_by<60>() + range_int(second))
+                   .value();
     return true;
 }
 struct ResponseInfo {
     ParsedResponse parsed;
     u32 header_end = 0;
-    u32 ttl = 0;
+    u64 remaining_us = 0;
     u64 age_us = 0;
 };
-bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, ResponseInfo& info) {
+[[nodiscard]] bool response_info(
+    const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, ResponseInfo& info) {
     HttpResponseParser parser;
     parser.reset();
     info.parsed.reset();
@@ -220,7 +225,7 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     Controls policy;
     u32 age = 0;
     bool age_seen = false, date_seen = false, expires_seen = false;
-    u64 date = 0, expires = 0;
+    i64 date = 0, expires = 0;
     for (u32 i = 0; i < response.header_count; ++i) {
         const auto& header = response.headers[i];
         const Str name = header.name;
@@ -239,10 +244,10 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
             if (age_seen || !decimal(header.value, age)) return false;
             age_seen = true;
         } else if (eq(name, "date", 4)) {
-            if (date_seen || !http_date(header.value, date)) return false;
+            if (date_seen || !http_date(header.value, &date)) return false;
             date_seen = true;
         } else if (eq(name, "expires", 7)) {
-            if (expires_seen || !http_date(header.value, expires)) return false;
+            if (expires_seen || !http_date(header.value, &expires)) return false;
             expires_seen = true;
         } else if (eq(name, "set-cookie", 10) || eq(name, "set-cookie2", 11) ||
                    eq(name, "content-range", 13) || eq(name, "trailer", 7) ||
@@ -259,21 +264,21 @@ bool response_info(const u8* wire, u32 length, u32 cap, u64 wall, u64 delay, Res
     else if (policy.max_seen)
         lifetime = policy.max_age;
     else if (expires_seen)
-        lifetime = expires > date
-                       ? static_cast<u64>(static_cast<i64>(expires) - static_cast<i64>(date))
-                       : 0;
-    if (lifetime > cap) lifetime = cap;
-    const u64 kDateUs = static_cast<u64>(static_cast<i64>(date) * 1000000);
+        lifetime = expires > date ? static_cast<u64>(expires - date) : 0;
+    const u32 ttl = lifetime > cap ? cap : static_cast<u32>(lifetime);
+    const u64 kLifetimeUs = range_int(ttl).scaled_by<1'000'000>().to_u64();
+    const u64 kDateUs = static_cast<u64>(date) * 1000000;
     u64 kApparent = 0;
     if (wall > kDateUs && __builtin_sub_overflow(wall, kDateUs, &kApparent)) return false;
-    const u64 age_us = static_cast<u64>(age) * 1000000;
+    const u64 age_us = range_int(age).scaled_by<1'000'000>().to_u64();
     u64 max_delay = 0;
     if (__builtin_sub_overflow(~u64{0}, age_us, &max_delay) || delay > max_delay) return false;
     u64 kAge = 0;
     if (__builtin_add_overflow(age_us, delay, &kAge)) return false;
     const u64 kInitial = kApparent > kAge ? kApparent : kAge;
-    if (kInitial >= static_cast<u64>(static_cast<i64>(lifetime) * 1000000)) return false;
-    info.ttl = static_cast<u32>(lifetime);
+    if (kInitial >= kLifetimeUs) return false;
+    info.remaining_us =
+        static_cast<u64>(static_cast<__int128_t>(kLifetimeUs) - static_cast<__int128_t>(kInitial));
     info.age_us = kInitial;
     return true;
 }
@@ -322,7 +327,7 @@ bool copy_response(const HttpCacheStorage::Record& entry,
     u32 count = 0;
     u64 value = kAge;
     do {
-        digits[count++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(value % 10));
+        digits[count++] = last_decimal_digit(value);
         value /= 10;
     } while (value);
     if (!add("Age: ", 5)) return false;
@@ -457,8 +462,7 @@ bool HttpCachePolicy::prepare_record(
         length != static_cast<u32>(static_cast<i64>(info.header_end) +
                                    static_cast<i64>(info.parsed.content_length)))
         return false;
-    const u64 kRemainingUs =
-        static_cast<u64>(static_cast<i64>(info.ttl) * 1000000 - static_cast<i64>(info.age_us));
+    const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;
     if (__builtin_sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining)
         return false;

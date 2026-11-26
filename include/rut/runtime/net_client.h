@@ -42,16 +42,16 @@ public:
     void stop();
     void cancel(u32 owner, u64 generation = 0);
     void adopt_config(const void* config);
-    NetReply call(u32 owner,
-                  u64 generation,
-                  NetOp operation,
-                  u32 handle,
-                  const NetEndpoint* endpoint,
-                  Str bytes,
-                  i32 amount,
-                  u64 now_ms,
-                  u32 timeout_ms,
-                  const void* config = nullptr);
+    [[nodiscard]] NetReply call(u32 owner,
+                                u64 generation,
+                                NetOp operation,
+                                u32 handle,
+                                const NetEndpoint* endpoint,
+                                Str bytes,
+                                i32 amount,
+                                u64 now_ms,
+                                u32 timeout_ms,
+                                const void* config = nullptr);
 
 private:
     enum Phase : u8 { Empty, Queued, Running, Done, Idle, Cancelled };

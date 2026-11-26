@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/forward_target.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -12,6 +13,7 @@
 #include "rut/runtime/connection_base.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/consistent_hash.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_cache_connection.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -448,8 +450,8 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         if ((strict || any_healthy) && backend_ejected(uid, i, now)) continue;
         // Compare exact active/weight ratios without division or narrowing.
         if (spec.policy == LoadBalancePolicy::LeastRequests && best != count) {
-            const u64 lhs = static_cast<u64>(state.active[uid][i]) * weights[best];
-            const u64 rhs = static_cast<u64>(state.active[uid][best]) * weights[i];
+            const i64 lhs = i64{state.active[uid][i]} * weights[best];
+            const i64 rhs = i64{state.active[uid][best]} * weights[i];
             if (lhs > rhs) continue;
             if (lhs < rhs) eligible = 0;
         }
@@ -7593,8 +7595,8 @@ inline void strip_ws_extensions(Connection& conn) {
 // validation and size check happens before the first recv_buf mutation.
 // Explicit general prefix modes share the ordinary request-line rewriter.
 // The legacy clean-prefix profile below retains its existing admission contract.
-inline bool materialize_general_target_transform(Connection& conn,
-                                                 const ForwardTargetTransformSpec& spec) {
+[[nodiscard]] inline bool materialize_general_target_transform(
+    Connection& conn, const ForwardTargetTransformSpec& spec) {
     if (!forward_target_transform_spec_valid(spec) || conn.req_path_overridden ||
         conn.req_body_overridden || conn.req_malformed || conn.req_header_override_overflow ||
         conn.resp_header_mutation_pending_count != conn.resp_header_mutation_count ||
@@ -7609,10 +7611,10 @@ inline bool materialize_general_target_transform(Connection& conn,
         conn.req_initial_send_len > conn.recv_buf.len() || !forward_target_valid(request.path))
         return false;
     auto& arena = conn.json_arena;
-    auto allocate = [&](u32 bytes) -> char* {
-        if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
-            static_cast<i64>(arena.space_used()) >
-                static_cast<i64>(262144) - static_cast<i64>(bytes))
+    auto allocate = [&] [[nodiscard]] (u32 bytes) -> char* {
+        if (bytes > 262144 || arena.backend.pool == nullptr ||
+            (!arena.current && !arena.init(arena.backend.pool)) ||
+            arena.space_used() > static_cast<u64>(i64{262144} - i64{bytes}))
             return nullptr;
         return static_cast<char*>(arena.alloc(bytes));
     };
@@ -7772,20 +7774,18 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         static_cast<u32>(static_cast<i64>(path_len) - static_cast<i64>(spec.strip_prefix.len));
     const u32 query_len =
         static_cast<u32>(static_cast<i64>(target_len) - static_cast<i64>(path_len));
-    const i64 new_target_len_wide = static_cast<i64>(spec.replace_prefix.len) +
-                                    static_cast<i64>(suffix_len) + static_cast<i64>(query_len);
-    if (new_target_len_wide < 0) return false;
-    const u64 new_target_len = static_cast<u64>(new_target_len_wide);
-    const i64 delta = static_cast<i64>(new_target_len) - static_cast<i64>(target_len);
-    const i64 final_total = static_cast<i64>(total) + delta;
-    if (new_target_len > 0xffffffffu || final_total < 0 ||
+    const auto new_target_len =
+        range_int(spec.replace_prefix.len) + range_int(suffix_len) + range_int(query_len);
+    const auto length_delta = new_target_len - range_int(target_len);
+    const i64 delta = length_delta.value();
+    const i64 final_total = (range_int(total) + length_delta).value();
+    if (new_target_len.value() > UINT32_MAX || final_total < 0 ||
         static_cast<u64>(final_total) > conn.recv_buf.capacity())
         return false;
 
     const u32 target_end =
         static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(target_len));
-    const u32 new_target_end =
-        static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(new_target_len));
+    const u32 new_target_end = static_cast<u32>((range_int(target_start) + new_target_len).value());
     const u32 suffix_start =
         static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(spec.strip_prefix.len));
     const u32 suffix_dest = static_cast<u32>(static_cast<i64>(target_start) +
@@ -9292,7 +9292,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         char digits[10];
         u32 n = 0;
         do {
-            digits[n++] = static_cast<char>('0' + static_cast<i64>(value % 10));
+            digits[n++] = last_decimal_digit(value);
             value /= 10;
         } while (value != 0);
         for (i64 i = static_cast<i64>(n); i > 0; i--) {
@@ -9320,7 +9320,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         char digits[3];
         i64 dn = 0;
         do {
-            digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));
+            digits[dn++] = last_decimal_digit(v);
             v /= 10;
         } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
@@ -9332,7 +9332,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         i64 dn = 0;
         u32 v = port;
         do {
-            digits[dn++] = static_cast<char>('0' + static_cast<i64>(v % 10));
+            digits[dn++] = last_decimal_digit(v);
             v /= 10;
         } while (v != 0);
         while (dn > 0) authority[authority_len++] = digits[--dn];
@@ -14903,7 +14903,7 @@ inline u32 strict_response_dec(char* out, u32 value) {
     char tmp[10];
     u32 n = 0;
     do {
-        tmp[n++] = static_cast<char>('0' + static_cast<i64>(value % 10));
+        tmp[n++] = last_decimal_digit(value);
         value /= 10;
     } while (value != 0);
     for (u32 i = 0; i < n; i++) out[i] = tmp[static_cast<i64>(n) - static_cast<i64>(i) - 1];
@@ -14914,22 +14914,22 @@ inline u32 strict_response_date(char* out, u64 now_us) {
     // HTTP dates have second precision. Each shard runs on one thread, so
     // reuse that thread's formatted second without sharing mutable state.
     struct DateCache {
-        u64 second = 0;
+        time_t second = 0;
         char bytes[29]{};
         bool valid = false;
     };
     static thread_local DateCache cache{};
-    const u64 kSecond = now_us / 1000000ULL;
-    if (cache.valid && cache.second == kSecond) {
+    time_t second;
+    if (!bounded_quotient<1'000'000>(now_us).try_to_signed(&second)) return 0;
+    if (cache.valid && cache.second == second) {
         __builtin_memcpy(out, cache.bytes, sizeof(cache.bytes));
         return sizeof(cache.bytes);
     }
     static constexpr const char* kWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     static constexpr const char* kMonth[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    time_t t = static_cast<time_t>(kSecond);
     struct tm tm;
-    if (gmtime_r(&t, &tm) == nullptr) return 0;
+    if (gmtime_r(&second, &tm) == nullptr) return 0;
     char* p = out;
     auto two = [&](int v) {
         *p++ = static_cast<char>('0' + v / 10);
@@ -14960,7 +14960,7 @@ inline u32 strict_response_date(char* out, u64 now_us) {
     const u32 kLen = static_cast<u32>(p - out);
     if (kLen == sizeof(cache.bytes)) {
         __builtin_memcpy(cache.bytes, out, sizeof(cache.bytes));
-        cache.second = kSecond;
+        cache.second = second;
         cache.valid = true;
     }
     return kLen;
@@ -15033,13 +15033,13 @@ inline bool redirect_legacy_authority_matches_listener(const RedirectAuthorityVi
     return actual_port != 0 && (!authority.has_port || authority.port == actual_port);
 }
 
-inline bool redirect_origin_request_valid(const Connection& conn,
-                                          bool require_listener_port_match,
-                                          ParsedRequest* out_req,
-                                          u32* out_target_start,
-                                          u32* out_path_len,
-                                          u32* out_query_len,
-                                          RedirectAuthorityView* out_authority) {
+[[nodiscard]] inline bool redirect_origin_request_valid(const Connection& conn,
+                                                        bool require_listener_port_match,
+                                                        ParsedRequest* out_req,
+                                                        u32* out_target_start,
+                                                        u32* out_path_len,
+                                                        u32* out_query_len,
+                                                        RedirectAuthorityView* out_authority) {
     if (out_req == nullptr || out_target_start == nullptr || out_path_len == nullptr ||
         out_query_len == nullptr || out_authority == nullptr || conn.recv_slice == nullptr ||
         conn.recv_buf.data() != conn.recv_slice || conn.recv_buf.len() == 0 ||
@@ -15058,8 +15058,8 @@ inline bool redirect_origin_request_valid(const Connection& conn,
     uintptr_t path_offset = 0;
     if (path_addr < base || __builtin_sub_overflow(path_addr, base, &path_offset) ||
         path_offset > conn.recv_buf.len() ||
-        static_cast<i64>(out_req->path.len) >
-            static_cast<i64>(conn.recv_buf.len()) - static_cast<i64>(path_offset))
+        i64{out_req->path.len} >
+            i64{conn.recv_buf.len()} - i64{static_cast<u32>(path_offset)})
         return false;
     const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;
@@ -15139,45 +15139,34 @@ inline bool build_redirect_response(const Connection& conn,
     char date[32];
     char body_len[10];
     char actual_port[10];
-    const i64 date_len_wide = strict_response_date(date, realtime_us());
-    const i64 body_len_digits_wide = strict_response_dec(body_len, policy.body.len);
-    const u32 date_len = static_cast<u32>(date_len_wide);
-    const u32 body_len_digits = static_cast<u32>(body_len_digits_wide);
+    const u32 date_len = strict_response_date(date, realtime_us());
+    const u32 body_len_digits = strict_response_dec(body_len, policy.body.len);
     const u32 actual_port_digits =
         legacy_profile ? strict_response_dec(actual_port, conn.listener_context.port) : 0;
     if (date_len == 0 || (legacy_profile && actual_port_digits == 0)) return false;
 
     const Str location_authority = legacy_profile ? authority.value : policy.static_authority;
     const bool append_listener_port = legacy_profile && !authority.has_port;
-    const i64 authority_len_wide =
-        static_cast<i64>(location_authority.len) +
-        (append_listener_port ? 1 + static_cast<i64>(actual_port_digits) : 0);
-    if (authority_len_wide < 0 || authority_len_wide > UINT32_MAX) return false;
-    const i64 authority_len = authority_len_wide;
-    const i64 location_query_len = legacy_profile ? static_cast<i64>(query_len) : 0;
-    u64 required = 0;
-    auto add = [&](u64 n) {
-        u64 next = 0;
-        if (__builtin_add_overflow(required, n, &next) || next > UINT32_MAX) return false;
-        required = next;
-        return true;
-    };
-    auto add_i64 = [&](i64 n) { return n >= 0 && add(static_cast<u64>(n)); };
+    const u32 location_query_len = legacy_profile ? query_len : 0;
     static constexpr char kLocationPrefix[] = "\r\nLocation: http://";
     static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
-    if (!add_i64(9 + 3 + 1 + static_cast<i64>(policy.reason.len)) ||
-        !add_i64(10 + static_cast<i64>(policy.server.len)) || !add_i64(8 + date_len_wide) ||
-        !add_i64(16 + static_cast<i64>(policy.content_type.len)) ||
-        !add_i64(18 + body_len_digits_wide) ||
-        !add_i64(static_cast<i64>(legacy_profile ? sizeof(kLocationPrefix)
-                                                 : sizeof(kFixedLocationPrefix)) -
-                 1 + authority_len) ||
-        !add_i64(static_cast<i64>(policy.target_path.len) + location_query_len) ||
-        !add_i64(static_cast<i64>(legacy_profile ? sizeof(kLegacyTail) : sizeof(kFixedTail)) - 1) ||
-        !add_i64(policy.body.len) || required > out_cap)
-        return false;
+    constexpr u32 kCommonBytes =
+        sizeof("HTTP/1.1 000 \r\nServer: \r\nDate: \r\nContent-Type: \r\nContent-Length: ") - 1;
+    constexpr u32 kLegacyBytes = kCommonBytes + sizeof(kLocationPrefix) + sizeof(kLegacyTail) - 2;
+    constexpr u32 kFixedBytes =
+        kCommonBytes + sizeof(kFixedLocationPrefix) + sizeof(kFixedTail) - 2;
+    const u32 kFixedLength = legacy_profile ? kLegacyBytes : kFixedBytes;
+    const u32 kPortDigits = append_listener_port ? actual_port_digits : 0;
+    const u8 kPortColon = append_listener_port ? 1 : 0;
+    const auto required = range_int(kFixedLength) + range_int(policy.reason.len) +
+                          range_int(policy.server.len) + range_int(date_len) +
+                          range_int(policy.content_type.len) + range_int(body_len_digits) +
+                          range_int(location_authority.len) + range_int(kPortColon) +
+                          range_int(kPortDigits) + range_int(policy.target_path.len) +
+                          range_int(location_query_len) + range_int(policy.body.len);
+    if (required.value() > out_cap) return false;
 
     u32 pos = 0;
     auto put = [&](const void* data, u32 len) {

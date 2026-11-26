@@ -1,5 +1,6 @@
 #include "rut/runtime/timer_wheel.h"
 
+#include "rut/common/range_int.h"
 #include "rut/runtime/connection.h"
 
 #include <stddef.h>  // offsetof
@@ -86,8 +87,8 @@ void TimerWheel::remove(Connection* c) {
     c->timer_node.detach();
 }
 
-u64 TimerWheel::timer_node_offset() {
-    return offsetof(Connection, timer_node);
+i64 TimerWheel::timer_node_offset() {
+    return range_int<0>::constant<offsetof(Connection, timer_node)>().value();
 }
 
 }  // namespace rut

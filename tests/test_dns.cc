@@ -165,6 +165,18 @@ NetReply call(NetClientWorker& w,
     return {};
 }
 }  // namespace
+TEST(dns, resolver_rejects_host_larger_than_query_storage) {
+    DnsResolver resolver{};
+    DnsQuery query{};
+    char host[255]{};
+    memset(host, 'a', sizeof(host) - 1);
+    u64 expires = 0;
+    CHECK_EQ(resolver.resolve(query, host, 0, 0, 1, 1, expires), -1);
+    CHECK_EQ(query.phase, 0u);
+    CHECK_EQ(query.valid_until, 0u);
+    CHECK_EQ(expires, 0u);
+}
+
 TEST(dns, hostname_policy_normalizes_and_rejects_ambiguous_or_dynamic_targets) {
     NetEndpoint e;
     CHECK(net_endpoint(

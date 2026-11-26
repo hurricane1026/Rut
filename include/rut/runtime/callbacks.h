@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/io_event.h"
@@ -220,11 +221,11 @@ inline bool tls_partial_initial_connect_request_owner(const Connection& conn) {
             conn.req_content_length == 0 || conn.req_body_remaining == 0 ||
             conn.req_body_remaining > conn.req_content_length)
             return false;
-        const u64 body_received = static_cast<u64>(static_cast<i64>(conn.req_content_length) -
-                                                   static_cast<i64>(conn.req_body_remaining));
-        return static_cast<u64>(conn.req_initial_send_len) ==
-               static_cast<u64>(static_cast<i64>(conn.req_header_end) +
-                                static_cast<i64>(body_received));
+        const auto body_received =
+            range_int(conn.req_content_length) - range_int(conn.req_body_remaining);
+        // The sum of the header and body can exceed u32. Compare the full i64 result.
+        return conn.req_initial_send_len ==
+               (range_int(conn.req_header_end) + body_received).value();
     }
     // Chunked partial-send ownership needs a fresh parse of the exact captured
     // body prefix. Until that proof is available, leave it on the conservative 413 path.

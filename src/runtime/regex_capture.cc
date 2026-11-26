@@ -1,6 +1,7 @@
 #include "rut/runtime/regex_capture.h"
 
 #include "core/placement_new.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/string_ops.h"
@@ -99,14 +100,18 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
                 CaptureProgram::view(text), search, text.len, re2::RE2::UNANCHORED, &found, 1))
             break;
         if (count == 64 || !found.data()) return 0;
-        const i64 start = static_cast<i64>(found.data() - text.ptr);
-        const i64 end = start + static_cast<i64>(found.size());
-        if (start < static_cast<i64>(search) || end > static_cast<i64>(text.len)) return 0;
-        matches[count++] = {static_cast<u32>(start), static_cast<u32>(end)};
-        size = size - (end - start) + static_cast<i64>(replacement.len);
+        const i64 start_offset = found.data() - text.ptr;
+        if (start_offset < search || start_offset > text.len) return 0;
+        const u32 start = static_cast<u32>(start_offset);
+        const auto available = range_int(text.len) - range_int(start);
+        if (found.size() > static_cast<u64>(available.value())) return 0;
+        const auto length = range_int(static_cast<u32>(found.size()));
+        const u32 end = static_cast<u32>((range_int(start) + length).value());
+        matches[count++] = {start, end};
+        size += (range_int(replacement.len) - length).value();
         if (end == start) {
             if (end == text.len) break;
-            search = static_cast<u32>(end + 1);
+            search = end + 1;
         } else
             search = end;
     }

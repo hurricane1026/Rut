@@ -5,6 +5,7 @@
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/common/uri_normalize.h"
@@ -1299,8 +1300,11 @@ u32 rut_helper_req_remote_addr(void* conn) {
 i64 rut_helper_time_now_micros() {
     TimeCache& tc = t_time_cache;
     if (!tc.valid) {
-        tc.value = static_cast<i64>(t_virtual_time_us != nullptr ? *t_virtual_time_us
-                                                                 : rut::monotonic_us());
+        const u64 now_us = t_virtual_time_us ? *t_virtual_time_us : rut::monotonic_us();
+        // Handler simulations reject clocks outside the signed JIT ABI.
+        range_int<0> now;
+        if (!decltype(now)::try_from_u64(now_us, &now)) __builtin_trap();
+        tc.value = now.value();
         tc.valid = true;
     }
     return tc.value;
@@ -3616,7 +3620,7 @@ extern "C" const char* rut_helper_bytes_concat(void* conn,
 extern "C" rut::u8 rut_helper_format_int(
     void* conn, void* arena, rut::i64 value, const char** out_ptr, rut::u32* out_size) {
     if (!out_ptr || !out_size) return 0;
-    char buffer[20];
+    char buffer[rut::kFormatIntegerBufferSize];
     const rut::Str kText = rut::format_integer(value, buffer);
     return rut_helper_str_concat(conn, arena, &kText, 1, out_ptr, out_size);
 }

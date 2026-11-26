@@ -15,6 +15,7 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_cache_connection.h"
@@ -818,8 +819,7 @@ inline bool h2_inject_content_length(u8* buf, u32* len, u32 body_start, u32 body
     } else {
         char tmp[10];
         u32 t = 0;
-        for (u32 v = body_len; v > 0; v /= 10)
-            tmp[t++] = static_cast<char>('0' + static_cast<i64>(v % 10));
+        for (u32 v = body_len; v > 0; v /= 10) tmp[t++] = last_decimal_digit(v);
         while (t > 0) digits[nd++] = tmp[--t];
     }
     static const char kKey[] = "content-length: ";

@@ -31,7 +31,7 @@ struct HttpCachePolicy : HttpCacheStorage {
                               u8* output,
                               u32 capacity,
                               u32& written);
-    static bool prepare_record(
+    [[nodiscard]] static bool prepare_record(
         const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record);
 };
 

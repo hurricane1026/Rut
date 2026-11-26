@@ -1,7 +1,9 @@
 #include "rut/runtime/access_log.h"
 
 #include "rut/common/integer_conversion.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/access_log_host.h"
+#include "rut/runtime/format_integer.h"
 #include <atomic>
 
 #include <errno.h>
@@ -88,7 +90,7 @@ static u32 write_u64_dec(char* buf, u64 val) {
     char tmp[20];
     i64 n = 0;
     while (val > 0) {
-        tmp[n++] = static_cast<char>('0' + static_cast<i64>(val % 10));
+        tmp[n++] = last_decimal_digit(val);
         val /= 10;
     }
     for (i64 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
@@ -131,43 +133,43 @@ static const char* method_str(u8 m) {
 
 // Format ISO8601 timestamp: "YYYY-MM-DDTHH:MM:SS.mmmZ" (24 chars)
 static u32 format_timestamp(char* buf, u64 timestamp_us) {
-    u64 secs = timestamp_us / 1000000ULL;
     u32 millis = static_cast<u32>((timestamp_us % 1000000ULL) / 1000);
 
     struct tm tm;
-    time_t t = static_cast<time_t>(secs);
-    gmtime_r(&t, &tm);
+    time_t t;
+    if (!bounded_quotient<1'000'000>(timestamp_us).try_to_signed(&t) || !gmtime_r(&t, &tm))
+        return 0;
 
     i64 w = 0;
     u32 year = static_cast<u32>(tm.tm_year + 1900);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(year / 1000));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 100) % 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>((year / 10) % 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(year % 10));
+    buf[w++] = last_decimal_digit(year / 100);
+    buf[w++] = last_decimal_digit(year / 10);
+    buf[w++] = last_decimal_digit(year);
     buf[w++] = '-';
     u32 mon = static_cast<u32>(tm.tm_mon + 1);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(mon / 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(mon % 10));
+    buf[w++] = last_decimal_digit(mon);
     buf[w++] = '-';
     u32 day = static_cast<u32>(tm.tm_mday);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(day / 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(day % 10));
+    buf[w++] = last_decimal_digit(day);
     buf[w++] = 'T';
     u32 hour = static_cast<u32>(tm.tm_hour);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(hour / 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(hour % 10));
+    buf[w++] = last_decimal_digit(hour);
     buf[w++] = ':';
     u32 min = static_cast<u32>(tm.tm_min);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(min / 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(min % 10));
+    buf[w++] = last_decimal_digit(min);
     buf[w++] = ':';
     u32 sec = static_cast<u32>(tm.tm_sec);
     buf[w++] = static_cast<char>('0' + static_cast<i64>(sec / 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(sec % 10));
+    buf[w++] = last_decimal_digit(sec);
     buf[w++] = '.';
     buf[w++] = static_cast<char>('0' + static_cast<i64>(millis / 100));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>((millis / 10) % 10));
-    buf[w++] = static_cast<char>('0' + static_cast<i64>(millis % 10));
+    buf[w++] = last_decimal_digit(millis / 10);
+    buf[w++] = last_decimal_digit(millis);
     buf[w++] = 'Z';
     return static_cast<u32>(w);
 }

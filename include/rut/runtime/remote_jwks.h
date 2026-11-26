@@ -142,8 +142,8 @@ private:
     bool advance_dns_https(u64 now);
     bool accept_dns_result(const JwksDnsAddresses& result, u64 now);
     void close_dns();
-    bool begin_http(u64 now);
-    bool start_http(HttpsFetch& fetch, u64 now);
+    [[nodiscard]] bool begin_http(u64 now);
+    [[nodiscard]] bool start_http(HttpsFetch& fetch, u64 now);
     bool can_try_next_address(const HttpsFetch& fetch) const;
     Str selected_address() const;
     Str discovery_selected_address() const;

@@ -5,6 +5,7 @@
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_base.h"
+#include "rut/runtime/format_integer.h"
 #ifdef __APPLE__
 #include "rut/runtime/kqueue_event_loop.h"  // IWYU pragma: keep
 #else
@@ -336,7 +337,7 @@ void capture_request_metadata(Connection& conn) {
             u64 end = 0;
             if (__builtin_add_overflow(offset, static_cast<u64>(req.path.len), &end)) return;
             if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
-                data[static_cast<i64>(offset)] == '/' && req.path_canon.ptr != nullptr) {
+                data[static_cast<u32>(offset)] == '/' && req.path_canon.ptr != nullptr) {
                 raw_target_offset = static_cast<u32>(offset);
                 raw_target_length = req.path.len;
             }
@@ -896,42 +897,42 @@ static void write_response_headers(Connection& conn,
     // Content-Length: decimal digits, always emitted (even for 0).
     conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
     if (body_len >= 1000000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000000u) % 10));
+        char d = last_decimal_digit(body_len / 1000000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000000u) % 10));
+        char d = last_decimal_digit(body_len / 100000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000000u) % 10));
+        char d = last_decimal_digit(body_len / 10000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000u) % 10));
+        char d = last_decimal_digit(body_len / 1000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000u) % 10));
+        char d = last_decimal_digit(body_len / 100000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000u) % 10));
+        char d = last_decimal_digit(body_len / 10000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000u) % 10));
+        char d = last_decimal_digit(body_len / 1000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100u) % 10));
+        char d = last_decimal_digit(body_len / 100u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10u) % 10));
+        char d = last_decimal_digit(body_len / 10u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + static_cast<i64>(body_len % 10));
+    char d = last_decimal_digit(body_len);
     conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
     if (content_type_len > 0) {
@@ -1011,42 +1012,42 @@ static bool header_name_eq_literal_ci(const char* data, u32 len, const char (&li
 // body_len values (the common case) don't pay for ten divisions.
 static void write_content_length_digits(Connection& conn, u32 body_len) {
     if (body_len >= 1000000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000000u) % 10));
+        char d = last_decimal_digit(body_len / 1000000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000000u) % 10));
+        char d = last_decimal_digit(body_len / 100000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000000u) % 10));
+        char d = last_decimal_digit(body_len / 10000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000000u) % 10));
+        char d = last_decimal_digit(body_len / 1000000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100000u) % 10));
+        char d = last_decimal_digit(body_len / 100000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10000u) % 10));
+        char d = last_decimal_digit(body_len / 10000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 1000u) % 10));
+        char d = last_decimal_digit(body_len / 1000u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 100u) % 10));
+        char d = last_decimal_digit(body_len / 100u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
-        char d = static_cast<char>('0' + static_cast<i64>((body_len / 10u) % 10));
+        char d = last_decimal_digit(body_len / 10u);
         conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
     }
-    char d = static_cast<char>('0' + static_cast<i64>(body_len % 10));
+    char d = last_decimal_digit(body_len);
     conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
 }
 

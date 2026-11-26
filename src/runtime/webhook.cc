@@ -1,7 +1,9 @@
 #include "rut/runtime/webhook.h"
 
+#include "rut/common/range_int.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/hash.h"
+#include "rut/runtime/parse_integer.h"
 
 #include <time.h>
 
@@ -27,27 +29,21 @@ bool standard_webhook_valid(Str id,
     if (!id.ptr || id.len == 0 || id.len > 256 || !timestamp.ptr || timestamp.len == 0 ||
         timestamp.len > 19 || !signature.ptr || signature.len == 0 || signature.len > 4096 ||
         (!body.ptr && body.len != 0) || body.len > kMaxHashInputBytes || !raw_key.ptr ||
-        raw_key.len == 0 || raw_key.len > kMaxHashKeyBytes || unix_seconds <= 0 ||
-        tolerance_seconds > 300)
+        raw_key.len == 0 || raw_key.len > kMaxHashKeyBytes || tolerance_seconds > 300)
         return false;
+    range_int<1> now;
+    if (!decltype(now)::try_from_i64(unix_seconds, &now)) return false;
     for (u32 i = 0; i < id.len; ++i)
         if (id.ptr[i] < 0x21 || id.ptr[i] > 0x7e || id.ptr[i] == '.') return false;
     if (timestamp.ptr[0] < '1' || timestamp.ptr[0] > '9') return false;
-    u64 seconds = 0;
-    constexpr u64 kMaxTime = 9223372036854775807ULL;
-    for (u32 i = 0; i < timestamp.len; ++i) {
-        const char c = timestamp.ptr[i];
-        if (c < '0' || c > '9') return false;
-        const u64 digit = static_cast<u64>(c - '0');
-        const i64 signed_seconds = static_cast<i64>(seconds);
-        if (signed_seconds > (static_cast<i64>(kMaxTime) - static_cast<i64>(digit)) / 10)
-            return false;
-        seconds = static_cast<u64>(signed_seconds * 10 + static_cast<i64>(digit));
-    }
-    const u64 now = static_cast<u64>(unix_seconds);
-    const i64 delta = seconds > now ? static_cast<i64>(seconds) - static_cast<i64>(now)
-                                    : static_cast<i64>(now) - static_cast<i64>(seconds);
-    if (delta > static_cast<i64>(tolerance_seconds)) return false;
+    i64 parsed_seconds;
+    range_int<1> seconds;
+    if (!parse_integer64(timestamp, parsed_seconds) ||
+        !decltype(seconds)::try_from_i64(parsed_seconds, &seconds))
+        return false;
+    const i64 delta = (seconds - now).value();
+    const i64 tolerance = tolerance_seconds;
+    if (delta < -tolerance || delta > tolerance) return false;
 
     static constexpr u8 kDot[] = {'.'};
     const rut_crypto_span_v1 parts[] = {

@@ -778,7 +778,7 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
     }
     u64 elapsed = 0;
     if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) return fail();
-    u32 stage_timeout = static_cast<u32>(static_cast<i64>(timeout_) - static_cast<i64>(elapsed));
+    u32 stage_timeout = static_cast<u32>(static_cast<i64>(timeout_) - i64{static_cast<u32>(elapsed)});
     u64 discovery_timeout_wide = 0;
     u32 kDiscoveryTimeout = 0;
     if (__builtin_mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
@@ -1178,7 +1178,7 @@ void JwksFetch::advance(u64 now) {
     if (fetch.state() != State::Done) {
         if (can_try_next_address(fetch)) {
             ++address_index_;
-            (void)begin_http(now);
+            if (!begin_http(now)) return;
         } else {
             if (fetch.connect_failed()) clear_dns_cache();
             (void)fail();
@@ -1192,7 +1192,7 @@ void JwksFetch::advance(u64 now) {
         }
         discovery_.cancel();
         discovering_ = false;
-        (void)start_http(keys_, now);
+        if (!start_http(keys_, now)) return;
     } else {
         if (keys_.status() == 429 || keys_.status() == 503) {
             ParsedResponse response{};

@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 
 namespace rut {
@@ -77,8 +78,7 @@ inline bool replace_h1_body_in_place(
     u32 digit_count = 0;
     u32 value = body.len;
     do {
-        digits[digit_count++] =
-            static_cast<char>(static_cast<i64>('0') + static_cast<i64>(value % 10));
+        digits[digit_count++] = last_decimal_digit(value);
         value /= 10;
     } while (value);
     const u32 new_line_len = static_cast<u32>(16 + static_cast<i64>(digit_count) + 2);

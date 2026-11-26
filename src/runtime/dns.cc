@@ -1,5 +1,6 @@
 #include "rut/runtime/dns.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/platform/socket.h"
 
@@ -69,6 +70,15 @@ bool name_at(const u8* p, u32 len, u32& offset, char* out) {
 }
 bool pending() {
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+// DNS names have at most 253 characters plus a terminator.
+bool copy_dns_name(char (&destination)[254], const char* source) {
+    if (!source) return false;
+    range_int<0, sizeof(destination)> len;
+    if (!decltype(len)::try_from_u64(strnlen(source, sizeof(destination)), &len)) return false;
+    constexpr auto kTerminatorSize = range_int<1, 2>::constant<1>();
+    memcpy(destination, source, (len + kTerminatorSize).to_u64());
+    return true;
 }
 }  // namespace
 bool dns_hostname(char* name) {
@@ -156,7 +166,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         at = static_cast<u32>(end_wide);
     }
     if (at != len) return DnsAnswer::Invalid;
-    memcpy(result.canonical, name, static_cast<size_t>(static_cast<i64>(strlen(name)) + 1));
+    if (!copy_dns_name(result.canonical, name)) return DnsAnswer::Invalid;
     for (u32 depth = 0; depth <= 8; ++depth) {
         bool alias = false;
         char target[254]{};
@@ -231,6 +241,7 @@ void DnsResolver::init() {
 }
 int DnsResolver::resolve(
     DnsQuery& q, const char* host, u32 server, u16 port, u64 epoch, u64 now, u64& expires) {
+    if (!host) return -1;
     if (!q.phase) {
         for (auto& e : cache) {
             if (e.epoch != epoch || e.server != server || e.port != port || e.expires <= now ||
@@ -244,9 +255,9 @@ int DnsResolver::resolve(
             expires = e.expires;
             return 1;
         }
+        if (!copy_dns_name(q.name, host)) return -1;
         u64 next_valid = 0;
         q.valid_until = __builtin_add_overflow(now, u64{60000}, &next_valid) ? ~u64{0} : next_valid;
-        memcpy(q.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
         q.phase = 1;
     }
     const u32 kAvailable = server ? 1 : count;
@@ -374,13 +385,14 @@ int DnsResolver::resolve(
     if (result.ttl && expires > now) {
         auto& e = cache[replacement++ % 16];
         e = {};
-        memcpy(e.name, host, static_cast<size_t>(static_cast<i64>(strlen(host)) + 1));
-        e.server = server;
-        e.port = port;
-        e.epoch = epoch;
-        e.expires = expires;
-        e.result = result;
-        e.next = 1;
+        if (copy_dns_name(e.name, host)) {
+            e.server = server;
+            e.port = port;
+            e.epoch = epoch;
+            e.expires = expires;
+            e.result = result;
+            e.next = 1;
+        }
     }
     return 1;
 }

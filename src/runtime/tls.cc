@@ -1,6 +1,7 @@
 #include "rut/runtime/tls.h"
 
 #include "core/expected.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_tls.h"
 #include "rut/platform/socket.h"
@@ -282,10 +283,11 @@ bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& o
     X509_free(peer);
     if (!kOk) return false;
     static constexpr char kHex[] = "0123456789abcdef";
-    for (size_t i = 0; i < 32; ++i) {
-        const size_t kOffset = static_cast<size_t>(static_cast<i64>(i) * 2);
-        out_hex[kOffset] = kHex[digest[i] >> 4];
-        out_hex[static_cast<i64>(kOffset) + 1] = kHex[digest[i] & 0x0f];
+    constexpr auto kNext = range_int<1, 2>::constant<1>();
+    for (i32 i = 0; i < 32; ++i) {
+        const auto offset = range_int(i).scaled_by<2>();
+        out_hex[offset.value()] = kHex[digest[i] >> 4];
+        out_hex[(offset + kNext).value()] = kHex[digest[i] & 0x0f];
     }
     out_valid = true;
     return true;

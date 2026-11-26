@@ -1,5 +1,7 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/common/range_int.h"
+#include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
 
@@ -278,7 +280,7 @@ u32 u32_to_dec(u32 v, char* buf) {
     char tmp[10];
     u32 n = 0;
     while (v > 0) {
-        tmp[n++] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(v % 10));
+        tmp[n++] = last_decimal_digit(v);
         v /= 10;
     }
     for (u32 i = 0; i < n; i++)
@@ -301,17 +303,19 @@ static u32 http2_write_response_impl(u8* out,
     // Encode the header block: :status, caller headers, then content-length when
     // there's a body. Sized for the bounded route-config header set + slack.
     u8 hblock[8192];
-    i64 hb = 0;
     // A pending dynamic table size update (from a peer SETTINGS_HEADER_TABLE_SIZE
     // change) MUST lead the header block, before any field (RFC 7541 §4.2).
-    hb += static_cast<i64>(enc.emit_pending_size_update(hblock + hb));
+    const auto pending = range_int(enc.emit_pending_size_update(hblock));
     char sbuf[3];
-    sbuf[0] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>((status / 100) % 10));
-    sbuf[1] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>((status / 10) % 10));
-    sbuf[2] = static_cast<char>(static_cast<i64>('0') + static_cast<i64>(status % 10));
-    const i64 kStatusEncoded = enc.encode(hblock + hb, Str{":status", 7}, Str{sbuf, 3});
-    if (kStatusEncoded < 0 || kStatusEncoded > static_cast<i64>(sizeof(hblock) - hb)) return 0;
-    hb += kStatusEncoded;
+    sbuf[0] = last_decimal_digit(status / 100);
+    sbuf[1] = last_decimal_digit(status / 10);
+    sbuf[2] = last_decimal_digit(status);
+    const i64 kStatusEncoded =
+        enc.encode(hblock + pending.value(), Str{":status", 7}, Str{sbuf, 3});
+    constexpr auto kCapacity =
+        range_int<sizeof(hblock), sizeof(hblock) + 1>::constant<sizeof(hblock)>();
+    if (kStatusEncoded < 0 || kStatusEncoded > (kCapacity - pending).value()) return 0;
+    i64 hb = (pending + range_int(static_cast<u32>(kStatusEncoded))).value();
     // HPACK literal overhead beyond raw name+value bytes: one field-line prefix
     // octet plus the actual length-prefix width for each name and value. The peer
     // (or an upstream we proxy) can

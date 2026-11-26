@@ -107,8 +107,8 @@ struct TimerWheel {
             ListNode* next = node->next;
             node->detach();
             // container_of: timer_node is at a known offset in Connection
-            auto* conn = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) -
-                                                       static_cast<i64>(timer_node_offset()));
+            auto* conn =
+                reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - timer_node_offset());
             on_expire(conn);
             count++;
             node = next;
@@ -118,7 +118,7 @@ struct TimerWheel {
     }
 
     // Offset of timer_node within Connection. Defined in .cc after Connection is complete.
-    static u64 timer_node_offset();
+    static i64 timer_node_offset();
 };
 
 }  // namespace rut
