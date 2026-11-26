@@ -103,6 +103,7 @@ struct UpstreamTarget {
     u32 hc_path_len = 0;
     u32 hc_interval_ms = 0;
     u32 hc_unhealthy_interval_ms = 0;
+    u8 hc_concurrency = 0;  // 0 retains the existing scheduling behavior
     u16 hc_expected_status = 200;
     ActiveHealthStatuses hc_healthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};
@@ -1447,7 +1448,8 @@ public:
                                    Str host = {},
                                    ActiveHealthStatuses statuses = {},
                                    bool require_initial_success = false,
-                                   u32 unhealthy_interval_ms = 0);
+                                   u32 unhealthy_interval_ms = 0,
+                                   u8 concurrency = 0);
 
     // Add a static response route. Same failure modes as add_proxy(),
     // minus the upstream-id check that doesn't apply here.

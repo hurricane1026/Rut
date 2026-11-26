@@ -74,6 +74,7 @@ struct HirUpstream {
     Str hc_path{};
     u32 hc_interval_ms = 0;
     u32 hc_unhealthy_interval_ms = 0;
+    u8 hc_concurrency = 0;  // 0 retains the existing scheduling behavior
     u16 hc_expected_status = 200;
     ActiveHealthStatuses hc_healthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};

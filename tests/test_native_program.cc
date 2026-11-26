@@ -3948,6 +3948,7 @@ route GET "/" { return 200 }
     CHECK(target.hc_enabled);
     CHECK_EQ(target.hc_type, ActiveHealthType::Tcp);
     CHECK_EQ(target.hc_path_len, 0u);
+    CHECK_EQ(target.hc_concurrency, 0u);
     CHECK_EQ(target.hc_expected_status, 0u);
     CHECK_EQ(target.hc_timeout_ms, 3000u);
     CHECK_EQ(target.hc_interval_ms, 2000u);
@@ -4414,13 +4415,14 @@ TEST(native_program, active_healthy_statuses_round_trip) {
     Source source;
     REQUIRE(source.append(R"rut(
 upstream api { backends: ["127.0.0.1:9001"]
-    health_check: { path: "/health" interval: 1s healthy_statuses: [200, 302] } }
+    health_check: { path: "/health" interval: 1s healthy_statuses: [200, 302] concurrency: 2 } }
 route GET "/" { return forward(api, load_balance: .roundRobin) }
 )rut"));
     Program owner;
     REQUIRE(owner.p);
     REQUIRE(load(source, *owner.p));
     const auto& target = owner.p->config.upstreams[0];
+    CHECK_EQ(target.hc_concurrency, 2u);
     CHECK_EQ(target.hc_expected_status, 0u);
     CHECK(target.hc_healthy_statuses.contains(200));
     CHECK(target.hc_healthy_statuses.contains(302));

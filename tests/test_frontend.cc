@@ -50674,3 +50674,26 @@ route GET "/" { return forward(api, load_balance: .consistentHash, hash_key: "x"
         if (a) CHECK_FALSE(analyze_file_heap(a.value()));
     }
 }
+
+TEST(frontend, active_health_concurrency_validation) {
+    for (const char* fields : {"concurrency: 0",
+                               "concurrency: 9",
+                               "concurrency: 4294967297",
+                               "concurrency: 1 concurrency: 2",
+                               "concurrency: -1"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/h\" interval: 1s %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto tokens =
+        lex(lit("upstream api { health_check: { path: \"/h\" interval: 1s concurrency: 8 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->items[0].upstream.hc_concurrency, 8u);
+}

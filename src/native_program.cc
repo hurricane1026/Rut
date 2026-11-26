@@ -584,6 +584,9 @@ bool load_native_program(const char* source,
         if (target.hc_require_initial_success > 1 ||
             (target.hc_require_initial_success && !target.hc_enabled))
             return fail("invalid native upstream initial readiness");
+        if (target.hc_concurrency > UpstreamTarget::kMaxBackends ||
+            (!target.hc_enabled && target.hc_concurrency != 0))
+            return fail("invalid native upstream health concurrency");
         if (!target.hc_enabled && target.hc_unhealthy_interval_ms != 0)
             return fail("invalid native upstream unhealthy interval");
         if (target.hc_enabled && !target.hc_thresholds.valid())

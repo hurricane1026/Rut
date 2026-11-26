@@ -4521,6 +4521,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].hc_interval_ms = mir.upstreams[i].hc_interval_ms;
         out.module.upstreams[i].hc_unhealthy_interval_ms =
             mir.upstreams[i].hc_unhealthy_interval_ms;
+        out.module.upstreams[i].hc_concurrency = mir.upstreams[i].hc_concurrency;
         out.module.upstreams[i].hc_expected_status = mir.upstreams[i].hc_expected_status;
         out.module.upstreams[i].hc_healthy_statuses = mir.upstreams[i].hc_healthy_statuses;
         out.module.upstreams[i].hc_thresholds = mir.upstreams[i].hc_thresholds;

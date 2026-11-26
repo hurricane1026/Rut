@@ -647,10 +647,12 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             Str host,
                                             ActiveHealthStatuses statuses,
                                             bool require_initial_success,
-                                            u32 unhealthy_interval_ms) {
+                                            u32 unhealthy_interval_ms,
+                                            u8 concurrency) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
-    if ((host.len && (!active_health_host_valid(host) || type == ActiveHealthType::Tcp)) ||
+    if (concurrency > UpstreamTarget::kMaxBackends ||
+        (host.len && (!active_health_host_valid(host) || type == ActiveHealthType::Tcp)) ||
         path_len >= sizeof(up.hc_path) ||
         !valid_active_health_check(
             type, path, path_len, interval_ms, status, thresholds, timeout_ms, statuses) ||
@@ -664,6 +666,7 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
     up.hc_path_len = path_len;
     up.hc_interval_ms = interval_ms;
     up.hc_unhealthy_interval_ms = unhealthy_interval_ms;
+    up.hc_concurrency = concurrency;
     up.hc_expected_status = status;
     up.hc_healthy_statuses = statuses;
     up.hc_thresholds = thresholds;

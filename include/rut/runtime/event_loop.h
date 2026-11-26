@@ -619,7 +619,12 @@ public:
                     (static_cast<i64>(start) + static_cast<i64>(scanned)) % static_cast<i64>(n));
                 const UpstreamTarget& up = cfg->upstreams[u];
                 if (!up.hc_enabled) continue;
-                if (up.hc_unhealthy_interval_ms != 0) {
+                if (up.hc_unhealthy_interval_ms != 0 || up.hc_concurrency != 0) {
+                    u32 in_flight = 0;
+                    if (up.hc_concurrency != 0) {
+                        for (u32 b = 0; b < UpstreamTarget::kMaxBackends; ++b)
+                            if (probe_in_flight(static_cast<u16>(u), b)) ++in_flight;
+                    }
                     const u32 count = up.addr_count;
                     if (count == 0 || count > UpstreamTarget::kMaxBackends) continue;
                     const u32 first = health_probe_backend_cursor[u] % count;
@@ -629,12 +634,14 @@ public:
                             (static_cast<i64>(first) + static_cast<i64>(scanned_backend)) %
                             static_cast<i64>(count));
                         if (up.weights[b] == 0 || probe_in_flight(static_cast<u16>(u), b)) continue;
-                        const u32 cadence = health_probe_issued[u][b] && probe_backend_latched_down(
-                                                                             static_cast<u16>(u), b)
-                                                ? up.hc_unhealthy_interval_ms
-                                                : up.hc_interval_ms;
+                        const u32 cadence =
+                            up.hc_unhealthy_interval_ms != 0 && health_probe_issued[u][b] &&
+                                    probe_backend_latched_down(static_cast<u16>(u), b)
+                                ? up.hc_unhealthy_interval_ms
+                                : up.hc_interval_ms;
                         if (now < deadline_after(health_probe_last_issue_ns[u][b], cadence))
                             continue;
+                        if (up.hc_concurrency != 0 && in_flight >= up.hc_concurrency) break;
                         if (budget == 0) {
                             health_probe_backend_cursor[u] = static_cast<u8>(b);
                             health_probe_sweep_cursor =
@@ -645,6 +652,7 @@ public:
                         }
                         if (start_health_probe(&self(), static_cast<u16>(u), b)) {
                             --budget;
+                            ++in_flight;
                             issued_here = true;
                             health_probe_last_issue_ns[u][b] = monotonic_ns();
                             health_probe_issued[u][b] = true;

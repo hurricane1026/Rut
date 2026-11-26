@@ -1753,6 +1753,13 @@ must fit 1 through 4294967295 bytes. Native artifact version 28 records the
 combined connect-attempt and route metadata layout; older artifacts (including
 version 27) must be rebuilt.
 
+An active `health_check` may set `concurrency` to 1–8 to bound in-flight
+probes per upstream per shard, including cancellation drain and guards retained
+across reload. Omission retains the existing schedule. Each target keeps its
+own cadence and deferred targets rotate fairly under the cap. Global sweep and
+resource limits still apply. Native artifact version 36 requires rebuilding
+older artifacts.
+
 An active `health_check` may also set `unhealthy_interval: 2s` using the same
 positive duration bounds as `interval`. The first check uses `interval`.
 After each issued probe, the next due time uses `unhealthy_interval` while

@@ -4059,7 +4059,8 @@ struct Parser {
                     seen_connect_attempts = true;
                     auto lit = expect(TokenType::IntLit);
                     if (!lit) return core::make_unexpected(lit.error());
-                    auto attempts = parse_integer_literal(*lit.value(), 8);
+                    auto attempts =
+                        parse_integer_literal(*lit.value(), AstUpstreamDecl::kMaxBackends);
                     if (!attempts) return core::make_unexpected(attempts.error());
                     if (attempts.value() == 0)
                         return frontend_error(
@@ -4203,6 +4204,7 @@ struct Parser {
                     bool hc_seen_host = false;
                     bool seen_interval = false;
                     bool seen_unhealthy_interval = false;
+                    bool seen_concurrency = false;
                     bool seen_status = false;
                     bool seen_statuses = false;
                     bool seen_type = false;
@@ -4334,6 +4336,22 @@ struct Parser {
                                                       dur.value()->text);
                             item.upstream.hc_unhealthy_interval_ms = interval;
                             seen_unhealthy_interval = true;
+                        } else if (hc_key.eq({"concurrency", 11})) {
+                            if (seen_concurrency)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto lit = expect(TokenType::IntLit);
+                            if (!lit) return core::make_unexpected(lit.error());
+                            auto parsed =
+                                parse_integer_literal(*lit.value(), AstUpstreamDecl::kMaxBackends);
+                            if (!parsed) return core::make_unexpected(parsed.error());
+                            if (parsed.value() == 0)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*lit.value()),
+                                                      lit.value()->text);
+                            item.upstream.hc_concurrency = static_cast<u8>(parsed.value());
+                            seen_concurrency = true;
                         } else if (hc_key.eq({"status", 6})) {
                             if (seen_status || seen_statuses)
                                 return frontend_error(FrontendError::UnexpectedToken,
