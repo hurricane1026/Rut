@@ -5989,6 +5989,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT AND Python3_Interpreter_FOUND)
+    foreach(body_idle_backend epoll io_uring)
+        add_test(NAME test_response_body_idle_timeout_${body_idle_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_response_body_idle_timeout.py
+                --server $<TARGET_FILE:rut> --backend ${body_idle_backend})
+        set_tests_properties(test_response_body_idle_timeout_${body_idle_backend} PROPERTIES
+            LABELS "integration;network;kong-core" TIMEOUT 60 SKIP_RETURN_CODE 77)
+    endforeach()
+
     foreach(header_timeout_backend epoll io_uring)
         add_test(NAME test_response_header_timeout_${header_timeout_backend}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_response_header_timeout.py

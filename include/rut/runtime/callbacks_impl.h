@@ -2667,6 +2667,8 @@ bool proxy_upstream_reusable(Loop* loop, Connection& conn) {
 // their existing close/accounting behavior through the fallback below.
 template <typename Loop>
 bool detach_upstream_close(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->disarm_response_body_idle(conn); })
+        loop->disarm_response_body_idle(conn);
     conn.release_backend_active();
     if (conn.h1_tls_upstream) {
         h1_tls_detach(loop, conn);
@@ -10866,6 +10868,13 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
 }
 
 template <typename Loop>
+bool body_idle_configured(Loop* loop, const Connection& conn) {
+    if constexpr (requires { loop->response_body_idle_configured(conn); })
+        return loop->response_body_idle_configured(conn);
+    return false;
+}
+
+template <typename Loop>
 void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
@@ -10933,7 +10942,8 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
         if constexpr (requires(Loop* candidate, Connection& c) {
                           candidate->start_response_splice_after_header(c);
                       }) {
-            if (loop->start_response_splice_after_header(conn)) return;
+            if (!body_idle_configured(loop, conn) && loop->start_response_splice_after_header(conn))
+                return;
         }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
@@ -11258,6 +11268,12 @@ bool start_upstream_body_relay(Loop* loop, Connection& conn, u32 send_len) {
 template <typename Loop>
 void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    if constexpr (requires { loop->disarm_response_body_idle(conn); }) {
+        if (ev.result > 0 &&
+            (conn.response_body_idle_armed || conn.response_body_idle_expiry_pending) &&
+            conn.response_body_idle_episode == ev.upstream_episode)
+            loop->disarm_response_body_idle(conn);
+    }
 
     if (ev.result <= 0) {
         // -ENOBUFS is the backend's "recv buffer full, couldn't read" signal, not
@@ -11490,15 +11506,18 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if constexpr (requires(Loop* candidate, Connection& c, u32 n) {
                       candidate->arm_response_splice_after_prefix(c, n);
                   }) {
-        if (loop->arm_response_splice_after_prefix(conn, send_len)) {
+        if (!body_idle_configured(loop, conn) &&
+            loop->arm_response_splice_after_prefix(conn, send_len)) {
             // The serialized prefix is sent by the ordinary Send owner.  The
             // splice state machine is admitted only from its completion, after
             // upstream_recv_buf and all old recv ownership are neutral.
             conn.relay_owner.admit_after_prefix = true;
-        } else if (start_upstream_body_relay<Loop>(loop, conn, send_len)) {
+        } else if (!body_idle_configured(loop, conn) &&
+                   start_upstream_body_relay<Loop>(loop, conn, send_len)) {
             return;
         }
-    } else if (start_upstream_body_relay<Loop>(loop, conn, send_len)) {
+    } else if (!body_idle_configured(loop, conn) &&
+               start_upstream_body_relay<Loop>(loop, conn, send_len)) {
         return;
     }
 
@@ -11517,6 +11536,8 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 // resp_fully_buffered are per-response — cleared here, the keep-alive boundary.
 template <typename Loop>
 void proxy_stream_complete(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->disarm_response_body_idle(conn); })
+        loop->disarm_response_body_idle(conn);
     if (conn.response_policy_id != 0 && !strict_response_upload_ready(conn)) {
         loop->close_conn(conn);
         return;

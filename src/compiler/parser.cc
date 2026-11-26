@@ -3900,6 +3900,7 @@ struct Parser {
             bool seen_connect_attempts = false;
             bool seen_connect_timeout = false;
             bool seen_response_header_timeout = false;
+            bool seen_response_body_idle_timeout = false;
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
@@ -4052,6 +4053,19 @@ struct Parser {
                                               span_from(*value.value()),
                                               value.value()->text);
                     item.upstream.response_header_timeout_seconds = seconds;
+                } else if (field_name.eq({"response_body_idle_timeout", 26})) {
+                    if (seen_response_body_idle_timeout)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_response_body_idle_timeout = true;
+                    auto value = expect(TokenType::DurLit);
+                    if (!value) return core::make_unexpected(value.error());
+                    u8 seconds = 0;
+                    if (!dur_lit_to_exact_response_read_seconds(value.value()->text, &seconds))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*value.value()),
+                                              value.value()->text);
+                    item.upstream.response_body_idle_timeout_seconds = seconds;
                 } else if (field_name.eq({"connect_attempts", 16})) {
                     if (seen_connect_attempts)
                         return frontend_error(
@@ -4467,7 +4481,8 @@ struct Parser {
                        (seen_protocol || item.upstream.hc_enabled ||
                         item.upstream.passive_health.enabled ||
                         seen_minimum_healthy_weight_percent || seen_connect_attempts ||
-                        seen_connect_timeout || seen_response_header_timeout)) {
+                        seen_connect_timeout || seen_response_header_timeout ||
+                        seen_response_body_idle_timeout)) {
                 // Protocol-only and health-check-only upstreams are
                 // addressless declarations. The host application binds the
                 // address at runtime (pre-bound slot); populate_route_config

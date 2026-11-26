@@ -61,6 +61,61 @@ class EventLoopCRTP {
     Connection* jit_ready_tail_ = nullptr;
 
 public:
+    // This option owns only the serialized plaintext HTTP/1 response pump.
+    bool response_body_idle_configured(const Connection& c) const {
+        const RouteConfig* cfg = c.request_config;
+        if (!cfg || c.upstream_idx >= cfg->upstream_count) return false;
+        const auto& up = cfg->upstreams[c.upstream_idx];
+        return up.response_body_idle_timeout_seconds != 0 && !up.tls.enabled && !up.http2 &&
+               !c.tls_active && !c.h1_tls_upstream && c.protocol == ConnProtocol::Http11 && !c.h2 &&
+               c.response_policy_id == 0 && c.failure_policy_id == 0 &&
+               c.timeout_failure_policy_id == 0 && c.resp_body_mode == BodyMode::ContentLength &&
+               c.resp_body_remaining != 0 && c.throttle_down_bps == 0 && c.http_cache_ttl == 0 &&
+               c.http_cache_mutation_host == 0 && !c.req_wants_upgrade && !c.is_ws_tunnel &&
+               !c.is_ws_terminate_route && !c.is_ws_terminate &&
+               c.response_read_deadline_owner_is_neutral() && c.request_upload_complete &&
+               !c.upstream_request_incomplete && c.req_body_mode == BodyMode::None &&
+               c.req_body_remaining == 0 && !c.req_client_has_content_length &&
+               !c.req_client_has_transfer_encoding && !c.req_client_has_te &&
+               !c.req_client_has_expect && !c.req_client_has_upgrade_header && !c.req_malformed &&
+               !c.request_policy_body_pending && !c.request_body_fully_buffered &&
+               !c.req_body_streamed && !c.is_health_probe && !c.epoch_held && c.req_start_us != 0 &&
+               c.upstream_attempts != 0 && valid_upstream_episode(c.upstream_episode) &&
+               !c.upstream_episode_quarantined && !c.upstream_abandoned &&
+               !c.h2_proxy_recv_draining && !c.h2_proxy_synth_quarantined &&
+               !c.http1_boundary_deferred &&
+               c.http1_prebuilt_disposition == Http1RequestBufferDisposition::None;
+    }
+
+    void arm_response_body_idle(Connection& c) {
+        if ((c.response_body_idle_armed || c.response_body_idle_expiry_pending) &&
+            c.response_body_idle_episode == c.upstream_episode)
+            return;
+        if (!response_body_idle_configured(c) || c.resp_body_mode != BodyMode::ContentLength ||
+            c.resp_body_remaining == 0 || c.on_upstream_recv != &on_response_body_recvd<Derived> ||
+            c.on_send || c.upstream_fd < 0 || c.fd < 0)
+            return;
+        c.response_body_idle_episode = c.upstream_episode;
+        c.response_body_idle_armed = true;
+        c.response_body_idle_expiry_pending = false;
+        self().timer.refresh(
+            &c, c.request_config->upstreams[c.upstream_idx].response_body_idle_timeout_seconds);
+    }
+
+    void disarm_response_body_idle(Connection& c) {
+        if (!c.response_body_idle_armed && !c.response_body_idle_expiry_pending) return;
+        c.response_body_idle_armed = false;
+        c.response_body_idle_expiry_pending = false;
+        c.response_body_idle_episode = 0;
+        if constexpr (requires {
+                          self().timer.refresh(&c, self().upstream_timeout);
+                          self().keepalive_timeout;
+                      })
+            self().timer.refresh(&c,
+                                 c.state == ConnState::Proxying ? self().upstream_timeout
+                                                                : self().keepalive_timeout);
+    }
+
     static constexpr u32 kJitReadyBatchLimit = 64;
 
     // Per-loop shard limiter for @rateLimit(scope: shard). HTTP/1 and HTTP/2
@@ -76,6 +131,7 @@ public:
     ListenerContext listener_context{};
     Connection* grpc_upstreams = nullptr;
     bool connect_retry_scan_pending = false;
+    bool response_body_idle_expiries_pending = false;
 
     // An already-completed wait still suspends: never call its continuation
     // recursively from handler dispatch. One node per connection, no allocation.

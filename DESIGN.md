@@ -1771,6 +1771,17 @@ one-second sweep resolution. Omission preserves the existing upstream-wide
 schedule. Reload resets schedules and verdicts. Native artifact version 34
 requires rebuilding older artifacts.
 
+An upstream may set `response_body_idle_timeout: 2s` (1–63 whole seconds).
+For a cleartext HTTP/1 client forwarding a bodyless, ordinary HTTP/1 request to a
+plaintext HTTP/1 origin without cache, throttling, upgrade, or response/failure
+policies, the deadline applies while a positive Content-Length response is
+waiting for an origin body read. Buffered bytes are forwarded first; the deadline
+is suspended while a downstream send owns the pump and starts again only on the
+next origin read. A timeout after headers truncates and closes the response.
+Chunked and close-delimited bodies and other transport or policy profiles keep
+their existing behavior. Omission leaves the existing timeout behavior intact.
+Native artifact version 37 requires rebuilding older artifacts.
+
 Native artifact version 30 records the upstream response-header timeout. An
 upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For ordinary
 HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at

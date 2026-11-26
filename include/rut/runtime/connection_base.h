@@ -931,6 +931,8 @@ struct ConnectionBase {
     u32 connect_timeout_episode = 0;
     // Request and transport identity while a timed-out connect is retired.
     bool connect_retry_pending = false;
+    bool response_body_idle_armed = false;
+    bool response_body_idle_expiry_pending = false;
     u32 connect_retry_handler_gen = 0;
     u32 connect_retry_retired_episode = 0;
     u32 connect_retry_current_episode = 0;
@@ -2131,6 +2133,7 @@ struct ConnectionBase {
     // io_uring: the final response was written directly and its Send
     // completion (which accounts the request) is still pending.
     bool direct_write_completion_pending;
+    u32 response_body_idle_episode = 0;
     // io_uring plaintext body relay: the second upstream receive slice. While
     // a client send reads one slice, the next upstream recv fills the other.
     // Owned like the other slices: freed only once no kernel op references it.
@@ -2218,6 +2221,9 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         upstream_attempted_backends = 0;
         response_header_timeout_armed = false;
+        response_body_idle_armed = false;
+        response_body_idle_expiry_pending = false;
+        response_body_idle_episode = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;

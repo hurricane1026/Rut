@@ -20,7 +20,8 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 34 records the unhealthy probe cadence.
 // Version 35 records static upstream failover targets.
 // Version 36 records the active probe concurrency limit.
-constexpr u32 kVersion = 36;
+// Version 37 records the response body idle timeout.
+constexpr u32 kVersion = 37;
 struct StreamHeader {
     u64 magic;
     u32 version;
