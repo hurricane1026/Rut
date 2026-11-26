@@ -50589,3 +50589,22 @@ TEST(frontend, active_healthy_statuses_exact_and_invalid) {
         CHECK_FALSE(parse_file_heap(lexed.value()));
     }
 }
+TEST(frontend, upstream_unhealthy_interval_validation) {
+    for (const char* fields :
+         {"unhealthy_interval: 0s", "unhealthy_interval: 1s unhealthy_interval: 2s"}) {
+        char source[256];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/h\" interval: 1s %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+    auto tokens = lex(
+        lit("upstream api { health_check: { path: \"/h\" interval: 1s unhealthy_interval: 2s } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK_EQ(ast->items[0].upstream.hc_unhealthy_interval_ms, 2000u);
+}

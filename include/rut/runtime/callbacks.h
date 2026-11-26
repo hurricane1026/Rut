@@ -318,6 +318,7 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx);
 // backend. Defined in callbacks_impl.h; EventLoopCRTP uses it to distinguish an
 // intentional in-flight skip from a local launch deferral.
 bool probe_in_flight(u16 upstream_id, u32 backend_idx);
+bool probe_backend_latched_down(u16 upstream_id, u32 backend_idx);
 
 // Release the single-probe guard only after the backend has retired all I/O.
 void release_health_probe_guard(Connection& conn);

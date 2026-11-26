@@ -497,6 +497,9 @@ public:
     // activation) whenever the active config changes. Each backend bounds issue
     // by its submission capacity and reclaims probes using its own I/O lifetime.
     u64 health_probe_deadline_ns[RouteConfig::kMaxUpstreams]{};
+    u64 health_probe_last_issue_ns[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
+    bool health_probe_issued[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
+    u8 health_probe_backend_cursor[RouteConfig::kMaxUpstreams]{};
     static u64 deadline_after(u64 now, u32 interval_ms) {
         u64 delay = 0;
         if (__builtin_mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay))
@@ -544,8 +547,14 @@ public:
             const u32 m = cfg->upstream_count < RouteConfig::kMaxUpstreams
                               ? cfg->upstream_count
                               : RouteConfig::kMaxUpstreams;
-            for (u32 u = 0; u < m; u++)
+            for (u32 u = 0; u < m; u++) {
                 health_probe_deadline_ns[u] = deadline_after(now, cfg->upstreams[u].hc_interval_ms);
+                health_probe_backend_cursor[u] = 0;
+                for (u32 b = 0; b < UpstreamTarget::kMaxBackends; b++) {
+                    health_probe_last_issue_ns[u][b] = now;
+                    health_probe_issued[u][b] = false;
+                }
+            }
         }
         return true;
     }
@@ -609,6 +618,43 @@ public:
                     (static_cast<i64>(start) + static_cast<i64>(scanned)) % static_cast<i64>(n));
                 const UpstreamTarget& up = cfg->upstreams[u];
                 if (!up.hc_enabled) continue;
+                if (up.hc_unhealthy_interval_ms != 0) {
+                    const u32 count = up.addr_count;
+                    if (count == 0 || count > UpstreamTarget::kMaxBackends) continue;
+                    const u32 first = health_probe_backend_cursor[u] % count;
+                    bool issued_here = false;
+                    for (u32 scanned_backend = 0; scanned_backend < count; ++scanned_backend) {
+                        const u32 b = static_cast<u32>(
+                            (static_cast<i64>(first) + static_cast<i64>(scanned_backend)) %
+                            static_cast<i64>(count));
+                        if (up.weights[b] == 0 || probe_in_flight(static_cast<u16>(u), b)) continue;
+                        const u32 cadence = health_probe_issued[u][b] && probe_backend_latched_down(
+                                                                             static_cast<u16>(u), b)
+                                                ? up.hc_unhealthy_interval_ms
+                                                : up.hc_interval_ms;
+                        if (now < deadline_after(health_probe_last_issue_ns[u][b], cadence))
+                            continue;
+                        if (budget == 0) {
+                            health_probe_backend_cursor[u] = static_cast<u8>(b);
+                            health_probe_sweep_cursor =
+                                issued_here ? static_cast<u32>((static_cast<i64>(u) + 1) %
+                                                               static_cast<i64>(n))
+                                            : u;
+                            return;
+                        }
+                        if (start_health_probe(&self(), static_cast<u16>(u), b)) {
+                            --budget;
+                            issued_here = true;
+                            health_probe_last_issue_ns[u][b] = monotonic_ns();
+                            health_probe_issued[u][b] = true;
+                            health_probe_backend_cursor[u] = static_cast<u8>(
+                                (static_cast<i64>(b) + 1) % static_cast<i64>(count));
+                        }
+                    }
+                    next_cursor = static_cast<u32>((static_cast<i64>(u) + 1) % static_cast<i64>(n));
+                    cursor_advanced = true;
+                    continue;
+                }
                 if (now < health_probe_deadline_ns[u]) continue;
                 if (budget == 0) {
                     health_probe_sweep_cursor = u;  // out of budget — resume here next tick

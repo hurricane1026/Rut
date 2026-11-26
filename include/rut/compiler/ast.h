@@ -432,8 +432,9 @@ struct AstUpstreamDecl {
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_host_lit{};
-    Str hc_path_lit{};             // raw `path:` string literal
-    u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms
+    Str hc_path_lit{};       // raw `path:` string literal
+    u32 hc_interval_ms = 0;  // `interval:` DurLit converted to ms
+    u32 hc_unhealthy_interval_ms = 0;
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
     ActiveHealthStatuses hc_healthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};

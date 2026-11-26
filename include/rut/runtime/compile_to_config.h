@@ -635,7 +635,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_timeout_ms,
                                                    up.hc_host,
                                                    up.hc_healthy_statuses,
-                                                   up.hc_require_initial_success))
+                                                   up.hc_require_initial_success,
+                                                   up.hc_unhealthy_interval_ms))
                     return false;
             }
         }
@@ -698,7 +699,8 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
                                                    up.hc_timeout_ms,
                                                    up.hc_host,
                                                    up.hc_healthy_statuses,
-                                                   up.hc_require_initial_success))
+                                                   up.hc_require_initial_success,
+                                                   up.hc_unhealthy_interval_ms))
                     return false;
             }
         }
