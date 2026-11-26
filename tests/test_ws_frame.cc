@@ -31,7 +31,7 @@ bool roundtrips(WsOpcode op, bool fin, bool masked, u64 len) {
     WsFrameHeader h{};
     if (ws_parse_header(hdr, n, masked, &h) != ParseStatus::Complete) return false;
     if (h.header_len != n || h.fin != fin || h.masked != masked || h.opcode != op ||
-        h.payload_len != len) {
+        static_cast<u64>(h.payload_len) != len) {
         return false;
     }
     return !masked || memcmp(h.mask_key, key, 4) == 0;
@@ -264,7 +264,7 @@ TEST(ws_frame_write, rejects_reserved_and_out_of_range_opcodes_without_writing) 
 
 namespace {
 // Minimal header for the assembler (it reads only opcode/fin/payload_len).
-WsFrameHeader mh(WsOpcode op, bool fin, u64 len) {
+WsFrameHeader mh(WsOpcode op, bool fin, i64 len) {
     WsFrameHeader h{};
     h.opcode = op;
     h.fin = fin;
@@ -276,7 +276,7 @@ struct FeedResult {
     WsOpcode opcode;
     u64 total;
 };
-FeedResult feed(WsMessageAssembler& m, WsOpcode op, bool fin, u64 len, u64 max) {
+FeedResult feed(WsMessageAssembler& m, WsOpcode op, bool fin, i64 len, u64 max) {
     FeedResult r{};
     r.opcode = WsOpcode::Continuation;
     r.st = ws_message_feed(m, mh(op, fin, len), max, &r.opcode, &r.total);
@@ -295,10 +295,12 @@ TEST(ws_message, single_unfragmented_text) {
 
 TEST(ws_message, unbounded_fragment_lengths_cannot_overflow) {
     WsMessageAssembler m;
-    CHECK(feed(m, WsOpcode::Binary, false, ~u64{0} - 1, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Binary, false, INT64_MAX, 0).st == WsMessageStatus::NeedMore);
+    CHECK(feed(m, WsOpcode::Continuation, false, INT64_MAX, 0).st == WsMessageStatus::NeedMore);
     CHECK(feed(m, WsOpcode::Continuation, true, 2, 0).st == WsMessageStatus::Error);
     CHECK(!m.in_fragmented);
     CHECK(feed(m, static_cast<WsOpcode>(3), true, 0, 0).st == WsMessageStatus::Error);
+    CHECK(feed(m, WsOpcode::Binary, true, -1, 0).st == WsMessageStatus::Error);
 }
 
 TEST(ws_message, cap_reduced_between_fragments_cannot_underflow) {
@@ -365,12 +367,12 @@ TEST(ws_message, max_message_size_overflow_safe) {
 TEST(ws_frame, rsv1_requires_negotiation_and_only_marks_initial_data_fragments) {
     constexpr WsOpcode kOpcodes[] = {WsOpcode::Text, WsOpcode::Binary};
     constexpr bool kFlags[] = {false, true};
-    constexpr u64 kLengths[] = {0, 125, 126, 65536};
+    constexpr i64 kLengths[] = {0, 125, 126, 65536, INT64_MAX};
     const u8 kMask[] = {1, 2, 3, 4};
     for (WsOpcode opcode : kOpcodes) {
         for (bool fin : kFlags) {
             for (bool masked : kFlags) {
-                for (u64 length : kLengths) {
+                for (i64 length : kLengths) {
                     u8 wire[kWsMaxHeaderSize]{};
                     const u32 size =
                         ws_write_header(wire, opcode, fin, masked, kMask, length, true);

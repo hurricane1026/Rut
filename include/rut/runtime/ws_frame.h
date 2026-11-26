@@ -41,7 +41,7 @@ struct WsFrameHeader {
     bool masked;
     WsOpcode opcode;
     u8 mask_key[4];   // valid iff masked
-    u64 payload_len;  // 7-/16-/64-bit decoded length
+    i64 payload_len;  // decoded length, in [0, INT64_MAX]
     u32 header_len;   // octets this header consumed (2..14); payload starts at buf+header_len
     bool compressed = false;  // RFC 7692 RSV1, only on the first data fragment
 };

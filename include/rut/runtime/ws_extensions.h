@@ -33,7 +33,7 @@ u32 ws_format_deflate_agreement(const WsDeflateAgreement& agreement, char* outpu
 // coalesced bytes after it. Returns the new header length, or zero without
 // mutation if the bounded rewrite cannot fit or framing is invalid.
 // extension_value must not alias buffer.
-u32 ws_rewrite_extensions(
+[[nodiscard]] u32 ws_rewrite_extensions(
     u8* buffer, u32 header_len, u32 total_len, u32 capacity, Str extension_value);
 // Borrow the selected token from an owned, validated 101 header block. Its
 // storage must stay immutable for the lifetime of the connection context.

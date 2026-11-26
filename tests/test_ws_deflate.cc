@@ -525,7 +525,7 @@ TEST(ws_deflate, inspector_incompressible_maximum_falls_back_without_losing_owne
         REQUIRE_EQ(ws_parse_header(output.data(), produced, masked, &header, true),
                    ParseStatus::Complete);
         CHECK_FALSE(header.compressed);
-        CHECK_EQ(header.payload_len, input.size());
+        CHECK_EQ(static_cast<u64>(header.payload_len), input.size());
         if (masked)
             ws_unmask(output.data() + header.header_len, header.payload_len, header.mask_key);
         CHECK_EQ(memcmp(output.data() + header.header_len, input.data(), input.size()), 0);

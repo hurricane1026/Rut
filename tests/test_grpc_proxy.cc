@@ -432,7 +432,7 @@ struct EchoServer {
             const auto parsed = ws_parse_header(s->data, s->len, true, &header);
             if (parsed == ParseStatus::Incomplete ||
                 (parsed == ParseStatus::Complete &&
-                 s->len < header.header_len + header.payload_len))
+                 s->len < header.header_len + static_cast<u64>(header.payload_len)))
                 return NGHTTP2_ERR_DEFERRED;
             if (parsed != ParseStatus::Complete || header.opcode != WsOpcode::Close || len < 127)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;

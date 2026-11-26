@@ -1,5 +1,6 @@
 #include "rut/runtime/ws_deflate.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #if RUT_ENABLE_WEBSOCKET
@@ -31,19 +32,19 @@ struct WsDeflateCodec {
 };
 
 namespace {
-voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
+[[nodiscard]] voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
     auto& codec = *static_cast<WsDeflateCodec*>(opaque);
-    u64 kBytes = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(items), static_cast<u64>(size), &kBytes))
-        return nullptr;
-    const u32 kStart = static_cast<u32>((static_cast<i64>(codec.used) + 15) & ~15ll);
-    if (kStart > SlicePool::kBulkSliceSize ||
-        kBytes > static_cast<u64>(static_cast<i64>(SlicePool::kBulkSliceSize) -
-                                  static_cast<i64>(kStart)))
-        return nullptr;
-    u8* const kResult = reinterpret_cast<u8*>(&codec) + static_cast<i64>(kStart);
-    memset(kResult, 0, kBytes);
-    codec.used = static_cast<u32>(static_cast<i64>(kStart) + static_cast<i64>(kBytes));
+    u32 bytes;
+    if (__builtin_mul_overflow(items, size, &bytes)) return nullptr;
+    constexpr i64 kAlignment = 16;
+    constexpr auto kPadding = range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
+    const auto padded = range_int(codec.used) + kPadding;
+    const i64 start = padded.value() / kAlignment * kAlignment;
+    constexpr i64 kCapacity = SlicePool::kBulkSliceSize;
+    if (start > kCapacity || bytes > kCapacity - start) return nullptr;
+    u8* const kResult = reinterpret_cast<u8*>(&codec) + start;
+    memset(kResult, 0, bytes);
+    codec.used = static_cast<u32>(start + range_int(bytes).value());
     return kResult;
 }
 void codec_free(voidpf, voidpf) {}
@@ -176,11 +177,8 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
         const u8* source = input ? input + static_cast<i64>(offset) : nullptr;
         if (mask_key && kTake) {
             memcpy(codec.scratch, source, kTake);
-            ws_unmask_chunk(codec.scratch,
-                            kTake,
-                            mask_key,
-                            static_cast<u64>(static_cast<i64>(mask_offset & 3) +
-                                             static_cast<i64>(static_cast<u64>(offset) & 3)));
+            const auto phase = bounded_remainder<4>(mask_offset) + bounded_remainder<4>(offset);
+            ws_unmask_chunk(codec.scratch, kTake, mask_key, phase.to_u64());
             source = codec.scratch;
         }
         const auto kStatus = inflate_bytes(codec, source, kTake, output, boundary);

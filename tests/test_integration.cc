@@ -20675,14 +20675,14 @@ struct WsFrameEchoServer {
                     if (rut::ws_parse_header(acc + off, have - off, true, &h) !=
                         rut::ParseStatus::Complete)
                         break;
-                    const rut::u64 ftotal = h.header_len + h.payload_len;
+                    const rut::u64 ftotal = h.header_len + static_cast<u64>(h.payload_len);
                     if (have - off < ftotal) break;
                     rut::u8 pl[8192];
-                    for (rut::u64 i = 0; i < h.payload_len; i++)
+                    for (rut::i64 i = 0; i < h.payload_len; i++)
                         pl[i] = acc[off + h.header_len + i];
                     rut::ws_unmask(pl, h.payload_len, h.mask_key);
                     if (h.opcode == rut::WsOpcode::Close &&
-                        h.payload_len <= sizeof(s->close_payload)) {
+                        static_cast<u64>(h.payload_len) <= sizeof(s->close_payload)) {
                         for (u32 i = 0; i < h.payload_len; i++) s->close_payload[i] = pl[i];
                         s->close_length.store(static_cast<u32>(h.payload_len),
                                               std::memory_order_release);
@@ -20691,7 +20691,7 @@ struct WsFrameEchoServer {
                     rut::u8 key[4] = {0, 0, 0, 0};
                     rut::u32 hl =
                         rut::ws_write_header(out, h.opcode, true, false, key, h.payload_len);
-                    for (rut::u64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
+                    for (rut::i64 i = 0; i < h.payload_len; i++) out[hl + i] = pl[i];
                     if (s->echo_delay_us != 0) usleep(s->echo_delay_us);
                     (void)send_all(client,
                                    reinterpret_cast<char*>(out),
@@ -21116,7 +21116,7 @@ TEST(websocket_e2e, terminate_drop_pong_survives_every_segmentation) {
         for (int tries = 0; tries < 40 && !got; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
                 got = h.payload_len == 4 && memcmp(racc + h.header_len, "PONG", 4) == 0;
                 break;
             }
@@ -21225,7 +21225,7 @@ TEST(websocket_e2e, terminate_survives_segmentation_while_echo_in_flight) {
         for (int tries = 0; tries < 60 && got_frames < 2; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
                 const char* want = got_frames == 0 ? "PING" : "PONG";
                 ok = ok && h.payload_len == 4 && memcmp(racc + h.header_len, want, 4) == 0;
                 const u32 ftotal = h.header_len + static_cast<u32>(h.payload_len);
@@ -21323,8 +21323,8 @@ TEST(websocket_e2e, terminate_drop_then_forward_coalesced_in_one_segment) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];
@@ -21407,8 +21407,8 @@ TEST(websocket_e2e, terminate_inspects_forwards_and_drops) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover
@@ -21566,7 +21566,7 @@ static void check_ws_close_reason_round_trip(rut::test::TestCase* _tc, bool bran
         WsFrameHeader h;
         for (;;) {
             if (ws_parse_header(output, have, false, &h) == ParseStatus::Complete &&
-                have >= h.header_len + h.payload_len)
+                have >= h.header_len + static_cast<u64>(h.payload_len))
                 break;
             REQUIRE(have < sizeof(output));
             const i32 n = recv_timeout(
@@ -21714,7 +21714,7 @@ static void check_fixed_ws_rewrite_round_trip(rut::test::TestCase* _tc,
             WsFrameHeader h{};
             for (;;) {
                 if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
-                    have >= h.header_len + h.payload_len)
+                    have >= h.header_len + static_cast<u64>(h.payload_len))
                     break;
                 const i32 n = recv_timeout(client,
                                            reinterpret_cast<char*>(received + have),
@@ -21855,12 +21855,12 @@ TEST(websocket_e2e, terminate_forwards_fragmented) {
         REQUIRE(nread > 0);
         have += static_cast<u32>(nread);
         if (ws_parse_header(received, have, false, &h) == ParseStatus::Complete &&
-            have >= h.header_len + h.payload_len)
+            have >= h.header_len + static_cast<u64>(h.payload_len))
             break;
     }
     CHECK(h.opcode == WsOpcode::Text);
     REQUIRE_EQ(h.payload_len, 5u);
-    REQUIRE(have >= h.header_len + h.payload_len);
+    REQUIRE(have >= h.header_len + static_cast<u64>(h.payload_len));
     CHECK(memcmp(received + h.header_len, "HELLO", 5) == 0);
 
     close(c);
@@ -21923,8 +21923,8 @@ TEST(websocket_e2e, terminate_iouring) {
         for (int tries = 0; tries < 50; tries++) {
             WsFrameHeader h;
             if (rhave >= 2 && ws_parse_header(racc, rhave, false, &h) == ParseStatus::Complete &&
-                rhave >= h.header_len + h.payload_len) {
-                for (u64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
+                rhave >= h.header_len + static_cast<u64>(h.payload_len)) {
+                for (i64 i = 0; i < h.payload_len; i++) out[i] = racc[h.header_len + i];
                 *outlen = static_cast<u32>(h.payload_len);
                 const u32 total = h.header_len + static_cast<u32>(h.payload_len);
                 for (u32 i = total; i < rhave; i++) racc[i - total] = racc[i];  // keep leftover

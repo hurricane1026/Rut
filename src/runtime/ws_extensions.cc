@@ -1,6 +1,7 @@
 #include "rut/runtime/ws_extensions.h"
 
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"
 
@@ -10,23 +11,22 @@ namespace rut {
 namespace {
 struct Value {
     bool present = false;
-    u32 number = 0;
+    i32 number = 0;
     bool decimal = true;
-    u32 digits = 0;
+    i64 digits = 0;
     bool leading_zero = false;
 };
 struct Cursor {
     Str value;
-    u32 offset = 0;
+    i64 offset = 0;
     void whitespace() {
         while (offset < value.len && (value.ptr[offset] == ' ' || value.ptr[offset] == '\t'))
             ++offset;
     }
     Str token() {
-        const u32 kStart = offset;
+        const i64 kStart = offset;
         while (offset < value.len && is_http_tchar(static_cast<u8>(value.ptr[offset]))) ++offset;
-        return {value.ptr + static_cast<i64>(kStart),
-                static_cast<u32>(static_cast<i64>(offset) - static_cast<i64>(kStart))};
+        return {value.ptr + kStart, static_cast<u32>(offset - kStart)};
     }
     bool parameter_value(Value& result) {
         result.present = true;
@@ -53,8 +53,7 @@ struct Cursor {
             if (byte < '0' || byte > '9' || result.digits >= 2)
                 result.decimal = false;
             else
-                result.number = static_cast<u32>(static_cast<i64>(result.number) * 10 +
-                                                 static_cast<i64>(byte) - '0');
+                result.number = result.number * 10 + (i32{byte} - '0');
             ++result.digits;
             ++offset;
         }
@@ -71,8 +70,8 @@ bool parse(const Header* headers, u32 count, bool response, WsDeflateAgreement* 
     if (!agreement || count > kMaxHeaders || (!headers && count)) return false;
     *agreement = {};
     WsDeflateAgreement selected{};
-    u32 selections = 0;
-    for (u32 i = 0; i < count; ++i) {
+    i32 selections = 0;
+    for (i64 i = 0; i < count; ++i) {
         const auto& header = headers[i];
         if (!header.name.ptr ||
             !http_header_name_eq_ci(
@@ -230,15 +229,13 @@ u32 ws_rewrite_extensions(
         pos = static_cast<u32>(static_cast<i64>(kEnd) + 2);
     }
     constexpr Str kPrefix = lit_str("Sec-WebSocket-Extensions: ");
-    const i64 added = extension_value.len ? static_cast<i64>(kPrefix.len) +
-                                                static_cast<i64>(extension_value.len) + 2
-                                          : 0;
-    const i64 new_header_wide = static_cast<i64>(header_len) - static_cast<i64>(removed) + added;
-    if (new_header_wide < 0 ||
-        new_header_wide + static_cast<i64>(total_len) - static_cast<i64>(header_len) >
-            static_cast<i64>(capacity))
-        return 0;
-    const u64 kNewHeader = static_cast<u64>(new_header_wide);
+    constexpr u32 kLineOverhead = i64{kPrefix.len} + 2;
+    const u32 kOverhead = extension_value.len ? kLineOverhead : 0;
+    const auto header = range_int(header_len);
+    const auto added = range_int(extension_value.len) + range_int(kOverhead);
+    const auto new_header = header - range_int(removed) + added;
+    const auto tail = range_int(total_len) - header;
+    if (new_header.value() < 0 || (new_header + tail).value() > capacity) return 0;
     u32 written = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
     for (u32 pos = static_cast<u32>(static_cast<i64>(kFirstEnd) + 2);
          static_cast<i64>(pos) < static_cast<i64>(header_len) - 2;) {
@@ -253,9 +250,7 @@ u32 ws_rewrite_extensions(
     }
     // Shift the tail after scanning the old header; shrinking must not destroy
     // fields still being read, and growing must not overwrite early frame bytes.
-    memmove(buffer + static_cast<i64>(kNewHeader),
-            buffer + static_cast<i64>(header_len),
-            static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
+    memmove(buffer + new_header.value(), buffer + header.value(), static_cast<u32>(tail.value()));
     if (extension_value.len) {
         memcpy(buffer + static_cast<i64>(written), kPrefix.ptr, kPrefix.len);
         written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(kPrefix.len));
@@ -266,7 +261,7 @@ u32 ws_rewrite_extensions(
         written = static_cast<u32>(static_cast<i64>(written) + 2);
     }
     memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
-    return static_cast<u32>(kNewHeader);
+    return static_cast<u32>(new_header.value());
 }
 
 Str ws_selected_subprotocol(const u8* header, u32 header_len) {
