@@ -14,6 +14,7 @@ struct ShortArenaBackend {
     alignas(16) u8 storage[64];
     u32 acquire_count = 0;
     u32 release_count = 0;
+    u64 reported_size = 1;
 
     ShortArenaBackend() {
         for (u8& byte : storage) byte = 0xa5;
@@ -21,7 +22,7 @@ struct ShortArenaBackend {
 
     core::Expected<void, Error> init() { return {}; }
     u8* acquire(u64, u64* out_size) {
-        *out_size = 1;  // Deliberately shorter than Arena::Block::kHeaderSize.
+        *out_size = reported_size;
         ++acquire_count;
         return storage;
     }
@@ -50,6 +51,16 @@ TEST(block, short_backend_block_is_rejected_before_header_write) {
     Arena<ShortArenaBackend> arena;
     CHECK(!arena.init().has_value());
     CHECK_EQ(arena.backend.acquire_count, 1u);
+    CHECK_EQ(arena.backend.release_count, 1u);
+    CHECK_EQ(arena.current, nullptr);
+    CHECK_EQ(arena.total_allocated, 0u);
+    for (u8 byte : arena.backend.storage) CHECK_EQ(byte, 0xa5);
+}
+
+TEST(block, backend_block_outside_signed_offset_range_is_rejected) {
+    Arena<ShortArenaBackend> arena;
+    arena.backend.reported_size = u64{1} << 63;
+    CHECK(!arena.init().has_value());
     CHECK_EQ(arena.backend.release_count, 1u);
     CHECK_EQ(arena.current, nullptr);
     CHECK_EQ(arena.total_allocated, 0u);
@@ -242,6 +253,21 @@ TEST(arena, zero_size_alloc) {
 // ============================================================
 // Block overflow (from clapdb ArenaTest.NewBlockTest)
 // ============================================================
+
+TEST(arena, requests_outside_signed_block_range_do_not_acquire_or_advance) {
+    Arena<UndersizedArenaBackend> arena;
+    REQUIRE(arena.init().has_value());
+    auto* first = arena.current;
+    constexpr u64 kSignedMax = u64{INT64_MAX};
+    CHECK_EQ(arena.alloc(kSignedMax), nullptr);      // Alignment exceeds i64.
+    CHECK_EQ(arena.alloc(kSignedMax - 7), nullptr);  // Block header exceeds i64.
+    CHECK_EQ(arena.alloc(UINT64_MAX), nullptr);
+    CHECK_EQ(arena.backend.acquire_count, 1u);
+    CHECK_EQ(arena.current, first);
+    CHECK_EQ(first->used, 0);
+    CHECK(arena.alloc(8) != nullptr);
+    arena.destroy();
+}
 
 TEST(arena, overflow_to_new_block) {
     MmapArena a;
