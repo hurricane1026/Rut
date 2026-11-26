@@ -50608,3 +50608,69 @@ TEST(frontend, upstream_unhealthy_interval_validation) {
     REQUIRE(ast);
     CHECK_EQ(ast->items[0].upstream.hc_unhealthy_interval_ms, 2000u);
 }
+
+TEST(frontend, upstream_failover_membership_and_validation) {
+    const char* valid =
+        R"rut(upstream api { failover: ["127.0.0.1:09002"], backends: ["127.0.0.1:9001", "127.0.0.1:9002"] }
+route GET "/" { return forward(api, load_balance: .roundRobin) })rut";
+    auto tokens = lex(lit(valid));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.upstreams[0].failover_mask, 2u);
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].failover_mask, 2u);
+    rut::test::RouteConfigFixture short_fixture;
+    REQUIRE(short_fixture.config != nullptr);
+    auto& short_cfg = *short_fixture.config;
+    REQUIRE(short_cfg.add_upstream("api", 0x7f000001, 9001).has_value());
+    CHECK_FALSE(populate_route_config(short_cfg, rir.module));
+    rut::test::RouteConfigFixture reversed_fixture;
+    REQUIRE(reversed_fixture.config != nullptr);
+    auto& reversed = *reversed_fixture.config;
+    REQUIRE(reversed.add_upstream("api", 0x7f000001, 9002).has_value());
+    REQUIRE(reversed.add_upstream_backend(0, 0x7f000001, 9001));
+    CHECK_FALSE(populate_route_config(reversed, rir.module));
+    rut::test::RouteConfigFixture prebound_fixture;
+    REQUIRE(prebound_fixture.config != nullptr);
+    auto& prebound = *prebound_fixture.config;
+    REQUIRE(prebound.add_upstream("api", 0x7f000001, 9001).has_value());
+    REQUIRE(prebound.add_upstream_backend(0, 0x7f000001, 9002));
+    prebound.upstreams[0].weights[1] = 0;
+    CHECK_FALSE(populate_route_config(prebound, rir.module));
+    prebound.upstreams[0].weights[1] = 2;
+    REQUIRE(populate_route_config(prebound, rir.module));
+    CHECK_EQ(prebound.upstreams[0].failover_mask, 2u);
+    CHECK_EQ(prebound.upstreams[0].weights[1], 2u);
+    rir.module.upstreams[0].failover_mask = 4;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.module.upstreams[0].failover_mask = 2;
+    rir.module.upstreams[0].extra_ips[0] = rir.module.upstreams[0].ip;
+    rir.module.upstreams[0].extra_ports[0] = rir.module.upstreams[0].port;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    rir.destroy();
+    const char* invalid[] = {
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], failover: [] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], failover: ["127.0.0.1:9003"] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], failover: ["127.0.0.1:9002", "127.0.0.1:09002"] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001": 1, "127.0.0.1:9002": 0], failover: ["127.0.0.1:9002"] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], failover: ["127.0.0.1:9001", "127.0.0.1:9002"] })rut",
+        R"rut(upstream api { host: "127.0.0.1", port: 9001, failover: ["127.0.0.1:9001"] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:09001", "127.0.0.1:9002"], failover: ["127.0.0.1:9002"] })rut",
+        R"rut(upstream api { backends: ["127.0.0.1:9001", "127.0.0.1:9002"], failover: ["127.0.0.1:9002"] }
+route GET "/" { return forward(api, load_balance: .consistentHash, hash_key: "x", hash_seed: "0123456789abcdef0123456789abcdef") })rut",
+    };
+    for (const char* source : invalid) {
+        auto t = lex(lit(source));
+        REQUIRE(t);
+        auto a = parse_file_heap(t.value());
+        if (a) CHECK_FALSE(analyze_file_heap(a.value()));
+    }
+}

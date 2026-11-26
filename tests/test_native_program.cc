@@ -3839,6 +3839,7 @@ TEST(native_program, active_health_thresholds_survive_native_activation) {
     REQUIRE(source.append(R"rut(
 upstream api {
     backends: ["127.0.0.1:9001", "127.0.0.1:9002"]
+    failover: ["127.0.0.1:9002"]
     minimum_healthy_weight_percent: 50
     connect_attempts: 8
     response_header_timeout: 7s
@@ -3855,6 +3856,7 @@ route GET "/" { return forward(api, load_balance: .roundRobin) }
     const auto& config = owner.p->config;
     REQUIRE_EQ(config.upstream_count, 1u);
     const auto& target = config.upstreams[0];
+    CHECK_EQ(target.failover_mask, 2u);
     CHECK_EQ(target.minimum_healthy_weight_percent, 50u);
     CHECK_EQ(target.connect_attempts, 8u);
     CHECK_EQ(target.connect_timeout_seconds, 3u);

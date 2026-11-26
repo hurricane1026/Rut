@@ -18,7 +18,8 @@ constexpr u64 kMagic = 0x5255544e41544956ull;
 // Version 32 records active probe status sets.
 // Version 33 records active probe initial-readiness gating.
 // Version 34 records the unhealthy probe cadence.
-constexpr u32 kVersion = 34;
+// Version 35 records static upstream failover targets.
+constexpr u32 kVersion = 35;
 struct StreamHeader {
     u64 magic;
     u32 version;

@@ -54386,3 +54386,69 @@ TEST(route, preserve_host_connection_proto_tls_to_plain_origin_epoll) {
 TEST(route, preserve_host_connection_proto_tls_to_plain_origin_iouring) {
     check_preserve_host_connection_proto_tls_to_plain_origin(_tc, true);
 }
+
+TEST(route, failover_tier_obeys_health_exclusion_and_capacity) {
+    RouteConfig cfg;
+    auto uid = cfg.add_upstream("failover", 0x7f000001, 9001);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(uid.value()), 0x7f000001, 9002));
+    REQUIRE(cfg.add_upstream_backend(static_cast<u16>(uid.value()), 0x7f000001, 9003));
+    auto& target = cfg.upstreams[uid.value()];
+    target.failover_mask = 6;
+    const u64 now = 30'000'000;
+    const u16 id = static_cast<u16>(uid.value());
+    const ForwardLoadBalance rr{1, LoadBalancePolicy::RoundRobin};
+    const ForwardLoadBalance legacy{};
+    CHECK_EQ(select_forward_backend(&cfg, 0, legacy, id, 3, now, 0), 0u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, legacy, id, 3, now, 1), 3u);
+    target.weights[2] = 0;
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 0u);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 1), 3u);
+    for (u16 i = 0; i < kBackendFailThreshold; ++i) record_backend_result(id, 0, false, now);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 1u);
+    target.minimum_healthy_weight_percent = 75;
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 3u);
+    target.minimum_healthy_weight_percent = 0;
+    for (u16 i = 0; i < kBackendFailThreshold; ++i) record_backend_result(id, 1, false, now);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 3u);
+    record_backend_result(id, 0, true, now);
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 0u);
+    target.failover_mask = 8;
+    CHECK_EQ(select_forward_backend(&cfg, 0, rr, id, 3, now, 0), 3u);
+    record_backend_result(id, 1, true, now);
+}
+
+TEST(route, failover_fences_stale_passive_results) {
+    RouteConfig old_config, new_config;
+    REQUIRE(old_config.add_upstream("old", 0x7f000001, 9001).has_value());
+    REQUIRE(new_config.add_upstream("new", 0x7f000001, 9002).has_value());
+    const RouteConfig* active = &new_config;
+    struct Loop {
+        const RouteConfig** config_ptr;
+    } loop{&active};
+    CHECK(admit_passive_health_result(&loop, &old_config, 0));
+    new_config.upstreams[0].failover_mask = 1;
+    CHECK_FALSE(admit_passive_health_result(&loop, &old_config, 0));
+    new_config.upstreams[0].failover_mask = 0;
+    old_config.upstreams[0].failover_mask = 1;
+    CHECK_FALSE(admit_passive_health_result(&loop, &old_config, 0));
+    CHECK(admit_passive_health_result(&loop, &new_config, 0));
+}
+
+TEST(route, failover_configuration_rejects_invalid_masks_and_duplicates) {
+    UpstreamTarget target{};
+    REQUIRE(target.add_addr(0x7f000001, 9001));
+    REQUIRE(target.add_addr(0x7f000001, 9002));
+    target.failover_mask = 2;
+    CHECK(target.failover_valid());
+    target.failover_mask = 4;
+    CHECK_FALSE(target.failover_valid());
+    target.failover_mask = 3;
+    CHECK_FALSE(target.failover_valid());
+    target.failover_mask = 2;
+    target.weights[1] = 0;
+    CHECK_FALSE(target.failover_valid());
+    target.weights[1] = 1;
+    target.addrs[1] = target.addrs[0];
+    CHECK_FALSE(target.failover_valid());
+}

@@ -16602,6 +16602,10 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
                                   stmt.span,
                                   lit_str("hash arguments require a request scope"));
         const auto& up = mod.upstreams[upstream_index.value()];
+        if (up.failover_mask != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("consistentHash cannot use failover"));
         if (!up.has_address)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
@@ -22953,6 +22957,67 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.hc_require_initial_success = item.upstream.hc_require_initial_success;
         up.hc_type = item.upstream.hc_type;
         up.hc_timeout_ms = item.upstream.hc_timeout_ms;
+        if (item.upstream.failover_count != 0) {
+            for (u32 i = 0; i < item.upstream.backend_count; ++i) {
+                u32 ip = 0;
+                u16 port = 0;
+                if (!parse_host_port(item.upstream.backend_lits[i], ip, port))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          item.upstream.backend_lits[i]);
+                for (u32 j = 0; j < i; ++j) {
+                    u32 other_ip = 0;
+                    u16 other_port = 0;
+                    if (!parse_host_port(item.upstream.backend_lits[j], other_ip, other_port) ||
+                        (ip == other_ip && port == other_port))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              item.upstream.addr_span,
+                                              item.upstream.backend_lits[i]);
+                }
+            }
+            for (u32 f = 0; f < item.upstream.failover_count; ++f) {
+                u32 ip = 0;
+                u16 port = 0;
+                if (!parse_host_port(item.upstream.failover_lits[f], ip, port))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          item.upstream.failover_lits[f]);
+                u32 match = item.upstream.backend_count;
+                for (u32 i = 0; i < item.upstream.backend_count; ++i) {
+                    u32 candidate_ip = 0;
+                    u16 candidate_port = 0;
+                    if (!parse_host_port(
+                            item.upstream.backend_lits[i], candidate_ip, candidate_port))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              item.upstream.addr_span,
+                                              item.upstream.backend_lits[i]);
+                    if (candidate_ip == ip && candidate_port == port) {
+                        if (match != item.upstream.backend_count)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  item.upstream.addr_span,
+                                                  item.upstream.failover_lits[f]);
+                        match = i;
+                    }
+                }
+                if (match == item.upstream.backend_count || (up.failover_mask & (1u << match)))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          item.upstream.addr_span,
+                                          item.upstream.failover_lits[f]);
+                up.failover_mask |= static_cast<u8>(1u << match);
+            }
+            bool regular = false, backup = false;
+            for (u32 i = 0; i < item.upstream.backend_count; ++i) {
+                if (item.upstream.weight_count != 0 && item.upstream.backend_weights[i] == 0)
+                    continue;
+                if (up.failover_mask & (1u << i))
+                    backup = true;
+                else
+                    regular = true;
+            }
+            if (!regular || !backup)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"failover", 8});
+        }
         up.minimum_healthy_weight_percent = item.upstream.minimum_healthy_weight_percent;
         up.connect_attempts = item.upstream.connect_attempts;
         up.connect_timeout_seconds = item.upstream.connect_timeout_seconds;

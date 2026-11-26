@@ -1602,6 +1602,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.hc_require_initial_success = module.upstreams[i].hc_require_initial_success;
         up.hc_type = module.upstreams[i].hc_type;
         up.hc_timeout_ms = module.upstreams[i].hc_timeout_ms;
+        up.failover_mask = module.upstreams[i].failover_mask;
         up.minimum_healthy_weight_percent = module.upstreams[i].minimum_healthy_weight_percent;
         up.connect_attempts = module.upstreams[i].connect_attempts;
         up.connect_timeout_seconds = module.upstreams[i].connect_timeout_seconds;

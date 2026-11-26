@@ -565,6 +565,7 @@ bool load_native_program(const char* source,
             return fail("invalid native upstream connect timeout");
         if (target.connect_attempts == 0 || target.connect_attempts > UpstreamTarget::kMaxBackends)
             return fail("invalid native upstream connect attempts");
+        if (!target.failover_valid()) return fail("invalid native upstream failover");
         if (target.minimum_healthy_weight_percent > 100)
             return fail("invalid native upstream healthy weight percent");
         if (target.response_header_timeout_seconds >= TimerWheel::kSlots)

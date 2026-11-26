@@ -162,10 +162,12 @@ inline bool admit_passive_health_result(Loop* loop, const RouteConfig* pinned, u
         const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
         if (pinned && current != pinned) {
             const bool kOldPassive =
-                uid < pinned->upstream_count && pinned->upstreams[uid].passive_health.enabled;
+                uid < pinned->upstream_count && (pinned->upstreams[uid].passive_health.enabled ||
+                                                 pinned->upstreams[uid].failover_mask != 0);
             const bool kCurrentStrict =
                 current && uid < current->upstream_count &&
-                (current->upstreams[uid].minimum_healthy_weight_percent != 0 ||
+                (current->upstreams[uid].failover_mask != 0 ||
+                 current->upstreams[uid].minimum_healthy_weight_percent != 0 ||
                  current->upstreams[uid].passive_health.enabled ||
                  current->upstreams[uid].hc_require_initial_success);
             if (kOldPassive || kCurrentStrict) return false;
@@ -366,6 +368,27 @@ inline bool upstream_capacity_available(const UpstreamTarget& target, u16 uid, u
            healthy * 100 >= configured * static_cast<i64>(target.minimum_healthy_weight_percent);
 }
 
+// Choose the regular tier while any enabled, ready and healthy regular target
+// exists; otherwise choose the corresponding backup tier.
+inline u8 failover_eligible(const UpstreamTarget& target, u16 uid, u64 now) {
+    if (target.failover_mask == 0 || target.addr_count == 0 ||
+        target.addr_count > UpstreamTarget::kMaxBackends ||
+        (static_cast<u32>(target.failover_mask) >> target.addr_count) != 0 ||
+        !upstream_capacity_available(target, uid, now))
+        return 0;
+    u8 regular = 0, backup = 0;
+    for (u32 i = 0; i < target.addr_count; ++i) {
+        if (target.weights[i] == 0 || !backend_initially_ready(target, uid, i) ||
+            backend_ejected(uid, i, now))
+            continue;
+        if (target.failover_mask & (1u << i))
+            backup |= static_cast<u8>(1u << i);
+        else
+            regular |= static_cast<u8>(1u << i);
+    }
+    return regular != 0 ? regular : backup;
+}
+
 inline u32 select_strict_backend(const UpstreamTarget& target, u16 uid, u64 now, u8 excluded) {
     if (!upstream_capacity_available(target, uid, now)) return target.addr_count;
     return select_backend(uid, target.addr_count, now, target.weights, true, excluded, &target);
@@ -386,7 +409,11 @@ inline u32 select_forward_backend(const RouteConfig* cfg,
         return count;
     if (!forward_load_balance_valid(spec)) return count;
     const auto& target = cfg->upstreams[uid];
-    const bool strict = target.minimum_healthy_weight_percent != 0;
+    const bool strict = target.minimum_healthy_weight_percent != 0 || target.failover_mask != 0;
+    if (target.failover_mask != 0) {
+        if (spec.policy == LoadBalancePolicy::ConsistentHash) return count;
+        excluded_backends |= static_cast<u8>(~failover_eligible(target, uid, now));
+    }
     // Native callers without a compiled forward site retain their legacy path.
     if (spec.policy == LoadBalancePolicy::None) {
         for (u32 i = 0; i < count; ++i)
@@ -2769,18 +2796,21 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (conn.request_config && conn.upstream_idx < conn.request_config->upstream_count) {
         const auto& target = conn.request_config->upstreams[conn.upstream_idx];
         const u64 now = monotonic_us();
-        if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success) &&
+        if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success ||
+             target.failover_mask != 0) &&
             !current_health_generation(loop, conn.request_config))
             return false;
         if (target.hc_require_initial_success &&
             (conn.upstream_backend_idx >= target.addr_count ||
              !backend_initially_ready(target, conn.upstream_idx, conn.upstream_backend_idx)))
             return false;
-        if (target.minimum_healthy_weight_percent != 0 &&
+        if ((target.minimum_healthy_weight_percent != 0 || target.failover_mask != 0) &&
             (conn.upstream_backend_idx >= target.addr_count ||
              !upstream_capacity_available(target, conn.upstream_idx, now) ||
              target.weights[conn.upstream_backend_idx] == 0 ||
-             backend_ejected(conn.upstream_idx, conn.upstream_backend_idx, now)))
+             backend_ejected(conn.upstream_idx, conn.upstream_backend_idx, now) ||
+             (target.failover_mask != 0 && (failover_eligible(target, conn.upstream_idx, now) &
+                                            (1u << conn.upstream_backend_idx)) == 0)))
             return false;
     }
     // Paired strict HEAD failures are a one-shot connect-establishment
@@ -3717,7 +3747,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         // (terminate-mode config is set unconditionally above, for every request)
         conn.upstream_attempts = 1;  // initial attempt; on_upstream_connected retries
         conn.upstream_start_us = monotonic_us();
-        const u32 kBackend = target.hc_require_initial_success &&
+        const u32 kBackend = (target.hc_require_initial_success || target.failover_mask != 0) &&
                                      !current_health_generation(loop, conn.request_config)
                                  ? target.addr_count
                                  : select_forward_backend(conn.request_config,
@@ -4984,13 +5014,20 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const auto& target = config->upstreams[upstream_id];
                 const u64 kStartUs = monotonic_us();
-                const bool kCanConnect = !target.http2 &&
-                                         !(target.tls.enabled && conn.req_wants_upgrade) &&
-                                         target.addr_count <= UpstreamTarget::kMaxBackends;
+                const bool kCanConnect =
+                    ((target.failover_mask == 0 && !target.hc_require_initial_success) ||
+                     current_health_generation(loop, config)) &&
+                    !target.http2 && !(target.tls.enabled && conn.req_wants_upgrade) &&
+                    target.addr_count <= UpstreamTarget::kMaxBackends;
                 const u32 kBackend =
-                    !kCanConnect || (target.hc_require_initial_success &&
-                                     !current_health_generation(loop, config))
-                        ? target.addr_count
+                    !kCanConnect ? target.addr_count
+                    : target.failover_mask != 0
+                        ? select_strict_backend(
+                              target,
+                              static_cast<u16>(upstream_id),
+                              kStartUs,
+                              static_cast<u8>(~failover_eligible(
+                                  target, static_cast<u16>(upstream_id), kStartUs)))
                     : target.minimum_healthy_weight_percent != 0
                         ? select_strict_backend(target, static_cast<u16>(upstream_id), kStartUs, 0)
                         : select_backend(static_cast<u16>(upstream_id),
@@ -5783,15 +5820,15 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
             }
-            const u32 kBackend =
-                target.hc_require_initial_success && !current_health_generation(loop, config)
-                    ? target.addr_count
-                    : select_forward_backend(config,
-                                             conn.shard_id,
-                                             conn.forward_load_balance,
-                                             static_cast<u16>(outcome.upstream_id),
-                                             target.addr_count,
-                                             monotonic_us());
+            const u32 kBackend = (target.hc_require_initial_success || target.failover_mask != 0) &&
+                                         !current_health_generation(loop, config)
+                                     ? target.addr_count
+                                     : select_forward_backend(config,
+                                                              conn.shard_id,
+                                                              conn.forward_load_balance,
+                                                              static_cast<u16>(outcome.upstream_id),
+                                                              target.addr_count,
+                                                              monotonic_us());
             if (kBackend >= target.addr_count) {
                 release_upstream_slot(loop, conn);
                 conn.pending_handler_fn = nullptr;
@@ -6290,7 +6327,8 @@ bool try_connect_next_backend_impl(Loop* loop,
                                    Connection::Callback on_connected) {
     if (!config || conn.upstream_idx >= config->upstream_count) return false;
     const UpstreamTarget& target = config->upstreams[conn.upstream_idx];
-    if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success) &&
+    if ((target.minimum_healthy_weight_percent != 0 || target.hc_require_initial_success ||
+         target.failover_mask != 0) &&
         !current_health_generation(loop, config))
         return false;
     const u32 kBudget =
@@ -10661,7 +10699,8 @@ void h2_proxy_begin(Loop* loop, Connection& conn) {
     conn.upstream_attempts = 1;
     conn.upstream_start_us = monotonic_us();
     conn.set_slots(nullptr, nullptr, nullptr, &h2_on_upstream_connected<Loop>);
-    const u32 kBackend = target.hc_require_initial_success && !current_health_generation(loop, cfg)
+    const u32 kBackend = (target.hc_require_initial_success || target.failover_mask != 0) &&
+                                 !current_health_generation(loop, cfg)
                              ? target.addr_count
                              : select_forward_backend(cfg,
                                                       conn.shard_id,

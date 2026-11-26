@@ -4076,6 +4076,26 @@ struct Parser {
                     if (!parsed_percent) return core::make_unexpected(parsed_percent.error());
                     const u32 kPercent = static_cast<u32>(parsed_percent.value());
                     item.upstream.minimum_healthy_weight_percent = static_cast<u8>(kPercent);
+                } else if (field_name.eq({"failover", 8})) {
+                    if (item.upstream.failover_count != 0)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    auto open = expect(TokenType::LBracket);
+                    if (!open) return core::make_unexpected(open.error());
+                    if (cur().type == TokenType::RBracket)
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
+                    while (true) {
+                        auto endpoint = expect(TokenType::StringLit);
+                        if (!endpoint) return core::make_unexpected(endpoint.error());
+                        if (item.upstream.failover_count >= AstUpstreamDecl::kMaxBackends)
+                            return frontend_error(FrontendError::TooManyItems,
+                                                  span_from(*endpoint.value()));
+                        item.upstream.failover_lits[item.upstream.failover_count++] =
+                            endpoint.value()->text;
+                        if (!take(TokenType::Comma) || cur().type == TokenType::RBracket) break;
+                    }
+                    auto close = expect(TokenType::RBracket);
+                    if (!close) return core::make_unexpected(close.error());
                 } else if (field_name.eq({"backends", 8})) {
                     // String arrays retain equal weights; dictionary entries bind each
                     // endpoint directly to its literal weight in declaration order.
@@ -4412,6 +4432,9 @@ struct Parser {
             }
             auto rbrace = expect(TokenType::RBrace);
             if (!rbrace) return core::make_unexpected(rbrace.error());
+            if (item.upstream.failover_count != 0 && item.upstream.backend_count == 0)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, {"failover", 8});
             if (item.upstream.passive_health.enabled && item.upstream.http2)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       item.upstream.addr_span,
