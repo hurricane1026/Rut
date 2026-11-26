@@ -44,11 +44,27 @@ def main():
                     'malformed': '{', 'duplicate': '{"result":false,"result":true}',
                     'alias': '{"result":false,"resul\\u0074":true}',
                     'large': 'x' * 9000}.get(resource, '{"result":true}')
-            if self.path.endswith('/bound'):
+            if self.path.endswith(('/bound', '/context')):
+                now = int(time.time())
+                selected = request['input']
                 decision = dict(allow=True, revision='report-policy-v1', subject='report-reader',
                                 action='read', resource=resource, scope='reports:read',
-                                expires_at=int(time.time()) + 60)
+                                expires_at=now + 60)
+                if self.path.endswith('/context'):
+                    decision.update(request_id=selected['request_id'], audience=selected['audience'],
+                                    method=selected['method'], path=selected['path'],
+                                    policy_id=selected['policy_id'], issued_at=now)
                 decision.update({
+                    'wrong-request-id': {'request_id': 'another-request'},
+                    'bad-request-id': {'request_id': None},
+                    'wrong-audience': {'audience': 'another-gateway'},
+                    'wrong-policy-id': {'policy_id': 'other-policy'},
+                    'wrong-method': {'method': 'POST'},
+                    'wrong-path': {'path': '/other'},
+                    'future-decision': {'issued_at': now + 10},
+                    'old-decision': {'issued_at': now - 31, 'expires_at': now + 10},
+                    'long-decision': {'expires_at': now + 61},
+                    'bad-issue-time': {'issued_at': 'now'},
                     'bad-revision': {'revision': 'old-revision'},
                     'bad-subject': {'subject': 'other-consumer'},
                     'bad-resource': {'resource': 'other-resource'},
@@ -118,6 +134,8 @@ def main():
             source = source.replace('listen :8080\n', '')  # CLI selects an ephemeral port.
             bound = (examples / 'opa-bound-decision-auth.rut').read_text()
             source += '\n' + bound[bound.index('func boundIdentityStatus'):]
+            contextual = (examples / 'opa-request-context-auth.rut').read_text()
+            source += '\n' + contextual[contextual.index('func boundContextStatus'):]
             source += '''
 route GET "/ready" { return 204 }
 route POST "/boolean" {
@@ -200,6 +218,7 @@ route GET "/untrusted" {
             env = dict(os.environ, RUT_API_KEY='local-secret', OPA_ENDPOINT=json.dumps(endpoint),
                        OPA_DECISION=json.dumps(dict(endpoint, path='/v1/data/rut/decision')),
                        OPA_BOUND=json.dumps(dict(endpoint, path='/v1/data/rut/bound')),
+                       OPA_CONTEXT=json.dumps(dict(endpoint, path='/v1/data/rut/context')),
                        OPA_UNTRUSTED=json.dumps(dict(endpoint, serverName='wrong.invalid')))
             with log.open('wb') as output:
                 process = subprocess.Popen([args.server, '0', str(program), '--backend', args.backend,
@@ -338,6 +357,24 @@ route GET "/untrusted" {
                     assert h2_request(port, '/bound/good',
                                       [('authorization', 'Bearer local-secret')])[0] == 200
                     assert len(forwarded) == forwarded_before + 2
+                    forwarded_before = len(forwarded)
+                    for resource, expected in [
+                        ('wrong-request-id', 403), ('bad-request-id', 503),
+                        ('wrong-audience', 403), ('wrong-policy-id', 503),
+                        ('wrong-method', 403), ('wrong-path', 403), ('future-decision', 503),
+                        ('old-decision', 503), ('long-decision', 503), ('bad-issue-time', 503),
+                        ('explicit-deny', 403),
+                    ]:
+                        path = '/context/' + resource
+                        assert request(path)[0] == expected, (resource, expected)
+                        assert h2_request(port, path, [('authorization', 'Bearer local-secret')])[0] == expected
+                    assert len(forwarded) == forwarded_before
+                    assert request('/context/good')[0] == 200
+                    assert h2_request(port, '/context/good',
+                                      [('authorization', 'Bearer local-secret')])[0] == 200
+                    assert len(forwarded) == forwarded_before + 2
+                    assert request('/context/good?trace=local')[0] == 200
+                    assert records[-1][2]['input']['path'] == '/context/good'
                     assert forwarded[-1][1]['X-Consumer-ID'] == 'report-reader'
                     assert 'Authorization' not in forwarded[-1][1]
                     with ThreadPoolExecutor(max_workers=4) as workers:
@@ -379,10 +416,15 @@ route GET "/untrusted" {
                                 break
                         assert json.loads(data) == dict(allow=True, tenant='tenant-h2', role='reader'), data
                     for path, headers, message in records:
-                        assert path in ('/v1/data/rut/allow', '/v1/data/rut/decision', '/v1/data/rut/bound')
+                        assert path in ('/v1/data/rut/allow', '/v1/data/rut/decision',
+                                        '/v1/data/rut/bound', '/v1/data/rut/context')
                         assert headers['Content-Type'] == 'application/json'
                         assert all(key.lower() not in ('authorization', 'cookie', 'x-consumer-id') for key in headers)
                         assert set(message) == {'input'}
+                    request_ids = [message['input']['request_id'] for path, _, message in records
+                                   if path == '/v1/data/rut/context']
+                    assert len(request_ids) == len(set(request_ids))
+                    assert all(re.fullmatch(r'[0-9a-f-]{36}', value) for value in request_ids)
                     print(f'PASS: {args.backend} OPA Boolean/structured decisions, strict errors, TLS, authenticated proxy and isolation')
                 finally:
                     if process.poll() is None:

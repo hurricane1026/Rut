@@ -128,3 +128,21 @@ action. All text comparisons are exact and case-sensitive.
 The [bound decision example](../examples/opa-bound-decision-auth.rut) binds all
 five fields before forwarding, with its fixed verified HTTPS policy supplied as
 `OPA_BOUND`.
+
+### Optional request context and decision lifetime
+
+The [request context example](../examples/opa-request-context-auth.rut) uses a
+fixed HTTPS `OPA_CONTEXT` endpoint and the structured allow decision.
+
+| Helper | Decision requirement |
+| --- | --- |
+| `requestIdStatus` | `request_id` equals the gateway-generated ID sent with this request. |
+| `audienceStatus` | `audience` equals the gateway's configured policy audience. |
+| `policyIdStatus` | `policy_id` equals the configured policy identity independently of its revision. |
+| `httpTargetStatus` | `method` and `path` equal those sent in this request's policy input. The example uses the raw path without its query. |
+| `decisionLifetimeStatus` | Integer Unix seconds `issued_at` and `expires_at` describe an active decision with age and lifetime within the configured limits. |
+
+The gateway generates a fresh ID for each call and passes the same ID to the
+validator. The policy must return it along with the audience, policy identity,
+target and timestamps. A mismatched request ID, audience or target returns
+403. A wrong policy identity, invalid field or invalid lifetime returns 503.

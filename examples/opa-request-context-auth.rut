@@ -1,0 +1,48 @@
+import "middleware/auth.rut"
+import "middleware/opa.rut"
+
+listen :8080
+upstream backend at "127.0.0.1:9000"
+
+// OPA_CONTEXT is a fixed HTTPS endpoint returning an allow object bound to
+// the verified identity, policy and gateway-generated request context.
+func boundContextStatus(_ decision: Json, _ requestId: str, _ path: str, _ subject: str) -> i32 {
+    guard opa.policyIdStatus(decision, "reports") == 200 &&
+        opa.decisionLifetimeStatus(decision, 30, 60) == 200 else { 503 }
+    let identity = opa.subjectStatus(decision, subject)
+    guard identity == 200 else { identity }
+    let requestBinding = opa.requestIdStatus(decision, requestId)
+    guard requestBinding == 200 else { requestBinding }
+    let audience = opa.audienceStatus(decision, "reports-gateway")
+    guard audience == 200 else { audience }
+    opa.httpTargetStatus(decision, "GET", path)
+}
+
+func contextualRequest(_ subject: str, _ resource: str, _ requestId: str, _ path: str) -> Json {
+    guard requestId != "" else { nil }
+    guard let input = json.value({subject: subject, action: "read", resource: resource,
+                                  request_id: requestId, method: "GET", path: path,
+                                  audience: "reports-gateway", policy_id: "reports"}) else { nil }
+    opa.request(input)
+}
+
+route GET "/context/:id" {
+    let identity = auth.apiKey(req.authorization.or(""), env("RUT_API_KEY"), "report-reader", "primary")
+    let resource = req.param("id").or("")
+    let pendingId = uuid()
+    let requestId = pendingId.or("")
+    let path = req.pathOnly
+    guard let request = contextualRequest(identity.consumerId, resource, requestId, path) else { return 503 }
+    let pending = httpCall(env("OPA_CONTEXT"), request, 1000)
+    guard let reply = pending else { return 503 }
+    let allowed = opa.requireDecision(reply)
+    match boundContextStatus(allowed, requestId, path, identity.consumerId) {
+        200 => {
+            req.remove("Authorization")
+            req.set("X-Consumer-ID", identity.consumerId)
+            return forward(backend, load_balance: .roundRobin)
+        }
+        403 => { return 403 }
+        _ => { return 503 }
+    }
+}
