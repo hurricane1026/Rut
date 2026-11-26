@@ -10895,6 +10895,10 @@ precedes explicitly selected input construction; undefined/false decisions deny,
 and malformed/unavailable decisions fail closed. No OPA configuration syntax or
 Rego engine is added. See [the executable contract](docs/opa-authorization.md).
 
+Structured OPA allow decisions can be bound to the expected policy revision,
+verified subject, requested resource/action, delegated scope and expiry before
+forwarding. The decision fields use the application's trusted HTTPS schema.
+
 MIR reserves 32 blocks for the existing eight route guards, call continuations
 and terminal control. Callout codegen persists only values live across a call,
 including arguments reused during polling and edge-specific Phi inputs. Other

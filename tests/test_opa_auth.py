@@ -15,6 +15,8 @@ import tempfile
 import threading
 import time
 
+from auth_h2_fixture import request as h2_request
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -42,6 +44,23 @@ def main():
                     'malformed': '{', 'duplicate': '{"result":false,"result":true}',
                     'alias': '{"result":false,"resul\\u0074":true}',
                     'large': 'x' * 9000}.get(resource, '{"result":true}')
+            if self.path.endswith('/bound'):
+                decision = dict(allow=True, revision='report-policy-v1', subject='report-reader',
+                                action='read', resource=resource, scope='reports:read',
+                                expires_at=int(time.time()) + 60)
+                decision.update({
+                    'bad-revision': {'revision': 'old-revision'},
+                    'bad-subject': {'subject': 'other-consumer'},
+                    'bad-resource': {'resource': 'other-resource'},
+                    'bad-action': {'action': 'write'},
+                    'bad-scope': {'scope': 'reports:reader'},
+                    'invalid-scope': {'scope': 'reports:read  malformed'},
+                    'expired': {'expires_at': int(time.time())},
+                    'invalid-expiry': {'expires_at': "unknown"},
+                    'missing-subject': {'subject': None},
+                    'explicit-deny': {'allow': False},
+                }.get(resource, {}))
+                body = json.dumps({'result': decision})
             if self.path.endswith('/decision'):
                 body = json.dumps(dict(result=dict(allow=resource != 'deny',
                                       tenant='tenant-' + resource, role='reader')))
@@ -97,6 +116,8 @@ def main():
                 (root / 'middleware' / name).write_bytes((examples / 'middleware' / name).read_bytes())
             source = (examples / 'opa-auth.rut').read_text().replace(':9000"', f':{upstream.server_port}"')
             source = source.replace('listen :8080\n', '')  # CLI selects an ephemeral port.
+            bound = (examples / 'opa-bound-decision-auth.rut').read_text()
+            source += '\n' + bound[bound.index('func boundIdentityStatus'):]
             source += '''
 route GET "/ready" { return 204 }
 route POST "/boolean" {
@@ -178,6 +199,7 @@ route GET "/untrusted" {
             program.write_text(source)
             env = dict(os.environ, RUT_API_KEY='local-secret', OPA_ENDPOINT=json.dumps(endpoint),
                        OPA_DECISION=json.dumps(dict(endpoint, path='/v1/data/rut/decision')),
+                       OPA_BOUND=json.dumps(dict(endpoint, path='/v1/data/rut/bound')),
                        OPA_UNTRUSTED=json.dumps(dict(endpoint, serverName='wrong.invalid')))
             with log.open('wb') as output:
                 process = subprocess.Popen([args.server, '0', str(program), '--backend', args.backend,
@@ -300,6 +322,24 @@ route GET "/untrusted" {
                     assert request('/tenant-forward/allow')[0] == 200
                     assert len(forwarded) == count + 1
                     assert request('/mapped/deny')[0] == 403
+                    forwarded_before = len(forwarded)
+                    for resource, expected in [
+                        ('bad-revision', 503), ('bad-subject', 403), ('bad-resource', 403),
+                        ('bad-action', 403), ('bad-scope', 403), ('invalid-scope', 503),
+                        ('expired', 503), ('invalid-expiry', 503), ('missing-subject', 503),
+                        ('explicit-deny', 403),
+                    ]:
+                        status, _, _ = request('/bound/' + resource)
+                        assert status == expected, (resource, status, expected)
+                        assert h2_request(port, '/bound/' + resource,
+                                          [('authorization', 'Bearer local-secret')])[0] == expected
+                        assert len(forwarded) == forwarded_before
+                    assert request('/bound/good')[0] == 200
+                    assert h2_request(port, '/bound/good',
+                                      [('authorization', 'Bearer local-secret')])[0] == 200
+                    assert len(forwarded) == forwarded_before + 2
+                    assert forwarded[-1][1]['X-Consumer-ID'] == 'report-reader'
+                    assert 'Authorization' not in forwarded[-1][1]
                     with ThreadPoolExecutor(max_workers=4) as workers:
                         results = list(workers.map(lambda i: request('/mapped/' + str(i)), range(4)))
                     for i, (status, _, data) in enumerate(results):
@@ -339,7 +379,7 @@ route GET "/untrusted" {
                                 break
                         assert json.loads(data) == dict(allow=True, tenant='tenant-h2', role='reader'), data
                     for path, headers, message in records:
-                        assert path in ('/v1/data/rut/allow', '/v1/data/rut/decision')
+                        assert path in ('/v1/data/rut/allow', '/v1/data/rut/decision', '/v1/data/rut/bound')
                         assert headers['Content-Type'] == 'application/json'
                         assert all(key.lower() not in ('authorization', 'cookie', 'x-consumer-id') for key in headers)
                         assert set(message) == {'input'}

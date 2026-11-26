@@ -105,3 +105,26 @@ rules and tenant mismatches return 403; an empty configured tenant, missing or
 non-string tenant on an allow, malformed response, or unavailable OPA returns 503.
 Check its status before forwarding; do not derive the expected tenant from an
 untrusted request. `requireDecision` remains available for other decision schemas.
+
+### Optional structured decision bindings
+
+After `opa.requireDecision` accepts an allow result, routes can enforce the
+following fields before forwarding. The expected values come from an
+authenticated caller identity or trusted route/policy context.
+
+| Helper | Required decision field and comparison |
+| --- | --- |
+| `revisionStatus` | Exact `revision` string. A stale or different revision returns 503. |
+| `subjectStatus` | Exact `subject` string matching the authenticated subject. |
+| `resourceActionStatus` | Exact `resource` and `action` strings matching the selected operation. |
+| `delegatedScopesStatus` | A valid nonempty `scope` string containing all configured scopes. Grant and policy are each limited to 1024 bytes. |
+| `freshDecisionStatus` | Positive integer `expires_at` strictly later than the gateway's current Unix second. |
+
+The helpers return 200 on acceptance. A valid decision with a nonmatching
+subject, resource, action or insufficient scopes returns 403. Missing or
+malformed fields, an expired decision and invalid expected values return 503.
+Expected strings are nonempty, at most 256 bytes, and at most 64 bytes for an
+action. All text comparisons are exact and case-sensitive.
+The [bound decision example](../examples/opa-bound-decision-auth.rut) binds all
+five fields before forwarding, with its fixed verified HTTPS policy supplied as
+`OPA_BOUND`.

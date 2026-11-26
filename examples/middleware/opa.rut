@@ -51,3 +51,47 @@ func tenantStatus(_ decision: Json, _ tenant: str) -> i32 {
     guard let actual = json.string(json.get(decision, "/tenant").or(decision)) else { 503 }
     if actual == tenant { 200 } else { 403 }
 }
+
+// Bind the allow result to a trusted policy revision.
+func revisionStatus(_ decision: Json, _ expected: str) -> i32 {
+    guard expected != "" && Bytes(expected).count <= 256 else { 503 }
+    guard let revision = json.string(json.get(decision, "/revision").or(decision)) else { 503 }
+    guard revision == expected else { 503 }
+    200
+}
+
+// The caller supplies the subject obtained from its authentication policy.
+func subjectStatus(_ decision: Json, _ expected: str) -> i32 {
+    guard expected != "" && Bytes(expected).count <= 256 else { 503 }
+    guard let subject = json.string(json.get(decision, "/subject").or(decision)) else { 503 }
+    guard subject == expected else { 403 }
+    200
+}
+
+func resourceActionStatus(_ decision: Json, _ resource: str, _ action: str) -> i32 {
+    guard resource != "" && Bytes(resource).count <= 256 &&
+        action != "" && Bytes(action).count <= 64 else { 503 }
+    guard let actualResource = json.string(json.get(decision, "/resource").or(decision)) else { 503 }
+    guard let actualAction = json.string(json.get(decision, "/action").or(decision)) else { 503 }
+    guard actualResource == resource && actualAction == action else { 403 }
+    200
+}
+
+// Require every configured delegated permission from the strict scope list.
+func delegatedScopesStatus(_ decision: Json, _ required: str) -> i32 {
+    guard let policy = json.value({scope: required}) else { 503 }
+    guard jwtHasAnyScope(policy, required) else { 503 }
+    guard let grant = json.string(json.get(decision, "/scope").or(decision)) else { 503 }
+    guard jwtHasAnyScope(decision, grant) else { 503 }
+    guard jwtHasAllScopes(decision, required) else { 403 }
+    200
+}
+
+// The backend supplies an absolute Unix-second expiration for its decision.
+func freshDecisionStatus(_ decision: Json) -> i32 {
+    guard let expiry = json.int(json.get(decision, "/expires_at").or(decision)) else { 503 }
+    guard expiry > 0 else { 503 }
+    guard let times = json.value({iss: "rut", aud: "rut", sub: "rut", exp: expiry}) else { 503 }
+    guard jwtClaimsValid(times, "rut", "rut") else { 503 }
+    200
+}
