@@ -1,4 +1,5 @@
 #pragma once
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #include <sys/socket.h>
@@ -12,11 +13,14 @@ struct BufferedSendVector {
     const u8* second_source = nullptr;
     u32 first_size = 0;
     u32 total_size = 0;
-    constexpr void bind(const u8* first, u32 first_len, const u8* second, u32 second_len) {
+    [[nodiscard]] constexpr bool bind(const u8* first,
+                                      u32 first_len,
+                                      const u8* second,
+                                      u32 second_len) {
         first_source = first;
         second_source = second;
         first_size = first_len;
-        const i64 total = static_cast<i64>(first_len) + static_cast<i64>(second_len);
+        const i64 total = (range_int(first_len) + range_int(second_len)).value();
         if (total > static_cast<i64>(UINT32_MAX)) {
             first_source = nullptr;
             second_source = nullptr;
@@ -25,7 +29,7 @@ struct BufferedSendVector {
             message = {};
             parts[0] = {};
             parts[1] = {};
-            return;
+            return false;
         }
         total_size = static_cast<u32>(total);
         message = {};
@@ -33,36 +37,40 @@ struct BufferedSendVector {
         parts[1] = {const_cast<u8*>(second), second_len};
         message.msg_iov = parts;
         message.msg_iovlen = 2;
+        return true;
     }
-    constexpr bool matches(const u8* first, u32 total) const {
+    [[nodiscard]] constexpr bool matches(const u8* first, u32 total) const {
         return first != nullptr && first_source == first && first_size == parts[0].iov_len &&
                second_source == parts[1].iov_base && total_size == total &&
                message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
                parts[0].iov_len != 0 && parts[1].iov_base != nullptr && parts[1].iov_len != 0 &&
                parts[0].iov_len <= total &&
-               parts[1].iov_len ==
-                   static_cast<u64>(static_cast<i64>(total) - static_cast<i64>(parts[0].iov_len));
+               parts[1].iov_len == static_cast<u64>(
+                                       (range_int(total) -
+                                        range_int(static_cast<u32>(parts[0].iov_len))).value());
     }
-    constexpr void advance(u32 n) {
+    [[nodiscard]] constexpr bool advance(u32 n) {
         while (n && message.msg_iovlen) {
             auto& part = *message.msg_iov;
             const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
-            part.iov_len =
-                static_cast<u64>(static_cast<i64>(part.iov_len) - static_cast<i64>(kStep));
             const bool kFirst = &part == parts;
             const u8* source = kFirst ? first_source : second_source;
             const u32 kSize =
-                kFirst
-                    ? first_size
-                    : static_cast<u32>(static_cast<i64>(total_size) - static_cast<i64>(first_size));
-            part.iov_base = const_cast<u8*>(
-                source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len)));
-            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));
+                kFirst ? first_size
+                       : static_cast<u32>((range_int(total_size) - range_int(first_size)).value());
+            const auto remaining =
+                static_cast<__int128_t>(part.iov_len) - static_cast<__int128_t>(kStep);
+            if (remaining < 0 || remaining > kSize) return false;
+            const u32 offset = static_cast<u32>(static_cast<__int128_t>(kSize) - remaining);
+            part.iov_len = static_cast<size_t>(remaining);
+            part.iov_base = const_cast<u8*>(source + range_int(offset).value());
+            n = static_cast<u32>((range_int(n) - range_int(kStep)).value());
             if (part.iov_len == 0) {
                 ++message.msg_iov;
                 --message.msg_iovlen;
             }
         }
+        return n == 0;
     }
 };
 }  // namespace rut

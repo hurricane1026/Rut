@@ -1,5 +1,6 @@
 #include "rut/runtime/response_body_chain.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #include <stdint.h>
@@ -136,7 +137,7 @@ consteval bool direct_write_extent_contract() {
             const bool kValid =
                 kAddress >= kBegin && !__builtin_sub_overflow(kAddress, kBegin, &kOffset) &&
                 kOffset <= kCapacity &&
-                static_cast<i64>(kCount) <= static_cast<i64>(kCapacity) - static_cast<i64>(kOffset);
+                kCount <= (range_int(kCapacity) - range_int(static_cast<u32>(kOffset))).value();
             if (detail::record_direct_write_extent(
                     kBegin, kAddress, kCapacity, kCount, tail_dirty, node_dirty) != kValid)
                 return false;

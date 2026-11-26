@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -3869,11 +3870,14 @@ public:
             }
             const auto* next = c.response_body_tail.head->next;
             const u32 first = c.buffered_response_front_size();
-            c.response_send_vector.bind(
-                buf,
-                first,
-                ResponseBodyChain::payload(next) + static_cast<i64>(next->offset),
-                static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(first)));
+            if (!c.response_send_vector.bind(
+                    buf,
+                    first,
+                    ResponseBodyChain::payload(next) + range_int(next->offset).value(),
+                    static_cast<u32>((range_int(len) - range_int(first)).value()))) {
+                if (deadline_send) c.clear_response_read_deadline_send_owner();
+                return false;
+            }
             vector = &c.response_send_vector;
         }
         if (study_direct_body && c.response_read_deadline_upload.downstream_close &&
@@ -8465,12 +8469,11 @@ public:
             &timer.slots[expiry & static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
         if (last == head) return true;
-        const u64 node_offset = TimerWheel::timer_node_offset();
+        const i64 node_offset = TimerWheel::timer_node_offset();
         ListNode* node = head->next;
         for (;;) {
             if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
-            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) -
-                                                    static_cast<i64>(node_offset));
+            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
             if (c->idle_trim_examined) return true;  // reached the examined region
             ListNode* const next = node->next;
             const bool at_end = node == last;

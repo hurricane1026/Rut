@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "io_uring_send_target.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
@@ -873,11 +874,10 @@ bool IoUringBackend::add_send_file(i32 fd,
     if (conn_id >= connection_capacity || connection_capacity == 0 || fd < 0 || file_fd < 0 ||
         len == 0 || !send_result_fits(len))
         return false;
-    constexpr u64 kOffTMax = (u64{1} << (sizeof(off_t) * 8 - 1)) - 1;
-    if (static_cast<u64>(file_off) > kOffTMax) return false;
+    off_t pos;
+    if (!range_int(file_off).try_to_signed(&pos)) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;  // the completion must stay accountable
-    off_t pos = static_cast<off_t>(file_off);
     const ssize_t n = ::sendfile(fd, file_fd, &pos, len);
     // get_sqe() only reserves the slot; leaving it unsubmitted needs no undo.
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
@@ -974,6 +974,7 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
         return false;
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) return false;
+    if (vector && written != len && !vector->advance(written)) return false;
     // Same send state as add_send, advanced past the bytes the caller already
     // wrote directly; the Send completion still reports the whole length.
     send_state[conn_id] = {buf,
@@ -993,7 +994,6 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
         send_state[conn_id].offset = 0;
         send_state[conn_id].remaining = len;
     } else {
-        if (vector) vector->advance(written);
         sqe->opcode = vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
         sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
         sqe->fd = fd;
@@ -2142,13 +2142,11 @@ u32 IoUringBackend::wait(IoEvent* events,
                      conns[conn_id].fd != ss.fd))
                     result = -ECANCELED;
                 if (result == 0 && ss.remaining > 0) {
-                    constexpr u64 kOffTMax = (u64{1} << (sizeof(off_t) * 8 - 1)) - 1;
-                    const u64 pos_wide = static_cast<u64>(static_cast<i64>(ss.file_base) +
-                                                          static_cast<i64>(ss.offset));
-                    if (pos_wide > kOffTMax) {
+                    off_t pos;
+                    const auto file_position = range_int(ss.file_base) + range_int(ss.offset);
+                    if (!file_position.try_to_signed(&pos)) {
                         result = -EOVERFLOW;
                     } else {
-                        off_t pos = static_cast<off_t>(pos_wide);
                         const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
                         if (n > 0) {
                             ss.offset = static_cast<u32>(static_cast<i64>(ss.offset) + n);
@@ -2192,7 +2190,8 @@ u32 IoUringBackend::wait(IoEvent* events,
             }
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
-                if (!advance_send_bytes(ss.offset, ss.remaining, nw)) {
+                if (!advance_send_bytes(ss.offset, ss.remaining, nw) ||
+                    (ss.vector && !ss.vector->advance(nw))) {
                     // A completion may never claim bytes outside the submitted
                     // range.  Clear the state and emit one terminal failure;
                     // wrapping remaining would otherwise manufacture a complete
@@ -2220,7 +2219,6 @@ u32 IoUringBackend::wait(IoEvent* events,
                         c.recv_buf.data() == ss.src)
                         c.upstream_write_idle_progress_us = monotonic_us();
                 }
-                if (ss.vector) ss.vector->advance(nw);
                 if (ss.remaining > 0) {
                     // Partial — re-submit remaining bytes
                     io_uring_sqe* sqe = get_sqe_flushing();

@@ -403,14 +403,14 @@ struct IoUringBackend {
     // Complete a downstream send the caller already started with a direct
     // write of `written` bytes: a NOP injecting `len` when all bytes were
     // written, else a Send of the remainder whose completion reports `len`.
-    bool add_send_after_direct_write(i32 fd,
-                                     u32 conn_id,
-                                     const u8* buf,
-                                     u32 len,
-                                     u32 written,
-                                     u32 generation,
-                                     BufferedSendVector* vector = nullptr,
-                                     u32 extra_flags = 0);
+    [[nodiscard]] bool add_send_after_direct_write(i32 fd,
+                                                   u32 conn_id,
+                                                   const u8* buf,
+                                                   u32 len,
+                                                   u32 written,
+                                                   u32 generation,
+                                                   BufferedSendVector* vector = nullptr,
+                                                   u32 extra_flags = 0);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.

@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/send_progress.h"
@@ -352,8 +353,9 @@ void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
     struct itimerspec ts;
     __builtin_memset(&ts, 0, sizeof(ts));
     if (deadline_ns > 0) {
-        ts.it_value.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000ull);
-        ts.it_value.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000ull);
+        if (!bounded_quotient<1'000'000'000>(deadline_ns).try_to_signed(&ts.it_value.tv_sec))
+            return;
+        ts.it_value.tv_nsec = bounded_remainder<1'000'000'000>(deadline_ns).value();
     }
     // TFD_TIMER_ABSTIME — deadline_ns is absolute CLOCK_MONOTONIC. A zero
     // value disarms the timer. it_interval stays zero → one-shot.

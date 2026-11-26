@@ -203,10 +203,9 @@ def main():
         source = "src/runtime/buffered_send_vector.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("source + (static_cast<i64>(kSize) - static_cast<i64>(part.iov_len))",
-             "source + kStep"),
+            ("source + range_int(offset).value()", "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n = static_cast<u32>(static_cast<i64>(n) - static_cast<i64>(kStep));",
+            ("\n            n = static_cast<u32>((range_int(n) - range_int(kStep)).value());",
              "\n            n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
