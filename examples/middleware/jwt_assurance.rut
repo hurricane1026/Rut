@@ -10,11 +10,15 @@ func requireAcr(_ document: Json, _ expected: str) -> Json {
     document
 }
 
+func methodGroups(_ document: Json) -> Json {
+    guard let methods = json.get(document, "/amr") else { nil }
+    json.value({groups: methods})
+}
+
 func requireAmr(_ document: Json, _ expected: str) -> Json {
     guard selectorValid(expected) else { respond 503 }
-    guard let methods = json.get(document, "/amr") else { respond 403 }
-    guard let projection = json.value({groups: methods}) else { respond 403 }
-    guard jwtHasGroup(projection, expected) else { respond 403 }
+    guard let methods = methodGroups(document) else { respond 403 }
+    guard jwtHasGroup(methods, expected) else { respond 403 }
     document
 }
 
@@ -45,5 +49,41 @@ func requireVerifiedEmail(_ document: Json, _ expected: str) -> Json {
 func requireSession(_ document: Json, _ expected: str) -> Json {
     guard selectorValid(expected) else { respond 503 }
     guard json.string(json.get(document, "/sid").or(document)).or("") == expected else { respond 403 }
+    document
+}
+
+// ACR is a single class. AMR is a list of methods used in the same authentication.
+func requireAnyAcr(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard selectorValid(first) && selectorValid(second) else { respond 503 }
+    let actual = json.string(json.get(document, "/acr").or(document)).or("")
+    guard actual == first || actual == second else { respond 403 }
+    document
+}
+
+func requireAnyAmr(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard selectorValid(first) && selectorValid(second) else { respond 503 }
+    guard let methods = methodGroups(document) else { respond 403 }
+    guard jwtHasGroup(methods, first) || jwtHasGroup(methods, second) else { respond 403 }
+    document
+}
+
+func requireAllAmr(_ document: Json, _ first: str, _ second: str) -> Json {
+    guard selectorValid(first) && selectorValid(second) && first != second else { respond 503 }
+    guard let methods = methodGroups(document) else { respond 403 }
+    guard jwtHasGroup(methods, first) && jwtHasGroup(methods, second) else { respond 403 }
+    document
+}
+
+func requireAmrWithout(_ document: Json, _ required: str, _ forbidden: str) -> Json {
+    guard selectorValid(required) && selectorValid(forbidden) && required != forbidden else { respond 503 }
+    guard let methods = methodGroups(document) else { respond 403 }
+    guard jwtHasGroup(methods, required) && !jwtHasGroup(methods, forbidden) else { respond 403 }
+    document
+}
+
+func requireSessionPrincipal(_ document: Json, _ session: str, _ subject: str) -> Json {
+    guard selectorValid(session) && selectorValid(subject) else { respond 503 }
+    guard json.string(json.get(document, "/sid").or(document)).or("") == session &&
+        json.string(json.get(document, "/sub").or(document)).or("") == subject else { respond 403 }
     document
 }

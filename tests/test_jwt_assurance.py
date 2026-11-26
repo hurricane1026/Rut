@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise five assurance policies through a native-loaded gateway."""
+"""Exercise JWT assurance policies through a native-loaded gateway."""
 import argparse
 import os
 from pathlib import Path
@@ -33,12 +33,20 @@ def main():
                     {'email': 'alice@example.test', 'email_verified': 'true'},
                     {'email': 'alice@example.test', 'email_verified': False}]),
         "/session": ({'sid': 'session-one'}, [{'sid': 'session-two'}, {'sid': 1}]),
+        "/acr-any": ({'acr': 'alternate'}, [{'acr': 'Alternate'}, {'acr': ['alternate']}]),
+        "/amr-any": ({'amr': ['webauthn']}, [{'amr': ['webauthn', 7]}, {'amr': ['pwd']}]),
+        "/amr-all": ({'amr': ['webauthn', 'otp']}, [{'amr': ['otp']}, {'amr': ['otp', 'webauthn', 7]}]),
+        "/amr-without": ({'amr': ['otp', 'webauthn']},
+                         [{'amr': ['otp', 'sms']}, {'amr': ['otp', 7]}, {'amr': ['webauthn']}]),
+        "/session-principal": ({'sid': 'session-one'}, [{'sid': 'session-two'},
+                                                        {'sid': 'session-one', 'sub': 'bob'}]),
     }
     with tempfile.TemporaryDirectory(prefix="rut-jwt-assurance-") as directory:
         root = Path(directory)
         env = dict(os.environ, JWT_SECRET=KEY, JWT_REQUIRED_ACR="assured", JWT_REQUIRED_AMR="otp",
                    JWT_MAX_AUTH_AGE="120", JWT_VERIFIED_EMAIL="alice@example.test",
-                   JWT_REQUIRED_SESSION="session-one")
+                   JWT_REQUIRED_SESSION="session-one", JWT_ALTERNATE_ACR="alternate",
+                   JWT_ALTERNATE_AMR="webauthn", JWT_FORBIDDEN_AMR="sms", JWT_REQUIRED_SUBJECT="alice")
         for configured in (True, False):
             (root / "middleware").mkdir()
             module = "middleware/jwt_assurance.rut"
@@ -82,7 +90,7 @@ def main():
             finally:
                 proc.terminate()
                 proc.wait(timeout=10)
-    print(f"{args.backend}: five JWT assurance policies passed")
+    print(f"{args.backend}: JWT assurance policies passed")
     return 0
 
 
