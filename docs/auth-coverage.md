@@ -1593,6 +1593,11 @@ See [the contract and limits](oauth-introspection.md#optional-mtls-certificate-b
 
 ## Complete required-scope list policy
 
+The signed-token scope examples now exercise five additional set policies:
+forbidden-only, allowed subset, exact match, any with veto and all with veto.
+All return a challenged 403 for rejected verified grants.
+
+
 `jwtHasAllScopes` authorizes every permission in a trusted nonempty list, bounded
 to 1024 bytes, against the verified document's top-level scope. It validates both
 whole lists under the existing strict grammar before granting permission. Exact

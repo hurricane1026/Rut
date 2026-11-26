@@ -9370,6 +9370,11 @@ policy; a nil singleton field by itself cannot distinguish absence from duplicat
 
 ### Static authentication helper layer
 
+JWT scope set helpers support forbidden-only checks, allowed subsets, exact
+sets, and any/all required lists with explicit vetoes. They consume the
+already-authenticated grant and apply the same strict bounded scope grammar.
+
+
 `examples/middleware/auth.rut` provides API key, custom-header key, Basic and
 current/previous-key rotation helpers over ordinary typed `Identity` structs.
 The language card documents exact signatures and bounds. Identity and credential
