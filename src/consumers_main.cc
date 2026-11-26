@@ -823,6 +823,72 @@ u32 policy_count_active_credentials(PolicySnapshot& snapshot, u32 consumer) {
     return count;
 }
 
+bool policy_minimum_active_per_consumer(PolicySnapshot& snapshot, u32 value) {
+    i64 minimum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, minimum) || minimum > 64) return false;
+    auto& doc = snapshot.registry;
+    for (u32 owner = doc.nodes[snapshot.consumers].child; owner != json::kNone;
+         owner = doc.nodes[owner].next) {
+        if (policy_enabled(doc, owner) &&
+            policy_count_active_credentials(snapshot, owner) < minimum)
+            return false;
+    }
+    return true;
+}
+
+bool policy_maximum_enabled_per_consumer(PolicySnapshot& snapshot, u32 value) {
+    i64 maximum = 0;
+    if (!policy_quantity(snapshot.policy, value, 1, maximum) || maximum > 64) return false;
+    auto& doc = snapshot.registry;
+    for (u32 owner = doc.nodes[snapshot.consumers].child; owner != json::kNone;
+         owner = doc.nodes[owner].next) {
+        const u32 id = field(doc, owner, lit_str("id"));
+        i32 enabled = 0;
+        for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+             record = doc.nodes[record].next) {
+            if (policy_enabled(doc, record) &&
+                equal(doc, field(doc, record, lit_str("consumerId")), doc, id) &&
+                ++enabled > maximum)
+                return false;
+        }
+    }
+    return true;
+}
+
+bool policy_enabled_consumer_groups(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 owner = doc.nodes[snapshot.consumers].child; owner != json::kNone;
+         owner = doc.nodes[owner].next) {
+        if (policy_enabled(doc, owner) &&
+            doc.nodes[field(doc, owner, lit_str("groups"))].child == json::kNone)
+            return false;
+    }
+    return true;
+}
+
+bool policy_explicit_credential_groups(PolicySnapshot& snapshot, u32) {
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) && field(doc, record, lit_str("groups")) == json::kNone)
+            return false;
+    }
+    return true;
+}
+
+bool policy_future_activation(PolicySnapshot& snapshot, u32 value) {
+    i64 maximum = 0;
+    if (!policy_quantity(snapshot.policy, value, 0, maximum)) return false;
+    auto& doc = snapshot.registry;
+    for (u32 record = doc.nodes[snapshot.credentials].child; record != json::kNone;
+         record = doc.nodes[record].next) {
+        if (policy_enabled(doc, record) &&
+            policy_time(doc, record, lit_str("notBefore")) - snapshot.now > maximum)
+            return false;
+    }
+    return true;
+}
+
 bool policy_minimum_active(PolicySnapshot& snapshot, u32 value) {
     i64 minimum = 0;
     if (!policy_quantity(snapshot.policy, value, 0, minimum) || minimum > 64) return false;
@@ -901,6 +967,15 @@ bool policy_continuous_validity(PolicySnapshot& snapshot, u32 value) {
 constexpr PolicyRule kPolicyRules[] = {
     {lit_str("requireHashedKeys"), true, policy_hashed_keys},
     {lit_str("allowedMethods"), false, policy_allowed_methods},
+    {lit_str("minimumActiveCredentialsPerEnabledConsumer"),
+     false,
+     policy_minimum_active_per_consumer},
+    {lit_str("maximumEnabledCredentialsPerConsumer"), false, policy_maximum_enabled_per_consumer},
+    {lit_str("requireGroupsForEnabledConsumers"), true, policy_enabled_consumer_groups},
+    {lit_str("requireExplicitGroupsForEnabledCredentials"),
+     true,
+     policy_explicit_credential_groups},
+    {lit_str("maximumFutureActivationSeconds"), false, policy_future_activation},
     {lit_str("requireExpiryForEnabledCredentials"), true, policy_expiry},
     {lit_str("maxCredentialLifetimeSeconds"), false, policy_max_lifetime},
     {lit_str("minimumRemainingValiditySeconds"), false, policy_remaining_validity},

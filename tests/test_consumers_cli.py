@@ -101,6 +101,55 @@ def test_deployment_policy(tool, root):
     check({remaining: 1}, records=[dict(key, expiresAt=0)], rule=remaining)
     check({remaining: 1}, records=[dict(key, expiresAt=0, enabled=False)], ok=True)
     check({remaining: 9223372036854775807}, now=9223372036854775807, rule=remaining)
+
+    minimum = 'minimumActiveCredentialsPerEnabledConsumer'
+    second = dict(parked, enabled=True)
+    check({minimum: 2}, records=[key, second], ok=True)
+    check({minimum: 2}, records=[key, dict(second, notBefore=121)], rule=minimum)
+    check({minimum: 2}, records=[key, dict(second, expiresAt=120)], rule=minimum)
+    check({minimum: 2}, records=[key, dict(second, consumerId='disabled', groups=[])],
+          rule=minimum)
+    check({minimum: 1}, records=[key, second], consumers=[alice, dict(disabled, enabled=True)], rule=minimum)
+    for invalid in (0, 65, True, '2'):
+        check({minimum: invalid}, rule=minimum)
+
+    maximum = 'maximumEnabledCredentialsPerConsumer'
+    check({maximum: 1}, ok=True)
+    check({maximum: 1}, records=[key, dict(second, notBefore=121)], rule=maximum)
+    check({maximum: 1}, records=[key, dict(second, expiresAt=120)], rule=maximum)
+    check({maximum: 1}, records=[dict(key, consumerId='disabled', groups=[]),
+                                 dict(second, consumerId='disabled', groups=[])], rule=maximum)
+    check({maximum: 2}, records=[key, second], ok=True)
+    for invalid in (0, 65, True, '2'):
+        check({maximum: invalid}, rule=maximum)
+
+    owner_groups = 'requireGroupsForEnabledConsumers'
+    check({owner_groups: True}, ok=True)
+    check({owner_groups: True}, consumers=[alice, dict(disabled, enabled=True)], rule=owner_groups)
+    check({owner_groups: False}, consumers=[alice, dict(disabled, enabled=True)], ok=True)
+    check({owner_groups: 1}, rule=owner_groups)
+
+    credential_groups = 'requireExplicitGroupsForEnabledCredentials'
+    inherited = {field: value for field, value in key.items() if field != 'groups'}
+    check({credential_groups: True}, ok=True, records=[dict(key, groups=[])])
+    check({credential_groups: True}, records=[inherited], rule=credential_groups)
+    check({credential_groups: True}, records=[dict(inherited, enabled=False)], ok=True)
+    check({credential_groups: True}, records=[dict(inherited, consumerId='disabled')],
+          rule=credential_groups)
+
+    activation = 'maximumFutureActivationSeconds'
+    check({activation: 0}, ok=True)
+    check({activation: 0}, records=[dict(key, notBefore=121)], rule=activation)
+    check({activation: 0}, records=[dict(key, notBefore=121, enabled=False)], ok=True)
+    check({activation: 1}, records=[dict(key, notBefore=121)], ok=True)
+    check({activation: 1}, records=[dict(key, notBefore=122, consumerId='disabled', groups=[])],
+          rule=activation)
+    far = dict(key, notBefore=9223372036854775807, expiresAt=0)
+    check({activation: 9223372036854775806}, records=[far], now=1, ok=True)
+    check({activation: 9223372036854775805}, records=[far], now=1, rule=activation)
+    for invalid in (-1, False, 1.5, '1', 9223372036854775808):
+        check({activation: invalid}, rule=activation)
+
     active = 'minimumActiveCredentials'
     check({active: 1}, now=100, ok=True)
     check({active: 1}, now=99, rule=active)
@@ -188,6 +237,14 @@ def test_apply_checked(tool, root):
     assert b'invalid private' in apply_checked().stderr
     policy.chmod(0o600)
     assert not output.exists()
+
+    private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
+                         maximumFutureActivationSeconds=0))
+    private(patch, changes(credentials=[dict(hashed, notBefore=121, expiresAt=122)],
+                           remove_credentials=[raw['id']]))
+    assert b'maximumFutureActivationSeconds' in apply_checked().stderr
+    assert not output.exists()
+    private(patch, updated)
 
     private(policy, dict(requireHashedKeys=True, allowedMethods=['header'],
                          requireExpiryForEnabledCredentials=True))

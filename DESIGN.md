@@ -11363,6 +11363,10 @@ uses only the validated candidate snapshot and the supplied time.
 snapshot before publishing the exact validated bytes. A rejected rule leaves
 input and destination state intact.
 
+The Consumer guardrails can require a minimum number of active credentials,
+cap enabled records per owner, enforce explicit group scopes and bound future
+activation. They use the same offline deployment policy and candidate snapshot.
+
 Offline `rut-consumers diff BEFORE AFTER` validates both private snapshots and
 buffers a bounded redacted change report before stdout. Stable decoded IDs match
 records; metadata compares decoded values and group sets while preserving optional
