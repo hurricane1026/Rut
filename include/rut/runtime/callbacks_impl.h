@@ -15153,11 +15153,12 @@ inline bool build_redirect_response(const Connection& conn,
     static constexpr char kLegacyTail[] = "\r\nConnection: close\r\n\r\n";
     static constexpr char kFixedLocationPrefix[] = "\r\nConnection: close\r\nLocation: http://";
     static constexpr char kFixedTail[] = "\r\n\r\n";
-    constexpr u32 kCommonBytes =
+    constexpr i64 kCommonBytes =
         sizeof("HTTP/1.1 000 \r\nServer: \r\nDate: \r\nContent-Type: \r\nContent-Length: ") - 1;
-    constexpr u32 kLegacyBytes = kCommonBytes + sizeof(kLocationPrefix) + sizeof(kLegacyTail) - 2;
+    constexpr u32 kLegacyBytes =
+        kCommonBytes + static_cast<i64>(sizeof(kLocationPrefix) + sizeof(kLegacyTail)) - 2;
     constexpr u32 kFixedBytes =
-        kCommonBytes + sizeof(kFixedLocationPrefix) + sizeof(kFixedTail) - 2;
+        kCommonBytes + static_cast<i64>(sizeof(kFixedLocationPrefix) + sizeof(kFixedTail)) - 2;
     const u32 kFixedLength = legacy_profile ? kLegacyBytes : kFixedBytes;
     const u32 kPortDigits = append_listener_port ? actual_port_digits : 0;
     const u8 kPortColon = append_listener_port ? 1 : 0;

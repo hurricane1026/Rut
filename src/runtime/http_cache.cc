@@ -173,7 +173,7 @@ bool http_date(Str value, i64* seconds) {
         minute > 59 || second > 59)
         return false;
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    constexpr u32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    constexpr i32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     u32 month = 0;
     while (month < 12 &&
            !Str{p + static_cast<i64>(8), 3}.eq({kMonths + static_cast<i64>(month) * 3, 3}))
@@ -191,8 +191,9 @@ bool http_date(Str value, i64* seconds) {
     const auto last_year = range_int(year) - kOne;
     const auto year_days = (range_int(year) - kEpochYear).scaled_by<365>();
     const auto leap_days = leap_years(static_cast<u32>(last_year.value())) - leap_years(1969u);
-    u32 days_in_year = day - 1;
-    for (u32 i = 0; i < month; ++i) days_in_year += kDays[i] + (i == 1 && kLeap ? 1u : 0u);
+    i32 days_in_year = static_cast<i32>(day) - 1;
+    for (i32 i = 0; i < static_cast<i32>(month); ++i)
+        days_in_year += kDays[i] + (i == 1 && kLeap ? 1 : 0);
     const auto days = year_days + leap_days + range_int(days_in_year);
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
     if (!Str{p, 3}.eq({kWeekdays + ((days.value() + 4) % 7) * 3, 3})) return false;

@@ -11,7 +11,7 @@ bool MemoryHttpCacheStore::matches(const Entry& entry, KeyView key) {
 bool MemoryHttpCacheStore::find(KeyView key, Record& record) const {
     if (!key.bytes || key.len > kMaxKey) return false;
     const auto start = bounded_remainder<kCapacity / kWays>(key.hash).scaled_by<kWays>();
-    constexpr auto kBucketWidth = range_int<kWays, kWays + 1>::constant<kWays>();
+    constexpr auto kBucketWidth = range_int<kWays, i64{kWays} + 1>::constant<kWays>();
     const u32 kStart = static_cast<u32>(start.value());
     const i64 kEnd = (start + kBucketWidth).value();
     for (u32 i = kStart; i < kEnd; ++i) {
@@ -30,7 +30,7 @@ bool MemoryHttpCacheStore::find(KeyView key, Record& record) const {
 MemoryHttpCacheStore::Token MemoryHttpCacheStore::reserve(KeyView key, u32 ttl, u64 now_us) {
     if (!key.bytes || key.len > kMaxKey || generation_ == ~u64{0}) return {};
     const auto start = bounded_remainder<kCapacity / kWays>(key.hash).scaled_by<kWays>();
-    constexpr auto kBucketWidth = range_int<kWays, kWays + 1>::constant<kWays>();
+    constexpr auto kBucketWidth = range_int<kWays, i64{kWays} + 1>::constant<kWays>();
     const u32 kStart = static_cast<u32>(start.value());
     const i64 kEnd = (start + kBucketWidth).value();
     u32 victim = kStart;

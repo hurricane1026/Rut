@@ -111,7 +111,7 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
         size += (range_int(replacement.len) - length).value();
         if (end == start) {
             if (end == text.len) break;
-            search = end + 1;
+            search = static_cast<u32>(i64{end} + 1);
         } else
             search = end;
     }

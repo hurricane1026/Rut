@@ -192,9 +192,9 @@ struct Arena {
     u64 space_used() const {
         // Each block has 0 <= used <= size. Every partial sum is bounded by
         // total_allocated, which alloc_block updates with checked addition.
-        u64 used = 0;
-        for (const Block* b = current; b; b = b->prev) used += static_cast<u64>(b->used);
-        return used;
+        __int128_t used = 0;
+        for (const Block* b = current; b; b = b->prev) used += b->used;
+        return static_cast<u64>(used);
     }
 
     u64 space_allocated() const { return total_allocated; }
