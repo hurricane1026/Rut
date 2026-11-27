@@ -556,6 +556,18 @@ TEST(arena, space_allocated_grows_with_blocks) {
     a.destroy();
 }
 
+TEST(arena, space_used_reports_invalid_accounting) {
+    MmapArena arena;
+    MmapArena::Block oldest{nullptr, {}, 2};
+    MmapArena::Block middle{&oldest, {}, INT64_MAX};
+    MmapArena::Block newest{&middle, {}, INT64_MAX};
+    arena.current = &newest;
+    CHECK_EQ(arena.space_used(), MmapArena::kInvalidSpaceUsed);
+
+    // A negative counter must fail even if earlier usage could absorb it.
+    middle.used = -1;
+    CHECK_EQ(arena.space_used(), MmapArena::kInvalidSpaceUsed);
+}
 TEST(arena, space_used_zero_after_reset) {
     MmapArena a;
     REQUIRE(a.init(4096).has_value());

@@ -193,12 +193,19 @@ struct Arena {
         total_allocated = 0;
     }
 
-    u64 space_used() const {
-        // Each block has 0 <= used <= size. Every partial sum is bounded by
-        // total_allocated, which alloc_block updates with checked addition.
-        __int128_t used = 0;
-        for (const Block* b = current; b; b = b->prev) used += b->used;
-        return static_cast<u64>(used);
+    // Valid usage is below the allocated total because each block includes a header.
+    // The sentinel makes budget checks fail closed when the accounting is invalid.
+    static constexpr u64 kInvalidSpaceUsed = UINT64_MAX;
+
+    [[nodiscard]] u64 space_used() const {
+        u64 used = 0;
+        for (const Block* b = current; b; b = b->prev) {
+            range_int<0> block_used;
+            if (!decltype(block_used)::try_from_i64(b->used, &block_used)) return kInvalidSpaceUsed;
+            const u64 bytes = block_used.to_u64();
+            if (add_overflow(used, bytes, &used)) return kInvalidSpaceUsed;
+        }
+        return used;
     }
 
     u64 space_allocated() const { return total_allocated; }
