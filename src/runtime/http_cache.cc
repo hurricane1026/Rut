@@ -14,7 +14,7 @@ namespace {
 constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
 
 [[nodiscard]] u8 ascii_lower(char byte) {
-    const u8 c = __builtin_bit_cast(u8, byte);
+    const u8 c = byte_value(byte);
     if (c < 'A' || c > 'Z') return c;
     const auto lower = range_int(c) + range_int<'a' - 'A', 'a' - 'A' + 1>{};
     return lower.min(range_int<UINT8_MAX, i64{UINT8_MAX} + 1>{}).to<u8>();
@@ -23,7 +23,7 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
 [[nodiscard]] bool valid_name(Str name) {
     if (!name.len) return false;
     for (u32 i = 0; i < name.len; ++i)
-        if (!is_http_tchar(__builtin_bit_cast(u8, name.ptr[i]))) return false;
+        if (!is_http_tchar(byte_value(name.ptr[i]))) return false;
     return true;
 }
 [[nodiscard]] bool eq(Str value, const char* text, u32 length) {
@@ -55,7 +55,7 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
         const char byte = text.ptr[i];
         if (byte < '0' || byte > '9') return false;
         static_assert('0' == 0x30 && '9' == 0x39);
-        const auto digit = bounded_remainder<16>(__builtin_bit_cast(u8, byte));
+        const auto digit = bounded_remainder<16>(byte_value(byte));
         result = (range_int(result).scaled_by<10>() + digit).min(kMax).to<u32>();
     }
     value = result;
@@ -175,8 +175,8 @@ using HttpDateSeconds = range_int<0, i64{1} << 40>;
     if (tens < '0' || tens > '9' || ones < '0' || ones > '9') return false;
     static_assert('0' == 0x30 && '9' == 0x39);
     constexpr range_int<9, 10> kMaxDigit{};
-    const auto first = bounded_remainder<16>(__builtin_bit_cast(u8, tens)).min(kMaxDigit);
-    const auto second = bounded_remainder<16>(__builtin_bit_cast(u8, ones)).min(kMaxDigit);
+    const auto first = bounded_remainder<16>(byte_value(tens)).min(kMaxDigit);
+    const auto second = bounded_remainder<16>(byte_value(ones)).min(kMaxDigit);
     *out = first.scaled_by<10>() + second;
     return true;
 }
@@ -254,7 +254,7 @@ struct ResponseInfo {
         const Str name = header.name;
         if (!valid_name(name)) return false;
         for (u32 j = 0; j < header.value.len; ++j) {
-            const u8 c = __builtin_bit_cast(u8, header.value.ptr[j]);
+            const u8 c = byte_value(header.value.ptr[j]);
             if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
         }
         if (eq(name, "cache-control", 13)) {

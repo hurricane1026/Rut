@@ -59,10 +59,7 @@ template <ByteSpanSize Size>
     uintptr_t distance;
     if (sub_overflow(data_address, pool_address, &distance)) return false;
     if constexpr (sizeof(Size) >= sizeof(ptrdiff_t)) {
-        // A positive distance with the sign bit set does not fit ptrdiff_t.
-        static_assert(sizeof(ptrdiff_t) == sizeof(uintptr_t));
-        const ptrdiff_t start_offset = __builtin_bit_cast(ptrdiff_t, distance);
-        if (start_offset < 0) return false;
+        if (distance > u64{PTRDIFF_MAX}) return false;
     }
     return distance <= last_start_offset;
 }

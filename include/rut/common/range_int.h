@@ -246,4 +246,11 @@ constexpr auto bounded_quotient(u64 value) {
     return range_int<0, UINT64_MAX / Divisor + 1>(detail::kRangeProof, value / Divisor);
 }
 
+// Decode the low 64 bits of a deliberate wrapping operation as a signed value.
+[[nodiscard]] constexpr i64 signed_wrapping_value(u64 bits) {
+    constexpr u64 kSignBit = u64{1} << 63;
+    const auto low = bounded_remainder<kSignBit>(bits);
+    return bits < kSignBit ? low.value() : (range_int<INT64_MIN, INT64_MIN + 1>{} + low).value();
+}
+
 }  // namespace rut

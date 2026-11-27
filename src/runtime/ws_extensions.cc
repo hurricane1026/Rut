@@ -26,8 +26,7 @@ struct Cursor {
     }
     [[nodiscard]] Str token() {
         const u32 kStart = offset;
-        while (offset < value.len && is_http_tchar(__builtin_bit_cast(u8, value.ptr[offset])))
-            ++offset;
+        while (offset < value.len && is_http_tchar(byte_value(value.ptr[offset]))) ++offset;
         const auto start = range_int(kStart);
         const auto length = (range_int(offset) - start).max(range_int<0, 1>{});
         return {value.ptr + start.index(), length.to<u32>()};
@@ -39,7 +38,7 @@ struct Cursor {
         if (kQuoted) ++offset;
         bool closed = !kQuoted;
         while (offset < value.len) {
-            u8 byte = __builtin_bit_cast(u8, value.ptr[offset]);
+            u8 byte = byte_value(value.ptr[offset]);
             if (kQuoted && byte == '"') {
                 ++offset;
                 closed = true;
@@ -47,7 +46,7 @@ struct Cursor {
             }
             if (kQuoted && byte == '\\') {
                 if (++offset == value.len) return false;
-                byte = __builtin_bit_cast(u8, value.ptr[offset]);
+                byte = byte_value(value.ptr[offset]);
             } else if (!kQuoted && !is_http_tchar(byte)) {
                 break;
             }
@@ -221,7 +220,7 @@ u32 ws_rewrite_extensions(
         memcmp(buffer + i64{header_len} - 4, "\r\n\r\n", 4) != 0)
         return 0;
     for (u32 i = 0; i < extension_value.len; ++i) {
-        const u8 kByte = __builtin_bit_cast(u8, extension_value.ptr[i]);
+        const u8 kByte = byte_value(extension_value.ptr[i]);
         if (kByte < 0x20 || kByte >= 0x7f) return 0;
     }
     const i64 fields_end = i64{header_len} - 2;

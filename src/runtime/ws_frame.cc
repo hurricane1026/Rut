@@ -122,7 +122,7 @@ u32 ws_write_header(u8* out,
     if (payload_len >= (u64{1} << 63)) return 0;  // 64-bit length MSB is reserved zero
 
     const u64 flags = (fin ? u64{0x80} : 0) | (compressed ? u64{0x40} : 0);
-    out[0] = bounded_remainder<256>(flags | __builtin_bit_cast(u8, op)).to<u8>();
+    out[0] = bounded_remainder<256>(flags | static_cast<u8>(op)).to<u8>();
     const u8 mask_bit = masked ? 0x80 : 0x00;
     u8 offset;
     if (payload_len <= 125) {

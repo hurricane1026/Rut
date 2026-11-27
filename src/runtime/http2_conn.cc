@@ -355,9 +355,7 @@ namespace {
             for (u32 j = 0; j < name.len; j++) {
                 const char ch = name.ptr[j];
                 if (ch >= 'A' && ch <= 'Z') {
-                    const auto lower =
-                        bounded_remainder<256>(u64{__builtin_bit_cast(u8, ch)} | u64{0x20});
-                    lname[j] = __builtin_bit_cast(char, lower.to<u8>());
+                    lname[j] = static_cast<char>(ch | 0x20);
                 } else {
                     lname[j] = ch;
                 }
@@ -538,7 +536,7 @@ namespace {
 [[nodiscard]] bool h2_name_ok(Str n) {
     if (n.len == 0) return false;
     for (u32 i = 0; i < n.len; i++) {
-        const auto kCh = __builtin_bit_cast(u8, n.ptr[i]);
+        const auto kCh = byte_value(n.ptr[i]);
         if ((kCh >= 'a' && kCh <= 'z') || (kCh >= '0' && kCh <= '9')) continue;
         switch (kCh) {
             case '!':

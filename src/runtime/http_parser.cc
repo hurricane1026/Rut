@@ -32,13 +32,13 @@ static inline u64 load_u64(const u8* p) {
 }
 
 static constexpr u32 u32_lit(char a, char b, char c, char d) {
-    return u32{__builtin_bit_cast(u8, a)} | (u32{__builtin_bit_cast(u8, b)} << 8) |
-           (u32{__builtin_bit_cast(u8, c)} << 16) | (u32{__builtin_bit_cast(u8, d)} << 24);
+    return u32{byte_value(a)} | (u32{byte_value(b)} << 8) | (u32{byte_value(c)} << 16) |
+           (u32{byte_value(d)} << 24);
 }
 
 static constexpr u64 u64_lit(const char* s) {
     u64 v = 0;
-    for (int i = 0; i < 8; i++) v |= u64{__builtin_bit_cast(u8, s[i])} << (i * 8);
+    for (int i = 0; i < 8; i++) v |= u64{byte_value(s[i])} << (i * 8);
     return v;
 }
 
@@ -64,7 +64,7 @@ static inline bool str_ci_eq(const u8* a, const char* b, u32 len) {
         i += 4;
     }
     for (; i < static_cast<i64>(len); i++) {
-        if ((a[i] | 0x20) != (__builtin_bit_cast(u8, b[i]) | 0x20)) return false;
+        if ((a[i] | 0x20) != (byte_value(b[i]) | 0x20)) return false;
     }
     return true;
 }

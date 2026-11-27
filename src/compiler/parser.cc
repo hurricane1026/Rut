@@ -304,12 +304,12 @@ struct Parser {
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
+            u8 value = byte_value(raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
+                const u8 esc = byte_value(raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -371,12 +371,12 @@ struct Parser {
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
+            u8 value = byte_value(raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
+                const u8 esc = byte_value(raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -441,12 +441,12 @@ struct Parser {
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
+            u8 value = byte_value(raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
+                const u8 esc = byte_value(raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -507,12 +507,12 @@ struct Parser {
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
+            u8 value = byte_value(raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
+                const u8 esc = byte_value(raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -1579,17 +1579,16 @@ struct Parser {
 
     // `-<intlit>` fusion shared by unary parsing and match-arm patterns. The
     // caller has consumed the `-`; cur() must be the IntLit. The magnitude
-    // accumulates in u64 with cap 2^63 so INT64_MIN is representable;
-    // Form its two's-complement bits in u64, including INT64_MIN.
+    // accumulates in u64 with cap 2^63 so INT64_MIN is representable.
     FrontendResult<AstExpr> parse_fused_negative_int_lit(const Token& minus) {
         const Token tok = cur();
         pos++;
         auto parsed_mag = parse_integer_literal(tok, 0x8000000000000000ull);
         if (!parsed_mag) return core::make_unexpected(parsed_mag.error());
-        const u64 kMag = parsed_mag.value();
         AstExpr lit{};
         lit.kind = AstExprKind::IntLit;
-        lit.int_value = __builtin_bit_cast(i64, u64{0} - kMag);
+        if (!try_signed_magnitude(parsed_mag.value(), true, &lit.int_value))
+            return frontend_error(FrontendError::InvalidInteger, span_from(tok), tok.text);
         lit.span = Span{minus.start, tok.end, minus.line, minus.col};
         return lit;
     }
@@ -3938,7 +3937,7 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*value.value()));
                         for (u32 i = 0; i < kText.len; i++) {
-                            const u8 kByte = __builtin_bit_cast(u8, kText.ptr[i]);
+                            const u8 kByte = byte_value(kText.ptr[i]);
                             if (kByte < 32 || kByte == 127 || kByte == '\\')
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       span_from(*value.value()));
@@ -4288,7 +4287,7 @@ struct Parser {
                                                       span_from(*lit.value()),
                                                       path_text);
                             for (u32 i = 0; i < path_text.len; i++) {
-                                const unsigned char ch = __builtin_bit_cast(u8, path_text.ptr[i]);
+                                const unsigned char ch = byte_value(path_text.ptr[i]);
                                 if (ch <= 0x20 || ch == 0x7f)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*lit.value()),

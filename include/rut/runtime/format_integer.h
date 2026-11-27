@@ -33,7 +33,7 @@ inline constexpr u32 kFormatIntegerBufferSize = [] {
     }();
     const bool kNegative = value < 0;
     // Unsigned negation also gives the exact magnitude of INT64_MIN.
-    const u64 bits = __builtin_bit_cast(u64, value);
+    const u64 bits = value;  // Conversion to unsigned is modulo 2^64.
     u64 magnitude = kNegative ? wrapping_sub(u64{0}, bits) : bits;
     char* cursor = buffer + sizeof(buffer);
     auto append_pair = [&] {

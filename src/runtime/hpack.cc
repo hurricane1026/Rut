@@ -113,15 +113,17 @@ constexpr HuffTrie kTrie = build_trie();
 
 // Table-driven Huffman decode FSM (nghttp2-style), built at compile time from
 // the bit trie. Each step consumes a 4-bit nibble: from state `node`, fsm_next
-// is the resulting trie node and fsm_sym (>=0) the symbol completed during the
+// is the resulting trie node and fsm_sym (<256) the symbol completed during the
 // nibble (at most one, since the shortest code is 5 bits). fsm_fail marks an
 // EOS symbol completing in the stream (a decode error). pad_ok[node] marks a
 // state that is a valid trailing-padding position (root, or 1..7 ones along the
 // EOS prefix). The HPACK Huffman code is complete, so every nibble transition
 // is valid mid-stream — no failure path except EOS and end-of-input padding.
+constexpr u16 kNoHuffmanByte = 256;
+
 struct HuffFsm {
     i16 next[kMaxNodes][16];
-    i16 sym[kMaxNodes][16];
+    u16 sym[kMaxNodes][16];
     u8 fail[kMaxNodes][16];
     u8 pad_ok[kMaxNodes];
 };
@@ -132,14 +134,14 @@ struct HuffFsm {
         f.pad_ok[n] = 0;
         for (u32 v = 0; v < 16; v++) {
             f.next[n][v] = 0;
-            f.sym[n][v] = -1;
+            f.sym[n][v] = kNoHuffmanByte;
             f.fail[n][v] = 0;
         }
     }
     for (i16 n = 0; n < kTrie.node_count; n++) {
         for (u32 v = 0; v < 16; v++) {
             i16 cur = n;
-            i16 emitted = -1;
+            u16 emitted = kNoHuffmanByte;
             u8 failed = 0;
             for (i32 b = 3; b >= 0; b--) {
                 const u32 kBit = (v >> b) & 1u;
@@ -263,18 +265,18 @@ constexpr HuffFsm kFsm = build_fsm();
         // High nibble then low nibble — one FSM step each.
         const u32 kHi = kByte >> 4;
         if (kFsm.fail[node][kHi]) return -1;  // EOS symbol in the stream
-        const i16 kHiSymbol = kFsm.sym[node][kHi];
-        if (kHiSymbol >= 0) {
+        const u16 kHiSymbol = kFsm.sym[node][kHi];
+        if (kHiSymbol < kNoHuffmanByte) {
             if (o >= limit) return -1;
-            out[o++] = bounded_remainder<256>(__builtin_bit_cast(u16, kHiSymbol)).to<u8>();
+            out[o++] = bounded_remainder<256>(kHiSymbol).to<u8>();
         }
         node = kFsm.next[node][kHi];
         const u32 kLo = kByte & 0xf;
         if (kFsm.fail[node][kLo]) return -1;
-        const i16 kLoSymbol = kFsm.sym[node][kLo];
-        if (kLoSymbol >= 0) {
+        const u16 kLoSymbol = kFsm.sym[node][kLo];
+        if (kLoSymbol < kNoHuffmanByte) {
             if (o >= limit) return -1;
-            out[o++] = bounded_remainder<256>(__builtin_bit_cast(u16, kLoSymbol)).to<u8>();
+            out[o++] = bounded_remainder<256>(kLoSymbol).to<u8>();
         }
         node = kFsm.next[node][kLo];
     }

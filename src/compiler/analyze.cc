@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/http_query.h"
+#include "rut/common/range_int.h"
 #include "rut/common/route_host.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
@@ -3877,7 +3878,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
             case HirExprKind::BitShl:
                 folded = static_cast<u64>(n) >= width
                              ? 0
-                             : (is64 ? __builtin_bit_cast(i64, static_cast<u64>(a) << n)
+                             : (is64 ? signed_wrapping_value(static_cast<u64>(a) << n)
                                      : static_cast<i64>(static_cast<i32>(static_cast<u32>(a)
                                                                          << static_cast<u32>(n))));
                 break;
@@ -3939,11 +3940,11 @@ static i64 fold_arith_i64(HirExprKind kind, i64 a, i64 b) {
     const bool ovf = a == INT64_MIN && b == -1;
     switch (kind) {
         case HirExprKind::Add:
-            return __builtin_bit_cast(i64, static_cast<u64>(a) + static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) + static_cast<u64>(b));
         case HirExprKind::Sub:
-            return __builtin_bit_cast(i64, static_cast<u64>(a) - static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) - static_cast<u64>(b));
         case HirExprKind::Mul:
-            return __builtin_bit_cast(i64, static_cast<u64>(a) * static_cast<u64>(b));
+            return signed_wrapping_value(static_cast<u64>(a) * static_cast<u64>(b));
         case HirExprKind::Div:
             if (b == 0) return 0;
             return ovf ? INT64_MIN : a / b;

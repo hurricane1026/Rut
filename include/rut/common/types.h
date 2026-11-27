@@ -31,6 +31,11 @@ using i64 = int64_t;
 using f32 = float;
 using f64 = double;
 
+// Interpret a char from a byte stream as an unsigned octet on either char ABI.
+[[nodiscard]] constexpr u8 byte_value(char value) {
+    return static_cast<u8>(value);
+}
+
 // Non-owning string view (no stdlib dependency)
 struct Str {
     const char* ptr;

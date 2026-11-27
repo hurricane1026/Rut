@@ -107,18 +107,16 @@ template <bool Wide, class Digits = integer_detail::PortableDigits>
         }
     }
     while (length--) {
-        const u8 byte = __builtin_bit_cast(u8, *data++);
+        const u8 byte = byte_value(*data++);
         if (byte < '0' || byte > '9') return false;
         // In ASCII the low nibble of a validated digit is its decimal value.
         static_assert('0' == 0x30 && '9' == 0x39);
         number = wrapping_add(number * 10, bounded_remainder<16>(byte).to_u64());
     }
     constexpr u64 kPositiveLimit = Wide ? INT64_MAX : INT32_MAX;
-    // Even the negative limit is representable as an unsigned magnitude.
-    const u64 max_magnitude = wrapping_add(kPositiveLimit, u64{negative});
-    if (number > max_magnitude) return false;
-    // Negate the unsigned bit pattern to include INT64_MIN without signed negation.
-    output = __builtin_bit_cast(i64, negative ? wrapping_sub(u64{0}, number) : number);
+    const u64 limit = wrapping_add(kPositiveLimit, u64{negative});
+    if (number > limit) return false;
+    output = signed_wrapping_value(negative ? wrapping_sub(u64{0}, number) : number);
     return true;
 }
 

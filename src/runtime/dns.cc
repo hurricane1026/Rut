@@ -31,11 +31,11 @@ void put(u8* p, u16 v) {
     p[0] = range_int(v).divided_by<256>().to<u8>();
     p[1] = bounded_remainder<256>(v).to<u8>();
 }
-char lower(u8 c) {
+[[nodiscard]] char lower(char c) {
     range_int<'A', 'Z' + 1> upper;
-    if (!decltype(upper)::try_from_i64(c, &upper)) return __builtin_bit_cast(char, c);
+    if (!decltype(upper)::try_from_i64(c, &upper)) return c;
     const u8 folded = (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
-    return __builtin_bit_cast(char, folded);
+    return static_cast<char>(folded);
 }
 // Compression pointers must move backwards. Both jumps and expanded names are bounded.
 bool name_at(const u8* p, u32 len, u32& offset, char* out) {
@@ -97,7 +97,7 @@ bool dns_hostname(char* name) {
     bool alphabetic = false;
     u32 label = 0;
     for (u32 i = 0; i <= len; ++i) {
-        const char kC = lower(__builtin_bit_cast(u8, name[i]));
+        const char kC = lower(name[i]);
         name[i] = kC;
         if (!kC || kC == '.') {
             if (!label || label > 63 || name[static_cast<i64>(i) - 1] == '-') return false;
