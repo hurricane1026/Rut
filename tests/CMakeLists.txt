@@ -5063,6 +5063,13 @@ set_tests_properties(test_cli_backend PROPERTIES LABELS "cli" RUN_SERIAL TRUE TI
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    foreach(syslog_backend epoll io_uring)
+        add_test(NAME test_cli_access_log_syslog_${syslog_backend}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_access_log_syslog.py
+                $<TARGET_FILE:rut> ${syslog_backend})
+        set_tests_properties(test_cli_access_log_syslog_${syslog_backend} PROPERTIES
+            LABELS "cli;access-log" TIMEOUT 45 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME test_cli_access_log_host
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_access_log_host.py
                 $<TARGET_FILE:rut>)

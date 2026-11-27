@@ -403,6 +403,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    bool access_log_compress,
                                    i32 access_log_level,
                                    bool access_log_path_only,
+                                   const char* access_log_syslog,
+                                   AccessLogSyslogFormat access_log_syslog_format,
                                    SourceAccessLogFd* source_live_fd,
                                    AccessLogFormatProfile source_live_format,
                                    const RouteConfig* route_config,
@@ -513,7 +515,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         write_str("Metrics: built-in GET /metrics enabled (reserved path — shadows user routes)\n");
     }
 
-    if (access_log_path != nullptr && source_live_fd != nullptr) {
+    if ((access_log_path || access_log_syslog) && source_live_fd) {
         write_str("Conflicting legacy and SourceLive access log modes\n");
         for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
         return {RunShardsOutcomeKind::Failure};
@@ -524,11 +526,23 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         return {RunShardsOutcomeKind::Failure};
     }
 
-    // Set up access log flusher if --access-log was specified.
+    // Periodic access log output uses the same per-shard rings for either sink.
     AccessLogFlusher log_flusher;
     i32 access_log_fd = -1;
-    if (access_log_path) {
-        access_log_fd = open(access_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (access_log_path || access_log_syslog) {
+        AccessLogSyslogDestination destination{};
+        if (access_log_syslog) {
+            auto fd =
+                open_access_log_syslog(access_log_syslog, access_log_syslog_format, destination);
+            if (!fd) {
+                write_error("Invalid or unavailable access log syslog endpoint", fd.error());
+                for (u32 j = 0; j < shard_count; j++) shards[j].shutdown();
+                return {RunShardsOutcomeKind::Failure};
+            }
+            access_log_fd = fd.value();
+        } else {
+            access_log_fd = open(access_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        }
         if (access_log_fd < 0) {
             write_str("Failed to open access log: ");
             write_str(access_log_path);
@@ -548,7 +562,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 return {RunShardsOutcomeKind::Failure};
             }
         }
-        log_flusher.init(access_log_fd, access_log_compress, access_log_level);
+        if (access_log_syslog)
+            log_flusher.init_syslog(access_log_fd, destination);
+        else
+            log_flusher.init(access_log_fd, access_log_compress, access_log_level);
         for (u32 i = 0; i < shard_count; i++) {
             log_flusher.add_ring(shards[i].log_ring);
         }
@@ -681,6 +698,11 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         bool success = true;
         if (access_log_fd >= 0) {
             log_flusher.stop();
+            if (log_flusher.syslog_send_failures() != 0) {
+                write_str("Access log syslog send failures: ");
+                write_u64(log_flusher.syslog_send_failures());
+                write_str("\n");
+            }
             close(access_log_fd);
             access_log_fd = -1;
         }
@@ -977,6 +999,8 @@ int main(int argc, char** argv) {
     bool source_listener_present = false;
     AccessLogSinkSpec source_access_log{};
     const char* access_log_path = nullptr;
+    const char* access_log_syslog = nullptr;
+    AccessLogSyslogFormat access_log_syslog_format = AccessLogSyslogFormat::Auto;
     bool cli_access_log_path_present = false;
     bool cli_access_log_path_only = false;
     bool access_log_compress = false;
@@ -1006,7 +1030,9 @@ int main(int argc, char** argv) {
     //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
     //                      [--tls-client-crl PATH] [--tls-client-crl-verify-issuer]
-    //                      [--access-log PATH] [--access-log-compress] [--access-log-path-only]
+    //                      [--access-log PATH | --access-log-syslog ENDPOINT]
+    //                      [--access-log-syslog-format rfc3164|rfc5424]
+    //                      [--access-log-compress] [--access-log-path-only]
     //                      [--metrics]
     // --metrics: serve an aggregated Prometheus exposition at GET /metrics.
     //   NOTE: this RESERVES the /metrics path — GET /metrics (and /metrics/,
@@ -1177,6 +1203,22 @@ int main(int argc, char** argv) {
                 i++;
                 access_log_path = argv[i];
                 cli_access_log_path_present = true;
+            } else if (str_eq(argv[i], "--access-log-syslog")) {
+                if (starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--access-log-syslog requires an endpoint argument\n");
+                    return 1;
+                }
+                access_log_syslog = argv[++i];
+            } else if (str_eq(argv[i], "--access-log-syslog-format")) {
+                const char* format = argv[++i];
+                if (str_eq(format, "rfc3164"))
+                    access_log_syslog_format = AccessLogSyslogFormat::Rfc3164;
+                else if (str_eq(format, "rfc5424"))
+                    access_log_syslog_format = AccessLogSyslogFormat::Rfc5424;
+                else {
+                    write_str("--access-log-syslog-format requires rfc3164 or rfc5424\n");
+                    return 1;
+                }
             } else if (str_eq(argv[i], "--tls-cert")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--tls-cert requires a path argument\n");
@@ -1246,7 +1288,9 @@ int main(int argc, char** argv) {
                 str_eq(argv[i], "--tls-cert") || str_eq(argv[i], "--tls-key") ||
                 str_eq(argv[i], "--tls-client-ca") || str_eq(argv[i], "--tls-client-crl") ||
                 str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level") ||
-                str_eq(argv[i], "--opt") || str_eq(argv[i], "--max-connections-per-shard")) {
+                str_eq(argv[i], "--access-log-syslog") ||
+                str_eq(argv[i], "--access-log-syslog-format") || str_eq(argv[i], "--opt") ||
+                str_eq(argv[i], "--max-connections-per-shard")) {
                 if (str_eq(argv[i], "--max-connections-per-shard"))
                     write_str("--max-connections-per-shard capacity requires an argument\n");
                 else {
@@ -1418,6 +1462,24 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    const char* syslog_error = nullptr;
+    if (access_log_syslog) {
+        if (cli_access_log_path_present || source_access_log.present)
+            syslog_error = "--access-log-syslog conflicts with --access-log and source accessLog\n";
+        else if (access_log_compress || cli_access_log_level_present)
+            syslog_error = "--access-log-syslog does not support compression options\n";
+    } else if (access_log_syslog_format != AccessLogSyslogFormat::Auto) {
+        syslog_error = "--access-log-syslog-format requires --access-log-syslog\n";
+    }
+    if (syslog_error) {
+        write_str(syslog_error);
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+
     AccessLogStartupInputs access_log_inputs{};
     access_log_inputs.source = source_access_log;
     access_log_inputs.cli_path_present = cli_access_log_path_present;
@@ -1427,7 +1489,7 @@ int main(int argc, char** argv) {
     access_log_inputs.cli_level_present = cli_access_log_level_present;
     access_log_inputs.cli_level = access_log_level;
     access_log_inputs.environment_compression_present = environment_access_log_compress_present;
-    access_log_inputs.cli_path_only = cli_access_log_path_only;
+    access_log_inputs.cli_path_only = cli_access_log_path_only && !access_log_syslog;
     auto resolved_access_log = resolve_access_log_startup(access_log_inputs);
     if (!resolved_access_log) {
         switch (resolved_access_log.error()) {
@@ -1563,6 +1625,8 @@ int main(int argc, char** argv) {
     }
 
     RunShardsOutcome outcome{};
+    const bool access_log_path_only =
+        resolved_access_log->legacy_path_only || (access_log_syslog && cli_access_log_path_only);
     SourceAccessLogFd* source_live_fd_ptr =
         resolved_access_log->mode == AccessLogStartupMode::SourceLive ? &source_live_fd : nullptr;
     const AccessLogFormatProfile source_live_format =
@@ -1583,7 +1647,9 @@ int main(int argc, char** argv) {
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level,
-                                          resolved_access_log->legacy_path_only,
+                                          access_log_path_only,
+                                          access_log_syslog,
+                                          access_log_syslog_format,
                                           source_live_fd_ptr,
                                           source_live_format,
                                           route_config,
@@ -1615,7 +1681,9 @@ int main(int argc, char** argv) {
             access_log_path,
             access_log_compress,
             access_log_level,
-            resolved_access_log->legacy_path_only,
+            access_log_path_only,
+            access_log_syslog,
+            access_log_syslog_format,
             source_live_fd_ptr,
             source_live_format,
             route_config,
@@ -1635,7 +1703,9 @@ int main(int argc, char** argv) {
                                                  access_log_path,
                                                  access_log_compress,
                                                  access_log_level,
-                                                 resolved_access_log->legacy_path_only,
+                                                 access_log_path_only,
+                                                 access_log_syslog,
+                                                 access_log_syslog_format,
                                                  source_live_fd_ptr,
                                                  source_live_format,
                                                  route_config,
@@ -1655,7 +1725,9 @@ int main(int argc, char** argv) {
                                              access_log_path,
                                              access_log_compress,
                                              access_log_level,
-                                             resolved_access_log->legacy_path_only,
+                                             access_log_path_only,
+                                             access_log_syslog,
+                                             access_log_syslog_format,
                                              source_live_fd_ptr,
                                              source_live_format,
                                              route_config,
