@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace rut {
@@ -29,7 +30,8 @@ struct UpstreamConn {
     u8 backend_idx = 0;      // which backend endpoint of the upstream this connects to
     bool idle = false;       // true = parked, available for reuse
     bool allocated = false;  // true = slot in use
-    u32 parked_sec = 0;      // monotonic seconds when parked (idle-timeout sweep)
+    // Seconds in legacy mode; microseconds when an explicit positive timeout is set.
+    u64 parked_time = 0;
 };
 
 struct UpstreamPool {
@@ -40,6 +42,8 @@ struct UpstreamPool {
     UpstreamConn conns[kMaxConns];
     u32 free_stack[kMaxConns];
     u32 free_top = 0;
+    bool idle_timeout_configured = false;
+    u32 idle_timeout_sec = 0;
     // Parked slots form an intrusive list, most recently parked first, so
     // take_idle() and sweep() visit only idle entries instead of every slot.
     u32 idle_prev[kMaxConns];
@@ -63,9 +67,22 @@ struct UpstreamPool {
     // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
     // caller must close the fd itself). The fd must have no I/O armed on it.
     bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
+        return put_idle_at(fd,
+                           upstream_id,
+                           backend_idx,
+                           now_sec,
+                           idle_timeout_configured && idle_timeout_sec ? clock_us() : 0);
+    }
+
+    bool put_idle_at(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us) {
         u32 idx;
         if (fd < 0 || !pop_free_slot(idx)) return false;
-        conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
+        conns[idx] = {fd,
+                      upstream_id,
+                      backend_idx,
+                      /*idle=*/true,
+                      /*allocated=*/true,
+                      idle_timeout_configured && idle_timeout_sec ? now_us : now_sec};
         link_idle(idx);
         idle_count.fetch_add(1, std::memory_order_release);
         return true;
@@ -77,13 +94,25 @@ struct UpstreamPool {
     // low-traffic or removed endpoint could otherwise hold dead fds until reload).
     // Driven by the per-shard 1s timer tick. No-op when the pool is empty.
     void sweep(u32 now_sec, u32 max_idle_sec) {
-        if (idle_count.load(std::memory_order_acquire) == 0) return;
+        if (idle_timeout_configured) max_idle_sec = idle_timeout_sec;
+        if ((idle_timeout_configured && max_idle_sec == 0) ||
+            idle_count.load(std::memory_order_acquire) == 0)
+            return;
+        const u64 now_us = idle_timeout_configured ? clock_us() : 0;
+        sweep_at(now_sec, max_idle_sec, now_us);
+    }
+
+    void sweep_at(u32 now_sec, u32 max_idle_sec, u64 now_us) {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
             u32 idle = 0;
-            (void)__builtin_sub_overflow(now_sec, c.parked_sec, &idle);
-            if (idle >= max_idle_sec) {
+            (void)__builtin_sub_overflow(now_sec, static_cast<u32>(c.parked_time), &idle);
+            u64 idle_us = 0;
+            if (idle_timeout_configured
+                    ? !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                          idle_us >= static_cast<u64>(max_idle_sec) * 1000000u
+                    : idle >= max_idle_sec) {
                 ::close(c.fd);
                 release_slot(i);
             }
@@ -101,6 +130,11 @@ struct UpstreamPool {
     // Candidates are tried most recently parked first (the likeliest to be live).
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
+        return take_idle_at(
+            upstream_id, backend_idx, idle_timeout_configured && idle_timeout_sec ? clock_us() : 0);
+    }
+
+    i32 take_idle_at(u16 upstream_id, u8 backend_idx, u64 now_us) {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             const UpstreamConn& c = conns[i];
@@ -109,7 +143,16 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
+            u64 idle_us = 0;
+            const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
+                                 !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                                 idle_us >= static_cast<u64>(idle_timeout_sec) * 1000000u;
             release_slot(i);
+            if (expired) {
+                ::close(fd);
+                i = next;
+                continue;
+            }
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
@@ -151,6 +194,14 @@ struct UpstreamPool {
     static i32 create_socket() { return platform::stream_socket(); }
 
 private:
+    static u64 clock_us() {
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        u64 now_us = static_cast<u64>(ts.tv_sec) * 1000000u;
+        (void)__builtin_add_overflow(now_us, static_cast<u64>(ts.tv_nsec) / 1000u, &now_us);
+        return now_us;
+    }
+
     bool pop_free_slot(u32& slot) {
         if (free_top == 0) return false;
         slot = free_stack[--free_top];
