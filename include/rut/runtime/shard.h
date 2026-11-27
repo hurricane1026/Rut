@@ -110,7 +110,8 @@ struct Shard {
     core::Expected<void, Error> init(u32 shard_id,
                                      i32 lfd,
                                      u32 pool_prealloc = 0,
-                                     u32 capacity = kDefaultConnectionCapacity) {
+                                     u32 capacity = kDefaultConnectionCapacity,
+                                     u32 upstream_pool_capacity = UpstreamPool::kMaxConns) {
         last_init_failure_detail = IoUringInitFailureDetail::None;
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
@@ -175,7 +176,7 @@ struct Shard {
             return core::make_unexpected(Error::from_errno(Error::Source::Mmap));
         }
         upstream = new (up_mem) UpstreamPool();
-        upstream->init();
+        upstream->init(upstream_pool_capacity);
         loop->upstream = upstream;  // wire idle-reuse pool into the proxy data path
 
         // Access log ring is allocated lazily via init_access_log(),

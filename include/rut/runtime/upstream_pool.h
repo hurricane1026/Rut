@@ -2,6 +2,7 @@
 
 #include "rut/common/types.h"
 #include "rut/platform/socket.h"
+#include "rut/runtime/route_table.h"
 #include <atomic>
 
 #include <errno.h>
@@ -44,6 +45,8 @@ struct UpstreamPool {
     u32 free_top = 0;
     bool idle_timeout_configured = false;
     u32 idle_timeout_sec = 0;
+    u32 endpoint_capacity = kMaxConns;
+    u16 endpoint_counts[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     // Parked slots form an intrusive list, most recently parked first, so
     // take_idle() and sweep() visit only idle entries instead of every slot.
     u32 idle_prev[kMaxConns];
@@ -53,7 +56,9 @@ struct UpstreamPool {
     // cross-thread observation; pool slot ownership remains single-threaded.
     std::atomic<u32> idle_count{0};
 
-    void init() {
+    void init(u32 capacity = kMaxConns) {
+        endpoint_capacity = capacity <= kMaxConns ? capacity : kMaxConns;
+        reset_endpoint_counts();
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_relaxed);
         reset_idle_list();
@@ -64,8 +69,9 @@ struct UpstreamPool {
     }
 
     // Park a connected, idle upstream fd for reuse by a later request to the same
-    // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
-    // caller must close the fd itself). The fd must have no I/O armed on it.
+    // (upstream_id, backend_idx) endpoint. Returns false when the endpoint quota
+    // or pool is full, reuse is disabled, or the key is invalid. The caller must
+    // close a rejected fd. The fd must have no I/O armed on it.
     bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
         return put_idle_at(fd,
                            upstream_id,
@@ -76,7 +82,11 @@ struct UpstreamPool {
 
     bool put_idle_at(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u64 now_us) {
         u32 idx;
-        if (fd < 0 || !pop_free_slot(idx)) return false;
+        if (fd < 0 || upstream_id >= RouteConfig::kMaxUpstreams ||
+            backend_idx >= UpstreamTarget::kMaxBackends ||
+            endpoint_counts[upstream_id][backend_idx] >= endpoint_capacity || !pop_free_slot(idx))
+            return false;
+        ++endpoint_counts[upstream_id][backend_idx];
         conns[idx] = {fd,
                       upstream_id,
                       backend_idx,
@@ -175,6 +185,7 @@ struct UpstreamPool {
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_release);
         reset_idle_list();
+        reset_endpoint_counts();
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -187,6 +198,7 @@ struct UpstreamPool {
         free_top = kMaxConns;
         idle_count.store(0, std::memory_order_release);
         reset_idle_list();
+        reset_endpoint_counts();
         for (u32 i = 0; i < kMaxConns; i++) free_stack[i] = i;
     }
 
@@ -200,6 +212,11 @@ private:
         u64 now_us = static_cast<u64>(ts.tv_sec) * 1000000u;
         (void)__builtin_add_overflow(now_us, static_cast<u64>(ts.tv_nsec) / 1000u, &now_us);
         return now_us;
+    }
+
+    void reset_endpoint_counts() {
+        for (u32 i = 0; i < RouteConfig::kMaxUpstreams; ++i)
+            for (u32 j = 0; j < UpstreamTarget::kMaxBackends; ++j) endpoint_counts[i][j] = 0;
     }
 
     bool pop_free_slot(u32& slot) {
@@ -237,6 +254,7 @@ private:
 
     void release_slot(u32 i) {
         unlink_idle(i);
+        --endpoint_counts[conns[i].upstream_id][conns[i].backend_idx];
         conns[i] = UpstreamConn{};
         push_free_slot(i);
         u32 count = idle_count.load(std::memory_order_relaxed);
