@@ -21,6 +21,7 @@
 #include "rut/runtime/mapped_array.h"
 #endif
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #ifdef __linux__
@@ -993,6 +994,9 @@ int main(int argc, char** argv) {
     enum class BackendSelection : u8 { Auto, Epoll, IoUring };
     BackendSelection backend_selection = BackendSelection::Auto;
     bool backend_specified = false;
+    u32 upstream_dns_server = 0;
+    u16 upstream_dns_port = 53;
+    bool upstream_dns_specified = false;
     bool ebpf_plan_requested = false;
     const char* ebpf_output_prefix = nullptr;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
@@ -1009,6 +1013,30 @@ int main(int argc, char** argv) {
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "--upstream-dns-resolver")) {
+            if (upstream_dns_specified || i + 1 >= argc) {
+                write_str("--upstream-dns-resolver requires one IPv4:port argument\n");
+                return 1;
+            }
+            const char* value = argv[++i];
+            const char* colon = strrchr(value, ':');
+            const size_t len = colon ? static_cast<size_t>(colon - value) : 0;
+            char address[16]{};
+            if (len == 0 || len >= sizeof(address) ||
+                !parse_cli_port(colon + 1, upstream_dns_port) || upstream_dns_port == 0) {
+                write_str("invalid --upstream-dns-resolver IPv4:port\n");
+                return 1;
+            }
+            memcpy(address, value, len);
+            in_addr ip{};
+            if (inet_pton(AF_INET, address, &ip) != 1 || ip.s_addr == 0) {
+                write_str("invalid --upstream-dns-resolver IPv4:port\n");
+                return 1;
+            }
+            upstream_dns_server = ip.s_addr;
+            upstream_dns_specified = true;
+            continue;
+        }
         if (str_eq(argv[i], "--backend")) {
             if (backend_specified) {
                 write_str("--backend specified twice\n");
@@ -1341,7 +1369,9 @@ int main(int argc, char** argv) {
                                  msg,
                                  sizeof(msg),
                                  static_cast<u8>(opt_level),
-                                 ebpf_plan_requested)) {
+                                 ebpf_plan_requested,
+                                 upstream_dns_server,
+                                 upstream_dns_port)) {
             write_str("Failed to load ");
             write_str(config_path);
             write_str(": ");

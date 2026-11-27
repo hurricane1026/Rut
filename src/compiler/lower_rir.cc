@@ -4490,6 +4490,13 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         out.module.upstreams[i].has_address = mir.upstreams[i].has_address;
         out.module.upstreams[i].ip = mir.upstreams[i].ip;
         out.module.upstreams[i].port = mir.upstreams[i].port;
+        const Str dns_host = mir.upstreams[i].dns_host;
+        if (dns_host.len != 0) {
+            char* copy = out.module.arena->alloc_array<char>(dns_host.len);
+            if (!copy) return frontend_error(FrontendError::OutOfMemory, mir.upstreams[i].span);
+            for (u32 k = 0; k < dns_host.len; ++k) copy[k] = dns_host.ptr[k];
+            out.module.upstreams[i].dns_host = {copy, dns_host.len};
+        }
         out.module.upstreams[i].extra_count = mir.upstreams[i].extra_count;
         for (u32 b = 0; b < mir.upstreams[i].extra_count; b++) {
             out.module.upstreams[i].extra_ips[b] = mir.upstreams[i].extra_ips[b];

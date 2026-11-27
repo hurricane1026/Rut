@@ -1001,7 +1001,7 @@ cooldown behavior. This option supports HTTP/1 upstreams with HTTP/1 or HTTP/2
 downstreams on epoll and io_uring. Native HTTP/2/gRPC upstreams reject the option;
 `grpc-status` is not interpreted as an HTTP status. Explicit socket operations
 through `wait(upstream(...).connect())` use target eligibility but do not report
-business HTTP verdicts. No retry-on-status, DNS discovery, manual health API or
+business HTTP verdicts. No retry-on-status, live DNS refresh, manual health API or
 cross-shard health synchronization is not implied. Native ABI 28 requires rebuilding
 older artifacts. See [passive-health implementation](passive-health.md).
 An active `health_check` may also set `unhealthy_interval: 2s` using the same
@@ -1013,6 +1013,20 @@ interval. Zero-weight, in-flight, and locally deferred probes do not advance the
 per-backend schedule. Probe issuance remains subject to the per-sweep budget and
 one-second sweep resolution. Omission preserves the existing upstream-wide
 schedule. Reload resets schedules and verdicts. Native artifact version 34
+requires rebuilding older artifacts.
+
+A native CLI gateway may declare one DNS upstream with
+`upstream api { host: "api.example", port: 8080 }`. Before creating listeners
+or shards, the gateway resolves a bounded IPv4 A/CNAME snapshot and assigns equal
+weight to up to eight distinct addresses. The compiler never queries DNS. The
+snapshot remains fixed after TTL expiry; live refresh, AAAA/SRV, DNS names in
+backend lists, and consistent-hash selection for DNS targets are absent. The
+name selects dial addresses only: HTTP Host, health-check authority, TLS SNI,
+and certificate identity retain their explicit existing configuration. Failure,
+no answer, timeout, or more than eight addresses prevents startup. The default
+resolver reads IPv4 nameservers from `/etc/resolv.conf`; an administrator can
+instead specify `--upstream-dns-resolver 127.0.0.1:1053` as an IPv4:port.
+DNS queries share one three-second startup deadline. Native artifact version 39
 requires rebuilding older artifacts.
 
 An upstream may set `response_body_idle_timeout: 2s` (1–63 whole seconds).

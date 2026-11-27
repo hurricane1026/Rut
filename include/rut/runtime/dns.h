@@ -8,6 +8,7 @@ bool dns_hostname(char* name);
 struct DnsResult {
     u32 addresses[8]{};  // network byte order
     u32 count = 0;
+    bool overflow = false;  // More than eight distinct A records.
     u32 ttl = 60;
     char canonical[254]{};
 };

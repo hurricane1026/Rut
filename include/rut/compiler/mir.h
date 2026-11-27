@@ -580,6 +580,7 @@ struct MirUpstream {
     bool has_address = false;
     u32 ip = 0;
     u16 port = 0;
+    Str dns_host{};
     // Extra load-balancing endpoints copied from HIR (primary = ip/port).
     static constexpr u32 kMaxExtraBackends = 7;
     u32 extra_count = 0;

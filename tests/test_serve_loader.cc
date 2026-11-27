@@ -9881,3 +9881,17 @@ TEST(serve_loader, websocket_cache_effects_keep_identity_and_clock_across_messag
     program.destroy();
 }
 #endif
+
+TEST(serve_loader, unresolved_dns_is_rejected_by_in_process_source_loader) {
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_unresolved_dns",
+                   "app.rut",
+                   "upstream api { host: \"service.test\" port: 8080 }\n"
+                   "route GET \"/\" { return forward(api, load_balance: .roundRobin) }\n");
+    LoadedProgram program;
+    LoadError err;
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err));
+    program.destroy();
+    CHECK_FALSE(load_rut_program(path.c_str(), program, err, jit::OptLevel::O0, ~u64{0}, true));
+    program.destroy();
+}

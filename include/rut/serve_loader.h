@@ -100,13 +100,16 @@ struct LoadedProgram {
 //
 // `opt` selects the JIT IR optimization level (higher = faster handlers,
 // slower startup compile). `max_source_bytes` bounds the root source plus
-// every imported module read during analysis.
+// every imported module read during analysis. Only the native artifact producer
+// may set both final flags: its unresolved DNS configuration is not publishable
+// until the gateway parent has resolved it.
 bool load_rut_program(const char* path,
                       LoadedProgram& out,
                       LoadError& err,
                       jit::OptLevel opt = jit::OptLevel::O2,
                       u64 max_source_bytes = ~u64{0},
-                      bool retain_native_module = false);
+                      bool retain_native_module = false,
+                      bool allow_unresolved_native_dns = false);
 
 bool write_native_program(LoadedProgram& program, const char* output);
 

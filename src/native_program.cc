@@ -2,7 +2,9 @@
 #include "rut/common/upstream_health.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_artifact.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/dns.h"
 #include "rut/runtime/ebpf_plan.h"
 #include "rut/runtime/response_body_files.h"
 #include "rut/runtime/slice_pool.h"
@@ -225,7 +227,9 @@ bool load_native_program(const char* source,
                          char* error,
                          u32 error_size,
                          u8 opt,
-                         bool request_ebpf_plan) {
+                         bool request_ebpf_plan,
+                         u32 upstream_dns_server,
+                         u16 upstream_dns_port) {
     if (!error || !error_size) return false;
     error[0] = '\0';
     auto fail = [&](const char* message) {
@@ -559,8 +563,18 @@ bool load_native_program(const char* source,
         return fail("invalid native configuration counts");
     for (u32 i = 0; i < c.upstream_count; ++i) {
         const auto& target = c.upstreams[i];
-        if (target.addr_count == 0 || target.addr_count > UpstreamTarget::kMaxBackends)
+        const size_t dns_len = strnlen(target.dns_host, sizeof(target.dns_host));
+        if (dns_len == sizeof(target.dns_host)) return fail("invalid native upstream DNS name");
+        if (dns_len != 0) {
+            char normalized[254]{};
+            memcpy(normalized, target.dns_host, dns_len + 1);
+            if (!dns_hostname(normalized) || strcmp(normalized, target.dns_host) != 0 ||
+                target.dns_port == 0 || target.addr_count != 0 || target.failover_mask != 0)
+                return fail("invalid native upstream DNS target");
+        } else if (target.dns_port != 0 || target.addr_count == 0 ||
+                   target.addr_count > UpstreamTarget::kMaxBackends) {
             return fail("invalid native upstream backend count");
+        }
         if (target.connect_timeout_seconds >= TimerWheel::kSlots)
             return fail("invalid native upstream connect timeout");
         if (target.connect_attempts == 0 || target.connect_attempts > UpstreamTarget::kMaxBackends)
@@ -719,6 +733,56 @@ bool load_native_program(const char* source,
     if (!out.es256.load(c.es256_configurations, c.es256_configuration_count))
         return fail("cannot initialize native ES256 policies");
     c.es256 = &out.es256;
+    // Resolve only in the gateway parent, before any listener or shard exists.
+    // The compiler producer and offline eBPF export must never query DNS.
+    bool needs_dns = false;
+    for (u32 i = 0; i < c.upstream_count; ++i) needs_dns |= c.upstreams[i].dns_host[0] != 0;
+    if (needs_dns && request_ebpf_plan)
+        return fail("upstream DNS is unavailable in offline eBPF plans");
+    if (needs_dns) {
+        DnsResolver resolver;
+        resolver.init();
+        const u64 started = monotonic_us() / 1000;
+        u64 deadline = 0;
+        if (__builtin_add_overflow(started, u64{3000}, &deadline))
+            return fail("cannot establish upstream DNS deadline");
+        for (u32 i = 0; i < c.upstream_count; ++i) {
+            auto& target = c.upstreams[i];
+            if (!target.dns_host[0]) continue;
+            DnsQuery query;
+            u64 expires = 0;
+            int status = 0;
+            while (!g_startup_cancelled && status == 0) {
+                const u64 now = monotonic_us() / 1000;
+                if (now >= deadline) break;
+                status = resolver.resolve(query,
+                                          target.dns_host,
+                                          upstream_dns_server,
+                                          upstream_dns_port,
+                                          1,
+                                          now,
+                                          expires);
+                if (status != 0) break;
+                if (query.fd >= 0) {
+                    const short events = (query.phase == 3 || query.phase == 6) ? POLLIN : POLLOUT;
+                    pollfd ready{query.fd, events, 0};
+                    (void)poll(&ready, 1, 10);
+                }
+            }
+            query.close();
+            if (status != 1 || query.result.overflow || query.result.count == 0 ||
+                query.result.count > UpstreamTarget::kMaxBackends) {
+                snprintf(
+                    error, error_size, "cannot resolve upstream DNS name: %s", target.dns_host);
+                out.destroy();
+                return false;
+            }
+            for (u32 j = 0; j < query.result.count; ++j)
+                if (!target.add_addr(ntohl(query.result.addresses[j]), target.dns_port))
+                    return fail("cannot materialize upstream DNS targets");
+            if (!target.failover_valid()) return fail("invalid resolved upstream targets");
+        }
+    }
     attach_response_body_files(c);
     out.has_listener = h.has_listener;
     out.listener = h.listener;

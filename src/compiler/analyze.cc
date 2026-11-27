@@ -16,6 +16,7 @@
 #include "rut/compiler/parser.h"
 #include "rut/runtime/consistent_hash.h"
 #include "rut/runtime/consumer_registry.h"
+#include "rut/runtime/dns.h"
 #include "rut/runtime/es256_policy.h"
 #include "rut/runtime/forward_auth.h"
 #include "rut/runtime/hash.h"
@@ -16606,7 +16607,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
                                   lit_str("consistentHash cannot use failover"));
-        if (!up.has_address)
+        if (!up.has_address || up.dns_host.len != 0)
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   stmt.span,
                                   lit_str("consistentHash requires static IPv4 endpoints"));
@@ -22921,20 +22922,40 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             u32 ip = 0;
             if (!parse_ipv4(host_part.ptr, host_part.len, ip)) {
-                // Keep the detail informative when host_part is
-                // empty (`":8080"` in at-form, `{ host: "" }` in dict
-                // form). An empty detail prints nothing and hides
-                // what went wrong. Falls back to the full at-form
-                // literal or to "host" for dict form.
-                const Str host_detail = host_part.len != 0
-                                            ? host_part
-                                            : (item.upstream.port_is_set ? Str{"host", 4} : lit);
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_detail);
+                // Only the explicit host/port form admits a single DNS name.
+                // The compiler validates it but never performs a lookup.
+                char dns_name[254]{};
+                bool valid_name = item.upstream.port_is_set && host_part.len > 0 &&
+                                  host_part.len < sizeof(dns_name) &&
+                                  item.upstream.failover_count == 0;
+                if (valid_name) {
+                    for (u32 j = 0; j < host_part.len; ++j) {
+                        if (host_part.ptr[j] == 0) valid_name = false;
+                        dns_name[j] = host_part.ptr[j];
+                    }
+                    valid_name = valid_name && dns_hostname(dns_name);
+                }
+                if (valid_name) {
+                    up.dns_host = host_part;
+                    up.has_address = true;
+                    up.port = static_cast<u16>(port_value);
+                } else {
+                    // Keep the detail informative when host_part is
+                    // empty (`":8080"` in at-form, `{ host: "" }` in dict
+                    // form). An empty detail prints nothing and hides
+                    // what went wrong. Falls back to the full at-form
+                    // literal or to "host" for dict form.
+                    const Str host_detail =
+                        host_part.len != 0 ? host_part
+                                           : (item.upstream.port_is_set ? Str{"host", 4} : lit);
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, item.upstream.addr_span, host_detail);
+                }
+            } else {
+                up.has_address = true;
+                up.ip = ip;
+                up.port = static_cast<u16>(port_value);
             }
-            up.has_address = true;
-            up.ip = ip;
-            up.port = static_cast<u16>(port_value);
         }
         // Active health-check config (parser already validated path/interval
         // presence + ranges). Carried verbatim; no probing in this slice.
