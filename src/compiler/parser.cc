@@ -1,5 +1,6 @@
 #include "rut/compiler/parser.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
 #include "rut/common/range_int.h"
@@ -1185,7 +1186,7 @@ struct Parser {
                     if (!amount) return core::make_unexpected(amount.error());
                     pos++;  // consume the unit
                     expr.kind = AstExprKind::ByteSizeLit;
-                    if (__builtin_mul_overflow(amount.value(), mult, &expr.int_value))
+                    if (mul_overflow(amount.value(), mult, &expr.int_value))
                         return frontend_error(
                             FrontendError::InvalidInteger, span_from(tok), tok.text);
                     expr.span = Span{tok.start, unit.end, tok.line, tok.col};

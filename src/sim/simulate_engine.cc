@@ -1,5 +1,6 @@
 #include "rut/sim/simulate_engine.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/route_host.h"
 #include "rut/common/types.h"
 #include "rut/compiler/rir.h"
@@ -41,8 +42,9 @@ static u32 cstr_len(const char* s) {
 
 static void copy_cstr(char* dst, u32 dst_size, const char* src) {
     if (dst_size == 0) return;
+    const auto kLimit = range_int(dst_size) - range_int<1, 2>{};
     u32 i = 0;
-    while (i + 1 < dst_size && src[i]) {
+    while (i < kLimit.value() && src[i]) {
         dst[i] = src[i];
         i++;
     }
@@ -63,9 +65,10 @@ static bool parse_u32_token(const char* s, u32 len, u32* out) {
     u32 v = 0;
     for (u32 i = 0; i < len; i++) {
         if (s[i] < '0' || s[i] > '9') return false;
-        const u32 digit = static_cast<u32>(s[i] - '0');
-        if (v > (static_cast<u32>(-1) - digit) / 10) return false;
-        v = v * 10 + digit;
+        const auto digit = range_int(static_cast<u8>(s[i])) - range_int<'0', '1'>{};
+        const auto next = range_int(v).scaled_by<10>() + digit;
+        if (next.value() > UINT32_MAX) return false;
+        v = static_cast<u32>(next.value());
     }
     *out = v;
     return true;
@@ -186,7 +189,10 @@ static bool rir_function_needs_uncaptured_transport_metadata(const rir::Function
 }
 
 static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
-    char* mem = arena.alloc_array<char>(len + 1);
+    // The array count includes a terminator and must fit the Arena's u32 API.
+    const auto kCount = range_int(len) + range_int<1, 2>{};
+    if (kCount.value() > UINT32_MAX) return false;
+    char* mem = arena.alloc_array<char>(static_cast<u32>(kCount.value()));
     if (!mem) return false;
     for (u32 i = 0; i < len; i++) mem[i] = src[i];
     mem[len] = '\0';
@@ -428,7 +434,8 @@ static const char* action_str(jit::HandlerAction action) {
 }
 
 static void put_str(char* buf, u32 buf_size, u32* pos, const char* s) {
-    while (*s && *pos + 1 < buf_size) buf[(*pos)++] = *s++;
+    const auto kLimit = range_int(buf_size) - range_int<1, 2>{};
+    while (*s && *pos < kLimit.value()) buf[(*pos)++] = *s++;
 }
 
 static void put_u32(char* buf, u32 buf_size, u32* pos, u32 value) {
@@ -442,7 +449,8 @@ static void put_u32(char* buf, u32 buf_size, u32* pos, u32 value) {
             value /= 10;
         }
     }
-    while (n > 0 && *pos + 1 < buf_size) buf[(*pos)++] = tmp[--n];
+    const auto kLimit = range_int(buf_size) - range_int<1, 2>{};
+    while (n > 0 && *pos < kLimit.value()) buf[(*pos)++] = tmp[--n];
 }
 
 static void put_u64(char* buf, u32 buf_size, u32* pos, u64 value) {

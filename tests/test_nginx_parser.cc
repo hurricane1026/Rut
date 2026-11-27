@@ -396,6 +396,19 @@ static void check_http_profile_equal(rut::test::TestCase* _tc,
 
 }  // namespace
 
+TEST(nginx_parser, rejects_unrepresentable_eof_position) {
+    constexpr Str kOversized{"", UINT32_MAX};
+    const auto server = nginx::parse(kOversized);
+    const auto http = nginx::parse_http_profile(kOversized);
+    const auto config = nginx::parse_nginx_http_config(kOversized);
+    REQUIRE(!server);
+    REQUIRE(!http);
+    REQUIRE(!config);
+    CHECK(server.error().code == FrontendError::TooManyItems);
+    CHECK(http.error().code == FrontendError::TooManyItems);
+    CHECK(config.error().code == FrontendError::TooManyItems);
+}
+
 TEST(nginx_parser, parses_minimal_server_and_spans) {
     const char source[] =
         "server {\n"

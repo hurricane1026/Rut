@@ -189,6 +189,12 @@ static HeapFrontendResult<MirModule> build_mir_heap(const HirModule& module) {
     return {mir.value()};
 }
 
+TEST(frontend, lexer_rejects_unrepresentable_eof_position) {
+    const auto result = lex({"", UINT32_MAX});
+    REQUIRE(!result);
+    CHECK(result.error().code == FrontendError::TooManyItems);
+}
+
 TEST(frontend, ip_parse_lowers_optional_domain_values_and_hash_keys) {
     const char* sources[] = {
         test::ip_parse::kSource,

@@ -194,9 +194,10 @@ void rut_helper_req_routing_string(void* conn,
         if (!pc.ok) return;
         Str target = pc.req.path;
         if (!forward_target_valid(target)) return;
+        const auto kRemaining = range_int<262144, 262145>{} - range_int(target.len);
         auto& arena = connection.json_arena;
         if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
-            arena.space_used() > 262144 - target.len)
+            __int128_t{arena.space_used()} > kRemaining.value())
             return;
         auto* bytes = static_cast<char*>(arena.alloc(target.len));
         u32 normalized_length = 0;
@@ -249,13 +250,13 @@ void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, 
         *out_len = 1;
         return;
     }
-    i++;  // skip space
+    i = static_cast<u32>((range_int(i) + range_int<1, 2>{}).value());
     u32 path_start = i;
     while (i < req_len && req_data[i] != ' ' && req_data[i] != '\r') {
         i++;
     }
     *out_ptr = reinterpret_cast<const char*>(req_data + path_start);
-    *out_len = i - path_start;
+    *out_len = static_cast<u32>((range_int(i) - range_int(path_start)).value());
 }
 
 void rut_helper_req_path_only(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
@@ -278,8 +279,8 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     const ParseCache& pc = parse_cached(req_data, req_len);
     if (!pc.ok) return;
     const ParsedRequest& req = pc.req;
-    const u32 available = req_len - pc.header_end;
-    if (available == 0) return;
+    const auto kAvailable = range_int(req_len) - range_int(pc.header_end);
+    if (kAvailable.value() <= 0) return;
 
     if (req.chunked) return;
     // Without a Content-Length the body framing is undefined: in HTTP/1
@@ -287,7 +288,7 @@ void rut_helper_req_body(const u8* req_data, u32 req_len, const char** out_ptr, 
     // request's body. The HTTP/2 bridge synthesizes a Content-Length for
     // DATA-only bodies (see h2_finish_body) so they take the path below.
     if (!req.has_content_length) return;
-    if (req.content_length == 0 || available < req.content_length) return;
+    if (req.content_length == 0 || kAvailable.value() < req.content_length) return;
 
     *out_ptr = reinterpret_cast<const char*>(req_data + pc.header_end);
     *out_len = req.content_length;
@@ -453,8 +454,10 @@ extern "C" void* rut_helper_http_call_frame(
     __builtin_memcpy(static_cast<void*>(&saved), ctx.slots(), sizeof(HttpCallFrameHeader*));
     if (saved) return saved;
     auto& arena = conn.json_arena;
+    const auto kRemaining =
+        range_int<262144, 262145>{} - range_int(static_cast<u32>(size)) - range_int(length);
     if (!arena.backend.pool || (!arena.current && !arena.init(arena.backend.pool)) ||
-        arena.space_used() > 262144 - size - length)
+        __int128_t{arena.space_used()} > kRemaining.value())
         return nullptr;
     auto* frame = static_cast<HttpCallFrameHeader*>(arena.alloc(size));
     auto* snapshot = static_cast<u8*>(arena.alloc(length));
@@ -464,16 +467,18 @@ extern "C" void* rut_helper_http_call_frame(
     frame->request = snapshot;
     frame->length = length;
     const uintptr_t kRequestStart = reinterpret_cast<uintptr_t>(request);
-    const uintptr_t kRequestEnd = kRequestStart + length;
     const u32 kParamCount =
         ctx.route_param_count > kMaxRouteParams ? kMaxRouteParams : ctx.route_param_count;
     for (u32 i = 0; i < kParamCount; ++i) {
         auto& param = ctx.route_params[i];
         const uintptr_t kValueStart = reinterpret_cast<uintptr_t>(param.value);
-        if (!param.value || kValueStart < kRequestStart || kValueStart > kRequestEnd ||
-            param.value_len > kRequestEnd - kValueStart)
-            continue;
-        param.value = reinterpret_cast<const char*>(snapshot + (kValueStart - kRequestStart));
+        // RUT_INTEGER_RANGE: addresses can use the full uintptr_t range.
+        const auto kDistance = __int128_t{kValueStart} - __int128_t{kRequestStart};
+        if (!param.value || kDistance < 0 || kDistance > length) continue;
+        const u32 kOffset = static_cast<u32>(kDistance);
+        const auto kAvailable = range_int(length) - range_int(kOffset);
+        if (param.value_len > kAvailable.value()) continue;
+        param.value = reinterpret_cast<const char*>(snapshot + range_int(kOffset).value());
     }
     __builtin_memcpy(ctx.slots(), static_cast<const void*>(&frame), sizeof(HttpCallFrameHeader*));
     return frame;
@@ -603,19 +608,21 @@ extern "C" u64 rut_helper_forward_auth_header(void* connection,
     // by taking the bytes between the first two spaces in the validated start line.
     u32 start = 0;
     while (start < length && data[start] != ' ') ++start;
+    if (start == length) return 0xffffffffu;
     const Str method{reinterpret_cast<const char*>(data), start};
-    ++start;
+    start = static_cast<u32>((range_int(start) + range_int<1, 2>{}).value());
     u32 end = start;
     while (end < length && data[end] != ' ') ++end;
     if (end == length) return 0xffffffffu;
-    const auto reply =
-        forward_auth_for_request(connection,
-                                 {header, header_length},
-                                 policy,
-                                 {credential, credential_length},
-                                 method,
-                                 {reinterpret_cast<const char*>(data + start), end - start},
-                                 timeout_ms);
+    const auto kTargetLength = range_int(end) - range_int(start);
+    const auto reply = forward_auth_for_request(
+        connection,
+        {header, header_length},
+        policy,
+        {credential, credential_length},
+        method,
+        {reinterpret_cast<const char*>(data + start), static_cast<u32>(kTargetLength.value())},
+        timeout_ms);
     if (reply.status == static_cast<i32>(0x80000000u))
         return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
     if (reply.status == 1) {

@@ -1,3 +1,4 @@
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/auth.h"
@@ -949,10 +950,11 @@ bool policy_consumer_covers_window(PolicySnapshot& snapshot, u32 consumer, i64 h
     return false;
 }
 
-bool policy_continuous_validity(PolicySnapshot& snapshot, u32 value) {
+[[nodiscard]] bool policy_continuous_validity(PolicySnapshot& snapshot, u32 value) {
     i64 seconds = 0, horizon = 0;
+    // RUT_INTEGER_RANGE: the policy duration and wall clock are runtime values.
     if (!policy_quantity(snapshot.policy, value, 1, seconds) ||
-        __builtin_add_overflow(snapshot.now, seconds, &horizon))
+        add_overflow(snapshot.now, seconds, &horizon))
         return false;
     auto& doc = snapshot.registry;
     for (u32 consumer = doc.nodes[snapshot.consumers].child; consumer != json::kNone;
