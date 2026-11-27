@@ -192,6 +192,8 @@ gracefully before exiting.
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |
+| `--access-log-syslog ENDPOINT` | Send access logs to a local syslog socket or a UDP collector | off |
+| `--access-log-syslog-format FORMAT` | Choose `rfc3164` or `rfc5424` | RFC 3164 locally, RFC 5424 over UDP |
 | `--access-log-compress` | zstd-compress access logs | off |
 | `--access-log-level N` | Access log verbosity | build default |
 
@@ -232,6 +234,41 @@ Example with TLS:
   app.rut
 curl -k https://127.0.0.1:8443/
 ```
+
+### Access logs via syslog
+
+Use the local datagram socket exposed by syslogd, rsyslog, syslog-ng, or
+systemd-journald. On Linux this is usually `/dev/log`. Use the socket path
+visible to Rut when running inside a container.
+
+```sh
+rut 8080 app.rut --access-log-syslog unix:/dev/log
+```
+
+For a remote collector, enable its UDP syslog listener and pass its address.
+Hostnames are resolved at startup, the port defaults to 514, and IPv6 literals
+use brackets. Use `--access-log-syslog-format rfc3164` for older receivers that
+expect the BSD wire format. For example, configure the
+[Vector syslog source](https://vector.dev/docs/reference/configuration/sources/syslog/)
+in UDP mode, or use [Fluent Bit's syslog input](https://docs.fluentbit.io/manual/4.2/data-pipeline/inputs/syslog)
+in `udp` or `unix_udp` mode.
+
+```sh
+rut 8080 app.rut --access-log-syslog udp://logs.internal:514 --access-log-path-only
+rut 8080 app.rut --access-log-syslog 'udp://[2001:db8::10]:1514'
+```
+
+Rut sends one access log record per datagram with facility `local0`, severity
+`info`, and tag `rut-access`. The message body uses the same access log text
+as file output. Use `--access-log-path-only` to omit query strings. A syslog
+sink cannot be combined with a file sink, a source `accessLog` declaration,
+or compression.
+
+Delivery is best effort. An unavailable or saturated collector does not block
+request handling. Rut reports locally detected send failures at shutdown.
+UDP provides neither delivery acknowledgments nor encryption. For TCP, TLS,
+durable queues, or vendor-specific exports, configure a local logging daemon
+to receive the Unix datagrams and forward them.
 
 ## 4. Verify a change actually serves
 

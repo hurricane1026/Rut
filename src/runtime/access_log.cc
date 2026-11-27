@@ -5,8 +5,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/un.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -468,8 +472,171 @@ u32 AccessLogRing::available() const {
     return static_cast<u32>(static_cast<i64>(wp) - static_cast<i64>(rp));
 }
 
+// Local receivers expect the traditional libc syslog envelope. Network
+// listeners default to RFC 5424 and can opt in to the BSD envelope.
+static bool resolve_syslog_address(const char* endpoint, AccessLogSyslogDestination& out) {
+    if (strncmp(endpoint, "unix:", 5) == 0) {
+        const char* path = endpoint + 5;
+        sockaddr_un local{};
+        const size_t length = strnlen(path, sizeof(local.sun_path));
+        if (path[0] != '/' || length == sizeof(local.sun_path)) return false;
+        local.sun_family = AF_UNIX;
+        const i64 path_length = static_cast<i64>(length);
+        const i64 address_length =
+            static_cast<i64>(offsetof(sockaddr_un, sun_path)) + path_length + 1;
+        out.address_length = static_cast<socklen_t>(address_length);
+#ifdef __APPLE__
+        local.sun_len = static_cast<decltype(local.sun_len)>(out.address_length);
+#endif
+        memcpy(local.sun_path, path, static_cast<size_t>(path_length + 1));
+        memcpy(&out.address, &local, sizeof(local));
+        return true;
+    }
+
+    if (strncmp(endpoint, "udp://", 6) != 0) return false;
+    const char* host = endpoint + 6;
+    const char* end = nullptr;
+    const char* port = "514";
+    if (*host == '[') {
+        ++host;
+        end = strchr(host, ']');
+        if (!end || (end[1] != '\0' && end[1] != ':')) return false;
+        if (end[1] == ':') port = end + 2;
+    } else {
+        end = strchr(host, ':');
+        if (end)
+            port = end + 1;
+        else
+            end = strchr(host, '\0');
+    }
+    const auto host_length = end - host;
+    char name[256];
+    if (host_length <= 0 || host_length >= static_cast<i64>(sizeof(name))) return false;
+    i32 number = 0;
+    for (const char* digit = port; *digit != '\0'; ++digit) {
+        if (*digit < '0' || *digit > '9') return false;
+        number = number * 10 + (*digit - '0');
+        if (number > 65535) return false;
+    }
+    if (number == 0) return false;
+    memcpy(name, host, static_cast<size_t>(host_length));
+    name[host_length] = '\0';
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_NUMERICSERV;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(name, port, &hints, &addresses) != 0) return false;
+    for (const addrinfo* address = addresses; address; address = address->ai_next) {
+        if ((address->ai_family == AF_INET || address->ai_family == AF_INET6) &&
+            address->ai_addrlen <= sizeof(out.address)) {
+            memcpy(&out.address, address->ai_addr, address->ai_addrlen);
+            out.address_length = address->ai_addrlen;
+            break;
+        }
+    }
+    freeaddrinfo(addresses);
+    return out.address_length != 0;
+}
+
+core::Expected<i32, Error> open_access_log_syslog(const char* endpoint,
+                                                  AccessLogSyslogFormat format,
+                                                  AccessLogSyslogDestination& destination) {
+    AccessLogSyslogDestination resolved{};
+    if (!endpoint || !resolve_syslog_address(endpoint, resolved))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+
+    if (format == AccessLogSyslogFormat::Auto)
+        format = resolved.address.ss_family == AF_UNIX ? AccessLogSyslogFormat::Rfc3164
+                                                       : AccessLogSyslogFormat::Rfc5424;
+    resolved.format = format;
+    if (gethostname(resolved.hostname, sizeof(resolved.hostname) - 1) != 0 ||
+        resolved.hostname[0] == '\0')
+        strcpy(resolved.hostname, "-");
+    for (char* byte = resolved.hostname; *byte != '\0'; ++byte)
+        if (*byte <= ' ' || *byte > '~') *byte = '_';
+    resolved.process_id = static_cast<i32>(getpid());
+
+    const i32 fd = socket(resolved.address.ss_family, SOCK_DGRAM, 0);
+    if (fd < 0) return core::make_unexpected(Error::from_errno(Error::Source::Socket));
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        const auto error = Error::from_errno(Error::Source::Socket);
+        close(fd);
+        return core::make_unexpected(error);
+    }
+    destination = resolved;
+    return fd;
+}
+
+void AccessLogFlusher::record_syslog_failure() {
+    static constexpr i64 kMaxSyslogSendFailures = static_cast<i64>(~u64{0} >> 1);
+    if (syslog_send_failures_ < kMaxSyslogSendFailures) ++syslog_send_failures_;
+}
+
+void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line, u32 length) {
+    char header[128];
+    i32 header_length = 0;
+    // Facility local0, severity informational.
+    if (syslog_.format == AccessLogSyslogFormat::Rfc5424) {
+        header_length = snprintf(header,
+                                 sizeof(header),
+                                 "<134>1 %.24s %s rut-access %d - - ",
+                                 line,
+                                 syslog_.hostname,
+                                 syslog_.process_id);
+    } else {
+        const auto seconds = static_cast<time_t>(entry.timestamp_us / 1000000);
+        tm local{};
+        if (!localtime_r(&seconds, &local) || local.tm_mon < 0 || local.tm_mon >= 12) {
+            record_syslog_failure();
+            return;
+        }
+        static constexpr const char* months[] = {
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        const char* host = syslog_.address.ss_family == AF_UNIX ? "" : syslog_.hostname;
+        header_length = snprintf(header,
+                                 sizeof(header),
+                                 "<134>%s %2d %02d:%02d:%02d %s%s"
+                                 "rut-access[%d]: ",
+                                 months[local.tm_mon],
+                                 local.tm_mday,
+                                 local.tm_hour,
+                                 local.tm_min,
+                                 local.tm_sec,
+                                 host,
+                                 *host ? " " : "",
+                                 syslog_.process_id);
+    }
+    if (header_length <= 0 || header_length >= static_cast<i32>(sizeof(header))) {
+        record_syslog_failure();
+        return;
+    }
+    static constexpr i64 kMessageCapacity =
+        static_cast<i64>(sizeof(header)) + static_cast<i64>(kAccessLogTextLineCapacity);
+    char message[kMessageCapacity];
+    memcpy(message, header, static_cast<size_t>(header_length));
+    const i64 payload_length = static_cast<i64>(length) - 1;  // strip file record delimiter
+    for (i64 i = 0; i < payload_length; ++i) {
+        const auto byte = static_cast<unsigned char>(line[i]);
+        message[static_cast<i64>(header_length) + i] = byte < 32 || byte == 127 ? '?' : line[i];
+    }
+    const i64 size = header_length + payload_length;
+    ssize_t sent;
+    do {
+        sent = sendto(output_fd,
+                      message,
+                      static_cast<size_t>(size),
+                      0,
+                      reinterpret_cast<const sockaddr*>(&syslog_.address),
+                      syslog_.address_length);
+    } while (sent < 0 && errno == EINTR);
+    if (sent != size) record_syslog_failure();
+}
+
 void AccessLogFlusher::init(i32 fd, bool compress_enabled, i32 level, u32 interval_ms) {
     ring_count = 0;
+    syslog_ = {};
+    syslog_send_failures_ = 0;
     output_fd = fd;
     flush_interval_ms = interval_ms;
     compress = compress_enabled;
@@ -481,6 +648,11 @@ void AccessLogFlusher::init(i32 fd, bool compress_enabled, i32 level, u32 interv
     running = false;
     zstd_ctx = nullptr;
     for (u32 i = 0; i < kMaxRings; i++) rings[i] = nullptr;
+}
+
+void AccessLogFlusher::init_syslog(i32 fd, const AccessLogSyslogDestination& destination) {
+    init(fd);
+    syslog_ = destination;
 }
 
 void AccessLogFlusher::add_ring(AccessLogRing* ring) {
@@ -611,7 +783,9 @@ u32 AccessLogFlusher::flush_once() {
     for (u32 i = 0; i < ring_count; i++) {
         while (rings[i]->pop(entry)) {
             u32 n = format_access_log_text(entry, line, sizeof(line));
-            if (n > 0) {
+            if (n > 0 && syslog_.address_length != 0) {
+                send_syslog(entry, line, n);
+            } else if (n > 0) {
                 // Flush batch if this line won't fit.
                 if (batch_len + static_cast<i64>(n) > static_cast<i64>(kBatchSize)) {
                     if (!flush_batch(reinterpret_cast<const u8*>(batch),

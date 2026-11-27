@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include <pthread.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -183,7 +184,23 @@ u32 format_access_log_downstream_request_bytes_line(const AccessLogEntry& entry,
                                                     char* buf,
                                                     u32 buf_size);
 
-// Background flusher — reads from all shard rings, writes text entries to fd.
+// Resolved at startup. The flusher sends one bounded record per datagram.
+enum class AccessLogSyslogFormat : u8 { Auto, Rfc3164, Rfc5424 };
+
+struct AccessLogSyslogDestination {
+    sockaddr_storage address{};
+    socklen_t address_length = 0;
+    AccessLogSyslogFormat format = AccessLogSyslogFormat::Auto;
+    char hostname[64]{};
+    i32 process_id = 0;
+};
+
+core::Expected<i32, Error> open_access_log_syslog(const char* endpoint,
+                                                  AccessLogSyslogFormat format,
+                                                  AccessLogSyslogDestination& destination);
+
+// Background flusher. Reads records from all shard rings and writes file lines
+// or sends syslog datagrams.
 // Optionally compresses output with zstd streaming compression.
 //
 // Modes:
@@ -221,6 +238,9 @@ struct AccessLogFlusher {
               i32 level = kDefaultLevel,
               u32 interval_ms = 100);
 
+    void init_syslog(i32 fd, const AccessLogSyslogDestination& destination);
+    // Read only after stop() has joined the writer.
+    i64 syslog_send_failures() const { return syslog_send_failures_; }
     void add_ring(AccessLogRing* ring);
 
     core::Expected<void, Error> start();
@@ -233,6 +253,10 @@ struct AccessLogFlusher {
     bool flush_batch(const u8* data, u32 len);
 
 private:
+    void send_syslog(const AccessLogEntry& entry, const char* line, u32 length);
+    void record_syslog_failure();
+    AccessLogSyslogDestination syslog_{};
+    i64 syslog_send_failures_ = 0;
     static void* thread_entry(void* arg);
 };
 
