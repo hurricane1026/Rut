@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
@@ -17,9 +18,8 @@ inline constexpr u32 kFormatIntegerBufferSize = [] {
 }();
 
 // Canonical signed decimal into caller-owned scratch: no allocation, NUL or
-// padding. The returned view occupies the tail of the buffer. Handle INT64_MIN
-// before signed negation since its magnitude requires the high bit of u64.
-inline Str format_integer(i64 value, char (&buffer)[kFormatIntegerBufferSize]) {
+// padding. The returned view occupies the tail of the buffer.
+[[nodiscard]] inline Str format_integer(i64 value, char (&buffer)[kFormatIntegerBufferSize]) {
     struct DecimalPairs {
         char digits[100][2];
     };
@@ -32,8 +32,9 @@ inline Str format_integer(i64 value, char (&buffer)[kFormatIntegerBufferSize]) {
         return pairs;
     }();
     const bool kNegative = value < 0;
-    u64 magnitude =
-        value == INT64_MIN ? u64{INT64_MAX} + 1 : static_cast<u64>(kNegative ? -value : value);
+    // Unsigned negation also gives the exact magnitude of INT64_MIN.
+    const u64 bits = __builtin_bit_cast(u64, value);
+    u64 magnitude = kNegative ? wrapping_sub(u64{0}, bits) : bits;
     char* cursor = buffer + sizeof(buffer);
     auto append_pair = [&] {
         const auto& pair = bounded_remainder<100>(magnitude).at(kPairs.digits);

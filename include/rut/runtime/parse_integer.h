@@ -7,56 +7,46 @@
 namespace rut {
 namespace integer_detail {
 
-inline u64 wrap_add(u64 a, u64 b) {
-    u64 result = 0;
-    // RUT_INTEGER_RANGE: packed decimal arithmetic uses the low 64 bits.
-    (void)add_overflow(a, b, &result);
-    return result;
-}
-
-inline u64 wrap_sub(u64 a, u64 b) {
-    u64 result = 0;
-    // RUT_INTEGER_RANGE: packed decimal arithmetic uses the low 64 bits.
-    (void)sub_overflow(a, b, &result);
-    return result;
-}
-
 // Each caller proves that the complete word is inside the supplied view.
-inline bool digits8(const char* data, u32& result) {
+[[nodiscard]] inline bool digits8(const char* data, u32& result) {
     u64 word;
     __builtin_memcpy(&word, data, sizeof(word));
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     word = __builtin_bswap64(word);
 #endif
-    if (((wrap_add(word, 0x4646464646464646ULL) | wrap_sub(word, 0x3030303030303030ULL)) &
-         0x8080808080808080ULL))
+    constexpr u64 kAsciiZero = 0x3030303030303030ULL;
+    if ((wrapping_add(word, u64{0x4646464646464646ULL}) | wrapping_sub(word, kAsciiZero)) &
+        0x8080808080808080ULL)
         return false;
-    word = wrap_sub(word, 0x3030303030303030ULL);
-    word = wrap_add(static_cast<u64>(word) * 10u, static_cast<u64>(word >> 8));
-    result = static_cast<u32>(
-        (wrap_add((word & 0x000000ff000000ffULL) * 0x000f424000000064ULL,
-                  ((word >> 16) & 0x000000ff000000ffULL) * 0x0000271000000001ULL)) >>
-        32);
+    // The packed arithmetic intentionally keeps the low bits of each word.
+    word = wrapping_sub(word, kAsciiZero);
+    word = wrapping_add(wrapping_mul(word, u64{10}), word >> 8);
+    constexpr u64 kPairMask = 0x000000ff000000ffULL;
+    const u64 packed =
+        wrapping_add(wrapping_mul(word & kPairMask, u64{0x000f424000000064ULL}),
+                     wrapping_mul((word >> 16) & kPairMask, u64{0x0000271000000001ULL}));
+    result = bounded_quotient<(u64{1} << 32)>(packed).to<u32>();
     return true;
 }
 
-inline bool digits4(const char* data, u32& result) {
+[[nodiscard]] inline bool digits4(const char* data, u32& result) {
     u32 word;
     __builtin_memcpy(&word, data, sizeof(word));
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
     word = __builtin_bswap32(word);
 #endif
-    if (((wrap_add(word, 0x46464646u) | wrap_sub(word, 0x30303030u)) & 0x80808080u)) return false;
-    word = wrap_sub(word, 0x30303030u);
-    word =
-        wrap_add(static_cast<u64>(static_cast<u32>(word * u32{10})), static_cast<u64>(word >> 8));
-    result = (((word & 0x00ff00ffu) * 0x00640001u) >> 16) & 0xffffu;
+    constexpr u32 kAsciiZero = 0x30303030u;
+    if ((wrapping_add(word, u32{0x46464646}) | wrapping_sub(word, kAsciiZero)) & 0x80808080u)
+        return false;
+    word = wrapping_sub(word, kAsciiZero);
+    word = wrapping_add(wrapping_mul(word, u32{10}), word >> 8);
+    result = wrapping_mul(word & u32{0x00ff00ff}, u32{0x00640001}) >> 16;
     return true;
 }
 
 struct PortableDigits {
     static constexpr bool kBlock16 = false;
-    static bool read8(const char* data, u32& result) { return digits8(data, result); }
+    [[nodiscard]] static bool read8(const char* data, u32& result) { return digits8(data, result); }
 };
 
 }  // namespace integer_detail
@@ -65,7 +55,7 @@ struct PortableDigits {
 // terminator, padding, alignment, locale or CPU feature requirements. On failure
 // the output is unchanged. Wide selects the signed 64-bit rather than 32-bit range.
 template <bool Wide, class Digits = integer_detail::PortableDigits>
-inline bool parse_integer(Str text, i64& output) {
+[[nodiscard]] inline bool parse_integer(Str text, i64& output) {
     if (!text.ptr || !text.len) return false;
     const char* data = text.ptr;
     u32 length = text.len;
@@ -83,7 +73,7 @@ inline bool parse_integer(Str text, i64& output) {
                 u64 zeros;
                 __builtin_memcpy(&zeros, data, sizeof(zeros));
                 if (zeros != 0x3030303030303030ULL) break;
-                data += static_cast<i64>(8);
+                data += 8;
                 length = (range_int(length) - range_int<8, 9>{}).max(range_int<0, 1>{}).to<u32>();
             }
             while (length && *data == '0') {
@@ -97,45 +87,38 @@ inline bool parse_integer(Str text, i64& output) {
                 u64 block;
                 if (!Digits::read16(data, block)) return false;
                 number = block;
-                data += static_cast<i64>(16);
+                data += 16;
                 length = (range_int(length) - range_int<16, 17>{}).max(range_int<0, 1>{}).to<u32>();
             }
         }
         while (length >= 8) {
             u32 block;
             if (!Digits::read8(data, block)) return false;
-            number = integer_detail::wrap_add(number * 100000000, block);
-            data += static_cast<i64>(8);
+            number = wrapping_add(number * 100000000, u64{block});
+            data += 8;
             length = (range_int(length) - range_int<8, 9>{}).max(range_int<0, 1>{}).to<u32>();
         }
         if (length >= 4) {
             u32 block;
             if (!integer_detail::digits4(data, block)) return false;
-            number = integer_detail::wrap_add(number * 10000, block);
-            data += static_cast<i64>(4);
+            number = wrapping_add(number * 10000, u64{block});
+            data += 4;
             length = (range_int(length) - range_int<4, 5>{}).max(range_int<0, 1>{}).to<u32>();
         }
     }
     while (length--) {
-        const u8 byte = static_cast<u8>(*data++);
+        const u8 byte = __builtin_bit_cast(u8, *data++);
         if (byte < '0' || byte > '9') return false;
-        const u32 digit = static_cast<u32>(static_cast<i32>(byte) - static_cast<i32>('0'));
-        number = integer_detail::wrap_add(number * 10, digit);
+        // In ASCII the low nibble of a validated digit is its decimal value.
+        static_assert('0' == 0x30 && '9' == 0x39);
+        number = wrapping_add(number * 10, bounded_remainder<16>(byte).to_u64());
     }
-    constexpr u64 kPositiveLimit = Wide ? 9223372036854775807ULL : 2147483647ULL;
-    u64 max_magnitude = 0;
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)add_overflow(kPositiveLimit, static_cast<u64>(negative), &max_magnitude);
+    constexpr u64 kPositiveLimit = Wide ? INT64_MAX : INT32_MAX;
+    // Even the negative limit is representable as an unsigned magnitude.
+    const u64 max_magnitude = wrapping_add(kPositiveLimit, u64{negative});
     if (number > max_magnitude) return false;
-    // Form the two's-complement representation with unsigned arithmetic, including
-    // INT64_MIN, then preserve its bits without a signed overflow.
-    u64 magnitude = 0;
-    if (negative)
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)sub_overflow(u64{0}, number, &magnitude);
-    else
-        magnitude = number;
-    output = __builtin_bit_cast(i64, magnitude);
+    // Negate the unsigned bit pattern to include INT64_MIN without signed negation.
+    output = __builtin_bit_cast(i64, negative ? wrapping_sub(u64{0}, number) : number);
     return true;
 }
 
