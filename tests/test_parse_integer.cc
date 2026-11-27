@@ -36,7 +36,7 @@ void compare(rut::test::TestCase* _tc, Str text) {
                  valid);
         CHECK_EQ(actual, expected);
         actual = 123;
-        CHECK_EQ(wide ? parse_integer64(text, actual) : parse_integer32(text, actual), valid);
+        CHECK_EQ(wide ? parse_integer64(text, &actual) : parse_integer32(text, &actual), valid);
         CHECK_EQ(actual, expected);
     }
 }

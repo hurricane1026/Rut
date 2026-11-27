@@ -38,7 +38,7 @@ bool standard_webhook_valid(Str id,
     if (timestamp.ptr[0] < '1' || timestamp.ptr[0] > '9') return false;
     i64 parsed_seconds;
     range_int<1> seconds;
-    if (!parse_integer64(timestamp, parsed_seconds) ||
+    if (!parse_integer64(timestamp, &parsed_seconds) ||
         !decltype(seconds)::try_from_i64(parsed_seconds, &seconds))
         return false;
     const i64 delta = (seconds - now).value();

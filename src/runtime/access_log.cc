@@ -1,7 +1,6 @@
 #include "rut/runtime/access_log.h"
 
 #include "rut/common/checked_arithmetic.h"
-#include "rut/common/integer_conversion.h"
 #include "rut/common/range_int.h"
 #include "rut/runtime/access_log_host.h"
 #include "rut/runtime/format_integer.h"
@@ -485,15 +484,16 @@ static bool resolve_syslog_address(const char* endpoint, AccessLogSyslogDestinat
         const size_t length = strnlen(path, sizeof(local.sun_path));
         if (path[0] != '/' || length == sizeof(local.sun_path)) return false;
         local.sun_family = AF_UNIX;
-        i64 path_length = 0;
-        if (!try_u64_to_i64(static_cast<u64>(length), path_length)) return false;
-        const i64 address_length =
-            static_cast<i64>(offsetof(sockaddr_un, sun_path)) + path_length + 1;
-        out.address_length = static_cast<socklen_t>(address_length);
+        range_int<0, sizeof(local.sun_path)> path_length;
+        if (!decltype(path_length)::try_from_u64(length, &path_length)) return false;
+        constexpr i64 kOffset = offsetof(sockaddr_un, sun_path);
+        const auto path_bytes = path_length + range_int<1, 2>{};
+        const auto address_length = range_int<kOffset, kOffset + 1>{} + path_bytes;
+        out.address_length = address_length.to<socklen_t>();
 #ifdef __APPLE__
-        local.sun_len = static_cast<decltype(local.sun_len)>(out.address_length);
+        local.sun_len = address_length.to<decltype(local.sun_len)>();
 #endif
-        memcpy(local.sun_path, path, static_cast<size_t>(path_length + 1));
+        memcpy(local.sun_path, path, path_bytes.to<u16>());
         memcpy(&out.address, &local, sizeof(local));
         return true;
     }
@@ -591,7 +591,7 @@ void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line
                                  syslog_.process_id);
     } else {
         time_t seconds = 0;
-        if (__builtin_add_overflow(entry.timestamp_us / 1000000, u64{0}, &seconds)) {
+        if (!bounded_quotient<1'000'000>(entry.timestamp_us).try_to_signed(&seconds)) {
             record_syslog_failure();
             return;
         }

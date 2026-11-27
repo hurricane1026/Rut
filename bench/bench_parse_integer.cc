@@ -20,14 +20,14 @@ static uint64_t rng() {
     return random_state;
 }
 template <bool Wide>
-static bool finish(uint64_t n, bool negative, int64_t& result) {
+static bool finish(uint64_t n, bool negative, int64_t* result) {
     const uint64_t limit = (Wide ? 9223372036854775807ULL : 2147483647ULL) + negative;
     if (n > limit) return false;
-    result = negative ? static_cast<int64_t>(uint64_t(0) - n) : static_cast<int64_t>(n);
+    *result = negative ? static_cast<int64_t>(uint64_t(0) - n) : static_cast<int64_t>(n);
     return true;
 }
 template <bool Wide>
-__attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_t& result) {
+__attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_t* result) {
     if (!len) return false;
     bool negative = *p == '-';
     if (negative || *p == '+') {
@@ -44,11 +44,11 @@ __attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_
     return finish<Wide>(n, negative, result);
 }
 template <bool Wide>
-__attribute__((noinline)) static bool parse(const char* data, uint32_t length, int64_t& value) {
-    return rut::parse_integer<Wide>({data, length}, &value);
+__attribute__((noinline)) static bool parse(const char* data, uint32_t length, int64_t* value) {
+    return rut::parse_integer<Wide>({data, length}, value);
 }
 template <bool Wide>
-__attribute__((noinline)) static bool selected(const char* data, uint32_t length, int64_t& value) {
+__attribute__((noinline)) static bool selected(const char* data, uint32_t length, int64_t* value) {
     if constexpr (Wide) return rut::parse_integer64({data, length}, value);
     return rut::parse_integer32({data, length}, value);
 }
@@ -58,7 +58,7 @@ static double now() {
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 int main() {
-    using Fn = bool (*)(const char*, uint32_t, int64_t&);
+    using Fn = bool (*)(const char*, uint32_t, int64_t*);
     const bool widths[] = {false, true};
     for (bool wide : widths) {
         random_state = 0x123456789abcdef;
@@ -110,10 +110,10 @@ int main() {
             }
             for (auto& e : entries) {
                 int64_t expected = 0;
-                bool ok = functions[0](e.text, e.len, expected);
+                bool ok = functions[0](e.text, e.len, &expected);
                 for (auto f : functions) {
                     int64_t actual = 0;
-                    bool got = f(e.text, e.len, actual);
+                    bool got = f(e.text, e.len, &actual);
                     if (got != ok || (got && actual != expected)) {
                         fprintf(stderr, "mismatch set=%u text=%.*s\n", set, e.len, e.text);
                         return 1;
@@ -128,7 +128,7 @@ int main() {
                     for (unsigned repeat = 0; repeat < 512; ++repeat)
                         for (auto& e : entries) {
                             int64_t value = 0;
-                            bool ok = functions[which](e.text, e.len, value);
+                            bool ok = functions[which](e.text, e.len, &value);
                             checksum += ok ? uint64_t(value) : 13;
                         }
                     double elapsed = now() - start;

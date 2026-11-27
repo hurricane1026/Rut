@@ -37,7 +37,10 @@
 using namespace rut;
 
 TEST(grpc_accounting, overflow_leaves_the_last_exact_total) {
-    u64 bytes = UINT64_MAX - 1;
+    u64 bytes = 0;
+    CHECK(grpc_count_bytes(&bytes, u64{UINT32_MAX} + 1));
+    CHECK_EQ(bytes, u64{UINT32_MAX} + 1);
+    bytes = UINT64_MAX - 1;
     CHECK(grpc_count_bytes(&bytes, 1));
     CHECK_EQ(bytes, UINT64_MAX);
     CHECK(!grpc_count_bytes(&bytes, 1));

@@ -9,7 +9,7 @@
 // ============================================================
 
 // Search for a substring in a Buffer's data.
-static bool buf_contains(const Buffer& buf, const char* needle) {
+static bool buf_contains(const SliceBuffer& buf, const char* needle) {
     const char* data = reinterpret_cast<const char*>(buf.data());
     rut::u32 len = buf.len();
     rut::u32 nlen = 0;

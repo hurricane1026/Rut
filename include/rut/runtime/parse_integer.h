@@ -122,8 +122,8 @@ template <bool Wide, class Digits = integer_detail::PortableDigits>
 
 // Compile-time selected runtime entry points. The implementation translation
 // unit alone receives ISA flags; callers retain the normal deployment baseline.
-bool parse_integer32(Str text, i64& output);
-bool parse_integer64(Str text, i64& output);
+[[nodiscard]] bool parse_integer32(Str text, i64* output);
+[[nodiscard]] bool parse_integer64(Str text, i64* output);
 const char* parse_integer_arch();
 
 }  // namespace rut

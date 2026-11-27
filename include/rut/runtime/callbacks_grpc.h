@@ -13,7 +13,7 @@
 #include "rut/runtime/ws_handshake.h"
 
 namespace rut {
-[[nodiscard]] inline bool grpc_count_bytes(u64* total, u32 count) {
+[[nodiscard]] inline bool grpc_count_bytes(u64* total, u64 count) {
     // Streaming RPCs can accumulate the full u64 range.
     return try_add_to(total, count);
 }

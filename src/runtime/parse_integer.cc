@@ -2,11 +2,11 @@
 
 namespace rut {
 
-bool parse_integer32(Str text, i64& output) {
-    return parse_integer<false, integer_detail::SelectedDigits>(text, &output);
+[[nodiscard]] bool parse_integer32(Str text, i64* output) {
+    return parse_integer<false, integer_detail::SelectedDigits>(text, output);
 }
-bool parse_integer64(Str text, i64& output) {
-    return parse_integer<true, integer_detail::SelectedDigits>(text, &output);
+[[nodiscard]] bool parse_integer64(Str text, i64* output) {
+    return parse_integer<true, integer_detail::SelectedDigits>(text, output);
 }
 const char* parse_integer_arch() {
 #if defined(RUT_INTEGER_ARCH_SSE2)

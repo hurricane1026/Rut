@@ -170,7 +170,7 @@ struct UpstreamPool {
             const i32 prior_completed = c.completed_requests;
             u64 idle_us = 0;
             const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
-                                 !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                                 !sub_overflow(now_us, c.parked_time, &idle_us) &&
                                  idle_us >= static_cast<u64>(idle_timeout_sec) * 1000000u;
             release_slot(i);
             if (expired) {
@@ -224,11 +224,13 @@ struct UpstreamPool {
     static i32 create_socket() { return platform::stream_socket(); }
 
 private:
-    static u64 clock_us() {
+    [[nodiscard]] static u64 clock_us() {
         timespec ts{};
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        u64 now_us = static_cast<u64>(ts.tv_sec) * 1000000u;
-        (void)__builtin_add_overflow(now_us, static_cast<u64>(ts.tv_nsec) / 1000u, &now_us);
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0) return 0;
+        u64 now_us;
+        if (mul_overflow(ts.tv_sec, 1'000'000u, &now_us) ||
+            add_overflow(now_us, ts.tv_nsec / 1000, &now_us))
+            return UINT64_MAX;
         return now_us;
     }
 
