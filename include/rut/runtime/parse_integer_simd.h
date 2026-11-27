@@ -46,21 +46,21 @@ inline __m128i four_digit_groups(__m128i digits) {
 }
 struct X86Digits {
     static constexpr bool kBlock16 = true;
-    static bool read8(const char* data, u32& result) {
+    [[nodiscard]] static bool read8(const char* data, u32* result) {
         u64 word;
         __builtin_memcpy(&word, data, sizeof(word));
         const auto digits =
             _mm_sub_epi8(_mm_cvtsi64_si128(static_cast<i64>(word)), _mm_set1_epi8('0'));
         if (!valid_digits(digits, 0xff)) return false;
         const auto groups = four_digit_groups(digits);
-        result = low_group(groups) * 10000 + low_group(_mm_srli_si128(groups, 4));
+        *result = low_group(groups) * 10000 + low_group(_mm_srli_si128(groups, 4));
         return true;
     }
-    static bool read16(const char* data, u64& result) {
+    [[nodiscard]] static bool read16(const char* data, u64* result) {
         const auto digits = _mm_sub_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data)),
                                          _mm_set1_epi8('0'));
         if (!valid_digits(digits, 0xffff)) return false;
-        result = combine16(four_digit_groups(digits));
+        *result = combine16(four_digit_groups(digits));
         return true;
     }
 };
@@ -78,16 +78,16 @@ struct Avx512Digits {
         result = _mm512_castsi512_si128(_mm512_madd_epi16(pairs, _mm512_set1_epi32(0x00010064)));
         return true;
     }
-    static bool read8(const char* data, u32& result) {
+    [[nodiscard]] static bool read8(const char* data, u32* result) {
         __m128i blocks;
         if (!groups(data, 0xff, blocks)) return false;
-        result = low_group(blocks) * 10000 + low_group(_mm_srli_si128(blocks, 4));
+        *result = low_group(blocks) * 10000 + low_group(_mm_srli_si128(blocks, 4));
         return true;
     }
-    static bool read16(const char* data, u64& result) {
+    [[nodiscard]] static bool read16(const char* data, u64* result) {
         __m128i blocks;
         if (!groups(data, 0xffff, blocks)) return false;
-        result = combine16(blocks);
+        *result = combine16(blocks);
         return true;
     }
 };
@@ -103,17 +103,17 @@ struct NeonDigits {
         const auto groups = vpaddlq_u32(vmulq_u32(pairs, vld1q_u32(pair_weights)));
         return static_cast<u32>(vgetq_lane_u64(groups, 0) * 10000 + vgetq_lane_u64(groups, 1));
     }
-    static bool read8(const char* data, u32& result) {
+    [[nodiscard]] static bool read8(const char* data, u32* result) {
         const auto digits = vsub_u8(vld1_u8(reinterpret_cast<const u8*>(data)), vdup_n_u8('0'));
         if (vmaxv_u8(digits) > 9) return false;
-        result = reduce8(digits);
+        *result = reduce8(digits);
         return true;
     }
-    static bool read16(const char* data, u64& result) {
+    [[nodiscard]] static bool read16(const char* data, u64* result) {
         const auto digits = vsubq_u8(vld1q_u8(reinterpret_cast<const u8*>(data)), vdupq_n_u8('0'));
         if (vmaxvq_u8(digits) > 9) return false;
-        result = static_cast<u64>(reduce8(vget_low_u8(digits))) * 100000000 +
-                 reduce8(vget_high_u8(digits));
+        *result = static_cast<u64>(reduce8(vget_low_u8(digits))) * 100000000 +
+                  reduce8(vget_high_u8(digits));
         return true;
     }
 };

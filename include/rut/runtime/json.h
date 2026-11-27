@@ -579,7 +579,7 @@ struct Document {
 };
 
 inline bool integer(Str s, i64& out) {
-    return s.ptr && s.len && s.ptr[0] != '+' && parse_integer<true>(s, out);
+    return s.ptr && s.len && s.ptr[0] != '+' && parse_integer<true>(s, &out);
 }
 
 // All updates are immutable. Set/remove require an existing RFC 6901 target;

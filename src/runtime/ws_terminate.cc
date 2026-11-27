@@ -401,7 +401,7 @@ namespace {
                               const u8* payload,
                               u64 len,
                               bool masked,
-                              u64& /*mask_rng*/,
+                              const u64& /*mask_rng*/,
                               Str prefix = {},
                               Str suffix = {},
                               bool compressed = false) {

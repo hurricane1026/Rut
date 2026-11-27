@@ -45,7 +45,7 @@ __attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_
 }
 template <bool Wide>
 __attribute__((noinline)) static bool parse(const char* data, uint32_t length, int64_t& value) {
-    return rut::parse_integer<Wide>({data, length}, value);
+    return rut::parse_integer<Wide>({data, length}, &value);
 }
 template <bool Wide>
 __attribute__((noinline)) static bool selected(const char* data, uint32_t length, int64_t& value) {

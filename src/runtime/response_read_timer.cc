@@ -72,7 +72,7 @@ static_assert(timer_rearm_contract(), "Response timer violates rearm interval co
                         const u32 tag =
                             generation | (arriving == cancel ? kResponseReadTimerCancelBit : 0);
                         const auto result = consume_response_read_timer_owner(
-                            phase, owner_generation, tag, target_owned, cancel_owned);
+                            phase, owner_generation, tag, &target_owned, &cancel_owned);
                         if (result != expected || target_owned != bool(remaining & target) ||
                             cancel_owned != bool(remaining & cancel))
                             return false;

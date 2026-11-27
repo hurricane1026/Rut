@@ -48,3 +48,31 @@ void discard_results(const Object& object, bool condition) {
     (void)side_effect();
     (void)condition;
 }
+
+using Length = unsigned;
+enum class Phase { Ready };
+using MutableLength = Length&;
+
+// expected-warning@+1 {{use a pointer for a mutable scalar parameter}}
+void consume(MutableLength length);
+// expected-warning@+1 {{use a pointer for a mutable scalar parameter}}
+void advance(Phase& phase);
+// expected-warning@+1 {{use a pointer for a mutable scalar parameter}}
+void next(char*& cursor);
+
+void consume(Length* length);
+void read(const Length& length);
+void copy(Length length);
+void reset(Object& object);
+[[nodiscard]] Phase& operator++(Phase& phase);
+void move(Object&& object);
+
+template <typename T>
+// expected-warning@+1 {{use a pointer for a mutable scalar parameter}}
+void update_value(T& value) {
+    value = {};
+}
+
+void exercise_template(Length* length) {
+    update_value(*length);
+}

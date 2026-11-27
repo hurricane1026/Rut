@@ -2192,7 +2192,7 @@ u32 IoUringBackend::wait(IoEvent* events,
             }
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);
-                if (!advance_send_bytes(ss.offset, ss.remaining, nw) ||
+                if (!advance_send_bytes(&ss.offset, &ss.remaining, nw) ||
                     (ss.vector && !ss.vector->advance(nw))) {
                     // A completion may never claim bytes outside the submitted
                     // range.  Clear the state and emit one terminal failure;

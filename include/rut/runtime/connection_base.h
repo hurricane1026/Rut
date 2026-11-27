@@ -1127,8 +1127,8 @@ struct ConnectionBase {
         const auto result = consume_response_read_timer_owner(response_read_timer_phase,
                                                               response_read_timer_owner_generation,
                                                               tagged_generation,
-                                                              response_read_timer_target_owned,
-                                                              response_read_timer_cancel_owned);
+                                                              &response_read_timer_target_owned,
+                                                              &response_read_timer_cancel_owned);
         if (result == TimerCompletion::Rejected) return false;
         if (result == TimerCompletion::Drained) {
             const bool cleared = clear_response_read_timer_owner();

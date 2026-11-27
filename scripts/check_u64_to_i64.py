@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enforce the Clang integer range policies in production code."""
+"""Enforce Clang integer range and API style policies in production code."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -20,10 +20,12 @@ INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 RANGE_CAST_MESSAGE = 'narrow a range_int with a range-checked conversion'
 BIT_CAST_MESSAGE = 'use a value conversion for integer or enum bit casts'
 NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
+MUTABLE_REFERENCE_MESSAGE = 'use a pointer for a mutable scalar parameter'
 VOID_DISCARD_MESSAGE = 'void cast discards a [[nodiscard]] result'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
 MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE,
-            ADDRESS_MESSAGE, BIT_CAST_MESSAGE, VOID_DISCARD_MESSAGE, *ARITHMETIC_MESSAGES)
+            ADDRESS_MESSAGE, BIT_CAST_MESSAGE, VOID_DISCARD_MESSAGE, MUTABLE_REFERENCE_MESSAGE,
+            *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -142,7 +144,8 @@ def main():
                         help='write native arithmetic sites that need a proof')
     parser.add_argument('--require-arithmetic-proofs', action='store_true',
                         help='fail on unannotated native arithmetic in the audit scope')
-    parser.add_argument('--overflow-base', help='audit checked arithmetic on C++ lines added since the merge base')
+    parser.add_argument('--overflow-base',
+                        help='audit checked arithmetic and mutable scalar references since the merge base')
     parser.add_argument('--range-cast-inventory', type=Path,
                         help='write all explicit narrowing casts derived from range_int::value()')
     parser.add_argument('--nodiscard-inventory', type=Path,
@@ -235,7 +238,18 @@ def main():
     arithmetic = [site for site in sites if site[-1] in ARITHMETIC_MESSAGES]
     range_casts = [site for site in sites if site[-1] == RANGE_CAST_MESSAGE]
     nodiscard = [site for site in sites if site[-1] == NODISCARD_MESSAGE]
-    failures = [site for site in sites if site[-1] not in (*ARITHMETIC_MESSAGES, NODISCARD_MESSAGE)]
+    mutable_references = [site for site in sites if site[-1] == MUTABLE_REFERENCE_MESSAGE]
+    failures = [site for site in sites if site[-1] not in
+                (*ARITHMETIC_MESSAGES, NODISCARD_MESSAGE, MUTABLE_REFERENCE_MESSAGE)]
+    for site in mutable_references:
+        path, line, _, span, _ = site
+        first, last = (span[0], span[2]) if span else (line, line)
+        if any(interval and interval.start <= last and first < interval.stop
+               for interval in changed.get(path, ())):
+            failures.append(site)
+    enforced = sum(site[-1] == MUTABLE_REFERENCE_MESSAGE for site in failures)
+    print(f'{enforced} changed mutable scalar reference parameters '
+          f'({len(mutable_references)} in production)')
     for site in nodiscard:
         path, line, _, span, _ = site
         first, last = (span[0], span[2]) if span else (line, line)

@@ -113,11 +113,11 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
         return;
     }
 }
-[[nodiscard]] inline bool grpc_pop(u8* buf, u32& len, u32 n) {
+[[nodiscard]] inline bool grpc_pop(u8* buf, u32* len, u32 n) {
     u32 remaining = 0;
-    if (sub_overflow(len, n, &remaining)) return false;
+    if (sub_overflow(*len, n, &remaining)) return false;
     if (remaining) __builtin_memmove(buf, buf + range_int{n}.index(), remaining);
-    len = remaining;
+    *len = remaining;
     return true;
 }
 inline bool grpc_timeout(Str value, u64* micros) {
@@ -853,7 +853,7 @@ inline void grpc_consume_output(GrpcExchange& x, bool from_client, u32 length) {
             x.failure = 13;
     } else {
         if (!grpc_pop(from_client ? x.upload : x.download,
-                      from_client ? x.upload_len : x.download_len,
+                      from_client ? &x.upload_len : &x.download_len,
                       length)) {
             x.failure = 13;
             return;

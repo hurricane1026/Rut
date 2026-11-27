@@ -41,7 +41,7 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
     }
     return text;
 }
-[[nodiscard]] bool decimal(Str text, u32& value) {
+[[nodiscard]] bool decimal(Str text, u32* value) {
     text = trim(text);
     if (text.len >= 2 && text.ptr[0] == '"' && text.ptr[i64{text.len} - 1] == '"') {
         ++text.ptr;
@@ -58,7 +58,7 @@ constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
         const auto digit = bounded_remainder<16>(byte_value(byte));
         result = (range_int(result).scaled_by<10>() + digit).min(kMax).to<u32>();
     }
-    value = result;
+    *value = result;
     return true;
 }
 struct Controls {
@@ -115,7 +115,7 @@ struct Controls {
             seen = &out.min_seen;
         }
         if (target) {
-            if (!valued || *seen || !decimal(value, *target)) return false;
+            if (!valued || *seen || !decimal(value, target)) return false;
             *seen = true;
         }
         if (end == text.len) break;
@@ -264,7 +264,7 @@ struct ResponseInfo {
         } else if (eq(name, "connection", 10)) {
             if (!token_list(header.value, false)) return false;
         } else if (eq(name, "age", 3)) {
-            if (age_seen || !decimal(header.value, age)) return false;
+            if (age_seen || !decimal(header.value, &age)) return false;
             age_seen = true;
         } else if (eq(name, "date", 4)) {
             if (date_seen || !http_date(header.value, &date)) return false;
@@ -310,8 +310,8 @@ struct ResponseInfo {
                                  bool http10,
                                  u8* out,
                                  u32 capacity,
-                                 u32& written) {
-    written = 0;
+                                 u32* written) {
+    *written = 0;
     if (!entry.response || entry.response_len > HttpCacheStorage::kMaxResponse) return false;
     HttpResponseParser parser;
     ParsedResponse response;
@@ -325,11 +325,11 @@ struct ResponseInfo {
             (range_int(entry.response_len) - range_int(parser.header_end)).value())
         return false;
     auto add = [&](const void* p, u32 n) {
-        const auto start = range_int(written);
+        const auto start = range_int(*written);
         const auto end = start + range_int(n);
         if (end.value() > capacity) return false;
         __builtin_memcpy(out + start.index(), p, n);
-        written = end.min(range_int(capacity)).to<u32>();
+        *written = end.min(range_int(capacity)).to<u32>();
         return true;
     };
     if (!add(http10 ? "HTTP/1.0 200 OK\r\n" : "HTTP/1.1 200 OK\r\n", 17)) return false;
@@ -450,7 +450,7 @@ bool HttpCachePolicy::read_response(const Key& key,
             return sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
         }());
     return kFresh &&
-           copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
+           copy_response(record, now_us, keep_alive, key.http10, output, capacity, &written);
 }
 bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& total) {
     ResponseInfo info;

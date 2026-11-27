@@ -830,6 +830,28 @@ public:
         return true;
     }
 
+    bool VisitParmVarDecl(const ParmVarDecl* param) {
+        const auto* function = dyn_cast<FunctionDecl>(param->getDeclContext());
+        // An overloaded unary operator takes the operand itself.
+        if (function && (function->getOverloadedOperator() == OO_PlusPlus ||
+                         function->getOverloadedOperator() == OO_MinusMinus))
+            return true;
+        const auto loc = param->getLocation();
+        if (loc.isInvalid() || param->isImplicit() ||
+            context.getSourceManager().isInSystemHeader(loc))
+            return true;
+        const auto* reference = param->getType()->getAs<LValueReferenceType>();
+        if (!reference) return true;
+        const auto value = reference->getPointeeType();
+        if (value.isConstQualified() || !value->isScalarType()) return true;
+        if (!reported.insert(loc.getRawEncoding()).second) return true;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                    "use a pointer for a mutable scalar parameter");
+        diagnostics.Report(loc, id) << param->getSourceRange();
+        return true;
+    }
+
     bool VisitFunctionDecl(const FunctionDecl* decl) {
         const auto loc = decl->getLocation();
         const auto result = decl->getReturnType();

@@ -32,7 +32,7 @@ void compare(rut::test::TestCase* _tc, Str text) {
         i64 expected = 123;
         i64 actual = 123;
         const bool valid = reference(text, wide, expected);
-        CHECK_EQ(wide ? parse_integer<true>(text, actual) : parse_integer<false>(text, actual),
+        CHECK_EQ(wide ? parse_integer<true>(text, &actual) : parse_integer<false>(text, &actual),
                  valid);
         CHECK_EQ(actual, expected);
         actual = 123;
@@ -82,11 +82,11 @@ TEST(parse_integer, strict_decimal_contract_and_signed_boundaries) {
     compare(_tc, {nullptr, 0});
     compare(_tc, {nullptr, 20});
     i64 value = 0;
-    CHECK(parse_integer<false>(lit_str("-2147483648"), value));
+    CHECK(parse_integer<false>(lit_str("-2147483648"), &value));
     CHECK_EQ(value, -2147483648LL);
-    CHECK_FALSE(parse_integer<false>(lit_str("2147483648"), value));
+    CHECK_FALSE(parse_integer<false>(lit_str("2147483648"), &value));
     CHECK_EQ(value, -2147483648LL);
-    CHECK(parse_integer<true>(lit_str("-9223372036854775808"), value));
+    CHECK(parse_integer<true>(lit_str("-9223372036854775808"), &value));
     CHECK_EQ(value, (-9223372036854775807LL - 1));
 }
 

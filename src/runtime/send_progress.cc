@@ -13,7 +13,7 @@ namespace {
     const bool kValid = kTotal <= INT32_MAX && kNext > offset && kNext <= kTotal;
     u32 next_offset = offset;
     u32 next_remaining = remaining;
-    if (advance_send_bytes(next_offset, next_remaining, completed) != kValid) return false;
+    if (advance_send_bytes(&next_offset, &next_remaining, completed) != kValid) return false;
     if (!kValid) return next_offset == offset && next_remaining == remaining;
     return next_offset == kNext &&
            (range_int(next_offset) + range_int(next_remaining)).value() == kTotal;
