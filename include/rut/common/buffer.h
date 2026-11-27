@@ -3,6 +3,8 @@
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
+#include <stdio.h>
+
 namespace rut {
 
 struct Buffer;
@@ -162,10 +164,11 @@ struct Buffer {
     // Commit n bytes written directly via write_ptr().
     // Call after recv() returns — advances len_ without copying.
     void commit(u32 n) noexcept {
-        if (released_) __builtin_trap();
+        if (released_) commit_failed("buffer has a live view", n);
         const auto kEnd = range_int(len_) + range_int(n);
         const auto kCapacity = range_int(cap_);
-        if (!ptr_ || kEnd.value() > kCapacity.value()) __builtin_trap();
+        if (!ptr_) commit_failed("buffer has no storage", n);
+        if (kEnd.value() > kCapacity.value()) commit_failed("write exceeds capacity", n);
         len_ = kEnd.min(kCapacity).to<u32>();
     }
 
@@ -213,6 +216,17 @@ struct Buffer {
     bool is_released() const noexcept { return released_; }
 
 private:
+    [[noreturn, gnu::cold, gnu::noinline]] void commit_failed(const char* reason,
+                                                              u32 n) const noexcept {
+        ::fprintf(stderr,
+                  "rut: Buffer::commit: %s (length=%u, capacity=%u, bytes=%u)\n",
+                  reason,
+                  len_,
+                  cap_,
+                  n);
+        __builtin_trap();
+    }
+
     friend struct View;
     u8* ptr_;
     u32 len_;
