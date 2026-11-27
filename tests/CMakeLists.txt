@@ -669,6 +669,28 @@ add_test(
 set_tests_properties(test_cli_sigpipe PROPERTIES LABELS "cli" TIMEOUT 30)
 endif()
 
+add_test(
+    NAME test_cli_upstream_keepalive_timeout
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_upstream_keepalive_timeout.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_upstream_keepalive_timeout PROPERTIES
+    LABELS "cli"
+    RUN_SERIAL TRUE
+    TIMEOUT 45)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+foreach(backend IN ITEMS epoll io_uring)
+    add_test(
+        NAME test_cli_upstream_keepalive_origin_${backend}
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_upstream_keepalive_origin.py
+                $<TARGET_FILE:rut> ${backend})
+    set_tests_properties(test_cli_upstream_keepalive_origin_${backend} PROPERTIES
+        LABELS "cli" RUN_SERIAL TRUE TIMEOUT 45 SKIP_RETURN_CODE 77)
+endforeach()
+endif()
+
 # Runtime connection capacity is a Linux backend option; the macOS kqueue
 # development backend accepts only the default and rejects other values.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

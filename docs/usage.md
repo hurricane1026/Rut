@@ -189,6 +189,7 @@ gracefully before exiting.
 | `--opt N` | JIT optimization level: `0` (low, fastest startup) .. `3` (high) | `2` |
 | `--pool-prealloc N` | Pre-commit N buffer slices per shard | `0` (lazy) |
 | `--max-connections-per-shard N` | Maximum connection slots allocated by each shard (Linux; macOS accepts only the default) | `16384` |
+| `--upstream-keepalive-idle-timeout N` | Idle lifetime in seconds for pooled plaintext HTTP/1 upstream connections; `0` disables expiry | downstream keepalive timeout (60 seconds by default) |
 | `--tls-cert PATH` | TLS certificate (PEM); enables TLS | off |
 | `--tls-key PATH` | TLS private key (PEM); required with `--tls-cert` | off |
 | `--access-log PATH` | Write access logs to PATH | off |
@@ -204,6 +205,11 @@ Both program forms manage compilation automatically; users never need to invoke
 
 `--tls-cert`/`--tls-key` must be given together. With TLS enabled the
 server uses the epoll backend.
+
+`--upstream-keepalive-idle-timeout` is a server-wide startup setting accepting
+integers from 0 through 2147483647. Idle sockets are checked on reuse and by a
+periodic sweep, so unused sockets may remain open for up to one additional tick.
+This setting applies to plaintext HTTP/1 upstream sockets.
 
 `--max-connections-per-shard` is a startup-only setting. It accepts values
 from 1 through 16,777,213 (the runtime maximum) and applies independently to

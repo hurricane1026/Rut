@@ -397,6 +397,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    u32 drain_secs,
                                    u32 pool_prealloc,
                                    u32 connection_capacity,
+                                   bool upstream_idle_timeout_set,
+                                   u32 upstream_idle_timeout,
                                    TlsServerContext* tls_server,
                                    bool allow_io_uring_fallback,
                                    const char* access_log_path,
@@ -455,6 +457,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         shards[i].owns_listen_fd = true;
 
         auto rc = shards[i].init(i, lfd, pool_prealloc, connection_capacity);
+        if (rc) {
+            shards[i].upstream->idle_timeout_configured = upstream_idle_timeout_set;
+            shards[i].upstream->idle_timeout_sec = upstream_idle_timeout;
+        }
         if (!rc) {
             write_str("Failed to init shard ");
             write_u32(i);
@@ -989,6 +995,8 @@ int main(int argc, char** argv) {
     u32 drain_secs = kDefaultDrainSecs;
     u32 pool_prealloc = 0;  // 0 = fully lazy
     u32 connection_capacity = kDefaultConnectionCapacity;
+    bool upstream_idle_timeout_set = false;
+    u32 upstream_idle_timeout = 0;
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* tls_client_ca_path = nullptr;
@@ -1039,6 +1047,26 @@ int main(int argc, char** argv) {
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "--upstream-keepalive-idle-timeout")) {
+            if (upstream_idle_timeout_set || i + 1 >= argc || !is_all_digits(argv[i + 1])) {
+                write_str(
+                    "--upstream-keepalive-idle-timeout requires one integer from 0 to "
+                    "2147483647\n");
+                return 1;
+            }
+            u32 value = 0;
+            for (const char* p = argv[++i]; *p; ++p) {
+                u32 digit = static_cast<u32>(*p - '0');
+                if (value > (2147483647u - digit) / 10u) {
+                    write_str("--upstream-keepalive-idle-timeout must be at most 2147483647\n");
+                    return 1;
+                }
+                value = value * 10u + digit;
+            }
+            upstream_idle_timeout = value;
+            upstream_idle_timeout_set = true;
+            continue;
+        }
         if (str_eq(argv[i], "--upstream-dns-resolver")) {
             if (upstream_dns_specified || i + 1 >= argc) {
                 write_str("--upstream-dns-resolver requires one IPv4:port argument\n");
@@ -1642,6 +1670,8 @@ int main(int argc, char** argv) {
                                           drain_secs,
                                           pool_prealloc,
                                           connection_capacity,
+                                          upstream_idle_timeout_set,
+                                          upstream_idle_timeout,
                                           tls_server,
                                           false,
                                           access_log_path,
@@ -1676,6 +1706,8 @@ int main(int argc, char** argv) {
             drain_secs,
             pool_prealloc,
             connection_capacity,
+            upstream_idle_timeout_set,
+            upstream_idle_timeout,
             tls_server,
             tls_server != nullptr && backend_selection == BackendSelection::Auto,
             access_log_path,
@@ -1698,6 +1730,8 @@ int main(int argc, char** argv) {
                                                  drain_secs,
                                                  pool_prealloc,
                                                  connection_capacity,
+                                                 upstream_idle_timeout_set,
+                                                 upstream_idle_timeout,
                                                  tls_server,
                                                  false,
                                                  access_log_path,
@@ -1720,6 +1754,8 @@ int main(int argc, char** argv) {
                                              drain_secs,
                                              pool_prealloc,
                                              connection_capacity,
+                                             upstream_idle_timeout_set,
+                                             upstream_idle_timeout,
                                              tls_server,
                                              false,
                                              access_log_path,

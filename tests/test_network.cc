@@ -17689,6 +17689,43 @@ TEST(upstream_pool, sweep_closes_only_expired_sockets) {
     for (i32* sv : {old_a, fresh, old_b}) close(sv[1]);
 }
 
+TEST(upstream_pool, configured_idle_expiry_applies_on_take_and_sweep) {
+    UpstreamPool pool;
+    pool.init();
+    pool.idle_timeout_configured = true;
+    pool.idle_timeout_sec = 10;
+    i32 fresh[2], expired[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fresh), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, expired), 0);
+    REQUIRE(pool.put_idle_at(expired[0], 1, 0, 100, 100000000));
+    REQUIRE(pool.put_idle_at(fresh[0], 1, 0, 105, 105000000));
+    CHECK_EQ(pool.take_idle_at(1, 0, 109999999), fresh[0]);
+    CHECK_EQ(pool.take_idle_at(1, 0, 110000000), -1);
+    CHECK(close(expired[0]) < 0);
+    close(expired[1]);
+    close(fresh[0]);
+    close(fresh[1]);
+
+    i32 swept[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, swept), 0);
+    REQUIRE(pool.put_idle_at(swept[0], 1, 0, 100, 100000000));
+    pool.sweep_at(110, 10, 109999999);
+    CHECK_EQ(pool.idle_count, 1u);
+    pool.sweep_at(110, 10, 110000000);
+    CHECK_EQ(pool.idle_count, 0u);
+    CHECK(close(swept[0]) < 0);
+    close(swept[1]);
+
+    i32 disabled[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, disabled), 0);
+    pool.idle_timeout_sec = 0;
+    REQUIRE(pool.put_idle(disabled[0], 1, 0, 100));
+    pool.sweep(1000, 1);
+    CHECK_EQ(pool.take_idle_at(1, 0, 1000000000), disabled[0]);
+    close(disabled[0]);
+    close(disabled[1]);
+}
+
 TEST(upstream_pool, create_socket) {
     i32 fake_fd = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(fake_fd >= 0);
