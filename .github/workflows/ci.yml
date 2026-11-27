@@ -270,10 +270,12 @@ jobs:
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_ring_iterator
           python3 scripts/check_ring_iterators.py build/check_ring_iterator build
           python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-22 --clang-check clang-check-22 --inventory runtime-arithmetic.txt
-      - name: Check integer range proofs, error returns, array indices, and narrowing
+      - name: Check integer range proofs and nodiscard declarations
         if: matrix.compiler == 'clang' && matrix.shard == 1
         env:
           OVERFLOW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # Keep the in-flight migration's earlier declarations in the inventory.
+          NODISCARD_MIGRATION_BASE: fe8d0747c1a490e99f7259f92a3b95ce9b8a9e81
         run: |
           clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_u64_to_i64.cc \
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_u64_to_i64.so
@@ -286,9 +288,16 @@ jobs:
               git fetch --no-tags origin "$OVERFLOW_BASE"
             fi
             audit_args+=(--overflow-base "$OVERFLOW_BASE")
+            nodiscard_base=$(git merge-base HEAD "$OVERFLOW_BASE")
+            if git merge-base --is-ancestor "$nodiscard_base" "$NODISCARD_MIGRATION_BASE" 2>/dev/null &&
+               git merge-base --is-ancestor "$NODISCARD_MIGRATION_BASE" HEAD; then
+              nodiscard_base=$NODISCARD_MIGRATION_BASE
+            fi
+            audit_args+=(--nodiscard-base "$nodiscard_base")
           fi
           python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 \
             --arithmetic-inventory integer-arithmetic.txt --range-cast-inventory range-casts.txt \
+            --nodiscard-inventory nodiscard.txt \
             "${audit_args[@]}"
       - name: Compare range_int code generation with native integers
         if: matrix.compiler == 'clang' && matrix.shard == 1
@@ -303,6 +312,7 @@ jobs:
             runtime-arithmetic.txt
             integer-arithmetic.txt
             range-casts.txt
+            nodiscard.txt
           if-no-files-found: ignore
 
       # Publish immediately after building so long-running tests do not delay

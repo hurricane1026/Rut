@@ -17,8 +17,9 @@ ARITHMETIC_MESSAGE = 'integer arithmetic needs a range proof'
 NARROWING_MESSAGE = 'integer arithmetic result may not fit the destination'
 INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 RANGE_CAST_MESSAGE = 'narrow a range_int with a range-checked conversion'
+NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
-MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, *ARITHMETIC_MESSAGES)
+MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -27,7 +28,7 @@ OVERFLOW_BUILTIN = re.compile(rb'\b__builtin_(?:[su])?(add|sub|mul)(?:ll?)?_over
 RANGE_COMMENT = re.compile(rb'//\s*RUT_INTEGER_RANGE:\s*\S')
 
 
-def changed_source_lines(base):
+def changed_source_lines(base, *, check_deleted_attributes=False):
     # Git supplies the migration boundary. No inventory of exceptions is kept.
     names = subprocess.check_output(
         ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=AM', base, '--'], cwd=ROOT
@@ -44,6 +45,12 @@ def changed_source_lines(base):
         changes[path] = [range(int(start), int(start) + int(count or 1))
                          for start, count in re.findall(
                              r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', patch, re.M)]
+        if check_deleted_attributes:
+            for hunk in re.split(r'^@@ ', patch, flags=re.M)[1:]:
+                match = re.match(r'-\d+(?:,\d+)? \+(\d+),0 @@', hunk)
+                if match and re.search(r'^-.*\[\[.*\bnodiscard\b', hunk, re.M):
+                    following = int(match[1]) + 1
+                    changes[path].append(range(following, following + 1))
     return changes
 
 
@@ -127,6 +134,9 @@ def main():
     parser.add_argument('--overflow-base', help='audit checked arithmetic on C++ lines added since the merge base')
     parser.add_argument('--range-cast-inventory', type=Path,
                         help='write all explicit narrowing casts derived from range_int::value()')
+    parser.add_argument('--nodiscard-inventory', type=Path,
+                        help='report declarations that are missing [[nodiscard]]')
+    parser.add_argument('--nodiscard-base', help='require [[nodiscard]] on declarations changed since this commit')
     args = parser.parse_args()
     check = ['-fsyntax-only', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve()),
              '-Xclang', '-add-plugin', '-Xclang', 'rut-u64-to-i64']
@@ -143,6 +153,15 @@ def main():
                     str(args.plugin.resolve()), *arithmetic_check, '-Xclang', '-verify',
                     '-isystem', ROOT / 'include', '-std=c++23',
                     ROOT / 'scripts/clang/integer_arithmetic_cases.cc'], check=True)
+    nodiscard_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-nodiscard']
+    if args.nodiscard_inventory or args.nodiscard_base:
+        subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
+                        str(args.plugin.resolve()), *nodiscard_check, '-Xclang', '-verify',
+                        '-std=c++23', ROOT / 'scripts/clang/nodiscard_cases.cc'], check=True)
+    else:
+        nodiscard_check = []
+    nodiscard_changed = (changed_source_lines(args.nodiscard_base, check_deleted_attributes=True)
+                         if args.nodiscard_base else {})
     base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
                                     cwd=ROOT, text=True).strip() if args.overflow_base else None)
     changed = changed_source_lines(base) if base else {}
@@ -170,7 +189,7 @@ def main():
         cwd, flags = command
         run = subprocess.run([args.clang, *flags, '-Wno-error', '-fno-color-diagnostics',
                               '-fdiagnostics-print-source-range-info', *check, *overflow_check,
-                              *arithmetic_check], cwd=cwd,
+                              *arithmetic_check, *nodiscard_check], cwd=cwd,
                              text=True, capture_output=True)
         if run.returncode:
             raise RuntimeError(f'Clang conversion audit failed\n{run.stderr}')
@@ -202,7 +221,23 @@ def main():
         args.inventory.write_text(''.join(row + '\n' for row in sorted(rows)))
     arithmetic = [site for site in sites if site[-1] in ARITHMETIC_MESSAGES]
     range_casts = [site for site in sites if site[-1] == RANGE_CAST_MESSAGE]
-    failures = [site for site in sites if site[-1] not in ARITHMETIC_MESSAGES]
+    nodiscard = [site for site in sites if site[-1] == NODISCARD_MESSAGE]
+    failures = [site for site in sites if site[-1] not in (*ARITHMETIC_MESSAGES, NODISCARD_MESSAGE)]
+    for site in nodiscard:
+        path, line, _, span, _ = site
+        first, last = (span[0], span[2]) if span else (line, line)
+        if any(interval and interval.start <= last and first < interval.stop
+               for interval in nodiscard_changed.get(path, ())):
+            failures.append(site)
+    if args.nodiscard_inventory:
+        args.nodiscard_inventory.write_text(''.join(
+            f'{path.relative_to(ROOT)}:{line}:{column}: {message}\n'
+            for path, line, column, _, message in nodiscard
+        ))
+    if nodiscard_check:
+        enforced = sum(site[-1] == NODISCARD_MESSAGE for site in failures)
+        print(f'{enforced} changed declarations missing [[nodiscard]] ({len(nodiscard)} in production)')
+
     if args.range_cast_inventory:
         args.range_cast_inventory.write_text(''.join(
             f'{path.relative_to(ROOT)}:{line}:{column}: {message}\n'

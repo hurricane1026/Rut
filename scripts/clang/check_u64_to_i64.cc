@@ -1,11 +1,13 @@
 // Check native integer conversions after Clang resolves aliases and promotions.
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/TypeLoc.h"
 #include "clang/Analysis/CFG.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace clang;
 
@@ -702,6 +704,61 @@ class IntegerArithmeticAction : public PluginASTAction {
         return true;
     }
 };
+class NodiscardVisitor : public RecursiveASTVisitor<NodiscardVisitor> {
+    ASTContext& context;
+    llvm::DenseSet<unsigned> reported;
+
+public:
+    explicit NodiscardVisitor(ASTContext& context) : context(context) {}
+
+    bool shouldVisitTemplateInstantiations() const { return true; }
+
+    bool VisitFunctionDecl(const FunctionDecl* decl) {
+        const auto loc = decl->getLocation();
+        const auto result = decl->getReturnType();
+        if (loc.isInvalid() || decl->isImplicit() || result->isVoidType() ||
+            (result->isDependentType() && !result->isPointerType() && !result->isReferenceType()) ||
+            decl->hasAttr<WarnUnusedResultAttr>() ||
+            isa<CXXConstructorDecl, CXXDestructorDecl, CXXDeductionGuideDecl>(decl) ||
+            context.getSourceManager().isInSystemHeader(loc))
+            return true;
+        if (const auto* method = dyn_cast<CXXMethodDecl>(decl);
+            method && method->getParent()->isLambda())
+            return true;
+        if (!reported.insert(loc.getRawEncoding()).second) return true;
+        auto end = loc;
+        if (const auto* type = decl->getTypeSourceInfo()) {
+            if (const auto function = type->getTypeLoc().getAs<FunctionTypeLoc>()) {
+                if (function.getRParenLoc().isValid()) end = function.getRParenLoc();
+                const auto result_end = function.getReturnLoc().getEndLoc();
+                if (result_end.isValid() &&
+                    context.getSourceManager().isBeforeInTranslationUnit(end, result_end))
+                    end = result_end;
+            }
+        }
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                    "non-void functions require [[nodiscard]]");
+        diagnostics.Report(loc, id) << SourceRange(decl->getBeginLoc(), end);
+        return true;
+    }
+};
+
+class NodiscardConsumer : public ASTConsumer {
+    void HandleTranslationUnit(ASTContext& context) override {
+        NodiscardVisitor(context).TraverseDecl(context.getTranslationUnitDecl());
+    }
+};
+
+class NodiscardAction : public PluginASTAction {
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
+        return std::make_unique<NodiscardConsumer>();
+    }
+
+    bool ParseArgs(const CompilerInstance&, const std::vector<std::string>&) override {
+        return true;
+    }
+};
 }  // namespace
 
 static FrontendPluginRegistry::Add<SignedConversionAction> registration(
@@ -713,3 +770,6 @@ static FrontendPluginRegistry::Add<OverflowResultAction> overflow_registration(
 
 static FrontendPluginRegistry::Add<IntegerArithmeticAction> arithmetic_registration(
     "rut-integer-arithmetic", "Find native integer operations without a type-range proof");
+
+static FrontendPluginRegistry::Add<NodiscardAction> nodiscard_registration(
+    "rut-nodiscard", "Require [[nodiscard]] on non-void functions");
