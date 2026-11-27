@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "io_uring_send_target.h"
+#include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
@@ -2184,6 +2185,14 @@ u32 IoUringBackend::wait(
                     ++head;
                     count++;
                     continue;
+                }
+                if (type == IoEventType::UpstreamSend && conns && conn_id < max_conns) {
+                    Connection& c = conns[conn_id];
+                    if ((c.upstream_write_idle_armed || c.upstream_write_idle_expiry_pending) &&
+                        c.upstream_write_idle_episode == upstream_episode &&
+                        c.upstream_episode == upstream_episode && c.upstream_fd == ss.fd &&
+                        c.recv_buf.data() == ss.src)
+                        c.upstream_write_idle_progress_us = monotonic_us();
                 }
                 if (ss.vector) ss.vector->advance(nw);
                 if (ss.remaining > 0) {

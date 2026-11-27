@@ -62,6 +62,7 @@ struct HirUpstream {
     u8 connect_timeout_seconds = 0;  // 0 retains the global timeout.
     u8 response_header_timeout_seconds = 0;
     u8 response_body_idle_timeout_seconds = 0;
+    u8 write_timeout_seconds = 0;
     u32 weight_count = 0;
     u16 backend_weights[8]{};
     // Active health-check config copied from the DSL (data only; no probing in

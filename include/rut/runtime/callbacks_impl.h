@@ -6949,6 +6949,33 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
+template <typename Loop>
+void expire_upstream_write_idle(Loop* loop, Connection& conn) {
+    // An early origin response may already own publication. Do not replace it
+    // with a timeout; the normal close ledger keeps any outstanding buffers.
+    if (conn.proxy_resp_started || conn.upstream_recv_buf.len() != 0 || conn.fd < 0 ||
+        conn.upstream_fd < 0) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.upstream_request_incomplete = true;
+    conn.request_upload_complete = false;
+    if constexpr (requires { loop->begin_upstream_retirement(conn, kUpstreamOpSend); }) {
+        record_passive_timeout(loop, conn);
+        u8 targets = kUpstreamOpSend;
+        if (conn.upstream_recv_armed) targets |= kUpstreamOpRecv;
+        if (!loop->begin_upstream_retirement(conn, targets)) {
+            loop->close_conn(conn);
+            return;
+        }
+        // The ledger retains the kernel's old buffer references until every
+        // target and cancellation completion drains. Detach before formatting
+        // the 504 so the old attempt cannot be counted twice or reused.
+        (void)detach_upstream_close(loop, conn);
+    }
+    respond_upstream_timeout(loop, conn);
+}
+
 // STOPGAP, not streaming. A downstream recv CQE did not fit in recv_buf while the
 // request body was still being forwarded upstream (io_uring: wait() copies
 // min(nbytes, room) and drops the rest, reporting -ENOBUFS), so the body can no

@@ -1201,7 +1201,8 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // 8 bytes. The bounded request-body override carries two flags plus one Str
     // view and alignment padding (+24 bytes). The parked connect-retry identity
     // state adds one bounded 64-byte owner block, bringing the 64-bit layout to
-    // 6368 bytes with or without WebSocket.
+    // 6368 bytes with or without WebSocket. The upstream write-idle owner fits
+    // existing padding after reordering the receive-slice capacity field.
     CHECK_EQ(sizeof(Connection), 6368u);
 }
 

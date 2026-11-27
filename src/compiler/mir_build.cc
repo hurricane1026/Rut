@@ -1610,6 +1610,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.response_header_timeout_seconds = module.upstreams[i].response_header_timeout_seconds;
         up.response_body_idle_timeout_seconds =
             module.upstreams[i].response_body_idle_timeout_seconds;
+        up.write_timeout_seconds = module.upstreams[i].write_timeout_seconds;
         up.weight_count = module.upstreams[i].weight_count;
         for (u32 b = 0; b < up.weight_count; ++b)
             up.backend_weights[b] = module.upstreams[i].backend_weights[b];

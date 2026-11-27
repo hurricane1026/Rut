@@ -375,6 +375,7 @@ struct ConnectionBase {
 
     // Upstream (only when proxying)
     i32 upstream_fd;
+    u32 upstream_write_idle_episode = 0;
     // A dedicated pooled Connection owns outbound H1 TLS I/O and cancellation.
     H1TlsUpstream* h1_tls_upstream = nullptr;
     H1TlsUpstream* h1_tls_transport = nullptr;
@@ -391,6 +392,8 @@ struct ConnectionBase {
     u8 upstream_backend_idx;         // which backend endpoint the current connect targets
     u8 upstream_attempted_backends;  // endpoints already tried by this request
     bool response_header_timeout_armed;
+    bool upstream_write_idle_armed = false;
+    bool upstream_write_idle_expiry_pending = false;
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
@@ -2036,10 +2039,8 @@ struct ConnectionBase {
     // Free connections hold nullptr; a live idle connection keeps its slices bound
     // (the io_uring loop trims their dirty pages once idle for a few seconds).
     u8* recv_slice;
-    // Capacity declared when recv_slice was installed by the owning loop.  Keep
-    // this independent of Buffer's mutable binding so checked request metadata
-    // can reject a rebound/shifted/recapped Buffer before reading through it.
-    u32 recv_slice_capacity;
+    // Last actual origin write, used only by the opt-in upload idle timeout.
+    u64 upstream_write_idle_progress_us = 0;
     u8* send_slice;
     Buffer recv_buf;
     Buffer send_buf;
@@ -2058,6 +2059,9 @@ struct ConnectionBase {
     i32 local_body_file_fd = -1;
     const u8* local_body_base = nullptr;
     u32 local_response_size = 0;
+    // Capacity declared when recv_slice was installed by the owning loop. Keep
+    // this independent of Buffer's mutable binding for request metadata checks.
+    u32 recv_slice_capacity;
 
     // Upstream recv buffer — separate from client recv_buf to prevent:
     // 1. Client pipelined data being parsed as upstream response
@@ -2224,6 +2228,10 @@ struct ConnectionBase {
         response_body_idle_armed = false;
         response_body_idle_expiry_pending = false;
         response_body_idle_episode = 0;
+        upstream_write_idle_armed = false;
+        upstream_write_idle_expiry_pending = false;
+        upstream_write_idle_episode = 0;
+        upstream_write_idle_progress_us = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;

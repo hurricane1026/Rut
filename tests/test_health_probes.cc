@@ -1153,6 +1153,254 @@ void unhealthy_cadence(rut::test::TestCase* _tc) {
     CHECK_FALSE(rig.loop->health_probe_issued[0][1]);
     CHECK(rig.loop->health_probe_last_issue_ns[0][1] >= issued);
 }
+static bool write_idle_loopback_pair(i32 pair[2]) {
+    Socket listener;
+    listener.fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener.fd < 0) return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ||
+        listen(listener.fd, 1))
+        return false;
+    socklen_t len = sizeof(addr);
+    if (getsockname(listener.fd, reinterpret_cast<sockaddr*>(&addr), &len)) return false;
+    pair[0] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (pair[0] < 0 || connect(pair[0], reinterpret_cast<sockaddr*>(&addr), sizeof(addr)))
+        return false;
+    pair[1] = accept4(listener.fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (pair[1] < 0) return false;
+    const int flags = fcntl(pair[0], F_GETFL, 0);
+    return flags >= 0 && fcntl(pair[0], F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static constexpr u32 kWriteIdleBodySize = 1024 * 1024;
+
+template <typename Loop>
+void write_idle_stalled_body(rut::test::TestCase* _tc,
+                             bool reject_retirement = false,
+                             bool initial_coalesced = false,
+                             bool early_response = false) {
+    struct MappedBody {
+        void* data = mmap(nullptr,
+                          kWriteIdleBodySize,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1,
+                          0);
+        ~MappedBody() {
+            if (data != MAP_FAILED) munmap(data, kWriteIdleBodySize);
+        }
+    } body;
+    REQUIRE(body.data != MAP_FAILED);
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.owner.config->upstreams[0].write_timeout_seconds = 1;
+    i32 upstream[2]{-1, -1};
+    i32 downstream[2]{-1, -1};
+    REQUIRE(write_idle_loopback_pair(upstream));
+    REQUIRE(write_idle_loopback_pair(downstream));
+    Socket origin;
+    origin.fd = upstream[1];
+    Socket client;
+    client.fd = downstream[1];
+    const int small = 4096;
+    REQUIRE_EQ(setsockopt(upstream[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    u8 fill[4096]{};
+    bool blocked = false;
+    for (u32 i = 0; i < 4096; ++i) {
+        const ssize_t n = send(upstream[0], fill, sizeof(fill), MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            blocked = true;
+            break;
+        }
+        REQUIRE(n > 0);
+    }
+    REQUIRE(blocked);
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_attempts = 1;
+    c->req_start_us = monotonic_us();
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_content_length = initial_coalesced ? kWriteIdleBodySize - 4 : kWriteIdleBodySize;
+    c->req_header_end = initial_coalesced ? 4 : 0;
+    c->req_initial_send_len = kWriteIdleBodySize;
+    c->recv_buf.bind(static_cast<u8*>(body.data), kWriteIdleBodySize);
+    c->recv_buf.set_len(kWriteIdleBodySize);
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<Loop>,
+                 initial_coalesced ? &on_upstream_request_sent<Loop> : &on_request_body_sent<Loop>);
+    rig.loop->epoch_enter();
+    if constexpr (requires { rig.loop->backend.active_upstream_episode[c->id]; })
+        rig.loop->backend.active_upstream_episode[c->id] = c->upstream_episode;
+    REQUIRE(rig.loop->submit_send_upstream(*c, c->recv_buf.data(), c->recv_buf.len()));
+    REQUIRE(c->upstream_write_idle_armed);
+    u64 old = 0;
+    REQUIRE_FALSE(__builtin_sub_overflow(monotonic_us(), u64{2'000'000}, &old));
+    c->upstream_write_idle_progress_us = old;
+    // Free a bounded part of the origin receive queue and let the backend
+    // report a real partial write while the logical send remains outstanding.
+    u8 received[65536];
+    while (recv(origin.fd, received, sizeof(received), MSG_DONTWAIT) > 0) {
+    }
+    REQUIRE(rig.until([&] { return c->upstream_write_idle_progress_us > old; }));
+    REQUIRE(c->upstream_write_idle_armed);
+    CHECK(rig.loop->backend.upstream_send_state[c->id].offset > 0);
+    CHECK(rig.loop->backend.upstream_send_state[c->id].remaining > 0);
+    rig.loop->timer.remove(c);
+    rig.loop->timer.add(c, 0);
+    const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+    rig.loop->dispatch_batch(&tick, 1);
+    CHECK(c->upstream_write_idle_armed);
+    CHECK(c->fd >= 0);
+    // No further progress: the same outstanding owner must now time out.
+    c->upstream_write_idle_progress_us = old;
+    if (reject_retirement) c->recv_paused_for_send = true;
+    if (early_response) c->proxy_resp_started = true;
+    rig.loop->timer.remove(c);
+    rig.loop->timer.add(c, 0);
+    rig.loop->dispatch_batch(&tick, 1);
+    if (reject_retirement || early_response) {
+        REQUIRE(rig.until([&] { return rig.loop->active_count() == 0; }));
+        char byte = 0;
+        CHECK_EQ(recv(client.fd, &byte, 1, MSG_DONTWAIT), 0);
+        return;
+    }
+    char response[256]{};
+    u32 used = 0;
+    REQUIRE(rig.until([&] {
+        const ssize_t n =
+            recv(client.fd, response + used, sizeof(response) - used - 1, MSG_DONTWAIT);
+        if (n > 0) used += static_cast<u32>(n);
+        response[used] = '\0';
+        return strstr(response, "504 Gateway Timeout") != nullptr;
+    }));
+}
+
+TEST(write_idle, epoll_stalled_body_returns_504) {
+    write_idle_stalled_body<EpollEventLoop>(_tc);
+}
+TEST(write_idle, iouring_stalled_body_returns_504) {
+    write_idle_stalled_body<IoUringEventLoop>(_tc);
+}
+TEST(write_idle, iouring_untransferable_owner_closes_and_drains) {
+    write_idle_stalled_body<IoUringEventLoop>(_tc, true);
+}
+TEST(write_idle, epoll_coalesced_initial_write) {
+    write_idle_stalled_body<EpollEventLoop>(_tc, false, true);
+}
+TEST(write_idle, iouring_coalesced_initial_write) {
+    write_idle_stalled_body<IoUringEventLoop>(_tc, false, true);
+}
+TEST(write_idle, epoll_published_response_closes_without_504) {
+    write_idle_stalled_body<EpollEventLoop>(_tc, false, false, true);
+}
+TEST(write_idle, iouring_published_response_closes_without_504) {
+    write_idle_stalled_body<IoUringEventLoop>(_tc, false, false, true);
+}
+
+template <typename Loop>
+void write_idle_terminal_same_batch(rut::test::TestCase* _tc, bool timeout_first) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    rig.owner.config->upstreams[0].write_timeout_seconds = 1;
+    i32 upstream[2]{-1, -1};
+    i32 downstream[2]{-1, -1};
+    REQUIRE(write_idle_loopback_pair(upstream));
+    REQUIRE(write_idle_loopback_pair(downstream));
+    Socket origin;
+    origin.fd = upstream[1];
+    Socket client;
+    client.fd = downstream[1];
+    const int small = 4096;
+    REQUIRE_EQ(setsockopt(upstream[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    u8 fill[4096]{};
+    bool blocked = false;
+    for (u32 i = 0; i < 4096; ++i) {
+        const ssize_t n = send(upstream[0], fill, sizeof(fill), MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            blocked = true;
+            break;
+        }
+        REQUIRE(n > 0);
+    }
+    REQUIRE(blocked);
+    Connection* c = rig.loop->alloc_conn();
+    REQUIRE(c);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Proxying;
+    c->request_config = rig.active;
+    c->upstream_idx = 0;
+    c->upstream_attempts = 1;
+    c->req_start_us = monotonic_us();
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_content_length = sizeof(fill);
+    c->req_initial_send_len = sizeof(fill);
+    REQUIRE_EQ(c->recv_buf.write(fill, sizeof(fill)), sizeof(fill));
+    REQUIRE(rig.loop->alloc_upstream_buf(*c));
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<Loop>,
+                 &on_request_body_sent<Loop>);
+    rig.loop->epoch_enter();
+    if constexpr (requires { rig.loop->backend.active_upstream_episode[c->id]; })
+        rig.loop->backend.active_upstream_episode[c->id] = c->upstream_episode;
+    REQUIRE(rig.loop->submit_send_upstream(*c, c->recv_buf.data(), c->recv_buf.len()));
+    REQUIRE(c->upstream_write_idle_armed);
+    u8 received[65536];
+    IoEvent events[32]{};
+    IoEvent terminal{};
+    bool found = false;
+    for (u32 tries = 0; tries < 3000 && !found; ++tries) {
+        while (recv(origin.fd, received, sizeof(received), MSG_DONTWAIT) > 0) {
+        }
+        const u32 count =
+            rig.loop->backend.wait(events, 32, rig.loop->conns, rig.initialized_slots(), 0);
+        for (u32 i = 0; i < count; ++i) {
+            if (events[i].type == IoEventType::UpstreamSend && events[i].conn_id == c->id &&
+                events[i].result > 0) {
+                terminal = events[i];
+                found = true;
+            } else if (events[i].type != IoEventType::Timeout) {
+                rig.loop->dispatch(events[i]);
+            }
+        }
+        if (!found) usleep(1000);
+    }
+    REQUIRE(found);
+    u64 old = 0;
+    REQUIRE_FALSE(__builtin_sub_overflow(monotonic_us(), u64{2'000'000}, &old));
+    c->upstream_write_idle_progress_us = old;
+    rig.loop->timer.remove(c);
+    rig.loop->timer.add(c, 0);
+    const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+    const IoEvent batch[] = {timeout_first ? tick : terminal, timeout_first ? terminal : tick};
+    rig.loop->dispatch_batch(batch, 2);
+    CHECK(c->fd >= 0);
+    CHECK(c->request_upload_complete);
+    CHECK_FALSE(c->upstream_write_idle_armed);
+    CHECK_FALSE(c->upstream_write_idle_expiry_pending);
+}
+TEST(write_idle, epoll_terminal_same_batch) {
+    write_idle_terminal_same_batch<EpollEventLoop>(_tc, true);
+    write_idle_terminal_same_batch<EpollEventLoop>(_tc, false);
+}
+TEST(write_idle, iouring_terminal_same_batch) {
+    write_idle_terminal_same_batch<IoUringEventLoop>(_tc, true);
+    write_idle_terminal_same_batch<IoUringEventLoop>(_tc, false);
+}
+
 TEST(health_probe, epoll_unhealthy_cadence) {
     unhealthy_cadence<EpollEventLoop>(_tc);
 }

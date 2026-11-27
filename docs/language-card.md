@@ -1025,6 +1025,10 @@ next origin read. A timeout after headers truncates and closes the response.
 Chunked and close-delimited bodies and other transport or policy profiles keep
 their existing behavior. Omission leaves the existing timeout behavior intact.
 Native artifact version 37 requires rebuilding older artifacts.
+An upstream may set `write_timeout: 2s` (1–63 whole seconds) for stalled
+plaintext HTTP/1 request-body writes. Partial writes refresh the idle deadline;
+waiting for client data does not. Native artifact version 38 requires rebuilding
+older artifacts.
 
 An upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For
 ordinary HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at send completion,

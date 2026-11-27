@@ -2357,6 +2357,7 @@ public:
         // before either the TLS continuation or fail-closed error handling.
         if (!c.h1_tls_transport && !c.response_header_timeout_armed &&
             !c.response_body_idle_armed && !c.response_body_idle_expiry_pending &&
+            !c.upstream_write_idle_armed && !c.upstream_write_idle_expiry_pending &&
             !c.throttle_paused && !c.ws_shutdown_deadline_armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
             c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
@@ -7519,6 +7520,7 @@ public:
         if (!__builtin_sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
             __builtin_add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
         resolve_response_body_idle_expiries();
+        this->resolve_upstream_write_idle_expiries(slots_initialized);
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {
@@ -8559,6 +8561,12 @@ public:
                             this->response_body_idle_expiries_pending = true;
                             return;
                         }
+                        if (c->upstream_write_idle_armed) {
+                            c->upstream_write_idle_armed = false;
+                            c->upstream_write_idle_expiry_pending = true;
+                            this->upstream_write_idle_scan_pending = true;
+                            return;
+                        }
                         if (c->is_health_probe && c->upstream_fd >= 0) {
                             record_probe_if_current(this, *c, false, monotonic_us());
                             free_health_probe(*c);
@@ -9187,6 +9195,8 @@ public:
                         if (!conn.h1_tls_transport && !conn.response_header_timeout_armed &&
                             !conn.response_body_idle_armed &&
                             !conn.response_body_idle_expiry_pending && !conn.throttle_paused &&
+                            !conn.upstream_write_idle_armed &&
+                            !conn.upstream_write_idle_expiry_pending &&
                             conn.connect_timeout_episode == 0 && !conn.connect_retry_pending &&
                             !conn.ws_shutdown_deadline_armed &&
                             conn.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
