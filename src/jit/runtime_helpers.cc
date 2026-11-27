@@ -700,7 +700,7 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
     u32 new_total = total;
     u32 new_header_end = old_header_end;
     if (!replace_h1_body_in_place(
-            data, &new_total, conn.recv_buf.capacity(), &new_header_end, old_body_len, body))
+            data, &new_total, conn.recv_buf.capacity_u32(), &new_header_end, old_body_len, body))
         return false;
     conn.recv_buf.set_len(new_total);
     conn.req_header_end = new_header_end;

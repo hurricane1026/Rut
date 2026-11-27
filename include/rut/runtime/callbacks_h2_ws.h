@@ -102,11 +102,11 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
             loop->close_conn(c);
             return;
         }
-        c.send_buf.write(x->request_headers, n);
+        c.send_buf.append_prefix(x->request_headers, n);
         x->request_headers_sent = true;
     } else if (x->ws_accepted && output_len) {
-        n = output_len < c.send_buf.capacity() ? output_len : c.send_buf.capacity();
-        c.send_buf.write(output, n);
+        n = output_len < c.send_buf.capacity() ? output_len : c.send_buf.capacity_u32();
+        c.send_buf.append_prefix(output, n);
         grpc_consume_output(*x, true, n);
     } else if (x->ws_accepted && !x->upload_len && x->request_end && !x->request_end_sent) {
         if (c.tls_active) {

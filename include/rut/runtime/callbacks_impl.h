@@ -536,24 +536,24 @@ inline u32 format_probe_host(char* out, const struct sockaddr_in& addr) {
 // User-Agent: rut-healthcheck\r\n\r\n` into the connection-owned recv_buf (a
 // probe never receives client bytes, so recv_buf is free for the request).
 inline void build_probe_request(Connection& conn, const UpstreamTarget& target, u32 backend_idx) {
-    Buffer& buf = conn.recv_buf;
+    SliceBuffer& buf = conn.recv_buf;
     static const char kGet[] = "GET ";
-    buf.write(reinterpret_cast<const u8*>(kGet), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>(kGet), 4);
     if (target.hc_path_len > 0)
-        buf.write(reinterpret_cast<const u8*>(target.hc_path), target.hc_path_len);
+        buf.append_prefix(reinterpret_cast<const u8*>(target.hc_path), target.hc_path_len);
     else
-        buf.write(reinterpret_cast<const u8*>("/"), 1);
+        buf.append_prefix(reinterpret_cast<const u8*>("/"), 1);
     static const char kProto[] = " HTTP/1.1\r\nHost: ";
-    buf.write(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
+    buf.append_prefix(reinterpret_cast<const u8*>(kProto), sizeof(kProto) - 1);
     if (target.hc_host_len) {
-        buf.write(reinterpret_cast<const u8*>(target.hc_host), target.hc_host_len);
+        buf.append_prefix(reinterpret_cast<const u8*>(target.hc_host), target.hc_host_len);
     } else {
         char host[24];
         const u32 kHostLen = format_probe_host(host, target.addrs[backend_idx]);
-        buf.write(reinterpret_cast<const u8*>(host), kHostLen);
+        buf.append_prefix(reinterpret_cast<const u8*>(host), kHostLen);
     }
     static const char kTail[] = "\r\nConnection: close\r\nUser-Agent: rut-healthcheck\r\n\r\n";
-    buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
+    buf.append_prefix(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1);
 }
 
 template <typename Loop>
@@ -685,8 +685,8 @@ bool start_health_probe(Loop* loop, u16 upstream_idx, u32 backend_idx) {
     // io_uring reads the connect address after submission. Keep it in an owned,
     // otherwise unused send slice instead of borrowing a reloadable config.
     conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(&target.addrs[backend_idx]),
-                        sizeof(target.addrs[backend_idx]));
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&target.addrs[backend_idx]),
+                                sizeof(target.addrs[backend_idx]));
 
     conn.set_slots(nullptr, nullptr, nullptr, &on_probe_connected<Loop>);
     if (!loop->submit_connect(conn, conn.send_buf.data(), sizeof(target.addrs[backend_idx]))) {
@@ -1573,8 +1573,7 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
     }
     const i64 total =
         static_cast<i64>(parser.header_end) + static_cast<i64>(request.content_length);
-    if (host_count != 1 || content_length_count != 1 ||
-        total > static_cast<i64>(conn.recv_buf.capacity()) ||
+    if (host_count != 1 || content_length_count != 1 || total > conn.recv_buf.capacity() ||
         static_cast<i64>(conn.recv_buf.len()) > total)
         return false;
     out->header_end = parser.header_end;
@@ -3895,10 +3894,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         if (response_version == HttpVersion::Http11 && !headers_only) {
             conn.send_buf.reset();
             if (conn.keep_alive)
-                conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(kResponse200),
+                                            kResponse200Len);
             else
-                conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
-                                    kResponse200CloseLen);
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(kResponse200Close),
+                                            kResponse200CloseLen);
         } else {
             format_static_response(conn, 200, conn.keep_alive, headers_only, response_version);
         }
@@ -4861,7 +4861,7 @@ void handle_jit_outcome(Loop* loop,
                                                       : conn.send_buf.write_avail());
                 conn.local_response_size = static_cast<u32>(static_cast<i64>(conn.send_buf.len()) +
                                                             static_cast<i64>(body.len));
-                conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(body.data), n);
                 conn.local_body_cursor =
                     reinterpret_cast<const u8*>(body.data) + static_cast<i64>(n);
                 conn.local_body_remaining =
@@ -6945,12 +6945,12 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
             "Gateway Timeout";
         conn.send_buf.reset();
         if (http1_request_is_head(conn)) {
-            conn.send_buf.write(
+            conn.send_buf.append_prefix(
                 reinterpret_cast<const u8*>(k504),
                 static_cast<u32>(static_cast<i64>(sizeof(k504)) - 1 -
                                  (static_cast<i64>(sizeof("Gateway Timeout")) - 1)));
         } else {
-            conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+            conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
         }
     }
     conn.keep_alive = false;
@@ -7223,11 +7223,12 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         "Payload Too Large";
     conn.send_buf.reset();
     if (http1_request_is_head(conn)) {
-        conn.send_buf.write(reinterpret_cast<const u8*>(k413),
-                            static_cast<u32>(static_cast<i64>(sizeof(k413)) - 1 -
-                                             (static_cast<i64>(sizeof("Payload Too Large")) - 1)));
+        conn.send_buf.append_prefix(
+            reinterpret_cast<const u8*>(k413),
+            static_cast<u32>(static_cast<i64>(sizeof(k413)) - 1 -
+                             (static_cast<i64>(sizeof("Payload Too Large")) - 1)));
     } else {
-        conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
     }
     conn.keep_alive = false;
     conn.resp_status = 413;
@@ -7315,8 +7316,7 @@ inline bool rewrite_request_line_path(Connection& conn) {
     const u32 new_len = conn.req_path_override.len;
     if (new_len == 0) return false;
     const i64 delta = static_cast<i64>(new_len) - static_cast<i64>(old_len);
-    if (delta > 0 && static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
-        return false;
+    if (delta > 0 && static_cast<i64>(total) + delta > conn.recv_buf.capacity()) return false;
     if (delta != 0) {
         __builtin_memmove(buf + (static_cast<i64>(j) + delta),
                           buf + static_cast<i64>(j),
@@ -7381,9 +7381,7 @@ inline bool apply_request_header_overrides(Connection& conn) {
             return false;
         const u32 ins_len = write_line ? checked_line_len : 0;  // ": " + CRLF
         const i64 delta = static_cast<i64>(ins_len) - static_cast<i64>(old_span);
-        if (delta > 0 &&
-            static_cast<i64>(total) + delta > static_cast<i64>(conn.recv_buf.capacity()))
-            return false;
+        if (delta > 0 && static_cast<i64>(total) + delta > conn.recv_buf.capacity()) return false;
         const u32 tail_src = static_cast<u32>(static_cast<i64>(pos) + static_cast<i64>(old_span));
         if (delta != 0)
             __builtin_memmove(
@@ -8462,13 +8460,12 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (has_te && !request_policy_preserves_host(policy_id)) return RequestPolicyBodyState::Invalid;
     if (!req.has_content_length ||
         static_cast<i64>(req.content_length) >
-            static_cast<i64>(conn.recv_buf.capacity()) - static_cast<i64>(parser.header_end))
+            conn.recv_buf.capacity() - static_cast<i64>(parser.header_end))
         return RequestPolicyBodyState::Invalid;
     if (request_policy_places_content_length_after_host(policy_id) && req.content_length == 0)
         return RequestPolicyBodyState::Invalid;
     const i64 required = static_cast<i64>(parser.header_end) + static_cast<i64>(req.content_length);
-    if (required > static_cast<i64>(conn.recv_buf.capacity()))
-        return RequestPolicyBodyState::Invalid;
+    if (required > conn.recv_buf.capacity()) return RequestPolicyBodyState::Invalid;
     // INVARIANT: every rejection above this line depends only on headers,
     // the request line, or connection state already known before any body
     // byte has necessarily arrived -- never on the content of body bytes
@@ -8882,8 +8879,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
             return true;
         }
         if (conn.send_buf.len() > conn.send_buf.capacity() ||
-            static_cast<i64>(n) >
-                static_cast<i64>(conn.send_buf.capacity()) - static_cast<i64>(conn.send_buf.len()))
+            static_cast<i64>(n) > conn.send_buf.capacity() - static_cast<i64>(conn.send_buf.len()))
             return false;
         return conn.send_buf.write(p, n) == n;
     };
@@ -9267,16 +9263,14 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         }
         measured += 2;
         if (measured_index != req.header_count || measured < 0 ||
-            measured > static_cast<i64>(conn.send_buf.capacity()) ||
-            measured > static_cast<i64>(conn.recv_buf.capacity()))
+            measured > conn.send_buf.capacity() || measured > conn.recv_buf.capacity())
             return false;
         measured_id3_length = static_cast<u64>(measured);
     }
 
     auto append = [&](const u8* p, u32 n) {
         if (conn.send_buf.len() > conn.send_buf.capacity() ||
-            static_cast<i64>(n) >
-                static_cast<i64>(conn.send_buf.capacity()) - static_cast<i64>(conn.send_buf.len()))
+            static_cast<i64>(n) > conn.send_buf.capacity() - static_cast<i64>(conn.send_buf.len()))
             return false;
         return conn.send_buf.write(p, n) == n;
     };
@@ -9623,7 +9617,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
             if (http1_request_is_head(conn)) {
                 format_static_response(conn, 500, /*keep_alive=*/false, /*headers_only=*/true);
             } else {
-                conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
             }
             conn.keep_alive = false;
             conn.resp_status = kStatusInternalServerError;
@@ -9639,14 +9633,14 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         const u32 kOldHeader = conn.req_header_end;
         const u32 kOldTotal = conn.recv_buf.len();
         const u32 kNewHeader = ws_rewrite_extensions(
-            conn.recv_slice, kOldHeader, kOldTotal, conn.recv_buf.capacity(), kWsDeflateOffer);
+            conn.recv_slice, kOldHeader, kOldTotal, conn.recv_buf.capacity_u32(), kWsDeflateOffer);
         if (!kNewHeader) {
             loop->close_conn(conn);
             return;
         }
         const i64 new_total = static_cast<i64>(kOldTotal) - static_cast<i64>(kOldHeader) +
                               static_cast<i64>(kNewHeader);
-        if (new_total < 0 || new_total > static_cast<i64>(conn.recv_buf.capacity())) {
+        if (new_total < 0 || new_total > conn.recv_buf.capacity()) {
             loop->close_conn(conn);
             return;
         }
@@ -10069,7 +10063,7 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
                    request_resendable_from_recv_buf(conn) &&
                    conn.recv_buf.len() <= conn.send_buf.capacity()) {
             conn.send_buf.reset();
-            conn.send_buf.write(conn.recv_buf.data(), conn.req_initial_send_len);
+            conn.send_buf.append_prefix(conn.recv_buf.data(), conn.req_initial_send_len);
             conn.retry_req_send_len = conn.req_initial_send_len;
             conn.retry_req_snapshot_replayable = true;
         }
@@ -10236,7 +10230,7 @@ void h2_proxy_flush(Loop* loop, Connection& conn, const u8* src, u32 resp_len) {
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     conn.send_progress = 0;
     conn.send_buf.reset();
-    conn.send_buf.write(src, resp_len);
+    conn.send_buf.append_prefix(src, resp_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
     if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -11628,8 +11622,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) >
-            static_cast<i64>(conn.recv_buf.capacity())) {
+        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) > conn.recv_buf.capacity()) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
             loop->close_conn(conn);
@@ -11642,12 +11635,12 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         }
         conn.pipeline_stash_len = 0;
         conn.upstream_recv_buf.reset();
-        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
+        conn.upstream_recv_buf.append_prefix(conn.recv_buf.data(), kLateLen);
         conn.reset_request_receive_buffer();
-        conn.recv_buf.write(conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len),
-                            kStashLen);
+        conn.recv_buf.append_prefix(
+            conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len), kStashLen);
         conn.retry_req_send_len = 0;
-        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
+        conn.recv_buf.append_prefix(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
         pipeline_dispatch<Loop>(loop, conn);
@@ -14055,8 +14048,8 @@ bool handle_configured_strict_local_response_in_scope(
         ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/conn.keep_alive);
 
     u8 scratch[SlicePool::kSliceSize];
-    const u32 cap =
-        conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity() : sizeof(scratch);
+    const u32 cap = conn.send_buf.capacity() < i64{sizeof(scratch)} ? conn.send_buf.capacity_u32()
+                                                                    : sizeof(scratch);
     u32 response_len = 0;
     if (!build_strict_local_response(conn, policy, is_head, scratch, cap, &response_len))
         return fail_closed();
@@ -15178,8 +15171,8 @@ inline bool build_redirect_response(const Connection& conn,
 
 inline bool stage_redirect_response(Connection& conn, const RouteConfig& config, u16 policy_id) {
     u8 scratch[SlicePool::kSliceSize];
-    const u32 cap =
-        conn.send_buf.capacity() < sizeof(scratch) ? conn.send_buf.capacity() : sizeof(scratch);
+    const u32 cap = conn.send_buf.capacity() < i64{sizeof(scratch)} ? conn.send_buf.capacity_u32()
+                                                                    : sizeof(scratch);
     u32 len = 0;
     if (!build_redirect_response(conn, config, policy_id, scratch, cap, &len)) return false;
     conn.send_buf.reset();
@@ -16086,7 +16079,7 @@ inline void reject_strict_response(
         "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n"
         "Connection: close\r\n\r\nBad Gateway";
     conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
     conn.keep_alive = false;
     conn.resp_status = kStatusBadGateway;
     conn.upstream_keep_alive = false;
@@ -16361,7 +16354,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 "\r\n"
                 "Bad Gateway";
             conn.send_buf.reset();
-            conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+            conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
         }
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
@@ -16530,8 +16523,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             explicit_method == static_cast<u8>(LogHttpMethod::Get) && resp.content_length > 0 &&
             raw_header_end <= conn.upstream_recv_buf.capacity() &&
             static_cast<i64>(resp.content_length) <=
-                static_cast<i64>(conn.upstream_recv_buf.capacity()) -
-                    static_cast<i64>(raw_header_end) &&
+                conn.upstream_recv_buf.capacity() - static_cast<i64>(raw_header_end) &&
             raw_body_len >= 0 && raw_body_len <= static_cast<i64>(resp.content_length);
         const bool strict_positive_head =
             strict_common && fixed_upload_head &&
@@ -16856,7 +16848,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             const u32 kRewritten = ws_rewrite_extensions(conn.response_header_slice,
                                                          conn.response_header_buf.len(),
                                                          conn.response_header_buf.len(),
-                                                         conn.response_header_buf.capacity(),
+                                                         conn.response_header_buf.capacity_u32(),
                                                          {extension, kExtensionLength});
             if (!kRewritten) {
                 loop->close_conn(conn);
@@ -17069,7 +17061,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                         "\r\n"
                         "Bad Gateway";
                     conn.send_buf.reset();
-                    conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+                    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k502),
+                                                sizeof(k502) - 1);
                     conn.keep_alive = false;
                     conn.resp_status = kStatusBadGateway;
                     conn.transition_to_sending(&on_response_sent<Loop>);
@@ -17136,7 +17129,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     "\r\n"
                     "Bad Gateway";
                 conn.send_buf.reset();
-                conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
                 conn.keep_alive = false;
                 conn.resp_status = kStatusBadGateway;
                 conn.transition_to_sending(&on_response_sent<Loop>);
@@ -17217,12 +17210,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             static const char kConnClose[] = "Connection: close\r\n";
             const i64 drain_len = static_cast<i64>(kHdrEnd) + static_cast<i64>(kConnCloseLen) +
                                   static_cast<i64>(kHeaderEndLen) + static_cast<i64>(body_len);
-            if (drain_len <= static_cast<i64>(conn.send_buf.capacity())) {
+            if (drain_len <= conn.send_buf.capacity()) {
                 conn.send_buf.reset();
-                conn.send_buf.write(d, static_cast<u32>(static_cast<i64>(kHdrEnd) + 2));
-                conn.send_buf.write(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);
-                conn.send_buf.write(d + static_cast<i64>(kHdrEnd) + 2,
-                                    static_cast<u32>(static_cast<i64>(body_len) + 2));
+                conn.send_buf.append_prefix(d, static_cast<u32>(static_cast<i64>(kHdrEnd) + 2));
+                conn.send_buf.append_prefix(reinterpret_cast<const u8*>(kConnClose), kConnCloseLen);
+                conn.send_buf.append_prefix(d + static_cast<i64>(kHdrEnd) + 2,
+                                            static_cast<u32>(static_cast<i64>(body_len) + 2));
                 conn.keep_alive = false;
                 conn.resp_body_sent = conn.send_buf.len();
                 const bool kDrainBodyDone =
@@ -17324,8 +17317,7 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) >
-            static_cast<i64>(conn.recv_buf.capacity())) {
+        if (static_cast<i64>(kStashLen) + static_cast<i64>(kLateLen) > conn.recv_buf.capacity()) {
             conn.pipeline_stash_len = 0;
             conn.send_buf.reset();
             loop->close_conn(conn);
@@ -17338,12 +17330,12 @@ void continue_http1_request_boundary(Loop* loop, Connection& conn) {
         }
         conn.pipeline_stash_len = 0;
         conn.upstream_recv_buf.reset();
-        conn.upstream_recv_buf.write(conn.recv_buf.data(), kLateLen);
+        conn.upstream_recv_buf.append_prefix(conn.recv_buf.data(), kLateLen);
         conn.reset_request_receive_buffer();
-        conn.recv_buf.write(conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len),
-                            kStashLen);
+        conn.recv_buf.append_prefix(
+            conn.send_buf.data() + static_cast<i64>(conn.retry_req_send_len), kStashLen);
         conn.retry_req_send_len = 0;
-        conn.recv_buf.write(conn.upstream_recv_buf.data(), kLateLen);
+        conn.recv_buf.append_prefix(conn.upstream_recv_buf.data(), kLateLen);
         conn.upstream_recv_buf.reset();
         conn.send_buf.reset();
         pipeline_dispatch<Loop>(loop, conn);

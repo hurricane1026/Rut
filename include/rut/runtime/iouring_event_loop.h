@@ -3448,7 +3448,7 @@ public:
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
         u8* tin = c.tls_in_slice;
-        const u32 tin_capacity = c.tls_in_buf.capacity();
+        const i64 tin_capacity = c.tls_in_buf.capacity();
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         const u8 allocated_shard = c.shard_id;
@@ -5977,7 +5977,7 @@ public:
             c.req_method != static_cast<u8>(LogHttpMethod::Get) || declared_body == 0 ||
             raw_header_end == 0 || raw_header_end > c.buffered_response_len() ||
             static_cast<i64>(declared_body) >
-                static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
+                c.upstream_recv_buf.capacity() - static_cast<i64>(raw_header_end))
             return false;
         const u32 initial_body = static_cast<u32>(static_cast<i64>(c.buffered_response_len()) -
                                                   static_cast<i64>(raw_header_end));
@@ -6564,7 +6564,7 @@ public:
                     static_cast<i64>(c.buffered_response_len()) - static_cast<i64>(raw_header_end))
                 return CombinedSendEligibility::Invalid;
             if (static_cast<i64>(declared) >
-                static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len))
+                c.response_header_buf.capacity() - static_cast<i64>(header_len))
                 return CombinedSendEligibility::Fallback;
             return CombinedSendEligibility::Eligible;
         };

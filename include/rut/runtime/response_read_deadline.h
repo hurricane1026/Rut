@@ -1370,7 +1370,7 @@ inline bool response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable
                route_method) &&
            c.pipeline_stash_len != 0 && c.send_buf.len() == c.pipeline_stash_len &&
            static_cast<i64>(c.recv_buf.len()) <=
-               static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len);
+               c.recv_buf.capacity() - static_cast<i64>(c.pipeline_stash_len);
 }
 
 inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
@@ -1381,7 +1381,7 @@ inline bool response_read_deadline_coalesced_get_phase1_stash_is_stable(
             c, proof, allow_retired_episode) ||
         c.pipeline_stash_len == 0 || c.send_buf.len() != c.pipeline_stash_len ||
         static_cast<i64>(c.recv_buf.len()) >
-            static_cast<i64>(c.recv_buf.capacity()) - static_cast<i64>(c.pipeline_stash_len))
+            c.recv_buf.capacity() - static_cast<i64>(c.pipeline_stash_len))
         return false;
     return true;
 }
@@ -2299,10 +2299,10 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
         header_len == 0 || body_len == 0 || c.response_header_buf.data() == nullptr ||
         c.upstream_recv_buf.data() == nullptr || header_len > c.response_header_buf.capacity() ||
         static_cast<i64>(body_len) >
-            static_cast<i64>(c.response_header_buf.capacity()) - static_cast<i64>(header_len) ||
+            c.response_header_buf.capacity() - static_cast<i64>(header_len) ||
         raw_header_end == 0 || raw_header_end > c.upstream_recv_buf.capacity() ||
         static_cast<i64>(body_len) >
-            static_cast<i64>(c.upstream_recv_buf.capacity()) - static_cast<i64>(raw_header_end))
+            c.upstream_recv_buf.capacity() - static_cast<i64>(raw_header_end))
         return false;
 
     const u32 send_len =
@@ -2389,7 +2389,7 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             (complete_buffering
                  ? ResponseBodyChain::kMaxBody
                  : static_cast<u32>(
-                       static_cast<i64>(c.upstream_recv_buf.capacity()) -
+                       c.upstream_recv_buf.capacity() -
                        static_cast<i64>(c.response_read_deadline_post_commit_raw_header_end))) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||

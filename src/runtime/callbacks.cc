@@ -583,7 +583,7 @@ bool pipeline_stash(Connection& conn) {
         return false;
     }
     const u8* src = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
-    conn.send_buf.write(src, kLeftover);
+    conn.send_buf.append_prefix(src, kLeftover);
     conn.pipeline_stash_len = static_cast<u16>(kLeftover);
     return true;
 }
@@ -598,8 +598,7 @@ PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transitio
     const u32 kStashOff = conn.retry_req_send_len;
     const u8* src = conn.send_buf.data() + static_cast<i64>(kStashOff);
     const u32 kExisting = conn.recv_buf.len();
-    if (static_cast<i64>(kStashLen) + static_cast<i64>(kExisting) >
-        static_cast<i64>(conn.recv_buf.capacity()))
+    if (static_cast<i64>(kStashLen) + static_cast<i64>(kExisting) > conn.recv_buf.capacity())
         return PipelineTransitionResult::LimitExceeded;
     if (count_transition) {
         const PipelineTransitionResult kTransition = pipeline_advance(conn);
@@ -876,66 +875,66 @@ static void write_response_headers(Connection& conn,
                                    HttpVersion response_version) {
     conn.send_buf.reset();
     const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
-    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
     code_buf[2] = static_cast<char>('0' + code % 10);
-    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
-    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Content-Length: decimal digits, always emitted (even for 0).
-    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Length: "), 16);
     if (body_len >= 1000000000u) {
         char d = last_decimal_digit(body_len / 1000000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
         char d = last_decimal_digit(body_len / 100000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
         char d = last_decimal_digit(body_len / 10000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
         char d = last_decimal_digit(body_len / 1000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
         char d = last_decimal_digit(body_len / 100000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
         char d = last_decimal_digit(body_len / 10000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
         char d = last_decimal_digit(body_len / 1000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
         char d = last_decimal_digit(body_len / 100u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
         char d = last_decimal_digit(body_len / 10u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     char d = last_decimal_digit(body_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     if (content_type_len > 0) {
-        conn.send_buf.write(reinterpret_cast<const u8*>("Content-Type: "), 14);
-        conn.send_buf.write(reinterpret_cast<const u8*>(content_type), content_type_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Type: "), 14);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(content_type), content_type_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     }
     if (keep_alive)
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
     else
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
 }
 
 void format_static_response(
@@ -951,7 +950,7 @@ void format_static_response(
     write_response_headers(
         conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0, response_version);
     if (!kSuppressBody && kBodyLen > 0)
-        conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
 void format_response_with_body(Connection& conn,
@@ -982,7 +981,7 @@ void format_response_with_body(Connection& conn,
                            sizeof(kDefaultContentType) - 1,
                            response_version);
     if (!headers_only && body_len > 0)
-        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(body_data), body_len);
 }
 
 // Case-insensitive compare against a string literal. Templated on the
@@ -1004,42 +1003,42 @@ static bool header_name_eq_literal_ci(const char* data, u32 len, const char (&li
 static void write_content_length_digits(Connection& conn, u32 body_len) {
     if (body_len >= 1000000000u) {
         char d = last_decimal_digit(body_len / 1000000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000000u) {
         char d = last_decimal_digit(body_len / 100000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000000u) {
         char d = last_decimal_digit(body_len / 10000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000000u) {
         char d = last_decimal_digit(body_len / 1000000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100000u) {
         char d = last_decimal_digit(body_len / 100000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10000u) {
         char d = last_decimal_digit(body_len / 10000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 1000u) {
         char d = last_decimal_digit(body_len / 1000u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 100u) {
         char d = last_decimal_digit(body_len / 100u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     if (body_len >= 10u) {
         char d = last_decimal_digit(body_len / 10u);
-        conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
     }
     char d = last_decimal_digit(body_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>(&d), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(&d), 1);
 }
 
 // Count ASCII digits needed to represent `v` in base 10 (at least 1).
@@ -1145,48 +1144,49 @@ bool format_response_with_body_and_headers(Connection& conn,
     conn.send_buf.reset();
     // Status line: "HTTP/1.x <3-digit code> <reason>\r\n"
     const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
-    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
     code_buf[2] = static_cast<char>('0' + code % 10);
-    conn.send_buf.write(reinterpret_cast<const u8*>(code_buf), 3);
-    conn.send_buf.write(reinterpret_cast<const u8*>(" "), 1);
-    conn.send_buf.write(reinterpret_cast<const u8*>(reason), reason_len);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(code_buf), 3);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(" "), 1);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>(reason), reason_len);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Content-Length (from body_len_emit, not the user's headers).
-    conn.send_buf.write(reinterpret_cast<const u8*>("Content-Length: "), 16);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Content-Length: "), 16);
     write_content_length_digits(conn, body_len_emit);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     // Default Content-Type only if the user didn't supply one AND
     // we're actually going to send a body. No-body responses (1xx /
     // 204 / 304 and redirect-style header-only responses) shouldn't
     // advertise a Content-Type — matches format_static_response.
     if (emit_default_content_type) {
         static const char kDefaultContentType[] = "Content-Type: text/plain; charset=utf-8\r\n";
-        conn.send_buf.write(reinterpret_cast<const u8*>(kDefaultContentType),
-                            sizeof(kDefaultContentType) - 1);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(kDefaultContentType),
+                                    sizeof(kDefaultContentType) - 1);
     }
     // User-supplied headers, skipping Content-Length.
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
-        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].key_data), headers[i].key_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>(": "), 2);
-        conn.send_buf.write(reinterpret_cast<const u8*>(headers[i].value_data),
-                            headers[i].value_len);
-        conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(headers[i].key_data),
+                                    headers[i].key_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(": "), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(headers[i].value_data),
+                                    headers[i].value_len);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
     }
     // Connection + blank line.
     if (keep_alive)
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: keep-alive\r\n"), 24);
     else
-        conn.send_buf.write(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
-    conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>("Connection: close\r\n"), 19);
+    conn.send_buf.append_prefix(reinterpret_cast<const u8*>("\r\n"), 2);
 
     if (!headers_only && body_len_emit > 0) {
-        conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len_emit);
+        conn.send_buf.append_prefix(reinterpret_cast<const u8*>(body_data), body_len_emit);
     }
     return true;
 }

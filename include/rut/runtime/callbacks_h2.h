@@ -98,7 +98,7 @@ inline bool h2_prepare_forward_request(Connection& conn,
 
     u8* saved_slice = conn.recv_slice;
     const u32 saved_slice_capacity = conn.recv_slice_capacity;
-    Buffer saved_buf = static_cast<Buffer&&>(conn.recv_buf);
+    SliceBuffer saved_buf = static_cast<SliceBuffer&&>(conn.recv_buf);
     const u32 saved_header_end = conn.req_header_end;
     const u32 saved_initial_send_len = conn.req_initial_send_len;
     const RequestTransferEncoding saved_transfer_encoding = conn.req_client_transfer_encoding;
@@ -124,7 +124,7 @@ inline bool h2_prepare_forward_request(Connection& conn,
         }
     }
     if (ok) *out_len = conn.recv_buf.len();
-    conn.recv_buf = static_cast<Buffer&&>(saved_buf);
+    conn.recv_buf = static_cast<SliceBuffer&&>(saved_buf);
     conn.recv_slice = saved_slice;
     conn.recv_slice_capacity = saved_slice_capacity;
     conn.req_header_end = saved_header_end;
@@ -2470,10 +2470,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     if (!kClose && conn.h2->grpc.active) {
         const u32 used =
             static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
-        const u32 wire_room = used < conn.send_buf.capacity()
-                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
-                                                     static_cast<i64>(used))
-                                  : 0;
+        const u32 wire_room =
+            used < conn.send_buf.capacity()
+                ? static_cast<u32>(conn.send_buf.capacity() - static_cast<i64>(used))
+                : 0;
         const u32 storage_room =
             static_cast<u32>(static_cast<i64>(kRespStorageCap) - static_cast<i64>(d.resp_len));
         const u32 room = storage_room < wire_room ? storage_room : wire_room;
@@ -2497,10 +2497,10 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     if (!kClose && conn.h2->outbound_stream != 0) {
         const u32 kUsed =
             static_cast<u32>(static_cast<i64>(ctrl_len) + static_cast<i64>(d.resp_len));
-        const u32 kWireRoom = kUsed <= conn.send_buf.capacity()
-                                  ? static_cast<u32>(static_cast<i64>(conn.send_buf.capacity()) -
-                                                     static_cast<i64>(kUsed))
-                                  : 0;
+        const u32 kWireRoom =
+            kUsed <= conn.send_buf.capacity()
+                ? static_cast<u32>(conn.send_buf.capacity() - static_cast<i64>(kUsed))
+                : 0;
         H2PumpStatus pump_status = H2PumpStatus::Blocked;
         const u32 kStorageRoom =
             d.resp_len <= kRespStorageCap
@@ -2529,8 +2529,8 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.send_buf.reset();
-        conn.send_buf.write(ctrl, ctrl_len);
-        conn.send_buf.write(resp, d.resp_len);
+        conn.send_buf.append_prefix(ctrl, ctrl_len);
+        conn.send_buf.append_prefix(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
         if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -2562,8 +2562,8 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     // Combine control + response frames into the send buffer and flush.
     conn.send_buf.reset();
-    conn.send_buf.write(ctrl, ctrl_len);
-    conn.send_buf.write(resp, d.resp_len);
+    conn.send_buf.append_prefix(ctrl, ctrl_len);
+    conn.send_buf.append_prefix(resp, d.resp_len);
     conn.keep_alive = !kClose;  // on_h2_sent closes the connection when false
     conn.transition_to_sending(&on_h2_sent<Loop>);
     if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -2674,7 +2674,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
         conn.send_progress = 0;
         conn.send_buf.reset();
-        conn.send_buf.write(resp, d.resp_len);
+        conn.send_buf.append_prefix(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
         if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -2716,7 +2716,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
         conn.send_progress = 0;
         conn.send_buf.reset();
-        conn.send_buf.write(resp, d.resp_len);
+        conn.send_buf.append_prefix(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
         if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -2866,7 +2866,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
         conn.send_progress = 0;
         conn.send_buf.reset();
-        conn.send_buf.write(resp, d.resp_len);
+        conn.send_buf.append_prefix(resp, d.resp_len);
         conn.keep_alive = true;
         conn.transition_to_sending(&on_h2_sent<Loop>);
         if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {
@@ -2964,7 +2964,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     }
     conn.send_progress = 0;
     conn.send_buf.reset();
-    conn.send_buf.write(resp, d.resp_len);
+    conn.send_buf.append_prefix(resp, d.resp_len);
     conn.keep_alive = true;
     conn.transition_to_sending(&on_h2_sent<Loop>);
     if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) {

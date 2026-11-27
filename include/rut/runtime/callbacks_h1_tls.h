@@ -102,7 +102,7 @@ void h1_tls_closed(void* lp, Connection& transport) {
             buffered_response_preserved = false;
         } else {
             const u32 buffered_len = transport.recv_buf.len();
-            owner->upstream_recv_buf.write(transport.recv_buf.data(), buffered_len);
+            owner->upstream_recv_buf.append_prefix(transport.recv_buf.data(), buffered_len);
             transport.recv_buf.consume(buffered_len);
         }
     }
@@ -156,7 +156,7 @@ bool h1_tls_recv(Loop* loop, Connection& owner) {
            owner.upstream_recv_buf.write_avail()) {
         const u32 available = owner.upstream_recv_buf.write_avail();
         const u32 n = transport.recv_buf.len() < available ? transport.recv_buf.len() : available;
-        owner.upstream_recv_buf.write(transport.recv_buf.data(), n);
+        owner.upstream_recv_buf.append_prefix(transport.recv_buf.data(), n);
         transport.recv_buf.consume(n);
         state->receiving = false;
         IoEvent received{};
@@ -247,9 +247,10 @@ bool h1_tls_send(Loop* loop, Connection& owner, const u8* bytes, u32 length) {
     auto& transport = *state->transport;
     // Never give a child SQE an owner-buffer pointer: owner teardown may
     // release its request/config while child cancellation is still draining.
-    const u32 n = length < transport.send_buf.capacity() ? length : transport.send_buf.capacity();
+    const u32 n =
+        length < transport.send_buf.capacity() ? length : transport.send_buf.capacity_u32();
     transport.send_buf.reset();
-    transport.send_buf.write(bytes, n);
+    transport.send_buf.append_prefix(bytes, n);
     transport.on_send = &h1_tls_sent<Loop>;
     return client_send(loop, transport, transport.send_buf.data(), n);
 }
@@ -334,7 +335,7 @@ bool h1_tls_connect(Loop* loop, Connection& owner, const void* addr, u32 addr_le
     }
     // The child connect can outlive its owner, including a probe on reload.
     transport->send_buf.reset();
-    transport->send_buf.write(static_cast<const u8*>(addr), addr_len);
+    transport->send_buf.append_prefix(static_cast<const u8*>(addr), addr_len);
     owner.h1_tls_upstream = state;
     transport->h1_tls_transport = state;
     transport->on_close = &h1_tls_closed<Loop>;

@@ -542,7 +542,7 @@ struct ConnectionBase {
     // from upstream_recv_buf. Keeping the header block independent lets a full
     // upstream body buffer stream normally even when mutations grow the headers.
     u8* response_header_slice;
-    Buffer response_header_buf;
+    SliceBuffer response_header_buf;
 
     void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
         auto reanchor = [&](Str& value) {
@@ -1493,9 +1493,9 @@ struct ConnectionBase {
     // `tls` above); io_uring leaves `tls` null and uses `tls_engine`.
     TlsEngine tls_engine;
     u8* tls_in_slice;  // ciphertext arriving from the network (recv lands here)
-    Buffer tls_in_buf;
+    SliceBuffer tls_in_buf;
     u8* tls_out_slice;  // ciphertext to send: handshake flights + encrypted app data
-    Buffer tls_out_buf;
+    SliceBuffer tls_out_buf;
     // A tls_out_buf send is in flight; the buffer cannot be reused until its CQE.
     bool tls_out_inflight;
     // Bytes the in-flight raw send covers. Read-ahead may append more ciphertext
@@ -1695,7 +1695,7 @@ struct ConnectionBase {
             req_header_end > req_initial_send_len || !recv_buf.valid() || recv_buf.is_released())
             return invalid;
 
-        const u32 capacity = recv_buf.capacity();
+        const u32 capacity = recv_buf.capacity_u32();
         const u32 count = recv_buf.len();
         if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
             count > capacity || req_header_end > count || req_initial_send_len > count ||
@@ -2048,8 +2048,8 @@ struct ConnectionBase {
     // Last actual origin write, used only by the opt-in upload idle timeout.
     u64 upstream_write_idle_progress_us = 0;
     u8* send_slice;
-    Buffer recv_buf;
-    Buffer send_buf;
+    SliceBuffer recv_buf;
+    SliceBuffer send_buf;
     // JSON results own slices until the request completes. Never point a
     // pending response at a thread-local helper workspace.
     SliceArena json_arena{};
@@ -2075,7 +2075,7 @@ struct ConnectionBase {
     // 3. Client Recv during response streaming polluting upstream body data
     // Lazy-allocated: only proxy connections pay the cost.
     u8* upstream_recv_slice;
-    Buffer upstream_recv_buf;
+    SliceBuffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
     ChainDirectRecvOwner chain_direct_recv_owner{};
     RelayOwner relay_owner{};

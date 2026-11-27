@@ -146,20 +146,20 @@ void h1ws_h2_drive(Loop* loop, Connection& c) {
                 loop->close_conn(c);
                 return;
             }
-            c.send_buf.write(x->response_headers, x->response_headers_len);
+            c.send_buf.append_prefix(x->response_headers, x->response_headers_len);
             x->response_headers_sent = true;
         }
     } else {
         u32 length = 0;
         const u8* output = grpc_output(*x, false, &length);
         if (length) {
-            const u32 kAmount = length < c.send_buf.capacity() ? length : c.send_buf.capacity();
+            const u32 kAmount = length < c.send_buf.capacity() ? length : c.send_buf.capacity_u32();
             if (!grpc_count_bytes(&x->staged_response_bytes, kAmount)) {
                 g.busy = false;
                 loop->close_conn(c);
                 return;
             }
-            c.send_buf.write(output, kAmount);
+            c.send_buf.append_prefix(output, kAmount);
             grpc_consume_output(*x, false, kAmount);
         } else if (!x->download_len && x->response_end && !x->response_end_sent) {
             if (!x->ws_accepted) {

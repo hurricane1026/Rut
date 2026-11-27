@@ -2,6 +2,8 @@
 #include "rut/common/buffer.h"
 #include "test.h"
 
+#include <sys/mman.h>
+
 using namespace rut;
 
 // === Buffer write + read ===
@@ -30,7 +32,7 @@ TEST(buffer, read_multiple_times) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
     const u8 src[] = {10, 20, 30};
-    buf.write(src, 3);
+    buf.append_prefix(src, 3);
     u8 out1[16], out2[16];
     CHECK_EQ(buf.read(out1, sizeof(out1)), 3u);
     CHECK_EQ(buf.read(out2, sizeof(out2)), 3u);
@@ -40,11 +42,11 @@ TEST(buffer, read_multiple_times) {
 TEST(buffer, reset_clears_data) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     CHECK_EQ(buf.len(), 5u);
     buf.reset();
     CHECK_EQ(buf.len(), 0u);
-    buf.write(reinterpret_cast<const u8*>("world"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("world"), 5);
     CHECK_EQ(buf.len(), 5u);
 }
 
@@ -53,7 +55,7 @@ TEST(buffer, reset_clears_data) {
 TEST(buffer, release_to_view) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("test"), 4);
     View view = buf.release();
     CHECK(view.valid());
     CHECK_EQ(view.len(), 4u);
@@ -65,7 +67,7 @@ TEST(buffer, view_can_read) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
     const u8 src[] = {0xAA, 0xBB, 0xCC};
-    buf.write(src, 3);
+    buf.append_prefix(src, 3);
     View view = buf.release();
     u8 out[16];
     CHECK_EQ(view.read(out, sizeof(out)), 3u);
@@ -76,7 +78,7 @@ TEST(buffer, view_can_read) {
 TEST(buffer, view_read_multiple_times) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abc"), 3);
+    buf.append_prefix(reinterpret_cast<const u8*>("abc"), 3);
     View view = buf.release();
     u8 out1[16], out2[16];
     CHECK_EQ(view.read(out1, sizeof(out1)), 3u);
@@ -89,12 +91,12 @@ TEST(buffer, view_read_multiple_times) {
 TEST(buffer, view_destructor_restores_writable) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     {
         View view = buf.release();
         CHECK(buf.is_released());
         u8 out[16];
-        view.read(out, sizeof(out));
+        CHECK_EQ(view.read(out, sizeof(out)), 5);
         // view destroyed here
     }
     // Buffer auto-restored: writable again, len reset
@@ -107,7 +109,7 @@ TEST(buffer, view_destructor_restores_writable) {
 TEST(buffer, view_move_then_destroy_restores) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     {
         View v1 = buf.release();
         View v2(static_cast<View&&>(v1));  // move, v1 invalidated
@@ -124,7 +126,7 @@ TEST(buffer, view_move_then_destroy_restores) {
 TEST(buffer, buffer_move_invalidates_source) {
     u8 storage[16];
     Buffer b1(storage, sizeof(storage));
-    b1.write(reinterpret_cast<const u8*>("hi"), 2);
+    b1.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     Buffer b2(static_cast<Buffer&&>(b1));
     CHECK(!b1.valid());
     CHECK(b2.valid());
@@ -134,7 +136,7 @@ TEST(buffer, buffer_move_invalidates_source) {
 TEST(buffer, view_move_invalidates_source) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     View v1 = buf.release();
     View v2(static_cast<View&&>(v1));
     CHECK(!v1.valid());
@@ -168,7 +170,7 @@ TEST(buffer, release_empty_buffer) {
 TEST(buffer, read_with_zero_max) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     u8 out[1];
     CHECK_EQ(buf.read(out, 0), 0u);
 }
@@ -176,7 +178,7 @@ TEST(buffer, read_with_zero_max) {
 TEST(buffer, release_sets_flag) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     CHECK(!buf.is_released());
     View view = buf.release();
     CHECK(buf.is_released());
@@ -190,7 +192,7 @@ TEST(buffer, full_cycle) {
     Buffer buf(storage, sizeof(storage));
 
     // Cycle 1
-    buf.write(reinterpret_cast<const u8*>("request1"), 8);
+    buf.append_prefix(reinterpret_cast<const u8*>("request1"), 8);
     {
         View view = buf.release();
         u8 out[32];
@@ -200,7 +202,7 @@ TEST(buffer, full_cycle) {
     CHECK(!buf.is_released());
 
     // Cycle 2
-    buf.write(reinterpret_cast<const u8*>("request2"), 8);
+    buf.append_prefix(reinterpret_cast<const u8*>("request2"), 8);
     {
         View view = buf.release();
         u8 out[32];
@@ -216,10 +218,10 @@ TEST(buffer, full_cycle) {
 TEST(buffer, buffer_move_assign) {
     u8 s1[16], s2[16];
     Buffer b1(s1, sizeof(s1));
-    b1.write(reinterpret_cast<const u8*>("aaa"), 3);
+    b1.append_prefix(reinterpret_cast<const u8*>("aaa"), 3);
 
     Buffer b2(s2, sizeof(s2));
-    b2.write(reinterpret_cast<const u8*>("bb"), 2);
+    b2.append_prefix(reinterpret_cast<const u8*>("bb"), 2);
 
     b2 = static_cast<Buffer&&>(b1);  // move-assign
     CHECK(!b1.valid());
@@ -230,11 +232,11 @@ TEST(buffer, buffer_move_assign) {
 TEST(buffer, view_move_assign) {
     u8 s1[16], s2[16];
     Buffer buf1(s1, sizeof(s1));
-    buf1.write(reinterpret_cast<const u8*>("xxx"), 3);
+    buf1.append_prefix(reinterpret_cast<const u8*>("xxx"), 3);
     View v1 = buf1.release();
 
     Buffer buf2(s2, sizeof(s2));
-    buf2.write(reinterpret_cast<const u8*>("yy"), 2);
+    buf2.append_prefix(reinterpret_cast<const u8*>("yy"), 2);
     View v2 = buf2.release();
 
     v2 = static_cast<View&&>(v1);  // move-assign, v2's old owner restored
@@ -248,7 +250,7 @@ TEST(buffer, view_move_assign) {
 TEST(buffer, view_move_assign_restores_old_owner) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     View v1 = buf.release();
     CHECK(buf.is_released());
 
@@ -266,7 +268,7 @@ TEST(buffer, capacity_query) {
     u8 storage[64];
     Buffer buf(storage, sizeof(storage));
     CHECK_EQ(buf.capacity(), 64u);
-    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("test"), 4);
     CHECK_EQ(buf.capacity(), 64u);  // capacity unchanged after write
 }
 
@@ -278,7 +280,7 @@ TEST(buffer, stress_release_restore_10_cycles) {
 
     for (int i = 0; i < 10; i++) {
         const u8 byte = static_cast<u8>(i);
-        buf.write(&byte, 1);
+        buf.append_prefix(&byte, 1);
         {
             View view = buf.release();
             u8 out[1];
@@ -295,7 +297,7 @@ TEST(buffer, stress_release_restore_10_cycles) {
 TEST(buffer, view_read_truncates) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abcdef"), 6);
+    buf.append_prefix(reinterpret_cast<const u8*>("abcdef"), 6);
     View view = buf.release();
 
     u8 out[3];
@@ -309,7 +311,7 @@ TEST(buffer, view_read_truncates) {
 TEST(buffer, buffer_read_truncates) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abcdef"), 6);
+    buf.append_prefix(reinterpret_cast<const u8*>("abcdef"), 6);
 
     u8 out[2];
     CHECK_EQ(buf.read(out, 2), 2u);
@@ -322,12 +324,12 @@ TEST(buffer, buffer_read_truncates) {
 TEST(buffer, write_appends) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hel"), 3);
-    buf.write(reinterpret_cast<const u8*>("lo"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hel"), 3);
+    buf.append_prefix(reinterpret_cast<const u8*>("lo"), 2);
     CHECK_EQ(buf.len(), 5u);
 
     u8 out[16];
-    buf.read(out, sizeof(out));
+    CHECK_EQ(buf.read(out, sizeof(out)), 5);
     CHECK_EQ(out[0], 'h');
     CHECK_EQ(out[3], 'l');
     CHECK_EQ(out[4], 'o');
@@ -351,7 +353,7 @@ TEST(copilot, release_null_buffer_no_lock) {
 TEST(copilot, release_flag_prevents_double) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hi"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     View view = buf.release();
     CHECK(buf.is_released());
     // Double release would trap; only verify precondition state here
@@ -363,7 +365,7 @@ TEST(copilot, release_flag_prevents_double) {
 TEST(copilot, read_is_const) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("test"), 4);
     View view = buf.release();
 
     // const ref read
@@ -376,7 +378,7 @@ TEST(copilot, read_is_const) {
 TEST(copilot, buffer_read_is_const) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abc"), 3);
+    buf.append_prefix(reinterpret_cast<const u8*>("abc"), 3);
 
     const Buffer& cb = buf;
     u8 out[16];
@@ -389,10 +391,10 @@ TEST(copilot, buffer_read_is_const) {
 TEST(copilot2, dest_released_move_assign_guarded) {
     u8 s1[16], s2[16];
     Buffer b1(s1, sizeof(s1));
-    b1.write(reinterpret_cast<const u8*>("aaa"), 3);
+    b1.append_prefix(reinterpret_cast<const u8*>("aaa"), 3);
 
     Buffer b2(s2, sizeof(s2));
-    b2.write(reinterpret_cast<const u8*>("bb"), 2);
+    b2.append_prefix(reinterpret_cast<const u8*>("bb"), 2);
     View view = b2.release();
     CHECK(b2.is_released());
     // b2 = static_cast<Buffer&&>(b1);  // would trap — dest is released
@@ -405,7 +407,7 @@ TEST(copilot2, dest_released_move_assign_guarded) {
 TEST(copilot2, restore_resets_len_documented) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     CHECK_EQ(buf.len(), 5u);
     {
         View view = buf.release();
@@ -449,10 +451,10 @@ TEST(copilot3, read_empty_view_no_memcpy_crash) {
 TEST(copilot4, read_overlapping_dst_safe) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abcdefgh"), 8);
+    buf.append_prefix(reinterpret_cast<const u8*>("abcdefgh"), 8);
     // Read into the same storage at offset 4 — overlaps with src
     View view = buf.release();
-    view.read(storage + 4, 8);
+    CHECK_EQ(view.read(storage + 4, 8), 8);
     // With memcpy this would be UB. With memmove it's safe.
     CHECK_EQ(storage[4], 'a');
     CHECK_EQ(storage[7], 'd');
@@ -462,12 +464,12 @@ TEST(copilot4, read_overlapping_dst_safe) {
 TEST(copilot4, write_overlapping_src_safe) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("abcd"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("abcd"), 4);
     // Write from within the same storage (overlap with existing data)
-    buf.write(storage, 4);  // appends "abcd" again from overlapping src
+    buf.append_prefix(storage, 4);  // appends "abcd" again from overlapping src
     CHECK_EQ(buf.len(), 8u);
     u8 out[16];
-    buf.read(out, sizeof(out));
+    CHECK_EQ(buf.read(out, sizeof(out)), 8);
     CHECK_EQ(out[0], 'a');
     CHECK_EQ(out[4], 'a');
 }
@@ -495,7 +497,7 @@ TEST(io_boundary, write_ptr_and_commit) {
 TEST(io_boundary, commit_after_write) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("AB"), 2);
+    buf.append_prefix(reinterpret_cast<const u8*>("AB"), 2);
     CHECK_EQ(buf.write_ptr(), storage + 2);
     buf.write_ptr()[0] = 'C';
     buf.commit(1);
@@ -506,7 +508,7 @@ TEST(io_boundary, commit_after_write) {
 TEST(io_boundary, data_read_only) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     const u8* d = buf.data();
     CHECK_EQ(d, storage);
     CHECK_EQ(d[0], 'h');
@@ -516,7 +518,7 @@ TEST(io_boundary, data_read_only) {
 TEST(io_boundary, view_data_ptr) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("test"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("test"), 4);
     View view = buf.release();
     CHECK_EQ(view.data(), storage);
     CHECK_EQ(view.data()[0], 't');
@@ -526,7 +528,7 @@ TEST(io_boundary, view_data_ptr) {
 TEST(io_boundary, bind_resets_buffer) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("data"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("data"), 4);
     CHECK_EQ(buf.len(), 4u);
     u8 new_storage[64];
     buf.bind(new_storage, sizeof(new_storage));
@@ -539,7 +541,7 @@ TEST(io_boundary, bind_resets_buffer) {
 TEST(io_boundary, bind_clears_released_state) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("x"), 1);
+    buf.append_prefix(reinterpret_cast<const u8*>("x"), 1);
     View view = buf.release();
     CHECK(buf.is_released());
     // Normally this would be a bug, but bind() is for connection reset
@@ -589,7 +591,7 @@ TEST(io_coverage, write_ptr_when_full) {
 TEST(io_coverage, write_when_full) {
     u8 storage[4];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("ABCD"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("ABCD"), 4);
     CHECK_EQ(buf.len(), 4u);
     u32 written = buf.write(reinterpret_cast<const u8*>("E"), 1);
     CHECK_EQ(written, 0u);  // no space
@@ -616,7 +618,7 @@ TEST(io_coverage, data_on_default) {
 TEST(io_coverage, bind_same_storage) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("hello"), 5);
+    buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     buf.bind(storage, sizeof(storage));
     CHECK_EQ(buf.len(), 0u);
     CHECK_EQ(buf.capacity(), 16u);
@@ -628,7 +630,7 @@ TEST(io_coverage, write_then_commit_interleaved) {
     u8 storage[32];
     Buffer buf(storage, sizeof(storage));
     // write 3 bytes
-    buf.write(reinterpret_cast<const u8*>("ABC"), 3);
+    buf.append_prefix(reinterpret_cast<const u8*>("ABC"), 3);
     CHECK_EQ(buf.len(), 3u);
     // commit 2 bytes (e.g., recv directly wrote to buf)
     buf.write_ptr()[0] = 'D';
@@ -648,7 +650,7 @@ TEST(io_coverage, write_then_commit_interleaved) {
 TEST(io_coverage, view_data_matches_buffer) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("test123"), 7);
+    buf.append_prefix(reinterpret_cast<const u8*>("test123"), 7);
     View view = buf.release();
     CHECK_EQ(view.data(), storage);
     CHECK_EQ(view.len(), 7u);
@@ -660,16 +662,44 @@ TEST(io_coverage, view_data_matches_buffer) {
 TEST(io_coverage, reset_preserves_storage) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
-    buf.write(reinterpret_cast<const u8*>("data"), 4);
+    buf.append_prefix(reinterpret_cast<const u8*>("data"), 4);
     buf.reset();
     CHECK_EQ(buf.len(), 0u);
     CHECK_EQ(buf.capacity(), 16u);
     CHECK_EQ(buf.data(), storage);
     // Can write again
-    buf.write(reinterpret_cast<const u8*>("new"), 3);
+    buf.append_prefix(reinterpret_cast<const u8*>("new"), 3);
     CHECK_EQ(buf.len(), 3u);
 }
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(buffer, allocation_and_offsets_above_u32) {
+    constexpr i64 kOffset = i64{UINT32_MAX} + 1;
+    constexpr i64 kCapacity = kOffset + 2;
+    void* allocation =
+        mmap(nullptr, kCapacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(allocation != MAP_FAILED);
+    auto* data = static_cast<u8*>(allocation);
+    Buffer buffer(data, kCapacity);
+    CHECK_EQ(buffer.capacity(), kCapacity);
+    CHECK_EQ(buffer.write_avail(), kCapacity);
+    buffer.set_len(kOffset);
+    CHECK(buffer.write_ptr() == data + kOffset);
+    const u8 src[] = {42, 19};
+    CHECK_EQ(buffer.write(src, 1), 1);
+    *buffer.write_ptr() = src[1];
+    buffer.commit(1);
+    buffer.set_len(kOffset);
+    CHECK_EQ(buffer.write(src, INT64_MAX), 2);
+    {
+        const auto view = buffer.release();
+        CHECK_EQ(view.len(), kCapacity);
+        CHECK_EQ(view.data()[kOffset], src[0]);
+        CHECK_EQ(view.data()[kOffset + 1], src[1]);
+    }
+    CHECK_EQ(buffer.len(), 0);
+    CHECK_EQ(munmap(allocation, kCapacity), 0);
 }

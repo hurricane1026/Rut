@@ -161,7 +161,7 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     conn->reset_request_receive_buffer();
     u32 hdr_len = entry.raw_header_len;
     if (hdr_len > conn->recv_buf.write_avail()) hdr_len = conn->recv_buf.write_avail();
-    conn->recv_buf.write(entry.raw_headers, hdr_len);
+    conn->recv_buf.append_prefix(entry.raw_headers, hdr_len);
 
     // Step 3: Dispatch Recv (don't use inject_and_dispatch — it overwrites recv_buf)
     IoEvent recv_ev = {conn->id, static_cast<i32>(hdr_len), 0, 0, IoEventType::Recv, 0};
