@@ -62,9 +62,11 @@ const FunctionDecl* enclosing_function(ASTContext& context, const Stmt& stmt) {
 class LocalReads : public RecursiveASTVisitor<LocalReads> {
     ASTContext& context;
     const VarDecl* cursor;
+    bool allow_writes;
 
 public:
-    LocalReads(ASTContext& context, const VarDecl* cursor) : context(context), cursor(cursor) {}
+    LocalReads(ASTContext& context, const VarDecl* cursor, bool allow_writes = true)
+        : context(context), cursor(cursor), allow_writes(allow_writes) {}
 
     bool VisitLambdaExpr(LambdaExpr* lambda) {
         for (const LambdaCapture& capture : lambda->captures())
@@ -97,6 +99,7 @@ public:
 
 private:
     bool standalone_write(const Expr& expr) {
+        if (!allow_writes) return false;
         const auto parents = context.getParents(expr);
         if (parents.size() != 1) return false;
         if (parents[0].get<CompoundStmt>()) return true;
@@ -266,6 +269,8 @@ class OverflowResultVisitor : public RecursiveASTVisitor<OverflowResultVisitor> 
 public:
     explicit OverflowResultVisitor(ASTContext& context) : context(context) {}
 
+    bool shouldVisitTemplateInstantiations() const { return true; }
+
     bool TraverseFunctionDecl(FunctionDecl* decl) {
         return traverse_function(decl,
                                  [&] { return RecursiveASTVisitor::TraverseFunctionDecl(decl); });
@@ -283,12 +288,14 @@ public:
 
     bool VisitCallExpr(CallExpr* call) {
         const auto* callee = call->getDirectCallee();
-        if (!callee || !callee->getBuiltinID() ||
+        if (!callee || !callee->getIdentifier() ||
             context.getSourceManager().isInSystemHeader(call->getExprLoc()))
             return true;
         const auto name = callee->getName();
-        if (name != "__builtin_add_overflow" && name != "__builtin_sub_overflow" &&
-            name != "__builtin_mul_overflow")
+        const auto namespace_decl =
+            dyn_cast<NamespaceDecl>(callee->getDeclContext()->getRedeclContext());
+        if (!namespace_decl || namespace_decl->getName() != "rut" ||
+            (name != "add_overflow" && name != "sub_overflow" && name != "mul_overflow"))
             return true;
         if (function && function->hasAttr<WarnUnusedResultAttr>() && returns_status(*call))
             return true;
@@ -296,7 +303,7 @@ public:
         const auto id = diagnostics.getCustomDiagID(
             DiagnosticsEngine::Warning,
             "checked arithmetic requires an explicit return from a nodiscard function");
-        diagnostics.Report(call->getExprLoc(), id);
+        diagnostics.Report(call->getExprLoc(), id) << call->getSourceRange();
         return true;
     }
 
@@ -372,6 +379,245 @@ class OverflowResultAction : public PluginASTAction {
         return true;
     }
 };
+
+// Widen enough to represent the exact product of any two native 128-bit
+// integers. Use signed comparisons even for original unsigned operands.
+class IntegerArithmeticVisitor : public RecursiveASTVisitor<IntegerArithmeticVisitor> {
+    using Int = llvm::APInt;
+    struct Range {
+        Int min, max;
+    };
+    static constexpr unsigned Width = 257;
+    ASTContext& context;
+
+    Range type_range(QualType type) const {
+        const auto width = context.getIntWidth(type);
+        if (type->isUnsignedIntegerOrEnumerationType())
+            return {Int(Width, 0), Int::getMaxValue(width).zext(Width)};
+        return {Int::getSignedMinValue(width).sext(Width),
+                Int::getSignedMaxValue(width).sext(Width)};
+    }
+
+    static bool fits(const Range& value, const Range& type) {
+        return value.min.sge(type.min) && value.max.sle(type.max);
+    }
+
+    static bool arithmetic(BinaryOperatorKind kind) {
+        return kind == BO_Add || kind == BO_Sub || kind == BO_Mul;
+    }
+
+    static Range calculate(BinaryOperatorKind kind, const Range& a, const Range& b) {
+        if (kind == BO_Add || kind == BO_AddAssign) return {a.min + b.min, a.max + b.max};
+        if (kind == BO_Sub || kind == BO_SubAssign) return {a.min - b.max, a.max - b.min};
+        return product(a, b);
+    }
+
+    Range expr_range(const Expr* expr, QualType type, unsigned depth = 0) const {
+        const auto limits = type_range(type);
+        if (depth == 12) return limits;
+        expr = expr->IgnoreParens();
+        if (auto value = expr->getIntegerConstantExpr(context)) {
+            const Int exact = value->extend(Width);
+            if (fits({exact, exact}, limits)) return {exact, exact};
+        }
+        if (const auto* list = dyn_cast<InitListExpr>(expr); list && list->getNumInits() == 1)
+            return expr_range(list->getInit(0), type, depth + 1);
+        if (const auto* cast = dyn_cast<CastExpr>(expr)) {
+            const auto* input = cast->getSubExpr();
+            if (input->getType()->isIntegerType()) {
+                const auto narrower = expr_range(input, input->getType(), depth + 1);
+                if (fits(narrower, type_range(expr->getType())) && fits(narrower, limits))
+                    return narrower;
+            }
+        } else if (expr->getType()->isIntegerType()) {
+            if (const auto* op = dyn_cast<BinaryOperator>(expr);
+                op && (arithmetic(op->getOpcode()) || op->getOpcode() == BO_And) &&
+                op->getLHS()->getType()->isIntegerType() &&
+                op->getRHS()->getType()->isIntegerType()) {
+                const auto* lhs = op->getLHS();
+                const auto* rhs = op->getRHS();
+                const auto a = expr_range(lhs, lhs->getType(), depth + 1);
+                const auto b = expr_range(rhs, rhs->getType(), depth + 1);
+                Range result = type_range(expr->getType());
+                if (arithmetic(op->getOpcode())) {
+                    result = calculate(op->getOpcode(), a, b);
+                } else {
+                    // A nonnegative operand has no sign bit set. The AND can
+                    // only clear further bits and cannot grow past that operand.
+                    if (!a.min.isNegative()) result = {Int(Width, 0), a.max};
+                    if (!b.min.isNegative() && b.max.slt(result.max))
+                        result = {Int(Width, 0), b.max};
+                }
+                if (fits(result, type_range(expr->getType())) && fits(result, limits))
+                    return result;
+            }
+            const auto narrower = type_range(expr->getType());
+            if (fits(narrower, limits)) return narrower;
+        }
+        return limits;
+    }
+
+    static Range product(const Range& a, const Range& b) {
+        const Int products[] = {a.min * b.min, a.min * b.max, a.max * b.min, a.max * b.max};
+        Range result{products[0], products[0]};
+        for (const auto& candidate : products) {
+            if (candidate.slt(result.min)) result.min = candidate;
+            if (candidate.sgt(result.max)) result.max = candidate;
+        }
+        return result;
+    }
+
+    void report(SourceLocation loc, bool narrowing = false) const {
+        if (context.getSourceManager().isInSystemHeader(loc)) return;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = narrowing
+                            ? diagnostics.getCustomDiagID(
+                                  DiagnosticsEngine::Warning,
+                                  "integer arithmetic result may not fit the destination")
+                            : diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                          "integer arithmetic needs a range proof");
+        diagnostics.Report(loc, id);
+    }
+
+    bool bounded_loop_step(const UnaryOperator& step) const {
+        if (!step.isIncrementDecrementOp()) return false;
+        const auto* counter = variable(step.getSubExpr());
+        if (!counter || !counter->getType()->isIntegerType() ||
+            counter->getType().isVolatileQualified())
+            return false;
+        const auto parents = context.getParents(step);
+        if (parents.size() != 1) return false;
+        const auto* loop = parents[0].get<ForStmt>();
+        if (!loop || loop->getInc() != &step || !loop->getCond()) return false;
+        const auto* init = dyn_cast_or_null<DeclStmt>(loop->getInit());
+        if (!init || !init->isSingleDecl() || init->getSingleDecl() != counter ||
+            !counter->getInit() || !counter->getInit()->getIntegerConstantExpr(context))
+            return false;
+        const auto* comparison = dyn_cast<BinaryOperator>(loop->getCond()->IgnoreParenImpCasts());
+        if (!comparison) return false;
+        const Expr* cursor = comparison->getLHS();
+        const Expr* bound = comparison->getRHS();
+        auto code = comparison->getOpcode();
+        if (variable(cursor) != counter) {
+            std::swap(cursor, bound);
+            if (code != BO_LT && code != BO_GT) return false;
+            code = BinaryOperator::reverseComparisonOp(code);
+        }
+        if (variable(cursor) != counter || code != (step.isIncrementOp() ? BO_LT : BO_GT) ||
+            !cursor->getType()->isIntegerType() || !bound->getType()->isIntegerType())
+            return false;
+        const auto limits = type_range(counter->getType());
+        if (!fits(limits, type_range(cursor->getType()))) return false;
+        const auto threshold = expr_range(bound, bound->getType());
+        const bool guarded =
+            step.isIncrementOp() ? threshold.max.sle(limits.max) : threshold.min.sge(limits.min);
+        if (!guarded) return false;
+        // RecursiveASTVisitor takes mutable nodes, but LocalReads only inspects them.
+        auto reads = LocalReads(context, counter, false);
+        return reads.TraverseStmt(const_cast<Expr*>(loop->getCond())) &&
+               reads.TraverseStmt(const_cast<Stmt*>(loop->getBody()));
+    }
+
+public:
+    explicit IntegerArithmeticVisitor(ASTContext& context) : context(context) {}
+
+    bool shouldVisitTemplateInstantiations() const { return true; }
+
+    bool VisitBinaryOperator(const BinaryOperator* op) {
+        if (!op->getType()->isIntegerType() || op->isTypeDependent() || op->isValueDependent() ||
+            context.getSourceManager().isInSystemHeader(op->getOperatorLoc()))
+            return true;
+        const auto kind = op->getOpcode();
+        if (kind != BO_Add && kind != BO_Sub && kind != BO_Mul && kind != BO_AddAssign &&
+            kind != BO_SubAssign && kind != BO_MulAssign && kind != BO_Div && kind != BO_Rem &&
+            kind != BO_DivAssign && kind != BO_RemAssign && kind != BO_Shl && kind != BO_Shr &&
+            kind != BO_ShlAssign && kind != BO_ShrAssign)
+            return true;
+        const auto* compound = dyn_cast<CompoundAssignOperator>(op);
+        const auto arithmetic_type =
+            compound ? compound->getComputationResultType() : op->getType();
+        const auto lhs_type =
+            compound ? compound->getComputationLHSType() : op->getLHS()->getType();
+        const auto rhs_type = op->getRHS()->getType();
+        if (!arithmetic_type->isIntegerType() || !lhs_type->isIntegerType() ||
+            !rhs_type->isIntegerType())
+            return true;
+        const auto a = expr_range(op->getLHS(), lhs_type);
+        const auto b = expr_range(op->getRHS(), rhs_type);
+        const auto limits = type_range(arithmetic_type);
+        if (kind == BO_Div || kind == BO_Rem || kind == BO_DivAssign || kind == BO_RemAssign) {
+            const Int negative_one(Width, -1, true);
+            if ((b.min.isNonPositive() && !b.max.isNegative()) ||
+                (arithmetic_type->isSignedIntegerType() && a.min == limits.min &&
+                 b.min.sle(negative_one) && b.max.sge(negative_one)) ||
+                (compound && !fits(limits, type_range(op->getType()))))
+                report(op->getOperatorLoc());
+            return true;
+        }
+        if (kind == BO_Shl || kind == BO_Shr || kind == BO_ShlAssign || kind == BO_ShrAssign) {
+            const auto width = context.getIntWidth(arithmetic_type);
+            if (b.min.isNegative() || b.max.sge(Int(Width, width))) {
+                report(op->getOperatorLoc());
+            } else if (kind == BO_Shl || kind == BO_ShlAssign) {
+                const auto min_factor = Int::getOneBitSet(Width, b.min.getZExtValue());
+                const auto max_factor = Int::getOneBitSet(Width, b.max.getZExtValue());
+                const auto result = product(a, {min_factor, max_factor});
+                if (!fits(result, limits) || !fits(result, type_range(op->getType())))
+                    report(op->getOperatorLoc());
+            }
+            return true;
+        }
+        const Range result = calculate(kind, a, b);
+        if (!fits(result, limits) || !fits(result, type_range(op->getType())))
+            report(op->getOperatorLoc());
+        return true;
+    }
+
+    bool VisitCastExpr(const CastExpr* cast) {
+        if (cast->getCastKind() != CK_IntegralCast || cast->isTypeDependent() ||
+            cast->isValueDependent() ||
+            context.getSourceManager().isInSystemHeader(cast->getExprLoc()))
+            return true;
+        const auto* op = dyn_cast<BinaryOperator>(cast->getSubExpr()->IgnoreParens());
+        if (!op || !arithmetic(op->getOpcode()) || !op->getType()->isIntegerType() ||
+            !cast->getType()->isIntegerType())
+            return true;
+        if (!fits(expr_range(op, op->getType()), type_range(cast->getType())))
+            report(cast->getExprLoc(), true);
+        return true;
+    }
+
+    bool VisitUnaryOperator(const UnaryOperator* op) {
+        if (!op->getType()->isIntegerType() || op->isTypeDependent() || op->isValueDependent() ||
+            context.getSourceManager().isInSystemHeader(op->getOperatorLoc()) ||
+            (!op->isIncrementDecrementOp() && op->getOpcode() != UO_Minus))
+            return true;
+        const auto value = expr_range(op->getSubExpr(), op->getType());
+        const Int one(Width, 1);
+        const auto result = op->getOpcode() == UO_Minus ? Range{-value.max, -value.min}
+                            : op->isIncrementOp()       ? Range{value.min + one, value.max + one}
+                                                        : Range{value.min - one, value.max - one};
+        if (!fits(result, type_range(op->getType())) && !bounded_loop_step(*op))
+            report(op->getOperatorLoc());
+        return true;
+    }
+};
+
+class IntegerArithmeticConsumer : public ASTConsumer {
+    void HandleTranslationUnit(ASTContext& context) override {
+        IntegerArithmeticVisitor(context).TraverseDecl(context.getTranslationUnitDecl());
+    }
+};
+
+class IntegerArithmeticAction : public PluginASTAction {
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
+        return std::make_unique<IntegerArithmeticConsumer>();
+    }
+
+    bool ParseArgs(const CompilerInstance&, const std::vector<std::string>&) override {
+        return true;
+    }
+};
 }  // namespace
 
 static FrontendPluginRegistry::Add<SignedConversionAction> registration(
@@ -380,3 +626,6 @@ static FrontendPluginRegistry::Add<SignedConversionAction> registration(
 
 static FrontendPluginRegistry::Add<OverflowResultAction> overflow_registration(
     "rut-overflow-result", "Require explicit error returns for checked arithmetic");
+
+static FrontendPluginRegistry::Add<IntegerArithmeticAction> arithmetic_registration(
+    "rut-integer-arithmetic", "Find native integer operations without a type-range proof");

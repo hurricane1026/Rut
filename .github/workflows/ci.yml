@@ -287,7 +287,8 @@ jobs:
             fi
             audit_args+=(--overflow-base "$OVERFLOW_BASE")
           fi
-          python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 "${audit_args[@]}"
+          python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 \
+            --arithmetic-inventory integer-arithmetic.txt "${audit_args[@]}"
       - name: Compare range_int code generation with native integers
         if: matrix.compiler == 'clang' && matrix.shard == 1
         run: |
@@ -297,7 +298,9 @@ jobs:
         if: always() && matrix.compiler == 'clang' && matrix.shard == 1
         with:
           name: runtime-arithmetic-${{ matrix.build_type }}
-          path: runtime-arithmetic.txt
+          path: |
+            runtime-arithmetic.txt
+            integer-arithmetic.txt
           if-no-files-found: ignore
 
       # Publish immediately after building so long-running tests do not delay

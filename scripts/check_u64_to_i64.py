@@ -13,16 +13,22 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 MESSAGE = 'u64 to i64 conversion requires a range proof'
 OVERFLOW_MESSAGE = 'checked arithmetic requires an explicit return from a nodiscard function'
+ARITHMETIC_MESSAGE = 'integer arithmetic needs a range proof'
+NARROWING_MESSAGE = 'integer arithmetic result may not fit the destination'
+ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
+MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
-    rf' warning: ({re.escape(MESSAGE)}|{re.escape(OVERFLOW_MESSAGE)})$', re.M
+    rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
 )
+OVERFLOW_BUILTIN = re.compile(rb'\b__builtin_(?:[su])?(add|sub|mul)(?:ll?)?_overflow(?:_p)?\b')
+RANGE_COMMENT = re.compile(rb'//\s*RUT_INTEGER_RANGE:\s*\S')
 
 
 def changed_source_lines(base):
     # Git supplies the migration boundary. No inventory of exceptions is kept.
     names = subprocess.check_output(
-        ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=AM', f'{base}...HEAD'], cwd=ROOT
+        ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=AM', base, '--'], cwd=ROOT
     )
     changes = {}
     for name in names.decode().split('\0'):
@@ -30,7 +36,7 @@ def changed_source_lines(base):
         if not first_party(path) or path.suffix not in {'.cc', '.cpp', '.cxx', '.c', '.h', '.hpp'}:
             continue
         patch = subprocess.check_output(
-            ['git', 'diff', '--unified=0', '--no-ext-diff', '--no-renames', f'{base}...HEAD', '--', name],
+            ['git', 'diff', '--unified=0', '--no-ext-diff', '--no-renames', base, '--', name],
             cwd=ROOT, text=True
         )
         changes[path] = [range(int(start), int(start) + int(count or 1))
@@ -43,23 +49,64 @@ def first_party(path):
     return any(path.is_relative_to(ROOT / folder) for folder in ('src', 'include'))
 
 
+def check_builtin_locations():
+    tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', 'src', 'include'], cwd=ROOT)
+    locations = []
+    for name in tracked.decode().split('\0'):
+        path = ROOT / name
+        if path.suffix not in {'.cc', '.cpp', '.cxx', '.c', '.h', '.hpp'}:
+            continue
+        if path == ROOT / 'include/rut/common/checked_arithmetic.h' or not path.is_file():
+            continue
+        for line, source in enumerate(source_lines(path), 1):
+            if OVERFLOW_BUILTIN.search(source):
+                locations.append(f'{name}:{line}: use rut checked arithmetic helpers')
+    return locations
+
+
+@cache
+def base_source(base, path):
+    previous = subprocess.run(
+        ['git', 'show', f'{base}:{path.relative_to(ROOT)}'], cwd=ROOT, capture_output=True
+    )
+    return previous.stdout if previous.returncode == 0 else b''
+
+
+@cache
+def without_whitespace(source):
+    return re.sub(rb'\s+', b'', source)
+
+
+def inherited_overflow_call(base, path, span):
+    if not span:
+        return False
+    call = without_whitespace(expression_text(source_lines(path), span))
+    if not re.match(rb'(?:add|sub|mul)_overflow\(', call):
+        return False
+    # A rename of an existing builtin still has the same result semantics.
+    # Account for duplicate calls so introducing a copy cannot bypass the gate.
+    previous = without_whitespace(base_source(base, path))
+    current = without_whitespace(b'\n'.join(source_lines(path)))
+    return 0 < current.count(call) <= previous.count(b'__builtin_' + call)
+
+
 @cache
 def source_lines(path):
     return path.read_bytes().splitlines()
 
 
+def expression_text(lines, span):
+    first, start, last, end = span
+    if first == last:
+        return lines[first - 1][start - 1:end - 1]
+    return b'\n'.join([lines[first - 1][start - 1:], *lines[first:last - 1],
+                      lines[last - 1][:end - 1]])
+
+
 def fingerprint(path, line, span):
     lines = source_lines(path)
     context = lines[line - 1].strip()
-    if span:
-        first, start, last, end = span
-        if first == last:
-            expression = lines[first - 1][start - 1:end - 1]
-        else:
-            expression = b'\n'.join([lines[first - 1][start - 1:], *lines[first:last - 1],
-                                     lines[last - 1][:end - 1]])
-    else:
-        expression = context
+    expression = expression_text(lines, span) if span else context
     return json.dumps([str(path.relative_to(ROOT)), context.decode(), expression.decode()],
                       ensure_ascii=False)
 
@@ -71,6 +118,10 @@ def main():
     parser.add_argument('--clang', default='clang')
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--inventory', type=Path)
+    parser.add_argument('--arithmetic-inventory', type=Path,
+                        help='write native arithmetic sites that need a proof')
+    parser.add_argument('--require-arithmetic-proofs', action='store_true',
+                        help='fail on unannotated native arithmetic in the audit scope')
     parser.add_argument('--overflow-base', help='audit checked arithmetic on C++ lines added since the merge base')
     args = parser.parse_args()
     check = ['-fsyntax-only', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve()),
@@ -81,10 +132,20 @@ def main():
     overflow_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-overflow-result']
     subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
                     str(args.plugin.resolve()), *overflow_check, '-Xclang', '-verify',
-                    '-std=c++23', ROOT / 'scripts/clang/overflow_result_cases.cc'], check=True)
-    changed = changed_source_lines(args.overflow_base) if args.overflow_base else {}
+                    '-I', ROOT / 'include', '-std=c++23',
+                    ROOT / 'scripts/clang/overflow_result_cases.cc'], check=True)
+    arithmetic_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-integer-arithmetic']
+    subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
+                    str(args.plugin.resolve()), *arithmetic_check, '-Xclang', '-verify',
+                    '-isystem', ROOT / 'include', '-std=c++23',
+                    ROOT / 'scripts/clang/integer_arithmetic_cases.cc'], check=True)
+    base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
+                                    cwd=ROOT, text=True).strip() if args.overflow_base else None)
+    changed = changed_source_lines(base) if base else {}
     if not changed:
         overflow_check = []
+    if not args.arithmetic_inventory and not args.require_arithmetic_proofs:
+        arithmetic_check = []
 
     commands = set()
     entries = json.loads((args.build / 'compile_commands.json').read_text())
@@ -106,13 +167,14 @@ def main():
     def inspect(command):
         cwd, flags = command
         run = subprocess.run([args.clang, *flags, '-Wno-error', '-fno-color-diagnostics',
-                              '-fdiagnostics-print-source-range-info', *check, *overflow_check], cwd=cwd,
+                              '-fdiagnostics-print-source-range-info', *check, *overflow_check,
+                              *arithmetic_check], cwd=cwd,
                              text=True, capture_output=True)
         if run.returncode:
             raise RuntimeError(f'Clang conversion audit failed\n{run.stderr}')
         diagnostics = DIAGNOSTIC.findall(run.stderr)
         if len(diagnostics) != sum(run.stderr.count(f'warning: {message}')
-                                   for message in (MESSAGE, OVERFLOW_MESSAGE)):
+                                   for message in MESSAGES):
             raise RuntimeError(f'Could not read Clang audit diagnostics\n{run.stderr}')
         sites = set()
         for filename, line, column, first, start, last, end, message in diagnostics:
@@ -120,11 +182,12 @@ def main():
             line = int(line)
             if not first_party(path):
                 continue
-            if message == OVERFLOW_MESSAGE and not any(
-                line in lines for lines in changed.get(path, ())
-            ):
-                continue
             span = tuple(map(int, (first, start, last, end))) if first else ()
+            if message == OVERFLOW_MESSAGE:
+                if not any(line in lines for lines in changed.get(path, ())):
+                    continue
+                if inherited_overflow_call(base, path, span):
+                    continue
             sites.add((path, line, int(column), span, message))
         return sites
 
@@ -135,13 +198,34 @@ def main():
         rows = [fingerprint(path, line, span) for path, line, _, span, message in sites
                 if message == MESSAGE]
         args.inventory.write_text(''.join(row + '\n' for row in sorted(rows)))
-    for path, line, column, _, message in sites:
+    arithmetic = [site for site in sites if site[-1] in ARITHMETIC_MESSAGES]
+    failures = [site for site in sites if site[-1] not in ARITHMETIC_MESSAGES]
+    rows = []
+    for path, line, col, span, message in arithmetic:
+        lines = source_lines(path)
+        note = next((entry.strip().decode() for entry in lines[max(0, line - 2):line]
+                     if RANGE_COMMENT.search(entry)), None)
+        rows.append(f'{path.relative_to(ROOT)}:{line}:{col}: {note or message}\n')
+        if args.require_arithmetic_proofs and not note and (
+            not base or any(line in interval for interval in changed.get(path, ()))
+        ):
+            failures.append((path, line, col, span, message))
+    if args.arithmetic_inventory:
+        args.arithmetic_inventory.write_text(''.join(rows))
+        narrowing = sum(message == NARROWING_MESSAGE for *_, message in arithmetic)
+        print(f'{len(arithmetic) - narrowing} native arithmetic sites, '
+              f'{narrowing} arithmetic result conversions require review')
+    for path, line, column, _, message in failures:
         print(f'{path.relative_to(ROOT)}:{line}:{column}: {message}')
     conversions = sum(message == MESSAGE for *_, message in sites)
     print(f'{len(commands)} production compile commands, {conversions} unproven conversions')
     if args.overflow_base:
-        print(f'{len(sites) - conversions} unchecked arithmetic result paths on changed lines')
-    return bool(sites)
+        unchecked = sum(message == OVERFLOW_MESSAGE for *_, message in failures)
+        print(f'{unchecked} unchecked arithmetic result paths on changed lines')
+    direct = check_builtin_locations()
+    for location in direct:
+        print(location)
+    return bool(failures or direct)
 
 
 if __name__ == '__main__':
