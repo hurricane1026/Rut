@@ -167,58 +167,63 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
     key.len = end.min(range_int<kMaxKey, kMaxKey + 1>{}).to<u32>();
     return true;
 }
+using HttpDateSeconds = range_int<0, i64{1} << 40>;
+
+[[nodiscard]] bool date_pair(const char* text, range_int<0, 100>* out) {
+    const char tens = text[0];
+    const char ones = text[1];
+    if (tens < '0' || tens > '9' || ones < '0' || ones > '9') return false;
+    static_assert('0' == 0x30 && '9' == 0x39);
+    constexpr range_int<9, 10> kMaxDigit{};
+    const auto first = bounded_remainder<16>(__builtin_bit_cast(u8, tens)).min(kMaxDigit);
+    const auto second = bounded_remainder<16>(__builtin_bit_cast(u8, ones)).min(kMaxDigit);
+    *out = first.scaled_by<10>() + second;
+    return true;
+}
+
 // IMF-fixdate only. Unsupported/invalid date syntax is a cache bypass, never a
 // guess at freshness. No locale, timezone configuration or wall-clock mutation.
-bool http_date(Str value, i64* seconds) {
+[[nodiscard]] bool http_date(Str value, HttpDateSeconds* seconds) {
     if (value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' || value.ptr[7] != ' ' ||
         value.ptr[11] != ' ' || value.ptr[16] != ' ' || value.ptr[19] != ':' ||
         value.ptr[22] != ':' || value.ptr[25] != ' ' || !Str{value.ptr + 26, 3}.eq(lit_str("GMT")))
         return false;
     const char* p = value.ptr;
-    auto number = [&](u32 start, u32 count, u32& result) {
-        result = 0;
-        for (u32 i = 0; i < count; ++i) {
-            const char c = p[static_cast<u32>(static_cast<i64>(start) + static_cast<i64>(i))];
-            if (c < '0' || c > '9') return false;
-            result = static_cast<u32>(static_cast<i64>(result) * 10 + static_cast<i64>(c) -
-                                      static_cast<i64>('0'));
-        }
-        return true;
-    };
-    u32 day, year, hour, minute, second;
-    if (!number(5, 2, day) || !number(12, 4, year) || !number(17, 2, hour) ||
-        !number(20, 2, minute) || !number(23, 2, second) || year < 1970 || hour > 23 ||
-        minute > 59 || second > 59)
+    range_int<0, 100> day, century, year_suffix, hour, minute, second;
+    if (!date_pair(p + 5, &day) || !date_pair(p + 12, &century) ||
+        !date_pair(p + 14, &year_suffix) || !date_pair(p + 17, &hour) ||
+        !date_pair(p + 20, &minute) || !date_pair(p + 23, &second) || hour.value() > 23 ||
+        minute.value() > 59 || second.value() > 59)
         return false;
+    const auto year = century.scaled_by<100>() + year_suffix;
+    if (year.value() < 1970) return false;
+
     constexpr char kMonths[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     constexpr i32 kDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    u32 month = 0;
-    while (month < 12 &&
-           !Str{p + static_cast<i64>(8), 3}.eq({kMonths + static_cast<i64>(month) * 3, 3}))
-        ++month;
+    constexpr u16 kDaysBeforeMonth[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    i32 month = 0;
+    while (month < 12 && !Str{p + 8, 3}.eq({kMonths + i64{month} * 3, 3})) ++month;
     if (month == 12) return false;
-    const bool kLeap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day == 0 || static_cast<i64>(day) > static_cast<i64>(kDays[month]) +
-                                                static_cast<i64>(month == 1 && kLeap ? 1u : 0u))
-        return false;
-    constexpr auto kEpochYear = range_int<1970, 1971>::constant<1970>();
-    constexpr auto kOne = range_int<1, 2>::constant<1>();
-    auto leap_years = [](u32 y) {
-        return range_int(y / 4) - range_int(y / 100) + range_int(y / 400);
+    const bool kLeap =
+        year.value() % 4 == 0 && (year.value() % 100 != 0 || year.value() % 400 == 0);
+    if (day.value() == 0 || day.value() > i64{kDays[month]} + (month == 1 && kLeap)) return false;
+
+    constexpr range_int<0, 1> kZero{};
+    constexpr range_int<1, 2> kOne{};
+    constexpr range_int<1970, 1971> kEpochYear{};
+    auto leap_years = [](auto y) {
+        return y.template divided_by<4>() - y.template divided_by<100>() +
+               y.template divided_by<400>();
     };
-    const auto last_year = range_int(year) - kOne;
-    const auto year_days = (range_int(year) - kEpochYear).scaled_by<365>();
+    const auto year_days = (year - kEpochYear).max(kZero).scaled_by<365>();
     const auto leap_days =
-        leap_years(last_year.max(range_int<0, 1>{}).to<u32>()) - leap_years(1969u);
-    i32 days_in_year = static_cast<i32>(day) - 1;
-    for (i32 i = 0; i < static_cast<i32>(month); ++i)
-        days_in_year += kDays[i] + (i == 1 && kLeap ? 1 : 0);
-    const auto days = year_days + leap_days + range_int(days_in_year);
+        leap_years((year - kOne).max(kZero)) - leap_years(range_int<1969, 1970>{});
+    const auto month_days =
+        range_int(kDaysBeforeMonth[month]) + range_int(u8{month > 1 && kLeap}) + day - kOne;
+    const auto days = (year_days + leap_days + month_days).max(kZero);
     constexpr char kWeekdays[] = "SunMonTueWedThuFriSat";
     if (!Str{p, 3}.eq({kWeekdays + ((days.value() + 4) % 7) * 3, 3})) return false;
-    *seconds = (days.scaled_by<86400>() + range_int(hour).scaled_by<3600>() +
-                range_int(minute).scaled_by<60>() + range_int(second))
-                   .value();
+    *seconds = days.scaled_by<86400>() + hour.scaled_by<3600>() + minute.scaled_by<60>() + second;
     return true;
 }
 struct ResponseInfo {
@@ -243,7 +248,7 @@ struct ResponseInfo {
     Controls policy;
     u32 age = 0;
     bool age_seen = false, date_seen = false, expires_seen = false;
-    i64 date = 0, expires = 0;
+    HttpDateSeconds date, expires;
     for (u32 i = 0; i < response.header_count; ++i) {
         const auto& header = response.headers[i];
         const Str name = header.name;
@@ -276,16 +281,16 @@ struct ResponseInfo {
     // origin metadata. Date-less responses continue through the ordinary proxy.
     if (policy.blocked || !date_seen || wall == 0 || cap == 0 || cap > HttpCachePolicy::kMaxTtl)
         return false;
-    u64 lifetime = cap;
+    i64 lifetime = cap;
     if (policy.shared_seen)
         lifetime = policy.shared_age;
     else if (policy.max_seen)
         lifetime = policy.max_age;
     else if (expires_seen)
-        lifetime = expires > date ? static_cast<u64>(expires - date) : 0;
-    const u32 ttl = lifetime > cap ? cap : static_cast<u32>(lifetime);
-    const u64 kLifetimeUs = range_int(ttl).scaled_by<1'000'000>().to_u64();
-    const u64 kDateUs = static_cast<u64>(date) * 1000000;
+        lifetime = (expires - date).value();
+    const auto ttl = range_int(lifetime).max(range_int<0, 1>{}).min(range_int(cap));
+    const u64 kLifetimeUs = ttl.scaled_by<1'000'000>().to_u64();
+    const u64 kDateUs = date.scaled_by<1'000'000>().to_u64();
     u64 kApparent = 0;
     if (wall > kDateUs && sub_overflow(wall, kDateUs, &kApparent)) return false;
     const u64 age_us = range_int(age).scaled_by<1'000'000>().to_u64();
@@ -488,18 +493,20 @@ u64 http_cache_config_identity() {
     static u64 next = 0;
     return __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
 }
-u64 http_cache_wall_us() {
-    struct timespec now{};
-    return clock_gettime(CLOCK_REALTIME, &now) == 0 && now.tv_sec > 0 && now.tv_nsec >= 0 &&
-                   now.tv_nsec < 1000000000 && static_cast<u64>(now.tv_sec) <= ~u64{0} / 1000000
-               ? ([&] {
-                     u64 whole = 0;
-                     u64 fractional = static_cast<u64>(now.tv_nsec) / 1000;
-                     if (mul_overflow(static_cast<u64>(now.tv_sec), u64{1000000}, &whole) ||
-                         add_overflow(whole, fractional, &whole))
-                         return u64{0};
-                     return whole;
-                 }())
-               : 0;
+[[nodiscard]] u64 http_cache_wall_us() {
+    timespec now{};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    constexpr u64 kMicrosPerSecond = 1'000'000;
+    constexpr i64 kMaxWholeSeconds = UINT64_MAX / kMicrosPerSecond;
+    range_int<1, kMaxWholeSeconds + 1> seconds;
+    range_int<0, 1'000'000'000> nanos;
+    if (!decltype(seconds)::try_from_i64(now.tv_sec, &seconds) ||
+        !decltype(nanos)::try_from_i64(now.tv_nsec, &nanos))
+        return 0;
+    const u64 whole = seconds.to_u64() * kMicrosPerSecond;
+    const u64 fractional = nanos.divided_by<1000>().to_u64();
+    u64 result;
+    if (add_overflow(whole, fractional, &result)) return 0;
+    return result;
 }
 }  // namespace rut

@@ -116,6 +116,20 @@ TEST(http_cache, cache_control_age_date_and_vary_are_not_ignored) {
     CHECK(lookup(*cache, key(), 3999999) == HttpCache::Result::Hit);
     CHECK(lookup(*cache, key(), 4000000) == HttpCache::Result::Miss);
 }
+TEST(http_cache, expires_across_leap_day_uses_calendar_seconds) {
+    constexpr u64 kLeapWall = 951868799ull * 1000000;  // Tue, 29 Feb 2000 23:59:59 GMT
+    const char wire[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Date: Tue, 29 Feb 2000 23:59:59 GMT\r\n"
+        "Expires: Wed, 01 Mar 2000 00:00:01 GMT\r\n"
+        "Content-Length: 1\r\n\r\nx";
+    HttpCachePolicy::Fill fill{};
+    fill.ttl = 60;
+    HttpCachePolicy::Record record{};
+    REQUIRE(HttpCachePolicy::prepare_record(
+        fill, reinterpret_cast<const u8*>(wire), sizeof(wire) - 1, 0, kLeapWall, record));
+    CHECK_EQ(record.expires_us, 2000000u);
+}
 TEST(http_cache, cache_control_max_age_saturates_without_narrowing_wrap) {
     const auto max = key("Cache-Control: max-age=4294967295\r\n");
     const auto just_over = key("Cache-Control: max-age=4294967296\r\n");

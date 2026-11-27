@@ -86,6 +86,6 @@ public:
 using HttpCache = HttpResponseCache<MemoryHttpCacheStore>;
 HttpCache& local_http_cache();
 u64 http_cache_config_identity();
-u64 http_cache_wall_us();
+[[nodiscard]] u64 http_cache_wall_us();
 
 }  // namespace rut
