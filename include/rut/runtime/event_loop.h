@@ -204,11 +204,12 @@ public:
                         c.request_config->upstreams[c.upstream_idx].write_timeout_seconds) *
                     1'000'000;
                 const u64 now = monotonic_us();
-                u64 elapsed = 0;
-                (void)__builtin_sub_overflow(now, c.upstream_write_idle_progress_us, &elapsed);
-                if (now < c.upstream_write_idle_progress_us) elapsed = 0;
+                const u64 progress = c.upstream_write_idle_progress_us;
+                // RUT_INTEGER_RANGE: the ordered full-width timestamps have a u64 difference.
+                const u64 elapsed =
+                    now < progress ? 0 : static_cast<u64>(__int128_t{now} - __int128_t{progress});
                 i64 elapsed_signed = 0;
-                if (!try_u64_to_i64(elapsed, elapsed_signed)) {
+                if (!try_u64_to_i64(elapsed, &elapsed_signed)) {
                     disarm_upstream_write_idle(c);
                     expire_upstream_write_idle(&self(), c);
                     continue;

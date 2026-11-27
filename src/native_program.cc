@@ -1,3 +1,4 @@
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/common/upstream_health.h"
 #include "rut/jit/runtime_helpers.h"
@@ -742,10 +743,8 @@ bool load_native_program(const char* source,
     if (needs_dns) {
         DnsResolver resolver;
         resolver.init();
-        const u64 started = monotonic_us() / 1000;
-        u64 deadline = 0;
-        if (__builtin_add_overflow(started, u64{3000}, &deadline))
-            return fail("cannot establish upstream DNS deadline");
+        const u64 deadline =
+            (bounded_quotient<1000>(monotonic_us()) + range_int<3000, 3001>{}).to_u64();
         for (u32 i = 0; i < c.upstream_count; ++i) {
             auto& target = c.upstreams[i];
             if (!target.dns_host[0]) continue;
