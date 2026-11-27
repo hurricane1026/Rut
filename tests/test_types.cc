@@ -22,14 +22,30 @@ TEST(byte_span, publishes_only_contained_offsets) {
     const char bytes[10]{};
     const char* buffer = bytes + 1;
     u32 offset = UINT32_MAX;
-    CHECK(byte_span_offset_within(buffer, 8, buffer + 1, 7, &offset));
+    CHECK(byte_span_offset_within(buffer, 8u, buffer + 1, 7u, &offset));
     CHECK_EQ(offset, 1u);
-    CHECK_FALSE(byte_span_offset_within(buffer, 8, buffer + 1, UINT32_MAX, &offset));
-    CHECK_FALSE(byte_span_offset_within(buffer, 8, bytes, 1, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, 8u, buffer + 1, u32{UINT32_MAX}, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, 8u, bytes, 1u, &offset));
     CHECK_EQ(offset, 1u);
-    CHECK(byte_span_offset_within(buffer, 8, buffer + 8, 0, &offset));
+    CHECK(byte_span_offset_within(buffer, 8u, buffer + 8, 0u, &offset));
     CHECK_EQ(offset, 8u);
 }
+
+#if UINTPTR_MAX > UINT32_MAX
+TEST(byte_span, publishes_offsets_above_four_gibibytes) {
+    // Model a wide address interval without allocating or reading memory.
+    constexpr uintptr_t kBase = 4096;
+    constexpr size_t kOffset = (u64{1} << 32) + 1;
+    const auto* buffer = reinterpret_cast<const void*>(kBase);
+    const auto* data = reinterpret_cast<const void*>(kBase + kOffset);
+    size_t offset = 0;
+    CHECK(byte_span_offset_within(buffer, kOffset + 1, data, size_t{1}, &offset));
+    CHECK_EQ(offset, kOffset);
+    CHECK_FALSE(byte_span_offset_within(buffer, kOffset, data, size_t{1}, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, size_t{SIZE_MAX}, data, size_t{SIZE_MAX}, &offset));
+    CHECK_EQ(offset, kOffset);
+}
+#endif
 
 TEST(byte_span, checks_64_bit_length_arithmetic) {
     const char pool[3]{};

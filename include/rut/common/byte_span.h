@@ -13,25 +13,38 @@ namespace rut {
     return !add_overflow(reinterpret_cast<uintptr_t>(data), byte_count, end);
 }
 
+template <typename Size>
+concept ByteSpanSize = sizeof(Size) <= sizeof(u64) &&
+                       (__is_same(Size, u8) || __is_same(Size, u16) || __is_same(Size, u32) ||
+                        __is_same(Size, u64) || __is_same(Size, size_t));
+
 // The caller supplies a live buffer of used bytes. A candidate span may
-// come from elsewhere. Publish its offset only after proving containment.
+// come from elsewhere. The two lengths and the offset have the same width.
+// The offset is written only if the candidate fits.
+template <ByteSpanSize Size>
 [[nodiscard]] inline bool byte_span_offset_within(
-    const void* buffer, u32 used, const void* data, u32 len, u32* out) {
+    const void* buffer, Size used, const void* data, Size len, Size* out) {
     if (buffer == nullptr || data == nullptr) return false;
     const auto begin = reinterpret_cast<uintptr_t>(buffer);
     const auto address = reinterpret_cast<uintptr_t>(data);
-    u32 offset;
+    Size offset;
     if (sub_overflow(address, begin, &offset)) return false;
-    if ((range_int(offset) + range_int(len)).value() > used) return false;
+
+    if constexpr (sizeof(Size) <= sizeof(u32) && sizeof(Size) < sizeof(ptrdiff_t)) {
+        if ((range_int(offset) + range_int(len)).value() > used) return false;
+    } else {
+        // Bound the last start without adding two potentially full-width values.
+        Size last_start;
+        if (offset > u64{PTRDIFF_MAX} || sub_overflow(used, len, &last_start) ||
+            offset > last_start)
+            return false;
+    }
     *out = offset;
     return true;
 }
 
 // Empty spans may point to the end of the pool.
-template <typename Size>
-    requires(sizeof(Size) <= sizeof(u64) &&
-             (__is_same(Size, u8) || __is_same(Size, u16) || __is_same(Size, u32) ||
-              __is_same(Size, u64) || __is_same(Size, size_t)))
+template <ByteSpanSize Size>
 [[nodiscard]] inline bool byte_span_within(const char* pool,
                                            Size used,
                                            const char* data,
