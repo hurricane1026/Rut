@@ -46,6 +46,16 @@ TEST(byte_span, checks_64_bit_length_arithmetic) {
     CHECK(byte_span_within(pool, size_t{3}, pool + 2, size_t{1}));
 }
 
+TEST(byte_span, rejects_offsets_outside_ptrdiff_range) {
+    // Only integer addresses are compared. These pointers are never dereferenced.
+    const auto* base = reinterpret_cast<const char*>(uintptr_t{1});
+    constexpr uintptr_t kMaxOffset = PTRDIFF_MAX;
+    const auto* limit = reinterpret_cast<const char*>(kMaxOffset + 1);
+    const auto* beyond = reinterpret_cast<const char*>(kMaxOffset + 2);
+    CHECK(byte_span_within(base, UINT64_MAX, limit, u64{0}));
+    CHECK_FALSE(byte_span_within(base, UINT64_MAX, beyond, u64{0}));
+}
+
 // === Str ===
 
 TEST(str, eq_same) {

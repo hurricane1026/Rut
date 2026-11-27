@@ -42,9 +42,16 @@ template <typename Size>
 
     const auto pool_address = reinterpret_cast<uintptr_t>(pool);
     const auto data_address = reinterpret_cast<uintptr_t>(data);
-    uintptr_t start_offset;
-    return !sub_overflow(data_address, pool_address, &start_offset) &&
-           start_offset <= last_start_offset;
+    // Compare integer addresses because the candidate may belong to another object.
+    uintptr_t distance;
+    if (sub_overflow(data_address, pool_address, &distance)) return false;
+    if constexpr (sizeof(Size) >= sizeof(ptrdiff_t)) {
+        // A positive distance with the sign bit set does not fit ptrdiff_t.
+        static_assert(sizeof(ptrdiff_t) == sizeof(uintptr_t));
+        const ptrdiff_t start_offset = __builtin_bit_cast(ptrdiff_t, distance);
+        if (start_offset < 0) return false;
+    }
+    return distance <= last_start_offset;
 }
 
 }  // namespace rut
