@@ -205,6 +205,15 @@ struct Parser {
         return 0;
     }
 
+    using HexDigit = range_int<0, 16>;
+
+    [[nodiscard]] static bool decode_hex_digit(char c, HexDigit* out) {
+        if (c >= '0' && c <= '9') return HexDigit::try_from_i64(c - '0', out);
+        if (c >= 'a' && c <= 'f') return HexDigit::try_from_i64(c - 'a' + 10, out);
+        if (c >= 'A' && c <= 'F') return HexDigit::try_from_i64(c - 'A' + 10, out);
+        return false;
+    }
+
     // Decode source integers once for expressions and bounded configuration
     // fields. Keep the original token text/span for diagnostics. Check before
     // multiplying so arbitrarily long inputs cannot wrap into a valid value.
@@ -224,15 +233,33 @@ struct Parser {
         for (u32 i = begin; i < kText.len; ++i) {
             const char kC = kText.ptr[i];
             if (kC == '_') continue;
-            const u32 kDigit = kC >= '0' && kC <= '9'   ? static_cast<u32>(kC - '0')
-                               : kC >= 'a' && kC <= 'f' ? static_cast<u32>(kC - 'a') + 10u
-                               : kC >= 'A' && kC <= 'F' ? static_cast<u32>(kC - 'A') + 10u
-                                                        : 16u;
+            HexDigit digit;
+            if (!decode_hex_digit(kC, &digit))
+                return frontend_error(FrontendError::InvalidInteger, span_from(token), kText);
+            const u64 kDigit = digit.to_u64();
             if (kDigit >= radix || kDigit > maximum || value > (maximum - kDigit) / radix)
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), kText);
             value = value * radix + kDigit;
         }
         return value;
+    }
+
+    // Carry a configuration field's validated literal bound into its destination type.
+    template <i64 Maximum>
+    static FrontendResult<range_int<0, __int128_t{Maximum} + 1>> parse_integer_literal(
+        const Token& token) {
+        auto parsed = parse_integer_literal(token, Maximum);
+        if (!parsed) return core::make_unexpected(parsed.error());
+        range_int<0, __int128_t{Maximum} + 1> bounded;
+        if (!decltype(bounded)::try_from_u64(parsed.value(), &bounded))
+            return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
+        return bounded;
+    }
+
+    static FrontendResult<i32> parse_status_i32(const Token& token) {
+        auto parsed = parse_integer_literal<INT32_MAX>(token);
+        if (!parsed) return core::make_unexpected(parsed.error());
+        return parsed.value().to<i32>();
     }
 
     static FrontendResult<u32> parse_bounded_decimal(const Token& token,
@@ -242,9 +269,10 @@ struct Parser {
             return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
         u32 value = 0;
         for (u32 i = 0; i < token.text.len; i++) {
-            if (token.text.ptr[i] < '0' || token.text.ptr[i] > '9')
+            range_int<0, 10> digit_range;
+            if (!decltype(digit_range)::try_from_i64(token.text.ptr[i] - '0', &digit_range))
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
-            const u32 digit = static_cast<u32>(token.text.ptr[i] - '0');
+            const u32 digit = digit_range.to<u32>();
             if (digit > maximum || value > (maximum - digit) / 10u)
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
             value = value * 10u + digit;
@@ -275,28 +303,13 @@ struct Parser {
         u8 decoded[kMaxFailurePolicyBodyLen];
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
-        auto hex = [](u8 c, u8& out) {
-            if (c >= '0' && c <= '9') {
-                out = static_cast<u8>(c - '0');
-                return true;
-            }
-            if (c >= 'a' && c <= 'f') {
-                out = static_cast<u8>(c - 'a' + 10);
-                return true;
-            }
-            if (c >= 'A' && c <= 'F') {
-                out = static_cast<u8>(c - 'A' + 10);
-                return true;
-            }
-            return false;
-        };
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = static_cast<u8>(raw.ptr[i]);
+            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -317,12 +330,12 @@ struct Parser {
                         if (i + 2 >= raw.len)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        u8 hi = 0, lo = 0;
-                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
-                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                        HexDigit hi, lo;
+                        if (!decode_hex_digit(raw.ptr[i + 1], &hi) ||
+                            !decode_hex_digit(raw.ptr[i + 2], &lo))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        value = static_cast<u8>((hi << 4) | lo);
+                        value = (hi.scaled_by<16>() + lo).to<u8>();
                         i += 2;
                         break;
                     }
@@ -357,28 +370,13 @@ struct Parser {
         u8 decoded[kMaxStrictLocalResponseBodyLen];
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
-        auto hex = [](u8 c, u8& out) {
-            if (c >= '0' && c <= '9') {
-                out = static_cast<u8>(c - '0');
-                return true;
-            }
-            if (c >= 'a' && c <= 'f') {
-                out = static_cast<u8>(c - 'a' + 10);
-                return true;
-            }
-            if (c >= 'A' && c <= 'F') {
-                out = static_cast<u8>(c - 'A' + 10);
-                return true;
-            }
-            return false;
-        };
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = static_cast<u8>(raw.ptr[i]);
+            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -399,12 +397,12 @@ struct Parser {
                         if (i + 2 >= raw.len)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        u8 hi = 0, lo = 0;
-                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
-                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                        HexDigit hi, lo;
+                        if (!decode_hex_digit(raw.ptr[i + 1], &hi) ||
+                            !decode_hex_digit(raw.ptr[i + 2], &lo))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        value = static_cast<u8>((hi << 4) | lo);
+                        value = (hi.scaled_by<16>() + lo).to<u8>();
                         i += 2;
                         break;
                     }
@@ -442,28 +440,13 @@ struct Parser {
         u8 decoded[kMaxStrictLocalResponseBodyLen];
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
-        auto hex = [](u8 c, u8& out) {
-            if (c >= '0' && c <= '9') {
-                out = static_cast<u8>(c - '0');
-                return true;
-            }
-            if (c >= 'a' && c <= 'f') {
-                out = static_cast<u8>(c - 'a' + 10);
-                return true;
-            }
-            if (c >= 'A' && c <= 'F') {
-                out = static_cast<u8>(c - 'A' + 10);
-                return true;
-            }
-            return false;
-        };
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = static_cast<u8>(raw.ptr[i]);
+            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -484,12 +467,12 @@ struct Parser {
                         if (i + 2 >= raw.len)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        u8 hi = 0, lo = 0;
-                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
-                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                        HexDigit hi, lo;
+                        if (!decode_hex_digit(raw.ptr[i + 1], &hi) ||
+                            !decode_hex_digit(raw.ptr[i + 2], &lo))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        value = static_cast<u8>((hi << 4) | lo);
+                        value = (hi.scaled_by<16>() + lo).to<u8>();
                         i += 2;
                         break;
                     }
@@ -523,28 +506,13 @@ struct Parser {
         u8 decoded[kMaxRedirectBodyLen];
         u32 decoded_len = 0;
         const Str raw = literal.value()->text;
-        auto hex = [](u8 c, u8& out) {
-            if (c >= '0' && c <= '9') {
-                out = static_cast<u8>(c - '0');
-                return true;
-            }
-            if (c >= 'a' && c <= 'f') {
-                out = static_cast<u8>(c - 'a' + 10);
-                return true;
-            }
-            if (c >= 'A' && c <= 'F') {
-                out = static_cast<u8>(c - 'A' + 10);
-                return true;
-            }
-            return false;
-        };
         for (u32 i = 0; i < raw.len; i++) {
-            u8 value = static_cast<u8>(raw.ptr[i]);
+            u8 value = __builtin_bit_cast(u8, raw.ptr[i]);
             if (value == '\\') {
                 if (++i >= raw.len)
                     return frontend_error(
                         FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                const u8 esc = __builtin_bit_cast(u8, raw.ptr[i]);
                 switch (esc) {
                     case 'n':
                         value = '\n';
@@ -565,12 +533,12 @@ struct Parser {
                         if (i + 2 >= raw.len)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        u8 hi = 0, lo = 0;
-                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
-                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                        HexDigit hi, lo;
+                        if (!decode_hex_digit(raw.ptr[i + 1], &hi) ||
+                            !decode_hex_digit(raw.ptr[i + 2], &lo))
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
-                        value = static_cast<u8>((hi << 4) | lo);
+                        value = (hi.scaled_by<16>() + lo).to<u8>();
                         i += 2;
                         break;
                     }
@@ -1091,16 +1059,16 @@ struct Parser {
             }
             Token integer_token = *arg;
             integer_token.text = arg->text.slice(0, digit_len);
-            auto parsed_value = parse_integer_literal(integer_token, 0xffffffffull);
+            auto parsed_value = parse_integer_literal<UINT32_MAX>(integer_token);
             if (!parsed_value) return core::make_unexpected(parsed_value.error());
-            const u64 kValue = parsed_value.value();
-            const u64 ms = kValue * multiplier_ms;
-            if (ms > 0xffffffffull)
+            const u64 kValue = parsed_value.value().to_u64();
+            range_int<0, i64{UINT32_MAX} + 1> ms;
+            if (!decltype(ms)::try_from_u64(kValue * multiplier_ms, &ms))
                 return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
             if (!rparen) return core::make_unexpected(rparen.error());
             expr.wait_event_kind = WaitEventKind::Timer;
-            expr.wait_ms = static_cast<u32>(ms);
+            expr.wait_ms = ms.to<u32>();
             expr.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return expr;
         }
@@ -1280,7 +1248,7 @@ struct Parser {
                     all_digits = false;
                     break;
                 }
-                index = index * 10 + static_cast<i32>(ch - '0');
+                index = index * 10 + (ch - '0');
             }
             if (all_digits && index > 0) {
                 if (index > 10)
@@ -2087,13 +2055,6 @@ struct Parser {
                 return stmt;
             }
 
-            auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
-                auto parsed_value = parse_integer_literal(tok, 0x7fffffffull);
-                if (!parsed_value) return core::make_unexpected(parsed_value.error());
-                const i32 kValue = static_cast<i32>(parsed_value.value());
-                return kValue;
-            };
-
             auto status = expect(TokenType::IntLit);
             if (!status) return core::make_unexpected(status.error());
             auto parsed = parse_status_i32(*status.value());
@@ -2140,15 +2101,6 @@ struct Parser {
             // control-flow terminator is always explicit.
             AstStatement stmt{};
             stmt.kind = AstStmtKind::ReturnStatus;
-
-            // Expect an IntLit and parse it as a signed i32 with the
-            // INT_MAX overflow check that both branches share.
-            auto parse_status_i32 = [&](const Token& tok) -> FrontendResult<i32> {
-                auto parsed_value = parse_integer_literal(tok, 0x7fffffffull);
-                if (!parsed_value) return core::make_unexpected(parsed_value.error());
-                const i32 kValue = static_cast<i32>(parsed_value.value());
-                return kValue;
-            };
 
             // `return redirect({...})` is intentionally contextual: redirect is
             // not a global keyword, and the complete object is required so no
@@ -2280,11 +2232,11 @@ struct Parser {
                         auto v = expect(TokenType::IntLit);
                         if (!v) return core::make_unexpected(v.error());
                         auto status = parse_status_i32(*v.value());
-                        if (!status || status.value() < 300 || status.value() > 399)
+                        if (!status || status.value() < 300 || status.value() > 399 ||
+                            !range_int(status.value()).to(&policy.status_code))
                             return frontend_error(FrontendError::InvalidStatusCode,
                                                   span_from(*v.value()),
                                                   v.value()->text);
-                        policy.status_code = static_cast<u16>(status.value());
                     } else if (name.eq({"reason", 6})) {
                         seen = &have_reason;
                         auto v = expect(TokenType::StringLit);
@@ -2550,12 +2502,12 @@ struct Parser {
                                 // `host: .preserve`; validated once the full
                                 // object (and thus the host mode) is known, at
                                 // the closing brace below.
-                                static constexpr const char* kStrip[] = {"connection",
-                                                                         "keepAlive",
-                                                                         "te",
-                                                                         "expect",
-                                                                         "upgrade",
-                                                                         "proxyConnection"};
+                                static constexpr Str kStrip[] = {lit_str("connection"),
+                                                                 lit_str("keepAlive"),
+                                                                 lit_str("te"),
+                                                                 lit_str("expect"),
+                                                                 lit_str("upgrade"),
+                                                                 lit_str("proxyConnection")};
                                 if (cur().type == TokenType::RBracket)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(cur()),
@@ -2567,9 +2519,7 @@ struct Parser {
                                     if (!item) return core::make_unexpected(item.error());
                                     u32 match = 6;
                                     for (u32 si = 0; si < 6; si++) {
-                                        if (item.value()->text.eq(
-                                                {kStrip[si],
-                                                 static_cast<u32>(__builtin_strlen(kStrip[si]))})) {
+                                        if (item.value()->text.eq(kStrip[si])) {
                                             match = si;
                                             break;
                                         }
@@ -2892,11 +2842,11 @@ struct Parser {
                                 if (!status ||
                                     (is_timeout_policy
                                          ? (status.value() < 400 || status.value() > 599)
-                                         : (status.value() != 502 && status.value() != 503)))
+                                         : (status.value() != 502 && status.value() != 503)) ||
+                                    !range_int(status.value()).to(&policy.status_code))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
-                                policy.status_code = static_cast<u16>(status.value());
                             } else if (field_name.eq({"reason", 6})) {
                                 seen = &have_reason;
                                 auto value = expect(TokenType::StringLit);
@@ -3259,9 +3209,9 @@ struct Parser {
                         return frontend_error(FrontendError::UnexpectedToken, span_from(start));
                     auto num = expect(TokenType::IntLit);
                     if (!num) return core::make_unexpected(num.error());
-                    auto parsed_amount = parse_integer_literal(*num.value(), 0xffffffffull);
+                    auto parsed_amount = parse_integer_literal<UINT32_MAX>(*num.value());
                     if (!parsed_amount) return core::make_unexpected(parsed_amount.error());
-                    const u64 kAmount = parsed_amount.value();
+                    const u64 kAmount = parsed_amount.value().to_u64();
                     auto unit = expect(TokenType::Ident);
                     if (!unit) return core::make_unexpected(unit.error());
                     const Str u = unit.value()->text;
@@ -3288,7 +3238,10 @@ struct Parser {
                         return frontend_error(
                             FrontendError::UnsupportedSyntax, kValueSpan, kWsMaxMessageSizeDetail);
                     }
-                    ws_max_size = static_cast<u32>(bytes);
+                    range_int<1, i64{kWsMaxMessageCapacity} + 1> size;
+                    if (!decltype(size)::try_from_u64(bytes, &size))
+                        return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+                    ws_max_size = size.to<u32>();
                 }
                 auto rparen = expect(TokenType::RParen);
                 if (!rparen) return core::make_unexpected(rparen.error());
@@ -3383,12 +3336,13 @@ struct Parser {
                 if (!count) return core::make_unexpected(count.error());
                 auto parsed = parse_status_i32(*count.value());
                 if (!parsed) return core::make_unexpected(parsed.error());
-                if (parsed.value() < 1 || parsed.value() > 1048576)
+                range_int<1, 1048577> bytes;
+                if (!decltype(bytes)::try_from_i64(parsed.value(), &bytes))
                     return frontend_error(FrontendError::InvalidInteger, span_from(start));
                 auto close = expect(TokenType::RParen);
                 if (!close) return core::make_unexpected(close.error());
                 stmt.status_code = 200;
-                stmt.workload_body_bytes = static_cast<u32>(parsed.value());
+                stmt.workload_body_bytes = bytes.to<u32>();
                 stmt.response_headers.push(
                     {{"Content-Type", 12}, {"application/octet-stream", 24}});
                 stmt.span = Span{start.start, close.value()->end, start.line, start.col};
@@ -3644,17 +3598,17 @@ struct Parser {
             }
             Token integer_token = *arg;
             integer_token.text = arg->text.slice(0, digit_len);
-            auto parsed_value = parse_integer_literal(integer_token, 0xffffffffull);
+            auto parsed_value = parse_integer_literal<UINT32_MAX>(integer_token);
             if (!parsed_value) return core::make_unexpected(parsed_value.error());
-            const u64 kValue = parsed_value.value();
+            const u64 kValue = parsed_value.value().to_u64();
             // Apply unit; re-check against u32 range after multiplication.
-            const u64 ms = kValue * multiplier_ms;
-            if (ms > 0xffffffffull)
+            range_int<0, i64{UINT32_MAX} + 1> ms;
+            if (!decltype(ms)::try_from_u64(kValue * multiplier_ms, &ms))
                 return frontend_error(FrontendError::InvalidInteger, span_from(*arg), arg->text);
             auto rparen = expect(TokenType::RParen);
             if (!rparen) return core::make_unexpected(rparen.error());
             stmt.wait_event_kind = WaitEventKind::Timer;
-            stmt.status_code = static_cast<u32>(ms);  // reused field: ms to sleep
+            stmt.status_code = ms.to<u32>();  // reused field: ms to sleep
             stmt.span = Span{start.start, rparen.value()->end, start.line, start.col};
             return stmt;
         }
@@ -3846,9 +3800,9 @@ struct Parser {
         while (cur().type != TokenType::RBracket) {
             auto literal = expect(TokenType::IntLit);
             if (!literal) return core::make_unexpected(literal.error());
-            auto parsed = parse_integer_literal(*literal.value(), 599);
+            auto parsed = parse_integer_literal<599>(*literal.value());
             if (!parsed) return core::make_unexpected(parsed.error());
-            const u32 kStatus = static_cast<u32>(parsed.value());
+            const u32 kStatus = parsed.value().to<u32>();
             if (kStatus < 200 || PassiveHealthPolicy::contains(statuses, kStatus))
                 return frontend_error(
                     FrontendError::InvalidInteger, span_from(*literal.value()), name);
@@ -3984,7 +3938,7 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*value.value()));
                         for (u32 i = 0; i < kText.len; i++) {
-                            const u8 kByte = static_cast<u8>(kText.ptr[i]);
+                            const u8 kByte = __builtin_bit_cast(u8, kText.ptr[i]);
                             if (kByte < 32 || kByte == 127 || kByte == '\\')
                                 return frontend_error(FrontendError::UnsupportedSyntax,
                                                       span_from(*value.value()));
@@ -4027,10 +3981,10 @@ struct Parser {
                     // with the right leading byte) from silently
                     // wrapping past 2^64 and landing below 0xffffffff —
                     // the post-multiply guard alone isn't enough.
-                    auto parsed_v = parse_integer_literal(*lit.value(), 0xffffffffull);
+                    auto parsed_v = parse_integer_literal<UINT32_MAX>(*lit.value());
                     if (!parsed_v) return core::make_unexpected(parsed_v.error());
-                    const u64 kV = parsed_v.value();
-                    item.upstream.port_lit = static_cast<u32>(kV);
+                    const u32 kV = parsed_v.value().to<u32>();
+                    item.upstream.port_lit = kV;
                     item.upstream.port_is_set = true;
                     seen_port = true;
                 } else if (field_name.eq({"connect_timeout", 15})) {
@@ -4041,12 +3995,13 @@ struct Parser {
                     auto dur = expect(TokenType::DurLit);
                     if (!dur) return core::make_unexpected(dur.error());
                     const u32 ms = dur_lit_to_ms(dur.value()->text);
-                    if (ms == 0 || ms % 1000 != 0 || ms / 1000 >= TimerWheel::kSlots)
+                    range_int<1, TimerWheel::kSlots> seconds;
+                    if (ms % 1000 != 0 || !decltype(seconds)::try_from_i64(ms / 1000, &seconds))
                         return frontend_error(
                             FrontendError::UnsupportedSyntax,
                             span_from(*dur.value()),
                             lit_str("connect_timeout requires whole seconds from 1s to 63s"));
-                    item.upstream.connect_timeout_seconds = static_cast<u8>(ms / 1000);
+                    item.upstream.connect_timeout_seconds = seconds.to<u8>();
                 } else if (field_name.eq({"response_header_timeout", 23})) {
                     if (seen_response_header_timeout)
                         return frontend_error(
@@ -4094,12 +4049,12 @@ struct Parser {
                     auto lit = expect(TokenType::IntLit);
                     if (!lit) return core::make_unexpected(lit.error());
                     auto attempts =
-                        parse_integer_literal(*lit.value(), AstUpstreamDecl::kMaxBackends);
+                        parse_integer_literal<AstUpstreamDecl::kMaxBackends>(*lit.value());
                     if (!attempts) return core::make_unexpected(attempts.error());
-                    if (attempts.value() == 0)
+                    if (attempts.value().value() == 0)
                         return frontend_error(
                             FrontendError::InvalidInteger, span_from(*lit.value()), field_name);
-                    item.upstream.connect_attempts = static_cast<u8>(attempts.value());
+                    item.upstream.connect_attempts = attempts.value().to<u8>();
                 } else if (field_name.eq({"minimum_healthy_weight_percent", 30})) {
                     if (seen_minimum_healthy_weight_percent)
                         return frontend_error(
@@ -4107,10 +4062,10 @@ struct Parser {
                     seen_minimum_healthy_weight_percent = true;
                     auto lit = expect(TokenType::IntLit);
                     if (!lit) return core::make_unexpected(lit.error());
-                    auto parsed_percent = parse_integer_literal(*lit.value(), 100);
+                    auto parsed_percent = parse_integer_literal<100>(*lit.value());
                     if (!parsed_percent) return core::make_unexpected(parsed_percent.error());
-                    const u32 kPercent = static_cast<u32>(parsed_percent.value());
-                    item.upstream.minimum_healthy_weight_percent = static_cast<u8>(kPercent);
+
+                    item.upstream.minimum_healthy_weight_percent = parsed_percent.value().to<u8>();
                 } else if (field_name.eq({"failover", 8})) {
                     if (item.upstream.failover_count != 0)
                         return frontend_error(
@@ -4164,10 +4119,10 @@ struct Parser {
                             }
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
-                            auto parsed_weight = parse_integer_literal(*lit.value(), 65535);
+                            auto parsed_weight = parse_integer_literal<65535>(*lit.value());
                             if (!parsed_weight) return core::make_unexpected(parsed_weight.error());
-                            const u32 kWeight = static_cast<u32>(parsed_weight.value());
-                            item.upstream.backend_weights[index] = static_cast<u16>(kWeight);
+
+                            item.upstream.backend_weights[index] = parsed_weight.value().to<u16>();
                             ++item.upstream.weight_count;
                         }
                         item.upstream.backend_lits[item.upstream.backend_count++] =
@@ -4204,13 +4159,13 @@ struct Parser {
                         if (index < 4) {
                             auto literal = expect(TokenType::IntLit);
                             if (!literal) return core::make_unexpected(literal.error());
-                            auto parsed_value = parse_integer_literal(*literal.value(), 255);
+                            auto parsed_value = parse_integer_literal<255>(*literal.value());
                             if (!parsed_value) return core::make_unexpected(parsed_value.error());
-                            const u32 kValue = static_cast<u32>(parsed_value.value());
-                            if (index == 0) policy.tcp_failures = static_cast<u8>(kValue);
-                            if (index == 1) policy.timeouts = static_cast<u8>(kValue);
-                            if (index == 2) policy.http_failures = static_cast<u8>(kValue);
-                            if (index == 3) policy.successes = static_cast<u8>(kValue);
+                            const u8 kValue = parsed_value.value().to<u8>();
+                            if (index == 0) policy.tcp_failures = kValue;
+                            if (index == 1) policy.timeouts = kValue;
+                            if (index == 2) policy.http_failures = kValue;
+                            if (index == 3) policy.successes = kValue;
                         } else {
                             auto* statuses =
                                 index == 4 ? policy.healthy_statuses : policy.unhealthy_statuses;
@@ -4333,8 +4288,7 @@ struct Parser {
                                                       span_from(*lit.value()),
                                                       path_text);
                             for (u32 i = 0; i < path_text.len; i++) {
-                                const unsigned char ch =
-                                    static_cast<unsigned char>(path_text.ptr[i]);
+                                const unsigned char ch = __builtin_bit_cast(u8, path_text.ptr[i]);
                                 if (ch <= 0x20 || ch == 0x7f)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*lit.value()),
@@ -4378,13 +4332,13 @@ struct Parser {
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
                             auto parsed =
-                                parse_integer_literal(*lit.value(), AstUpstreamDecl::kMaxBackends);
+                                parse_integer_literal<AstUpstreamDecl::kMaxBackends>(*lit.value());
                             if (!parsed) return core::make_unexpected(parsed.error());
-                            if (parsed.value() == 0)
+                            if (parsed.value().value() == 0)
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
-                            item.upstream.hc_concurrency = static_cast<u8>(parsed.value());
+                            item.upstream.hc_concurrency = parsed.value().to<u8>();
                             seen_concurrency = true;
                         } else if (hc_key.eq({"status", 6})) {
                             if (seen_status || seen_statuses)
@@ -4399,9 +4353,9 @@ struct Parser {
                             // the valid HTTP range — e.g. 4294967496 -> 200 —
                             // must be rejected, not silently narrowed past the
                             // range check below.
-                            auto parsed_sv = parse_integer_literal(*lit.value(), 65535);
+                            auto parsed_sv = parse_integer_literal<65535>(*lit.value());
                             if (!parsed_sv) return core::make_unexpected(parsed_sv.error());
-                            const u64 kSv = parsed_sv.value();
+                            const u16 kSv = parsed_sv.value().to<u16>();
                             // The probe path parses the upstream reply with
                             // HttpResponseParser, which rejects any response
                             // outside 100..599 BEFORE the equality check — so an
@@ -4412,7 +4366,7 @@ struct Parser {
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
-                            item.upstream.hc_expected_status = static_cast<u16>(kSv);
+                            item.upstream.hc_expected_status = kSv;
                             seen_status = true;
                         } else if (hc_key.eq({"healthy_statuses", 16})) {
                             if (seen_statuses || seen_status)
@@ -4438,16 +4392,15 @@ struct Parser {
                             auto lit = expect(TokenType::IntLit);
                             if (!lit) return core::make_unexpected(lit.error());
                             auto parsed_value =
-                                parse_integer_literal(*lit.value(), ActiveHealthThresholds::kMax);
+                                parse_integer_literal<ActiveHealthThresholds::kMax>(*lit.value());
                             if (!parsed_value) return core::make_unexpected(parsed_value.error());
-                            const u32 kValue = static_cast<u32>(parsed_value.value());
+                            const u8 kValue = parsed_value.value().to<u8>();
                             if (kValue == 0)
                                 return frontend_error(FrontendError::InvalidInteger,
                                                       span_from(*lit.value()),
                                                       lit.value()->text);
                             auto& thresholds = item.upstream.hc_thresholds;
-                            (kFailure ? thresholds.failures : thresholds.successes) =
-                                static_cast<u8>(kValue);
+                            (kFailure ? thresholds.failures : thresholds.successes) = kValue;
                             seen = true;
                         } else {
                             return frontend_error(FrontendError::UnexpectedToken,
@@ -5601,8 +5554,10 @@ struct Parser {
     static u32 dur_lit_to_seconds(Str t) {
         u64 digits = 0;
         u32 i = 0;
-        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
-            digits = digits * 10 + static_cast<u64>(t.ptr[i] - '0');
+        for (; i < t.len; i++) {
+            range_int<0, 10> digit;
+            if (!decltype(digit)::try_from_i64(t.ptr[i] - '0', &digit)) break;
+            digits = digits * 10 + digit.to_u64();
             if (digits > 0xffffffffull) return 0;
         }
         const Str kUnit{t.ptr + i, t.len - i};
@@ -5618,7 +5573,8 @@ struct Parser {
         else
             return 0;
         if (secs == 0 && digits > 0) secs = 1;  // e.g. 1ms → 1s
-        return secs > 0xffffffffull ? 0xffffffffu : static_cast<u32>(secs);
+        range_int<0, i64{UINT32_MAX} + 1> seconds;
+        return decltype(seconds)::try_from_u64(secs, &seconds) ? seconds.to<u32>() : UINT32_MAX;
     }
 
     // Rate-limit windows are stored exactly as u32 seconds. Unlike throttle's
@@ -5628,8 +5584,10 @@ struct Parser {
         if (out == nullptr) return false;
         u64 digits = 0;
         u32 i = 0;
-        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
-            const u64 digit = static_cast<u64>(t.ptr[i] - '0');
+        for (; i < t.len; i++) {
+            range_int<0, 10> parsed_digit;
+            if (!decltype(parsed_digit)::try_from_i64(t.ptr[i] - '0', &parsed_digit)) break;
+            const u64 digit = parsed_digit.to_u64();
             if (digits > (0xffffffffffffffffull - digit) / 10ull) return false;
             digits = digits * 10ull + digit;
         }
@@ -5648,8 +5606,9 @@ struct Parser {
         } else {
             return false;
         }
-        if (seconds == 0 || seconds > 0xffffffffull) return false;
-        *out = static_cast<u32>(seconds);
+        range_int<1, i64{UINT32_MAX} + 1> checked;
+        if (!decltype(checked)::try_from_u64(seconds, &checked)) return false;
+        *out = checked.to<u32>();
         return true;
     }
 
@@ -5660,8 +5619,10 @@ struct Parser {
         if (out == nullptr) return false;
         u64 digits = 0;
         u32 i = 0;
-        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
-            const u64 digit = static_cast<u64>(t.ptr[i] - '0');
+        for (; i < t.len; i++) {
+            range_int<0, 10> parsed_digit;
+            if (!decltype(parsed_digit)::try_from_i64(t.ptr[i] - '0', &parsed_digit)) break;
+            const u64 digit = parsed_digit.to_u64();
             if (digits > (0xffffffffffffffffull - digit) / 10ull) return false;
             digits = digits * 10ull + digit;
         }
@@ -5681,8 +5642,9 @@ struct Parser {
         } else {
             return false;
         }
-        if (seconds < 1 || seconds > 63) return false;
-        *out = static_cast<u8>(seconds);
+        range_int<1, 64> checked;
+        if (!decltype(checked)::try_from_u64(seconds, &checked)) return false;
+        *out = checked.to<u8>();
         return true;
     }
 
@@ -5783,9 +5745,9 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto lim = expect(TokenType::IntLit);
             if (!lim) return core::make_unexpected(lim.error());
-            auto parsed_maxv = parse_integer_literal(*lim.value(), 0xffffffffull);
+            auto parsed_maxv = parse_integer_literal<UINT32_MAX>(*lim.value());
             if (!parsed_maxv) return core::make_unexpected(parsed_maxv.error());
-            const u64 kMaxv = parsed_maxv.value();
+            const u32 kMaxv = parsed_maxv.value().to<u32>();
             if (!expect(TokenType::Comma))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto win_kw = expect(TokenType::Ident);
@@ -5848,10 +5810,10 @@ struct Parser {
                     auto bv = expect(TokenType::IntLit);
                     if (!bv) return core::make_unexpected(bv.error());
                     burst_span = span_from(*bv.value());
-                    auto parsed_b = parse_integer_literal(*bv.value(), 0xffffffffull);
+                    auto parsed_b = parse_integer_literal<UINT32_MAX>(*bv.value());
                     if (!parsed_b) return core::make_unexpected(parsed_b.error());
-                    const u64 kB = parsed_b.value();
-                    deco.rate_limit_burst = static_cast<u32>(kB);
+                    const u32 kB = parsed_b.value().to<u32>();
+                    deco.rate_limit_burst = kB;
                 } else {
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*arg.value()),
@@ -5860,14 +5822,13 @@ struct Parser {
             }
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
-            const u32 burst =
-                deco.rate_limit_burst == 0 ? static_cast<u32>(kMaxv) : deco.rate_limit_burst;
-            if (!rate_limit_params_representable(static_cast<u32>(kMaxv), kWin, burst))
+            const u32 burst = deco.rate_limit_burst == 0 ? kMaxv : deco.rate_limit_burst;
+            if (!rate_limit_params_representable(kMaxv, kWin, burst))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     burst_span,
                     lit_str("rate-limit burst is too large for this limit and window"));
-            deco.rate_limit_max = static_cast<u32>(kMaxv);
+            deco.rate_limit_max = kMaxv;
             deco.rate_limit_window_sec = kWin;
             return deco;
         }
@@ -5880,16 +5841,19 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto amount = expect(TokenType::IntLit);
             if (!amount) return core::make_unexpected(amount.error());
-            auto parsed = parse_integer_literal(*amount.value(), 0xffffffffull);
+            auto parsed = parse_integer_literal<UINT32_MAX>(*amount.value());
             if (!parsed) return core::make_unexpected(parsed.error());
             auto unit = expect(TokenType::Ident);
             if (!unit) return core::make_unexpected(unit.error());
             const Str kUnit = unit.value()->text;
             const u64 kMult = byte_size_multiplier(kUnit);
-            if (!kMult || !parsed.value() || parsed.value() > 0xffffffffull / kMult ||
-                !expect(TokenType::RParen))
+            const u64 kAmount = parsed.value().to_u64();
+            if (!kMult || !kAmount || kAmount > UINT32_MAX / kMult || !expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
-            deco.request_body_limit = static_cast<u32>(parsed.value() * kMult);
+            range_int<0, i64{UINT32_MAX} + 1> bytes;
+            if (!decltype(bytes)::try_from_u64(kAmount * kMult, &bytes))
+                return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
+            deco.request_body_limit = bytes.to<u32>();
             return deco;
         }
 
@@ -5904,9 +5868,9 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
             auto num = expect(TokenType::IntLit);
             if (!num) return core::make_unexpected(num.error());
-            auto parsed_amount = parse_integer_literal(*num.value(), 0xffffffffull);
+            auto parsed_amount = parse_integer_literal<UINT32_MAX>(*num.value());
             if (!parsed_amount) return core::make_unexpected(parsed_amount.error());
-            const u64 kAmount = parsed_amount.value();
+            const u64 kAmount = parsed_amount.value().to_u64();
             // ByteSize unit — a separate identifier token (e.g. "5mb" lexes as
             // IntLit "5" + Ident "mb"; the duration lexer doesn't claim it).
             auto unit = expect(TokenType::Ident);
@@ -5931,10 +5895,10 @@ struct Parser {
                     FrontendError::UnsupportedSyntax, deco.span, dur.value()->text);
             if (!expect(TokenType::RParen))
                 return frontend_error(FrontendError::UnexpectedToken, deco.span, deco.name);
-            const u64 kBps = kBytes / kWin;
-            if (kBps == 0 || kBps > 0xffffffffull)
+            range_int<1, i64{UINT32_MAX} + 1> bps;
+            if (!decltype(bps)::try_from_u64(kBytes / kWin, &bps))
                 return frontend_error(FrontendError::UnsupportedSyntax, deco.span, deco.name);
-            deco.throttle_down_bps = static_cast<u32>(kBps);
+            deco.throttle_down_bps = bps.to<u32>();
             return deco;
         }
         // Unknown decorator name — only the official whitelist is allowed.
@@ -6003,9 +5967,9 @@ struct Parser {
             if (step.kind == AstChainStepKind::Before && take(TokenType::KwElse)) {
                 auto status = expect(TokenType::IntLit);
                 if (!status) return core::make_unexpected(status.error());
-                auto status_value = parse_integer_literal(*status.value(), 0xffffffffull);
+                auto status_value = parse_integer_literal<UINT32_MAX>(*status.value());
                 if (!status_value) return core::make_unexpected(status_value.error());
-                const u32 kParsedStatus = static_cast<u32>(status_value.value());
+                const u32 kParsedStatus = status_value.value().to<u32>();
                 step.has_else = true;
                 step.else_status = kParsedStatus;
                 step.span = Span{start.start, status.value()->end, start.line, start.col};
@@ -6120,14 +6084,14 @@ struct Parser {
         if (!object_lbrace) return core::make_unexpected(object_lbrace.error());
 
         StrictLocalResponsePolicySpec policy{};
-        u16 fields = 0;
+        u32 fields = 0;
         while (cur().type != TokenType::RBrace && cur().type != TokenType::Eof) {
             auto name = expect_field_name();
             if (!name) return core::make_unexpected(name.error());
             auto colon = expect(TokenType::Colon);
             if (!colon) return core::make_unexpected(colon.error());
 
-            u16 bit = 0;
+            u32 bit = 0;
             const Str field = name.value()->text;
             if (field.eq({"version", 7})) {
                 bit = 1u << 0;
@@ -6142,14 +6106,14 @@ struct Parser {
                 bit = 1u << 1;
                 auto value = expect(TokenType::IntLit);
                 if (!value) return core::make_unexpected(value.error());
-                auto parsed_status = parse_integer_literal(*value.value(), 0xffffffffull);
+                auto parsed_status = parse_integer_literal<UINT32_MAX>(*value.value());
                 if (!parsed_status) return core::make_unexpected(parsed_status.error());
-                const u32 kStatus = static_cast<u32>(parsed_status.value());
-                if (kStatus > 0xffffu ||
-                    !strict_local_response_status_supported(static_cast<u16>(kStatus)))
+                u16 status;
+                if (!parsed_status.value().to(&status) ||
+                    !strict_local_response_status_supported(status))
                     return frontend_error(FrontendError::InvalidStatusCode,
                                           span_from(*value.value()));
-                policy.status_code = static_cast<u16>(kStatus);
+                policy.status_code = status;
             } else if (field.eq({"reason", 6})) {
                 bit = 1u << 2;
                 auto value = expect(TokenType::StringLit);
@@ -6236,7 +6200,7 @@ struct Parser {
             if ((fields & bit) != 0)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, span_from(*name.value()), field);
-            fields = static_cast<u16>(fields | bit);
+            fields = fields | bit;
             take(TokenType::Comma);
         }
         // `header_names`/`connection_header`/`header_order` are optional as a
@@ -6250,11 +6214,11 @@ struct Parser {
                                   span_from(cur()),
                                   lit_str("header_names, connection_header and header_order "
                                           "must be used together"));
-        u16 required = 0x1ffu;
+        u32 required = 0x1ffu;
         if ((fields & kEnvoyGroupBits) == kEnvoyGroupBits) {
-            required = static_cast<u16>(required | kEnvoyGroupBits);
+            required = required | kEnvoyGroupBits;
             if (policy.header_order == StrictLocalResponseHeaderOrder::DateServerLength)
-                required = static_cast<u16>(required & ~(1u << 5));
+                required = required & ~(1u << 5);
         }
         if (fields != required)
             return frontend_error(
@@ -6398,7 +6362,8 @@ struct Parser {
         }
 
         static_assert(kRouteMethodSlots == kStrictLocalResponseMethodSlots);
-        if (slot == kRouteMethodAny || slot >= kStrictLocalResponseMethodSlots)
+        range_int<1, kStrictLocalResponseMethodSlots> method_slot;
+        if (!decltype(method_slot)::try_from_i64(slot, &method_slot))
             return frontend_error(FrontendError::UnsupportedSyntax, span_from(start), start.text);
         if (file->pre_route_policy_ids[slot] != 0)
             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -6412,7 +6377,7 @@ struct Parser {
         const u16 policy_id = file->add_strict_local_response_policy(parsed->policy);
         if (policy_id == 0) return frontend_error(FrontendError::TooManyItems, span_from(start));
         file->pre_route_policy_ids[slot] = policy_id;
-        item.pre_route.method_slot = static_cast<u8>(slot);
+        item.pre_route.method_slot = method_slot.to<u8>();
         item.pre_route.policy_id = policy_id;
         item.span = Span{start.start, parsed->outer_rbrace->end, start.line, start.col};
         item.pre_route.span = item.span;
@@ -6480,14 +6445,14 @@ struct Parser {
         auto path = expect(TokenType::StringLit);
         if (!path) return core::make_unexpected(path.error());
         ExactStrictLocalResponseBinding binding{};
-        binding.path_len = static_cast<u8>(path.value()->text.len);
-        binding.method = static_cast<u8>(method_slot);
         binding.path_view = path_view;
-        if (path.value()->text.len == 0 ||
-            path.value()->text.len > kMaxExactStrictLocalResponsePathLen)
+        range_int<1, i64{kMaxExactStrictLocalResponsePathLen} + 1> path_len;
+        if (!decltype(path_len)::try_from_i64(path.value()->text.len, &path_len) ||
+            !range_int(method_slot).to(&binding.method))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
-        for (u32 i = 0; i < path.value()->text.len; i++) {
+        binding.path_len = path_len.to<u8>();
+        for (u32 i = 0; i < binding.path_len; i++) {
             if (!exact_strict_local_response_path_byte_valid(path.value()->text.ptr[i]))
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, span_from(*path.value()), path.value()->text);
@@ -6550,8 +6515,10 @@ struct Parser {
     static u32 dur_lit_to_ms(Str t) {
         u64 digits = 0;
         u32 i = 0;
-        for (; i < t.len && t.ptr[i] >= '0' && t.ptr[i] <= '9'; i++) {
-            digits = digits * 10 + static_cast<u64>(t.ptr[i] - '0');
+        for (; i < t.len; i++) {
+            range_int<0, 10> digit;
+            if (!decltype(digit)::try_from_i64(t.ptr[i] - '0', &digit)) break;
+            digits = digits * 10 + digit.to_u64();
             if (digits > 0xffffffffull) return 0;
         }
         const Str kUnit{t.ptr + i, t.len - i};
@@ -6566,7 +6533,9 @@ struct Parser {
             ms = digits * 3600ull * 1000ull;
         else
             return 0;
-        return ms > 0xffffffffull ? 0xffffffffu : static_cast<u32>(ms);
+        range_int<0, i64{UINT32_MAX} + 1> milliseconds;
+        return decltype(milliseconds)::try_from_u64(ms, &milliseconds) ? milliseconds.to<u32>()
+                                                                       : UINT32_MAX;
     }
 
     // `timer <name>, every: <duration>[, shard: N] { <body> }`.
@@ -6602,12 +6571,12 @@ struct Parser {
                 return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
             auto shard_lit = expect(TokenType::IntLit);
             if (!shard_lit) return core::make_unexpected(shard_lit.error());
-            auto shard_value = parse_integer_literal(*shard_lit.value(), 65535);
+            auto shard_value = parse_integer_literal<65535>(*shard_lit.value());
             if (!shard_value)
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       span_from(*shard_lit.value()),
                                       shard_lit.value()->text);
-            item.timer.shard = static_cast<i32>(shard_value.value());
+            item.timer.shard = shard_value.value().to<i32>();
         }
         auto lbrace = expect(TokenType::LBrace);
         if (!lbrace) return core::make_unexpected(lbrace.error());

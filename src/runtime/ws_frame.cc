@@ -119,21 +119,22 @@ u32 ws_write_header(u8* out,
         if (op == WsOpcode::Close && payload_len == 1)
             return 0;  // Close body needs the 2-byte code
     }
-    if (payload_len >= (static_cast<u64>(1) << 63)) return 0;  // 64-bit length MSB is reserved zero
+    if (payload_len >= (u64{1} << 63)) return 0;  // 64-bit length MSB is reserved zero
 
-    out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | (compressed ? 0x40 : 0) | static_cast<u8>(op));
+    const u64 flags = (fin ? u64{0x80} : 0) | (compressed ? u64{0x40} : 0);
+    out[0] = bounded_remainder<256>(flags | __builtin_bit_cast(u8, op)).to<u8>();
     const u8 mask_bit = masked ? 0x80 : 0x00;
     u8 offset;
     if (payload_len <= 125) {
-        out[1] = static_cast<u8>(mask_bit | static_cast<u8>(payload_len));
+        out[1] = bounded_remainder<256>(mask_bit | payload_len).to<u8>();
         offset = 2;
     } else if (payload_len <= 0xFFFF) {
-        out[1] = static_cast<u8>(mask_bit | 126);
-        out[2] = static_cast<u8>((payload_len >> 8) & 0xFF);
-        out[3] = static_cast<u8>(payload_len & 0xFF);
+        out[1] = bounded_remainder<256>(mask_bit | 126).to<u8>();
+        out[2] = bounded_remainder<256>(payload_len >> 8).to<u8>();
+        out[3] = bounded_remainder<256>(payload_len).to<u8>();
         offset = 4;
     } else {
-        out[1] = static_cast<u8>(mask_bit | 127);
+        out[1] = bounded_remainder<256>(mask_bit | 127).to<u8>();
         for (u8 i = 0; i < 8; ++i) {
             const auto kPosition = range_int<2, 3>{} + range_int(i);
             const auto kShift = (range_int<7, 8>{} - range_int(i)).scaled_by<8>();
@@ -146,7 +147,7 @@ u32 ws_write_header(u8* out,
         __builtin_memmove(out + range_int(offset).value(), mask_key, 4);
         return (range_int(offset) + range_int<4, 5>{}).to<u32>();
     }
-    return static_cast<u32>(offset);
+    return offset;
 }
 
 WsMessageStatus ws_message_feed(WsMessageAssembler& m,

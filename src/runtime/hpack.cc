@@ -175,7 +175,7 @@ constexpr HuffFsm kFsm = build_fsm();
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     if (len == 0 || prefix_bits == 0 || prefix_bits > 8) return 0;
     // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
-    const u32 kMask = static_cast<u32>((i32{1} << prefix_bits) - 1);
+    const u32 kMask = ~(~u32{0} << prefix_bits);
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
@@ -195,28 +195,28 @@ u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
         shift += 7;
         if (shift > 28) return 0;  // would overflow on next octet
     }
-    *out = static_cast<u32>(acc);
-    return static_cast<u32>(i);
+    if (!range_int(acc).to(out)) return 0;
+    return i;
 }
 
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
     if (prefix_bits == 0 || prefix_bits > 8) return 0;
     // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
-    const u32 kMask = static_cast<u32>((i32{1} << prefix_bits) - 1);
+    const u32 kMask = ~(~u32{0} << prefix_bits);
     if (value < kMask) {
-        out[0] = static_cast<u8>(prefix_top | value);
+        out[0] = bounded_remainder<256>(u64{prefix_top} | value).to<u8>();
         return 1;
     }
-    out[0] = static_cast<u8>(prefix_top | kMask);
+    out[0] = bounded_remainder<256>(u64{prefix_top} | kMask).to<u8>();
     const auto kRemainder = range_int(value) - range_int(kMask);
     u32 remainder = kRemainder.max(range_int<0, 1>{}).to<u32>();
-    i64 i = 1;
+    u32 i = 1;
     while (remainder >= 128) {
-        out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
+        out[i++] = (bounded_remainder<128>(remainder) + range_int<128, 129>{}).to<u8>();
         remainder >>= 7;
     }
-    out[i++] = static_cast<u8>(remainder);
-    return static_cast<u32>(i);
+    out[i++] = bounded_remainder<128>(remainder).to<u8>();
+    return i;
 }
 
 i64 huffman_encoded_len(const u8* src, u32 len) {
@@ -238,7 +238,7 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
         nbits += static_cast<i64>(kEntry.bits);
         while (nbits >= 8) {
             nbits -= 8;
-            out[o++] = static_cast<u8>((acc >> nbits) & 0xff);
+            out[o++] = bounded_remainder<256>(acc >> nbits).to<u8>();
         }
     }
     if (nbits > 0) {
@@ -246,37 +246,37 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
         const i64 kPad = 8 - nbits;
         const i64 kMask = (i64{1} << kPad) - i64{1};
         acc = (acc << kPad) | static_cast<u64>(kMask);
-        out[o++] = static_cast<u8>(acc & 0xff);
+        out[o++] = bounded_remainder<256>(acc).to<u8>();
     }
     return o;
 }
 
 i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
     // The signed result reports -1 on failure and otherwise carries the exact length.
-    if (cap > INT32_MAX) cap = INT32_MAX;
+    const i32 limit = range_int(cap).min(range_int<INT32_MAX, i64{INT32_MAX} + 1>{}).to<i32>();
     i16 node = 0;
-    u32 o = 0;
+    i32 o = 0;
     for (u32 i = 0; i < len; i++) {
         const u8 kByte = src[i];
         // High nibble then low nibble — one FSM step each.
         const u32 kHi = kByte >> 4;
         if (kFsm.fail[node][kHi]) return -1;  // EOS symbol in the stream
         if (kFsm.sym[node][kHi] >= 0) {
-            if (o >= cap) return -1;
+            if (o >= limit) return -1;
             out[o++] = static_cast<u8>(kFsm.sym[node][kHi]);
         }
         node = kFsm.next[node][kHi];
         const u32 kLo = kByte & 0xf;
         if (kFsm.fail[node][kLo]) return -1;
         if (kFsm.sym[node][kLo] >= 0) {
-            if (o >= cap) return -1;
+            if (o >= limit) return -1;
             out[o++] = static_cast<u8>(kFsm.sym[node][kLo]);
         }
         node = kFsm.next[node][kLo];
     }
     // Trailing bits must be a valid EOS-prefix padding (root or 1..7 ones).
     if (!kFsm.pad_ok[node]) return -1;
-    return static_cast<i32>(o);
+    return o;
 }
 
 u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
@@ -290,8 +290,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     const u8* data = in + static_cast<i64>(kHdr);
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
-        if (kN < 0) return 0;
-        *out_len = static_cast<u32>(kN);
+        if (!range_int(kN).to(out_len)) return 0;
     } else {
         if (slen > cap) return 0;
         for (i64 i = 0; i < slen; i++) out[i] = data[i];
@@ -302,9 +301,9 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
 
 i64 encode_string(u8* out, const u8* src, u32 len) {
     const i64 kHlen = huffman_encoded_len(src, len);
-    if (kHlen < static_cast<i64>(len)) {
-        // kHlen < len <= UINT32_MAX proves this narrowing is representable.
-        const i64 kHdr = encode_integer(out, static_cast<u32>(kHlen), 7, 0x80);  // H=1
+    u32 encoded_length;
+    if (kHlen < len && range_int(kHlen).to(&encoded_length)) {
+        const i64 kHdr = encode_integer(out, encoded_length, 7, 0x80);  // H=1
         const i64 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }
@@ -680,20 +679,19 @@ i64 Encoder::encode(u8* out, Str name, Str value) {
 // dynamic table size update so the next header block tells the peer's decoder the
 // new size in lockstep. Without that the two tables desync and decoding breaks.
 void Encoder::set_table_size(u32 settings_max) {
-    const u32 kNew = settings_max < DynamicTable::kHardCap ? settings_max : DynamicTable::kHardCap;
+    constexpr auto kCap = range_int<DynamicTable::kHardCap, i64{DynamicTable::kHardCap} + 1>{};
+    const auto size = range_int(settings_max).min(kCap);
+    const i32 next = size.to<i32>();
     // The size currently in effect for the peer's decoder is the final pending
     // value if one is armed, else our live table limit. No net change → nothing
     // to do (avoids spurious size updates on duplicate SETTINGS).
-    const i32 kCurrent =
-        pending_size_update >= 0 ? pending_size_update : static_cast<i32>(dyn.max_size);
-    if (static_cast<i32>(kNew) == kCurrent) return;
-    dyn_set_max_size(dyn, kNew);  // shrinking evicts entries that no longer fit
-    // Track the smallest size reached since the last emit. A shrink-then-grow
-    // between header blocks must signal the minimum first (§4.2), otherwise the
-    // peer decoder never evicts at the shrink and its table diverges from ours.
-    if (pending_size_update < 0 || static_cast<i32>(kNew) < pending_min_size)
-        pending_min_size = static_cast<i32>(kNew);
-    pending_size_update = static_cast<i32>(kNew);
+    const i64 kCurrent = pending_size_update >= 0 ? pending_size_update : i64{dyn.max_size};
+    if (next == kCurrent) return;
+    dyn_set_max_size(dyn, size.to<u32>());  // shrinking evicts entries that no longer fit
+    // A shrink-then-grow between header blocks must signal the minimum first
+    // so the decoder evicts identically (§4.2).
+    if (pending_size_update < 0 || next < pending_min_size) pending_min_size = next;
+    pending_size_update = next;
 }
 
 u32 Encoder::emit_pending_size_update(u8* out) {

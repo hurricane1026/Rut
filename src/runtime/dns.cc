@@ -22,17 +22,20 @@
 namespace rut {
 namespace {
 u16 word(const u8* p) {
-    return static_cast<u16>((p[0] << 8) | p[1]);
+    return (range_int(p[0]).scaled_by<256>() + range_int(p[1])).to<u16>();
 }
 u32 number(const u8* p) {
     return (static_cast<u32>(word(p)) << 16) | word(p + 2);
 }
 void put(u8* p, u16 v) {
-    p[0] = static_cast<u8>(v >> 8);
-    p[1] = static_cast<u8>(v);
+    p[0] = range_int(v).divided_by<256>().to<u8>();
+    p[1] = bounded_remainder<256>(v).to<u8>();
 }
 char lower(u8 c) {
-    return static_cast<char>(c >= 'A' && c <= 'Z' ? static_cast<i64>(c) + 32 : c);
+    range_int<'A', 'Z' + 1> upper;
+    if (!decltype(upper)::try_from_i64(c, &upper)) return __builtin_bit_cast(char, c);
+    const u8 folded = (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
+    return __builtin_bit_cast(char, folded);
 }
 // Compression pointers must move backwards. Both jumps and expanded names are bounded.
 bool name_at(const u8* p, u32 len, u32& offset, char* out) {
@@ -94,7 +97,7 @@ bool dns_hostname(char* name) {
     bool alphabetic = false;
     u32 label = 0;
     for (u32 i = 0; i <= len; ++i) {
-        const char kC = lower(static_cast<u8>(name[i]));
+        const char kC = lower(__builtin_bit_cast(u8, name[i]));
         name[i] = kC;
         if (!kC || kC == '.') {
             if (!label || label > 63 || name[static_cast<i64>(i) - 1] == '-') return false;
@@ -112,8 +115,11 @@ bool dns_hostname(char* name) {
 }
 u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
     if (!name || !p || capacity < 18) return 0;
-    const u32 kLen = static_cast<u32>(strnlen(name, capacity));
-    if ((range_int(kLen) + range_int<18, 19>{}).value() > capacity) return 0;
+    range_int<0, i64{UINT32_MAX} + 1> name_length;
+    if (!decltype(name_length)::try_from_u64(strnlen(name, capacity), &name_length) ||
+        (name_length + range_int<18, 19>{}).value() > capacity)
+        return 0;
+    const u32 kLen = name_length.to<u32>();
     memset(p, 0, 12);
     put(p, id);
     put(p + 2, 0x0100);
@@ -160,16 +166,17 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
     Record records[64]{};
     for (u32 i = 0; i < kTotal; ++i) {
         auto& r = records[i];
-        if (!name_at(p, len, at, r.owner) || static_cast<i64>(at) + 10 > static_cast<i64>(len))
-            return DnsAnswer::Invalid;
+        if (!name_at(p, len, at, r.owner)) return DnsAnswer::Invalid;
+        const auto data = range_int(at) + range_int<10, 11>{};
+        if (data.value() > len) return DnsAnswer::Invalid;
+        r.data = data.min(range_int(len)).to<u32>();
         r.type = word(p + static_cast<i64>(at) + 2) == 1 ? word(p + static_cast<i64>(at)) : 0;
         r.ttl = number(p + static_cast<i64>(at) + 4);
         if (r.ttl & 0x80000000u) r.ttl = 0;
         r.size = word(p + static_cast<i64>(at) + 8);
-        r.data = static_cast<u32>(static_cast<i64>(at) + 10);
-        const i64 end_wide = static_cast<i64>(r.data) + static_cast<i64>(r.size);
-        if (end_wide > static_cast<i64>(len)) return DnsAnswer::Invalid;
-        at = static_cast<u32>(end_wide);
+        const auto end = data + range_int(r.size);
+        if (end.value() > len) return DnsAnswer::Invalid;
+        at = end.min(range_int(len)).to<u32>();
     }
     if (at != len) return DnsAnswer::Invalid;
     if (!copy_dns_name(result.canonical, name)) return DnsAnswer::Invalid;
@@ -188,7 +195,9 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
                 if (!duplicate) {
                     if (result.count < 8) {
                         result.addresses[result.count] = address;
-                        result.count = static_cast<u32>(static_cast<i64>(result.count) + 1);
+                        result.count = (range_int(result.count) + range_int<1, 2>{})
+                                           .min(range_int<8, 9>{})
+                                           .to<u32>();
                     } else {
                         result.overflow = true;
                     }
@@ -254,7 +263,7 @@ int DnsResolver::resolve(
                 strcmp(e.name, host) != 0)
                 continue;
             q.result = e.result;
-            const u32 kIndex = static_cast<u32>(static_cast<i64>(e.next++) % q.result.count);
+            const u32 kIndex = e.next++ % q.result.count;
             const u32 kFirst = q.result.addresses[0];
             q.result.addresses[0] = q.result.addresses[kIndex];
             q.result.addresses[kIndex] = kFirst;
@@ -285,7 +294,9 @@ int DnsResolver::resolve(
 #endif
         q.question_size = dns_question(q.name, q.id, q.question + 2, sizeof(q.question) - 2);
         if (!q.question_size) return -1;
-        put(q.question, static_cast<u16>(q.question_size));
+        range_int<1, i64{sizeof(q.question)} - 1> length;
+        if (!decltype(length)::try_from_i64(q.question_size, &length)) return -1;
+        put(q.question, length.to<u16>());
         q.fd = platform::datagram_socket();
         if (q.fd < 0) return -1;
         sockaddr_in peer{};
@@ -308,8 +319,9 @@ int DnsResolver::resolve(
     if (q.phase == 3) {
         const auto kN = recv(q.fd, q.packet, 4096, MSG_TRUNC);
         if (kN < 0 && pending()) return 0;
-        if (kN < 0 || kN > 4096) return retry();
-        length = static_cast<u32>(kN);
+        range_int<0, 4097> received;
+        if (!decltype(received)::try_from_i64(kN, &received)) return retry();
+        length = received.to<u32>();
     } else if (q.phase == 4) {
         pollfd ready{q.fd, POLLOUT, 0};
         const int kPolled = poll(&ready, 1, 0);
@@ -321,26 +333,39 @@ int DnsResolver::resolve(
         q.phase = 5;
         return 0;
     } else if (q.phase == 5) {
+        const auto target = range_int(q.question_size) + range_int<2, 3>{};
+        const auto sent = range_int(q.sent);
+        if (target.value() > i64{sizeof(q.question)} || sent.value() >= target.value())
+            return retry();
+        const auto pending_bytes = (target - sent).max(range_int<0, 1>{});
         const auto kN =
-            send(q.fd,
-                 q.question + static_cast<i64>(q.sent),
-                 static_cast<u32>(static_cast<i64>(q.question_size) + 2 - static_cast<i64>(q.sent)),
-                 platform::kSendFlags);
+            send(q.fd, q.question + sent.index(), pending_bytes.to_u64(), platform::kSendFlags);
         if (kN < 0 && pending()) return 0;
-        if (kN <= 0) return retry();
-        q.sent = static_cast<u32>(static_cast<i64>(q.sent) + kN);
-        if (static_cast<i64>(q.sent) == static_cast<i64>(q.question_size) + 2) q.phase = 6;
+        range_int<1, i64{sizeof(q.question)} + 1> written;
+        if (!decltype(written)::try_from_i64(kN, &written) ||
+            written.value() > pending_bytes.value())
+            return retry();
+        q.sent = (sent + written)
+                     .min(range_int<sizeof(q.question), i64{sizeof(q.question)} + 1>{})
+                     .to<u32>();
+        if (q.sent == target.value()) q.phase = 6;
         return 0;
     } else if (q.phase == 6) {
-        const u32 kTarget = q.received < 2 ? 2 : static_cast<u32>(static_cast<i64>(q.size) + 2);
-        const auto kN =
-            recv(q.fd,
-                 q.packet + static_cast<i64>(q.received),
-                 static_cast<u32>(static_cast<i64>(kTarget) - static_cast<i64>(q.received)),
-                 0);
+        constexpr i64 kCapacity = sizeof(q.packet);
+        range_int<0, kCapacity + 1> target;
+        if (!decltype(target)::try_from_i64(q.received < 2 ? 2 : i64{q.size} + 2, &target))
+            return retry();
+        const auto received = range_int(q.received);
+        if (received.value() >= target.value()) return retry();
+        const auto pending_bytes = (target - received).max(range_int<0, 1>{});
+        const auto kN = recv(q.fd, q.packet + received.index(), pending_bytes.to_u64(), 0);
         if (kN < 0 && pending()) return 0;
-        if (kN <= 0) return retry();
-        q.received = static_cast<u32>(static_cast<i64>(q.received) + kN);
+        range_int<1, i64{sizeof(q.packet)} + 1> read;
+        if (!decltype(read)::try_from_i64(kN, &read) || read.value() > pending_bytes.value())
+            return retry();
+        q.received = (received + read)
+                         .min(range_int<sizeof(q.packet), i64{sizeof(q.packet)} + 1>{})
+                         .to<u32>();
         if (q.received == 2) {
             q.size = word(q.packet);
             if (q.size < 12 || q.size > 4096) return retry();
