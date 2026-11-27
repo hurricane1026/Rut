@@ -762,23 +762,25 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         (void)h.consume_data(sid, len);
         return;
     }
+    constexpr i64 kCapacity = sizeof(x->download);
     const auto kBuffered = range_int(x->download_len) + range_int(len);
-    if (kBuffered.value() > static_cast<i64>(sizeof(x->download))) {
-        x->failure = 8;
-        x->response_end = true;
-        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
-        return;
+    u8 failure = 0;
+    if (kBuffered.value() > kCapacity) {
+        failure = 8;
+    } else if (!grpc_count_bytes(&x->response_bytes, len) ||
+               (x->has_response_length && x->response_bytes > x->expected_response_bytes) ||
+               x->failure == 13) {
+        failure = 13;
     }
-    if (!grpc_count_bytes(&x->response_bytes, len) ||
-        (x->has_response_length && x->response_bytes > x->expected_response_bytes))
-        x->failure = 13;
-    if (x->failure == 13) {
+    if (failure) {
+        // HTTP/2 already counted this DATA. Detach returns credit for buffered bytes.
+        (void)h.consume_data(sid, len);
+        x->failure = failure;
         x->response_end = true;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
     if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
-    constexpr i64 kCapacity = sizeof(x->download);
     x->download_len = kBuffered.min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     if (x->ws && x->ws_accepted) {
         if (!ws_h2_process(*x, false)) x->failure = 13;

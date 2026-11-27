@@ -4034,6 +4034,72 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
     run(terminal_headers, 4, true, nullptr, 0, false, nullptr, 0, 13, false);
 }
 
+TEST(grpc_proxy, rejected_response_data_returns_connection_credit) {
+    auto run = [&_tc](u32 buffered) {
+        GrpcDriveFixture loop;
+        Connection upstream;
+        upstream.reset();
+        Http2Conn h;
+        h.init_client();
+        h.peer_settings_seen = true;
+        h.grpc.upstream = true;
+        upstream.h2 = &h;
+        GrpcExchange x;
+        x.init();
+        x.upstream = &upstream;
+        x.upstream_stream = 1;
+        x.request_headers_sent = true;
+        x.slot_held = true;
+        auto* stream = h.open_stream(1);
+        REQUIRE(stream != nullptr);
+        stream->manual_window = true;
+        REQUIRE(grpc_attach(h, &x));
+
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        h.cb_ctx = &dispatch;
+        h.on_headers = &grpc_response_headers<GrpcDriveFixture>;
+        h.on_data = &grpc_response_data<GrpcDriveFixture>;
+        const hpack::Header headers[] = {
+            {{":status", 7}, {"200", 3}},
+            {{"content-type", 12}, {"application/grpc", 16}},
+            {{"content-length", 14}, buffered ? Str{"1", 1} : Str{"0", 1}},
+        };
+        u8 input[128];
+        u8 output[128];
+        u32 written = 0;
+        const i64 kInitialWindow = h.conn_recv_window;
+        const u32 kHeaderLength = http2_write_headers(input, sizeof(input), 1, headers, 3, false);
+        REQUIRE_GT(kHeaderLength, 0u);
+        REQUIRE_FALSE(h.process(input, kHeaderLength, output, sizeof(output), &written).close);
+        REQUIRE(x.has_response_length);
+
+        const u8 byte = 'x';
+        const u32 kFrameLength = http2_write_data(input, 1, &byte, 1, false);
+        if (buffered) {
+            REQUIRE_FALSE(h.process(input, kFrameLength, output, sizeof(output), &written).close);
+            REQUIRE_EQ(x.download_len, buffered);
+            REQUIRE_EQ(stream->recv_unconsumed, buffered);
+        }
+
+        REQUIRE_FALSE(h.process(input, kFrameLength, output, sizeof(output), &written).close);
+        CHECK_EQ(x.failure, 13u);
+        CHECK(x.response_end);
+        CHECK(x.upstream == nullptr);
+        CHECK_EQ(loop.released, 1u);
+        CHECK_EQ(x.download_len, buffered);
+        CHECK_EQ(stream->recv_unconsumed, 0u);
+        CHECK_EQ(h.conn_recv_window, kInitialWindow);
+        Http2FrameHeader update{};
+        REQUIRE_EQ(parse_frame_header(output, written, &update), ParseStatus::Complete);
+        CHECK_EQ(Http2FrameType{update.type}, Http2FrameType::WindowUpdate);
+        CHECK_EQ(update.stream_id, 0u);
+        CHECK(h.open_stream(3) == stream);
+    };
+
+    run(0);
+    run(1);
+}
+
 TEST(grpc_proxy, encoded_terminal_response_releases_stream_slot_for_queued_rpc) {
     GrpcDriveFixture loop;
     Connection upstream;
