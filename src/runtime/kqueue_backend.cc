@@ -549,9 +549,11 @@ u32 KqueueBackend::wait(
     int n;
     do {
         n = kevent64(kqueue_fd, nullptr, 0, &ready, 1, 0, timeout);
-    } while (n < 0 && errno == EINTR);
+    } while (n < 0 && errno == EINTR && timeout == nullptr);
     pending_streak_ = 0;
     if (n < 0) {
+        // A finite wait must be recomputed by the shard after interruption.
+        if (errno == EINTR) return 0;
         fail(errno);
         return 0;
     }

@@ -1759,22 +1759,22 @@ TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
     CHECK_EQ(hir_owned->routes.len, 4u);
 }
 
-// Non-whole-second intervals are rejected honestly: the firing path is the
-// 1s keepalive tick (a 1500ms timer would silently fire every ~2s), and
-// pulling the tick forward would also advance the idle/probe timer wheel.
-// Lift when timers get a dedicated precise wakeup.
-TEST(timer_dsl, rejects_non_whole_second_intervals) {
+TEST(timer_dsl, accepts_millisecond_intervals) {
     using namespace rut;
-    for (const char* src : {"timer t, every: 500ms { }\n", "timer t, every: 1500ms { }\n"}) {
-        auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
-        REQUIRE(lexed);
-        auto ast = parse_file(lexed.value());
-        REQUIRE(ast);
-        std::unique_ptr<AstFile> ast_owned(ast.value());
-        auto hir = analyze_file(*ast_owned);
-        REQUIRE(!hir);
-        CHECK(hir.error().detail.len != 0);
-    }
+    const char* source =
+        "timer fast, every: 500ms { }\n"
+        "timer slow, every: 1500ms { }\n";
+    auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    REQUIRE_EQ(hir_owned->routes.len, 2u);
+    CHECK_EQ(hir_owned->routes[0].timer_interval_ms, 500u);
+    CHECK_EQ(hir_owned->routes[1].timer_interval_ms, 1500u);
 }
 
 // A selector outside the process shard range (kMaxShards) would compile into
@@ -1941,6 +1941,7 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     loop0->fire_due_timers();
     loop1->fire_due_timers();
     CHECK_EQ(loop0->timer_fire_count[0], 0u);  // wrong shard: never fires
+    CHECK_EQ(loop0->background_timer_deadline_ns, 0u);  // and needs no timer wakeup
     CHECK_GE(loop1->timer_fire_count[0], 1u);  // pinned shard fires
     loop0->pool.destroy();
     loop1->pool.destroy();
@@ -2037,6 +2038,69 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
     loop->pool.destroy();
+}
+
+static std::atomic<u32> precise_timer_calls{0};
+
+static u64 precise_timer_probe(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    precise_timer_calls.fetch_add(1, std::memory_order_release);
+    return 0;
+}
+
+template <typename Loop>
+static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("pulse", 5, 25, &precise_timer_probe));
+    auto loop = std::make_unique<Loop>();
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    const auto init = loop->init(0, listener, 0, 32);
+    if (!init) {
+        close(listener);
+        if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
+            if (io_uring_init_error_is_unsupported(init.error(),
+                                                   loop->backend.init_failure_detail()))
+                SKIP("io_uring unavailable");
+        }
+        REQUIRE(init.has_value());
+        return;
+    }
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    precise_timer_calls.store(0, std::memory_order_relaxed);
+    pthread_t thread{};
+    const i32 started = pthread_create(
+        &thread,
+        nullptr,
+        [](void* data) -> void* {
+            static_cast<Loop*>(data)->run();
+            return nullptr;
+        },
+        loop.get());
+    if (started != 0) {
+        loop->shutdown();
+        close(listener);
+        REQUIRE_EQ(started, 0);
+        return;
+    }
+    const i64 deadline = test_mono_ms() + 700;
+    while (precise_timer_calls.load(std::memory_order_acquire) < 3 && test_mono_ms() < deadline)
+        usleep(5000);
+    const u32 calls = precise_timer_calls.load(std::memory_order_acquire);
+    loop->stop();
+    pthread_join(thread, nullptr);
+    CHECK_GE(calls, 3u);
+    if constexpr (std::is_same_v<Loop, IoUringEventLoop>) CHECK_EQ(loop->backend.failure_code(), 0);
+    loop->shutdown();
+    close(listener);
+}
+
+TEST(timer, epoll_wakes_idle_shard_for_background_deadline) {
+    test_precise_background_timer_on_idle_shard<EpollEventLoop>(_tc);
+}
+
+TEST(timer, io_uring_wakes_idle_shard_for_background_deadline) {
+    test_precise_background_timer_on_idle_shard<IoUringEventLoop>(_tc);
 }
 
 // A hot reload swapping *config_ptr must re-arm timer deadlines for the new

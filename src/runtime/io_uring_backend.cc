@@ -103,6 +103,23 @@ static i32 io_uring_enter(i32 fd, u32 to_submit, u32 min_complete, u32 flags) {
     return ret >= 0 ? ret : -errno;
 }
 
+// Extended enter arguments are supported on kernels with the ring features
+// required by this backend. This deadline adds no SQE or CQE.
+static i32 io_uring_enter_until(i32 fd, u32 to_submit, u32 flags, u64 deadline_ns) {
+    const u64 now = monotonic_ns();
+    if (deadline_ns <= now) return io_uring_enter(fd, to_submit, 0, flags);
+    u64 ns = 0;
+    (void)__builtin_sub_overflow(deadline_ns, now, &ns);
+    IoTimespec timeout{};
+    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(ns / 1'000'000'000);
+    timeout.tv_nsec = static_cast<decltype(timeout.tv_nsec)>(ns % 1'000'000'000);
+    io_uring_getevents_arg args{};
+    args.ts = static_cast<decltype(args.ts)>(reinterpret_cast<uintptr_t>(&timeout));
+    const i32 ret = static_cast<i32>(syscall(
+        __NR_io_uring_enter, fd, to_submit, 1u, flags | IORING_ENTER_EXT_ARG, &args, sizeof(args)));
+    return ret >= 0 ? ret : -errno;
+}
+
 static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
     i32 ret = static_cast<i32>(syscall(__NR_io_uring_register, fd, opcode, arg, nr_args));
     return ret >= 0 ? ret : -errno;
@@ -1299,8 +1316,12 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 
 // --- Wait (submit + harvest) ---
 
-u32 IoUringBackend::wait(
-    IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, bool wait_for_event) {
+u32 IoUringBackend::wait(IoEvent* events,
+                         u32 max_events,
+                         Connection* conns,
+                         u32 max_conns,
+                         bool wait_for_event,
+                         u64 deadline_ns) {
     if (failure_code() != 0) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
@@ -1312,17 +1333,17 @@ u32 IoUringBackend::wait(
         __atomic_load_n(cq_head, __ATOMIC_ACQUIRE) != __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     const u32 kernel_flags = sq_flags ? __atomic_load_n(sq_flags, __ATOMIC_ACQUIRE) : 0;
     const bool kernel_work = (kernel_flags & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN)) != 0;
-    u32 flags = IORING_ENTER_GETEVENTS;
-    i32 ret;
+    constexpr u32 flags = IORING_ENTER_GETEVENTS;
+    const bool timed_wait = wait_for_event && !ready && deadline_ns != 0;
     while (pending != 0 || (wait_for_event && !ready) || kernel_work) {
-        if (pending > 0) {
-            ret = io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
-            if (ret >= 0)
-                pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
-        } else {
-            ret = io_uring_enter(ring_fd, 0, wait_for_event ? 1u : 0u, flags);
+        const i32 ret = timed_wait
+                            ? io_uring_enter_until(ring_fd, pending, flags, deadline_ns)
+                            : io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
+        if (ret >= 0) {
+            pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
+            break;
         }
-        if (ret >= 0) break;
+        if (ret == -ETIME && timed_wait) break;
         if (ret == -EINTR) continue;
         record_enter_error(ret);
         return 0;

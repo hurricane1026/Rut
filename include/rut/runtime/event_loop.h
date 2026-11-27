@@ -604,63 +604,60 @@ public:
     }
 
     // --- Background timers (`timer name, every: D`) ---
-    // Lives in the CRTP base so BOTH backends (epoll and io_uring) schedule timers.
-    // main.cc prefers io_uring when available, so a backend-specific scheduler
-    // would silently drop timers on the default host. State reaches the concrete
-    // loop's config_ptr via self(). timer_fire_count is exposed for tests.
+    // The shard's wait is bounded by the nearest deadline. Background timers
+    // do not advance the separate connection idle/keepalive wheel.
     u64 timer_deadline_ns[RouteConfig::kMaxTimers]{};
     u32 timer_fire_count[RouteConfig::kMaxTimers]{};
-    // The config whose timer deadlines are currently armed. Re-armed whenever the
-    // active config changes (incl. a hot reload swapping *config_ptr), so a new
-    // timer set measures `every: D` from activation, not from stale deadlines.
     const RouteConfig* timer_armed_config = nullptr;
+    u64 background_timer_deadline_ns = 0;
 
-    // Fire any background timer whose interval has elapsed. Called from each
-    // concrete loop's 1s keepalive tick (so timers run at ~1s granularity, slice 1)
-    // and once at run() start (so `every: D` measures from activation, not the
-    // first tick). Timer bodies are currently no-op handlers; this drives the
-    // schedule + compiled-handler invocation with no Connection/Request.
+    u32 background_timer_wait_ms(u32 limit) const {
+        if (background_timer_deadline_ns == 0) return limit;
+        const u64 now = monotonic_ns();
+        if (background_timer_deadline_ns <= now) return 0;
+        u64 remaining = 0;
+        (void)__builtin_sub_overflow(background_timer_deadline_ns, now, &remaining);
+        const i64 ms =
+            static_cast<i64>(remaining / 1'000'000) + (remaining % 1'000'000 != 0 ? 1 : 0);
+        // epoll takes a signed millisecond timeout.
+        const i64 bounded = ms < INT32_MAX ? ms : INT32_MAX;
+        return bounded < static_cast<i64>(limit) ? static_cast<u32>(bounded) : limit;
+    }
+
     void fire_due_timers() {
         const RouteConfig** cfg_ptr = self().config_ptr;
         const RouteConfig* cfg = cfg_ptr ? *cfg_ptr : nullptr;
-        const u64 now = monotonic_ns();
-        // (Re)arm deadlines whenever the active config changes — first install or a
-        // hot reload — so each timer's interval is measured from activation rather
-        // than reusing the old config's deadlines (or a zero deadline for a newly
-        // added slot, which would fire on the next tick instead of after `every`).
-        if (cfg != timer_armed_config) {
-            timer_armed_config = cfg;
-            if (cfg != nullptr) {
-                const u32 m = cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count
-                                                                         : RouteConfig::kMaxTimers;
-                for (u32 i = 0; i < m; i++)
-                    timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
-            }
-            return;
-        }
+        const bool changed = cfg != timer_armed_config;
+        timer_armed_config = cfg;
+        if (changed) background_timer_deadline_ns = 0;
         if (cfg == nullptr || cfg->timer_count == 0) return;
-        const u32 n =
+        if (!changed && background_timer_deadline_ns == 0) return;
+
+        const u64 now = monotonic_ns();
+        if (!changed && now < background_timer_deadline_ns) return;
+        background_timer_deadline_ns = 0;
+        const u32 count =
             cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
-        for (u32 i = 0; i < n; i++) {
-            // `shard: N` pins the timer to one shard (singleton tasks); the
-            // default -1 runs a copy on every shard.
-            if (cfg->timers[i].shard >= 0 &&
-                static_cast<u32>(cfg->timers[i].shard) != self().shard_id)
-                continue;
-            if (now < timer_deadline_ns[i]) continue;
-            jit::HandlerCtx ctx{};
-            SliceArena scratch{};
-            if (scratch.init(&self().pool)) {
-                (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, &scratch);
-                scratch.destroy();
-            } else {
-                timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
-                continue;
+        for (u32 i = 0; i < count; i++) {
+            const auto& entry = cfg->timers[i];
+            if (entry.shard >= 0 && static_cast<u32>(entry.shard) != self().shard_id) continue;
+            if (changed) {
+                timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
+            } else if (now >= timer_deadline_ns[i]) {
+                jit::HandlerCtx ctx{};
+                SliceArena scratch{};
+                if (scratch.init(&self().pool)) {
+                    (void)entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
+                    scratch.destroy();
+                    timer_fire_count[i]++;
+                }
+                // Schedule from this firing, including after scratch exhaustion.
+                // A delayed shard never runs a backlog of missed periods.
+                timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
             }
-            timer_fire_count[i]++;
-            // Reschedule from now (not the missed deadline) to avoid a catch-up
-            // burst after a long stall.
-            timer_deadline_ns[i] = deadline_after(now, cfg->timers[i].interval_ms);
+            if (background_timer_deadline_ns == 0 ||
+                timer_deadline_ns[i] < background_timer_deadline_ns)
+                background_timer_deadline_ns = timer_deadline_ns[i];
         }
     }
 

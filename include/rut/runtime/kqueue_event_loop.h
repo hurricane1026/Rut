@@ -266,8 +266,7 @@ public:
         if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_rs256(shard_id);
         if (config_ptr && *config_ptr) (void)(*config_ptr)->activate_es256(shard_id);
         backend.add_accept();
-        // Arm timer deadlines from activation (config is installed before run()),
-        // so `every: D` measures from here rather than from the first 1s tick.
+        // Measure the first background interval from config activation.
         this->fire_due_timers();
         // Likewise reset/arm active-health state at activation so requests
         // accepted before the first 1s sweep don't route off stale numeric-slot
@@ -279,19 +278,16 @@ public:
             this->drain_ready_jit_handlers();
             const bool fetch_busy =
                 config_ptr && *config_ptr && (*config_ptr)->jwks_fetch_busy(shard_id);
-            u32 n =
-                backend.wait(events,
-                             kMaxEventsPerWait,
-                             conns,
-                             kMaxConns,
-                             this->has_ready_jit_handlers() ? 0u : (fetch_busy ? 10u : ~u32{0}));
+            u32 n = backend.wait(events,
+                                 kMaxEventsPerWait,
+                                 conns,
+                                 kMaxConns,
+                                 this->has_ready_jit_handlers()
+                                     ? 0u
+                                     : this->background_timer_wait_ms(fetch_busy ? 10u : ~u32{0}));
             dispatch_batch(events, n);
             poll_command();
-            // poll_command may have installed a new config (hot reload); re-arm
-            // timers now so a freshly activated `every: D` measures from the reload
-            // rather than waiting for the next 1s tick to notice (and then another
-            // interval before it actually fires). Cheap no-op when the config is
-            // unchanged (fire_due_timers compares the armed config pointer).
+            // Run due timers and arm any newly activated config after reload.
             this->fire_due_timers();
             // Reset/arm active-health state the instant a hot reload installs a
             // new config, so it doesn't route off stale numeric-slot verdicts
@@ -925,7 +921,6 @@ public:
                         }
                     });
                 }
-                this->fire_due_timers();
                 // Evict idle pooled upstream sockets past the keepalive deadline
                 // (1s-granular) — bounds dead-socket accumulation for endpoints that
                 // never get another request to trigger take_idle's probe.
