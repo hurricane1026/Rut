@@ -56,7 +56,8 @@ fail:
 EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t length) {
     if (!modulus || length < 256 || length > 512) return 0;
     RSA* rsa = RSA_new();
-    BIGNUM* n = BN_bin2bn(modulus, (int)length, 0);
+    const int modulus_size = length; /* Validated to be 256 through 512 bytes. */
+    BIGNUM* n = BN_bin2bn(modulus, modulus_size, 0);
     BIGNUM* e = BN_new();
     EVP_PKEY* owner = EVP_PKEY_new();
     EVP_PKEY* accepted = 0;
@@ -152,11 +153,12 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
         bytes > 512 || !signature || signature_len != bytes || (!message && message_len) ||
         message_len > 1024u * 1024u)
         return 0;
-    if (!BN_bin2bn(signature, (int)bytes, input) || BN_cmp(input, modulus) >= 0 ||
+    const int signature_size = bytes; /* Validated to be 256 through 512 bytes. */
+    if (!BN_bin2bn(signature, signature_size, input) || BN_cmp(input, modulus) >= 0 ||
         !BN_mod_exp_mont(output, input, exponent, modulus, scratch, mont))
         return 0;
     uint8_t actual[512];
-    if (BN_bn2binpad(output, actual, (int)bytes) != (int)bytes) return 0;
+    if (BN_bn2binpad(output, actual, signature_size) != signature_size) return 0;
     /* RFC 8017 9.2: compare the complete fixed SHA-256 encoded message. */
     static const uint8_t digest_info[] = {0x30,
                                           0x31,

@@ -1,5 +1,6 @@
 #include "rut/runtime/crypto_c.h"
 
+#include <limits.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 
@@ -89,12 +90,16 @@ uint32_t rut_crypto_base64_encode_v1(const uint8_t* input,
                                      uint32_t* output_len) {
     if (!output_len) return 0;
     *output_len = 0;
-    if ((!input && length) || !output || length > 1024u * 1024u) return 0;
-    uint32_t needed = (uint32_t)(((int64_t)length + 2) / 3 * 4);
+    enum { kMaxInputSize = 1024 * 1024 };
+    _Static_assert(INT_MAX >= (kMaxInputSize + 2) / 3 * 4, "Base64 length must fit OpenSSL int");
+    if ((!input && length) || !output || length > kMaxInputSize) return 0;
+    const int input_size = length;
+    const int encoded_size = (input_size + 2) / 3 * 4;
+    const uint32_t needed = encoded_size;
     if (capacity <= needed) return 0;
     static const uint8_t empty = 0;
-    int written = EVP_EncodeBlock(output, input ? input : &empty, (int)length);
-    if (written < 0 || (uint32_t)written != needed) return 0;
+    const int written = EVP_EncodeBlock(output, input ? input : &empty, input_size);
+    if (written != encoded_size) return 0;
     *output_len = needed;
     return 1;
 }
