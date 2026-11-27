@@ -43,8 +43,7 @@ void write_u16(u8* p, u16 v) {
     h.type = static_cast<u8>(type);
     h.flags = flags;
     h.stream_id = stream_id;
-    (void)write_frame_header(out, h);
-    return out + kFrameHeaderSize;
+    return out + range_int{write_frame_header(out, h)}.index();
 }
 
 }  // namespace
@@ -147,13 +146,14 @@ const u8 kClientPreface[kClientPrefaceLen] = {0x50, 0x52, 0x49, 0x20, 0x2a, 0x20
         append(Http2SettingId::MaxFrameSize, s.max_frame_size);
 
     const auto payload = range_int(count).scaled_by<6>();
-    (void)emit_header(out, payload.to<u32>(), Http2FrameType::Settings, 0, 0);
+    Http2FrameHeader header{payload.to<u32>(), 0, static_cast<u8>(Http2FrameType::Settings), 0};
+    if (write_frame_header(out, header) != kFrameHeaderSize) return 0;
     return (range_int<kFrameHeaderSize, i64{kFrameHeaderSize} + 1>{} + payload).to<u32>();
 }
 
 [[nodiscard]] u32 write_settings_ack(u8* out) {
-    (void)emit_header(out, 0, Http2FrameType::Settings, http2_flag::kAck, 0);
-    return kFrameHeaderSize;
+    return write_frame_header(
+        out, Http2FrameHeader{0, 0, static_cast<u8>(Http2FrameType::Settings), http2_flag::kAck});
 }
 
 [[nodiscard]] u32 write_goaway(u8* out, u32 last_stream_id, Http2Error error) {

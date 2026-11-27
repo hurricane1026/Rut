@@ -20,6 +20,15 @@ template <typename Left, typename Right, typename Result>
     return __builtin_mul_overflow(left, right, out);
 }
 
+// Accumulate an exact result. A failed addition leaves the counter unchanged.
+template <typename Result, typename Increment>
+[[nodiscard, gnu::always_inline]] constexpr bool try_add_to(Result* total, Increment increment) {
+    Result next;
+    if (add_overflow(*total, increment, &next)) return false;
+    *total = next;
+    return true;
+}
+
 namespace detail {
 template <typename T>
 concept WrappingInteger =

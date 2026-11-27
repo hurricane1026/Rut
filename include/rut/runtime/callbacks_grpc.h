@@ -14,11 +14,8 @@
 
 namespace rut {
 [[nodiscard]] inline bool grpc_count_bytes(u64* total, u32 count) {
-    u64 next = 0;
-    // RUT_INTEGER_RANGE: a streaming RPC can accumulate the full u64 range.
-    if (add_overflow(*total, count, &next)) return false;
-    *total = next;
-    return true;
+    // Streaming RPCs can accumulate the full u64 range.
+    return try_add_to(total, count);
 }
 
 [[nodiscard]] constexpr auto grpc_stream_slot(u32 cursor, u32 offset) {
@@ -222,6 +219,12 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
         (void)loop->access_log->push(entry);
 }
 
+inline void grpc_discard_receive_data(Http2Conn& h, u32 stream_id, u32 len) {
+    if (!len || h.grpc.websocket_http1 || h.grpc.websocket_http1_downstream) return;
+    // The caller closes at a safe boundary after the parser releases its state.
+    if (!h.consume_data(stream_id, len)) h.recv_credit_failed = true;
+}
+
 // Return all buffered credit on retirement (including cancellation), so one
 // cancelled RPC cannot exhaust the connection window for unrelated RPCs.
 template <typename Loop>
@@ -230,7 +233,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     Connection* down = x->downstream;
     Connection* up = x->upstream;
     if (down && down->h2) {
-        (void)down->h2->consume_data(x->downstream_stream, x->upload_len);
+        grpc_discard_receive_data(*down->h2, x->downstream_stream, x->upload_len);
         if (auto* stream = down->h2->find_stream(x->downstream_stream))
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
@@ -244,7 +247,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     }
     if (up && up->h2) {
         auto& h = *up->h2;
-        (void)h.consume_data(x->upstream_stream, x->download_len);
+        grpc_discard_receive_data(h, x->upstream_stream, x->download_len);
         if (auto* s = h.find_stream(x->upstream_stream)) {
             if (cancel && x->request_headers_sent) grpc_queue_cancel(h, x->upstream_stream);
             s->state = Http2StreamState::Closed;
@@ -516,7 +519,7 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
 }
 template <typename Loop>
 inline void grpc_detach_upstream_exchange(Loop* loop, Http2Conn& h, GrpcExchange& x) {
-    (void)h.consume_data(x.upstream_stream, x.download_len);
+    grpc_discard_receive_data(h, x.upstream_stream, x.download_len);
     if (x.request_headers_sent) grpc_queue_cancel(h, x.upstream_stream);
     if (auto* stream = h.find_stream(x.upstream_stream)) stream->state = Http2StreamState::Closed;
     grpc_detach(h, &x);
@@ -764,7 +767,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) {
-        (void)h.consume_data(sid, len);
+        grpc_discard_receive_data(h, sid, len);
         return;
     }
     constexpr i64 kCapacity = sizeof(x->download);
@@ -779,7 +782,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     }
     if (failure) {
         // HTTP/2 already counted this DATA. Detach returns credit for buffered bytes.
-        (void)h.consume_data(sid, len);
+        grpc_discard_receive_data(h, sid, len);
         x->failure = failure;
         x->response_end = true;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
@@ -825,7 +828,7 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
         }
         x->response_end = true;
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
-        (void)h.consume_data(x->upstream_stream, x->download_len);
+        grpc_discard_receive_data(h, x->upstream_stream, x->download_len);
         Connection* down = x->downstream;
         if (auto* stream = h.find_stream(x->upstream_stream))
             stream->state = Http2StreamState::Closed;
@@ -907,6 +910,10 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     auto& g = h.grpc;
     if (g.connecting || conn.on_send || g.busy) return;
+    if (h.recv_credit_failed) {
+        loop->close_conn(conn);
+        return;
+    }
     // Readiness backends bootstrap SSL_connect through the preface write;
     // never send an RPC header until peer identity and h2 ALPN are verified.
     if (g.client_tls.ssl_ctx && !g.tls_verified && g.preface_sent) return;
@@ -1205,7 +1212,8 @@ inline bool grpc_upstream_reusable(const Connection& conn,
                                    u32 backend_idx) {
     return conn.h2 && conn.request_config == cfg && conn.upstream_idx == upstream_id &&
            conn.upstream_backend_idx == backend_idx && !conn.h2->peer_goaway &&
-           conn.h2->grpc.active < 64 && conn.h2->last_stream_id < 0x7ffffffdu;
+           !conn.h2->recv_credit_failed && conn.h2->grpc.active < 64 &&
+           conn.h2->last_stream_id < 0x7ffffffdu;
 }
 
 template <typename Loop>
@@ -1658,7 +1666,7 @@ void grpc_request_data(
     if (!kCounted || kBuffered.value() > kCapacity ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
-        (void)down.h2->consume_data(x.downstream_stream, len);
+        grpc_discard_receive_data(*down.h2, x.downstream_stream, len);
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
@@ -1773,7 +1781,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
             Connection* up = x->upstream;
             if (!up || !up->h2) continue;
             auto& uh = *up->h2;
-            (void)uh.consume_data(x->upstream_stream, x->download_len);
+            grpc_discard_receive_data(uh, x->upstream_stream, x->download_len);
             if (auto* stream = uh.find_stream(x->upstream_stream)) {
                 if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
                 stream->state = Http2StreamState::Closed;
@@ -1832,7 +1840,7 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         Connection* up = x->upstream;
         if (!up || !up->h2) continue;
         auto& uh = *up->h2;
-        (void)uh.consume_data(x->upstream_stream, x->download_len);
+        grpc_discard_receive_data(uh, x->upstream_stream, x->download_len);
         if (auto* stream = uh.find_stream(x->upstream_stream)) {
             if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
             stream->state = Http2StreamState::Closed;

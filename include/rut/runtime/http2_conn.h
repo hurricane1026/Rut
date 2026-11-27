@@ -100,6 +100,7 @@ struct Http2Conn {
     bool peer_goaway;
     u32 peer_last_stream;
     u32 conn_recv_credit;
+    bool recv_credit_failed;  // A callback could not return credit for discarded DATA.
 
     hpack::DynamicTable hpack_dec;
     hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)

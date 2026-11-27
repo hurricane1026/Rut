@@ -29,6 +29,7 @@ void Http2Conn::init() {
     peer_goaway = false;
     peer_last_stream = 0x7fffffffu;
     conn_recv_credit = 0;
+    recv_credit_failed = false;
     hpack_dec.init(kDefaultHeaderTableSize);
     hpack_enc.init(kDefaultHeaderTableSize);
     our_settings.set_defaults();
@@ -268,7 +269,7 @@ namespace {
     h.type = static_cast<u8>(Http2FrameType::Headers);
     h.flags = flags;
     h.stream_id = stream_id;
-    (void)write_frame_header(out, h);
+    if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
     return (kFrameHeader + payload).to<u32>();
 }
 
@@ -281,7 +282,7 @@ namespace {
     h.type = static_cast<u8>(Http2FrameType::Data);
     h.flags = end_stream ? http2_flag::kEndStream : 0;
     h.stream_id = stream_id;
-    (void)write_frame_header(out, h);
+    if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
     for (u32 i = 0; i < len; i++)
         out[static_cast<i64>(kFrameHeaderSize) + static_cast<i64>(i)] = data[i];
     return (kFrameHeader + payload).to<u32>();
@@ -403,7 +404,7 @@ namespace {
     h.flags = http2_flag::kEndHeaders;
     if (kEndOnHeaders) h.flags |= http2_flag::kEndStream;
     h.stream_id = stream_id;
-    (void)write_frame_header(out, h);
+    if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
     for (i64 i = 0; i < hb; i++) out[static_cast<i64>(kFrameHeaderSize) + i] = hblock[i];
     const auto headers_size = kFrameHeader + header_bytes;
     if (headers_only || body_len == 0) return headers_size.to<u32>();
@@ -916,8 +917,8 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 }
             }
             c.peer_settings_seen = true;
-            (void)w.emit<kFrameHeaderSize>(write_settings_ack);
-            return Http2Error::NoError;
+            return w.emit<kFrameHeaderSize>(write_settings_ack) ? Http2Error::NoError
+                                                                : Http2Error::InternalError;
         }
 
         case Http2FrameType::Headers: {
@@ -961,9 +962,10 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 c.last_stream_id = h.stream_id;
                 new_stream = true;
                 if (!s) {
-                    (void)w.emit<kShortControlFrame>(
-                        write_rst_stream, h.stream_id, Http2Error::RefusedStream);
-                    return Http2Error::NoError;
+                    return w.emit<kShortControlFrame>(
+                               write_rst_stream, h.stream_id, Http2Error::RefusedStream)
+                               ? Http2Error::NoError
+                               : Http2Error::InternalError;
                 }
             }
             if (s->got_headers) {
@@ -1069,12 +1071,14 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
 
             Http2Stream* s = c.find_stream(h.stream_id);
             if (!s || s->state == Http2StreamState::HalfClosedRemote) {
-                (void)w.emit<kShortControlFrame>(
-                    write_rst_stream, h.stream_id, Http2Error::StreamClosed);
+                if (!w.emit<kShortControlFrame>(
+                        write_rst_stream, h.stream_id, Http2Error::StreamClosed))
+                    return Http2Error::InternalError;
                 // Still replenish the connection window for the consumed octets.
                 c.conn_recv_window += static_cast<i64>(h.length);
-                if (h.length > 0)
-                    (void)w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length);
+                if (h.length > 0 &&
+                    !w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length))
+                    return Http2Error::InternalError;
                 return Http2Error::NoError;
             }
 
@@ -1132,9 +1136,10 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 return Http2Error::FlowControlError;
             c.conn_recv_window += frame_payload.value();
             if (h.length > 0) {
-                (void)w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length);
-                if (!kEndStream)
-                    (void)w.emit<kShortControlFrame>(write_window_update, h.stream_id, h.length);
+                if (!w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length) ||
+                    (!kEndStream &&
+                     !w.emit<kShortControlFrame>(write_window_update, h.stream_id, h.length)))
+                    return Http2Error::InternalError;
             }
             return Http2Error::NoError;
         }
@@ -1177,16 +1182,17 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         case Http2FrameType::Ping: {
             if (h.stream_id != 0 || h.length != 8) return Http2Error::FrameSizeError;
             if (!(h.flags & http2_flag::kAck)) {
-                (void)w.emit<kLongControlFrame>([&](u8* out) {
-                    const Http2FrameHeader ack{
-                        .length = 8,
-                        .stream_id = 0,
-                        .type = static_cast<u8>(Http2FrameType::Ping),
-                        .flags = http2_flag::kAck,
-                    };
-                    (void)write_frame_header(out, ack);
-                    __builtin_memmove(out + kFrameHeader.index(), payload, 8);
-                });
+                if (!w.emit<kLongControlFrame>([&](u8* out) {
+                        const Http2FrameHeader ack{
+                            .length = 8,
+                            .stream_id = 0,
+                            .type = static_cast<u8>(Http2FrameType::Ping),
+                            .flags = http2_flag::kAck,
+                        };
+                        const u32 kHeaderLen = write_frame_header(out, ack);
+                        __builtin_memmove(out + range_int{kHeaderLen}.index(), payload, 8);
+                    }))
+                    return Http2Error::InternalError;
             }
             return Http2Error::NoError;
         }
@@ -1212,12 +1218,20 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     OutWriter w{out, out_cap, 0};
     u32 pos = 0;
 
+    if (recv_credit_failed) {
+        goaway_sent =
+            w.emit<kLongControlFrame>(write_goaway, last_stream_id, Http2Error::FlowControlError) ||
+            goaway_sent;
+        *out_written = w.len;
+        return {0, true};
+    }
+
     if (!preface_seen) {
         const ParseStatus kPs = match_client_preface(in, len);
         if (kPs == ParseStatus::Error) {
-            (void)w.emit<kLongControlFrame>(
-                write_goaway, last_stream_id, Http2Error::ProtocolError);
-            goaway_sent = true;
+            goaway_sent = w.emit<kLongControlFrame>(
+                              write_goaway, last_stream_id, Http2Error::ProtocolError) ||
+                          goaway_sent;
             *out_written = w.len;
             return {0, true};
         }
@@ -1247,13 +1261,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                     s.state == Http2StreamState::HalfClosedLocal) {
                     i32 next_window;
                     if (!(range_int(s.recv_window) + range_int(s.recv_credit)).to(&next_window)) {
-                        (void)w.emit<kLongControlFrame>(
-                            write_goaway, last_stream_id, Http2Error::FlowControlError);
-                        goaway_sent = true;
+                        goaway_sent =
+                            w.emit<kLongControlFrame>(
+                                write_goaway, last_stream_id, Http2Error::FlowControlError) ||
+                            goaway_sent;
                         *out_written = w.len;
                         return {pos, true};
                     }
-                    (void)w.emit<kShortControlFrame>(write_window_update, s.id, s.recv_credit);
+                    if (!w.emit<kShortControlFrame>(write_window_update, s.id, s.recv_credit))
+                        continue;
                     s.recv_window = next_window;
                 }
                 s.recv_credit = 0;
@@ -1266,9 +1282,9 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
             ParseStatus::Complete)
             break;
         if (h.length > our_settings.max_frame_size) {
-            (void)w.emit<kLongControlFrame>(
-                write_goaway, last_stream_id, Http2Error::FrameSizeError);
-            goaway_sent = true;
+            goaway_sent = w.emit<kLongControlFrame>(
+                              write_goaway, last_stream_id, Http2Error::FrameSizeError) ||
+                          goaway_sent;
             *out_written = w.len;
             return {pos, true};
         }
@@ -1320,9 +1336,12 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         const Http2Error kErr = handle_frame(
             *this, h, in + static_cast<i64>(pos) + static_cast<i64>(kFrameHeaderSize), w);
         pos = (range_int(pos) + frame_size).min(range_int(len)).to<u32>();
-        if (kErr != Http2Error::NoError) {
-            (void)w.emit<kLongControlFrame>(write_goaway, last_stream_id, kErr);
-            goaway_sent = true;
+        if (kErr != Http2Error::NoError || recv_credit_failed) {
+            goaway_sent = w.emit<kLongControlFrame>(
+                              write_goaway,
+                              last_stream_id,
+                              recv_credit_failed ? Http2Error::FlowControlError : kErr) ||
+                          goaway_sent;
             *out_written = w.len;
             return {pos, true};
         }

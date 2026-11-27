@@ -4038,7 +4038,7 @@ TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
 }
 
 TEST(grpc_proxy, rejected_response_data_returns_connection_credit) {
-    auto run = [&_tc](u32 buffered) {
+    auto run = [&_tc](u32 buffered, bool corrupt_accounting) {
         GrpcDriveFixture loop;
         Connection upstream;
         upstream.reset();
@@ -4084,23 +4084,32 @@ TEST(grpc_proxy, rejected_response_data_returns_connection_credit) {
             REQUIRE_EQ(stream->recv_unconsumed, buffered);
         }
 
-        REQUIRE_FALSE(h.process(input, kFrameLength, output, sizeof(output), &written).close);
+        if (corrupt_accounting) stream->recv_unconsumed = 0;
+        const auto kResult = h.process(input, kFrameLength, output, sizeof(output), &written);
+        CHECK_EQ(kResult.close, corrupt_accounting);
         CHECK_EQ(x.failure, 13u);
         CHECK(x.response_end);
         CHECK(x.upstream == nullptr);
         CHECK_EQ(loop.released, 1u);
         CHECK_EQ(x.download_len, buffered);
         CHECK_EQ(stream->recv_unconsumed, 0u);
-        CHECK_EQ(h.conn_recv_window, kInitialWindow);
         Http2FrameHeader update{};
+        if (corrupt_accounting) {
+            REQUIRE_EQ(parse_frame_header(output, written, &update), ParseStatus::Complete);
+            CHECK_EQ(Http2FrameType{update.type}, Http2FrameType::Goaway);
+            CHECK(h.goaway_sent);
+            return;
+        }
+        CHECK_EQ(h.conn_recv_window, kInitialWindow);
         REQUIRE_EQ(parse_frame_header(output, written, &update), ParseStatus::Complete);
         CHECK_EQ(Http2FrameType{update.type}, Http2FrameType::WindowUpdate);
         CHECK_EQ(update.stream_id, 0u);
         CHECK(h.open_stream(3) == stream);
     };
 
-    run(0);
-    run(1);
+    run(0, false);
+    run(1, false);
+    run(1, true);
 }
 
 TEST(grpc_proxy, encoded_terminal_response_releases_stream_slot_for_queued_rpc) {
