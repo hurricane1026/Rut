@@ -40,16 +40,16 @@ enum class ExactPathNormalizationResult : u8 {
 // coherence checks prevent address arithmetic from wrapping; they cannot prove
 // that arbitrary addresses refer to mapped storage, so callers still own valid
 // storage provenance for every supplied range.
-inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
-                                                                 char* output,
-                                                                 u32 output_capacity,
-                                                                 u32* output_len) {
+[[nodiscard]] inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
+                                                                               char* output,
+                                                                               u32 output_capacity,
+                                                                               u32* output_len) {
     if (raw.ptr == nullptr || raw.len == 0 || output == nullptr || output_len == nullptr)
         return ExactPathNormalizationResult::InvalidInput;
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
     uintptr_t raw_end = 0;
-    if (add_overflow(raw_begin, static_cast<uintptr_t>(raw.len), &raw_end))
+    if (add_overflow(raw_begin, raw.len, &raw_end))
         return ExactPathNormalizationResult::InvalidInput;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
@@ -75,13 +75,14 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
 
     // Refuse aliased storage so the transactional input/output guarantees are
     // preserved even when a caller accidentally supplies an in-place range.
+    // The size bound does not constrain the uintptr_t value of either address.
     const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output);
     const uintptr_t output_len_begin = reinterpret_cast<uintptr_t>(output_len);
     uintptr_t output_end = 0;
     uintptr_t output_len_end = 0;
-    if (add_overflow(output_begin, static_cast<uintptr_t>(normalized_len), &output_end) ||
-        add_overflow(
-            output_len_begin, static_cast<uintptr_t>(sizeof(*output_len)), &output_len_end))
+    if (add_overflow(output_begin, normalized_len, &output_end))
+        return ExactPathNormalizationResult::InvalidInput;
+    if (add_overflow(output_len_begin, sizeof(*output_len), &output_len_end))
         return ExactPathNormalizationResult::InvalidInput;
     const auto ranges_overlap = [](uintptr_t first_begin,
                                    uintptr_t first_end,
