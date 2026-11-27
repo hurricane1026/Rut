@@ -448,9 +448,11 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                 // not (`!x`) never directly follows a value token without
                 // whitespace, so "value token immediately before, no gap"
                 // identifies the postfix reading.
-                const Token* last = out.tokens.len > 0
-                                        ? &out.tokens[(range_int(out.tokens.len) - kOne).value()]
-                                        : nullptr;
+                range_int<1, i64{UINT32_MAX} + 1> token_count;
+                const Token* last =
+                    decltype(token_count)::try_from_i64(out.tokens.len, &token_count)
+                        ? &out.tokens[(token_count - kOne).index()]
+                        : nullptr;
                 // String/regex tokens store `end` at the closing quote, so
                 // the character after the literal starts at end + 1.
                 const bool last_is_quoted =

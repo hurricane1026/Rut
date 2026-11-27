@@ -15,8 +15,9 @@ MESSAGE = 'u64 to i64 conversion requires a range proof'
 OVERFLOW_MESSAGE = 'checked arithmetic requires an explicit return from a nodiscard function'
 ARITHMETIC_MESSAGE = 'integer arithmetic needs a range proof'
 NARROWING_MESSAGE = 'integer arithmetic result may not fit the destination'
+INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
-MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, *ARITHMETIC_MESSAGES)
+MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -144,8 +145,6 @@ def main():
     changed = changed_source_lines(base) if base else {}
     if not changed:
         overflow_check = []
-    if not args.arithmetic_inventory and not args.require_arithmetic_proofs:
-        arithmetic_check = []
 
     commands = set()
     entries = json.loads((args.build / 'compile_commands.json').read_text())
@@ -222,6 +221,8 @@ def main():
     if args.overflow_base:
         unchecked = sum(message == OVERFLOW_MESSAGE for *_, message in failures)
         print(f'{unchecked} unchecked arithmetic result paths on changed lines')
+    indices = sum(message == INDEX_MESSAGE for *_, message in failures)
+    print(f'{indices} array indices bypass range_int::index() or at()')
     direct = check_builtin_locations()
     for location in direct:
         print(location)

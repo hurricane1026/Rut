@@ -60,7 +60,7 @@ ParseStatus ws_parse_header(
         for (u8 i = 0; i < 8; ++i) {
             const auto kPosition = range_int<2, 3>{} + range_int(i);
             // RUT_INTEGER_RANGE: each iteration appends one of exactly eight wire bytes.
-            wire_length = (wire_length << 8) | buf[kPosition.value()];
+            wire_length = (wire_length << 8) | buf[kPosition.index()];
         }
         if (!try_u64_to_i64(wire_length, &payload_len)) return ParseStatus::Error;
         offset = 10;
@@ -96,7 +96,7 @@ void ws_unmask_chunk(u8* payload, u64 len, const u8 mask_key[4], u64 offset) {
     const auto phase = bounded_remainder<kKeySize>(offset);
     for (u64 i = 0; i < len; i++) {
         const auto combined = phase + bounded_remainder<kKeySize>(i);
-        payload[i] ^= mask_key[bounded_remainder<kKeySize>(combined.to_u64()).value()];
+        payload[i] ^= mask_key[bounded_remainder<kKeySize>(combined.to_u64()).index()];
     }
 }
 
@@ -138,7 +138,7 @@ u32 ws_write_header(u8* out,
             const auto kPosition = range_int<2, 3>{} + range_int(i);
             const auto kShift = (range_int<7, 8>{} - range_int(i)).scaled_by<8>();
             // RUT_INTEGER_RANGE: the loop bounds the shift count to [0, 56].
-            out[kPosition.value()] = static_cast<u8>(payload_len >> kShift.value());
+            out[kPosition.index()] = static_cast<u8>(payload_len >> kShift.value());
         }
         offset = 10;
     }

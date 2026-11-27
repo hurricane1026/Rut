@@ -44,7 +44,7 @@ inline bool access_log_sink_path_valid(Str path) {
         path.ptr[0] != '/')
         return false;
     const range_int<1, kAccessLogSinkPathMax> kLast = length - range_int<1, 2>{};
-    if (path.ptr[kLast.value()] == '/') return false;
+    if (path.ptr[kLast.index()] == '/') return false;
     if (path.eq({"/dev/stderr", 11u})) return false;
 
     u32 segment_start = 1u;

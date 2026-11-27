@@ -284,10 +284,10 @@ bool tls_capture_verified_client_fingerprint(SSL* ssl, char out_hex[64], bool& o
     if (!kOk) return false;
     static constexpr char kHex[] = "0123456789abcdef";
     constexpr auto kNext = range_int<1, 2>::constant<1>();
-    for (i32 i = 0; i < 32; ++i) {
+    for (u8 i = 0; i < 32; ++i) {
         const auto offset = range_int(i).scaled_by<2>();
-        out_hex[offset.value()] = kHex[digest[i] >> 4];
-        out_hex[(offset + kNext).value()] = kHex[digest[i] & 0x0f];
+        out_hex[offset.index()] = kHex[digest[i] >> 4];
+        out_hex[(offset + kNext).index()] = kHex[digest[i] & 0x0f];
     }
     out_valid = true;
     return true;

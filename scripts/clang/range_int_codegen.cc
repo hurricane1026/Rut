@@ -191,6 +191,14 @@ u32 compare_proven_narrow(u16 left, u16 right) {
 #endif
 }
 
+i64 compare_proven_index(u16 position) {
+#ifdef RUT_USE_RANGE_INT
+    return range_int(position).index();
+#else
+    return position;
+#endif
+}
+
 Full compare_scale(Signed value) {
 #ifdef RUT_USE_RANGE_INT
     return value.scaled_by<8>();

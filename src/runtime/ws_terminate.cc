@@ -428,7 +428,7 @@ namespace {
         dst[static_cast<i64>(prefix.len) + static_cast<i64>(i)] = payload[i];
     const auto suffix_offset = range_int(prefix.len) + range_int(payload_len);
     for (u32 i = 0; i < suffix.len; i++)
-        dst[(suffix_offset + range_int(i)).value()] = static_cast<u8>(suffix.ptr[i]);
+        dst[(suffix_offset + range_int(i)).index()] = static_cast<u8>(suffix.ptr[i]);
     if (masked) ws_unmask(dst, output_len, key);
     *produced = static_cast<u32>(static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
                                  static_cast<i64>(output_len));

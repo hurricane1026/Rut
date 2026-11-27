@@ -70,6 +70,70 @@ u8 narrowed_underflow(u8 a, u8 b) {
     return a - b;  // expected-warning {{integer arithmetic result may not fit the destination}}
 }
 
+int negative_path_index(const int* data, u32 length) {
+    if (length < 2 || length > 255) return 0;
+    const auto last = range_int(length) - range_int<1, 2>{};
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return data[last.value()];
+}
+
+int negative_index_through_alias(const int* data, range_int<-1, 5> index) {
+    const auto at = index.value();
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return data[static_cast<u32>(at)];
+}
+
+int negative_index_through_unmodified_local(const int* data, range_int<-1, 5> index) {
+    auto at = index.value();
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return data[at];
+}
+
+int range_value_still_requires_index(const int* data, range_int<0, 4> index) {
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return data[index.value() & 3];
+}
+
+int proven_array_access(const int (&data)[4], range_int<0, 4> index) {
+    return index.at(data);
+}
+
+int proven_path_index(const int* data, u32 length) {
+    range_int<2, 256> validated;
+    if (!decltype(validated)::try_from_i64(length, &validated)) return 0;
+    const auto last = validated - range_int<1, 2>{};
+    const auto at = last.index();
+    return data[at];
+}
+
+template <typename T>
+concept CanIndex = requires(T value) { value.index(); };
+
+static_assert(CanIndex<range_int<0, 5>>);
+static_assert(CanIndex<range_int<1, 255>>);
+static_assert(!CanIndex<range_int<-1, 255>>);
+static_assert(range_int<0, 5>::constant<3>().index() == 3);
+
+struct Indices {
+    int operator[](i64 index) const;
+    int operator[](i64 row, i64 column) const;
+};
+
+int negative_overloaded_index(const Indices& values, range_int<-1, 5> index) {
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return values[index.value()];
+}
+
+int explicit_overloaded_index(const Indices& values, range_int<0, 5> index) {
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return values.operator[](index.value());
+}
+
+int multidimensional_index(const Indices& values, range_int<0, 5> row, range_int<0, 3> column) {
+    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    return values[row.index(), column.value()];
+}
+
 void bounded_loop(unsigned end) {
     for (unsigned i = 0; i < end; ++i) {
     }

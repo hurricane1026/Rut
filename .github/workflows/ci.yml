@@ -270,7 +270,7 @@ jobs:
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_ring_iterator
           python3 scripts/check_ring_iterators.py build/check_ring_iterator build
           python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-22 --clang-check clang-check-22 --inventory runtime-arithmetic.txt
-      - name: Check integer range proofs and arithmetic error returns
+      - name: Check integer range proofs, error returns, and array indices
         if: matrix.compiler == 'clang' && matrix.shard == 1
         env:
           OVERFLOW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}

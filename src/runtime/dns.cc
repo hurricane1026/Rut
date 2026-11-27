@@ -84,12 +84,12 @@ bool copy_dns_name(char (&destination)[254], const char* source) {
 }  // namespace
 bool dns_hostname(char* name) {
     // Allow one extra character for the final root dot.
-    range_int<0, 255> length;
+    range_int<1, 255> length;
     if (!name || !decltype(length)::try_from_u64(strnlen(name, 255), &length)) return false;
     const auto kLast = length - range_int<1, 2>{};
-    const bool kRootDot = length.value() && name[kLast.value()] == '.';
+    const bool kRootDot = name[kLast.index()] == '.';
     const i64 len = kRootDot ? kLast.value() : length.value();
-    if (kRootDot) name[len] = 0;
+    if (kRootDot) name[kLast.index()] = 0;
     if (!len || len > 253) return false;
     bool alphabetic = false;
     u32 label = 0;

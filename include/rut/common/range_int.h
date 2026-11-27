@@ -130,6 +130,13 @@ public:
 
     constexpr i64 value() const { return value_; }
 
+    // A pointer or container index must have a nonnegative lower bound.
+    constexpr i64 index() const
+        requires(Begin >= 0)
+    {
+        return value_;
+    }
+
     // Only expose the conversion if the destination can represent every value.
     template <detail::RangeSource T>
         requires(Begin >= detail::kRangeSourceBegin<T> && End <= detail::kRangeSourceEnd<T>)
