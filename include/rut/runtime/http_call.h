@@ -28,12 +28,12 @@ public:
     ~HttpCallWorker() { stop(); }
     core::Expected<void, Error> start();
     void stop();
-    HttpCallReply call(u32 connection,
-                       u64 generation,
-                       const HttpsEndpoint& endpoint,
-                       Str request,
-                       u64 now_ms,
-                       u32 timeout_ms);
+    [[nodiscard]] HttpCallReply call(u32 connection,
+                                     u64 generation,
+                                     const HttpsEndpoint& endpoint,
+                                     Str request,
+                                     u64 now_ms,
+                                     u32 timeout_ms);
     void cancel(u32 connection, u64 generation = 0);
 
 private:

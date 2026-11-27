@@ -31,7 +31,7 @@ static u64 saturating_mul_u64(u64 value, u64 scale) {
     return mul_overflow(value, scale, &result) ? UINT64_MAX : result;
 }
 
-static u64 timespec_to_units(const timespec& ts, u64 scale) {
+[[nodiscard]] static u64 timespec_to_units(const timespec& ts, u64 scale) {
     if (ts.tv_sec < 0 || ts.tv_nsec < 0) return 0;
     const u64 seconds = static_cast<u64>(ts.tv_sec);
     const u64 fraction = scale == 1'000'000'000ULL ? static_cast<u64>(ts.tv_nsec)

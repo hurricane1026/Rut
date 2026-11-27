@@ -7,7 +7,7 @@ namespace rut {
 namespace detail {
 
 // Only physical extents may change before a receive completion is accepted.
-constexpr bool record_direct_write_extent(
+[[nodiscard]] constexpr bool record_direct_write_extent(
     u64 begin, u64 address, u32 capacity, u32 count, u32& tail_dirty, u32& node_dirty) {
     if (address < begin) return false;
     u64 raw_offset = 0;

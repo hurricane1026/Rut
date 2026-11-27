@@ -291,16 +291,16 @@ bool Rs256Policies::activate(u32 shard) {
     return true;
 }
 
-bool Rs256Policies::verify(u32 shard,
-                           Str configuration,
-                           json::Document& document,
-                           Str token,
-                           i64 now,
-                           char* payload,
-                           u32 capacity,
-                           u32& length,
-                           u64 monotonic_ms) {
-    length = 0;
+[[nodiscard]] bool Rs256Policies::verify(u32 shard,
+                                         Str configuration,
+                                         json::Document& document,
+                                         Str token,
+                                         i64 now,
+                                         char* payload,
+                                         u32 capacity,
+                                         u32* length,
+                                         u64 monotonic_ms) {
+    *length = 0;
     document.valid = false;
     document.count = 0;
     document.source = {};
@@ -328,12 +328,12 @@ bool Rs256Policies::verify(u32 shard,
                                    now,
                                    payload,
                                    capacity,
-                                   length,
+                                   *length,
                                    kid,
                                    policies_[i].required_type()) &&
             policies_[i].permits(document))
             return true;
-        length = 0;
+        *length = 0;
         document.valid = false;
         document.count = 0;
         document.source = {};

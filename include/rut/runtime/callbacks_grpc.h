@@ -1217,15 +1217,15 @@ inline bool grpc_upstream_reusable(const Connection& conn,
 }
 
 template <typename Loop>
-bool grpc_start_impl(Loop* loop,
-                     Connection& down,
-                     u32 sid,
-                     const RouteConfig* cfg,
-                     u16 uid,
-                     const hpack::Header* hs,
-                     u32 nh,
-                     const ParsedRequest& req,
-                     bool end) {
+[[nodiscard]] bool grpc_start_impl(Loop* loop,
+                                   Connection& down,
+                                   u32 sid,
+                                   const RouteConfig* cfg,
+                                   u16 uid,
+                                   const hpack::Header* hs,
+                                   u32 nh,
+                                   const ParsedRequest& req,
+                                   bool end) {
     auto* downstream_stream = down.h2->find_stream(sid);
     const bool kWebsocket =
         RUT_ENABLE_WEBSOCKET && downstream_stream && downstream_stream->websocket;

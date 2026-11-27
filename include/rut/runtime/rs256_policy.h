@@ -64,15 +64,15 @@ public:
     ~Rs256Policies() { destroy(); }
     bool load(const Str* configurations, u32 count);
     bool activate(u32 shard);
-    bool verify(u32 shard,
-                Str configuration,
-                json::Document& document,
-                Str token,
-                i64 now,
-                char* payload,
-                u32 capacity,
-                u32& length,
-                u64 monotonic_ms = ~u64{0});
+    [[nodiscard]] bool verify(u32 shard,
+                              Str configuration,
+                              json::Document& document,
+                              Str token,
+                              i64 now,
+                              char* payload,
+                              u32 capacity,
+                              u32* length,
+                              u64 monotonic_ms = ~u64{0});
     // Shard maintenance only: never called from the verifier. No blocking DNS,
     // readiness waits, lazy initialization or token-triggered refresh.
     void maintain(u32 shard, u64 monotonic_ms = ~u64{0});

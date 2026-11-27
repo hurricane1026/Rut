@@ -38,7 +38,7 @@ public:
     HttpCallWorker http_calls;
     NetClientWorker net_clients;
     void stop();
-    PasswordGatewayReply verify(
+    [[nodiscard]] PasswordGatewayReply verify(
         u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms);
     void cancel(u32 connection);
     void cancel_request(u32 connection, u64 generation);

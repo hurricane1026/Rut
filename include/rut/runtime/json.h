@@ -476,19 +476,17 @@ struct Document {
         }
         return n;
     }
-    static bool index(Str s, u32& n) {
+    [[nodiscard]] static bool index(Str s, u32* out) {
         if (s.len == 0 || (s.len > 1 && s.ptr[0] == '0')) return false;
-        n = 0;
+        u32 result = 0;
         for (u32 i = 0; i < s.len; ++i) {
-            if (s.ptr[i] < '0' || s.ptr[i] > '9' || n > 429496729u) return false;
-            const u32 digit = static_cast<u32>(s.ptr[i] - '0');
-            if (n == 429496729u && digit > 5) return false;
-            u64 next = 0;
-            if (mul_overflow(n, u64{10}, &next) ||
-                add_overflow(next, static_cast<u64>(digit), &next))
-                return false;
-            n = next;
+            const u8 byte = byte_value(s.ptr[i]);
+            if (byte < '0' || byte > '9') return false;
+            static_assert('0' == 0x30 && '9' == 0x39);
+            const auto digit = bounded_remainder<16>(byte);
+            if (!(range_int(result).scaled_by<10>() + digit).to(&result)) return false;
         }
+        *out = result;
         return true;
     }
     // RFC 6901 string form, not URI-fragment form. Empty pointer selects root.
@@ -516,7 +514,7 @@ struct Document {
             const Str key{other, token.len};
             if (nodes[id].kind == Kind::Array) {
                 u32 n;
-                if (!index(key, n)) return kNone;
+                if (!index(key, &n)) return kNone;
                 id = at(id, n);
             } else if (nodes[id].kind == Kind::Object) {
                 u32 found = kNone;

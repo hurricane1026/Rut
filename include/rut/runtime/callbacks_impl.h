@@ -2885,7 +2885,9 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
 template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
-inline u32 request_completion_duration_us(u64 now_us, u64 start_us, bool owns_completion) {
+[[nodiscard]] inline u32 request_completion_duration_us(u64 now_us,
+                                                        u64 start_us,
+                                                        bool owns_completion) {
     if (!owns_completion) return 0;
     u64 duration_us = 0;
     if (sub_overflow(now_us, start_us, &duration_us)) return 0;
@@ -8873,9 +8875,10 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     bool measuring = true;
     auto append = [&](const u8* p, u32 n) {
         if (measuring) {
-            u32 next = 0;
-            if (add_overflow(measured_len, n, &next)) return false;
-            measured_len = next;
+            const auto capacity = range_int(conn.send_buf.capacity_u32());
+            const auto end = range_int(measured_len) + range_int(n);
+            if (end.value() > capacity.value()) return false;
+            measured_len = end.min(capacity).to<u32>();
             return true;
         }
         if (conn.send_buf.len() > conn.send_buf.capacity() ||

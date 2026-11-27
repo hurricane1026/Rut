@@ -44,7 +44,7 @@ bool offered(const ParsedRequest& request, Str required) {
     }
     return false;
 }
-bool begin_close(WsH2Session& session, u16 code, Str reason) {
+[[nodiscard]] bool begin_close(WsH2Session& session, u16 code, Str reason) {
     auto& c = session.callback;
     if (c.ws_closing) return true;
     u64 deadline = 0;

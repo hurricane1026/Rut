@@ -109,7 +109,7 @@ u32 PasswordGateway::active_requests() const {
         if (entry.active) ++count;
     return count;
 }
-PasswordGatewayReply PasswordGateway::verify(
+[[nodiscard]] PasswordGatewayReply PasswordGateway::verify(
     u32 connection, u64 generation, Str password, Str record, u64 now_ms, u32 timeout_ms) {
     if (generation == 0) return {};
     if (worker.completion_fd() >= 0 && !worker.drain_completions()) {

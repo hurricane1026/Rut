@@ -8468,7 +8468,10 @@ public:
 
     // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
     // since they were armed. Returns false once a per-tick budget is exhausted.
-    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
+    [[nodiscard]] bool idle_trim_walk_list(u32 expiry,
+                                           u64 deadline_ns,
+                                           u32* examined,
+                                           u32* queued) {
         ListNode* head =
             &timer.slots[expiry & static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
@@ -8476,16 +8479,16 @@ public:
         const i64 node_offset = TimerWheel::timer_node_offset();
         ListNode* node = head->next;
         for (;;) {
-            if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
+            if (*examined == kIdleTrimMaxExamined || *queued == kIdleTrimMaxTrims) return false;
             auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
             if (c->idle_trim_examined) return true;  // reached the examined region
             ListNode* const next = node->next;
             const bool at_end = node == last;
             c->idle_trim_examined = true;
             node->move_to_tail(*head);
-            examined++;
+            ++*examined;
             idle_trim_examined++;
-            if (idle_trim_connection(*c)) queued++;
+            if (idle_trim_connection(*c)) ++*queued;
             // The time budget is checked after the node, so every tick makes progress.
             const u64 flush_cost = static_cast<u64>(idle_trim_nranges) * kIdleTrimFlushNsPerRange;
             u64 projected_deadline = 0;
@@ -8518,7 +8521,7 @@ public:
         u32 examined = 0;
         u32 queued = 0;
         for (u32 expiry = kWindow.begin; expiry != kWindow.end; ++expiry) {
-            if (!idle_trim_walk_list(expiry, deadline_ns, examined, queued)) break;
+            if (!idle_trim_walk_list(expiry, deadline_ns, &examined, &queued)) break;
         }
         idle_trim_flush();
     }

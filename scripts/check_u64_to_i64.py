@@ -182,9 +182,6 @@ def main():
     base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
                                     cwd=ROOT, text=True).strip() if args.overflow_base else None)
     changed = changed_source_lines(base) if base else {}
-    status_changes = nodiscard_changed if args.nodiscard_base else changed
-    if not changed:
-        overflow_check = []
 
     commands = set()
     entries = json.loads((args.build / 'compile_commands.json').read_text())
@@ -227,12 +224,6 @@ def main():
                     continue
                 if inherited_overflow_call(base, path, span):
                     continue
-            if message == OVERFLOW_NODISCARD_MESSAGE:
-                # Check the edited status path as well as edited signatures.
-                first, last = (span[0], span[2]) if span else (line, line)
-                if not any(interval and interval.start <= last and first < interval.stop
-                           for interval in status_changes.get(path, ())):
-                    continue
             sites.add((path, line, int(column), span, message))
         return sites
 
@@ -272,7 +263,7 @@ def main():
     enforced = sum(site[-1] == NODISCARD_MESSAGE for site in failures)
     print(f'{enforced} changed declarations missing [[nodiscard]] ({len(nodiscard)} in production)')
     missing_status = sum(site[-1] == OVERFLOW_NODISCARD_MESSAGE for site in failures)
-    print(f'{missing_status} changed checked arithmetic status paths missing [[nodiscard]]')
+    print(f'{missing_status} checked arithmetic status paths missing [[nodiscard]]')
     discards = sum(site[-1] == VOID_DISCARD_MESSAGE for site in failures)
     print(f'{discards} void casts discarding [[nodiscard]] results')
 

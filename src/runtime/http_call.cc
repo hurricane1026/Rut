@@ -273,12 +273,12 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
         }
     }
 }
-HttpCallReply HttpCallWorker::call(u32 connection,
-                                   u64 generation,
-                                   const HttpsEndpoint& endpoint,
-                                   Str request,
-                                   u64 now,
-                                   u32 timeout) {
+[[nodiscard]] HttpCallReply HttpCallWorker::call(u32 connection,
+                                                 u64 generation,
+                                                 const HttpsEndpoint& endpoint,
+                                                 Str request,
+                                                 u64 now,
+                                                 u32 timeout) {
     HttpCallReply reply;
     if (!started || !generation || !now || !timeout || timeout > 60000) return reply;
     Slot* found = nullptr;

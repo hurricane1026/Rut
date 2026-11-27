@@ -32,7 +32,7 @@ bool retry_ssl(SSL* ssl, int result) {
 }
 }  // namespace
 
-u64 jwt_monotonic_ms() {
+[[nodiscard]] u64 jwt_monotonic_ms() {
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0 ||
         now.tv_nsec >= 1000000000 || static_cast<u64>(now.tv_sec) > (~u64{0} - 999) / 1000)

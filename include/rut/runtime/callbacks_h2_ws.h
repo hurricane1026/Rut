@@ -142,13 +142,13 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
     if (down) grpc_kick_downstream(loop, *down);
 }
 
-inline bool h2ws_h1_response_headers(Connection& c,
-                                     GrpcExchange& x,
-                                     const ParsedResponse& response,
-                                     hpack::Header* headers,
-                                     u32* count,
-                                     char* names,
-                                     u32 capacity) {
+[[nodiscard]] inline bool h2ws_h1_response_headers(Connection& c,
+                                                   GrpcExchange& x,
+                                                   const ParsedResponse& response,
+                                                   hpack::Header* headers,
+                                                   u32* count,
+                                                   char* names,
+                                                   u32 capacity) {
     if (response.headers_truncated || response.content_length_count > 1 ||
         (response.chunked && response.has_content_length))
         return false;

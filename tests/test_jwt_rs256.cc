@@ -855,25 +855,25 @@ TEST(jwt_rs256, configured_policies_activate_each_shard_and_keep_generations_ind
     char payload[8192];
     u32 length = 17;
     CHECK(
-        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), length));
+        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), &length));
     CHECK_EQ(length, 0u);
     REQUIRE(policies.activate(0));
     CHECK(
-        !policies.verify(1, text, document, fixture.first, 100, payload, sizeof(payload), length));
+        !policies.verify(1, text, document, fixture.first, 100, payload, sizeof(payload), &length));
     REQUIRE(policies.activate(1));
     allocations = 0;
     tracking = true;
     const bool first =
-        policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), length);
+        policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), &length);
     const bool second =
-        policies.verify(1, text, document, fixture.second, 100, payload, sizeof(payload), length);
+        policies.verify(1, text, document, fixture.second, 100, payload, sizeof(payload), &length);
     tracking = false;
     CHECK(first);
     CHECK(second);
     CHECK_EQ(allocations, 0u);
     CHECK(!policies.activate(kMaxShards));
     CHECK(!policies.verify(
-        kMaxShards, text, document, fixture.first, 100, payload, sizeof(payload), length));
+        kMaxShards, text, document, fixture.first, 100, payload, sizeof(payload), &length));
     CHECK(!document.valid);
     CHECK_EQ(length, 0u);
     // Drop the old key from a replacement policy, leaving in-flight old readers intact.
@@ -886,17 +886,17 @@ TEST(jwt_rs256, configured_policies_activate_each_shard_and_keep_generations_ind
     Rs256Policies newer;
     REQUIRE(newer.load(&next, 1));
     REQUIRE(newer.activate(0));
-    CHECK(!newer.verify(0, next, document, fixture.second, 100, payload, sizeof(payload), length));
+    CHECK(!newer.verify(0, next, document, fixture.second, 100, payload, sizeof(payload), &length));
     CHECK(
-        policies.verify(0, text, document, fixture.second, 100, payload, sizeof(payload), length));
-    CHECK(newer.verify(0, next, document, fixture.first, 100, payload, sizeof(payload), length));
+        policies.verify(0, text, document, fixture.second, 100, payload, sizeof(payload), &length));
+    CHECK(newer.verify(0, next, document, fixture.first, 100, payload, sizeof(payload), &length));
     // The owner copies its configuration bytes; compiler buffers can be released.
     replacement[0] = '!';
     char lookup[8192];
     __builtin_memcpy(lookup, replacement, updated.len);
     lookup[0] = '{';
     CHECK(newer.verify(
-        0, {lookup, updated.len}, document, fixture.first, 100, payload, sizeof(payload), length));
+        0, {lookup, updated.len}, document, fixture.first, 100, payload, sizeof(payload), &length));
 }
 
 TEST(jwt_rs256, separately_supplied_jwks_respects_trusted_policy_and_owns_inputs) {
@@ -1016,13 +1016,14 @@ TEST(jwt_rs256,
     char payload[8192];
     u32 length = 1;
     CHECK(
-        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), length));
+        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), &length));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
     REQUIRE(policies.activate(1));
-    CHECK(policies.verify(1, text, document, fixture.first, 100, payload, sizeof(payload), length));
     CHECK(
-        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), length));
+        policies.verify(1, text, document, fixture.first, 100, payload, sizeof(payload), &length));
+    CHECK(
+        !policies.verify(0, text, document, fixture.first, 100, payload, sizeof(payload), &length));
 }
 
 static Str policy_with_revocation(SelectedKeyFixture& fixture, Str options, char* bytes) {
@@ -1086,7 +1087,7 @@ TEST(jwt_rs256, revocation_requires_verified_ids_and_strict_issued_after_before_
             allocations = 0;
             tracking = true;
             const bool accepted = policies.verify(
-                shard, text, document, signed_token, 100, payload, sizeof(payload), length);
+                shard, text, document, signed_token, 100, payload, sizeof(payload), &length);
             tracking = false;
             CHECK_EQ(allocations, 0u);
             CHECK_EQ(accepted, i < 4);
@@ -1179,16 +1180,16 @@ TEST(jwt_rs256, revocation_snapshots_preserve_old_readers_and_own_configuration)
     REQUIRE(signed_token.len);
     json::Document document;
     u32 length = 0;
-    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), length));
+    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), &length));
     CHECK(
-        !next.verify(0, next_text, document, signed_token, 100, payload, sizeof(payload), length));
-    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), length));
+        !next.verify(0, next_text, document, signed_token, 100, payload, sizeof(payload), &length));
+    CHECK(old.verify(0, old_text, document, signed_token, 100, payload, sizeof(payload), &length));
     // Caller-owned bytes may disappear; IDs and lookup text remain owned.
     char saved[8192];
     __builtin_memcpy(saved, next_text.ptr, next_text.len);
     __builtin_memset(next_bytes, '!', next_text.len);
     CHECK(!next.verify(
-        0, {saved, next_text.len}, document, signed_token, 100, payload, sizeof(payload), length));
+        0, {saved, next_text.len}, document, signed_token, 100, payload, sizeof(payload), &length));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
 }
@@ -1212,7 +1213,7 @@ TEST(jwt_rs256, optional_revocation_controls_are_independent_and_bound_decoded_j
             lit_str(R"({"alg":"RS256","kid":"current"})"),
             lit_str(R"({"sub":"alice","iss":"issuer","aud":"gateway","exp":200,"iat":51})"),
             token);
-        CHECK_EQ(policies.verify(0, text, document, no_jti, 100, payload, sizeof(payload), length),
+        CHECK_EQ(policies.verify(0, text, document, no_jti, 100, payload, sizeof(payload), &length),
                  control != 1);
         for (u32 size = 128; size <= 129; ++size) {
             char claims[2048];
@@ -1229,7 +1230,7 @@ TEST(jwt_rs256, optional_revocation_controls_are_independent_and_bound_decoded_j
                                         token);
             REQUIRE(value.len);
             CHECK_EQ(
-                policies.verify(0, text, document, value, 100, payload, sizeof(payload), length),
+                policies.verify(0, text, document, value, 100, payload, sizeof(payload), &length),
                 control == 0 || (control == 1 && size == 128));
         }
     }
@@ -1311,7 +1312,7 @@ TEST(jwt_rs256, explicit_type_binds_protected_header_before_identity_publication
                                                       100,
                                                       payload,
                                                       sizeof(payload),
-                                                      length);
+                                                      &length);
                 tracking = false;
                 CHECK_EQ(allocations, 0u);
                 CHECK_EQ(accepted, policy ? item.typed : item.plain);
@@ -1332,7 +1333,7 @@ TEST(jwt_rs256, explicit_type_binds_protected_header_before_identity_publication
     REQUIRE(value.len);
     json::Document document;
     u32 length = 99;
-    CHECK(!policies.verify(0, typed, document, value, 100, payload, sizeof(payload), length));
+    CHECK(!policies.verify(0, typed, document, value, 100, payload, sizeof(payload), &length));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
 }

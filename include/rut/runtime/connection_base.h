@@ -617,7 +617,7 @@ struct ConnectionBase {
         };
 
         const auto* source_chars = reinterpret_cast<const char*>(source);
-        u32 remaining = response_header_buf.capacity();
+        u32 remaining = response_header_buf.capacity_u32();
         for (u8 i = 0; i < count; i++) {
             if (!survives_folding(i)) continue;
             const auto& value = resp_header_mutations[i].value;

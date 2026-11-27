@@ -12,18 +12,19 @@ bool ws_prepare_handshake_before_forward(Loop*, Connection&);
 template <typename Loop>
 void h1ws_h2_drive(Loop*, Connection&);
 
-inline u32 h1ws_h2_response(Connection& c,
-                            const hpack::Header* headers,
-                            u32 count,
-                            bool accepted,
-                            u8* output,
-                            u32 capacity) {
+[[nodiscard]] inline u32 h1ws_h2_response(Connection& c,
+                                          const hpack::Header* headers,
+                                          u32 count,
+                                          bool accepted,
+                                          u8* output,
+                                          u32 capacity) {
     u32 used = 0;
     auto put = [&](Str value) {
-        u32 available = 0;
-        if (sub_overflow(capacity, used, &available) || value.len > available) return false;
-        __builtin_memcpy(output + static_cast<i64>(used), value.ptr, value.len);
-        used = (range_int(used) + range_int(value.len)).min(range_int(capacity)).to<u32>();
+        const auto offset = range_int(used);
+        const auto end = offset + range_int(value.len);
+        if (end.value() > capacity) return false;
+        __builtin_memcpy(output + offset.index(), value.ptr, value.len);
+        used = end.min(range_int(capacity)).to<u32>();
         return true;
     };
     Str status{};

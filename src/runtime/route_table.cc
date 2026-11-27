@@ -1,12 +1,13 @@
 #include "rut/runtime/route_table.h"
 
 #include "core/expected.h"
-#include "rut/common/checked_arithmetic.h"
+#include "rut/common/byte_span.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
@@ -249,25 +250,12 @@ bool RouteConfig::copy_validated_strict_local_response_table_from_owned(const Ro
     // native pointer subtraction would itself be undefined even after the
     // address-range validation above.
     u32 offsets[kMaxStrictLocalResponsePolicies][4]{};
-    const uintptr_t source_base = reinterpret_cast<uintptr_t>(source.strict_local_response_bytes);
-    auto checked_offset = [&](Str value, u32* out) {
-        if (out == nullptr || !source.strict_local_response_bytes_owned(value)) return false;
-        const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
-        if (address < source_base) return false;
-        uintptr_t wide_offset = 0;
-        if (sub_overflow(address, source_base, &wide_offset)) return false;
-        if (wide_offset > source.strict_local_response_bytes_used ||
-            wide_offset > kStrictLocalResponseBytesPoolBytes)
-            return false;
-        const u32 offset = static_cast<u32>(wide_offset);
-        if (static_cast<i64>(value.len) >
-                static_cast<i64>(source.strict_local_response_bytes_used) -
-                    static_cast<i64>(offset) ||
-            static_cast<i64>(value.len) >
-                static_cast<i64>(kStrictLocalResponseBytesPoolBytes) - static_cast<i64>(offset))
-            return false;
-        *out = offset;
-        return true;
+    const u32 used = range_int(source.strict_local_response_bytes_used)
+                         .min(range_int(kStrictLocalResponseBytesPoolBytes))
+                         .to<u32>();
+    auto checked_offset = [&] [[nodiscard]] (Str value, u32 * out) {
+        return byte_span_offset_within(
+            source.strict_local_response_bytes, used, value.ptr, value.len, out);
     };
     for (u32 i = 0; i < source.strict_local_response_policy_count; i++) {
         const auto& src = source.strict_local_response_policies[i];

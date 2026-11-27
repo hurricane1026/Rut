@@ -427,13 +427,13 @@ bool HttpCachePolicy::make_key(
     return true;
 }
 
-bool HttpCachePolicy::read_response(const Key& key,
-                                    const Record& record,
-                                    u64 now_us,
-                                    bool keep_alive,
-                                    u8* output,
-                                    u32 capacity,
-                                    u32& written) {
+[[nodiscard]] bool HttpCachePolicy::read_response(const Key& key,
+                                                  const Record& record,
+                                                  u64 now_us,
+                                                  bool keep_alive,
+                                                  u8* output,
+                                                  u32 capacity,
+                                                  u32* written) {
     u64 kElapsed = ~u64{0};
     if (now_us >= record.stored_us && sub_overflow(now_us, record.stored_us, &kElapsed))
         return false;
@@ -450,7 +450,7 @@ bool HttpCachePolicy::read_response(const Key& key,
             return sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
         }());
     return kFresh &&
-           copy_response(record, now_us, keep_alive, key.http10, output, capacity, &written);
+           copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
 }
 bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& total) {
     ResponseInfo info;

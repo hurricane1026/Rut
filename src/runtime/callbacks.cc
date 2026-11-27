@@ -1,6 +1,6 @@
 #include "rut/common/byte_span.h"
-#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/callbacks_impl.h"  // IWYU pragma: keep
@@ -1103,30 +1103,30 @@ bool format_response_with_body_and_headers(Connection& conn,
         sizeof("Content-Type: text/plain; charset=utf-8\r\n") - 1;
     constexpr u32 kConnKeepAliveLine = 24;  // "Connection: keep-alive\r\n"
     constexpr u32 kConnCloseLine = 19;      // "Connection: close\r\n"
-    u64 needed = 0;
-    bool needed_overflow = false;
-    auto add_needed = [&](u64 value) {
-        if (!needed_overflow) needed_overflow = add_overflow(needed, value, &needed);
+    u32 remaining = conn.send_buf.capacity_u32();
+    bool fits = true;
+    auto reserve = [&](u32 bytes) {
+        if (fits) fits = (range_int(remaining) - range_int(bytes)).to(&remaining);
     };
-    add_needed(kStatusLineFixed);
-    add_needed(reason_len);
-    add_needed(kContentLengthPrefix);
-    add_needed(decimal_digit_count(body_len_emit));
-    add_needed(2);
-    if (emit_default_content_type) add_needed(kDefaultContentTypeLine);
+    reserve(kStatusLineFixed);
+    reserve(reason_len);
+    reserve(kContentLengthPrefix);
+    reserve(decimal_digit_count(body_len_emit));
+    reserve(2);
+    if (emit_default_content_type) reserve(kDefaultContentTypeLine);
     for (u32 i = 0; i < header_count; i++) {
         if (header_name_eq_literal_ci(headers[i].key_data, headers[i].key_len, "Content-Length")) {
             continue;
         }
-        add_needed(headers[i].key_len);
-        add_needed(2);
-        add_needed(headers[i].value_len);
-        add_needed(2);
+        reserve(headers[i].key_len);
+        reserve(2);
+        reserve(headers[i].value_len);
+        reserve(2);
     }
-    add_needed(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
-    add_needed(2);  // blank line terminator
-    if (!headers_only) add_needed(body_len_emit);
-    if (needed_overflow || needed > conn.send_buf.capacity()) {
+    reserve(keep_alive ? kConnKeepAliveLine : kConnCloseLine);
+    reserve(2);  // blank line terminator
+    if (!headers_only) reserve(body_len_emit);
+    if (!fits) {
         // Fail closed: force connection close and emit a small 500.
         // format_static_response uses the reason-phrase body which is
         // guaranteed to fit. Update conn state too — resp_status and

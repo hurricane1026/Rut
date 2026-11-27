@@ -24,13 +24,13 @@ struct HttpCachePolicy : HttpCacheStorage {
     static bool make_key(
         const u8* request, u32 length, u64 config, u32 route, bool tls, u32 peer, Key& key);
     static bool response_can_buffer(const u8* response, u32 length, u32& total);
-    static bool read_response(const Key& key,
-                              const Record& record,
-                              u64 now_us,
-                              bool keep_alive,
-                              u8* output,
-                              u32 capacity,
-                              u32& written);
+    [[nodiscard]] static bool read_response(const Key& key,
+                                            const Record& record,
+                                            u64 now_us,
+                                            bool keep_alive,
+                                            u8* output,
+                                            u32 capacity,
+                                            u32* written);
     [[nodiscard]] static bool prepare_record(
         const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record);
 };
@@ -57,7 +57,7 @@ public:
         const KeyView kStorageKey{key.bytes, key.len, key.hash, key.config, key.host};
         Record record;
         if (storage_.find(kStorageKey, record) &&
-            read_response(key, record, now_us, keep_alive, output, capacity, written))
+            read_response(key, record, now_us, keep_alive, output, capacity, &written))
             return Result::Hit;
         written = 0;
         if (key.only_cached) return Result::OnlyCachedMiss;

@@ -3459,7 +3459,7 @@ extern "C" void rut_helper_json(void* conn,
                                 static_cast<i64>(now.tv_sec),
                                 payload,
                                 sizeof(payload),
-                                length))
+                                &length))
             return;
         writer.text({payload, length});
         if (!writer.ok) return;
@@ -3480,7 +3480,7 @@ extern "C" void rut_helper_json(void* conn,
                                 static_cast<i64>(now.tv_sec),
                                 payload,
                                 sizeof(payload),
-                                length))
+                                &length))
             return;
         writer.text({payload, length});
         if (!writer.ok) return;

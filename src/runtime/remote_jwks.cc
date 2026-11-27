@@ -435,7 +435,7 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
     }
     return delay < cap_seconds ? delay : cap_seconds;
 }
-bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
+[[nodiscard]] bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
     if (!now || !last_success || now < last_success) return false;
     const u64 max_age_ms = range_int(max_age_seconds).scaled_by<1000>().to_u64();
     u64 age = 0;

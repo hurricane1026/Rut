@@ -143,7 +143,7 @@ struct CompleteContentLengthResponseClassification {
     u64 total = 0;
 };
 
-inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out) {
+[[nodiscard]] inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out) {
     if (position == nullptr || out == nullptr || value.ptr == nullptr || *position >= value.len)
         return false;
     u64 parsed = 0;
@@ -164,8 +164,8 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
     return true;
 }
 
-inline CompleteContentLengthResponseClassification classify_complete_content_length_response(
-    const ParsedResponse& response) {
+[[nodiscard]] inline CompleteContentLengthResponseClassification
+classify_complete_content_length_response(const ParsedResponse& response) {
     CompleteContentLengthResponseClassification classification{};
     if (response.version != HttpVersion::Http11 || response.headers_truncated ||
         !response.has_content_length || response.content_length_count != 1 ||

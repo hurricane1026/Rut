@@ -32,7 +32,8 @@ public:
     // One request at a time. Rejects another begin until take/reset detaches the
     // prior request, even if terminal. False means no new request was started.
     // A valid begin may record Unavailable when queue/input validation fails.
-    bool begin(PasswordWorker& worker, Str password, Str record, u64 now_ms, u32 timeout_ms) {
+    [[nodiscard]] bool begin(
+        PasswordWorker& worker, Str password, Str record, u64 now_ms, u32 timeout_ms) {
         u64 deadline = 0;
         if (status != PasswordRequestStatus::Idle || timeout_ms == 0 ||
             timeout_ms > kMaxTimeoutMs ||

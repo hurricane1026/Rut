@@ -123,5 +123,5 @@ private:
 bool strong_etag_valid(Str value);
 
 // Zero on invalid/failed clock. Callers fail closed on zero or time reversal.
-u64 jwt_monotonic_ms();
+[[nodiscard]] u64 jwt_monotonic_ms();
 }  // namespace rut

@@ -45,7 +45,7 @@ namespace epoll_yield {
 // their sizes from this single source so they can't drift.
 static constexpr u32 kMaxConns = kDefaultConnectionCapacity;
 
-inline u64 monotonic_ns() {
+[[nodiscard]] inline u64 monotonic_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     u64 seconds = 0;

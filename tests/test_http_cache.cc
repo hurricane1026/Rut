@@ -267,15 +267,15 @@ TEST(http_cache, invalid_storage_records_cannot_read_past_the_payload) {
     u8 output[HttpCache::kMaxResponse];
     u32 written;
     HttpCacheStorage::Record record{truncated, sizeof(truncated) - 1, 1, 10000000, 0};
-    CHECK(
-        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+    CHECK(!HttpCachePolicy::read_response(
+        key(), record, 100, true, output, sizeof(output), &written));
     record.response = nullptr;
-    CHECK(
-        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+    CHECK(!HttpCachePolicy::read_response(
+        key(), record, 100, true, output, sizeof(output), &written));
     record.response = truncated;
     record.response_len = HttpCache::kMaxResponse + 1;
-    CHECK(
-        !HttpCachePolicy::read_response(key(), record, 100, true, output, sizeof(output), written));
+    CHECK(!HttpCachePolicy::read_response(
+        key(), record, 100, true, output, sizeof(output), &written));
 }
 TEST(http_cache, rejected_storage_write_cannot_leave_a_published_response) {
     auto cache = std::make_unique<HttpResponseCache<RejectingStore>>();
