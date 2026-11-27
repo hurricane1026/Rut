@@ -20,6 +20,9 @@ get-and-touch as well as SET/ADD/REPLACE, DELETE and TOUCH over TCP or verified
 TLS. The Meta text profile adds acknowledged stores, arithmetic, deletion,
 no-op round trips and item diagnostics under the same budgets.
 
+The [Kafka and S3 clients](kafka-s3-clients.md) use bounded TCP frames and
+configured HTTPS callouts respectively.
+
 ## Endpoint configuration
 
 `tcp(policy, timeoutMs) -> TcpConnection?` connects a TCP client.

@@ -1078,6 +1078,7 @@ TEST(https_fetch, callout_request_rejects_transport_injection_and_preserves_body
         length));
     wire[length] = 0;
     CHECK(strstr(wire, "POST /check?x=1 HTTP/1.1\r\n") != nullptr);
+    CHECK(strstr(wire, "\r\nHost: localhost\r\n") != nullptr);
     CHECK(strstr(wire, "Content-Length: 16\r\n") != nullptr);
     CHECK(strstr(wire, "\r\n\r\n{\"user\":\"alice\"}") != nullptr);
     const Str bad[] = {lit_str(R"({"method":"CONNECT"})"),

@@ -1,0 +1,32 @@
+// Paths and query strings come from method-specific, configured presigned URLs.
+func getObject() -> Json {
+    guard let request = json.value({method: "GET"}) else { nil }
+    httpCall(env("S3_GET_ENDPOINT"), request, 5000)
+}
+
+func putObject(_ body: str) -> Json {
+    guard body.len <= 4096 else { nil }
+    guard let request = json.value({method: "PUT", body: body}) else { nil }
+    httpCall(env("S3_PUT_ENDPOINT"), request, 5000)
+}
+
+func deleteObject() -> Json {
+    guard let request = json.value({method: "DELETE"}) else { nil }
+    httpCall(env("S3_DELETE_ENDPOINT"), request, 5000)
+}
+
+func listObjects() -> Json {
+    guard let request = json.value({method: "GET"}) else { nil }
+    httpCall(env("S3_LIST_ENDPOINT"), request, 5000)
+}
+
+func hasStatus(_ reply: Json, _ expected: i32) -> bool {
+    guard let field = json.get(reply, "/status") else { false }
+    guard let status = json.int(field) else { false }
+    status == i64(expected)
+}
+
+func body(_ reply: Json) -> str {
+    guard let field = json.get(reply, "/body") else { nil }
+    json.string(field)
+}
