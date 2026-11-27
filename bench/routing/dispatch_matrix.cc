@@ -1,10 +1,12 @@
 // Canonical segment-prefix dispatch only. Input is emitted by run_matrix.py.
+#include "rut/common/checked_arithmetic.h"
 #include "rut/jit/art_jit_codegen.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_select.h"
 #include "rut/runtime/route_trie.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -26,8 +28,9 @@ jit::ArtJitMatchFn compiled;
 bool monotonic_now_ns(u64* result) {
     timespec now{};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
-    *result = static_cast<u64>(now.tv_sec) * 1000000000ULL + static_cast<u64>(now.tv_nsec);
-    return true;
+    u64 seconds;
+    return now.tv_nsec >= 0 && !mul_overflow(now.tv_sec, 1'000'000'000u, &seconds) &&
+           !add_overflow(seconds, now.tv_nsec, result);
 }
 bool pattern(const Entry& r, const Entry& p) {
     if (!dynamic_paths)
@@ -143,15 +146,16 @@ int main(int argc, char**) {
                         return 8;
                     }
                     const u64 elapsed = end - start;
-                    double ns = static_cast<double>(elapsed) / (f == 1 ? 8192.0 : 131072.0);
-                    printf("%s,%u,%s,%s,%u,%.4f,%llu\n",
+                    const double elapsed_ns = elapsed;
+                    const double ns = elapsed_ns / (f == 1 ? 8192.0 : 131072.0);
+                    printf("%s,%u,%s,%s,%u,%.4f,%" PRIu64 "\n",
                            profile,
                            count,
                            name,
                            names[f],
                            rep,
                            ns,
-                           (unsigned long long)checksum);
+                           checksum);
                 }
         }
         if (!params) engine.shutdown();

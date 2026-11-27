@@ -304,7 +304,7 @@ jobs:
           fi
           python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 \
             --arithmetic-inventory integer-arithmetic.txt --range-cast-inventory range-casts.txt \
-            --nodiscard-inventory nodiscard.txt --cast-inventory explicit-casts.txt \
+            --nodiscard-inventory nodiscard.txt --strict-bench-casts --cast-inventory explicit-casts.txt \
             "${audit_args[@]}"
       - name: Compare range_int code generation with native integers
         if: matrix.compiler == 'clang' && matrix.shard == 1

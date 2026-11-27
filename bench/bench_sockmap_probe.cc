@@ -1,6 +1,7 @@
 // Isolated Linux capability experiment. No Rut compiler/runtime integration.
 // Emits a bounded eBPF program directly; no ELF loader, libbpf, or LLVM linkage.
 #include "rut/common/ebpf_bytecode.h"
+#include "rut/common/range_int.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 namespace {
+using namespace rut;
 static_assert(sizeof(bpf_insn) == 8);
 struct Resources {
     int fds[4] = {-1, -1, -1, -1};
@@ -65,7 +67,12 @@ struct Connection {
     }
 };
 int bpf_call(int command, union bpf_attr& attr) {
-    return static_cast<int>(syscall(SYS_bpf, command, &attr, sizeof(attr)));
+    int result;
+    if (!range_int(i64{syscall(SYS_bpf, command, &attr, sizeof(attr))}).to(&result)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return result;
 }
 bpf_insn insn(uint8_t code, uint8_t dst, uint8_t src, int16_t offset, int32_t value) {
     bpf_insn result{};
@@ -98,7 +105,11 @@ bool attach(int map, int program, bpf_attach_type type) {
     return bpf_call(BPF_PROG_ATTACH, attr) == 0;
 }
 bool insert(int map, uint32_t key, int socket_fd) {
-    uint32_t value = static_cast<uint32_t>(socket_fd);
+    uint32_t value;
+    if (!range_int(socket_fd).to(&value)) {
+        errno = EBADF;
+        return false;
+    }
     union bpf_attr attr{};
     attr.map_fd = map;
     attr.key = reinterpret_cast<uintptr_t>(&key);
@@ -133,24 +144,25 @@ void body_templates(bpf_insn (&parser)[22], bpf_insn (&verdict)[31]) {
 bool artifact(const char* prefix, const char* suffix, void* bytes, size_t size, bool writing) {
     char path[4096];
     int length = snprintf(path, sizeof(path), "%s.%s.bpf", prefix, suffix);
-    if (length < 0 || static_cast<size_t>(length) >= sizeof(path)) {
+    if (length < 0 || length >= i64{sizeof(path)}) {
         errno = ENAMETOOLONG;
         return false;
     }
     int fd =
         open(path, writing ? O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC : O_RDONLY | O_CLOEXEC, 0600);
     if (fd < 0) return false;
+    auto* data = reinterpret_cast<u8*>(bytes);
     size_t done = 0;
     while (done < size) {
-        ssize_t n = writing ? write(fd, static_cast<char*>(bytes) + done, size - done)
-                            : read(fd, static_cast<char*>(bytes) + done, size - done);
+        ssize_t n =
+            writing ? write(fd, data + done, size - done) : read(fd, data + done, size - done);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             close(fd);
             errno = EINVAL;
             return false;
         }
-        done += static_cast<size_t>(n);
+        done += range_int(i64{n}).max(range_int<0, 1>{}).to_u64();
     }
     char extra;
     const bool kOk = writing || read(fd, &extra, 1) == 0;
@@ -255,13 +267,14 @@ const char* setup(Resources& resources,
     resources.inserted[1] = true;
     return nullptr;
 }
-bool send_all(int fd, const char* bytes, size_t size) {
+bool send_all(int fd, const void* data, size_t size) {
+    const auto* bytes = reinterpret_cast<const u8*>(data);
     while (size) {
         ssize_t n = send(fd, bytes, size, MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return false;
         bytes += n;
-        size -= static_cast<size_t>(n);
+        size -= range_int(i64{n}).max(range_int<0, 1>{}).to_u64();
     }
     return true;
 }
@@ -273,22 +286,24 @@ struct Transfer {
     size_t copied = 0;
 };
 void* copy_transfer(void* argument) {
-    auto& transfer = *static_cast<Transfer*>(argument);
+    auto& transfer = *reinterpret_cast<Transfer*>(argument);
     char bytes[4096];
     while (transfer.copied < transfer.size) {
         size_t left = transfer.size - transfer.copied;
         ssize_t n = recv(transfer.from, bytes, left < sizeof(bytes) ? left : sizeof(bytes), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0 || !send_all(transfer.to, bytes, static_cast<size_t>(n))) return nullptr;
-        transfer.copied += static_cast<size_t>(n);
+        if (n <= 0 ||
+            !send_all(transfer.to, bytes, range_int(i64{n}).max(range_int<0, 1>{}).to_u64()))
+            return nullptr;
+        transfer.copied += range_int(i64{n}).max(range_int<0, 1>{}).to_u64();
     }
     transfer.ok = true;
     return nullptr;
 }
 void* write_transfer(void* argument) {
-    auto& transfer = *static_cast<Transfer*>(argument);
-    char bytes[4113];
-    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = static_cast<char>((i % 4096) % 251);
+    auto& transfer = *reinterpret_cast<Transfer*>(argument);
+    u8 bytes[4113];
+    for (size_t i = 0; i < sizeof(bytes); ++i) bytes[i] = bounded_remainder<251>(i % 4096).to<u8>();
     for (size_t sent = 0; sent < transfer.size;) {
         size_t left = transfer.size - sent;
         // Put the last body bytes and successor in one send(), exercising a split at the budget.
@@ -318,7 +333,7 @@ bool exchange(int sender,
         return false;
     }
     if (slow) usleep(100000);
-    char bytes[4096];
+    u8 bytes[4096];
     size_t received = 0;
     bool ok = true;
     while (received < size) {
@@ -334,27 +349,26 @@ bool exchange(int sender,
             ok = false;
             break;
         }
-        for (ssize_t i = 0; i < n; ++i)
-            if (bytes[i] != static_cast<char>(((received + static_cast<size_t>(i)) % 4096) % 251)) {
+        const u64 count = range_int(i64{n}).max(range_int<0, 1>{}).to_u64();
+        for (size_t i = 0; i < count; ++i)
+            if (bytes[i] != bounded_remainder<251>((received + i) % 4096).to<u8>()) {
                 if (ok)
-                    fprintf(stderr,
-                            "payload mismatch at %zu: %u\n",
-                            received + static_cast<size_t>(i),
-                            static_cast<unsigned char>(bytes[i]));
+                    fprintf(
+                        stderr, "payload mismatch at %zu: %u\n", received + i, unsigned{bytes[i]});
                 ok = false;
             }
-        received += static_cast<size_t>(n);
+        received += count;
     }
     pthread_join(writer_thread, nullptr);
     if (!kernel) pthread_join(relay_thread, nullptr);
     if (tail) {
-        char successor[17];
+        u8 successor[17];
         if (tail != sizeof(successor) ||
             recv(relay_from, successor, sizeof(successor), MSG_WAITALL) != sizeof(successor))
             ok = false;
         else
             for (size_t i = 0; i < sizeof(successor); ++i)
-                if (successor[i] != static_cast<char>(i)) ok = false;
+                if (successor[i] != i) ok = false;
     }
     if (tail) {
         char extra;
@@ -434,10 +448,10 @@ int main(int argc, char** argv) {
         const char kRewritten[] =
             "GET / HTTP/1.1\r\nHost: rewritten\r\nContent-Length: 1048576\r\n\r\n";
         char received[sizeof(kRewritten)]{};
-        char queued[sizeof(kOriginal) - 1 + 4096];
+        u8 queued[sizeof(kOriginal) - 1 + 4096];
         memcpy(queued, kOriginal, sizeof(kOriginal) - 1);
         for (size_t i = 0; i < 4096; ++i)
-            queued[sizeof(kOriginal) - 1 + i] = static_cast<char>(i % 251);
+            queued[sizeof(kOriginal) - 1 + i] = bounded_remainder<251>(i).to<u8>();
         if (!send_all(front.client, queued, sizeof(kOriginal) - 1 + (prequeued ? 4096 : 0)) ||
             recv(front.relay, received, sizeof(kOriginal) - 1, MSG_WAITALL) !=
                 sizeof(kOriginal) - 1 ||

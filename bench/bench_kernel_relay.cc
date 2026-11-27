@@ -1,12 +1,14 @@
 // Linux-only mechanism probe: identical TCP tunnel with copy or splice pumps.
 // No HTTP routing, TLS, policy, or production-runtime integration.
 #include "rut/common/ebpf_handoff_bytecode.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/ebpf_handoff.h"
 #include "rut/runtime/slice_pool.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -138,9 +140,11 @@ bool pump(Pair& pair, u32 side) {
                 return false;
             }
             if (kN == 0) return false;
-            dir.pending -= static_cast<u32>(kN);
-            dir.offset += static_cast<u32>(kN);
-            counters.written_bytes += static_cast<u64>(kN);
+            u32 sent;
+            if (!range_int(i64{kN}).to(&sent) || sent > dir.pending) return false;
+            dir.pending -= sent;
+            dir.offset += sent;
+            counters.written_bytes += sent;
             if (dir.pending != 0) continue;
             dir.offset = 0;
         }
@@ -165,8 +169,8 @@ bool pump(Pair& pair, u32 side) {
             dir.eof = true;
             continue;
         }
-        dir.pending = static_cast<u32>(kN);
-        counters.read_bytes += static_cast<u64>(kN);
+        if (kN > kBatch || !range_int(i64{kN}).to(&dir.pending)) return false;
+        counters.read_bytes += dir.pending;
     }
     return true;
 }
@@ -183,7 +187,7 @@ bool arm(Pair& pair, u32 index, u32 side, int operation) {
         // Avoid repeatedly waking on a half-close while the peer is blocked.
         if (!in.eof && in.pending == 0) event.events |= EPOLLRDHUP;
     }
-    event.data.u64 = (static_cast<u64>(pair.generation) << 32u) | (index * 2u + side + 1u);
+    event.data.u64 = (u64{pair.generation} << 32u) | (index * 2u + side + 1u);
     return epoll_ctl(poll_fd, operation, pair.fds[side], &event) == 0;
 }
 
@@ -206,7 +210,7 @@ bool accept_pair(int client, u16 origin_port) {
     for (auto& dir : pair.directions) {
         if (use_splice) {
             if (pipe2(dir.pipe_fds, O_NONBLOCK | O_CLOEXEC) != 0 ||
-                fcntl(dir.pipe_fds[1], F_SETPIPE_SZ, kBatch) < static_cast<int>(kBatch))
+                fcntl(dir.pipe_fds[1], F_SETPIPE_SZ, kBatch) < int{kBatch})
                 return false;
         } else {
             dir.bytes = pool.alloc_bulk();
@@ -238,6 +242,9 @@ int main(int argc, char** argv) {
     if (!end || *end != '\0' || kFront < 1024 || kFront > 65535) return 2;
     const long kOrigin = strtol(argv[3], &end, 10);
     if (!end || *end != '\0' || kOrigin < 1024 || kOrigin > 65535 || kOrigin == kFront) return 2;
+    u16 front_port, origin_port;
+    if (!range_int(i64{kFront}).to(&front_port) || !range_int(i64{kOrigin}).to(&origin_port))
+        return 2;
     if (!use_splice && !pool.init(1, 0, 0, 2 * kConnections)) return 2;
     if (use_ebpf) {
         const char* stage = kernel.init(kConnections, true, nullptr, true);
@@ -264,7 +271,7 @@ int main(int argc, char** argv) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(static_cast<u16>(kFront));
+    address.sin_port = htons(front_port);
     if (bind(kListener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
         listen(kListener, 1024) != 0)
         return 2;
@@ -287,7 +294,7 @@ int main(int argc, char** argv) {
             if (errno == EINTR) continue;
             return 2;
         }
-        counters.events += static_cast<u64>(kCount);
+        counters.events += range_int(kCount).max(range_int<0, 1>{}).to_u64();
         for (int i = 0; i < kCount; ++i) {
             const u64 kToken = events[i].data.u64;
             if (kToken == 0) {
@@ -300,7 +307,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                     ++counters.accepts;
-                    if (!accept_pair(kClient, static_cast<u16>(kOrigin))) {
+                    if (!accept_pair(kClient, origin_port)) {
                         ++counters.setup_failures;
                         for (auto& pair : pairs)
                             if (pair.active && pair.fds[0] == kClient) close_pair(pair);
@@ -308,11 +315,15 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
-            const u32 kSlot = static_cast<u32>(kToken) - 1u;
+            const u32 encoded_slot = bounded_remainder<(u64{1} << 32)>(kToken).to<u32>();
+            if (encoded_slot == 0) return 2;
+            const u32 kSlot = encoded_slot - 1u;
             const u32 kIndex = kSlot / 2u;
             if (kIndex >= kConnections) return 2;
             auto& pair = pairs[kIndex];
-            if (!pair.active || pair.generation != static_cast<u32>(kToken >> 32u)) continue;
+            if (!pair.active ||
+                pair.generation != bounded_quotient<(u64{1} << 32)>(kToken).to<u32>())
+                continue;
             if (!pair.connected) {
                 // EPOLLHUP is reported even for a zero interest mask. A client
                 // can close a readiness probe before the upstream establishes;
@@ -387,21 +398,25 @@ int main(int argc, char** argv) {
     pool.destroy();
     kernel.destroy();
     fprintf(stderr,
-            "COUNTERS {\"accepts\":%llu,\"reads\":%llu,\"writes\":%llu,"
-            "\"read_bytes\":%llu,\"written_bytes\":%llu,\"waits\":%llu,\"events\":%llu,"
-            "\"setup_failures\":%llu,\"io_failures\":%llu,\"kernel_bytes\":%llu,"
-            "\"retirement_failures\":%llu,\"admission_peer_closes\":%llu}\n",
-            static_cast<unsigned long long>(counters.accepts),
-            static_cast<unsigned long long>(counters.reads),
-            static_cast<unsigned long long>(counters.writes),
-            static_cast<unsigned long long>(counters.read_bytes),
-            static_cast<unsigned long long>(counters.written_bytes),
-            static_cast<unsigned long long>(counters.waits),
-            static_cast<unsigned long long>(counters.events),
-            static_cast<unsigned long long>(counters.setup_failures),
-            static_cast<unsigned long long>(counters.io_failures),
-            static_cast<unsigned long long>(counters.kernel_bytes),
-            static_cast<unsigned long long>(counters.retirement_failures),
-            static_cast<unsigned long long>(counters.admission_peer_closes));
+            "COUNTERS {\"accepts\":%" PRIu64 ",\"reads\":%" PRIu64 ",\"writes\":%" PRIu64
+            ","
+            "\"read_bytes\":%" PRIu64 ",\"written_bytes\":%" PRIu64 ",\"waits\":%" PRIu64
+            ",\"events\":%" PRIu64
+            ","
+            "\"setup_failures\":%" PRIu64 ",\"io_failures\":%" PRIu64 ",\"kernel_bytes\":%" PRIu64
+            ","
+            "\"retirement_failures\":%" PRIu64 ",\"admission_peer_closes\":%" PRIu64 "}\n",
+            counters.accepts,
+            counters.reads,
+            counters.writes,
+            counters.read_bytes,
+            counters.written_bytes,
+            counters.waits,
+            counters.events,
+            counters.setup_failures,
+            counters.io_failures,
+            counters.kernel_bytes,
+            counters.retirement_failures,
+            counters.admission_peer_closes);
     return counters.setup_failures != 0 || counters.retirement_failures != 0 ? 1 : 0;
 }

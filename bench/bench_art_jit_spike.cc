@@ -30,56 +30,56 @@ namespace {
 // SaaS-like routes (subset that fits in a quick spike). Real saas
 // has 80+ routes; this 32 is plenty to exercise the descent shape
 // (root upgrade to Node16, multi-byte edges, mixed depth).
-const char* kRoutes[] = {
-    "/api/v1/users",
-    "/api/v1/orders",
-    "/api/v1/products",
-    "/api/v1/sessions",
-    "/api/v1/events",
-    "/api/v1/teams",
-    "/api/v1/projects",
-    "/api/v1/messages",
-    "/api/v1/channels",
-    "/api/v2/users",
-    "/api/v2/orders",
-    "/admin",
-    "/admin/users",
-    "/admin/audit",
-    "/admin/billing",
-    "/oauth/token",
-    "/oauth/authorize",
-    "/oauth/jwks",
-    "/webhooks/stripe",
-    "/webhooks/github",
-    "/webhooks/slack",
-    "/health",
-    "/healthz",
-    "/metrics",
-    "/_status",
-    "/_ready",
-    "/_live",
-    "/internal/debug",
-    "/internal/profile",
-    "/v1",
-    "/v2",
-    "/static/css/main.css",
+static constexpr Str kRoutes[] = {
+    lit_str("/api/v1/users"),
+    lit_str("/api/v1/orders"),
+    lit_str("/api/v1/products"),
+    lit_str("/api/v1/sessions"),
+    lit_str("/api/v1/events"),
+    lit_str("/api/v1/teams"),
+    lit_str("/api/v1/projects"),
+    lit_str("/api/v1/messages"),
+    lit_str("/api/v1/channels"),
+    lit_str("/api/v2/users"),
+    lit_str("/api/v2/orders"),
+    lit_str("/admin"),
+    lit_str("/admin/users"),
+    lit_str("/admin/audit"),
+    lit_str("/admin/billing"),
+    lit_str("/oauth/token"),
+    lit_str("/oauth/authorize"),
+    lit_str("/oauth/jwks"),
+    lit_str("/webhooks/stripe"),
+    lit_str("/webhooks/github"),
+    lit_str("/webhooks/slack"),
+    lit_str("/health"),
+    lit_str("/healthz"),
+    lit_str("/metrics"),
+    lit_str("/_status"),
+    lit_str("/_ready"),
+    lit_str("/_live"),
+    lit_str("/internal/debug"),
+    lit_str("/internal/profile"),
+    lit_str("/v1"),
+    lit_str("/v2"),
+    lit_str("/static/css/main.css"),
 };
 constexpr u32 kRouteCount = sizeof(kRoutes) / sizeof(kRoutes[0]);
 constexpr u32 kIters = 5'000'000;
 
-double bench_scalar_art(const ArtTrie& art, const char* const* probes, u32 nprobes) {
+double bench_scalar_art(const ArtTrie& art, const Str* probes, u32 nprobes) {
     volatile u16 sink = 0;
     for (u32 i = 0; i < 50000; i++) {
-        const char* p = probes[i % nprobes];
-        sink ^= art.match(Str{p, static_cast<u32>(strlen(p))}, 0);
+        const Str p = probes[i % nprobes];
+        sink ^= art.match(p, 0);
     }
     auto start = std::chrono::high_resolution_clock::now();
     for (u32 i = 0; i < kIters; i++) {
-        const char* p = probes[i % nprobes];
-        sink ^= art.match(Str{p, static_cast<u32>(strlen(p))}, 0);
+        const Str p = probes[i % nprobes];
+        sink ^= art.match(p, 0);
     }
     auto end = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const auto result = sink;
     return std::chrono::duration<double, std::nano>(end - start).count() / kIters;
 }
 
@@ -98,27 +98,25 @@ double bench_jit_direct(jit::ArtJitMatchFn fn, const Str* canon_probes, u32 npro
         sink ^= fn(p.ptr, p.len, 0);
     }
     auto end = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const auto result = sink;
     return std::chrono::duration<double, std::nano>(end - start).count() / kIters;
 }
 
-double bench_jit_via_cfg(const RouteConfig& cfg, const char* const* probes, u32 nprobes) {
+double bench_jit_via_cfg(const RouteConfig& cfg, const Str* probes, u32 nprobes) {
     volatile u16 sink = 0;
     for (u32 i = 0; i < 50000; i++) {
-        const char* p = probes[i % nprobes];
-        const RouteEntry* r =
-            cfg.match(reinterpret_cast<const u8*>(p), static_cast<u32>(strlen(p)), 0);
+        const Str p = probes[i % nprobes];
+        const RouteEntry* r = cfg.match(reinterpret_cast<const u8*>(p.ptr), p.len, 0);
         sink ^= reinterpret_cast<uintptr_t>(r);
     }
     auto start = std::chrono::high_resolution_clock::now();
     for (u32 i = 0; i < kIters; i++) {
-        const char* p = probes[i % nprobes];
-        const RouteEntry* r =
-            cfg.match(reinterpret_cast<const u8*>(p), static_cast<u32>(strlen(p)), 0);
+        const Str p = probes[i % nprobes];
+        const RouteEntry* r = cfg.match(reinterpret_cast<const u8*>(p.ptr), p.len, 0);
         sink ^= reinterpret_cast<uintptr_t>(r);
     }
     auto end = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const auto result = sink;
     return std::chrono::duration<double, std::nano>(end - start).count() / kIters;
 }
 
@@ -139,7 +137,7 @@ double bench_jit_via_cfg_canonical(const RouteConfig& cfg, const Str* canon_prob
         sink ^= reinterpret_cast<uintptr_t>(r);
     }
     auto end = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const auto result = sink;
     return std::chrono::duration<double, std::nano>(end - start).count() / kIters;
 }
 
@@ -147,10 +145,7 @@ double bench_jit_via_cfg_canonical(const RouteConfig& cfg, const Str* canon_prob
 // fn called with pre-canonicalized input. Both consume the same
 // raw probe; the test harness does the canonicalization for the
 // JIT direct-call path the same way RouteConfig::match does.
-bool verify_parity(const ArtTrie& art,
-                   jit::ArtJitMatchFn jit_fn,
-                   const char* const* probes,
-                   u32 nprobes) {
+bool verify_parity(const ArtTrie& art, jit::ArtJitMatchFn jit_fn, const Str* probes, u32 nprobes) {
     static const u8 kMethods[] = {kRouteMethodAny,
                                   kRouteMethodGet,
                                   kRouteMethodPost,
@@ -162,10 +157,8 @@ bool verify_parity(const ArtTrie& art,
                                   kRouteMethodConnect,
                                   kRouteMethodTrace};
     bool ok = true;
-    auto check = [&](const char* p) {
-        const u32 plen = static_cast<u32>(strlen(p));
-        const Str raw{p, plen};
-        const bool reject = (plen == 0 || p[0] != '/');
+    auto check = [&](Str raw) {
+        const bool reject = raw.empty() || raw.ptr[0] != '/';
         const Str canon = reject ? Str{nullptr, 0} : canonicalize_request(raw);
         for (u8 m : kMethods) {
             const u16 art_result = art.match(raw, m);
@@ -173,7 +166,7 @@ bool verify_parity(const ArtTrie& art,
                 reject ? TrieNode::kInvalidRoute : jit_fn(canon.ptr, canon.len, m);
             if (art_result != jit_result) {
                 std::printf("PARITY FAIL on '%s' method=%u: ART=%u, JIT=%u\n",
-                            p,
+                            raw.ptr,
                             m,
                             art_result,
                             jit_result);
@@ -182,15 +175,15 @@ bool verify_parity(const ArtTrie& art,
         }
     };
     for (u32 i = 0; i < nprobes; i++) check(probes[i]);
-    static const char* kExtraProbes[] = {
-        "/admin/anything",
-        "/api/v1/users/me",
-        "/notregistered",
-        "/api/v1/users?q=1",
-        "/admin#frag",
-        "/admin/",
-        "",
-        "*",
+    static constexpr Str kExtraProbes[] = {
+        lit_str("/admin/anything"),
+        lit_str("/api/v1/users/me"),
+        lit_str("/notregistered"),
+        lit_str("/api/v1/users?q=1"),
+        lit_str("/admin#frag"),
+        lit_str("/admin/"),
+        lit_str(""),
+        lit_str("*"),
     };
     for (u32 i = 0; i < sizeof(kExtraProbes) / sizeof(kExtraProbes[0]); i++) {
         check(kExtraProbes[i]);
@@ -202,9 +195,10 @@ bool verify_parity(const ArtTrie& art,
 
 int main() {
     ArtTrie art;
-    for (u32 i = 0; i < kRouteCount; i++) {
-        const Str p{kRoutes[i], static_cast<u32>(strlen(kRoutes[i]))};
-        art.insert(p, 0, static_cast<u16>(i));
+    static_assert(kRouteCount <= UINT16_MAX);
+    for (u16 i = 0; i < kRouteCount; i++) {
+        const Str p = kRoutes[i];
+        art.insert(p, 0, i);
     }
     std::printf("Built ART: %u nodes (n4=%u n16=%u n48=%u n256=%u)\n",
                 art.node_count(),
@@ -241,8 +235,8 @@ int main() {
     RouteConfig cfg;
     // Default kind is ArtJit, no need to call use_art()
     for (u32 i = 0; i < kRouteCount; i++) {
-        if (!cfg.add_static(kRoutes[i], 0, 200)) {
-            std::printf("FAIL: add_static refused for %s\n", kRoutes[i]);
+        if (!cfg.add_static(kRoutes[i].ptr, 0, 200)) {
+            std::printf("FAIL: add_static refused for %s\n", kRoutes[i].ptr);
             engine.shutdown();
             return 1;
         }
@@ -254,7 +248,7 @@ int main() {
     // descent cost, not canon scan cost.
     Str canon_probes[kRouteCount];
     for (u32 i = 0; i < kRouteCount; i++) {
-        const Str raw{kRoutes[i], static_cast<u32>(strlen(kRoutes[i]))};
+        const Str raw = kRoutes[i];
         canon_probes[i] = canonicalize_request(raw);
     }
 

@@ -2,6 +2,7 @@
 // CSV: corpus, implementation, best ns/call (five trials), consumed checksum.
 #include "rut/runtime/parse_integer.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,8 +24,7 @@ template <bool Wide>
 static bool finish(uint64_t n, bool negative, int64_t* result) {
     const uint64_t limit = (Wide ? 9223372036854775807ULL : 2147483647ULL) + negative;
     if (n > limit) return false;
-    *result = negative ? static_cast<int64_t>(uint64_t(0) - n) : static_cast<int64_t>(n);
-    return true;
+    return rut::try_signed_magnitude(n, negative, result);
 }
 template <bool Wide>
 __attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_t* result) {
@@ -37,7 +37,7 @@ __attribute__((noinline)) static bool scalar(const char* p, uint32_t len, int64_
     uint64_t n = 0;
     const uint64_t limit = (Wide ? 9223372036854775807ULL : 2147483647ULL) + negative;
     for (uint32_t i = 0; i < len; ++i) {
-        uint32_t digit = static_cast<unsigned char>(p[i]) - uint32_t('0');
+        const uint32_t digit = rut::byte_value(p[i]) - uint32_t{'0'};
         if (digit > 9 || n > (limit - digit) / 10) return false;
         n = n * 10 + digit;
     }
@@ -55,7 +55,9 @@ __attribute__((noinline)) static bool selected(const char* data, uint32_t length
 static double now() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+    const double seconds = ts.tv_sec;
+    const double nanos = ts.tv_nsec;
+    return seconds + nanos * 1e-9;
 }
 int main() {
     using Fn = bool (*)(const char*, uint32_t, int64_t*);
@@ -81,8 +83,8 @@ int main() {
                     value %= scale;
                 }
                 bool neg = (rng() % 4) == 0;
-                int count = snprintf(
-                    e.text, sizeof(e.text), "%s%llu", neg ? "-" : "", (unsigned long long)value);
+                int count =
+                    snprintf(e.text, sizeof(e.text), "%s%" PRIu64 "", neg ? "-" : "", value);
                 e.len = uint32_t(count);
                 if (set == 4) {
                     const char* bad[] = {"",
@@ -105,7 +107,9 @@ int main() {
                 if (set == 5) {
                     e.len = 8 + rng() % 120;
                     memset(e.text, '0', e.len);
-                    e.text[e.len - 1] = static_cast<char>('1' + rng() % 9);
+                    e.text[e.len - 1] =
+                        (rut::range_int<'1', '2'>{} + rut::bounded_remainder<9>(rng()))
+                            .to<rut::i8>();
                 }
             }
             for (auto& e : entries) {
@@ -134,12 +138,12 @@ int main() {
                     double elapsed = now() - start;
                     if (elapsed < best) best = elapsed;
                 }
-                printf("%u,%s,%s,%.3f,%llu\n",
+                printf("%u,%s,%s,%.3f,%" PRIu64 "\n",
                        wide ? 64u : 32u,
                        sets[set],
                        names[which],
                        best * 1e9 / (512 * 4096),
-                       (unsigned long long)checksum);
+                       checksum);
             }
         }
     }

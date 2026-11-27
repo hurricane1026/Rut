@@ -162,6 +162,8 @@ def main():
                         help='report declarations that are missing [[nodiscard]]')
     parser.add_argument('--nodiscard-base', help='require [[nodiscard]] on declarations changed since this commit')
     parser.add_argument('--cast-base', help='fail on casts changed since this commit instead of all casts')
+    parser.add_argument('--strict-bench-casts', action='store_true',
+                        help='scan all tracked benchmark sources and reject every cast in bench/')
     parser.add_argument('--cast-inventory', type=Path, help='write all static_cast and C-style cast sites')
     args = parser.parse_args()
     load_plugin = ['-fsyntax-only', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve())]
@@ -200,6 +202,7 @@ def main():
     changed = changed_source_lines(base) if base else {}
 
     commands = set()
+    benchmark_sources = set()
     entries = json.loads((args.build / 'compile_commands.json').read_text())
     for entry in entries:
         cwd = Path(entry['directory'])
@@ -212,8 +215,19 @@ def main():
         output = flags.index('-o')
         del flags[output:output + 2]
         flags.remove('-c')
+        if path.is_relative_to(ROOT / 'bench'):
+            benchmark_sources.add(path)
         commands.add((cwd, tuple(flag for flag in flags if flag != '-w'),
                       path.is_relative_to(ROOT / 'src')))
+    if args.strict_bench_casts:
+        tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', 'bench'], cwd=ROOT)
+        for name in tracked.decode().split('\0'):
+            path = ROOT / name
+            if path.suffix not in TU_EXTENSIONS or path in benchmark_sources:
+                continue
+            standard = '-std=c17' if path.suffix == '.c' else '-std=c++23'
+            commands.add((ROOT, (standard, '-Iinclude', '-Itesting', str(path)), False))
+
     production_count = sum(production for _, _, production in commands)
     if not production_count:
         raise SystemExit('no production translation units for u64 to i64 conversion audit')
@@ -274,7 +288,8 @@ def main():
     for site in casts:
         path, line, _, span, _ = site
         first, last = (span[0], span[2]) if span else (line, line)
-        if not args.cast_base or any(interval and interval.start <= last and first < interval.stop
+        strict = not args.cast_base or (args.strict_bench_casts and path.is_relative_to(ROOT / 'bench'))
+        if strict or any(interval and interval.start <= last and first < interval.stop
                                      for interval in cast_changed.get(path, ())):
             failures.append(site)
     for message in CAST_MESSAGES:

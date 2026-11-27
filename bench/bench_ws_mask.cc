@@ -6,8 +6,8 @@ extern "C" void rut_bench_ws_mask(unsigned char* output,
                                   const unsigned char* key) {
     unsigned int word_key;
     __builtin_memcpy(&word_key, key, 4);
-    const unsigned long long kMask = static_cast<unsigned long long>(word_key) |
-                                     (static_cast<unsigned long long>(word_key) << 32);
+    const unsigned long long key64 = word_key;
+    const unsigned long long kMask = key64 | (key64 << 32);
     unsigned long offset = 0;
     for (; offset + 8 <= length; offset += 8) {
         unsigned long long word;

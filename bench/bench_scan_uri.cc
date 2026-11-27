@@ -14,6 +14,7 @@
 
 #include "char_tables.h"  // kUriTable
 #include "runtime/simd/simd.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include <chrono>
 #include <cstdio>
@@ -34,7 +35,7 @@ u32 scan_uri_scalar_ref(const u8* buf, u32 pos, u32 end, u32* canon_end_out) {
             *canon_end_out = (canon_end != end) ? canon_end : pos;
             return pos;
         }
-        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if (!kUriTable[b]) return UINT32_MAX;
         if ((b == '?' || b == '#') && canon_end == end) canon_end = pos;
         pos++;
     }
@@ -52,7 +53,7 @@ void make_buffer(u8* buf, u32 buf_size, u32 uri_len, bool with_qf) {
     // so canon_end detection has work to do.
     buf[0] = '/';
     for (u32 i = 1; i < uri_len; i++) {
-        buf[i] = static_cast<u8>('a' + (i % 26));
+        buf[i] = (range_int<'a', 'a' + 1>{} + bounded_remainder<26>(i)).to<u8>();
     }
     if (with_qf && uri_len > 8) {
         buf[uri_len - 4] = '?';
@@ -82,7 +83,7 @@ double bench_fn(Fn fn, const u8* buf, u32 pos, u32 end, u32 iters) {
         sink ^= fn(buf, pos, end, &canon_end);
     }
     auto end_t = std::chrono::high_resolution_clock::now();
-    (void)sink;
+    [[maybe_unused]] const u32 result = sink;
     return std::chrono::duration<double, std::nano>(end_t - start).count() / iters;
 }
 
