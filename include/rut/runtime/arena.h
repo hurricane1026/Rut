@@ -118,13 +118,13 @@ struct Arena {
     }
 
     // Bump allocate, 8-byte aligned.
-    [[nodiscard]] void* alloc(u64 requested_size) {
+    [[nodiscard]] void* alloc(i64 requested_size) {
         if (!current) return nullptr;
         constexpr i64 kAlignment = 8;
         constexpr auto kAlignmentPadding =
             range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
         range_int<0, kI64ExclusiveEnd - (kAlignment - 1)> request;
-        if (!decltype(request)::try_from_u64(requested_size, &request)) return nullptr;
+        if (!decltype(request)::try_from_i64(requested_size, &request)) return nullptr;
         const auto padded = request + kAlignmentPadding;
         const i64 aligned_size = padded.value() / kAlignment * kAlignment;
         if (aligned_size <= current->remaining()) {
@@ -143,10 +143,19 @@ struct Arena {
         return b->data();
     }
 
+    // Validate a full-width unsigned size at callers such as sizeof and mmap.
+    template <typename Size>
+        requires(__is_same(Size, unsigned long) || __is_same(Size, unsigned long long))
+    [[nodiscard]] void* alloc(Size requested_size) {
+        i64 size;
+        if (!try_u64_to_i64(requested_size, &size)) return nullptr;
+        return alloc(size);
+    }
+
     // Typed bump alloc + placement new.
     template <typename T, typename... Args>
     [[nodiscard]] T* alloc_t(Args&&... args) {
-        void* p = alloc(sizeof(T));
+        void* p = alloc(i64{sizeof(T)});
         if (!p) return nullptr;
         return ::new (p) T(static_cast<Args&&>(args)...);
     }
@@ -154,13 +163,10 @@ struct Arena {
     // Array bump alloc, value-initialized via placement new.
     template <typename T>
     [[nodiscard]] T* alloc_array(u32 count) {
-        T* a = nullptr;
-        // NOLINTNEXTLINE(bugprone-sizeof-expression)
-        if (count > 0 && sizeof(a[0]) > static_cast<u64>(-1) / count) return nullptr;
-        // NOLINTNEXTLINE(bugprone-sizeof-expression)
-        void* p = alloc(static_cast<u64>(sizeof(a[0])) * count);
-        if (!p) return nullptr;
-        a = static_cast<T*>(p);
+        i64 bytes;
+        if (mul_overflow(i64{sizeof(T)}, count, &bytes)) return nullptr;
+        auto* a = static_cast<T*>(alloc(bytes));
+        if (!a) return nullptr;
         for (u32 i = 0; i < count; i++) {
             // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
             void* slot = static_cast<void*>(a + static_cast<i64>(i));

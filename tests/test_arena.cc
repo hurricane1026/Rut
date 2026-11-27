@@ -258,7 +258,8 @@ TEST(arena, requests_outside_signed_block_range_do_not_acquire_or_advance) {
     Arena<UndersizedArenaBackend> arena;
     REQUIRE(arena.init().has_value());
     auto* first = arena.current;
-    constexpr u64 kSignedMax = u64{INT64_MAX};
+    constexpr i64 kSignedMax = INT64_MAX;
+    CHECK_EQ(arena.alloc(-1), nullptr);
     CHECK_EQ(arena.alloc(kSignedMax), nullptr);      // Alignment exceeds i64.
     CHECK_EQ(arena.alloc(kSignedMax - 7), nullptr);  // Block header exceeds i64.
     CHECK_EQ(arena.alloc(UINT64_MAX), nullptr);
