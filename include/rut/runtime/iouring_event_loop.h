@@ -8584,7 +8584,7 @@ public:
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
-                    timer.tick([this](Connection* c) {
+                    (void)timer.tick([this](Connection* c) {
                         if (c->response_body_idle_armed) {
                             c->response_body_idle_armed = false;
                             c->response_body_idle_expiry_pending = true;

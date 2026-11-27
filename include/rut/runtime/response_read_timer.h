@@ -19,9 +19,9 @@ namespace rut {
         now_ns >= deadline)
         return 0;
     // The guard establishes now_ns < deadline, so both differences fit u64.
-    const u64 kRounded = static_cast<u64>(__int128_t{deadline} - __int128_t{now_ns} - 1);
-    const auto kMillis = (bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64();
-    return kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis);
+    const u64 kRounded = wrapping_sub(wrapping_sub(deadline, now_ns), u64{1});
+    const auto kMillis = bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{};
+    return kMillis.min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>();
 }
 
 // Batch evidence records which completions arrived, including rejected ones.
@@ -54,11 +54,12 @@ enum class TimerCompletion : u8 { Rejected, Pending, Drained };
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch-enum"
 #pragma GCC diagnostic error "-Wswitch"
-constexpr TimerCompletion consume_response_read_timer_owner(ResponseReadTimerPhase phase,
-                                                            u32 owner_generation,
-                                                            u32 tagged_generation,
-                                                            bool& target_owned,
-                                                            bool& cancel_owned) {
+[[nodiscard]] constexpr TimerCompletion consume_response_read_timer_owner(
+    ResponseReadTimerPhase phase,
+    u32 owner_generation,
+    u32 tagged_generation,
+    bool& target_owned,
+    bool& cancel_owned) {
     const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
     if (generation == 0 || generation != owner_generation) return TimerCompletion::Rejected;
     const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;

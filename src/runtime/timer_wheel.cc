@@ -15,7 +15,7 @@ constexpr bool has_raw_tick_arithmetic =
 
 static_assert(!has_raw_tick_arithmetic<decltype(TimerWheel::cursor)>);
 
-consteval bool cursor_wrap_contract() {
+[[nodiscard]] consteval bool cursor_wrap_contract() {
     TimerWheel wheel{};
     using Tick = TimerWheel::Tick;
     wheel.cursor = Tick{UINT32_MAX};
@@ -27,9 +27,8 @@ consteval bool cursor_wrap_contract() {
     if (incremented_address != &wheel.cursor || wheel.cursor != Tick{}) return false;
     Tick* decremented_address = &--wheel.cursor;
     if (decremented_address != &wheel.cursor || wheel.cursor != Tick{UINT32_MAX}) return false;
-    return wheel.slot_after(0) == static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1) &&
-           wheel.tick_after(1) == Tick{} && wheel.slot_after(1) == 0 &&
-           wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
+    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == Tick{} &&
+           wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
            TimerWheel::elapsed_ticks(Tick{UINT32_MAX - 1}, Tick{1}) == 3;
 }
 
@@ -38,20 +37,19 @@ static_assert(TimerWheel::remaining_ticks(3, 1) == 2 && TimerWheel::remaining_ti
               TimerWheel::remaining_ticks(3, UINT32_MAX) == 0);
 
 // Check both ends of every representable bucket against the wheel geometry.
-consteval bool yield_fallback_contract() {
+[[nodiscard]] consteval bool yield_fallback_contract() {
     if (TimerWheel::yield_fallback_seconds(0) != 1) return false;
-    for (u32 seconds = 1; seconds < TimerWheel::kSlots;
-         seconds = static_cast<u32>(static_cast<i64>(seconds) + 1)) {
-        if (TimerWheel::yield_fallback_seconds(
-                static_cast<u32>((static_cast<i64>(seconds) - 1) * 1000 + 1)) != seconds ||
-            TimerWheel::yield_fallback_seconds(
-                static_cast<u32>(static_cast<i64>(seconds) * 1000)) != seconds)
+    static_assert(TimerWheel::kSlots <= UINT16_MAX);
+    for (u16 seconds = 1; seconds < TimerWheel::kSlots; ++seconds) {
+        const auto last_ms = range_int(seconds).scaled_by<1000>();
+        const auto first_ms = (last_ms - range_int<999, 1000>{}).max(range_int<0, 1>{});
+        if (TimerWheel::yield_fallback_seconds(first_ms.to<u32>()) != seconds ||
+            TimerWheel::yield_fallback_seconds(last_ms.to<u32>()) != seconds)
             return false;
     }
-    return TimerWheel::yield_fallback_seconds(
-               static_cast<u32>((static_cast<i64>(TimerWheel::kSlots) - 1) * 1000 + 1)) == 0 &&
-           TimerWheel::yield_fallback_seconds(
-               static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) * 1000)) == 0 &&
+    constexpr u32 kLastMs = TimerWheel::kSlots * 1000;
+    return TimerWheel::yield_fallback_seconds(kLastMs - 999) == 0 &&
+           TimerWheel::yield_fallback_seconds(kLastMs) == 0 &&
            TimerWheel::yield_fallback_seconds(0xffffffffu) == 0;
 }
 

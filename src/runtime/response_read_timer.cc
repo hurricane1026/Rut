@@ -10,35 +10,32 @@
 namespace rut {
 namespace {
 
-consteval bool timer_rearm_contract() {
-    constexpr u64 kMs = 1'000'000;
+[[nodiscard]] consteval bool timer_rearm_contract() {
+    constexpr i64 kMs = 1'000'000;
     constexpr u64 kMaxDelay =
-        static_cast<u64>(static_cast<i64>(UINT32_MAX) * static_cast<i64>(kMs));
+        range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}.scaled_by<kMs>().to_u64();
     // Hold the deadline at UINT64_MAX and move now across rounding, expiry,
     // and saturation boundaries. Check the interval represented by the
     // result independently of the division used in production.
-    constexpr u64 kIntervals[] = {
-        0,
-        1,
-        static_cast<u64>(static_cast<i64>(kMs) - 1),
-        kMs,
-        static_cast<u64>(static_cast<i64>(kMs) + 1),
-        static_cast<u64>(static_cast<i64>(kMaxDelay) - static_cast<i64>(kMs)),
-        static_cast<u64>(static_cast<i64>(kMaxDelay) - 1),
-        kMaxDelay,
-        static_cast<u64>(static_cast<i64>(kMaxDelay) + 1),
-        UINT64_MAX - 1};
+    constexpr u64 kIntervals[] = {0,
+                                  1,
+                                  kMs - 1,
+                                  kMs,
+                                  kMs + 1,
+                                  kMaxDelay - kMs,
+                                  kMaxDelay - 1,
+                                  kMaxDelay,
+                                  kMaxDelay + 1,
+                                  UINT64_MAX - 1};
     for (const u64 kRemaining : kIntervals) {
-        const u32 kDelay =
-            response_read_timer_remaining_ms(1, UINT64_MAX - 1, static_cast<u64>(~kRemaining));
+        const u32 kDelay = response_read_timer_remaining_ms(1, UINT64_MAX - 1, ~kRemaining);
+        const auto kCovered = range_int(kDelay).scaled_by<kMs>();
         if (kRemaining == 0) {
             if (kDelay != 0) return false;
         } else if (kRemaining > kMaxDelay) {
             if (kDelay != UINT32_MAX) return false;
-        } else if (kDelay == 0 ||
-                   static_cast<u64>(static_cast<i64>(kDelay) * static_cast<i64>(kMs)) <
-                       kRemaining ||
-                   static_cast<u64>((static_cast<i64>(kDelay) - 1) * static_cast<i64>(kMs)) >=
+        } else if (kDelay == 0 || kCovered.to_u64() < kRemaining ||
+                   (kCovered - range_int<kMs, kMs + 1>{}).max(range_int<0, 1>{}).to_u64() >=
                        kRemaining) {
             return false;
         }
@@ -52,7 +49,7 @@ static_assert(timer_rearm_contract(), "Response timer violates rearm interval co
 
 // Model outstanding kernel operations as a two-bit set. Checking every edge
 // (including rejection self-loops) also covers repeated and reordered CQEs.
-consteval bool timer_ownership_conserved() {
+[[nodiscard]] consteval bool timer_ownership_conserved() {
     using enum ResponseReadTimerPhase;
     constexpr ResponseReadTimerPhase phases[] = {None, Armed, CancelPending};
     constexpr u32 generations[] = {0, 1, 2, kResponseReadTimerGenerationMask};
@@ -93,10 +90,9 @@ static_assert(timer_ownership_conserved(),
 
 // Check every transition of the two-bit observation set, including the
 // second completion in either order and a replay after both have arrived.
-consteval bool timer_batch_observation_contract() {
+[[nodiscard]] consteval bool timer_batch_observation_contract() {
     constexpr u32 kGeneration = 7;
-    constexpr u32 kIncoming[] = {
-        0, kGeneration, static_cast<u32>(static_cast<i64>(kGeneration) + (1 << 16))};
+    constexpr u32 kIncoming[] = {0, kGeneration, kGeneration + (1u << 16)};
     for (unsigned prior = 0; prior < 4; ++prior) {
         for (unsigned kind = 1; kind <= 2; ++kind) {
             for (const u32 kId : kIncoming) {
@@ -129,17 +125,21 @@ static_assert(timer_batch_observation_contract(),
 
 // Cover each millisecond remainder at the bottom and top of
 // the input range, including the first carry into a whole second.
-consteval bool timer_timespec_contract() {
+[[nodiscard]] consteval bool timer_timespec_contract() {
     constexpr u32 kBases[] = {0, 1000, UINT32_MAX - 999};
     for (const u32 kBase : kBases) {
         for (u32 fraction = 0; fraction < 1000; ++fraction) {
-            const u32 kMs = static_cast<u32>(static_cast<i64>(kBase) + static_cast<i64>(fraction));
-            const auto kTime = io_timespec_from_ms(kMs);
-            if (kTime.tv_sec < 0 || kTime.tv_nsec < 0 || kTime.tv_nsec >= 1'000'000'000 ||
-                static_cast<u64>(static_cast<i64>(kTime.tv_sec) * 1'000'000'000 +
-                                 static_cast<i64>(kTime.tv_nsec)) !=
-                    static_cast<u64>(static_cast<i64>(kMs) * 1'000'000) ||
-                valid_positive_io_timespec(kTime) != (kMs != 0))
+            u32 ms = 0;
+            if (!(range_int(kBase) + range_int(fraction)).to(&ms)) return false;
+            const auto kTime = io_timespec_from_ms(ms);
+            i64 whole_nanos = 0;
+            i64 total_nanos = 0;
+            if (kTime.tv_sec < 0 || kTime.tv_nsec < 0 || kTime.tv_nsec >= 1'000'000'000)
+                return false;
+            if (mul_overflow(kTime.tv_sec, 1'000'000'000, &whole_nanos)) return false;
+            if (add_overflow(whole_nanos, kTime.tv_nsec, &total_nanos)) return false;
+            if (total_nanos != range_int(ms).scaled_by<1'000'000>().value() ||
+                valid_positive_io_timespec(kTime) != (ms != 0))
                 return false;
         }
     }

@@ -17,7 +17,7 @@ struct IdleTrimWindow {
     u32 end;
 };
 
-constexpr IdleTrimWindow idle_trim_window(u32 cursor, u32 timeout) {
+[[nodiscard]] constexpr IdleTrimWindow idle_trim_window(u32 cursor, u32 timeout) {
     if (timeout >= TimerWheel::kSlots || timeout <= IdleTrimWindow::kMinIdleTicks) return {};
     const u32 kYoungest = IdleTrimWindow::kMinIdleTicks;
     constexpr auto kAge =

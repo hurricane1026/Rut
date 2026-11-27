@@ -367,7 +367,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
                 break;
             }
             case IoEventType::Timeout:
-                timer.tick([this](Connection* c) {
+                (void)timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                     if (ws_handle_timer_tick(this, *c)) return;
 #endif
@@ -853,7 +853,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
                 }
                 break;
             case IoEventType::Timeout:
-                timer.tick([this](Connection* c) {
+                (void)timer.tick([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                     if (ws_handle_timer_tick(this, *c)) return;
 #endif

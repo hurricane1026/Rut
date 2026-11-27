@@ -277,9 +277,9 @@ void connect_timeout_wheel_ownership(rut::test::TestCase* _tc) {
     arm_connect_timeout(rig.loop, *c, target);
     CHECK_EQ(c->connect_timeout_episode, episode);
     u32 expired = 0;
-    for (u32 i = 0; i < 2; ++i) rig.loop->timer.tick([&](Connection*) { ++expired; });
+    for (u32 i = 0; i < 2; ++i) (void)rig.loop->timer.tick([&](Connection*) { ++expired; });
     CHECK_EQ(expired, 0u);
-    rig.loop->timer.tick([&](Connection* value) {
+    (void)rig.loop->timer.tick([&](Connection* value) {
         CHECK(value == c);
         ++expired;
     });

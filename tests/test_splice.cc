@@ -240,11 +240,11 @@ TEST(iouring_splice, positive_progress_refreshes_relay_timer_but_eagain_does_not
         CHECK(timer_slot_contains(3));
         CHECK_FALSE(timer_slot_contains(1));
         u32 expired = 0;
-        loop.timer.tick([&](Connection* expired_conn) {
+        (void)loop.timer.tick([&](Connection* expired_conn) {
             CHECK_EQ(expired_conn, c);
             ++expired;
         });
-        loop.timer.tick([&](Connection* expired_conn) {
+        (void)loop.timer.tick([&](Connection* expired_conn) {
             CHECK_EQ(expired_conn, c);
             ++expired;
         });
@@ -271,11 +271,11 @@ TEST(iouring_splice, positive_progress_refreshes_relay_timer_but_eagain_does_not
         CHECK(c->relay_owner.read_armed);
 
         u32 expired = 0;
-        loop.timer.tick([&](Connection* expired_conn) {
+        (void)loop.timer.tick([&](Connection* expired_conn) {
             CHECK_EQ(expired_conn, c);
             ++expired;
         });
-        loop.timer.tick([&](Connection* expired_conn) {
+        (void)loop.timer.tick([&](Connection* expired_conn) {
             CHECK_EQ(expired_conn, c);
             ++expired;
         });

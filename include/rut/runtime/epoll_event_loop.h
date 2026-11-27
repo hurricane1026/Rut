@@ -1247,7 +1247,7 @@ public:
                 if (!catchup_reaches_probe_timeout && !is_draining())
                     request_health_sweep_after_batch();
                 for (i32 t = 0; t < ticks; t++) {
-                    timer.tick([this](Connection* c) {
+                    (void)timer.tick([this](Connection* c) {
                         // A stalled active health probe: it accepted the connect
                         // (or stayed pending) but never produced a parseable
                         // response within upstream_timeout. Record a health FAILURE

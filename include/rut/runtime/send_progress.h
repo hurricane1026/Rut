@@ -5,7 +5,7 @@
 
 namespace rut {
 
-constexpr bool send_result_fits(i64 total) {
+[[nodiscard]] constexpr bool send_result_fits(i64 total) {
     return total >= 0 && total <= INT32_MAX;
 }
 

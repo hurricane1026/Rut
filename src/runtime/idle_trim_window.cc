@@ -9,16 +9,15 @@ namespace {
 
 // Independently arm one timer at every possible age, from oldest to
 // youngest. Compare its expiry to the next tick the sweep plans to visit.
-consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
+[[nodiscard]] consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
     constexpr i64 kCycle = i64{1} << 32;
     const auto kWindow = idle_trim_window(cursor, timeout);
     u32 next = kWindow.begin;
-    for (u32 age = TimerWheel::kSlots; age != 0;) {
-        age = static_cast<u32>(static_cast<i64>(age) - 1);
+    constexpr u32 kMaxAge = IdleTrimWindow::kMinIdleTicks + IdleTrimWindow::kAgeWindow;
+    for (u32 age = TimerWheel::kSlots; age > 0;) {
+        --age;
         if (timeout >= TimerWheel::kSlots || age >= timeout ||
-            age < IdleTrimWindow::kMinIdleTicks ||
-            static_cast<i64>(age) - static_cast<i64>(IdleTrimWindow::kMinIdleTicks) >=
-                static_cast<i64>(IdleTrimWindow::kAgeWindow))
+            age < IdleTrimWindow::kMinIdleTicks || age >= kMaxAge)
             continue;
         const auto kExpiry = range_int(cursor) - range_int(age) + range_int(timeout) +
                              range_int<kCycle, kCycle + 1>{};
@@ -29,12 +28,10 @@ consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
     return next == kWindow.end;
 }
 
-consteval bool window_contract() {
-    constexpr u32 kCursors[] = {
-        0, static_cast<u32>(static_cast<i64>(TimerWheel::kSlots) - 1), 0xfffffff0u, 0xffffffffu};
+[[nodiscard]] consteval bool window_contract() {
+    constexpr u32 kCursors[] = {0, TimerWheel::kSlots - 1, 0xfffffff0u, 0xffffffffu};
     for (const u32 kCursor : kCursors) {
-        for (u32 timeout = 0; static_cast<i64>(timeout) <= static_cast<i64>(TimerWheel::kSlots) + 1;
-             timeout = static_cast<u32>(static_cast<i64>(timeout) + 1))
+        for (u32 timeout = 0; timeout <= TimerWheel::kSlots + 1; ++timeout)
             if (!matches_armed_timers(kCursor, timeout)) return false;
         if (!matches_armed_timers(kCursor, 0xffffffffu)) return false;
     }

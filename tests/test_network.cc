@@ -8494,7 +8494,7 @@ TEST(timer, restart_replaces) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 2);
-    w.tick([](Connection*) {});
+    (void)w.tick([](Connection*) {});
     w.remove(&c);
     w.add(&c, 3);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
@@ -8531,8 +8531,8 @@ TEST(timer, refresh_resets) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 3);
-    w.tick([](Connection*) {});
-    w.tick([](Connection*) {});
+    (void)w.tick([](Connection*) {});
+    (void)w.tick([](Connection*) {});
     w.refresh(&c, 3);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
@@ -8548,7 +8548,7 @@ TEST(timer, cancel) {
     c.timer_node.init();
     w.add(&c, 1);
     w.remove(&c);
-    w.tick([](Connection*) {});
+    (void)w.tick([](Connection*) {});
     CHECK_EQ(w.tick([](Connection*) {}), 0u);
 }
 
@@ -8561,9 +8561,9 @@ TEST(timer, multi_same_slot) {
         conns[i].timer_node.init();
         w.add(&conns[i], 1);
     }
-    w.tick([](Connection*) {});
+    (void)w.tick([](Connection*) {});
     u32 count = 0;
-    w.tick([&](Connection*) { count++; });
+    (void)w.tick([&](Connection*) { count++; });
     CHECK_EQ(count, 100u);
 }
 
@@ -8590,7 +8590,7 @@ TEST(timer, self_restart) {
     w.add(&c, 0);  // slot 0
     int fires = 0;
     // tick: cursor=0, fires at slot 0. Callback re-adds at (0+1)&63=1. cursor→1.
-    w.tick([&](Connection* conn) {
+    (void)w.tick([&](Connection* conn) {
         fires++;
         if (fires < 3) {
             conn->timer_node.init();
@@ -8599,7 +8599,7 @@ TEST(timer, self_restart) {
     });
     CHECK_EQ(fires, 1);
     // tick: cursor=1, checks slot 1 → fires. Re-adds at (1+1)=2. cursor→2.
-    w.tick([&](Connection* conn) {
+    (void)w.tick([&](Connection* conn) {
         fires++;
         if (fires < 3) {
             conn->timer_node.init();
@@ -8608,7 +8608,7 @@ TEST(timer, self_restart) {
     });
     CHECK_EQ(fires, 2);
     // tick: cursor=2, checks slot 2 → fires. fires=3, no re-add. cursor→3.
-    w.tick([&](Connection*) { fires++; });
+    (void)w.tick([&](Connection*) { fires++; });
     CHECK_EQ(fires, 3);
 }
 
@@ -8625,7 +8625,7 @@ TEST(timer, huge_no_crash) {
     c.reset();
     c.timer_node.init();
     w.add(&c, 0xFFFFFFFF);
-    for (int i = 0; i < 100; i++) w.tick([](Connection*) {});
+    for (int i = 0; i < 100; i++) (void)w.tick([](Connection*) {});
     w.remove(&c);
     CHECK(true);  // no crash
 }
