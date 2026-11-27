@@ -62,15 +62,22 @@ TEST(byte_span, checks_64_bit_length_arithmetic) {
     CHECK(byte_span_within(pool, size_t{3}, pool + 2, size_t{1}));
 }
 
-TEST(byte_span, rejects_offsets_outside_ptrdiff_range) {
-    // Only integer addresses are compared. These pointers are never dereferenced.
+#if UINTPTR_MAX == UINT64_MAX
+TEST(byte_span, compares_full_width_integer_offsets) {
+    // Model numeric addresses without allocating or dereferencing memory.
     const auto* base = reinterpret_cast<const char*>(uintptr_t{1});
-    constexpr uintptr_t kMaxOffset = PTRDIFF_MAX;
-    const auto* limit = reinterpret_cast<const char*>(kMaxOffset + 1);
-    const auto* beyond = reinterpret_cast<const char*>(kMaxOffset + 2);
-    CHECK(byte_span_within(base, UINT64_MAX, limit, u64{0}));
-    CHECK_FALSE(byte_span_within(base, UINT64_MAX, beyond, u64{0}));
+    const auto* data = reinterpret_cast<const char*>(UINTPTR_MAX);
+    constexpr u64 kCapacity = UINT64_MAX;
+    CHECK(byte_span_within(base, kCapacity, data, u64{1}));
+    CHECK_FALSE(byte_span_within(base, kCapacity, data, u64{2}));
+
+    u64 offset = 0;
+    CHECK(byte_span_offset_within(base, kCapacity, data, u64{1}, &offset));
+    CHECK_EQ(offset, kCapacity - 1);
+    CHECK_FALSE(byte_span_offset_within(base, kCapacity, data, u64{2}, &offset));
+    CHECK_EQ(offset, kCapacity - 1);
 }
+#endif
 
 // === Str ===
 

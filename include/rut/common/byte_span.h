@@ -30,14 +30,12 @@ template <ByteSpanSize Size>
     Size offset;
     if (sub_overflow(address, begin, &offset)) return false;
 
-    if constexpr (sizeof(Size) <= sizeof(u32) && sizeof(Size) < sizeof(ptrdiff_t)) {
+    if constexpr (sizeof(Size) <= sizeof(u32)) {
         if ((range_int(offset) + range_int(len)).value() > used) return false;
     } else {
         // Bound the last start without adding two potentially full-width values.
         Size last_start;
-        if (offset > u64{PTRDIFF_MAX} || sub_overflow(used, len, &last_start) ||
-            offset > last_start)
-            return false;
+        if (sub_overflow(used, len, &last_start) || offset > last_start) return false;
     }
     *out = offset;
     return true;
@@ -58,9 +56,6 @@ template <ByteSpanSize Size>
     // Compare integer addresses because the candidate may belong to another object.
     uintptr_t distance;
     if (sub_overflow(data_address, pool_address, &distance)) return false;
-    if constexpr (sizeof(Size) >= sizeof(ptrdiff_t)) {
-        if (distance > u64{PTRDIFF_MAX}) return false;
-    }
     return distance <= last_start_offset;
 }
 
