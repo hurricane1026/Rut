@@ -240,7 +240,7 @@ struct AccessLogFlusher {
 
     void init_syslog(i32 fd, const AccessLogSyslogDestination& destination);
     // Read only after stop() has joined the writer.
-    u64 syslog_send_failures() const { return syslog_send_failures_; }
+    i64 syslog_send_failures() const { return syslog_send_failures_; }
     void add_ring(AccessLogRing* ring);
 
     core::Expected<void, Error> start();
@@ -254,8 +254,9 @@ struct AccessLogFlusher {
 
 private:
     void send_syslog(const AccessLogEntry& entry, const char* line, u32 length);
+    void record_syslog_failure();
     AccessLogSyslogDestination syslog_{};
-    u64 syslog_send_failures_ = 0;
+    i64 syslog_send_failures_ = 0;
     static void* thread_entry(void* arg);
 };
 

@@ -700,7 +700,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             log_flusher.stop();
             if (log_flusher.syslog_send_failures() != 0) {
                 write_str("Access log syslog send failures: ");
-                write_u64(log_flusher.syslog_send_failures());
+                write_u64(static_cast<u64>(log_flusher.syslog_send_failures()));
                 write_str("\n");
             }
             close(access_log_fd);

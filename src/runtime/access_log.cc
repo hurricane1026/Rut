@@ -481,11 +481,14 @@ static bool resolve_syslog_address(const char* endpoint, AccessLogSyslogDestinat
         const size_t length = strnlen(path, sizeof(local.sun_path));
         if (path[0] != '/' || length == sizeof(local.sun_path)) return false;
         local.sun_family = AF_UNIX;
-        out.address_length = static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + length + 1);
+        const i64 path_length = static_cast<i64>(length);
+        const i64 address_length =
+            static_cast<i64>(offsetof(sockaddr_un, sun_path)) + path_length + 1;
+        out.address_length = static_cast<socklen_t>(address_length);
 #ifdef __APPLE__
         local.sun_len = static_cast<decltype(local.sun_len)>(out.address_length);
 #endif
-        memcpy(local.sun_path, path, length + 1);
+        memcpy(local.sun_path, path, static_cast<size_t>(path_length + 1));
         memcpy(&out.address, &local, sizeof(local));
         return true;
     }
@@ -504,7 +507,7 @@ static bool resolve_syslog_address(const char* endpoint, AccessLogSyslogDestinat
         if (end)
             port = end + 1;
         else
-            end = host + strlen(host);
+            end = strchr(host, '\0');
     }
     const auto host_length = end - host;
     char name[256];
@@ -565,6 +568,11 @@ core::Expected<i32, Error> open_access_log_syslog(const char* endpoint,
     return fd;
 }
 
+void AccessLogFlusher::record_syslog_failure() {
+    static constexpr i64 kMaxSyslogSendFailures = static_cast<i64>(~u64{0} >> 1);
+    if (syslog_send_failures_ < kMaxSyslogSendFailures) ++syslog_send_failures_;
+}
+
 void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line, u32 length) {
     char header[128];
     i32 header_length = 0;
@@ -580,7 +588,7 @@ void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line
         const auto seconds = static_cast<time_t>(entry.timestamp_us / 1000000);
         tm local{};
         if (!localtime_r(&seconds, &local) || local.tm_mon < 0 || local.tm_mon >= 12) {
-            ++syslog_send_failures_;
+            record_syslog_failure();
             return;
         }
         static constexpr const char* months[] = {
@@ -600,10 +608,12 @@ void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line
                                  syslog_.process_id);
     }
     if (header_length <= 0 || header_length >= static_cast<i32>(sizeof(header))) {
-        ++syslog_send_failures_;
+        record_syslog_failure();
         return;
     }
-    char message[sizeof(header) + kAccessLogTextLineCapacity];
+    static constexpr i64 kMessageCapacity =
+        static_cast<i64>(sizeof(header)) + static_cast<i64>(kAccessLogTextLineCapacity);
+    char message[kMessageCapacity];
     memcpy(message, header, static_cast<size_t>(header_length));
     const i64 payload_length = static_cast<i64>(length) - 1;  // strip file record delimiter
     for (i64 i = 0; i < payload_length; ++i) {
@@ -620,7 +630,7 @@ void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line
                       reinterpret_cast<const sockaddr*>(&syslog_.address),
                       syslog_.address_length);
     } while (sent < 0 && errno == EINTR);
-    if (sent != size) ++syslog_send_failures_;
+    if (sent != size) record_syslog_failure();
 }
 
 void AccessLogFlusher::init(i32 fd, bool compress_enabled, i32 level, u32 interval_ms) {
