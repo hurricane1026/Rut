@@ -1,10 +1,10 @@
 #pragma once
 
-#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 // Rate-limit metering-key spec — the description of a route's "counting unit".
-// Lives in common/ (types.h-only) so both the compiler IR layers (AST → HIR →
+// Lives in common/ so both the compiler IR layers (AST → HIR →
 // MIR → RIR) and the runtime can carry it. The runtime-side value extraction
 // lives in runtime/rate_limit_key.h, which includes this header.
 
@@ -85,13 +85,12 @@ struct RateLimitRule {
 // Rate-limit GCRA arithmetic is precomputed during configuration. Keep the
 // interval exact (ceil rather than floor) so a configured window is never
 // shortened, and reject a burst whose tolerance cannot be represented in u64.
-inline u64 rate_limit_emit_interval_us(u32 max, u32 window_sec) {
-    if (max == 0 || window_sec == 0) return 0;
-    const u64 numerator = static_cast<u64>(window_sec) * 1000000ull;
-    u64 rounded = 0;
-    if (add_overflow(numerator, static_cast<u64>(static_cast<i64>(max) - 1), &rounded))
-        return UINT64_MAX;
-    return rounded / max;
+[[nodiscard]] constexpr u64 rate_limit_emit_interval_us(u32 max, u32 window_sec) {
+    range_int<1, i64{UINT32_MAX} + 1> divisor;
+    if (!decltype(divisor)::try_from_i64(max, &divisor) || window_sec == 0) return 0;
+    const auto numerator = range_int(window_sec).scaled_by<1000000>();
+    const auto rounded = numerator + (divisor - range_int<1, 2>{});
+    return rounded.to_u64() / divisor.to_u64();
 }
 
 inline bool rate_limit_params_representable(u32 max, u32 window_sec, u32 burst) {

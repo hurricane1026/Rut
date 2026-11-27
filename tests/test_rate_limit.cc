@@ -260,6 +260,9 @@ TEST(rate_limit_arithmetic, rejects_unrepresentable_tau_atomically) {
 }
 
 TEST(rate_limit_arithmetic, disabled_interval_is_safe) {
+    static_assert(rate_limit_emit_interval_us(1, UINT32_MAX) == 4294967295000000ull);
+    static_assert(rate_limit_emit_interval_us(UINT32_MAX, UINT32_MAX) == 1000000ull);
+    static_assert(rate_limit_emit_interval_us(UINT32_MAX, 1) == 1);
     CHECK_EQ(rate_limit_emit_interval_us(0, 60), 0ull);
     CHECK_EQ(rate_limit_emit_interval_us(10, 0), 0ull);
     RateLimitRuleSet disabled{};

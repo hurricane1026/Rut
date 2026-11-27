@@ -2,6 +2,7 @@
 
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/platform/socket.h"
 #include <new>
 
@@ -361,8 +362,7 @@ bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
 }
 
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
-    u64 interval_ms = 0;
-    if (mul_overflow(static_cast<u64>(interval_seconds), u64{1000}, &interval_ms)) return ~u64{0};
+    const u64 interval_ms = range_int(interval_seconds).scaled_by<1000>().to_u64();
     u64 deadline = 0;
     return add_overflow(completed_ms, interval_ms, &deadline) ? ~u64{0} : deadline;
 }
@@ -437,8 +437,7 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
 }
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
     if (!now || !last_success || now < last_success) return false;
-    u64 max_age_ms = 0;
-    if (mul_overflow(static_cast<u64>(max_age_seconds), u64{1000}, &max_age_ms)) return false;
+    const u64 max_age_ms = range_int(max_age_seconds).scaled_by<1000>().to_u64();
     u64 age = 0;
     return !sub_overflow(now, last_success, &age) && age < max_age_ms;
 }
@@ -780,15 +779,11 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
     if (sub_overflow(now, started_, &elapsed) || sub_overflow(timeout_, elapsed, &stage_timeout) ||
         stage_timeout == 0)
         return fail();
-    u64 discovery_timeout_wide = 0;
-    u32 kDiscoveryTimeout = 0;
-    if (mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
-                     u64{1000},
-                     &discovery_timeout_wide) ||
-        discovery_timeout_wide > UINT32_MAX)
-        kDiscoveryTimeout = UINT32_MAX;
-    else
-        kDiscoveryTimeout = static_cast<u32>(discovery_timeout_wide);
+    constexpr auto kMaxTimeout = range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{};
+    const u32 kDiscoveryTimeout = range_int(configuration_.discovery_timeout_seconds)
+                                      .scaled_by<1000>()
+                                      .min(kMaxTimeout)
+                                      .to<u32>();
     if (&fetch == &discovery_ && kDiscoveryTimeout && kDiscoveryTimeout < stage_timeout)
         stage_timeout = kDiscoveryTimeout;
     // A synchronous connect error uses the same next-address path as SO_ERROR.
@@ -1138,15 +1133,11 @@ void JwksFetch::advance(u64 now) {
     const bool kDnsHttpsActive = dns_https_ && dns_https_->state() == State::Busy;
     const bool kDnsActive = kDnsHttpsActive || dns_step_ != DnsStep::None || dns_fd_ >= 0;
     if (kDnsActive) {
-        u64 dns_timeout_wide = 0;
-        u32 kDnsTimeout = 0;
-        if (mul_overflow(static_cast<u64>(configuration_.dns_timeout_seconds),
-                         u64{1000},
-                         &dns_timeout_wide) ||
-            dns_timeout_wide > UINT32_MAX)
-            kDnsTimeout = UINT32_MAX;
-        else
-            kDnsTimeout = static_cast<u32>(dns_timeout_wide);
+        constexpr auto kMaxTimeout = range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{};
+        const u32 kDnsTimeout = range_int(configuration_.dns_timeout_seconds)
+                                    .scaled_by<1000>()
+                                    .min(kMaxTimeout)
+                                    .to<u32>();
         if (kDnsTimeout && elapsed >= kDnsTimeout) {
             (void)fail();
             return;

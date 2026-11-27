@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/integer_conversion.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -673,9 +674,8 @@ public:
     u64 health_probe_last_issue_ns[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     bool health_probe_issued[RouteConfig::kMaxUpstreams][UpstreamTarget::kMaxBackends]{};
     u8 health_probe_backend_cursor[RouteConfig::kMaxUpstreams]{};
-    static u64 deadline_after(u64 now, u32 interval_ms) {
-        u64 delay = 0;
-        if (mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay)) return UINT64_MAX;
+    [[nodiscard]] static u64 deadline_after(u64 now, u32 interval_ms) {
+        const u64 delay = range_int(interval_ms).scaled_by<1'000'000>().to_u64();
         u64 deadline = 0;
         if (add_overflow(now, delay, &deadline)) return UINT64_MAX;
         return deadline;

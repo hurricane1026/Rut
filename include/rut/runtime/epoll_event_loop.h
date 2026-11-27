@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -1069,8 +1070,7 @@ public:
         // recv interest until the next submit_recv rearms it.
         backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
-        u64 delay_ns = 0;
-        if (mul_overflow(static_cast<u64>(ms), u64{1'000'000}, &delay_ns)) return false;
+        const u64 delay_ns = range_int(ms).scaled_by<1'000'000>().to_u64();
         u64 deadline = 0;
         if (add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {

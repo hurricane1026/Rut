@@ -392,8 +392,7 @@ int DnsResolver::resolve(
         return 0;
     }
     if (kAnswer != DnsAnswer::Addresses && kAnswer != DnsAnswer::Alias) return retry();
-    u64 ttl_ms = 0;
-    if (mul_overflow(static_cast<u64>(result.ttl), u64{1000}, &ttl_ms)) return retry();
+    const u64 ttl_ms = range_int(result.ttl).scaled_by<1000>().to_u64();
     u64 kValidUntil = 0;
     if (add_overflow(now, ttl_ms, &kValidUntil)) kValidUntil = ~u64{0};
     if (kValidUntil < q.valid_until) q.valid_until = kValidUntil;
