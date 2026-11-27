@@ -8,11 +8,14 @@ namespace {
 
 // Big-endian readers/writers. HTTP/2 integers are network byte order.
 [[nodiscard]] u32 read_u24(const u8* p) {
-    return (static_cast<u32>(p[0]) << 16) | (static_cast<u32>(p[1]) << 8) | static_cast<u32>(p[2]);
+    return (range_int{p[0]}.scaled_by<(1 << 16)>() + range_int{p[1]}.scaled_by<(1 << 8)>() +
+            range_int{p[2]})
+        .to<u32>();
 }
 [[nodiscard]] u32 read_u32(const u8* p) {
-    return (static_cast<u32>(p[0]) << 24) | (static_cast<u32>(p[1]) << 16) |
-           (static_cast<u32>(p[2]) << 8) | static_cast<u32>(p[3]);
+    return (range_int{p[0]}.scaled_by<(1 << 24)>() + range_int{p[1]}.scaled_by<(1 << 16)>() +
+            range_int{p[2]}.scaled_by<(1 << 8)>() + range_int{p[3]})
+        .to<u32>();
 }
 [[nodiscard]] u16 read_u16(const u8* p) {
     return (range_int(p[0]).scaled_by<256>() + range_int(p[1])).to<u16>();
@@ -41,7 +44,7 @@ void write_u16(u8* p, u16 v) {
     h.flags = flags;
     h.stream_id = stream_id;
     (void)write_frame_header(out, h);
-    return out + static_cast<i64>(kFrameHeaderSize);
+    return out + kFrameHeaderSize;
 }
 
 }  // namespace
