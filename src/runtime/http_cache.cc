@@ -11,6 +11,15 @@
 namespace rut {
 namespace {
 
+constexpr i64 kMaxBufferedResponse = i64{HttpCachePolicy::kMaxResponse} - 256;
+
+[[nodiscard]] u8 ascii_lower(char byte) {
+    const u8 c = __builtin_bit_cast(u8, byte);
+    if (c < 'A' || c > 'Z') return c;
+    const auto lower = range_int(c) + range_int<'a' - 'A', 'a' - 'A' + 1>{};
+    return lower.min(range_int<UINT8_MAX, i64{UINT8_MAX} + 1>{}).to<u8>();
+}
+
 [[nodiscard]] bool valid_name(Str name) {
     if (!name.len) return false;
     for (u32 i = 0; i < name.len; ++i)
@@ -227,10 +236,8 @@ struct ResponseInfo {
     if (parser.parse(wire, length, &response) != ParseStatus::Complete ||
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
-        static_cast<i64>(response.content_length) >
-            static_cast<i64>(HttpCachePolicy::kMaxResponse) - 256 ||
-        static_cast<i64>(parser.header_end) > static_cast<i64>(HttpCachePolicy::kMaxResponse) -
-                                                  256 - static_cast<i64>(response.content_length))
+        (range_int(parser.header_end) + range_int(response.content_length)).value() >
+            kMaxBufferedResponse)
         return false;
     info.header_end = parser.header_end;
     Controls policy;
@@ -242,7 +249,7 @@ struct ResponseInfo {
         const Str name = header.name;
         if (!valid_name(name)) return false;
         for (u32 j = 0; j < header.value.len; ++j) {
-            const u8 c = static_cast<u8>(header.value.ptr[j]);
+            const u8 c = __builtin_bit_cast(u8, header.value.ptr[j]);
             if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
         }
         if (eq(name, "cache-control", 13)) {
@@ -390,9 +397,7 @@ bool HttpCachePolicy::make_key(
     if (hosts != 1 || host.len == 0 || req.path.len == 0 || req.path.ptr[0] != '/') return false;
     u64 host_hash = hash_bytes(1469598103934665603ull, &tls, sizeof(tls));
     for (u32 i = 0; i < host.len; ++i) {
-        u8 c = static_cast<u8>(host.ptr[i]);
-        if (c >= 'A' && c <= 'Z')
-            c = static_cast<u8>(static_cast<i64>(c) + static_cast<i64>('a' - 'A'));
+        const u8 c = ascii_lower(host.ptr[i]);
         host_hash = hash_bytes(host_hash, &c, 1);
     }
     key.host = host_hash;
@@ -405,9 +410,7 @@ bool HttpCachePolicy::make_key(
         const auto& header = req.headers[i];
         if (ignored_key_header(header.name)) continue;
         for (u32 j = 0; j < header.name.len; ++j) {
-            u8 c = static_cast<u8>(header.name.ptr[j]);
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<u8>(static_cast<i64>(c) + static_cast<i64>('a' - 'A'));
+            const u8 c = ascii_lower(header.name.ptr[j]);
             if (!append(key, &c, 1)) return true;
         }
         if (!append(key, ":", 1) || !append(key, header.value.ptr, header.value.len) ||
@@ -452,13 +455,12 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
     info.parsed.reset();
     if (parser.parse(response, length, &info.parsed) != ParseStatus::Complete ||
         info.parsed.status_code != 200 || info.parsed.headers_truncated || info.parsed.chunked ||
-        !info.parsed.has_content_length || info.parsed.content_length_count != 1 ||
-        static_cast<i64>(info.parsed.content_length) > static_cast<i64>(kMaxResponse) - 256 ||
-        static_cast<i64>(parser.header_end) >
-            static_cast<i64>(kMaxResponse) - 256 - static_cast<i64>(info.parsed.content_length))
+        !info.parsed.has_content_length || info.parsed.content_length_count != 1)
         return false;
-    total = static_cast<u32>(static_cast<i64>(parser.header_end) +
-                             static_cast<i64>(info.parsed.content_length));
+    const auto response_size = range_int(parser.header_end) + range_int(info.parsed.content_length);
+    if (response_size.value() > kMaxBufferedResponse) return false;
+    total =
+        response_size.min(range_int<kMaxBufferedResponse, kMaxBufferedResponse + 1>{}).to<u32>();
     return true;
 }
 bool HttpCachePolicy::prepare_record(
@@ -468,8 +470,7 @@ bool HttpCachePolicy::prepare_record(
     if (sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
-        length != static_cast<u32>(static_cast<i64>(info.header_end) +
-                                   static_cast<i64>(info.parsed.content_length)))
+        length != (range_int(info.header_end) + range_int(info.parsed.content_length)).value())
         return false;
     const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;
