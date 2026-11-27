@@ -300,7 +300,7 @@ def main():
         for before, after in [
             ("generation == 0 || generation != owner_generation", "generation == 0"),
             ("cancel ? cancel_owned : target_owned", "cancel ? target_owned : cancel_owned"),
-            ("target_owned || cancel_owned ?", "target_owned && cancel_owned ?"),
+            ("*target_owned || *cancel_owned ?", "*target_owned && *cancel_owned ?"),
         ]:
             mutate(root / "include", overlay, header, before, after)
             check(compiler, root, overlay, "Response-read timer completion violates ownership contract",

@@ -87872,6 +87872,26 @@ TEST(response_headers, stabilization_copies_only_mutations_that_survive_folding)
     CHECK(conn.resp_header_mutations[1].value.eq({"kept", 4}));
 }
 
+TEST(response_headers, stabilization_checks_total_capacity_before_copying) {
+    Connection conn;
+    conn.reset();
+    u8 storage[4]{};
+    conn.response_header_buf.bind(storage, sizeof(storage));
+    static const char source[] = "abc";
+    conn.resp_header_mutations[0] = {
+        {"X-Test", 6}, {source, 3}, ConnectionBase::RespHeaderMutationMode::Add};
+    conn.resp_header_mutations[1] = conn.resp_header_mutations[0];
+    conn.resp_header_mutation_count = 2;
+
+    // Two surviving mutations can reference the same input, so the total
+    // required space can exceed the size of that input.
+    CHECK_FALSE(
+        conn.stabilize_response_mutations(reinterpret_cast<const u8*>(source), sizeof(source) - 1));
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+    CHECK(conn.resp_header_mutations[0].value.ptr == source);
+    CHECK(conn.resp_header_mutations[1].value.ptr == source);
+}
+
 TEST(http2, proxy_forwardability_requires_scheme_and_usable_host) {
     const hpack::Header authority[] = {
         {{":scheme", 7}, {"https", 5}},

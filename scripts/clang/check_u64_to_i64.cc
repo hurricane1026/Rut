@@ -313,8 +313,15 @@ public:
         if (!namespace_decl || namespace_decl->getName() != "rut" ||
             (name != "add_overflow" && name != "sub_overflow" && name != "mul_overflow"))
             return true;
-        if (function && function->hasAttr<WarnUnusedResultAttr>() && returns_status(*call))
+        if (function && returns_status(*call)) {
+            if (!function->hasAttr<WarnUnusedResultAttr>()) {
+                auto& diagnostics = context.getDiagnostics();
+                const auto id = diagnostics.getCustomDiagID(
+                    DiagnosticsEngine::Warning, "checked arithmetic status requires [[nodiscard]]");
+                diagnostics.Report(call->getExprLoc(), id) << call->getSourceRange();
+            }
             return true;
+        }
         auto& diagnostics = context.getDiagnostics();
         const auto id = diagnostics.getCustomDiagID(
             DiagnosticsEngine::Warning,

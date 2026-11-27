@@ -7,6 +7,7 @@
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/load_balance.h"
+#include "rut/common/range_int.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/route_host.h"
 #include "rut/common/trap.h"
@@ -597,13 +598,15 @@ struct ConnectionBase {
     // Copy request-backed mutation values out of a synthesized request before
     // HTTP/2 reuses its request scratch for the encoded response. Literal values
     // already live in JIT-owned storage and do not need copying.
-    bool stabilize_response_mutations(const u8* source, u32 source_len) {
-        auto survives_folding = [&](u32 index) {
+    [[nodiscard]] bool stabilize_response_mutations(const u8* source, u32 source_len) {
+        const u8 count = resp_header_mutation_count;
+        if (count > kMaxRespHeaderMutations) return false;
+
+        auto survives_folding = [&](u8 index) {
             const auto& current = resp_header_mutations[index];
             if (current.mode == RespHeaderMutationMode::Remove) return false;
-            for (u32 later_index = static_cast<u32>(static_cast<i64>(index) + 1);
-                 later_index < resp_header_mutation_count;
-                 later_index++) {
+            const auto next = range_int(index) + range_int<1, 2>{};
+            for (u32 later_index = next.to<u32>(); later_index < count; later_index++) {
                 const auto& later = resp_header_mutations[later_index];
                 if (later.mode != RespHeaderMutationMode::Add &&
                     http_header_name_eq_ci(
@@ -612,33 +615,27 @@ struct ConnectionBase {
             }
             return true;
         };
-        u32 needed = 0;
-        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+
+        const auto* source_chars = reinterpret_cast<const char*>(source);
+        u32 remaining = response_header_buf.capacity();
+        for (u8 i = 0; i < count; i++) {
             if (!survives_folding(i)) continue;
             const auto& value = resp_header_mutations[i].value;
-            if (value.ptr == nullptr) continue;
-            const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr >= source &&
-                ptr + static_cast<i64>(value.len) <= source + static_cast<i64>(source_len)) {
-                u32 next_needed = 0;
-                if (add_overflow(needed, value.len, &next_needed)) return false;
-                needed = next_needed;
-            }
+            if (!byte_span_within(source_chars, source_len, value.ptr, value.len)) continue;
+            // Both operands fit in u32. Their i64 difference fits in u32 only
+            // when this value fits in the remaining space.
+            if (!(range_int(remaining) - range_int(value.len)).to(&remaining)) return false;
         }
-        if (needed > response_header_buf.capacity()) return false;
+
         response_header_buf.reset();
-        for (u32 i = 0; i < resp_header_mutation_count; i++) {
+        for (u8 i = 0; i < count; i++) {
             if (!survives_folding(i)) continue;
             auto& value = resp_header_mutations[i].value;
-            if (value.ptr == nullptr) continue;
+            if (!byte_span_within(source_chars, source_len, value.ptr, value.len)) continue;
+            const auto offset = range_int(response_header_buf.len());
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < source ||
-                ptr + static_cast<i64>(value.len) > source + static_cast<i64>(source_len))
-                continue;
-            const u32 offset = response_header_buf.len();
             if (response_header_buf.write(ptr, value.len) != value.len) return false;
-            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() +
-                                                      static_cast<i64>(offset));
+            value.ptr = reinterpret_cast<const char*>(response_header_buf.data() + offset.index());
         }
         return true;
     }

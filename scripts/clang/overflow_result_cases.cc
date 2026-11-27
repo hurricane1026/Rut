@@ -13,7 +13,7 @@ using namespace rut;
 }
 
 bool missing_annotation(int a, int b, int* out) {
-    // expected-warning@+1 {{checked arithmetic requires an explicit return}}
+    // expected-warning@+1 {{checked arithmetic status requires [[nodiscard]]}}
     if (add_overflow(a, b, out)) return false;
     return true;
 }
