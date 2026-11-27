@@ -4833,6 +4833,15 @@ TEST(grpc_proxy, upstream_tls_rejections_iouring) {
     for (u32 mode = 0; mode < 7; mode++) tls_rejection_case<IoUringEventLoop>(_tc, mode);
 }
 
+TEST(grpc_proxy, content_length_preserves_output_on_invalid_input) {
+    u32 length = 0;
+    REQUIRE(grpc_parse_content_length(lit_str("0004294967295"), &length));
+    CHECK_EQ(length, UINT32_MAX);
+    CHECK_FALSE(grpc_parse_content_length(lit_str("4294967296"), &length));
+    CHECK_FALSE(grpc_parse_content_length(lit_str("12x"), &length));
+    CHECK_EQ(length, UINT32_MAX);
+}
+
 TEST(grpc_proxy, observed_status_metadata) {
     const hpack::Header ok[] = {{{"grpc-status", 11}, {"0", 1}}};
     const hpack::Header denied[] = {{{"grpc-status", 11}, {"7", 1}}};

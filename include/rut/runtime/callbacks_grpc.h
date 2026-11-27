@@ -111,12 +111,11 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
         return;
     }
 }
-inline bool grpc_pop(u8* buf, u32& len, u32 n) {
-    if (n > len) {
-        return false;
-    }
-    len = static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(n));
-    if (len) __builtin_memmove(buf, buf + static_cast<i64>(n), len);
+[[nodiscard]] inline bool grpc_pop(u8* buf, u32& len, u32 n) {
+    u32 remaining = 0;
+    if (sub_overflow(len, n, &remaining)) return false;
+    if (remaining) __builtin_memmove(buf, buf + range_int{n}.index(), remaining);
+    len = remaining;
     return true;
 }
 inline bool grpc_timeout(Str value, u64* micros) {
@@ -405,9 +404,15 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq({"grpc-status", 11})) return true;
     return false;
 }
+using GrpcDecimalDigit = range_int<0, 10>;
+
+[[nodiscard]] constexpr bool grpc_decimal_digit(char byte, GrpcDecimalDigit* digit) {
+    return GrpcDecimalDigit::try_from_i64(i64{byte} - '0', digit);
+}
+
 // Invalid or duplicate status metadata is reported as UNKNOWN in telemetry;
 // forwarding remains opaque and does not rewrite backend trailers.
-inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+[[nodiscard]] inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
     bool seen = false;
     u8 status = 2;
     for (u32 i = 0; i < n; i++) {
@@ -416,13 +421,17 @@ inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
         seen = true;
         const Str kValue = hs[i].value;
         if (!kValue.len) return 2;
-        i64 parsed = 0;
-        for (u32 j = 0; j < kValue.len; j++) {
-            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return 2;
-            parsed = parsed * 10 + static_cast<i64>(kValue.ptr[j] - '0');
-            if (parsed > 16) return 2;
+        using GrpcStatus = range_int<0, 17>;
+        GrpcStatus parsed;
+        const char* cursor = kValue.ptr;
+        const char* const kEnd = cursor + range_int{kValue.len}.index();
+        while (cursor != kEnd) {
+            GrpcDecimalDigit digit;
+            if (!grpc_decimal_digit(*cursor++, &digit)) return 2;
+            const auto kNext = parsed.scaled_by<10>() + digit;
+            if (!GrpcStatus::try_from_i64(kNext.value(), &parsed)) return 2;
         }
-        status = static_cast<u8>(parsed);
+        status = parsed.to<u8>();
     }
     return status;
 }
@@ -486,16 +495,18 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, true, now_us);
 }
-inline bool grpc_parse_content_length(Str value, u32* out) {
+[[nodiscard]] inline bool grpc_parse_content_length(Str value, u32* out) {
     if (value.len == 0) return false;
-    i64 parsed = 0;
-    for (u32 i = 0; i < value.len; i++) {
-        if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
-        const u32 digit = static_cast<u32>(static_cast<i64>(value.ptr[i]) - static_cast<i64>('0'));
-        if (parsed > (static_cast<i64>(UINT32_MAX) - static_cast<i64>(digit)) / 10) return false;
-        parsed = parsed * 10 + static_cast<i64>(digit);
+    u32 parsed = 0;
+    const char* cursor = value.ptr;
+    const char* const kEnd = cursor + range_int{value.len}.index();
+    while (cursor != kEnd) {
+        GrpcDecimalDigit digit;
+        if (!grpc_decimal_digit(*cursor++, &digit)) return false;
+        const auto kNext = range_int{parsed}.scaled_by<10>() + digit;
+        if (!kNext.to(&parsed)) return false;
     }
-    *out = static_cast<u32>(parsed);
+    *out = parsed;
     return true;
 }
 template <typename Loop>
