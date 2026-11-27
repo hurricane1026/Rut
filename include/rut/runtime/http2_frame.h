@@ -86,11 +86,11 @@ struct Http2FrameHeader {
 // bytes are available, Complete on success. Never Error: any 9 bytes form a
 // syntactically valid header (semantic checks happen at higher layers). The
 // reserved bit of the stream id is masked off per §4.1.
-ParseStatus parse_frame_header(const u8* buf, u32 len, Http2FrameHeader* out);
+[[nodiscard]] ParseStatus parse_frame_header(const u8* buf, u32 len, Http2FrameHeader* out);
 
 // Write a 9-octet frame header into out (must hold >= kFrameHeaderSize bytes).
 // length is truncated to 24 bits and stream_id to 31 bits. Returns 9.
-u32 write_frame_header(u8* out, const Http2FrameHeader& h);
+[[nodiscard]] u32 write_frame_header(u8* out, const Http2FrameHeader& h);
 
 // Client connection preface (RFC 7540 §3.5): the exact 24 bytes a client sends
 // before its first frame.
@@ -99,7 +99,7 @@ extern const u8 kClientPreface[kClientPrefaceLen];
 
 // Match the client preface at buf[0..len). Complete = full 24-byte match,
 // Incomplete = buf is a (shorter) prefix of the preface, Error = mismatch.
-ParseStatus match_client_preface(const u8* buf, u32 len);
+[[nodiscard]] ParseStatus match_client_preface(const u8* buf, u32 len);
 
 // Connection SETTINGS state (RFC 7540 §6.5.2). set_defaults() seeds the
 // protocol defaults; parse_settings applies a peer's SETTINGS payload.
@@ -132,28 +132,28 @@ struct Http2Settings {
 // ignored per §6.5.2. Returns the connection error code: NoError on success,
 // FrameSizeError if len is not a multiple of 6, ProtocolError/FlowControlError
 // for out-of-range ENABLE_PUSH / INITIAL_WINDOW_SIZE / MAX_FRAME_SIZE values.
-Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s);
+[[nodiscard]] Http2Error parse_settings(const u8* payload, u32 len, Http2Settings* s);
 
 // Serialize a SETTINGS frame (header + payload) advertising the given settings
 // into out (must hold kFrameHeaderSize + 6*entries). Only non-default values we
 // care to announce are written. Returns total bytes written.
-u32 write_settings_frame(u8* out, const Http2Settings& s);
+[[nodiscard]] u32 write_settings_frame(u8* out, const Http2Settings& s);
 
 // Serialize an empty SETTINGS frame with the ACK flag (RFC 7540 §6.5.3) into
 // out (must hold >= kFrameHeaderSize). Returns kFrameHeaderSize.
-u32 write_settings_ack(u8* out);
+[[nodiscard]] u32 write_settings_ack(u8* out);
 
 // Serialize a GOAWAY frame (RFC 7540 §6.8) into out (must hold
 // kFrameHeaderSize + 8). Returns total bytes written.
-u32 write_goaway(u8* out, u32 last_stream_id, Http2Error error);
+[[nodiscard]] u32 write_goaway(u8* out, u32 last_stream_id, Http2Error error);
 
 // Serialize a WINDOW_UPDATE frame (RFC 7540 §6.9) into out (must hold
 // kFrameHeaderSize + 4). stream_id 0 targets the whole connection. Returns
 // total bytes written.
-u32 write_window_update(u8* out, u32 stream_id, u32 increment);
+[[nodiscard]] u32 write_window_update(u8* out, u32 stream_id, u32 increment);
 
 // Serialize an RST_STREAM frame (RFC 7540 §6.4) into out (must hold
 // kFrameHeaderSize + 4). Returns total bytes written.
-u32 write_rst_stream(u8* out, u32 stream_id, Http2Error error);
+[[nodiscard]] u32 write_rst_stream(u8* out, u32 stream_id, Http2Error error);
 
 }  // namespace rut

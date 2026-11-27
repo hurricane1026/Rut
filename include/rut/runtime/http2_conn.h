@@ -260,18 +260,19 @@ struct Http2Conn {
     void init();
     // HTTP/2 prior-knowledge client. Caller writes the preface + our SETTINGS.
     void init_client();
-    Http2Stream* open_stream(u32 id);
+    [[nodiscard]] Http2Stream* open_stream(u32 id);
     // Return previously delivered DATA credit. False on double-consume/overflow.
-    bool consume_data(u32 stream_id, u32 len);
+    [[nodiscard]] bool consume_data(u32 stream_id, u32 len);
 
     // Consume as many complete frames (and the preface) as `in` holds, writing
     // any required control frames into out[0..out_cap). Partial trailing frames
     // are left unconsumed for the next call. On a connection error a GOAWAY is
     // written and close=true is returned.
-    Http2Result process(const u8* in, u32 len, u8* out, u32 out_cap, u32* out_written);
+    [[nodiscard]] Http2Result process(
+        const u8* in, u32 len, u8* out, u32 out_cap, u32* out_written);
 
     // Look up a stream by id, or null.
-    Http2Stream* find_stream(u32 id);
+    [[nodiscard]] Http2Stream* find_stream(u32 id);
 };
 
 // --- Response serialization (stateless; encoder never indexes) ---
@@ -280,46 +281,47 @@ struct Http2Conn {
 // (we never split header blocks) and END_STREAM when end_stream. out must hold
 // kFrameHeaderSize + encoded header bytes. Returns octets written, or 0 if the
 // encoded block would exceed out_cap.
-u32 http2_write_headers(
+[[nodiscard]] u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream);
 
 // Write a DATA frame for data[0..len) on stream_id into out (must hold
 // kFrameHeaderSize + len). Returns octets written.
-u32 http2_write_data(u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);
+[[nodiscard]] u32 http2_write_data(
+    u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream);
 
 // Serialize a complete response for stream_id into out using the connection's
 // dynamic-indexing encoder: a HEADERS frame (:status, the `nhdrs` caller-
 // supplied headers, plus content-length when there is a body), then a DATA frame
 // if body_len > 0. END_STREAM is set on the last frame. Returns total octets
 // written, or 0 if it would exceed out_cap.
-u32 http2_write_response(u8* out,
-                         u32 out_cap,
-                         hpack::Encoder& enc,
-                         u32 stream_id,
-                         u16 status,
-                         const hpack::Header* hdrs,
-                         u32 nhdrs,
-                         const u8* body,
-                         u32 body_len);
+[[nodiscard]] u32 http2_write_response(u8* out,
+                                       u32 out_cap,
+                                       hpack::Encoder& enc,
+                                       u32 stream_id,
+                                       u16 status,
+                                       const hpack::Header* hdrs,
+                                       u32 nhdrs,
+                                       const u8* body,
+                                       u32 body_len);
 
-u32 http2_write_response_headers(u8* out,
-                                 u32 out_cap,
-                                 hpack::Encoder& enc,
-                                 u32 stream_id,
-                                 u16 status,
-                                 const hpack::Header* hdrs,
-                                 u32 nhdrs,
-                                 u32 body_len,
-                                 bool end_stream);
+[[nodiscard]] u32 http2_write_response_headers(u8* out,
+                                               u32 out_cap,
+                                               hpack::Encoder& enc,
+                                               u32 stream_id,
+                                               u16 status,
+                                               const hpack::Header* hdrs,
+                                               u32 nhdrs,
+                                               u32 body_len,
+                                               bool end_stream);
 
-u32 http2_write_head_response_headers(u8* out,
-                                      u32 out_cap,
-                                      hpack::Encoder& enc,
-                                      u32 stream_id,
-                                      u16 status,
-                                      const hpack::Header* hdrs,
-                                      u32 nhdrs,
-                                      u32 representation_length);
+[[nodiscard]] u32 http2_write_head_response_headers(u8* out,
+                                                    u32 out_cap,
+                                                    hpack::Encoder& enc,
+                                                    u32 stream_id,
+                                                    u16 status,
+                                                    const hpack::Header* hdrs,
+                                                    u32 nhdrs,
+                                                    u32 representation_length);
 
 // --- Request bridge ---
 
@@ -335,9 +337,9 @@ u32 http2_write_head_response_headers(u8* out,
 // or more headers than ParsedRequest holds).
 // Extended CONNECT is accepted only when an explicit protocol output is supplied.
 // Callers must additionally check local SETTINGS negotiation and END_STREAM.
-bool h2_headers_to_request(const hpack::Header* hs,
-                           u32 n,
-                           ParsedRequest* req,
-                           Str* protocol = nullptr);
+[[nodiscard]] bool h2_headers_to_request(const hpack::Header* hs,
+                                         u32 n,
+                                         ParsedRequest* req,
+                                         Str* protocol = nullptr);
 
 }  // namespace rut

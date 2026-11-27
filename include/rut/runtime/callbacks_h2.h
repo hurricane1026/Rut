@@ -325,7 +325,7 @@ inline u32 h2_pump_outbound(Http2Conn& h2, u8* out, u32 cap, H2PumpStatus& statu
     frame.type = static_cast<u8>(Http2FrameType::Data);
     frame.flags = (n == kRemaining) ? http2_flag::kEndStream : 0;
     frame.stream_id = h2.outbound_stream;
-    write_frame_header(out, frame);
+    (void)write_frame_header(out, frame);
     __builtin_memcpy(out + static_cast<i64>(kFrameHeaderSize),
                      h2.outbound_body + static_cast<i64>(h2.outbound_body_offset),
                      n);

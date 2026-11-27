@@ -82,7 +82,7 @@ struct HuffTrie {
     i16 node_count;
 };
 
-consteval HuffTrie build_trie() {
+[[nodiscard]] consteval HuffTrie build_trie() {
     static_assert(kMaxNodes <= INT16_MAX && kSymCount <= INT16_MAX);
     HuffTrie t{};
     for (u32 i = 0; i < kMaxNodes; i++) {
@@ -126,7 +126,7 @@ struct HuffFsm {
     u8 pad_ok[kMaxNodes];
 };
 
-constexpr HuffFsm build_fsm() {
+[[nodiscard]] constexpr HuffFsm build_fsm() {
     HuffFsm f{};
     for (u32 n = 0; n < kMaxNodes; n++) {
         f.pad_ok[n] = 0;
@@ -174,7 +174,7 @@ constexpr HuffFsm kFsm = build_fsm();
 
 }  // namespace
 
-u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
+[[nodiscard]] u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     if (len == 0 || prefix_bits == 0 || prefix_bits > 8) return 0;
     // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
     const u32 kMask = ~(~u32{0} << prefix_bits);
@@ -201,7 +201,7 @@ u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     return i;
 }
 
-u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
+[[nodiscard]] u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
     if (prefix_bits == 0 || prefix_bits > 8) return 0;
     // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
     const u32 kMask = ~(~u32{0} << prefix_bits);
@@ -221,7 +221,7 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
     return i;
 }
 
-i64 huffman_encoded_len(const u8* src, u32 len) {
+[[nodiscard]] i64 huffman_encoded_len(const u8* src, u32 len) {
     // The longest HPACK code is 30 bits, so the full u32 input range fits in
     // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
     i64 bits = 0;
@@ -230,7 +230,7 @@ i64 huffman_encoded_len(const u8* src, u32 len) {
     return huffman_encoded_bytes_from_bits(bits);
 }
 
-i64 huffman_encode(u8* out, const u8* src, u32 len) {
+[[nodiscard]] i64 huffman_encode(u8* out, const u8* src, u32 len) {
     u64 acc = 0;    // bit accumulator, MSB-first
     i64 nbits = 0;  // valid bits in acc
     i64 o = 0;
@@ -253,7 +253,7 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
     return o;
 }
 
-i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
+[[nodiscard]] i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
     // The signed result reports -1 on failure and otherwise carries the exact length.
     const i32 limit = range_int(cap).min(range_int<INT32_MAX, i64{INT32_MAX} + 1>{}).to<i32>();
     i16 node = 0;
@@ -283,7 +283,7 @@ i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
     return o;
 }
 
-u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
+[[nodiscard]] u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     if (len == 0) return 0;
     const bool kHuffman = (in[0] & 0x80) != 0;
     u32 slen = 0;
@@ -303,7 +303,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     return kConsumed.min(range_int(len)).to<u32>();
 }
 
-i64 encode_string(u8* out, const u8* src, u32 len) {
+[[nodiscard]] i64 encode_string(u8* out, const u8* src, u32 len) {
     const i64 kHlen = huffman_encoded_len(src, len);
     u32 encoded_length;
     if (kHlen < len && range_int(kHlen).to(&encoded_length)) {
@@ -393,7 +393,7 @@ constexpr StaticEntry kStatic[] = {
 
 constexpr u32 kStaticCount = sizeof(kStatic) / sizeof(kStatic[0]);  // 61
 
-bool str_eq(Str a, const char* b, u16 blen) {
+[[nodiscard]] bool str_eq(Str a, const char* b, u16 blen) {
     if (a.len != blen) return false;
     for (u32 i = 0; i < blen; i++)
         if (a.ptr[i] != b[i]) return false;
@@ -408,29 +408,43 @@ void dyn_clear(DynamicTable& d) {
     d.table_size = 0;
 }
 
-void dyn_evict_oldest(DynamicTable& d) {
-    if (d.nent == 0) return;
-    const DynamicTable::Entry kOld = d.ents[0];
-    const i64 kBlen = static_cast<i64>(kOld.nlen) + static_cast<i64>(kOld.vlen);
-    __builtin_memmove(d.buf, d.buf + kBlen, static_cast<i64>(d.byte_used) - kBlen);
-    d.byte_used = static_cast<u32>(static_cast<i64>(d.byte_used) - kBlen);
-    const i64 kOldCost = kBlen + 32;
-    d.table_size = static_cast<u32>(static_cast<i64>(d.table_size) - kOldCost);
+[[nodiscard]] bool dyn_evict_oldest(DynamicTable& d) {
+    if (d.nent == 0 || d.nent > DynamicTable::kMaxEntries || d.byte_used > DynamicTable::kByteCap)
+        return false;
+    const auto& oldest = d.ents[0];
+    const auto payload = range_int(oldest.nlen) + range_int(oldest.vlen);
+    const auto cost = payload + range_int<32, 33>{};
+    u32 next_used;
+    u32 next_size;
+    if (!(range_int(d.byte_used) - payload).to(&next_used) ||
+        !(range_int(d.table_size) - cost).to(&next_size))
+        return false;
     for (u32 i = 1; i < d.nent; i++) {
-        const i64 kPrevious = static_cast<i64>(i) - 1;
-        d.ents[kPrevious] = d.ents[i];
-        d.ents[kPrevious].off = static_cast<u32>(static_cast<i64>(d.ents[kPrevious].off) - kBlen);
+        auto entry = d.ents[i];
+        if (!(range_int(entry.off) - payload).to(&entry.off)) {
+            // The metadata was inconsistent. Drop the partial compaction and
+            // report failure so the caller stops using this HPACK context.
+            dyn_clear(d);
+            return false;
+        }
+        d.ents[i64{i} - 1] = entry;
     }
+    __builtin_memmove(d.buf, d.buf + payload.index(), next_used);
+    d.byte_used = next_used;
+    d.table_size = next_size;
     --d.nent;
+    return true;
 }
 
-void dyn_set_max_size(DynamicTable& d, u32 m) {
-    d.max_size = m;
-    while (d.table_size > d.max_size) dyn_evict_oldest(d);
+[[nodiscard]] bool dyn_set_max_size(DynamicTable& d, u32 size) {
+    while (d.table_size > size)
+        if (!dyn_evict_oldest(d)) return false;
+    d.max_size = size;
+    return true;
 }
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
-void dyn_add(DynamicTable& d, Str name, Str value) {
+[[nodiscard]] bool dyn_add(DynamicTable& d, Str name, Str value) {
     constexpr auto kByteCap = range_int<DynamicTable::kByteCap, i64{DynamicTable::kByteCap} + 1>{};
     const auto payload = range_int(name.len) + range_int(value.len);
     const auto cost = payload + range_int<32, 33>{};
@@ -438,23 +452,26 @@ void dyn_add(DynamicTable& d, Str name, Str value) {
         // §4.4: entry larger than the table empties it. The payload check also
         // keeps the u32 offsets and u16 entry lengths representable.
         dyn_clear(d);
-        return;
+        return true;
     }
     while ((range_int(d.table_size) + cost).value() > d.max_size ||
            d.nent >= DynamicTable::kMaxEntries)
-        dyn_evict_oldest(d);
+        if (!dyn_evict_oldest(d)) return false;
     const auto offset = range_int(d.byte_used);
+    const auto end = offset + payload;
+    if (end.value() > kByteCap.value()) return false;
     const auto name_length = range_int(name.len).min(kByteCap);
     const auto value_length = range_int(value.len).min(kByteCap);
     __builtin_memcpy(d.buf + offset.index(), name.ptr, name_length.to<u16>());
     __builtin_memcpy(d.buf + (offset + name_length).index(), value.ptr, value_length.to<u16>());
     // The eviction loop reserves the entry's full cost, which includes its payload.
-    d.byte_used = (offset + payload).min(kByteCap).to<u32>();
+    d.byte_used = end.min(kByteCap).to<u32>();
     d.ents[d.nent++] = {offset.to<u32>(), name_length.to<u16>(), value_length.to<u16>()};
     d.table_size = (range_int(d.table_size) + cost).min(range_int(d.max_size)).to<u32>();
+    return true;
 }
 
-bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
+[[nodiscard]] bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     if (i >= d.nent) return false;
     const i64 kEntry = static_cast<i64>(d.nent) - 1 - static_cast<i64>(i);
     const DynamicTable::Entry& e = d.ents[kEntry];
@@ -467,7 +484,7 @@ bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
 }
 
 // Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
-bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
+[[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
     if (idx <= kStaticCount) {
         const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
@@ -480,7 +497,7 @@ bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     return dyn_get(d, entry.max(range_int<0, 1>{}).to<u32>(), name, value);
 }
 
-bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
+[[nodiscard]] bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     Str value;
     if (idx <= kStaticCount) {
         if (idx == 0) return false;
@@ -493,7 +510,7 @@ bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     return dyn_get(d, entry.max(range_int<0, 1>{}).to<u32>(), name, &value);
 }
 
-u32 static_find_full(Str name, Str value) {
+[[nodiscard]] u32 static_find_full(Str name, Str value) {
     u32 index = 1;
     for (const auto& entry : kStatic) {
         if (str_eq(name, entry.name, entry.nlen) && str_eq(value, entry.value, entry.vlen))
@@ -503,7 +520,7 @@ u32 static_find_full(Str name, Str value) {
     return 0;
 }
 
-u32 static_find_name(Str name) {
+[[nodiscard]] u32 static_find_name(Str name) {
     u32 index = 1;
     for (const auto& entry : kStatic) {
         if (str_eq(name, entry.name, entry.nlen)) return index;
@@ -518,7 +535,7 @@ constexpr auto kFirstDynamicIndex =
 constexpr auto kMaxDynamicEntries =
     range_int<DynamicTable::kMaxEntries, i64{DynamicTable::kMaxEntries} + 1>{};
 
-u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
+[[nodiscard]] u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
     const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
     const u32 end = (kFirstDynamicIndex + entries).to<u32>();
     for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
@@ -531,7 +548,7 @@ u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
     return 0;
 }
 
-u32 dyn_find_name(const DynamicTable& d, Str name) {
+[[nodiscard]] u32 dyn_find_name(const DynamicTable& d, Str name) {
     const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
     const u32 end = (kFirstDynamicIndex + entries).to<u32>();
     for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
@@ -552,14 +569,14 @@ void DynamicTable::init(u32 settings_max) {
     table_size = 0;
 }
 
-bool decode_header_block(DynamicTable& dyn,
-                         const u8* in,
-                         u32 len,
-                         u8* out_buf,
-                         u32 out_cap,
-                         Header* headers,
-                         u32 max_headers,
-                         u32* count) {
+[[nodiscard]] bool decode_header_block(DynamicTable& dyn,
+                                       const u8* in,
+                                       u32 len,
+                                       u8* out_buf,
+                                       u32 out_cap,
+                                       Header* headers,
+                                       u32 max_headers,
+                                       u32* count) {
     i64 pos = 0;
     i64 op = 0;  // out_buf write cursor
     u32 hc = 0;
@@ -585,7 +602,7 @@ bool decode_header_block(DynamicTable& dyn,
             const u32 kC = decode_integer(in + pos, input_length, 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
             pos += static_cast<i64>(kC);
-            dyn_set_max_size(dyn, sz);
+            if (!dyn_set_max_size(dyn, sz)) return false;
             continue;
         }
         // Literal field: incremental indexing (§6.2.1, 0x40, 6-bit name index)
@@ -634,7 +651,7 @@ bool decode_header_block(DynamicTable& dyn,
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
                 op += static_cast<i64>(name.len);
             }
-            dyn_add(dyn, name, value);
+            if (!dyn_add(dyn, name, value)) return false;
         }
         if (hc >= max_headers) return false;
         headers[hc++] = {name, value};
@@ -643,7 +660,7 @@ bool decode_header_block(DynamicTable& dyn,
     return true;
 }
 
-i64 encode_header(u8* out, Str name, Str value) {
+[[nodiscard]] i64 encode_header(u8* out, Str name, Str value) {
     const u32 kFull = static_find_full(name, value);
     if (kFull > 0) return encode_integer(out, kFull, 7, 0x80);
 
@@ -655,7 +672,7 @@ i64 encode_header(u8* out, Str name, Str value) {
     return o;
 }
 
-i64 Encoder::encode(u8* out, Str name, Str value) {
+[[nodiscard]] i64 Encoder::encode(u8* out, Str name, Str value) {
     // Exact (name,value) match → Indexed Header Field (§6.1, 1 byte for small
     // indices). Check the dynamic table first: in steady state most fields hit
     // it, and it is far smaller than the 61-entry static table, so this skips
@@ -674,7 +691,7 @@ i64 Encoder::encode(u8* out, Str name, Str value) {
     o += encode_string(out + o, reinterpret_cast<const u8*>(value.ptr), value.len);
     // Index resolution above used the pre-add table — the same order the peer's
     // decoder sees — so adding now keeps both tables in sync.
-    dyn_add(dyn, name, value);
+    if (!dyn_add(dyn, name, value)) return -1;
     return o;
 }
 
@@ -688,7 +705,7 @@ i64 Encoder::encode(u8* out, Str name, Str value) {
 // limit: we shrink to match (evicting entries that no longer fit) and arm a §6.3
 // dynamic table size update so the next header block tells the peer's decoder the
 // new size in lockstep. Without that the two tables desync and decoding breaks.
-void Encoder::set_table_size(u32 settings_max) {
+[[nodiscard]] bool Encoder::set_table_size(u32 settings_max) {
     constexpr auto kCap = range_int<DynamicTable::kHardCap, i64{DynamicTable::kHardCap} + 1>{};
     const auto size = range_int(settings_max).min(kCap);
     const i32 next = size.to<i32>();
@@ -696,15 +713,16 @@ void Encoder::set_table_size(u32 settings_max) {
     // value if one is armed, else our live table limit. No net change → nothing
     // to do (avoids spurious size updates on duplicate SETTINGS).
     const i64 kCurrent = pending_size_update >= 0 ? pending_size_update : i64{dyn.max_size};
-    if (next == kCurrent) return;
-    dyn_set_max_size(dyn, size.to<u32>());  // shrinking evicts entries that no longer fit
+    if (next == kCurrent) return true;
+    if (!dyn_set_max_size(dyn, size.to<u32>())) return false;
     // A shrink-then-grow between header blocks must signal the minimum first
     // so the decoder evicts identically (§4.2).
     if (pending_size_update < 0 || next < pending_min_size) pending_min_size = next;
     pending_size_update = next;
+    return true;
 }
 
-u32 Encoder::emit_pending_size_update(u8* out) {
+[[nodiscard]] u32 Encoder::emit_pending_size_update(u8* out) {
     if (pending_size_update < 0) return 0;
     // §6.3 dynamic table size update: pattern 001 (0x20) + 5-bit prefix integer.
     // Signal the smallest size reached first (so the decoder evicts identically),

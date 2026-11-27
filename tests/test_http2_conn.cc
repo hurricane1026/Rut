@@ -525,7 +525,7 @@ bool has_frame(const u8* out, u32 len, Http2FrameType type, u8 flags_mask, u8 fl
     u32 pos = 0;
     while (pos + kFrameHeaderSize <= len) {
         Http2FrameHeader h;
-        parse_frame_header(out + pos, len - pos, &h);
+        if (parse_frame_header(out + pos, len - pos, &h) != ParseStatus::Complete) return false;
         if (pos + kFrameHeaderSize + h.length > len) break;
         if (h.type == static_cast<u8>(type) && (h.flags & flags_mask) == flags_val) return true;
         pos += kFrameHeaderSize + h.length;
@@ -755,13 +755,13 @@ TEST(http2_conn, ping_is_acked) {
     h.type = static_cast<u8>(Http2FrameType::Ping);
     h.flags = 0;
     h.stream_id = 0;
-    write_frame_header(ping, h);
+    (void)write_frame_header(ping, h);
     for (u32 i = 0; i < 8; i++) ping[kFrameHeaderSize + i] = static_cast<u8>(i + 1);
     u8 in[64];
     u32 inlen = with_preface(in, ping, sizeof(ping));
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     CHECK(has_frame(out, ow, Http2FrameType::Ping, http2_flag::kAck, http2_flag::kAck));
 }
 
@@ -778,7 +778,7 @@ TEST(http2_conn, window_update_grows_send_window) {
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK_EQ(s->send_window, static_cast<i32>(kDefaultInitialWindowSize) + 1000);
@@ -796,7 +796,7 @@ TEST(http2_conn, rst_stream_closes_and_notifies) {
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     CHECK_EQ(cap.reset_calls, 1u);
     CHECK_EQ(cap.reset_stream, 1u);
     CHECK(cap.reset_err == Http2Error::Cancel);
@@ -819,7 +819,7 @@ TEST(http2_conn, data_after_local_response_discarded_not_reset) {
     u32 inlen = with_preface(in, hf, hn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK(s->state == Http2StreamState::Open);
@@ -830,7 +830,7 @@ TEST(http2_conn, data_after_local_response_discarded_not_reset) {
     u8 df[64];
     u32 dn = http2_write_data(df, 1, reinterpret_cast<const u8*>("body"), 4, /*end_stream=*/true);
     ow = 0;
-    c.process(df, dn, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(df, dn, out, sizeof(out), &ow).close);
     CHECK(!has_frame(out, ow, Http2FrameType::RstStream, 0, 0));
     CHECK(c.find_stream(1) == nullptr);  // HalfClosedLocal + peer END_STREAM → Closed
 }
@@ -848,7 +848,7 @@ TEST(http2_conn, complete_request_closes_slot_on_response) {
     u32 inlen = with_preface(in, hf, hn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK(s->state == Http2StreamState::HalfClosedRemote);
@@ -872,7 +872,7 @@ TEST(http2_conn, coalesced_rst_cancels_parked_stream) {
     u32 inlen = with_preface(in, hf, hn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     // Serving layer parks stream 1 on the single async slot.
     c.async_stream = 1;
     c.async_is_head = true;
@@ -907,7 +907,7 @@ TEST(http2_conn, parked_stream_buffers_new_request_headers) {
     u32 inlen = with_preface(in, hf, hn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     c.async_stream = 1;
     c.async_kind = H2AsyncKind::Proxy;
     cap.headers_calls = 0;
@@ -951,7 +951,7 @@ TEST(http2_conn, continuation_assembles_header_block) {
     hh.type = static_cast<u8>(Http2FrameType::Headers);
     hh.flags = 0;  // no END_HEADERS, no END_STREAM
     hh.stream_id = 1;
-    write_frame_header(frame + fn, hh);
+    (void)write_frame_header(frame + fn, hh);
     frame[fn + kFrameHeaderSize] = 0x82;
     fn += kFrameHeaderSize + 1;
     Http2FrameHeader ch;
@@ -959,7 +959,7 @@ TEST(http2_conn, continuation_assembles_header_block) {
     ch.type = static_cast<u8>(Http2FrameType::Continuation);
     ch.flags = http2_flag::kEndHeaders;
     ch.stream_id = 1;
-    write_frame_header(frame + fn, ch);
+    (void)write_frame_header(frame + fn, ch);
     frame[fn + kFrameHeaderSize] = 0x84;
     fn += kFrameHeaderSize + 1;
     u8 in[128];
@@ -984,7 +984,7 @@ TEST(http2_conn, push_promise_from_client_is_protocol_error) {
     h.type = static_cast<u8>(Http2FrameType::PushPromise);
     h.flags = 0;
     h.stream_id = 1;
-    write_frame_header(pp, h);
+    (void)write_frame_header(pp, h);
     u8 in[64];
     u32 inlen = with_preface(in, pp, sizeof(pp));
     u8 out[256];
@@ -1318,7 +1318,7 @@ u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* p
     h.type = static_cast<u8>(type);
     h.flags = flags;
     h.stream_id = stream_id;
-    write_frame_header(out, h);
+    (void)write_frame_header(out, h);
     for (u32 i = 0; i < plen; i++) out[kFrameHeaderSize + i] = payload[i];
     return kFrameHeaderSize + plen;
 }
@@ -1411,7 +1411,7 @@ TEST(http2_conn, settings_initial_window_adjusts_streams) {
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     Http2Stream* st = c.find_stream(1);
     REQUIRE(st != nullptr);
     // 65535 default + (100000 - 65535) delta.
@@ -1430,7 +1430,7 @@ TEST(http2_conn, oversized_frame_goaway) {
     h.type = static_cast<u8>(Http2FrameType::Data);
     h.flags = 0;
     h.stream_id = 1;
-    write_frame_header(fh, h);
+    (void)write_frame_header(fh, h);
     u8 in[64];
     u32 inlen = with_preface(in, fh, sizeof(fh));
     u8 out[256];
@@ -1874,7 +1874,9 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     CHECK(has_cl);
     // The trailing DATA frame carries the body with END_STREAM.
     Http2FrameHeader df;
-    parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df);
+    CHECK_EQ(
+        parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df),
+        ParseStatus::Complete);
     CHECK_EQ(df.type, static_cast<u8>(Http2FrameType::Data));
     CHECK((df.flags & http2_flag::kEndStream) != 0);
 }
@@ -2193,7 +2195,7 @@ TEST(http2_conn, data_without_end_stream_replenishes_stream_window) {
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     CHECK_EQ(cap.data_len, 2u);
     CHECK_FALSE(cap.data_end);
     // Both connection- and stream-level WINDOW_UPDATE replenish the 2 octets.
@@ -2201,7 +2203,7 @@ TEST(http2_conn, data_without_end_stream_replenishes_stream_window) {
     u32 pos = 0;
     while (pos + kFrameHeaderSize <= ow) {
         Http2FrameHeader h;
-        parse_frame_header(out + pos, ow - pos, &h);
+        CHECK_EQ(parse_frame_header(out + pos, ow - pos, &h), ParseStatus::Complete);
         if (h.type == static_cast<u8>(Http2FrameType::WindowUpdate)) wu++;
         pos += kFrameHeaderSize + h.length;
     }
@@ -2334,7 +2336,7 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 inlen = with_preface(in, frame, fn);
     u8 out[256];
     u32 ow = 0;
-    c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
 
     // END_STREAM is set, but a pseudo-header (:path) disqualifies it as trailers
     // (RFC 7540 §8.1.2.1) → reset rather than finalize.
@@ -2343,7 +2345,7 @@ TEST(http2_conn, trailing_header_block_with_pseudo_header_rsts) {
     u32 bn = http2_write_headers(bframe, sizeof(bframe), 1, bad, 2, /*end_stream=*/true);
     u8 bout[128];
     u32 bow = 0;
-    c.process(bframe, bn, bout, sizeof(bout), &bow);
+    CHECK_FALSE(c.process(bframe, bn, bout, sizeof(bout), &bow).close);
     CHECK(has_frame(bout, bow, Http2FrameType::RstStream, 0, 0));
 }
 
@@ -3359,6 +3361,12 @@ TEST(http2_client, manual_credit_and_closed_stream_custody) {
     REQUIRE(second);
     CHECK(second != stream);  // closed does not imply the delivered bytes were released
     CHECK(!c.consume_data(1, 5));
+    c.conn_recv_credit = UINT32_MAX;
+    CHECK_FALSE(c.consume_data(1, 1));
+    CHECK_EQ(stream->recv_unconsumed, 4u);
+    CHECK_EQ(stream->recv_credit, 0u);
+    CHECK_EQ(c.conn_recv_credit, UINT32_MAX);
+    c.conn_recv_credit = 0;
     CHECK(c.consume_data(1, 4));
     CHECK(!c.consume_data(1, 1));
     CHECK(!c.process(nullptr, 0, out, sizeof(out), &written).close);
@@ -3478,7 +3486,7 @@ TEST(h2_serving, partial_frame_promotion_handles_nonzero_sub_frame_tail_capacity
     Http2FrameHeader frame{};
     frame.type = 0xff;
     frame.length = kDefaultMaxFrameSize;
-    write_frame_header(conn.recv_buf.write_ptr(), frame);
+    (void)write_frame_header(conn.recv_buf.write_ptr(), frame);
     conn.recv_buf.commit(kFrameHeaderSize);
     const u32 filled = conn.recv_buf.len();
     __builtin_memset(conn.recv_buf.write_ptr(), 0x5a, conn.recv_buf.write_avail());
@@ -3512,7 +3520,7 @@ TEST(h2_serving, partial_frame_promotion_failure_preserves_owned_slice) {
     Http2FrameHeader frame{};
     frame.type = 0xff;
     frame.length = kDefaultMaxFrameSize;
-    write_frame_header(partial, frame);
+    (void)write_frame_header(partial, frame);
     partial[kFrameHeaderSize] = 0x5a;
     conn.recv_buf.write(partial, sizeof(partial));
     u8* original = conn.recv_slice;

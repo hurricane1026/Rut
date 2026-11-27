@@ -291,9 +291,10 @@ bool ws_h2_process(GrpcExchange& exchange, bool from_client) {
         if (length) __builtin_memmove(input, input + static_cast<i64>(consumed), length);
         Connection* owner = from_client ? exchange.downstream : exchange.upstream;
         if (owner && owner->h2 && !owner->h2->grpc.websocket_http1 &&
-            !owner->h2->grpc.websocket_http1_downstream)
-            owner->h2->consume_data(
-                from_client ? exchange.downstream_stream : exchange.upstream_stream, consumed);
+            !owner->h2->grpc.websocket_http1_downstream &&
+            !owner->h2->consume_data(
+                from_client ? exchange.downstream_stream : exchange.upstream_stream, consumed))
+            return false;
     }
     if (!c.ws_closing && !session.output_length[kIndex] &&
         (from_client ? c.ws_client_eof : c.ws_upstream_eof)) {

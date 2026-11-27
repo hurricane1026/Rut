@@ -226,7 +226,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     Connection* down = x->downstream;
     Connection* up = x->upstream;
     if (down && down->h2) {
-        down->h2->consume_data(x->downstream_stream, x->upload_len);
+        (void)down->h2->consume_data(x->downstream_stream, x->upload_len);
         if (auto* stream = down->h2->find_stream(x->downstream_stream))
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
@@ -240,7 +240,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     }
     if (up && up->h2) {
         auto& h = *up->h2;
-        h.consume_data(x->upstream_stream, x->download_len);
+        (void)h.consume_data(x->upstream_stream, x->download_len);
         if (auto* s = h.find_stream(x->upstream_stream)) {
             if (cancel && x->request_headers_sent) grpc_queue_cancel(h, x->upstream_stream);
             s->state = Http2StreamState::Closed;
@@ -500,7 +500,7 @@ inline bool grpc_parse_content_length(Str value, u32* out) {
 }
 template <typename Loop>
 inline void grpc_detach_upstream_exchange(Loop* loop, Http2Conn& h, GrpcExchange& x) {
-    h.consume_data(x.upstream_stream, x.download_len);
+    (void)h.consume_data(x.upstream_stream, x.download_len);
     if (x.request_headers_sent) grpc_queue_cancel(h, x.upstream_stream);
     if (auto* stream = h.find_stream(x.upstream_stream)) stream->state = Http2StreamState::Closed;
     grpc_detach(h, &x);
@@ -748,7 +748,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) {
-        h.consume_data(sid, len);
+        (void)h.consume_data(sid, len);
         return;
     }
     const auto kBuffered = range_int(x->download_len) + range_int(len);
@@ -807,7 +807,7 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
         }
         x->response_end = true;
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
-        h.consume_data(x->upstream_stream, x->download_len);
+        (void)h.consume_data(x->upstream_stream, x->download_len);
         Connection* down = x->downstream;
         if (auto* stream = h.find_stream(x->upstream_stream))
             stream->state = Http2StreamState::Closed;
@@ -838,8 +838,10 @@ inline void grpc_consume_output(GrpcExchange& x, bool from_client, u32 length) {
             return;
         }
         Connection* owner = from_client ? x.downstream : x.upstream;
-        if (owner && owner->h2 && !owner->h2->grpc.websocket_http1)
-            owner->h2->consume_data(from_client ? x.downstream_stream : x.upstream_stream, length);
+        if (owner && owner->h2 && !owner->h2->grpc.websocket_http1 &&
+            !owner->h2->grpc.websocket_http1_downstream &&
+            !owner->h2->consume_data(from_client ? x.downstream_stream : x.upstream_stream, length))
+            x.failure = 13;
     }
 }
 
@@ -895,12 +897,17 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     if (h.conn_recv_credit &&
         static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len) >= 26) {
         u32 written = 0;
-        h.process(
+        const auto result = h.process(
             nullptr,
             0,
             g.control + static_cast<i64>(g.control_len),
             static_cast<u32>(static_cast<i64>(sizeof(g.control)) - static_cast<i64>(g.control_len)),
             &written);
+        if (result.close) {
+            g.busy = false;
+            loop->close_conn(conn);
+            return;
+        }
         g.control_len =
             static_cast<u32>(static_cast<i64>(g.control_len) + static_cast<i64>(written));
     }
@@ -1630,14 +1637,14 @@ void grpc_request_data(
     const bool kCounted = grpc_count_bytes(&x.request_bytes, len);
     if (x.failure || !x.upstream) {
         if (!kCounted && !x.failure) x.failure = 13;
-        down.h2->consume_data(x.downstream_stream, len);
+        if (!down.h2->consume_data(x.downstream_stream, len) && !x.failure) x.failure = 13;
         return;
     }
     const auto kBuffered = range_int(x.upload_len) + range_int(len);
     if (!kCounted || kBuffered.value() > static_cast<i64>(sizeof(x.upload)) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
-        down.h2->consume_data(x.downstream_stream, len);
+        (void)down.h2->consume_data(x.downstream_stream, len);
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
@@ -1753,7 +1760,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
             Connection* up = x->upstream;
             if (!up || !up->h2) continue;
             auto& uh = *up->h2;
-            uh.consume_data(x->upstream_stream, x->download_len);
+            (void)uh.consume_data(x->upstream_stream, x->download_len);
             if (auto* stream = uh.find_stream(x->upstream_stream)) {
                 if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
                 stream->state = Http2StreamState::Closed;
@@ -1812,7 +1819,7 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         Connection* up = x->upstream;
         if (!up || !up->h2) continue;
         auto& uh = *up->h2;
-        uh.consume_data(x->upstream_stream, x->download_len);
+        (void)uh.consume_data(x->upstream_stream, x->download_len);
         if (auto* stream = uh.find_stream(x->upstream_stream)) {
             if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
             stream->state = Http2StreamState::Closed;
