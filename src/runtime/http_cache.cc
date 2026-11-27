@@ -11,42 +11,45 @@
 namespace rut {
 namespace {
 
-bool valid_name(Str name) {
+[[nodiscard]] bool valid_name(Str name) {
     if (!name.len) return false;
     for (u32 i = 0; i < name.len; ++i)
-        if (!is_http_tchar(static_cast<u8>(name.ptr[i]))) return false;
+        if (!is_http_tchar(__builtin_bit_cast(u8, name.ptr[i]))) return false;
     return true;
 }
-bool eq(Str value, const char* text, u32 length) {
+[[nodiscard]] bool eq(Str value, const char* text, u32 length) {
     return http_header_name_eq_ci(value.ptr, value.len, text, length);
 }
-Str trim(Str text) {
+[[nodiscard]] Str trim(Str text) {
     while (text.len && (*text.ptr == ' ' || *text.ptr == '\t')) {
-        text.ptr += static_cast<i64>(1);
-        text.len = static_cast<u32>(static_cast<i64>(text.len) - 1);
+        ++text.ptr;
+        --text.len;
     }
-    while (text.len && (text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == ' ' ||
-                        text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == '\t'))
-        text.len = static_cast<u32>(static_cast<i64>(text.len) - 1);
+    while (text.len) {
+        const char last = text.ptr[i64{text.len} - 1];
+        if (last != ' ' && last != '\t') break;
+        --text.len;
+    }
     return text;
 }
-bool decimal(Str text, u32& value) {
+[[nodiscard]] bool decimal(Str text, u32& value) {
     text = trim(text);
-    if (text.len >= 2 && text.ptr[0] == '"' &&
-        text.ptr[static_cast<u32>(static_cast<i64>(text.len) - 1)] == '"')
-        text = {text.ptr + static_cast<i64>(1),
-                static_cast<u32>(static_cast<i64>(text.len) - static_cast<i64>(2))};
-    if (!text.len) return false;
-    i64 result = 0;
-    for (u32 i = 0; i < text.len; ++i) {
-        if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
-        const i64 digit = static_cast<i64>(text.ptr[i]) - static_cast<i64>('0');
-        if (result > (static_cast<i64>(UINT32_MAX) - digit) / 10)
-            result = 0xffffffffu;
-        else
-            result = result * 10 + digit;
+    if (text.len >= 2 && text.ptr[0] == '"' && text.ptr[i64{text.len} - 1] == '"') {
+        ++text.ptr;
+        --text.len;
+        --text.len;
     }
-    value = static_cast<u32>(result);
+    if (!text.len) return false;
+    u32 result = 0;
+    constexpr range_int<UINT32_MAX, i64{UINT32_MAX} + 1> kMax{};
+    for (u32 i = 0; i < text.len; ++i) {
+        const char byte = text.ptr[i];
+        if (byte < '0' || byte > '9') return false;
+        static_assert('0' == 0x30 && '9' == 0x39);
+        const auto digit = bounded_remainder<16>(__builtin_bit_cast(u8, byte));
+        result = (range_int(result).scaled_by<10>() + digit).min(kMax).to<u32>();
+    }
+    value = result;
     return true;
 }
 struct Controls {
@@ -59,7 +62,7 @@ struct Controls {
     u32 shared_age = 0xffffffffu;
     u32 min_fresh = 0;
 };
-bool controls(Str text, Controls& out, bool response) {
+[[nodiscard]] bool controls(Str text, Controls& out, bool response) {
     u32 begin = 0;
     while (begin < text.len) {
         u32 end = begin;
@@ -70,18 +73,19 @@ bool controls(Str text, Controls& out, bool response) {
             if (text.ptr[end] == '\\') return false;  // conservative on escaped extension values
         }
         if (quoted) return false;
-        Str item = trim({text.ptr + static_cast<i64>(begin),
-                         static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin))});
+        const auto start = range_int(begin);
+        const auto count = (range_int(end) - start).max(range_int<0, 1>{});
+        const Str item = trim({text.ptr + start.index(), count.to<u32>()});
         if (!item.len) return false;
         u32 separator = 0;
         while (separator < item.len && item.ptr[separator] != '=') ++separator;
         const Str name = trim({item.ptr, separator});
         if (!valid_name(name)) return false;
         const bool valued = separator < item.len;
-        const Str value = valued ? trim({item.ptr + static_cast<i64>(separator) + 1,
-                                         static_cast<u32>(static_cast<i64>(item.len) -
-                                                          static_cast<i64>(separator) - 1)})
-                                 : Str{};
+        const auto value_start = range_int(separator) + range_int<1, 2>{};
+        const auto value_length = (range_int(item.len) - value_start).max(range_int<0, 1>{});
+        const Str value =
+            valued ? trim({item.ptr + value_start.index(), value_length.to<u32>()}) : Str{};
         if (eq(name, "no-store", 8) || eq(name, "no-cache", 8) ||
             (response && eq(name, "private", 7)))
             out.blocked = true;
@@ -106,7 +110,8 @@ bool controls(Str text, Controls& out, bool response) {
             *seen = true;
         }
         if (end == text.len) break;
-        begin = static_cast<u32>(static_cast<i64>(end) + 1);
+        begin = end;
+        ++begin;
         if (begin == text.len) return false;
     }
     return true;
@@ -120,20 +125,22 @@ bool hop_header(Str name) {
            eq(name, "keep-alive", 10) || eq(name, "transfer-encoding", 17) || eq(name, "te", 2) ||
            eq(name, "trailer", 7) || eq(name, "upgrade", 7);
 }
-bool token_list(Str text, bool vary) {
+[[nodiscard]] bool token_list(Str text, bool vary) {
     u32 begin = 0;
     while (begin < text.len) {
         u32 end = begin;
         while (end < text.len && text.ptr[end] != ',') ++end;
-        const Str name = trim({text.ptr + static_cast<i64>(begin),
-                               static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(begin))});
+        const auto start = range_int(begin);
+        const auto count = (range_int(end) - start).max(range_int<0, 1>{});
+        const Str name = trim({text.ptr + start.index(), count.to<u32>()});
         if (!valid_name(name)) return false;
         if (vary) {
             if (eq(name, "*", 1) || ignored_key_header(name) || hop_header(name)) return false;
         } else if (!eq(name, "close", 5) && !eq(name, "keep-alive", 10))
             return false;
         if (end == text.len) return true;
-        begin = static_cast<u32>(static_cast<i64>(end) + 1);
+        begin = end;
+        ++begin;
     }
     return false;
 }
@@ -142,12 +149,13 @@ u64 hash_bytes(u64 hash, const void* bytes, u32 size) {
     for (u32 i = 0; i < size; ++i) hash = (hash ^ data[i]) * 1099511628211ull;
     return hash;
 }
-bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
-    if (static_cast<i64>(size) >
-        static_cast<i64>(HttpCachePolicy::kMaxKey) - static_cast<i64>(key.len))
-        return false;
-    __builtin_memcpy(key.bytes + static_cast<i64>(key.len), bytes, size);
-    key.len = static_cast<u32>(static_cast<i64>(key.len) + static_cast<i64>(size));
+[[nodiscard]] bool append(HttpCachePolicy::Key& key, const void* bytes, u32 size) {
+    const auto start = range_int(key.len);
+    const auto end = start + range_int(size);
+    if (end.value() > HttpCachePolicy::kMaxKey) return false;
+    __builtin_memcpy(key.bytes + start.index(), bytes, size);
+    constexpr i64 kMaxKey = HttpCachePolicy::kMaxKey;
+    key.len = end.min(range_int<kMaxKey, kMaxKey + 1>{}).to<u32>();
     return true;
 }
 // IMF-fixdate only. Unsupported/invalid date syntax is a cache bypass, never a
@@ -284,13 +292,13 @@ struct ResponseInfo {
     info.age_us = kInitial;
     return true;
 }
-bool copy_response(const HttpCacheStorage::Record& entry,
-                   u64 now,
-                   bool keep_alive,
-                   bool http10,
-                   u8* out,
-                   u32 capacity,
-                   u32& written) {
+[[nodiscard]] bool copy_response(const HttpCacheStorage::Record& entry,
+                                 u64 now,
+                                 bool keep_alive,
+                                 bool http10,
+                                 u8* out,
+                                 u32 capacity,
+                                 u32& written) {
     written = 0;
     if (!entry.response || entry.response_len > HttpCacheStorage::kMaxResponse) return false;
     HttpResponseParser parser;
@@ -301,14 +309,15 @@ bool copy_response(const HttpCacheStorage::Record& entry,
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
         parser.header_end > entry.response_len ||
-        response.content_length != static_cast<u32>(static_cast<i64>(entry.response_len) -
-                                                    static_cast<i64>(parser.header_end)))
+        response.content_length !=
+            (range_int(entry.response_len) - range_int(parser.header_end)).value())
         return false;
     auto add = [&](const void* p, u32 n) {
-        if (static_cast<i64>(n) > static_cast<i64>(capacity) - static_cast<i64>(written))
-            return false;
-        __builtin_memcpy(out + static_cast<i64>(written), p, n);
-        written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(n));
+        const auto start = range_int(written);
+        const auto end = start + range_int(n);
+        if (end.value() > capacity) return false;
+        __builtin_memcpy(out + start.index(), p, n);
+        written = end.min(range_int(capacity)).to<u32>();
         return true;
     };
     if (!add(http10 ? "HTTP/1.0 200 OK\r\n" : "HTTP/1.1 200 OK\r\n", 17)) return false;
@@ -333,11 +342,11 @@ bool copy_response(const HttpCacheStorage::Record& entry,
     } while (value);
     if (!add("Age: ", 5)) return false;
     for (u32 i = count; i > 0; --i)
-        if (!add(digits + static_cast<i64>(i) - 1, 1)) return false;
+        if (!add(digits + i64{i} - 1, 1)) return false;
     const Str connection = keep_alive ? lit_str("\r\nConnection: keep-alive\r\n\r\n")
                                       : lit_str("\r\nConnection: close\r\n\r\n");
     return add(connection.ptr, connection.len) &&
-           add(entry.response + static_cast<i64>(parser.header_end), response.content_length);
+           add(entry.response + range_int(parser.header_end).index(), response.content_length);
 }
 }  // namespace
 
@@ -426,9 +435,9 @@ bool HttpCachePolicy::read_response(const Key& key,
     if (kElapsed <= max_age && add_overflow(kElapsed, record.initial_age_us, &kAgeUs)) return false;
     const bool kFresh =
         now_us < record.expires_us && now_us >= record.stored_us &&
-        kAgeUs <= static_cast<u64>(static_cast<i64>(key.max_age) * 1000000) &&
+        kAgeUs <= range_int(key.max_age).scaled_by<1'000'000>().to_u64() &&
         key.min_fresh <= kMaxTtl &&
-        static_cast<u64>(static_cast<i64>(key.min_fresh) * 1000000) < ([&] {
+        range_int(key.min_fresh).scaled_by<1'000'000>().to_u64() < ([&] {
             u64 remaining = 0;
             return sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
         }());
