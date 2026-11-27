@@ -10,8 +10,8 @@ namespace rut {
 enum class ExactPathView : u8 { Raw = 0, SlashNormalized = 1 };
 
 static_assert(sizeof(ExactPathView) == sizeof(u8));
-static_assert(static_cast<u8>(ExactPathView::Raw) == 0);
-static_assert(static_cast<u8>(ExactPathView::SlashNormalized) == 1);
+static_assert(ExactPathView::Raw == ExactPathView{0});
+static_assert(ExactPathView::SlashNormalized == ExactPathView{1});
 
 // Shared bound for exact path selectors. The existing strict-local-response
 // bound aliases this value; normalized output is never truncated to fit it.
@@ -56,7 +56,7 @@ enum class ExactPathNormalizationResult : u8 {
 
     u32 path_end = 0;
     while (path_end < raw.len && raw.ptr[path_end] != '?') {
-        const u8 byte = static_cast<u8>(raw.ptr[path_end]);
+        const u8 byte = byte_value(raw.ptr[path_end]);
         if (raw.ptr[path_end] == '#' || byte < 0x20 || byte == 0x7f)
             return ExactPathNormalizationResult::InvalidInput;
         path_end++;

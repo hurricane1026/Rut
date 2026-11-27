@@ -905,6 +905,50 @@ class NodiscardAction : public PluginASTAction {
         return true;
     }
 };
+class ExplicitCastStyleVisitor : public RecursiveASTVisitor<ExplicitCastStyleVisitor> {
+    ASTContext& context;
+
+public:
+    explicit ExplicitCastStyleVisitor(ASTContext& context) : context(context) {}
+
+    bool VisitExplicitCastExpr(const ExplicitCastExpr* cast) {
+        if (!isa<CXXStaticCastExpr, CStyleCastExpr>(cast)) return true;
+        const auto& source = context.getSourceManager();
+        auto loc = source.getSpellingLoc(cast->getBeginLoc());
+        if (!loc.isFileID() || source.isWrittenInScratchSpace(loc))
+            loc = source.getExpansionLoc(cast->getBeginLoc());
+        if (loc.isInvalid() || source.isInSystemHeader(loc)) return true;
+
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = isa<CXXStaticCastExpr>(cast)
+                            ? diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                          "static_cast is prohibited")
+                            : diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                          "C-style casts are prohibited");
+        const auto end = source.getSpellingLoc(cast->getEndLoc());
+        auto report = diagnostics.Report(loc, id);
+        if (!cast->getBeginLoc().isMacroID() && end.isValid() &&
+            source.isWrittenInSameFile(loc, end) && !source.isBeforeInTranslationUnit(end, loc))
+            report << SourceRange(loc, end);
+        return true;
+    }
+};
+
+class ExplicitCastStyleConsumer : public ASTConsumer {
+    void HandleTranslationUnit(ASTContext& context) override {
+        ExplicitCastStyleVisitor(context).TraverseDecl(context.getTranslationUnitDecl());
+    }
+};
+
+class ExplicitCastStyleAction : public PluginASTAction {
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
+        return std::make_unique<ExplicitCastStyleConsumer>();
+    }
+
+    bool ParseArgs(const CompilerInstance&, const std::vector<std::string>&) override {
+        return true;
+    }
+};
 }  // namespace
 
 static FrontendPluginRegistry::Add<SignedConversionAction> registration(
@@ -922,3 +966,6 @@ static FrontendPluginRegistry::Add<NodiscardAction> nodiscard_registration(
 
 static FrontendPluginRegistry::Add<AddressAdditionAction> address_addition_registration(
     "rut-address-addition", "Require bounded offsets or explicit raw-span address validation");
+
+static FrontendPluginRegistry::Add<ExplicitCastStyleAction> cast_style_registration(
+    "rut-explicit-cast-style", "Prohibit static_cast and C-style casts");

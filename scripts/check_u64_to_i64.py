@@ -23,10 +23,14 @@ BIT_CAST_MESSAGE = 'use a value conversion for integer or enum bit casts'
 NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
 MUTABLE_REFERENCE_MESSAGE = 'use a pointer for a mutable scalar parameter'
 VOID_DISCARD_MESSAGE = 'void cast discards a [[nodiscard]] result'
+CAST_MESSAGES = ('static_cast is prohibited', 'C-style casts are prohibited')
+TU_EXTENSIONS = {'.cc', '.cpp', '.cxx', '.c++', '.c'}
+SOURCE_EXTENSIONS = TU_EXTENSIONS | {'.h', '.hh', '.hpp', '.hxx', '.inc'}
+CAST_FOLDERS = ('src', 'include', 'tests', 'testing', 'bench', 'helpers')
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
 MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, OVERFLOW_NODISCARD_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE,
             ADDRESS_MESSAGE, BIT_CAST_MESSAGE, VOID_DISCARD_MESSAGE, MUTABLE_REFERENCE_MESSAGE,
-            *ARITHMETIC_MESSAGES)
+            *CAST_MESSAGES, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -36,7 +40,7 @@ TRAP_BUILTIN = re.compile(rb'\b__builtin_(?:debug|verbose_)?trap\b')
 RANGE_COMMENT = re.compile(rb'//\s*RUT_INTEGER_RANGE:\s*\S')
 
 
-def changed_source_lines(base, *, check_deleted_attributes=False):
+def changed_source_lines(base, *, check_deleted_attributes=False, cast_scope=False):
     # Git supplies the migration boundary. No inventory of exceptions is kept.
     names = subprocess.check_output(
         ['git', 'diff', '--name-only', '-z', '--no-renames', '--diff-filter=AM', base, '--'], cwd=ROOT
@@ -44,7 +48,8 @@ def changed_source_lines(base, *, check_deleted_attributes=False):
     changes = {}
     for name in names.decode().split('\0'):
         path = ROOT / name
-        if not first_party(path) or path.suffix not in {'.cc', '.cpp', '.cxx', '.c', '.h', '.hpp'}:
+        in_scope = in_cast_scope(path) if cast_scope else first_party(path)
+        if not in_scope or path.suffix not in SOURCE_EXTENSIONS:
             continue
         patch = subprocess.check_output(
             ['git', 'diff', '--unified=0', '--no-ext-diff', '--no-renames', base, '--', name],
@@ -64,6 +69,10 @@ def changed_source_lines(base, *, check_deleted_attributes=False):
 
 def first_party(path):
     return any(path.is_relative_to(ROOT / folder) for folder in ('src', 'include'))
+
+
+def in_cast_scope(path):
+    return any(path.is_relative_to(ROOT / folder) for folder in CAST_FOLDERS)
 
 
 def check_builtin_locations():
@@ -152,9 +161,11 @@ def main():
     parser.add_argument('--nodiscard-inventory', type=Path,
                         help='report declarations that are missing [[nodiscard]]')
     parser.add_argument('--nodiscard-base', help='require [[nodiscard]] on declarations changed since this commit')
+    parser.add_argument('--cast-base', help='fail on casts changed since this commit instead of all casts')
+    parser.add_argument('--cast-inventory', type=Path, help='write all static_cast and C-style cast sites')
     args = parser.parse_args()
-    check = ['-fsyntax-only', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve()),
-             '-Xclang', '-add-plugin', '-Xclang', 'rut-u64-to-i64']
+    load_plugin = ['-fsyntax-only', '-Xclang', '-load', '-Xclang', str(args.plugin.resolve())]
+    check = [*load_plugin, '-Xclang', '-add-plugin', '-Xclang', 'rut-u64-to-i64']
     subprocess.run([args.clang, *check, '-Xclang', '-verify', '-I', ROOT / 'include',
                     '-std=c++23', ROOT / 'scripts/clang/u64_to_i64_cases.cc'], check=True)
 
@@ -177,6 +188,11 @@ def main():
     subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
                     str(args.plugin.resolve()), *nodiscard_check, '-Xclang', '-verify',
                     '-std=c++23', ROOT / 'scripts/clang/nodiscard_cases.cc'], check=True)
+    cast_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-explicit-cast-style']
+    subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
+                    str(args.plugin.resolve()), *cast_check, '-Xclang', '-verify',
+                    '-std=c++23', ROOT / 'scripts/clang/explicit_cast_style_cases.cc'], check=True)
+    cast_changed = changed_source_lines(args.cast_base, cast_scope=True) if args.cast_base else {}
     nodiscard_changed = (changed_source_lines(args.nodiscard_base, check_deleted_attributes=True)
                          if args.nodiscard_base else {})
     base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
@@ -188,7 +204,7 @@ def main():
     for entry in entries:
         cwd = Path(entry['directory'])
         path = (cwd / entry['file']).resolve()
-        if not path.is_relative_to(ROOT / 'src') or path.suffix not in {'.cc', '.cpp', '.cxx', '.c'}:
+        if not in_cast_scope(path) or path.suffix not in TU_EXTENSIONS:
             continue
         command = entry.get('arguments') or shlex.split(entry['command'])
         start = 2 if Path(command[0]).name == 'ccache' else 1
@@ -196,15 +212,21 @@ def main():
         output = flags.index('-o')
         del flags[output:output + 2]
         flags.remove('-c')
-        commands.add((cwd, tuple(flag for flag in flags if flag != '-w')))
-    if not commands:
+        commands.add((cwd, tuple(flag for flag in flags if flag != '-w'),
+                      path.is_relative_to(ROOT / 'src')))
+    production_count = sum(production for _, _, production in commands)
+    if not production_count:
         raise SystemExit('no production translation units for u64 to i64 conversion audit')
 
     def inspect(command):
-        cwd, flags = command
-        run = subprocess.run([args.clang, *flags, '-Wno-error', '-fno-color-diagnostics',
-                              '-fdiagnostics-print-source-range-info', *check, *overflow_check,
-                              *arithmetic_check, *nodiscard_check, *address_check], cwd=cwd,
+        cwd, flags, production = command
+        compiler = [args.clang, *flags, '-Wno-error', '-fno-color-diagnostics',
+                    '-fdiagnostics-print-source-range-info']
+        if production:
+            compiler += [*check, *overflow_check, *arithmetic_check, *nodiscard_check, *address_check]
+        else:
+            compiler += load_plugin
+        run = subprocess.run([*compiler, *cast_check], cwd=cwd,
                              text=True, capture_output=True)
         if run.returncode:
             raise RuntimeError(f'Clang conversion audit failed\n{run.stderr}')
@@ -216,7 +238,10 @@ def main():
         for filename, line, column, first, start, last, end, message in diagnostics:
             path = (cwd / filename).resolve()
             line = int(line)
-            if not first_party(path):
+            if message in CAST_MESSAGES:
+                if not in_cast_scope(path):
+                    continue
+            elif not first_party(path):
                 continue
             span = tuple(map(int, (first, start, last, end))) if first else ()
             if message == OVERFLOW_MESSAGE:
@@ -239,7 +264,23 @@ def main():
     nodiscard = [site for site in sites if site[-1] == NODISCARD_MESSAGE]
     mutable_references = [site for site in sites if site[-1] == MUTABLE_REFERENCE_MESSAGE]
     failures = [site for site in sites if site[-1] not in
-                (*ARITHMETIC_MESSAGES, NODISCARD_MESSAGE, MUTABLE_REFERENCE_MESSAGE)]
+                (*ARITHMETIC_MESSAGES, *CAST_MESSAGES, NODISCARD_MESSAGE, MUTABLE_REFERENCE_MESSAGE)]
+    casts = [site for site in sites if site[-1] in CAST_MESSAGES]
+    if args.cast_inventory:
+        args.cast_inventory.write_text(''.join(
+            f'{path.relative_to(ROOT)}:{line}:{column}: {message}\n'
+            for path, line, column, _, message in casts
+        ))
+    for site in casts:
+        path, line, _, span, _ = site
+        first, last = (span[0], span[2]) if span else (line, line)
+        if not args.cast_base or any(interval and interval.start <= last and first < interval.stop
+                                     for interval in cast_changed.get(path, ())):
+            failures.append(site)
+    for message in CAST_MESSAGES:
+        total = sum(site[-1] == message for site in casts)
+        rejected = sum(site[-1] == message for site in failures)
+        print(f'{rejected} prohibited casts ({total} found): {message}')
     for site in mutable_references:
         path, line, _, span, _ = site
         first, last = (span[0], span[2]) if span else (line, line)
@@ -290,7 +331,8 @@ def main():
     for path, line, column, _, message in failures:
         print(f'{path.relative_to(ROOT)}:{line}:{column}: {message}')
     conversions = sum(message == MESSAGE for *_, message in sites)
-    print(f'{len(commands)} production compile commands, {conversions} unproven conversions')
+    print(f'{production_count} production compile commands, {conversions} unproven conversions')
+    print(f'{len(commands)} compile commands checked for explicit casts')
     if args.overflow_base:
         unchecked = sum(message == OVERFLOW_MESSAGE for *_, message in failures)
         print(f'{unchecked} unchecked arithmetic result paths on changed lines')

@@ -274,7 +274,8 @@ jobs:
         if: matrix.compiler == 'clang' && matrix.shard == 1
         env:
           OVERFLOW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          # Keep the in-flight migration's earlier declarations in the inventory.
+          # Inventory legacy casts and declarations from before their enforcement began.
+          CAST_MIGRATION_BASE: e7f077bc49385027a45c000d4f872db4b8b4fb26
           NODISCARD_MIGRATION_BASE: 0e992e493fff1f2f9f6d229a20d973a315ead45a
         run: |
           clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_u64_to_i64.cc \
@@ -288,7 +289,13 @@ jobs:
               git fetch --no-tags origin "$OVERFLOW_BASE"
             fi
             audit_args+=(--overflow-base "$OVERFLOW_BASE")
-            nodiscard_base=$(git merge-base HEAD "$OVERFLOW_BASE")
+            cast_base=$(git merge-base HEAD "$OVERFLOW_BASE")
+            nodiscard_base=$cast_base
+            if git merge-base --is-ancestor "$cast_base" "$CAST_MIGRATION_BASE" 2>/dev/null &&
+               git merge-base --is-ancestor "$CAST_MIGRATION_BASE" HEAD; then
+              cast_base=$CAST_MIGRATION_BASE
+            fi
+            audit_args+=(--cast-base "$cast_base")
             if git merge-base --is-ancestor "$nodiscard_base" "$NODISCARD_MIGRATION_BASE" 2>/dev/null &&
                git merge-base --is-ancestor "$NODISCARD_MIGRATION_BASE" HEAD; then
               nodiscard_base=$NODISCARD_MIGRATION_BASE
@@ -297,7 +304,7 @@ jobs:
           fi
           python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 \
             --arithmetic-inventory integer-arithmetic.txt --range-cast-inventory range-casts.txt \
-            --nodiscard-inventory nodiscard.txt \
+            --nodiscard-inventory nodiscard.txt --cast-inventory explicit-casts.txt \
             "${audit_args[@]}"
       - name: Compare range_int code generation with native integers
         if: matrix.compiler == 'clang' && matrix.shard == 1
@@ -312,6 +319,7 @@ jobs:
             runtime-arithmetic.txt
             integer-arithmetic.txt
             range-casts.txt
+            explicit-casts.txt
             nodiscard.txt
           if-no-files-found: ignore
 

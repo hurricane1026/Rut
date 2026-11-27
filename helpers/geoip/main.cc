@@ -1,3 +1,4 @@
+#include "rut/common/range_int.h"
 #include "rut/runtime/parse_integer.h"
 #include "rut/runtime/parse_ip.h"
 
@@ -73,9 +74,9 @@ static bool serve(int fd, u16 port, const MMDB_s& database) {
 
 int main(int argc, char** argv) {
     i64 port;
-    if (argc != 3 || strlen(argv[2]) > 5 ||
-        !parse_integer32({argv[2], static_cast<u32>(strlen(argv[2]))}, port) || port < 0 ||
-        port > 65535) {
+    range_int<0, 6> port_length;
+    if (argc != 3 || !decltype(port_length)::try_from_u64(strnlen(argv[2], 6), &port_length) ||
+        !parse_integer32({argv[2], port_length.to<u32>()}, &port) || port < 0 || port > 65535) {
         fprintf(stderr, "Usage: rut-geoip DATABASE.mmdb PORT\n");
         return 1;
     }

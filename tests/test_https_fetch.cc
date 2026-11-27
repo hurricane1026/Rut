@@ -459,7 +459,7 @@ static void remote_rotation(test::TestCase* _tc) {
     u32 length = 7;
     const auto verify = [&](u32 shard, Str token, u64 now) {
         const bool valid = policies.verify(
-            shard, policy, document, token, 100, payload, sizeof(payload), length, now);
+            shard, policy, document, token, 100, payload, sizeof(payload), &length, now);
         if (!valid) {
             CHECK_EQ(length, 0u);
             CHECK(!document.valid);
@@ -653,7 +653,7 @@ static void remote_new_kid_admission(test::TestCase* _tc) {
     REQUIRE(stale.len);
     u32 length = 9;
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), &length, 100));
     CHECK_EQ(length, 0u);
     const auto refresh = [&](u64 now, u32 expected) {
         u32 completed = 0;
@@ -667,19 +667,19 @@ static void remote_new_kid_admission(test::TestCase* _tc) {
     };
     REQUIRE(refresh(100, 1));
     CHECK(policies.verify(
-        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, admitted, 100, payload, sizeof(payload), &length, 100));
     CHECK(!policies.verify(
-        0, policy_bytes, document, stale, 100, payload, sizeof(payload), length, 100));
+        0, policy_bytes, document, stale, 100, payload, sizeof(payload), &length, 100));
     // A malformed refresh keeps the admitted bank only within its original age.
     REQUIRE(refresh(1100, 2));
     CHECK(policies.verify(
-        0, policy_bytes, document, admitted, 1100, payload, sizeof(payload), length, 1100));
+        0, policy_bytes, document, admitted, 1100, payload, sizeof(payload), &length, 1100));
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), &length, 2100));
     // An authoritative empty set removes the admitted keys immediately.
     REQUIRE(refresh(2100, 3));
     CHECK(!policies.verify(
-        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), length, 2100));
+        0, policy_bytes, document, admitted, 2100, payload, sizeof(payload), &length, 2100));
     policies.cancel(0);
 }
 
@@ -830,12 +830,14 @@ static void failed_remote_activation(test::TestCase* _tc) {
     const Str token = fixture.sign(Fixture::header, Fixture::claims, token_bytes);
     json::Document document;
     u32 length = 99;
-    CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
+    CHECK(
+        !policies.verify(0, policy, document, token, 100, payload, sizeof(payload), &length, 100));
     CHECK_EQ(length, 0u);
     CHECK(!document.valid);
     policies.maintain(0, 100);
     policies.cancel(0);
-    CHECK(!policies.verify(0, policy, document, token, 100, payload, sizeof(payload), length, 100));
+    CHECK(
+        !policies.verify(0, policy, document, token, 100, payload, sizeof(payload), &length, 100));
 }
 
 TEST(https_fetch, failed_tls_activation_cannot_serve_bootstrap_or_initialize_on_verification) {
