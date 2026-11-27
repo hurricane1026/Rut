@@ -43,9 +43,8 @@ namespace rut {
             // RUT_INTEGER_RANGE: at most three shifts follow a lead of at most five bits.
             cp = (cp << 6) | (cc & 0x3F);
         }
-        if (cp < min_cp) return false;                   // overlong encoding
-        if (cp > 0x10FFFF) return false;                 // beyond Unicode
-        if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // UTF-16 surrogate half
+        // Reject overlong encodings, code points beyond Unicode, and surrogates.
+        if (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
     }
     return true;
 }
