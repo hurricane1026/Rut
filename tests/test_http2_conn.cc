@@ -4,6 +4,7 @@
 // built with the engine's own response writers (HPACK encoder), fed through
 // process(), and the decoded callbacks + emitted control frames are asserted.
 
+#include "rut/common/trap.h"
 #include "rut/runtime/callbacks_grpc.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
@@ -52,7 +53,7 @@ struct WsH2Fixture {
     std::unique_ptr<GrpcExchange> x = std::make_unique<GrpcExchange>();
     WsH2Fixture(u32 ordinary = 32, u32 bulk = 12) {
         if (!pool.init(ordinary, 0, SlicePool::kMaxCachedSlices, bulk).has_value())
-            __builtin_trap();
+            RUT_TRAP("HTTP/2 WebSocket fixture pool initialization failed");
         down->reset();
         down->peer_addr = 0x7f000001;
         down->peer_port = 3456;
@@ -2455,7 +2456,8 @@ struct FakeH2Loop {
     const RouteConfig** config_ptr = nullptr;
     FakeH2Loop() {
         timer.init();
-        if (!pool.init(16, 0, SlicePool::kMaxCachedSlices, 2).has_value()) __builtin_trap();
+        if (!pool.init(16, 0, SlicePool::kMaxCachedSlices, 2).has_value())
+            RUT_TRAP("FakeH2Loop pool initialization failed");
     }
     ~FakeH2Loop() { pool.destroy(); }
     bool alloc_h2(Connection& conn) {

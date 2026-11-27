@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -7918,10 +7919,9 @@ public:
                                                  &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
-            if (!try_add_to(&c.pending_ops, submitted)) {
-                ::fprintf(stderr, "rut: io_uring pending operation count overflow during close\n");
-                __builtin_trap();
-            }
+            if (!try_add_to(&c.pending_ops, submitted))
+                RUT_TRAP("io_uring connection %u pending operation count overflow during close",
+                         c.id);
         }
         if (c.fd >= 0) {
             ::close(c.fd);

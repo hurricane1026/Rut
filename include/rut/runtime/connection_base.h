@@ -9,6 +9,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/request_policy.h"
 #include "rut/common/route_host.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
@@ -2198,7 +2199,7 @@ struct ConnectionBase {
     void reset() {
         // Loop retirement must release this CPU-only slice before slot reuse.
         if (ws_handshake_slice != nullptr || ws_handshake_phase != WsHandshakePhase::None)
-            __builtin_trap();
+            RUT_TRAP("Connection %u reset before releasing its WebSocket handshake slice", id);
         json_arena.destroy();
         jit_response_body = {};
         jit_response_body_valid = false;

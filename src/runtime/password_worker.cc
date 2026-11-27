@@ -1,6 +1,7 @@
 #include "rut/runtime/password_worker.h"
 
 #include "core/expected.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/password.h"
@@ -58,7 +59,8 @@ void PasswordWorker::stop() {
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     // A join failure violates exclusive lifecycle ownership. Never release
     // storage while a worker might still be using it.
-    if (pthread_join(worker_thread, nullptr) != 0) __builtin_trap();
+    if (const int error = pthread_join(worker_thread, nullptr); error != 0)
+        RUT_TRAP("PasswordWorker::stop: pthread_join failed (error=%d)", error);
     started = false;
     close_notifications();
     for (auto& slot : slots) {
@@ -83,7 +85,10 @@ void PasswordWorker::notify_completion() {
         // A full pipe already carries a readable wakeup. Other errors violate
         // ownership: the producer must never close/change this borrowed fd.
         if (kWritten < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        __builtin_trap();
+        RUT_TRAP("PasswordWorker notification write failed (fd=%d, result=%zd, errno=%d)",
+                 notification_write,
+                 kWritten,
+                 kWritten < 0 ? errno : 0);
     }
 }
 

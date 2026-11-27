@@ -1,3 +1,4 @@
+#include "rut/common/trap.h"
 #include "rut/compiler/analyze.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/lower_rir.h"
@@ -84,7 +85,7 @@ static bool init_engine(const Manifest& manifest, ModuleContext& ctx, Engine& en
 
 static Str arena_copy(MmapArena& arena, const char* src, u32 len) {
     char* mem = arena.alloc_array<char>(len + 1);
-    if (!mem) __builtin_trap();
+    if (!mem) RUT_TRAP("Simulator test arena allocation failed");
     for (u32 i = 0; i < len; i++) mem[i] = src[i];
     mem[len] = '\0';
     return {mem, len};

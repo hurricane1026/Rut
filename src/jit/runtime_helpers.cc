@@ -7,6 +7,7 @@
 #include "rut/common/load_balance.h"
 #include "rut/common/range_int.h"
 #include "rut/common/shard_limits.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/uri_normalize.h"
 #include "rut/common/ws_message.h"
@@ -1310,7 +1311,8 @@ i64 rut_helper_time_now_micros() {
         const u64 now_us = t_virtual_time_us ? *t_virtual_time_us : rut::monotonic_us();
         // Handler simulations reject clocks outside the signed JIT ABI.
         range_int<0> now;
-        if (!decltype(now)::try_from_u64(now_us, &now)) __builtin_trap();
+        if (!decltype(now)::try_from_u64(now_us, &now))
+            RUT_TRAP("JIT clock exceeds the signed microsecond range");
         tc.value = now.value();
         tc.valid = true;
     }

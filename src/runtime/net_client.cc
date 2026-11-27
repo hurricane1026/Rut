@@ -1,6 +1,7 @@
 #include "rut/runtime/net_client.h"
 
 #include "rut/common/checked_arithmetic.h"
+#include "rut/common/trap.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/json.h"
@@ -122,7 +123,8 @@ core::Expected<void, Error> NetClientWorker::start() {
 void NetClientWorker::stop() {
     if (!started) return;
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
-    if (pthread_join(thread, nullptr) != 0) __builtin_trap();
+    if (const int error = pthread_join(thread, nullptr); error != 0)
+        RUT_TRAP("NetClientWorker::stop: pthread_join failed (error=%d)", error);
     OPENSSL_cleanse(slots, static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity));
     storage.destroy();
     slots = nullptr;

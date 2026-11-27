@@ -1,6 +1,7 @@
 #include "rut/compiler/mir_build.h"
 
 #include "core/expected.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_message.h"
 #include "rut/compiler/diagnostic.h"
@@ -1947,18 +1948,15 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             for (u32 i = 0; i < term.response_headers.len; i++) {
                 const auto& p = term.response_headers[i];
                 const bool ok = out->response_headers.push({p.key, p.value});
-                // Unreachable given the static_assert above; use a
-                // builtin trap in debug/release rather than `(void)ok`
-                // so a regression surfaces immediately instead of
-                // silently shipping a truncated header set.
-                if (!ok) __builtin_trap();
+                if (!ok) RUT_TRAP("MIR response headers exceed the HIR header capacity");
             }
             // forward(set_header:) overrides — same cap on both sides (the
             // static_assert above covers kMaxHeaders), straight copy.
             out->forward_set_headers.len = 0;
             for (u32 i = 0; i < term.forward_set_headers.len; i++) {
                 const auto& p = term.forward_set_headers[i];
-                if (!out->forward_set_headers.push({p.key, p.value})) __builtin_trap();
+                if (!out->forward_set_headers.push({p.key, p.value}))
+                    RUT_TRAP("MIR forward header overrides exceed the HIR header capacity");
             }
         };
         auto set_arm_effects = [&](MirBlock* out, const HirMatchArm& arm) -> FrontendResult<void> {

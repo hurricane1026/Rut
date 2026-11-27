@@ -1,10 +1,10 @@
 #pragma once
 
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 
 #include <inttypes.h>
-#include <stdio.h>
 
 namespace rut {
 
@@ -85,7 +85,7 @@ public:
 
     // Destructor: traps if BasicView<Size> still alive (the view would dangle)
     ~BasicBuffer() {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer destruction while a view is alive");
     }
 
     // No copy
@@ -95,7 +95,7 @@ public:
     // Move: traps if released (BasicView<Size> holds pointer to us — moving would dangle)
     BasicBuffer(BasicBuffer&& o) noexcept
         : ptr_(o.ptr_), cap_(o.cap_), len_(o.len_), released_(o.released_) {
-        if (released_) __builtin_trap();  // move while a view is alive = dangling owner_
+        if (released_) RUT_TRAP("Buffer move construction while a view is alive");
         o.ptr_ = nullptr;
         o.len_ = {};
         o.cap_ = {};
@@ -103,10 +103,8 @@ public:
     }
 
     void operator=(BasicBuffer&& o) noexcept {
-        if (o.released_) __builtin_trap();  // source has a view is alive = dangling owner_
-        if (released_)
-            __builtin_trap();  // dest has a view is alive = the view would corrupt new
-                               // state
+        if (o.released_) RUT_TRAP("Buffer move assignment from a buffer with a live view");
+        if (released_) RUT_TRAP("Buffer move assignment to a buffer with a live view");
         if (this != &o) {
             ptr_ = o.ptr_;
             len_ = o.len_;
@@ -140,14 +138,14 @@ public:
     // Traps if already released (double release = two Views = bug).
     // Returns empty BasicView<Size> if buffer is invalid (ptr_==nullptr).
     [[nodiscard]] BasicView<Size> release() noexcept {
-        if (released_) __builtin_trap();      // double release = bug
+        if (released_) RUT_TRAP("Buffer::release called twice");
         if (!ptr_) return BasicView<Size>();  // invalid buffer → empty BasicView<Size>, no lock
         released_ = true;
         return BasicView<Size>(ptr_, len_, this);
     }
 
     void reset() noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::reset: buffer has a live view");
         len_ = {};
     }
 
@@ -158,12 +156,12 @@ public:
     // Writable region for direct I/O (e.g. recv() target).
     // Returns pointer past current data; write_avail() bytes available.
     [[nodiscard]] u8* write_ptr() noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::write_ptr: buffer has a live view");
         return ptr_ ? ptr_ + len_.index() : nullptr;
     }
 
     [[nodiscard]] Size write_avail() const noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::write_avail: buffer has a live view");
         return ptr_ ? available().template to<Size>() : 0;
     }
 
@@ -179,12 +177,17 @@ public:
 
     // Set the absolute length after an in-place edit.
     void set_len(i64 n) noexcept {
-        if (released_ || !ptr_ || !cap_.try_count(n, &len_)) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::set_len: buffer has a live view");
+        if (!ptr_) RUT_TRAP("Buffer::set_len: buffer has no storage");
+        if (!cap_.try_count(n, &len_))
+            RUT_TRAP("Buffer::set_len: invalid length (%" PRId64 ", capacity=%" PRId64 ")",
+                     n,
+                     cap_.value());
     }
 
     // Drop the first n already-consumed bytes, shifting the remainder to the front.
     void consume(i64 n) noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::consume: buffer has a live view");
         Length consumed;
         if (!len_.try_nonempty_prefix(n, &consumed)) return;
         const auto kRemaining = (len_ - consumed).max(range_int<0, 1>{});
@@ -196,17 +199,15 @@ public:
     // Read-only data pointer for kernel send() / zero-copy forwarding.
     // Traps if released — use BasicView<Size>::data() for the released case.
     const u8* data() const noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::data: buffer has a live view");
         return ptr_;
     }
 
     // Forceful reinit — only for connection reset (all Views must be dead).
     // Caller guarantees no live Views reference this BasicBuffer.
     void bind(u8* ptr, i64 cap) noexcept {
-        if (!Length::try_from_i64(cap, &cap_)) {
-            ::fprintf(stderr, "rut: Buffer::bind: invalid capacity (%" PRId64 ")\n", cap);
-            __builtin_trap();
-        }
+        if (!Length::try_from_i64(cap, &cap_))
+            RUT_TRAP("Buffer::bind: invalid capacity (%" PRId64 ")", cap);
         ptr_ = ptr;
         len_ = {};
         released_ = false;
@@ -233,7 +234,7 @@ private:
     }
 
     void copy_prefix(const u8* src, i64 n, Length* copied) noexcept {
-        if (released_) __builtin_trap();
+        if (released_) RUT_TRAP("Buffer::copy_prefix: buffer has a live view");
         if (!ptr_) return;
         const auto kAvailable = available();
         Length written;
@@ -245,14 +246,11 @@ private:
 
     [[noreturn, gnu::cold, gnu::noinline]] void commit_failed(const char* reason,
                                                               i64 n) const noexcept {
-        ::fprintf(stderr,
-                  "rut: Buffer::commit: %s (length=%" PRId64 ", capacity=%" PRId64
-                  ", bytes=%" PRId64 ")\n",
-                  reason,
-                  len_.value(),
-                  cap_.value(),
-                  n);
-        __builtin_trap();
+        RUT_TRAP("Buffer::commit: %s (length=%" PRId64 ", capacity=%" PRId64 ", bytes=%" PRId64 ")",
+                 reason,
+                 len_.value(),
+                 cap_.value(),
+                 n);
     }
 
     friend struct BasicView<Size>;

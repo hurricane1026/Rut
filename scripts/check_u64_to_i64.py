@@ -29,6 +29,7 @@ DIAGNOSTIC = re.compile(
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
 )
 OVERFLOW_BUILTIN = re.compile(rb'\b__builtin_(?:[su])?(add|sub|mul)(?:ll?)?_overflow(?:_p)?\b')
+TRAP_BUILTIN = re.compile(rb'\b__builtin_(?:debug|verbose_)?trap\b')
 RANGE_COMMENT = re.compile(rb'//\s*RUT_INTEGER_RANGE:\s*\S')
 
 
@@ -63,17 +64,23 @@ def first_party(path):
 
 
 def check_builtin_locations():
-    tracked = subprocess.check_output(['git', 'ls-files', '-z', '--', 'src', 'include'], cwd=ROOT)
+    tracked = subprocess.check_output(
+        ['git', 'ls-files', '-z', '--', 'src', 'include', 'tests'], cwd=ROOT
+    )
     locations = []
     for name in tracked.decode().split('\0'):
         path = ROOT / name
         if path.suffix not in {'.cc', '.cpp', '.cxx', '.c', '.h', '.hpp'}:
             continue
-        if path == ROOT / 'include/rut/common/checked_arithmetic.h' or not path.is_file():
+        if not path.is_file():
             continue
+        check_arithmetic = first_party(path) and name != 'include/rut/common/checked_arithmetic.h'
+        check_trap = name != 'include/rut/common/trap.h'
         for line, source in enumerate(source_lines(path), 1):
-            if OVERFLOW_BUILTIN.search(source):
+            if check_arithmetic and OVERFLOW_BUILTIN.search(source):
                 locations.append(f'{name}:{line}: use rut checked arithmetic helpers')
+            if check_trap and TRAP_BUILTIN.search(source):
+                locations.append(f'{name}:{line}: use RUT_TRAP to log before terminating')
     return locations
 
 

@@ -1,5 +1,6 @@
 #include "rut/jit/codegen.h"
 
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/common/ws_control_flow.h"
 #include "rut/common/ws_message.h"
@@ -1004,7 +1005,8 @@ struct Ctx {
                     // 16 is 2x headroom; if frontend capacity ever grows, raise
                     // this in lockstep. Trap instead of silently truncating.
                     static constexpr u32 kMaxStructFields = 16;
-                    if (sd->field_count > kMaxStructFields) __builtin_trap();
+                    if (sd->field_count > kMaxStructFields)
+                        RUT_TRAP("JIT struct field count exceeds %u", kMaxStructFields);
                     LLVMTypeRef fields[kMaxStructFields]{};
                     for (u32 i = 0; i < sd->field_count; i++) {
                         fields[i] = map_type(sd->fields()[i].type);

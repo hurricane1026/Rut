@@ -1,6 +1,7 @@
 #include "rut/runtime/hpack.h"
 
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 
 namespace rut::hpack {
 
@@ -98,7 +99,8 @@ struct HuffTrie {
         for (i32 b = i32{kBits} - 1; b >= 0; b--) {
             const u32 kBit = (kCode >> b) & 1u;
             if (t.child[node][kBit] < 0) {
-                if (t.node_count == i32{kMaxNodes}) __builtin_trap();
+                if (t.node_count == i32{kMaxNodes})
+                    RUT_TRAP("HPACK Huffman tree exceeds its node capacity");
                 t.child[node][kBit] = t.node_count;
                 t.node_count++;
             }

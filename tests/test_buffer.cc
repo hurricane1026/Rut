@@ -2,7 +2,11 @@
 #include "rut/common/buffer.h"
 #include "test.h"
 
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 using namespace rut;
 
@@ -131,6 +135,39 @@ TEST(buffer, buffer_move_invalidates_source) {
     CHECK(!b1.valid());
     CHECK(b2.valid());
     CHECK_EQ(b2.len(), 2u);
+}
+
+TEST(buffer, move_with_live_view_logs_before_trapping) {
+    int diagnostics[2];
+    REQUIRE_EQ(pipe(diagnostics), 0);
+    const pid_t child = fork();
+    if (child == 0) {
+        close(diagnostics[0]);
+        const rlimit no_core{};
+        if (dup2(diagnostics[1], STDERR_FILENO) < 0 || setrlimit(RLIMIT_CORE, &no_core) != 0)
+            _exit(2);
+        close(diagnostics[1]);
+        u8 storage[16];
+        Buffer original(storage, sizeof(storage));
+        View view = original.release();
+        Buffer moved(static_cast<Buffer&&>(original));
+        _exit(0);
+    }
+
+    close(diagnostics[1]);
+    if (child < 0) close(diagnostics[0]);
+    REQUIRE(child > 0);
+    int status = 0;
+    const pid_t waited = waitpid(child, &status, 0);
+    char message[2048]{};
+    const ssize_t count = read(diagnostics[0], message, sizeof(message) - 1);
+    close(diagnostics[0]);
+    REQUIRE_EQ(waited, child);
+    CHECK(count > 0);
+    CHECK(WIFSIGNALED(status));
+    CHECK(!WIFSIGNALED(status) || WTERMSIG(status) == SIGILL || WTERMSIG(status) == SIGTRAP);
+    CHECK(strstr(message, "buffer.h:") != nullptr);
+    CHECK(strstr(message, "Buffer move construction while a view is alive") != nullptr);
 }
 
 TEST(buffer, view_move_invalidates_source) {
@@ -357,7 +394,7 @@ TEST(copilot, release_flag_prevents_double) {
     View view = buf.release();
     CHECK(buf.is_released());
     // Double release would trap; only verify precondition state here
-    // buf.release();  // would __builtin_trap()
+    // buf.release();  // would trap
     (void)view;
 }
 

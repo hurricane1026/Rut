@@ -3,6 +3,7 @@
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/runtime/json.h"
 #include <new>
 
@@ -247,7 +248,8 @@ core::Expected<void, Error> HttpCallWorker::start() {
 void HttpCallWorker::stop() {
     if (!started) return;
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
-    if (pthread_join(thread, nullptr) != 0) __builtin_trap();
+    if (const int error = pthread_join(thread, nullptr); error != 0)
+        RUT_TRAP("HttpCallWorker::stop: pthread_join failed (error=%d)", error);
     started = false;
     OPENSSL_cleanse(slots, sizeof(Slot) * kCapacity);
     storage.destroy();

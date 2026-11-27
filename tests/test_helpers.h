@@ -3,6 +3,7 @@
 // Shared test infrastructure — mock event loop, real socket helpers.
 
 #include "mock_backend.h"
+#include "rut/common/trap.h"
 #include "rut/runtime/callbacks_impl.h"
 #include "rut/runtime/connection.h"
 #ifdef __APPLE__
@@ -198,7 +199,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
 
     void free_ws_handshake_slice(u8* slice) {
         if (slice == nullptr) return;
-        if (slice != ws_handshake_storage || !ws_handshake_in_use) __builtin_trap();
+        if (slice != ws_handshake_storage || !ws_handshake_in_use)
+            RUT_TRAP("Test fixture released an unowned WebSocket handshake slice");
         ws_handshake_in_use = false;
         ws_handshake_free_calls++;
     }
@@ -220,7 +222,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         if (!ws_terminate_in_use || c.id != ws_terminate_owner_id) return;
         if (c.ws_c2u_msg != ws_terminate_storage[0] || c.ws_u2c_msg != ws_terminate_storage[1] ||
             c.ws_c2u_out != ws_terminate_storage[2] || c.ws_u2c_out != ws_terminate_storage[3])
-            __builtin_trap();
+            RUT_TRAP("Test fixture WebSocket buffer ownership mismatch");
         c.ws_c2u_msg = nullptr;
         c.ws_u2c_msg = nullptr;
         c.ws_c2u_out = nullptr;
