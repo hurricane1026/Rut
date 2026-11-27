@@ -213,9 +213,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
                 ++bin;
             }
             ++study_small_phase_hist[k][bin];
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(
-                study_small_phase_sum_us[k], phases[k], &study_small_phase_sum_us[k]);
+            study_small_phase_sum_us[k] = wrapping_add(study_small_phase_sum_us[k], u64{phases[k]});
             if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
         }
     }
@@ -247,8 +245,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
             ++bin;
         }
         ++study_wait_hist[kind][bin];
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(study_wait_sum_ns[kind], ns, &study_wait_sum_ns[kind]);
+        study_wait_sum_ns[kind] = wrapping_add(study_wait_sum_ns[kind], u64{ns});
         if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
     }
     void study_record_syscall(u32 kind, u64 ns) {
@@ -894,17 +891,13 @@ public:
 
     void epoch_enter() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -4363,12 +4356,10 @@ public:
         }
         const i64 relay_calls =
             static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(study_relay_calls, static_cast<u64>(relay_calls), &study_relay_calls);
+        study_relay_calls = wrapping_add(study_relay_calls, static_cast<u64>(relay_calls));
         u64 flush_phase_ns = 0;
         if (!sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
+            study_flush_phase_ns = wrapping_add(study_flush_phase_ns, u64{flush_phase_ns});
     }
 
     void clear_deferred_relay_read(u32 id) {
@@ -4538,11 +4529,12 @@ public:
             }
             r.segment_len = static_cast<u32>(n);
             relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(relay_pulled_bytes, static_cast<u64>(n), &relay_pulled_bytes);
+            relay_pulled_bytes = wrapping_add(relay_pulled_bytes, static_cast<u64>(n));
             r.segment_sent = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(r.body_bytes, static_cast<u64>(r.segment_len), &r.body_bytes);
+            if (!try_add_to(&r.body_bytes, r.segment_len)) {
+                close_conn(c);
+                return;
+            }
             c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
                                                      static_cast<i64>(r.segment_len));
             refresh_relay_progress_timer(c);
@@ -4587,13 +4579,13 @@ public:
         }
         r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
         relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
+        relay_written_bytes = wrapping_add(relay_written_bytes, static_cast<u64>(n));
         if (study_inside_cq)
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
+            study_cq_splice_bytes = wrapping_add(study_cq_splice_bytes, static_cast<u64>(n));
+        if (!try_add_to(&c.resp_body_sent, n)) {
+            close_conn(c);
+            return;
+        }
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
@@ -7541,8 +7533,7 @@ public:
         study_inside_cq = false;
         u64 cq_phase_ns = 0;
         if (!sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
+            study_cq_phase_ns = wrapping_add(study_cq_phase_ns, u64{cq_phase_ns});
         resolve_response_body_idle_expiries();
         this->resolve_upstream_write_idle_expiries(slots_initialized);
         settle_response_read_deadline_batch();
@@ -7927,8 +7918,10 @@ public:
                                                  &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(c.pending_ops, submitted, &c.pending_ops);
+            if (!try_add_to(&c.pending_ops, submitted)) {
+                ::fprintf(stderr, "rut: io_uring pending operation count overflow during close\n");
+                __builtin_trap();
+            }
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -8584,7 +8577,7 @@ public:
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
                 for (i32 t = 0; t < ticks; t++) {
-                    (void)timer.tick([this](Connection* c) {
+                    timer.advance([this](Connection* c) {
                         if (c->response_body_idle_armed) {
                             c->response_body_idle_armed = false;
                             c->response_body_idle_expiry_pending = true;

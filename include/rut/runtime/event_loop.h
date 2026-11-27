@@ -1173,17 +1173,13 @@ public:
     // Zero-cost when epoch pointer is null (no control plane wired).
     void epoch_enter() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -1649,7 +1645,7 @@ public:
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
-                    (void)timer.tick([this](Connection* c) {
+                    timer.advance([this](Connection* c) {
 #if RUT_ENABLE_WEBSOCKET
                         if (ws_handle_timer_tick(this, *c)) return;
 #endif

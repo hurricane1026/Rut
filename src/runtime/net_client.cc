@@ -133,9 +133,7 @@ void NetClientWorker::adopt_config(const void* config) {
     pool_config = config;
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
-    u64 next = 0;
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    if (epoch) (void)add_overflow(epoch, u64{1}, &next);
+    const u64 next = epoch ? wrapping_add(epoch, u64{1}) : 0;
     __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {

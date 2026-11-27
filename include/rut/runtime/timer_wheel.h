@@ -51,13 +51,13 @@ struct TimerWheel {
 
     [[nodiscard]] friend constexpr Tick operator++(Tick& t, int) {
         const Tick old = t;
-        (void)++t;
+        t = Tick{wrapping_add(static_cast<u32>(old), u32{1})};
         return old;
     }
 
     [[nodiscard]] friend constexpr Tick operator--(Tick& t, int) {
         const Tick old = t;
-        (void)--t;
+        t = Tick{wrapping_sub(static_cast<u32>(old), u32{1})};
         return old;
     }
 
@@ -100,6 +100,15 @@ struct TimerWheel {
     template <typename Fn>
     [[nodiscard]] u32 tick(Fn on_expire) {
         u32 count = 0;
+        advance([&](Connection* conn) {
+            on_expire(conn);
+            ++count;
+        });
+        return count;
+    }
+
+    template <typename Fn>
+    void advance(Fn on_expire) {
         ListNode* head = &slots[slot_after(0)];
         ListNode* node = head->next;
         while (node != head) {
@@ -109,11 +118,9 @@ struct TimerWheel {
             auto* conn =
                 reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - timer_node_offset());
             on_expire(conn);
-            count++;
             node = next;
         }
-        (void)++cursor;
-        return count;
+        cursor = tick_after(1);
     }
 
     // Offset of timer_node within Connection. Defined in .cc after Connection is complete.

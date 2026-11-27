@@ -458,17 +458,13 @@ public:
 
     void epoch_enter() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
-            u64 next = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            const u64 next = wrapping_add(epoch->epoch.load(std::memory_order_relaxed), u64{1});
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -1247,7 +1243,7 @@ public:
                 if (!catchup_reaches_probe_timeout && !is_draining())
                     request_health_sweep_after_batch();
                 for (i32 t = 0; t < ticks; t++) {
-                    (void)timer.tick([this](Connection* c) {
+                    timer.advance([this](Connection* c) {
                         // A stalled active health probe: it accepted the connect
                         // (or stayed pending) but never produced a parseable
                         // response within upstream_timeout. Record a health FAILURE

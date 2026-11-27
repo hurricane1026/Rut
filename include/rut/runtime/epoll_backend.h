@@ -67,9 +67,7 @@ struct EpollBackend {
                                      : static_cast<i64>(0)));
     }
     static void reset_fd_interest(FdInterest& r) {
-        u32 next = 0;
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(r.gen, u32{1}, &next);
+        const u32 next = wrapping_add(r.gen, u32{1});
         r = {-1, 0, 0, next};
     }
 

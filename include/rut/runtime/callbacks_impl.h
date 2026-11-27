@@ -2389,9 +2389,7 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
     if (conn.throttle_down_bps == 0) return false;
     const u64 kNowNs = monotonic_ns();
     if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
-    u64 kDelayNs = 0;
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
+    const u64 kDelayNs = wrapping_sub(conn.throttle_tat_ns, kNowNs);
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
@@ -2433,9 +2431,7 @@ void throttle_resume(Loop* loop, Connection& conn) {
         const u64 kNowNs = monotonic_ns();
         if (conn.throttle_tat_ns > kNowNs) {
             // Budget not recovered yet — re-park for the remaining deficit.
-            u64 kDelayNs = 0;
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
+            const u64 kDelayNs = wrapping_sub(conn.throttle_tat_ns, kNowNs);
             bool armed = false;
             if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
                 armed = loop->arm_throttle_timer(conn, kDelayNs);
@@ -2497,15 +2493,8 @@ inline bool http_cache_cors_mutations_admitted(const Connection& conn) {
         const u64 begin = reinterpret_cast<u64>(value.ptr);
         const u64 base = reinterpret_cast<u64>(buffer.data());
         // Reject even a zero-length view pointing into a buffer we will rewrite.
-        u64 distance = 0;
-        if (begin >= base) {
-            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-            (void)sub_overflow(begin, base, &distance);
-            return distance < buffer.capacity();
-        }
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)sub_overflow(base, begin, &distance);
-        return value.len > distance;
+        if (begin >= base) return wrapping_sub(begin, base) < buffer.capacity();
+        return value.len > wrapping_sub(base, begin);
     };
     for (u32 i = 0; i < conn.resp_header_mutation_count; ++i) {
         const auto& m = conn.resp_header_mutations[i];
@@ -3936,11 +3925,14 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)add_overflow(
-        conn.downstream_req_size, static_cast<u64>(consume), &conn.downstream_req_size);
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
+    u32 downstream_size = conn.downstream_req_size;
+    u32 request_size = conn.req_size;
+    if (!try_add_to(&downstream_size, consume) || !try_add_to(&request_size, consume)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.downstream_req_size = downstream_size;
+    conn.req_size = request_size;
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
@@ -4029,11 +4021,14 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)add_overflow(
-        conn.downstream_req_size, static_cast<u64>(consume), &conn.downstream_req_size);
-    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-    (void)add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
+    u32 downstream_size = conn.downstream_req_size;
+    u32 request_size = conn.req_size;
+    if (!try_add_to(&downstream_size, consume) || !try_add_to(&request_size, consume)) {
+        loop->close_conn(conn);
+        return;
+    }
+    conn.downstream_req_size = downstream_size;
+    conn.req_size = request_size;
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
@@ -12287,22 +12282,24 @@ bool ws_resume_client_recv(Loop* loop, Connection& conn) {
 // bytes are read after the FIN — otherwise the drain-then-close contract (stop
 // reading new data) would be violated and the tunnel would keep relaying.
 template <typename Loop>
-void ws_stop_upstream_poll(Loop* loop, Connection& conn) {
+[[nodiscard]] bool ws_stop_upstream_poll(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_upstream(c); }) {
         loop->ws_unpoll_upstream(conn);
     } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
-        (void)loop->pause_upstream_recv(conn);  // async: cancel the multishot recv
+        return loop->pause_upstream_recv(conn);
     }
+    return true;
 }
 
 // Symmetric to ws_stop_upstream_poll for the client fd.
 template <typename Loop>
-void ws_stop_client_poll(Loop* loop, Connection& conn) {
+[[nodiscard]] bool ws_stop_client_poll(Loop* loop, Connection& conn) {
     if constexpr (requires(Loop* lp, Connection& c) { lp->ws_unpoll_client(c); }) {
         loop->ws_unpoll_client(conn);
     } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
-        (void)loop->pause_recv(conn);  // async: cancel the multishot recv
+        return loop->pause_recv(conn);
     }
+    return true;
 }
 
 // True for backends whose recv eagerly consumes socket data into a provided
@@ -12404,9 +12401,9 @@ bool ws_receive_closing(Loop* loop, Connection& conn) {
     if (received || kEof) {
         consume(input.len());  // trailing bytes cannot create more application events
         if constexpr (FromClient)
-            ws_stop_client_poll(loop, conn);
+            return ws_stop_client_poll(loop, conn);
         else
-            ws_stop_upstream_poll(loop, conn);
+            return ws_stop_upstream_poll(loop, conn);
     }
     return true;
 }
@@ -12743,9 +12740,7 @@ bool ws_drain_pump(Loop* loop, Connection& conn) {
         if (!ws_try_send_client_to_upstream(loop, conn)) return false;
     if (!conn.ws_upstream_send_pending && conn.upstream_recv_buf.len() > 0)
         if (!ws_try_send_upstream_to_client(loop, conn)) return false;
-    ws_stop_client_poll(loop, conn);
-    ws_stop_upstream_poll(loop, conn);
-    return true;
+    return ws_stop_client_poll(loop, conn) && ws_stop_upstream_poll(loop, conn);
 }
 
 template <typename Loop>
@@ -13011,7 +13006,7 @@ void on_ws_pre_tunnel_upstream_recv(void* lp, Connection& conn, IoEvent ev) {
         // Stop polling the hung-up upstream fd so a slow 101 drain to the client
         // doesn't spin the level-triggered loop on redelivered EPOLLHUP. The fd
         // is still ::closed by close_conn once the tunnel is entered/torn down.
-        ws_stop_upstream_poll(loop, conn);
+        if (!ws_stop_upstream_poll(loop, conn)) close_conn_if_live(loop, conn);
         return;
     }
     if (!ws_pause_upstream_recv(loop, conn)) close_conn_if_live(loop, conn);
@@ -16201,10 +16196,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
 
     if (conn.upstream_start_us != 0) {
         const u64 first_response_us = monotonic_us();
-        u64 elapsed_us = 0;
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)sub_overflow(first_response_us, conn.upstream_start_us, &elapsed_us);
-        conn.upstream_us = static_cast<u32>(elapsed_us);
+        const u64 kElapsedUs = first_response_us >= conn.upstream_start_us
+                                   ? wrapping_sub(first_response_us, conn.upstream_start_us)
+                                   : 0;
+        conn.upstream_us = static_cast<u32>(kElapsedUs);
         conn.upstream_start_us = 0;
         if constexpr (requires { loop->study_note_first_response(conn, first_response_us); }) {
             if (ev.result > 0 || conn.upstream_recv_buf.len() != 0)
@@ -16893,7 +16888,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // client FIN during a backpressured 101 send would spin the loop on
         // redelivered Recv/0. It preserves the 101 send's EPOLLOUT and cancels
         // the io_uring recv; on_ws_101_sent re-arms once the tunnel is up.
-        ws_stop_client_poll(loop, conn);
+        if (!ws_stop_client_poll(loop, conn)) close_conn_if_live(loop, conn);
         return;
     }
 #endif

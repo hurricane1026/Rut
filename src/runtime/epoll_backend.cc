@@ -160,9 +160,7 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
         return -err;
     }
     if (last != nullptr) {
-        u32 next = 0;
-        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
-        (void)add_overflow(last->gen, u32{1}, &next);
+        const u32 next = wrapping_add(last->gen, u32{1});
         *last = {fd, events, ev.data.u64, next};
     }
     return 0;
