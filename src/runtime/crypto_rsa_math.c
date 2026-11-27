@@ -26,10 +26,11 @@ uint32_t rut_crypto_rsa_key_bits_internal(const EVP_PKEY* key) {
 
 EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) {
     if (!der || !length || length > 8192) return 0;
+    const int64_t der_length = length;
     const uint8_t* cursor = der;
-    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, length);
+    EVP_PKEY* candidate = d2i_PUBKEY(0, &cursor, der_length);
     if (!candidate) return 0;
-    if (cursor != der + (int64_t)length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
+    if (cursor != der + der_length || EVP_PKEY_id(candidate) != EVP_PKEY_RSA) goto fail;
     const int bits = EVP_PKEY_bits(candidate);
     if (bits < 2048 || bits > 4096) goto fail;
     const RSA* rsa = EVP_PKEY_get0_RSA(candidate);
@@ -38,8 +39,8 @@ EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) 
     const BIGNUM* exponent = 0;
     RSA_get0_key(rsa, &modulus, &exponent, 0);
     if (!modulus || !exponent || !BN_is_odd(modulus) || !BN_is_word(exponent, 65537)) goto fail;
-    const int canonical_size = i2d_PUBKEY(candidate, 0);
-    if (canonical_size <= 0 || (uint32_t)canonical_size != length) goto fail;
+    const int64_t canonical_size = i2d_PUBKEY(candidate, 0);
+    if (canonical_size <= 0 || canonical_size != der_length) goto fail;
     uint8_t canonical[8192];
     uint8_t* output = canonical;
     if (i2d_PUBKEY(candidate, &output) != canonical_size) goto fail;
@@ -67,10 +68,12 @@ EVP_PKEY* rut_crypto_rsa_from_modulus_internal(const uint8_t* modulus, uint32_t 
         if (EVP_PKEY_set1_RSA(owner, rsa)) {
             uint8_t der[8192];
             const int size = i2d_PUBKEY(owner, 0);
-            if (size > 0 && (uint32_t)size <= sizeof(der)) {
+            const int der_capacity = sizeof(der);
+            if (size > 0 && size <= der_capacity) {
+                const uint32_t der_length = size;
                 uint8_t* cursor = der;
                 if (i2d_PUBKEY(owner, &cursor) == size)
-                    accepted = rut_crypto_rsa_load_der_internal(der, (uint32_t)size);
+                    accepted = rut_crypto_rsa_load_der_internal(der, der_length);
             }
         }
     }
@@ -180,13 +183,14 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                                           0x04,
                                           0x20};
     uint8_t expected[512];
-    const int64_t padding_end = (int64_t)bytes - (int64_t)sizeof(digest_info) - 32 - 1;
+    const int digest_info_size = sizeof(digest_info);
+    const int hash_offset = signature_size - 32;
+    const int padding_end = hash_offset - digest_info_size - 1;
     expected[0] = 0;
     expected[1] = 1;
-    for (uint32_t i = 2; i < padding_end; ++i) expected[i] = 0xff;
+    for (int i = 2; i < padding_end; ++i) expected[i] = 0xff;
     expected[padding_end] = 0;
-    for (uint32_t i = 0; i < sizeof(digest_info); ++i)
-        expected[padding_end + 1 + (int64_t)i] = digest_info[i];
+    for (int i = 0; i < digest_info_size; ++i) expected[padding_end + 1 + i] = digest_info[i];
     uint32_t digest_len = 0;
     if (!rut_crypto_digest_v1(RUT_CRYPTO_SHA256_V1,
                               message,
@@ -194,7 +198,7 @@ uint32_t rut_crypto_rsa_verify_internal(const BIGNUM* modulus,
                               0,
                               0,
                               0,
-                              expected + ((int64_t)bytes - 32),
+                              expected + hash_offset,
                               32,
                               &digest_len) ||
         digest_len != 32)
