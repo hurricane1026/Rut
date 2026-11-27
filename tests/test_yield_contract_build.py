@@ -145,9 +145,9 @@ def main():
         source = "src/runtime/send_progress.cc"
         check(compiler, root, overlay, source=source)
         for before, after in [
-            ("completed > remaining", "completed >= remaining"),
+            ("completed > kRemaining.value()", "completed >= kRemaining.value()"),
             ("total <= INT32_MAX", "total <= UINT32_MAX"),
-            ("remaining = static_cast<u32>((range_int(remaining) - kDelta).value());",
+            ("remaining = (kRemaining - kDelta).max(range_int<0, 1>{}).to<u32>();",
              "remaining = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/send_progress.h", before, after)
@@ -205,7 +205,7 @@ def main():
         for before, after in [
             ("source + range_int(offset).value()", "source + kStep"),
             ("++message.msg_iov;", "/* leave the previous span selected */"),
-            ("\n            n = static_cast<u32>((range_int(n) - range_int(kStep)).value());",
+            ("\n            n = (range_int(n) - range_int(kStep)).max(range_int<0, 1>{}).to<u32>();",
              "\n            n = 0;"),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/buffered_send_vector.h",
@@ -260,8 +260,9 @@ def main():
 
         source = "src/runtime/response_read_timer.cc"
         for before, after in [
-            ("ms / 1000", "ms / 1001"),
-            ("(ms % 1000) * 1'000'000", "(ms * 1'000'000u) % 1'000'000'000u"),
+            ("divided_by<1000>()", "divided_by<1001>()"),
+            ("bounded_remainder<1000>(ms).scaled_by<1'000'000>()",
+             "bounded_remainder<1000>(ms * 1'000'000u).scaled_by<1'000'000>()"),
             ("ts.tv_nsec < 1'000'000'000", "ts.tv_nsec <= 1'000'000'000"),
             ("(ts.tv_sec != 0 || ts.tv_nsec != 0)", "true"),
         ]:
@@ -273,11 +274,12 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
-            ("(bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64()",
-             "(kRounded + 1'000'000) / 1'000'000"),
-            ("(bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64()",
-             "(kRounded + 1) / 1'000'000"),
-            ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
+            ("bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}",
+             "bounded_quotient<1'000'000>(kRounded + 1'000'000)"),
+            ("bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}",
+             "bounded_quotient<1'000'000>(kRounded + 1)"),
+            ("kMillis.min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>()",
+             "static_cast<u32>(kMillis.value())"),
             ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),
         ]:
