@@ -13,13 +13,15 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 MESSAGE = 'u64 to i64 conversion requires a range proof'
 OVERFLOW_MESSAGE = 'checked arithmetic requires an explicit return from a nodiscard function'
+ADDRESS_MESSAGE = 'use bounded offsets for address arithmetic or validate a raw span explicitly'
 ARITHMETIC_MESSAGE = 'integer arithmetic needs a range proof'
 NARROWING_MESSAGE = 'integer arithmetic result may not fit the destination'
 INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 RANGE_CAST_MESSAGE = 'narrow a range_int with a range-checked conversion'
 NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
-MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE, *ARITHMETIC_MESSAGES)
+MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE,
+            ADDRESS_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -148,6 +150,11 @@ def main():
                     str(args.plugin.resolve()), *overflow_check, '-Xclang', '-verify',
                     '-I', ROOT / 'include', '-std=c++23',
                     ROOT / 'scripts/clang/overflow_result_cases.cc'], check=True)
+    address_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-address-addition']
+    subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
+                    str(args.plugin.resolve()), *address_check, '-Xclang', '-verify',
+                    '-I', ROOT / 'include', '-std=c++23',
+                    ROOT / 'scripts/clang/address_addition_cases.cc'], check=True)
     arithmetic_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-integer-arithmetic']
     subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
                     str(args.plugin.resolve()), *arithmetic_check, '-Xclang', '-verify',
@@ -189,7 +196,7 @@ def main():
         cwd, flags = command
         run = subprocess.run([args.clang, *flags, '-Wno-error', '-fno-color-diagnostics',
                               '-fdiagnostics-print-source-range-info', *check, *overflow_check,
-                              *arithmetic_check, *nodiscard_check], cwd=cwd,
+                              *arithmetic_check, *nodiscard_check, *address_check], cwd=cwd,
                              text=True, capture_output=True)
         if run.returncode:
             raise RuntimeError(f'Clang conversion audit failed\n{run.stderr}')
@@ -268,6 +275,8 @@ def main():
     print(f'{len(range_casts)} explicit narrowing casts without a range_int conversion')
     indices = sum(message == INDEX_MESSAGE for *_, message in failures)
     print(f'{indices} array indices bypass range_int::index() or at()')
+    addresses = sum(message == ADDRESS_MESSAGE for *_, message in failures)
+    print(f'{addresses} address additions without bounded offsets or raw-span validation')
     direct = check_builtin_locations()
     for location in direct:
         print(location)

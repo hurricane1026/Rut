@@ -1022,14 +1022,10 @@ private:
             method_key == kRouteMethodInvalid || method_key == kRouteMethodAny ||
             route_method_slot_from_key(method_key) == kRouteMethodSlotInvalid)
             return invalid;
-        const uintptr_t raw_address = reinterpret_cast<uintptr_t>(raw_target.ptr);
-        const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
-        uintptr_t raw_end = 0;
-        uintptr_t normalized_end = 0;
-        if (add_overflow(raw_address, static_cast<uintptr_t>(raw_target.len), &raw_end) ||
-            add_overflow(normalized_address,
-                         static_cast<uintptr_t>(slash_normalized_path.len),
-                         &normalized_end))
+        uintptr_t raw_end, normalized_end;
+        if (!raw_byte_span_address_end(raw_target.ptr, raw_target.len, &raw_end) ||
+            !raw_byte_span_address_end(
+                slash_normalized_path.ptr, slash_normalized_path.len, &normalized_end))
             return invalid;
         if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
         bool previous_slash = false;

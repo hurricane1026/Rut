@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/byte_span.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
@@ -1710,7 +1711,7 @@ struct ConnectionBase {
         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
         uintptr_t address_end = 0;
         if (base != recv_slice || address < 4096 ||
-            add_overflow(address, static_cast<uintptr_t>(capacity), &address_end))
+            !raw_byte_span_address_end(base, capacity, &address_end))
             return invalid;
 
         const char* method = nullptr;

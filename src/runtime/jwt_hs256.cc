@@ -1,6 +1,6 @@
 #include "rut/runtime/jwt_hs256.h"
 
-#include "rut/common/checked_arithmetic.h"
+#include "rut/common/byte_span.h"
 #include "rut/common/types.h"
 #include "rut/runtime/crypto_c.h"
 #include "rut/runtime/json.h"
@@ -16,8 +16,8 @@ bool ranges_overlap(const void* left, u32 left_length, const void* right, u32 ri
     const auto kLeftStart = reinterpret_cast<uintptr_t>(left);
     const auto kRightStart = reinterpret_cast<uintptr_t>(right);
     uintptr_t left_end = 0, right_end = 0;
-    if (add_overflow(kLeftStart, static_cast<uintptr_t>(left_length), &left_end) ||
-        add_overflow(kRightStart, static_cast<uintptr_t>(right_length), &right_end))
+    if (!raw_byte_span_address_end(left, left_length, &left_end) ||
+        !raw_byte_span_address_end(right, right_length, &right_end))
         return true;
     return kLeftStart < right_end && kRightStart < left_end;
 }

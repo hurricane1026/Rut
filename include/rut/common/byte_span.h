@@ -5,6 +5,14 @@
 
 namespace rut {
 
+// For boundaries that must reject raw addresses whose exclusive end wraps.
+// Use relative offsets when checking containment in a live buffer.
+[[nodiscard]] inline bool raw_byte_span_address_end(const void* data,
+                                                    uintptr_t size,
+                                                    uintptr_t* end) {
+    return !add_overflow(reinterpret_cast<uintptr_t>(data), size, end);
+}
+
 // The caller supplies a live buffer of used bytes. A candidate span may
 // come from elsewhere. Publish its offset only after proving containment.
 [[nodiscard]] inline bool byte_span_offset_within(

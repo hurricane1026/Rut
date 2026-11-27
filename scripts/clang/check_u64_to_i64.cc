@@ -382,6 +382,75 @@ class OverflowResultAction : public PluginASTAction {
     }
 };
 
+// Recognize integer addresses through casts and local aliases. A difference
+// between two addresses is an offset and does not carry address provenance.
+class AddressAdditionVisitor : public RecursiveASTVisitor<AddressAdditionVisitor> {
+    ASTContext& context;
+
+    static bool is_address(const Expr* expr, unsigned depth = 0) {
+        if (depth == 12) return false;
+        expr = expr->IgnoreParenImpCasts();
+        if (const auto* cast = dyn_cast<CastExpr>(expr))
+            return cast->getCastKind() == CK_PointerToIntegral ||
+                   is_address(cast->getSubExpr(), depth + 1);
+        if (const auto* local = variable(expr); local && local->hasInit())
+            return is_address(local->getInit(), depth + 1);
+        if (const auto* branch = dyn_cast<ConditionalOperator>(expr))
+            return is_address(branch->getTrueExpr(), depth + 1) ||
+                   is_address(branch->getFalseExpr(), depth + 1);
+        if (const auto* op = dyn_cast<BinaryOperator>(expr)) {
+            if (op->getOpcode() == BO_Add)
+                return is_address(op->getLHS(), depth + 1) || is_address(op->getRHS(), depth + 1);
+            if (op->getOpcode() == BO_Sub)
+                return is_address(op->getLHS(), depth + 1) && !is_address(op->getRHS(), depth + 1);
+        }
+        return false;
+    }
+
+public:
+    explicit AddressAdditionVisitor(ASTContext& context) : context(context) {}
+
+    bool shouldVisitTemplateInstantiations() const { return true; }
+
+    bool VisitCallExpr(CallExpr* call) {
+        const auto* callee = call->getDirectCallee();
+        if (!callee || !callee->getIdentifier() || call->getNumArgs() < 2 ||
+            context.getSourceManager().isInSystemHeader(call->getExprLoc()))
+            return true;
+        const auto name = callee->getName();
+        const bool builtin = name.starts_with("__builtin_add") ||
+                             name.starts_with("__builtin_sadd") ||
+                             name.starts_with("__builtin_uadd");
+        if (name != "add_overflow" && name != "wrapping_add" && !builtin) return true;
+        if (!is_address(call->getArg(0)) && !is_address(call->getArg(1))) return true;
+        if (const auto* function = enclosing_function(context, *call);
+            function && function->getQualifiedNameAsString() == "rut::raw_byte_span_address_end")
+            return true;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(
+            DiagnosticsEngine::Warning,
+            "use bounded offsets for address arithmetic or validate a raw span explicitly");
+        diagnostics.Report(call->getExprLoc(), id) << call->getSourceRange();
+        return true;
+    }
+};
+
+class AddressAdditionConsumer : public ASTConsumer {
+    void HandleTranslationUnit(ASTContext& context) override {
+        AddressAdditionVisitor(context).TraverseDecl(context.getTranslationUnitDecl());
+    }
+};
+
+class AddressAdditionAction : public PluginASTAction {
+    std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, llvm::StringRef) override {
+        return std::make_unique<AddressAdditionConsumer>();
+    }
+
+    bool ParseArgs(const CompilerInstance&, const std::vector<std::string>&) override {
+        return true;
+    }
+};
+
 // Widen enough to represent the exact product of any two native 128-bit
 // integers. Use signed comparisons even for original unsigned operands.
 class IntegerArithmeticVisitor : public RecursiveASTVisitor<IntegerArithmeticVisitor> {
@@ -773,3 +842,6 @@ static FrontendPluginRegistry::Add<IntegerArithmeticAction> arithmetic_registrat
 
 static FrontendPluginRegistry::Add<NodiscardAction> nodiscard_registration(
     "rut-nodiscard", "Require [[nodiscard]] on non-void functions");
+
+static FrontendPluginRegistry::Add<AddressAdditionAction> address_addition_registration(
+    "rut-address-addition", "Require bounded offsets or explicit raw-span address validation");

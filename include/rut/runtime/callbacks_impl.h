@@ -7459,13 +7459,12 @@ inline bool apply_request_header_overrides(Connection& conn) {
     // memory, so they never alias recv_buf and this never trips for compiled .rut.)
     const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
     uintptr_t kBufHi = 0;
-    if (add_overflow(kBufLo, static_cast<uintptr_t>(conn.recv_buf.capacity()), &kBufHi))
-        return false;
+    if (!raw_byte_span_address_end(buf, conn.recv_buf.capacity(), &kBufHi)) return false;
     auto aliases_recv_buf = [&](const Str& s) {
         if (s.ptr == nullptr) return false;
         const uintptr_t p = reinterpret_cast<uintptr_t>(s.ptr);
         uintptr_t end = 0;
-        if (add_overflow(p, static_cast<uintptr_t>(s.len), &end)) return true;
+        if (!raw_byte_span_address_end(s.ptr, s.len, &end)) return true;
         return p < kBufHi && end > kBufLo;
     };
 

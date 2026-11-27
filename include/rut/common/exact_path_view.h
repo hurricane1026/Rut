@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rut/common/checked_arithmetic.h"
+#include "rut/common/byte_span.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -49,7 +49,7 @@ enum class ExactPathNormalizationResult : u8 {
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
     uintptr_t raw_end = 0;
-    if (add_overflow(raw_begin, raw.len, &raw_end))
+    if (!raw_byte_span_address_end(raw.ptr, raw.len, &raw_end))
         return ExactPathNormalizationResult::InvalidInput;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
@@ -80,9 +80,9 @@ enum class ExactPathNormalizationResult : u8 {
     const uintptr_t output_len_begin = reinterpret_cast<uintptr_t>(output_len);
     uintptr_t output_end = 0;
     uintptr_t output_len_end = 0;
-    if (add_overflow(output_begin, normalized_len, &output_end))
+    if (!raw_byte_span_address_end(output, normalized_len, &output_end))
         return ExactPathNormalizationResult::InvalidInput;
-    if (add_overflow(output_len_begin, sizeof(*output_len), &output_len_end))
+    if (!raw_byte_span_address_end(output_len, sizeof(*output_len), &output_len_end))
         return ExactPathNormalizationResult::InvalidInput;
     const auto ranges_overlap = [](uintptr_t first_begin,
                                    uintptr_t first_end,
