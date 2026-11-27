@@ -307,8 +307,7 @@ SyscallFaultConfig current_syscall_fault_config() {
     config.clock_gettime_fixed = g_clock_gettime_fixed.load(std::memory_order_relaxed);
     config.clock_gettime_match_all = g_clock_gettime_match_all.load(std::memory_order_relaxed);
     config.clock_gettime_clock_id = g_clock_gettime_clock_id.load(std::memory_order_relaxed);
-    config.clock_gettime_sec =
-        static_cast<time_t>(g_clock_gettime_sec.load(std::memory_order_relaxed));
+    config.clock_gettime_sec = time_t{g_clock_gettime_sec.load(std::memory_order_relaxed)};
     config.clock_gettime_nsec = g_clock_gettime_nsec.load(std::memory_order_relaxed);
     return config;
 }
@@ -1007,7 +1006,7 @@ extern "C" ssize_t send(int fd, const void* buf, size_t len, int flags) {
     }
     if (!rut::test_fault::g_real_send) {
 #ifdef __linux__
-        return static_cast<ssize_t>(syscall(SYS_sendto, fd, buf, len, flags, nullptr, 0));
+        return ssize_t{syscall(SYS_sendto, fd, buf, len, flags, nullptr, 0)};
 #else
         errno = ENOSYS;
         return -1;

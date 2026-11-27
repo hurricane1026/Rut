@@ -20,32 +20,32 @@ void fail(Diagnostic& diagnostic, FailurePhase phase, int error_number = 0) {
 }
 
 ExecutableIdentity make_identity(const struct stat& status) {
-    return {static_cast<std::uint64_t>(status.st_dev),
-            static_cast<std::uint64_t>(status.st_ino),
-            static_cast<std::uint64_t>(status.st_mode),
-            static_cast<std::uint64_t>(status.st_uid),
-            static_cast<std::uint64_t>(status.st_gid),
+    return {std::uint64_t{status.st_dev},
+            std::uint64_t{status.st_ino},
+            std::uint64_t{status.st_mode},
+            std::uint64_t{status.st_uid},
+            std::uint64_t{status.st_gid},
             static_cast<std::uint64_t>(status.st_size),
-            static_cast<std::int64_t>(status.st_mtim.tv_sec),
-            static_cast<std::int64_t>(status.st_mtim.tv_nsec),
-            static_cast<std::int64_t>(status.st_ctim.tv_sec),
-            static_cast<std::int64_t>(status.st_ctim.tv_nsec)};
+            std::int64_t{status.st_mtim.tv_sec},
+            std::int64_t{status.st_mtim.tv_nsec},
+            std::int64_t{status.st_ctim.tv_sec},
+            std::int64_t{status.st_ctim.tv_nsec}};
 }
 
 bool same_object(const struct stat& status, const ExecutableIdentity& expected) {
     return S_ISREG(status.st_mode) && status.st_dev != 0 && status.st_ino != 0 &&
-           static_cast<std::uint64_t>(status.st_dev) == expected.device &&
-           static_cast<std::uint64_t>(status.st_ino) == expected.inode;
+           std::uint64_t{status.st_dev} == expected.device &&
+           std::uint64_t{status.st_ino} == expected.inode;
 }
 
 bool same_metadata_except_ctime(const struct stat& status, const ExecutableIdentity& expected) {
     return same_object(status, expected) && status.st_size >= 0 &&
-           static_cast<std::uint64_t>(status.st_mode) == expected.mode &&
-           static_cast<std::uint64_t>(status.st_uid) == expected.uid &&
-           static_cast<std::uint64_t>(status.st_gid) == expected.gid &&
+           std::uint64_t{status.st_mode} == expected.mode &&
+           std::uint64_t{status.st_uid} == expected.uid &&
+           std::uint64_t{status.st_gid} == expected.gid &&
            static_cast<std::uint64_t>(status.st_size) == expected.size &&
-           static_cast<std::int64_t>(status.st_mtim.tv_sec) == expected.mtime_seconds &&
-           static_cast<std::int64_t>(status.st_mtim.tv_nsec) == expected.mtime_nanoseconds;
+           std::int64_t{status.st_mtim.tv_sec} == expected.mtime_seconds &&
+           std::int64_t{status.st_mtim.tv_nsec} == expected.mtime_nanoseconds;
 }
 
 bool same_current_ctime(const struct stat& first, const struct stat& second) {
@@ -381,9 +381,8 @@ bool ExecutableLease::authorize_cleanup(bool require_cloexec,
                 original_members[first] = true;
                 original_members[second] = true;
             }
-    const unsigned member_count = static_cast<unsigned>(original_members[0]) +
-                                  static_cast<unsigned>(original_members[1]) +
-                                  static_cast<unsigned>(original_members[2]);
+    const unsigned member_count = unsigned{original_members[0]} + unsigned{original_members[1]} +
+                                  unsigned{original_members[2]};
     if (member_count < 2u) {
         fail(diagnostic, FailurePhase::Kcmp, EINVAL);
         original_members = {};

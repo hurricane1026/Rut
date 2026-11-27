@@ -315,7 +315,7 @@ bool Rs256Policies::activate(u32 shard) {
             if (!monotonic_ms || !remote->last_success || remote->empty ||
                 monotonic_ms < remote->last_success ||
                 sub_overflow(monotonic_ms, remote->last_success, &age) ||
-                age >= static_cast<u64>(policies_[i].remote().max_age_seconds) * 1000)
+                age >= u64{policies_[i].remote().max_age_seconds} * 1000)
                 return false;
             if (remote->use_alternate) verifiers = &remote->alternate;
         }

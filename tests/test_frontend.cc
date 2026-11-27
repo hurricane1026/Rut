@@ -40841,7 +40841,7 @@ TEST(frontend, response_read_timeout_accepts_only_exact_whole_seconds_one_throug
     const char valid[] =
         "upstream b\nroute GET \"/\" { return forward(b, load_balance: .roundRobin, "
         "response_read_timeout: 1s) }\n";
-    for (const u8 forged_seconds : {static_cast<u8>(0), static_cast<u8>(64)}) {
+    for (const u8 forged_seconds : {u8{0}, u8{64}}) {
         lexed = lex(lit(valid));
         REQUIRE(lexed);
         ast = parse_file_heap(lexed.value());
@@ -41138,17 +41138,14 @@ route GET "/" {
     REQUIRE(hir);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
-    for (const u8 forged_method : {kRouteMethodHead,
-                                   kRouteMethodConnect,
-                                   kRouteMethodTrace,
-                                   kRouteMethodInvalid,
-                                   static_cast<u8>(10)}) {
+    for (const u8 forged_method :
+         {kRouteMethodHead, kRouteMethodConnect, kRouteMethodTrace, kRouteMethodInvalid, u8{10}}) {
         mir->functions[0].method = forged_method;
         FrontendRirModule forged{};
         CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
     }
     mir->functions[0].method = kRouteMethodGet;
-    for (const u16 forged_policy : {static_cast<u16>(2), static_cast<u16>(0xffffu)}) {
+    for (const u16 forged_policy : {u16{2}, u16{0xffffu}}) {
         mir->functions[0].blocks[0].term.forward_request_policy_id = forged_policy;
         FrontendRirModule forged{};
         CHECK_FALSE(lower_to_rir(mir.value(), forged).has_value());
@@ -41184,11 +41181,8 @@ route GET "/" {
         rir.module.functions[0].http_method = admitted;
         CHECK(rir::verify_module(rir.module).ok);
     }
-    for (const u8 rejected_method : {kRouteMethodHead,
-                                     kRouteMethodConnect,
-                                     kRouteMethodTrace,
-                                     kRouteMethodInvalid,
-                                     static_cast<u8>(10)}) {
+    for (const u8 rejected_method :
+         {kRouteMethodHead, kRouteMethodConnect, kRouteMethodTrace, kRouteMethodInvalid, u8{10}}) {
         rir.module.functions[0].http_method = rejected_method;
         CHECK_FALSE(rir::verify_module(rir.module).ok);
     }
@@ -43833,7 +43827,7 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     // {Synthesized, DateServerLength, LengthTypeDateServer} vocabulary: the
     // LegacyError branch must reject it explicitly rather than fall through
     // to the final `return profile;` and silently admit it as Synthesized.
-    for (const u8 raw_order : {static_cast<u8>(3), static_cast<u8>(4), static_cast<u8>(255)}) {
+    for (const u8 raw_order : {u8{3}, u8{4}, u8{255}}) {
         StrictLocalResponsePolicySpec forged_order = legacy;
         forged_order.header_order = static_cast<StrictLocalResponseHeaderOrder>(raw_order);
         CHECK_EQ(strict_local_response_policy_profile(forged_order),

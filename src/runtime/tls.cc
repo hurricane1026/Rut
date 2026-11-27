@@ -61,7 +61,7 @@ bool load_client_crl(SSL_CTX* ctx, const char* path, bool verify_issuer) {
     while (length < sizeof(pem)) {
         const ssize_t kRead =
             read(kFd,
-                 pem + static_cast<i64>(length),
+                 pem + i64{length},
                  static_cast<size_t>(static_cast<i64>(sizeof(pem)) - static_cast<i64>(length)));
         if (kRead < 0 && errno == EINTR) continue;
         if (kRead < 0) ok = false;
@@ -184,7 +184,7 @@ BIO* new_nosigpipe_socket_bio(BIO_METHOD* method, i32 fd) {
     // The descriptor lives in BIO's opaque data pointer; it is never dereferenced.
     BIO_set_data(bio,
                  reinterpret_cast<void*>(  // NOLINT(performance-no-int-to-ptr)
-                     static_cast<intptr_t>(fd)));
+                     intptr_t{fd}));
     BIO_set_init(bio, 1);
     return bio;
 }
@@ -206,8 +206,7 @@ bool client_offers(const u8* in, u32 len, const char* name, u8 nlen) {
         const u8 kEntryLen = in[i];
         if (static_cast<i64>(i) + 1 + static_cast<i64>(kEntryLen) > static_cast<i64>(len))
             break;  // truncated entry
-        if (kEntryLen == nlen && __builtin_memcmp(in + static_cast<i64>(i) + 1, name, nlen) == 0)
-            return true;
+        if (kEntryLen == nlen && __builtin_memcmp(in + i64{i} + 1, name, nlen) == 0) return true;
         i = static_cast<u32>(static_cast<i64>(i) + 1 + static_cast<i64>(kEntryLen));
     }
     return false;

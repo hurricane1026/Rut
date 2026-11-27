@@ -263,8 +263,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
                   static_cast<long long>(now),
                   static_cast<long long>(now + 600))
             : 0;
-    if (access && (claims_size <= 0 || claims_size >= static_cast<int>(sizeof(access_claims))))
-        return 2;
+    if (access && (claims_size <= 0 || claims_size >= int{sizeof(access_claims)})) return 2;
     const Str claims =
         access ? Str{access_claims, static_cast<u32>(strlen(access_claims))}
         : discovery
@@ -317,7 +316,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"other-client","jti":"access-bad-client","scope":"orders:read"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_client =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_client_bytes);
         length = snprintf(
@@ -326,7 +325,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-scope","scope":"orders:write"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_scope =
             first.sign(header, {altered, static_cast<u32>(length)}, bad_scope_bytes);
         length = snprintf(
@@ -335,7 +334,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"access-bad-iat","scope":"orders:read"})",
             static_cast<long long>(now + 301),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_iat = first.sign(header, {altered, static_cast<u32>(length)}, bad_iat_bytes);
         length = snprintf(
             altered,
@@ -343,7 +342,7 @@ static int print_remote_fixture(bool discovery = false, bool access = false) {
             R"({"sub":"alice","iss":"https://localhost","aud":"gateway","iat":%lld,"exp":%lld,"client_id":"orders-web","jti":"","scope":"orders:read"})",
             static_cast<long long>(now),
             static_cast<long long>(now + 600));
-        if (length <= 0 || length >= static_cast<int>(sizeof(altered))) return 2;
+        if (length <= 0 || length >= int{sizeof(altered)}) return 2;
         const Str bad_jti = first.sign(header, {altered, static_cast<u32>(length)}, bad_jti_bytes);
         const Str bad_kid = first.sign(Fixture::unapproved_access_header, claims, bad_kid_bytes);
         const Str bad_type = first.sign(Fixture::wrong_type_access_header, claims, bad_type_bytes);
@@ -1486,7 +1485,7 @@ struct DnsOrigin {
             answer[sizeof(answer) - 1] = second;
             __builtin_memcpy(packet + length + sizeof(answer), answer, sizeof(answer));
         }
-        const auto kResponseSize = length + packet[7] * static_cast<ssize_t>(sizeof(answer));
+        const auto kResponseSize = length + packet[7] * ssize_t{sizeof(answer)};
         return sendto(fd,
                       packet,
                       static_cast<u32>(kResponseSize),

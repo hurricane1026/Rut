@@ -14,11 +14,10 @@ inline constexpr u32 kPasswordRecordBytes = 123;
 inline bool password_record_valid(Str record) {
     constexpr auto kPrefix = lit_str("$rut-pbkdf2-sha256$600000$");
     if (!record.ptr || record.len != kPasswordRecordBytes ||
-        !Str{record.ptr, kPrefix.len}.eq(kPrefix) ||
-        record.ptr[static_cast<i64>(kPrefix.len) + 32] != '$')
+        !Str{record.ptr, kPrefix.len}.eq(kPrefix) || record.ptr[i64{kPrefix.len} + 32] != '$')
         return false;
     for (u32 i = kPrefix.len; i < record.len; ++i) {
-        if (i == static_cast<u32>(static_cast<i64>(kPrefix.len) + 32)) continue;
+        if (i == u32{i64{kPrefix.len} + 32}) continue;
         const char c = record.ptr[i];
         if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
     }

@@ -186,7 +186,7 @@ TEST(iouring_splice, shared_budget_yields_and_finishes_exact_body) {
     for (u32 i = 0; i < 2; ++i)
         REQUIRE(send_all(
             upstream[i][1], (i == 0 ? expected0 : expected1) + kFirstTurn, kBody - kFirstTurn));
-    constexpr u64 kTotalBody = static_cast<u64>(kBody) * 2;
+    constexpr u64 kTotalBody = u64{kBody} * 2;
     REQUIRE(pump_until(
         loop,
         [&] {
@@ -315,8 +315,7 @@ TEST(iouring_splice, active_relay_preserves_response_on_late_recv_overflow) {
 
     const u8 late_bytes[] = {'l', 'a', 't', 'e'};
     REQUIRE_EQ(c->recv_buf.write(late_bytes, sizeof(late_bytes)), sizeof(late_bytes));
-    const IoEvent late_recv{
-        c->id, static_cast<i32>(sizeof(late_bytes)), 0, 0, IoEventType::Recv, 0};
+    const IoEvent late_recv{c->id, i32{sizeof(late_bytes)}, 0, 0, IoEventType::Recv, 0};
     loop.dispatch_event(*c, late_recv);
     CHECK(c->req_body_lossy_successor);
     CHECK_FALSE(c->keep_alive);
@@ -420,7 +419,7 @@ TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
     for (u32 i = 0; i < kOwnerCount; ++i)
         REQUIRE(send_all(upstream[i][1], expected[i] + kFirstTurn, kBody - kFirstTurn));
 
-    constexpr u64 kTotalBody = static_cast<u64>(kOwnerCount) * kBody;
+    constexpr u64 kTotalBody = u64{kOwnerCount} * kBody;
     REQUIRE(pump_until(
         loop,
         [&] {

@@ -154,7 +154,7 @@ struct Writer {
         data[len++] = c;
     }
     void text(Str s) {
-        if (static_cast<i64>(s.len) > static_cast<i64>(cap) - static_cast<i64>(len)) {
+        if (i64{s.len} > i64{cap} - i64{len}) {
             ok = false;
             return;
         }
@@ -273,8 +273,7 @@ inline bool decode(Str s, u32& p, Writer& out) {
                 case 'u': {
                     if (!hex4(s, p, cp)) return false;
                     if (cp >= 0xd800 && cp <= 0xdbff) {
-                        if (static_cast<i64>(s.len) - static_cast<i64>(p) < 2 || s.ptr[p] != '\\' ||
-                            s.ptr[static_cast<i64>(p) + 1] != 'u')
+                        if (i64{s.len} - i64{p} < 2 || s.ptr[p] != '\\' || s.ptr[i64{p} + 1] != 'u')
                             return false;
                         p = static_cast<u32>(static_cast<i64>(p) + 2);
                         u32 lo;
@@ -422,7 +421,7 @@ struct Document {
             const Str token = c == 'n'   ? lit_str("null")
                               : c == 't' ? lit_str("true")
                                          : lit_str("false");
-            if (static_cast<i64>(source.len) - static_cast<i64>(p) < token.len ||
+            if (i64{source.len} - i64{p} < token.len ||
                 !source
                      .slice(p, static_cast<u32>(static_cast<i64>(p) + static_cast<i64>(token.len)))
                      .eq(token))

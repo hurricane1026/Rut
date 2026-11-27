@@ -110,7 +110,8 @@ static inline void rut_downstream_gate_wake(uint32_t* state) {
 static inline int64_t rut_downstream_gate_now_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    const int64_t seconds = now.tv_sec;
+    return seconds * 1000 + now.tv_nsec / 1000000;
 }
 
 static inline int rut_downstream_gate_wait_until(struct rut_downstream_publication_gate* gate,

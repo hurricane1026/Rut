@@ -66,7 +66,7 @@ CompletionStatus DeterministicEnvironment::next(jit::YieldKind yielded,
 CompletionStatus DeterministicEnvironment::complete_timer(u32 delay_ms,
                                                           u64 max_virtual_time_us,
                                                           DeterministicCompletion& completion) {
-    const u64 delta_us = static_cast<u64>(delay_ms) * 1000u;
+    const u64 delta_us = u64{delay_ms} * 1000u;
     if (delta_us > max_virtual_time_us - now_us) return CompletionStatus::TimeLimit;
 
     now_us += delta_us;

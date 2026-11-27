@@ -1021,8 +1021,7 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
+                conns[i].capture_buf = capture_region_ + i64{i} * i64{kCaptureSliceSize};
         }
         return true;
     }
@@ -1377,8 +1376,7 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
+            conns[id].capture_buf = capture_region_ + i64{id} * i64{kCaptureSliceSize};
         return &conns[id];
     }
 
@@ -1642,7 +1640,7 @@ public:
                 // ev.result carries timerfd tick count — may be >1 if loop stalled.
                 // Advance timer wheel once per accumulated tick to avoid skipping expirations.
                 i32 ticks = ev.result > 0 ? ev.result : 1;
-                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                const i32 max_ticks = i32{TimerWheel::kSlots};
                 if (ticks > max_ticks) ticks = max_ticks;  // clamp to wheel size
                 for (i32 t = 0; t < ticks; t++) {
                     timer.advance([this](Connection* c) {

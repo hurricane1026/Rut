@@ -3128,7 +3128,7 @@ TEST(ws_terminate, affix_rewrite_rejects_invalid_binary_text_size_utf8_and_trunc
         if (invalid == 5) {
             st.forward_text = {{oversized, sizeof(oversized)}, {}, {}, WsTextSource::MessageText};
         }
-        const u8 input[] = {invalid == 0 ? static_cast<u8>(0xff) : static_cast<u8>('x')};
+        const u8 input[] = {invalid == 0 ? u8{0xff} : u8{'x'}};
         u8 in[32], out[128], msg[32];
         const u32 n = build(in, op, true, false, input, 1);
         u32 used = 0, produced = 0;

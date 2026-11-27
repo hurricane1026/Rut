@@ -13,7 +13,7 @@ inline bool consistent_hash_seed(Str text, u8 (&seed)[16]) {
     for (u32 i = 0; i < 16; ++i) {
         u8 value = 0;
         for (u32 j = 0; j < 2; ++j) {
-            const char c = text.ptr[static_cast<i64>(i) * 2 + static_cast<i64>(j)];
+            const char c = text.ptr[i64{i} * 2 + i64{j}];
             if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             value = static_cast<u8>((value << 4) | (c <= '9' ? static_cast<i64>(c - '0')
                                                              : static_cast<i64>(c - 'a') + 10));
@@ -56,12 +56,12 @@ inline u64 consistent_hash_cost(u64 hash) {
     using LeadingZeros = range_int<0, 65>;
     const auto leading_zeros = LeadingZeros::count_leading_zeros(hash);
     using Wide = unsigned __int128;
-    Wide x = static_cast<Wide>(hash) << leading_zeros.to_u64();
+    Wide x = Wide{hash} << leading_zeros.to_u64();
     u32 fraction = 0;
     // Visit each fractional bit exactly once, from most to least significant.
     for (u32 bit = u32{1} << (kFractionBits - 1); bit != 0; bit >>= 1) {
         Wide y = (x * x) >> 63;
-        if (y >= (static_cast<Wide>(1) << 64)) {
+        if (y >= (Wide{1} << 64)) {
             y >>= 1;
             fraction |= bit;
         }

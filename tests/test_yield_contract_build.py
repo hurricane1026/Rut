@@ -82,11 +82,11 @@ def main():
             probe.unlink()
         for before, after in [
             ("completed <= received &&", ""),
-            ("static_cast<i64>(buffered) + static_cast<i64>(completed)",
-             "static_cast<i64>(buffered + completed)"),
-            ("static_cast<i64>(header) + static_cast<i64>(received)",
-             "static_cast<i64>(header + received)"),
-            ("+\n                                                static_cast<i64>(newly_copied)", ""),
+            ("i64{buffered} + i64{completed}",
+             "i64{buffered + completed}"),
+            ("i64{header} + i64{received}",
+             "i64{header + received}"),
+            ("+ i64{newly_copied}", ""),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/response_body_chain.h", before, after)
             check(compiler, root, overlay, "Buffered response violates retained byte accounting", source=source)
@@ -179,8 +179,8 @@ def main():
             ("event.copy_begin == expected_begin &&", ""),
             ("event.result > 0 &&", "event.result >= 0 &&"),
             ("event.copy_witness == IoEventCopyWitness::Full &&", ""),
-            ("static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) ==",
-             "static_cast<i64>(event.copy_end) - static_cast<i64>(event.copy_begin) >="),
+            ("i64{event.copy_end} - i64{event.copy_begin} ==",
+             "i64{event.copy_end} - i64{event.copy_begin} >="),
         ]:
             probe = mutate(root / "include", overlay, "rut/runtime/io_event.h", before, after)
             check(compiler, root, overlay, "Response copy violates positive span contract", source=source)

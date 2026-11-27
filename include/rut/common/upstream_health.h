@@ -46,8 +46,7 @@ struct PassiveHealthPolicy {
 
     static constexpr bool contains(const u64* statuses, u16 status) {
         return status >= 200 && status <= 599 &&
-               (statuses[(static_cast<i64>(status) - 200) / 64] &
-                (u64{1} << ((static_cast<i64>(status) - 200) % 64))) != 0;
+               (statuses[(i64{status} - 200) / 64] & (u64{1} << ((i64{status} - 200) % 64))) != 0;
     }
     constexpr bool valid() const {
         if (!enabled) return true;
@@ -69,8 +68,7 @@ struct ActiveHealthStatuses {
 
     constexpr bool contains(u16 status) const {
         return status >= 200 && status <= 599 &&
-               (words[(static_cast<i64>(status) - 200) / 64] &
-                (u64{1} << ((static_cast<i64>(status) - 200) % 64))) != 0;
+               (words[(i64{status} - 200) / 64] & (u64{1} << ((i64{status} - 200) % 64))) != 0;
     }
     constexpr bool empty() const {
         for (u32 i = 0; i < kWords; ++i)

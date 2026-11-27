@@ -54,7 +54,7 @@ static bool dispatch_complete_test_request(SmallLoop& loop, Connection& c) {
     if (c.recv_buf.write(reinterpret_cast<const rut::u8*>(kRequest), sizeof(kRequest) - 1u) !=
         sizeof(kRequest) - 1u)
         return false;
-    loop.dispatch(make_ev(c.id, IoEventType::Recv, static_cast<rut::i32>(sizeof(kRequest) - 1u)));
+    loop.dispatch(make_ev(c.id, IoEventType::Recv, rut::i32{sizeof(kRequest) - 1u}));
     return true;
 }
 

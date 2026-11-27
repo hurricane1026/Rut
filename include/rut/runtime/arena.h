@@ -35,8 +35,8 @@ struct MmapBackend {
         // Page-align
         if (size > static_cast<u64>(-1) - 4095) return nullptr;
         u64 aligned = 0;
-        if (add_overflow(size, static_cast<u64>(4095), &aligned)) return nullptr;
-        size = aligned & ~static_cast<u64>(4095);
+        if (add_overflow(size, u64{4095}, &aligned)) return nullptr;
+        size = aligned & ~u64{4095};
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
         *out_size = size;

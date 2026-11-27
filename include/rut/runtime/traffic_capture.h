@@ -78,7 +78,7 @@ bool capture_file_header_valid(const CaptureFileHeader* hdr);
 
 struct CaptureRing {
     static constexpr u32 kCapacity = 256;
-    static constexpr u32 kMask = static_cast<u32>(static_cast<i64>(kCapacity) - 1);
+    static constexpr u32 kMask = u32{i64{kCapacity} - 1};
 
     alignas(64) std::atomic<u32> write_pos;
     alignas(64) std::atomic<u32> read_pos;

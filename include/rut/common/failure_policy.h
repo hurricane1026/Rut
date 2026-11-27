@@ -45,7 +45,7 @@ inline u32 bounded_response_release_target(u32 raw_header_bytes,
                                            bool terminal) {
     if (body_received > declared_body) return 0;
     if (terminal) return body_received;
-    if (static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received) > UINT32_MAX) return 0;
+    if (i64{raw_header_bytes} + i64{body_received} > UINT32_MAX) return 0;
     const u32 raw_total =
         static_cast<u32>(static_cast<i64>(raw_header_bytes) + static_cast<i64>(body_received));
     const u32 released_raw = static_cast<u32>(static_cast<i64>(raw_total) %

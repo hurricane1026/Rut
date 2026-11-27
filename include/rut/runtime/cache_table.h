@@ -71,7 +71,7 @@ struct CacheTable {
         const u32 count = round_capacity(requested_capacity);
         if (count == 0) return false;
         void* mem = ::mmap(nullptr,
-                           static_cast<u64>(count) * sizeof(Slot),
+                           u64{count} * sizeof(Slot),
                            PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS,
                            -1,
@@ -85,7 +85,7 @@ struct CacheTable {
     }
 
     void destroy() {
-        if (slots != nullptr) ::munmap(slots, static_cast<u64>(slot_count) * sizeof(Slot));
+        if (slots != nullptr) ::munmap(slots, u64{slot_count} * sizeof(Slot));
         slots = nullptr;
         slot_count = 0;
         set_count = 0;
@@ -94,7 +94,7 @@ struct CacheTable {
     // Seeded multiply-mix (splitmix64 finalizer shape). Forced non-zero so
     // 0 stays the empty-slot sentinel.
     static u64 mix(u32 key, u64 mix_seed) {
-        u64 h = (static_cast<u64>(key) ^ mix_seed) * 0x9E3779B97F4A7C15ull;
+        u64 h = (u64{key} ^ mix_seed) * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
         h *= 0xBF58476D1CE4E5B9ull;
         h ^= h >> 32;
@@ -108,7 +108,7 @@ struct CacheTable {
     bool get(u32 key, i64* out) const {
         if (slots == nullptr) return false;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
+        Slot* set = slots + i64{set_index(hash)} * kWays;
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {
                 *out = set[w].value;
@@ -121,7 +121,7 @@ struct CacheTable {
     void set(u32 key, i64 value) {
         if (slots == nullptr) return;
         const KeyHash hash = hash_key(key);
-        Slot* set = slots + static_cast<i64>(set_index(hash)) * kWays;
+        Slot* set = slots + i64{set_index(hash)} * kWays;
         u32 victim = 0;
         for (u32 w = 0; w < kWays; w++) {
             if (set[w].key_hash == hash) {  // match → update in place
@@ -229,7 +229,7 @@ inline void cache_registry_publish_locked(CacheRegistry& reg,
 #ifdef __APPLE__
             arc4random_buf(&s, sizeof(s));
 #else
-            if (::getrandom(&s, sizeof(s), 0) != static_cast<long>(sizeof(s))) s = 0;
+            if (::getrandom(&s, sizeof(s), 0) != long{sizeof(s)}) s = 0;
 #endif
         }
         if (s == 0) {

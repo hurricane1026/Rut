@@ -585,11 +585,10 @@ TEST(nginx_complete_parser, accepts_empty_events_and_preserves_suffix_local_http
         "  events {}  http { log_format compat \"$request_length\"; access_log /tmp/a compat; "
         "server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
     const u32 http_start = 13u;
-    const auto parsed =
-        nginx::parse_nginx_http_config({source, static_cast<u32>(sizeof(source) - 1u)});
+    const auto parsed = nginx::parse_nginx_http_config({source, u32{sizeof(source) - 1u}});
     REQUIRE(parsed);
-    const auto direct = nginx::parse_http_profile(
-        {source + http_start, static_cast<u32>(sizeof(source) - 1u) - http_start});
+    const auto direct =
+        nginx::parse_http_profile({source + http_start, u32{sizeof(source) - 1u} - http_start});
     REQUIRE(direct);
     const auto& config = parsed.value();
     const auto& embedded = config.http;
@@ -641,11 +640,10 @@ TEST(nginx_complete_parser, accepts_multiline_comments_and_trailing_trivia) {
         "  }\n"
         "  # trailing { }\n";
     const u32 http_start = 55u;
-    const auto parsed =
-        nginx::parse_nginx_http_config({source, static_cast<u32>(sizeof(source) - 1u)});
+    const auto parsed = nginx::parse_nginx_http_config({source, u32{sizeof(source) - 1u}});
     REQUIRE(parsed);
-    const auto direct = nginx::parse_http_profile(
-        {source + http_start, static_cast<u32>(sizeof(source) - 1u) - http_start});
+    const auto direct =
+        nginx::parse_http_profile({source + http_start, u32{sizeof(source) - 1u} - http_start});
     REQUIRE(direct);
     const auto& config = parsed.value();
     CHECK_EQ(config.source.ptr, source);
@@ -706,21 +704,21 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
 
     const char missing_events_brace[] = "events ";
     const auto missing_events = nginx::parse_nginx_http_config(
-        {missing_events_brace, static_cast<u32>(sizeof(missing_events_brace) - 1u)});
+        {missing_events_brace, u32{sizeof(missing_events_brace) - 1u}});
     REQUIRE_FALSE(missing_events);
     CHECK(missing_events.error().code == FrontendError::UnexpectedEof);
     CHECK(missing_events.error().detail.eq(lit_str("expected '{' after events")));
 
     const char missing_http[] = "events {}";
     const auto missing_http_result =
-        nginx::parse_nginx_http_config({missing_http, static_cast<u32>(sizeof(missing_http) - 1u)});
+        nginx::parse_nginx_http_config({missing_http, u32{sizeof(missing_http) - 1u}});
     REQUIRE_FALSE(missing_http_result);
     CHECK(missing_http_result.error().code == FrontendError::UnexpectedEof);
     CHECK(missing_http_result.error().detail.eq(lit_str("missing http profile after events")));
 
     const char nonempty_events[] = "events { worker_connections 64; } http {}";
-    const auto rejected_events = nginx::parse_nginx_http_config(
-        {nonempty_events, static_cast<u32>(sizeof(nonempty_events) - 1u)});
+    const auto rejected_events =
+        nginx::parse_nginx_http_config({nonempty_events, u32{sizeof(nonempty_events) - 1u}});
     REQUIRE_FALSE(rejected_events);
     CHECK(rejected_events.error().code == FrontendError::UnsupportedSyntax);
     CHECK(rejected_events.error().detail.eq(lit_str("events directives are unsupported")));
@@ -728,22 +726,22 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
 
     const char main_before[] = "daemon off; events {} http {}";
     const auto rejected_main_before =
-        nginx::parse_nginx_http_config({main_before, static_cast<u32>(sizeof(main_before) - 1u)});
+        nginx::parse_nginx_http_config({main_before, u32{sizeof(main_before) - 1u}});
     REQUIRE_FALSE(rejected_main_before);
     CHECK(rejected_main_before.error().code == FrontendError::UnsupportedSyntax);
     CHECK(rejected_main_before.error().detail.eq(lit_str("expected leading events block")));
 
     const char main_between[] = "events {} daemon off; http {}";
     const auto rejected_main_between =
-        nginx::parse_nginx_http_config({main_between, static_cast<u32>(sizeof(main_between) - 1u)});
+        nginx::parse_nginx_http_config({main_between, u32{sizeof(main_between) - 1u}});
     REQUIRE_FALSE(rejected_main_between);
     CHECK(rejected_main_between.error().code == FrontendError::UnsupportedSyntax);
     CHECK(
         rejected_main_between.error().detail.eq(lit_str("expected one http profile after events")));
 
     const char duplicate_events[] = "events {} events {} http {}";
-    const auto rejected_duplicate_events = nginx::parse_nginx_http_config(
-        {duplicate_events, static_cast<u32>(sizeof(duplicate_events) - 1u)});
+    const auto rejected_duplicate_events =
+        nginx::parse_nginx_http_config({duplicate_events, u32{sizeof(duplicate_events) - 1u}});
     REQUIRE_FALSE(rejected_duplicate_events);
     CHECK(rejected_duplicate_events.error().code == FrontendError::UnsupportedSyntax);
     CHECK(rejected_duplicate_events.error().detail.eq(
@@ -785,8 +783,7 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
         "  events {}  http { log_format compat \"$request_length\"; access_log /tmp/a compat; "
         "bogus; server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } "
         "}\n";
-    const auto error =
-        nginx::parse_nginx_http_config({same_line, static_cast<u32>(sizeof(same_line) - 1u)});
+    const auto error = nginx::parse_nginx_http_config({same_line, u32{sizeof(same_line) - 1u}});
     REQUIRE_FALSE(error);
     CHECK(error.error().code == FrontendError::UnsupportedSyntax);
     CHECK_EQ(error.error().span.start, 83u);
@@ -800,7 +797,7 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
         "  access_log /tmp/a compat;\n"
         "  server { listen 127.0.0.1:8080; location / { proxy_pass http://127.0.0.1:9000; } } }\n";
     const auto later_error =
-        nginx::parse_nginx_http_config({multiline, static_cast<u32>(sizeof(multiline) - 1u)});
+        nginx::parse_nginx_http_config({multiline, u32{sizeof(multiline) - 1u}});
     REQUIRE_FALSE(later_error);
     CHECK(later_error.error().code == FrontendError::UnsupportedSyntax);
     CHECK_EQ(later_error.error().span.start, 30u);
@@ -810,13 +807,13 @@ TEST(nginx_complete_parser, rebases_http_errors_and_rejects_envelope_shapes) {
 
     const char reordered[] = "http {} events {}";
     const auto rejected_order =
-        nginx::parse_nginx_http_config({reordered, static_cast<u32>(sizeof(reordered) - 1u)});
+        nginx::parse_nginx_http_config({reordered, u32{sizeof(reordered) - 1u}});
     REQUIRE_FALSE(rejected_order);
     CHECK(rejected_order.error().code == FrontendError::UnsupportedSyntax);
     CHECK_EQ(rejected_order.error().span.start, 0u);
 
     const char old_wrapper[] = "http {}";
-    const auto old_parse = nginx::parse({old_wrapper, static_cast<u32>(sizeof(old_wrapper) - 1u)});
+    const auto old_parse = nginx::parse({old_wrapper, u32{sizeof(old_wrapper) - 1u}});
     REQUIRE_FALSE(old_parse);
     CHECK(old_parse.error().code == FrontendError::UnsupportedSyntax);
     CHECK(old_parse.error().detail.eq(lit_str("http/events wrappers are unsupported")));
@@ -949,7 +946,7 @@ TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
     forged.http_span = {};
     reject_outer(forged);
     forged = parsed.value();
-    forged.http.server.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.http.server.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     auto rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
@@ -969,7 +966,7 @@ TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = parsed.value();
-    forged.http.log_format.name.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.http.log_format.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = parsed.value();
@@ -994,7 +991,7 @@ TEST(nginx_complete_converter, authenticates_complete_source_before_lowering) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = parsed.value();
-    forged.http.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.http.source.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = parsed.value();
@@ -1287,13 +1284,13 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
 
     auto forged = profile.value();
     forged.access_log.destination_profile = nginx::AccessLogDestinationProfile::None;
-    forged.access_log.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.access_log.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     auto rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
 
     forged = profile.value();
-    forged.access_log.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.access_log.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
@@ -1309,7 +1306,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
-    forged.access_log.format_name.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.access_log.format_name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
@@ -1322,7 +1319,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     REQUIRE_FALSE(rejected);
 
     forged = profile.value();
-    forged.log_format.name.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.log_format.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
@@ -1334,7 +1331,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
-    forged.log_format.value.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.log_format.value.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
@@ -1383,7 +1380,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     forged = profile.value();
-    forged.server.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.server.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
 
@@ -1428,7 +1425,7 @@ TEST(nginx_converter, authenticates_access_log_off_and_complete_envelope) {
     forged_config.http_span.start++;
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
     forged_config = config.value();
-    forged_config.http.source.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged_config.http.source.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     REQUIRE_FALSE(nginx::lower_to_rut(forged_config));
     forged_config = config.value();
     forged_config.http.source.len++;
@@ -1642,7 +1639,7 @@ TEST(nginx_http_profile_parser, enforces_bounded_clean_absolute_access_path_prof
         "/a/log\\name",
         "\"/a/log\"",
         "/a/log:name",
-        std::string("/a/log") + static_cast<char>(1) + "x",
+        std::string("/a/log") + char{1} + "x",
     };
     for (const auto& path : rejected_paths) {
         source = make_request_length_http_profile(path, server_content);
@@ -3278,7 +3275,7 @@ TEST(nginx_parser, keeps_old_reserved_for_exact_absolute_redirect) {
                                  "server { listen 8080; location / { proxy_pass "
                                  "http://127.0.0.1:9000; } location = /old { return %u "
                                  "http://redirect.example/new; } }",
-                                 static_cast<unsigned>(status));
+                                 unsigned{status});
         REQUIRE_GT(len, 0);
         const auto parsed = nginx::parse({source, static_cast<u32>(len)});
         REQUIRE(parsed);
@@ -3364,7 +3361,7 @@ TEST(nginx_parser, parses_bounded_301_and_302_absolute_redirect_in_either_order)
                                       "server {\n  listen 8080;\n  location / { proxy_pass "
                                       "http://127.0.0.1:9000; }\n  location = /old { return %u "
                                       "http://redirect.example/new; }\n}\n",
-                                      static_cast<unsigned>(status));
+                                      unsigned{status});
         REQUIRE_GT(root_len, 0);
         REQUIRE_LT(static_cast<u32>(root_len), static_cast<u32>(sizeof(root_first)));
         check(root_first, static_cast<u32>(root_len), 3u, 4u, status);
@@ -3375,7 +3372,7 @@ TEST(nginx_parser, parses_bounded_301_and_302_absolute_redirect_in_either_order)
                                        "server {\n  listen 8080;\n  location = /old { return %u "
                                        "http://redirect.example/new; }\n  location / { proxy_pass "
                                        "http://127.0.0.1:9000; }\n}\n",
-                                       static_cast<unsigned>(status));
+                                       unsigned{status});
         REQUIRE_GT(exact_len, 0);
         REQUIRE_LT(static_cast<u32>(exact_len), static_cast<u32>(sizeof(exact_first)));
         check(exact_first, static_cast<u32>(exact_len), 4u, 3u, status);
@@ -4973,7 +4970,7 @@ TEST(nginx_parser, rejects_excluded_static_query_bytes_and_invalid_query_paths) 
     };
     const char control[] = {'/', '?', '\x01'};
     const char nul[] = {'/', '?', '\0'};
-    const char del[] = {'/', '?', static_cast<char>(0x7f)};
+    const char del[] = {'/', '?', char{0x7f}};
     const char non_ascii[] = {'/', '?', static_cast<char>(0x80)};
     const Rejection rejected[] = {
         {"/?a?b", 5},
@@ -6536,7 +6533,7 @@ TEST(nginx_converter, lowers_one_internal_exact_local_body_space_to_stable_rut) 
     REQUIRE(safe_literal != nullptr);
     const u32 literal_offset = static_cast<u32>(literal - root_lowered.value().data);
     REQUIRE_EQ(literal_offset, static_cast<u32>(safe_literal - safe_lowered.value().data));
-    const u32 body_prefix_end = literal_offset + static_cast<u32>(sizeof("body: b\"") - 1u);
+    const u32 body_prefix_end = literal_offset + u32{sizeof("body: b\"") - 1u};
     CHECK((Str{root_lowered.value().data, body_prefix_end}.eq(
         {safe_lowered.value().data, body_prefix_end})));
     const u32 body_end = literal_offset + sizeof(kBodyLiteral) - 1u;
@@ -6646,8 +6643,7 @@ TEST(nginx_converter, lowers_exact_local_return_in_either_declaration_order_to_s
         Str{legacy.value().data, common_prefix_len})));
     CHECK((Str{root_lowered.value().data + common_prefix_len, sizeof(kTraceGolden) - 1u}.eq(
         {kTraceGolden, sizeof(kTraceGolden) - 1u})));
-    const u32 suffix_len =
-        legacy.value().len - common_prefix_len - static_cast<u32>(sizeof(kTraceGolden) - 1u);
+    const u32 suffix_len = legacy.value().len - common_prefix_len - u32{sizeof(kTraceGolden) - 1u};
     CHECK(
         (Str{root_lowered.value().data + common_prefix_len + sizeof(kTraceGolden) - 1u, suffix_len}
              .eq({legacy.value().data + common_prefix_len + sizeof(kTraceGolden) - 1u,
@@ -8007,8 +8003,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     memcpy(no_content_golden.data + sizeof(kExpected) - 1u,
            kNoContentExactGolden,
            sizeof(kNoContentExactGolden) - 1u);
-    no_content_golden.len =
-        static_cast<u32>(sizeof(kExpected) + sizeof(kNoContentExactGolden) - 2u);
+    no_content_golden.len = u32{sizeof(kExpected) + sizeof(kNoContentExactGolden) - 2u};
     const char no_content_root_first[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /static { return 204; } }";
@@ -8102,7 +8097,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
            kHealthzNoContentExactGolden,
            sizeof(kHealthzNoContentExactGolden) - 1u);
     healthz_no_content_golden.len =
-        static_cast<u32>(sizeof(kExpected) + sizeof(kHealthzNoContentExactGolden) - 2u);
+        u32{sizeof(kExpected) + sizeof(kHealthzNoContentExactGolden) - 2u};
     const char healthz_no_content_root_first[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /healthz { return 204; } }";
@@ -8164,7 +8159,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     memcpy(healthz_golden.data + sizeof(kExpected) - 1u,
            kHealthzExactGolden,
            sizeof(kHealthzExactGolden) - 1u);
-    healthz_golden.len = static_cast<u32>(sizeof(kExpected) + sizeof(kHealthzExactGolden) - 2u);
+    healthz_golden.len = u32{sizeof(kExpected) + sizeof(kHealthzExactGolden) - 2u};
     const char healthz_root_first[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /healthz { return 200 \"successor-static\"; } }";
@@ -8289,8 +8284,7 @@ TEST(nginx_converter, lowers_canonical_model_to_stable_rut_source) {
     memcpy(normalized_golden.data + sizeof(kExpected) - 1u,
            kNormalizedExactGolden,
            sizeof(kNormalizedExactGolden) - 1u);
-    normalized_golden.len =
-        static_cast<u32>(sizeof(kExpected) + sizeof(kNormalizedExactGolden) - 2u);
+    normalized_golden.len = u32{sizeof(kExpected) + sizeof(kNormalizedExactGolden) - 2u};
     const char normalized_root_first[] =
         "server { listen 8080; location / { proxy_pass http://127.0.0.1:9000; } "
         "location = /health/check/ { return 200 \"successor-static\"; } }";
@@ -11731,12 +11725,12 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
     };
 
     auto forged = accepted;
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     expect_rejected(
         forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
 
     forged = accepted;
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     forged.location.proxy_read_timeout.present = true;
     forged.location.proxy_read_timeout.milliseconds = 1000;
     forged.location.proxy_read_timeout.span = accepted.location.proxy_pass.span;
@@ -11758,7 +11752,7 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
     expect_rejected(forged, lit_str("invalid bounded proxy_pass URI model"));
 
     forged = accepted;
-    forged.location.proxy_pass.uri = {reinterpret_cast<const char*>(static_cast<uintptr_t>(1)), 4};
+    forged.location.proxy_pass.uri = {reinterpret_cast<const char*>(uintptr_t{1}), 4};
     expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), accepted_uri_span);
 
     forged = accepted;
@@ -11823,8 +11817,7 @@ TEST(nginx_converter, rejects_forged_non_root_proxy_uri_before_reading_untrusted
 
     auto legacy_slash = api_server();
     const Span legacy_uri_span = legacy_slash.location.proxy_pass.uri_span;
-    legacy_slash.location.proxy_pass.uri.ptr =
-        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    legacy_slash.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     expect_rejected(legacy_slash, lit_str("invalid proxy_pass URI provenance"), legacy_uri_span);
 
     char* uri = source + accepted_uri_span.start;
@@ -11975,7 +11968,7 @@ TEST(nginx_converter, lowers_static_query_proxy_uri_to_exact_guarded_ordinary_ru
     expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
 
     forged = model;
-    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     forged.listen.port = 0;
     forged.location.proxy_pass.port = 0;
     expect_rejected(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
@@ -12180,7 +12173,7 @@ TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_
         forged, lit_str("invalid proxy_pass source provenance"), accepted.location.path_span);
 
     forged = with_timeout(accepted);
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     forged.listen.port = 0;
     forged.location.proxy_pass.port = 0;
     expect_rejected(
@@ -12198,7 +12191,7 @@ TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_
                     accepted.location.proxy_pass.uri_span);
 
     forged = with_timeout(accepted);
-    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     forged.listen.port = 0;
     forged.location.proxy_pass.port = 0;
     expect_rejected(forged,
@@ -12320,7 +12313,7 @@ TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_
     REQUIRE(five_byte_parsed);
     REQUIRE(nginx::lower_to_rut(five_byte_parsed.value()));
     forged = five_byte_parsed.value();
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     expect_rejected(forged,
                     lit_str("invalid proxy_pass source provenance"),
                     five_byte_parsed.value().location.path_span);
@@ -12331,12 +12324,12 @@ TEST(nginx_converter, validates_generic_proxy_location_before_dynamic_reads_and_
     REQUIRE(parsed_api);
     REQUIRE(nginx::lower_to_rut(parsed_api.value()));
     forged = parsed_api.value();
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     expect_rejected(forged,
                     lit_str("invalid proxy_pass source provenance"),
                     parsed_api.value().location.path_span);
     forged = parsed_api.value();
-    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     expect_rejected(forged,
                     lit_str("invalid proxy_pass URI provenance"),
                     parsed_api.value().location.proxy_pass.uri_span);
@@ -18053,10 +18046,10 @@ TEST(nginx_converter, issue372_exact_composition_mutations_fail_closed_after_pro
     };
 
     auto forged = accepted;
-    forged.location.path.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.path.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     reject(forged, lit_str("invalid proxy_pass source provenance"), path_span);
     forged = accepted;
-    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_pass.uri.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     reject(forged, lit_str("invalid proxy_pass URI provenance"), uri_span);
     std::vector<char> independent(source, source + sizeof(source));
     forged = accepted;
@@ -18100,7 +18093,7 @@ TEST(nginx_converter, issue372_exact_composition_mutations_fail_closed_after_pro
     source[proxy_span.start] = saved_proxy_keyword;
 
     forged = accepted;
-    forged.listen.value.ptr = reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.listen.value.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     reject(forged, lit_str("invalid listen source provenance"), listener_value_span);
     forged = accepted;
     forged.listen.value.ptr = independent.data() + forged.listen.value_span.start;
@@ -20715,8 +20708,7 @@ TEST(nginx_converter_issue373, hide_header_has_independent_full_source_golden) {
     static constexpr char kNoHideInput[] =
         "server { listen 127.0.0.1:8080; location / { proxy_pass "
         "http://127.0.0.1:9000; } }";
-    const auto no_hide_parsed =
-        nginx::parse({kNoHideInput, static_cast<u32>(sizeof(kNoHideInput) - 1u)});
+    const auto no_hide_parsed = nginx::parse({kNoHideInput, u32{sizeof(kNoHideInput) - 1u}});
     REQUIRE(no_hide_parsed);
     const auto no_hide_lowered = nginx::lower_to_rut(no_hide_parsed.value());
     REQUIRE(no_hide_lowered);
@@ -21150,8 +21142,7 @@ TEST(nginx_converter_issue600, custom_name_server_provenance_rejects_forged_view
             CHECK(result.error().detail.eq(detail));
         };
         auto forged = accepted;
-        forged.location.proxy_hide_header.name.ptr =
-            reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+        forged.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
         reject(forged, lit_str("invalid proxy_hide_header source provenance"));
         forged = accepted;
         forged.location.proxy_hide_header.name_span.start++;
@@ -21252,8 +21243,7 @@ TEST(nginx_converter_issue600, custom_name_http_profile_output_is_owned_and_auth
     CHECK_EQ(std::string(complete_lowered.value().data, complete_lowered.value().len), owned);
 
     auto forged = parsed.value();
-    forged.server.location.proxy_hide_header.name.ptr =
-        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.server.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     const auto rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));
@@ -21323,8 +21313,7 @@ TEST(nginx_converter_issue373, rejects_forged_hide_inventory_without_dynamic_rea
     forged.location.proxy_hide_header.name.ptr = nullptr;
     reject(forged, lit_str("invalid proxy_hide_header name model"));
     forged = accepted;
-    forged.location.proxy_hide_header.name.ptr =
-        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     reject(forged, lit_str("invalid proxy_hide_header source provenance"));
     forged = accepted;
     forged.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(UINTPTR_MAX - 7u);
@@ -22101,8 +22090,7 @@ TEST(nginx_converter_issue373, http_profile_comparison_rejects_forged_hide_child
     const auto parsed = nginx::parse_http_profile({source.data(), static_cast<u32>(source.size())});
     REQUIRE(parsed);
     auto forged = parsed.value();
-    forged.server.location.proxy_hide_header.name.ptr =
-        reinterpret_cast<const char*>(static_cast<uintptr_t>(1));
+    forged.server.location.proxy_hide_header.name.ptr = reinterpret_cast<const char*>(uintptr_t{1});
     auto rejected = nginx::lower_to_rut(forged);
     REQUIRE_FALSE(rejected);
     CHECK(rejected.error().detail.eq(lit_str("http profile metadata does not match its source")));

@@ -186,15 +186,13 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
                 u32 end = start;
                 while (end < connection.value.len && connection.value.ptr[end] != ',') ++end;
                 u32 last = end;
-                while (last > start && (connection.value.ptr[static_cast<i64>(last) - 1] == ' ' ||
-                                        connection.value.ptr[static_cast<i64>(last) - 1] == '\t'))
+                while (last > start && (connection.value.ptr[i64{last} - 1] == ' ' ||
+                                        connection.value.ptr[i64{last} - 1] == '\t'))
                     --last;
                 const u32 token_len =
                     (range_int(last) - range_int(start)).max(range_int<0, 1>{}).to<u32>();
-                nominated |= http_header_name_eq_ci(h.name.ptr,
-                                                    h.name.len,
-                                                    connection.value.ptr + static_cast<i64>(start),
-                                                    token_len);
+                nominated |= http_header_name_eq_ci(
+                    h.name.ptr, h.name.len, connection.value.ptr + i64{start}, token_len);
                 if (end == connection.value.len) break;
                 start = (range_int(end) + range_int<1, 2>{})
                             .min(range_int(connection.value.len))
@@ -212,10 +210,10 @@ void h2ws_h1_drive(Loop* loop, Connection& c) {
             return false;
         for (u32 j = 0; j < h.name.len; ++j) {
             const char kCh = h.name.ptr[j];
-            names[static_cast<i64>(used) + static_cast<i64>(j)] =
+            names[i64{used} + i64{j}] =
                 kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
         }
-        headers[(*count)++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
+        headers[(*count)++] = {{names + i64{used}, h.name.len}, h.value};
         used = (range_int(used) + range_int(h.name.len)).min(range_int(capacity)).to<u32>();
     }
     if (!kUpgraded) {
@@ -340,9 +338,8 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
             break;
         }
         if (produced)
-            __builtin_memcpy(x->download + static_cast<i64>(x->download_len),
-                             c.recv_buf.data() + static_cast<i64>(start),
-                             produced);
+            __builtin_memcpy(
+                x->download + i64{x->download_len}, c.recv_buf.data() + i64{start}, produced);
         x->download_len = buffered;
         if (x->ws && x->ws_accepted && !ws_h2_process(*x, false)) x->failure = 13;
         c.consume_request_receive_buffer(consumed);

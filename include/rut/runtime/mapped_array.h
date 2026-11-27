@@ -41,7 +41,7 @@ public:
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         }
 
-        const size_t bytes = static_cast<size_t>(count) * sizeof(T);
+        const size_t bytes = size_t{count} * sizeof(T);
         void* region =
             mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (region == MAP_FAILED)

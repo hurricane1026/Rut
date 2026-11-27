@@ -325,7 +325,7 @@ TEST(arena, alloc_exact_block_capacity) {
     MmapArena a;
     REQUIRE(a.init(4096).has_value());
     u64 cap = a.current->capacity();
-    u64 aligned_cap = cap & ~static_cast<u64>(7);
+    u64 aligned_cap = cap & ~u64{7};
     void* p = a.alloc(aligned_cap);
     CHECK(p != nullptr);
     CHECK_EQ(a.current->remaining(), cap - aligned_cap);

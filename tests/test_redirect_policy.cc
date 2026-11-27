@@ -225,11 +225,7 @@ TEST(redirect_policy, fixed_profile_is_closed_and_cross_products_fail) {
     invalid.static_authority = lit_str("user@redirect.example");
     CHECK_FALSE(redirect_policy_spec_valid(invalid));
     invalid = fixed;
-    for (u16 status : {static_cast<u16>(300),
-                       static_cast<u16>(303),
-                       static_cast<u16>(307),
-                       static_cast<u16>(308),
-                       static_cast<u16>(399)}) {
+    for (u16 status : {u16{300}, u16{303}, u16{307}, u16{308}, u16{399}}) {
         invalid = fixed;
         invalid.status_code = status;
         CHECK_FALSE(redirect_policy_spec_valid(invalid));

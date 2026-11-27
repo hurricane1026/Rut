@@ -20,7 +20,7 @@ consteval bool removal_preserves_timers() {
                     kDue[i],
                     i,
                     kCancel ? 0u : static_cast<u32>(static_cast<i64>(1) + static_cast<i64>(i % 2))};
-                if (!kCancel) expected_survivors |= static_cast<u32>(1u << i);
+                if (!kCancel) expected_survivors |= u32{1u << i};
             }
             u32 size = count;
             const u32 kRemoved = remove_by_conn(entries, size, 0);

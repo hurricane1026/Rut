@@ -83,8 +83,7 @@ bool read_exact(i32 fd, u64 length) {
     u64 read_count = 0u;
     while (read_count < length) {
         const u64 remaining = length - read_count;
-        const size_t wanted =
-            remaining < sizeof(bytes) ? static_cast<size_t>(remaining) : sizeof(bytes);
+        const size_t wanted = remaining < sizeof(bytes) ? size_t{remaining} : sizeof(bytes);
         const ssize_t result = read(fd, bytes, wanted);
         if (result > 0) {
             for (ssize_t i = 0; i < result; i++) {

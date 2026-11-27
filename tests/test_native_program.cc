@@ -79,7 +79,7 @@ struct Source {
     Source() {
         const char* directory = getenv("TMPDIR");
         if (directory && snprintf(path, sizeof(path), "%s/rut native source-XXXXXX", directory) >=
-                             static_cast<int>(sizeof(path)))
+                             int{sizeof(path)})
             return;
         fd = mkstemp(path);
     }
@@ -951,7 +951,7 @@ route GET "/root" { return websocket(backend) { message in
     const char json_payload[] = R"({"data":{"name":"x\u0000\u20ac"}})";
     u8 input[64], output[64], msg[64];
     input[0] = 0x82;
-    input[1] = static_cast<u8>(sizeof(json_payload) - 1);
+    input[1] = u8{sizeof(json_payload) - 1};
     memcpy(input + 2, json_payload, sizeof(json_payload) - 1);
     WsInspector st;
     st.forward_text = route.ws_forward_text;
@@ -981,7 +981,7 @@ route GET "/root" { return websocket(backend) { message in
     CHECK(root_route.ws_forward_text.source_path.ptr != nullptr);
     const char root_json[] = R"("\uD83D\uDE00")";
     input[0] = 0x81;
-    input[1] = static_cast<u8>(sizeof(root_json) - 1);
+    input[1] = u8{sizeof(root_json) - 1};
     memcpy(input + 2, root_json, sizeof(root_json) - 1);
     WsInspector root_st;
     root_st.forward_text = root_route.ws_forward_text;
@@ -1031,7 +1031,7 @@ route GET "/root-number" { return websocket(backend) { message in
     const char payload[] = R"({"n":1.2300e+999})";
     u8 input[64]{}, output[128]{}, msg[64]{};
     input[0] = 0x82;
-    input[1] = static_cast<u8>(sizeof(payload) - 1);
+    input[1] = u8{sizeof(payload) - 1};
     memcpy(input + 2, payload, sizeof(payload) - 1);
     WsInspector st;
     st.forward_text = route.ws_forward_text;
@@ -1057,7 +1057,7 @@ route GET "/root-number" { return websocket(backend) { message in
     CHECK(memcmp(output + 2, expected, sizeof(expected) - 1) == 0);
     const char branch_payload[] = R"({"n":2})";
     input[0] = 0x82;
-    input[1] = static_cast<u8>(sizeof(branch_payload) - 1);
+    input[1] = u8{sizeof(branch_payload) - 1};
     memcpy(input + 2, branch_payload, sizeof(branch_payload) - 1);
     used = 0;
     produced = 0;
@@ -1084,7 +1084,7 @@ route GET "/root-number" { return websocket(backend) { message in
     const char root_payload[] = "1.2300e+999";
     u8 root_input[64]{}, root_output[128]{}, root_message[64]{};
     root_input[0] = 0x82;
-    root_input[1] = static_cast<u8>(sizeof(root_payload) - 1);
+    root_input[1] = u8{sizeof(root_payload) - 1};
     memcpy(root_input + 2, root_payload, sizeof(root_payload) - 1);
     WsInspector root_inspector;
     root_inspector.forward_text = root_route.ws_forward_text;
@@ -4312,9 +4312,8 @@ TEST(native_program, string_core_executes_owned_and_borrowed_results_without_sou
                 memset(request.data(), 'z', request.size());
                 CHECK(connection->jit_response_body.eq(item.output));
                 const u64 expected_storage =
-                    item.route == 4
-                        ? 0
-                        : ((static_cast<u64>(item.output.len ? item.output.len : 1) + 7) & ~u64{7});
+                    item.route == 4 ? 0
+                                    : ((u64{item.output.len ? item.output.len : 1} + 7) & ~u64{7});
                 CHECK_EQ(arena.space_used(), expected_storage);
             }
         }

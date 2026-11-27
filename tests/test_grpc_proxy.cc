@@ -463,7 +463,7 @@ struct EchoServer {
             if (nghttp2_session_consume(session, id, amount) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             *flags |= NGHTTP2_DATA_FLAG_EOF;
-            return out_header + static_cast<ssize_t>(header.payload_len);
+            return out_header + ssize_t{header.payload_len};
         }
         if (s->wire_message) {
             static constexpr u8 request[] = {0x82, 0x85, 1, 2, 3, 4, 0x69, 0x67, 0x6f, 0x68, 0x6e};

@@ -51,12 +51,9 @@ static constexpr u32 kLargeProvidedBufCount = 1024;
 static constexpr u32 kLargeProvidedBufSize = 16384;
 static constexpr u16 kLargeBufGroupId = 1;
 static constexpr u32 kLargeProvidedBufIdBase = kProvidedBufCount;
-static_assert((kLargeProvidedBufCount &
-               static_cast<u32>(static_cast<i64>(kLargeProvidedBufCount) - 1)) == 0,
+static_assert((kLargeProvidedBufCount & u32{i64{kLargeProvidedBufCount} - 1}) == 0,
               "provided buffer ring entries must be a power of two");
-static_assert(static_cast<i64>(kLargeProvidedBufIdBase) +
-                      static_cast<i64>(kLargeProvidedBufCount) <=
-                  static_cast<i64>(0x10000u),
+static_assert(i64{kLargeProvidedBufIdBase} + i64{kLargeProvidedBufCount} <= i64{0x10000u},
               "provided buffer ids must fit the CQE's 16-bit buffer id");
 
 // Upstream recvs that target a bulk relay buffer (SlicePool::kBulkSliceSize)

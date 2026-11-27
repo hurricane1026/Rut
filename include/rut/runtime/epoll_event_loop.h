@@ -71,8 +71,7 @@ struct YieldHeap {
     // entries that linger briefly between close and their deadline.
     // Derived from the shared epoll_yield::kMaxConns so the heap and
     // EpollEventLoop always agree on capacity.
-    static constexpr u32 kCap =
-        static_cast<u32>(static_cast<i64>(kMaxConns) + static_cast<i64>(256));
+    static constexpr u32 kCap = u32{i64{kMaxConns} + i64{256}};
     MappedArray<Entry> entries;
     u32 capacity = 0;
     u32 size = 0;
@@ -104,9 +103,7 @@ struct YieldHeap {
     const Entry& top() const { return entries[0]; }
 
     bool push(u64 deadline_ns, u32 handler_gen, u32 conn_id) {
-        if (capacity == 0 ||
-            static_cast<i64>(size) >= static_cast<i64>(capacity) + static_cast<i64>(256))
-            return false;
+        if (capacity == 0 || i64{size} >= i64{capacity} + i64{256}) return false;
         u32 i = size++;
         entries[i] = {deadline_ns, handler_gen, conn_id};
         sift_up(i);
@@ -278,7 +275,7 @@ public:
         }
         if (!capture_region_) {
             void* region = mmap(nullptr,
-                                static_cast<size_t>(connection_capacity) * kCaptureSliceSize,
+                                size_t{connection_capacity} * kCaptureSliceSize,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS,
                                 -1,
@@ -291,8 +288,7 @@ public:
         }
         for (u32 i = 0; i < connection_capacity; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
-                conns[i].capture_buf =
-                    capture_region_ + static_cast<i64>(i) * static_cast<i64>(kCaptureSliceSize);
+                conns[i].capture_buf = capture_region_ + i64{i} * i64{kCaptureSliceSize};
         }
         return true;
     }
@@ -476,7 +472,7 @@ public:
         h2_pool.destroy();
         pool.destroy();
         if (capture_region_) {
-            munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
+            munmap(capture_region_, u64{connection_capacity} * kCaptureSliceSize);
             capture_region_ = nullptr;
         }
         destroy_slot_storage();
@@ -680,8 +676,7 @@ public:
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
         if (capture_region_)
-            conns[id].capture_buf =
-                capture_region_ + static_cast<i64>(id) * static_cast<i64>(kCaptureSliceSize);
+            conns[id].capture_buf = capture_region_ + i64{id} * i64{kCaptureSliceSize};
         return &conns[id];
     }
 
@@ -797,7 +792,7 @@ public:
             int fds[2];
             if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
             if (::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize) <
-                static_cast<i32>(kResponseSpliceChunkSize)) {
+                i32{kResponseSpliceChunkSize}) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
@@ -1224,7 +1219,7 @@ public:
                 break;
             case IoEventType::Timeout: {
                 i32 ticks = ev.result > 0 ? ev.result : 1;
-                const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
+                const i32 max_ticks = i32{TimerWheel::kSlots};
                 if (ticks > max_ticks) ticks = max_ticks;
                 const bool catchup_reaches_probe_timeout =
                     ticks > 1 && ticks >= static_cast<i32>(upstream_timeout);

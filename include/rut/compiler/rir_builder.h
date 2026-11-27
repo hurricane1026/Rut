@@ -1809,7 +1809,7 @@ struct Builder {
         if (policy_id == 0) return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetRedirect, nullptr, loc));
         r.inst->operand_count = 0;
-        r.inst->imm.i32_val = static_cast<i32>(policy_id);
+        r.inst->imm.i32_val = i32{policy_id};
         return {};
     }
 

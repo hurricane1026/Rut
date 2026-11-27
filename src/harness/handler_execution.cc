@@ -182,7 +182,7 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         CompletionStatus completion = CompletionStatus::Ready;
         if (result.yield_kind == jit::YieldKind::Timer ||
             (result.yield_kind == jit::YieldKind::Any && result.yield_payload_u32() != 0)) {
-            const u64 delay_us = static_cast<u64>(result.yield_payload_u32()) * 1000u;
+            const u64 delay_us = u64{result.yield_payload_u32()} * 1000u;
             if (delay_us > virtual_deadline_us - environment.now_us)
                 completion = CompletionStatus::TimeLimit;
             else

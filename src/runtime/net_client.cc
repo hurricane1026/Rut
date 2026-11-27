@@ -101,8 +101,7 @@ bool net_endpoint(Str configuration, bool datagram, NetEndpoint& endpoint) {
 }
 core::Expected<void, Error> NetClientWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
-    auto allocated =
-        storage.init(static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity + 64));
+    auto allocated = storage.init(size_t{i64{sizeof(Slot)} * kCapacity + 64});
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
@@ -125,7 +124,7 @@ void NetClientWorker::stop() {
     __atomic_store_n(&stopping, 1u, __ATOMIC_RELEASE);
     if (const int error = pthread_join(thread, nullptr); error != 0)
         RUT_TRAP("NetClientWorker::stop: pthread_join failed (error=%d)", error);
-    OPENSSL_cleanse(slots, static_cast<size_t>(static_cast<i64>(sizeof(Slot)) * kCapacity));
+    OPENSSL_cleanse(slots, size_t{i64{sizeof(Slot)} * kCapacity});
     storage.destroy();
     slots = nullptr;
     started = false;
@@ -144,7 +143,7 @@ void NetClientWorker::cancel(u32 owner, u64 generation) {
         auto& s = slots[i];
         const auto state = __atomic_load_n(&s.phase, __ATOMIC_ACQUIRE);
         if (state != Empty && s.owner == owner && (!generation || s.generation == generation))
-            __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
+            __atomic_store_n(&s.phase, u32{Cancelled}, __ATOMIC_RELEASE);
     }
 }
 NetReply NetClientWorker::call(u32 owner,
@@ -177,7 +176,7 @@ NetReply NetClientWorker::call(u32 owner,
         auto& s = *found;
         const auto state = __atomic_load_n(&s.phase, __ATOMIC_ACQUIRE);
         if (operation == NetOp::Close) {
-            __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
+            __atomic_store_n(&s.phase, u32{Cancelled}, __ATOMIC_RELEASE);
             reply.status = 0;
             reply.scalar = 1;
             return reply;
@@ -191,7 +190,7 @@ NetReply NetClientWorker::call(u32 owner,
             u64 remaining;
             if (sub_overflow(now, s.started, &elapsed) ||
                 sub_overflow(s.timeout, elapsed, &remaining) || remaining == 0) {
-                __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
+                __atomic_store_n(&s.phase, u32{Cancelled}, __ATOMIC_RELEASE);
                 reply.status = -2;
                 return reply;
             }
@@ -232,14 +231,14 @@ NetReply NetClientWorker::call(u32 owner,
             config == pool_config ? __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE) : 0;
     }
     auto& s = *found;
-    if (amount < 0 || amount > static_cast<i32>(kMaxBytes) || bytes.len > kMaxBytes ||
+    if (amount < 0 || amount > i32{kMaxBytes} || bytes.len > kMaxBytes ||
         (bytes.len && !bytes.ptr) ||
         ((operation == NetOp::Receive || operation == NetOp::ReadLine) && !amount) ||
         (s.datagram && (operation == NetOp::ReadLine || operation == NetOp::ReadExactly))) {
         reply.status = -4;
         // Invalid framing operations poison the session rather than leave an
         // ambiguous read cursor available to a later operation.
-        __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
+        __atomic_store_n(&s.phase, u32{Cancelled}, __ATOMIC_RELEASE);
         return reply;
     }
     s.operation = operation;
@@ -249,7 +248,7 @@ NetReply NetClientWorker::call(u32 owner,
     s.pending_length = bytes.len;
     if (bytes.len) __builtin_memcpy(s.pending, bytes.ptr, bytes.len);
     s.reply = {};
-    __atomic_store_n(&s.phase, static_cast<u32>(Queued), __ATOMIC_RELEASE);
+    __atomic_store_n(&s.phase, u32{Queued}, __ATOMIC_RELEASE);
     reply.status = NetReply::kPending;
     reply.retry_ms = timeout < 10 ? timeout : 10;
     return reply;
@@ -369,14 +368,14 @@ void NetClientWorker::run() {
             if (phase == Empty || phase == Idle || phase == Done) continue;
             if (phase == Cancelled) {
                 close(s);
-                __atomic_store_n(&s.phase, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                __atomic_store_n(&s.phase, u32{Empty}, __ATOMIC_RELEASE);
                 continue;
             }
             if (phase == Queued) {
                 u32 expected = Queued;
                 if (!__atomic_compare_exchange_n(&s.phase,
                                                  &expected,
-                                                 static_cast<u32>(Running),
+                                                 u32{Running},
                                                  false,
                                                  __ATOMIC_ACQ_REL,
                                                  __ATOMIC_ACQUIRE))
@@ -402,12 +401,8 @@ void NetClientWorker::run() {
             if (!complete) continue;
             OPENSSL_cleanse(s.pending, sizeof(s.pending));
             u32 expected = Running;
-            __atomic_compare_exchange_n(&s.phase,
-                                        &expected,
-                                        static_cast<u32>(Done),
-                                        false,
-                                        __ATOMIC_RELEASE,
-                                        __ATOMIC_RELAXED);
+            __atomic_compare_exchange_n(
+                &s.phase, &expected, u32{Done}, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
         }
         nanosleep(&idle, nullptr);
     }
@@ -507,7 +502,7 @@ bool NetClientWorker::write(Slot& s) {
         s.ssl
             ? SSL_write(
                   s.ssl,
-                  s.pending + static_cast<i64>(s.offset),
+                  s.pending + i64{s.offset},
                   static_cast<int>(static_cast<i64>(s.pending_length) - static_cast<i64>(s.offset)))
             : static_cast<int>(send(
                   s.fd,
@@ -558,8 +553,7 @@ bool NetClientWorker::read(Slot& s) {
         if (wanted) __builtin_memcpy(s.reply.bytes, s.buffer, wanted);
         s.reply.length = wanted;
         s.buffered = static_cast<u32>(static_cast<i64>(s.buffered) - static_cast<i64>(wanted));
-        if (s.buffered)
-            __builtin_memmove(s.buffer, s.buffer + static_cast<i64>(wanted), s.buffered);
+        if (s.buffered) __builtin_memmove(s.buffer, s.buffer + i64{wanted}, s.buffered);
         return success(s, 0);
     }
     if (s.eof || s.buffered == kMaxBytes) return failed(s);
@@ -567,7 +561,7 @@ bool NetClientWorker::read(Slot& s) {
     const int n =
         s.ssl
             ? SSL_read(s.ssl,
-                       s.buffer + static_cast<i64>(s.buffered),
+                       s.buffer + i64{s.buffered},
                        static_cast<int>(static_cast<i64>(kMaxBytes) - static_cast<i64>(s.buffered)))
             : static_cast<int>(
                   recv(s.fd,

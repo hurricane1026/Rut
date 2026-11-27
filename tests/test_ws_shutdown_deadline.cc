@@ -107,7 +107,7 @@ struct WsClosingFixture {
         ws_close_observation = {};
     }
     bool start() {
-        const u8 frame[] = {0x81, 0x81, 1, 2, 3, 4, static_cast<u8>('x' ^ 1)};
+        const u8 frame[] = {0x81, 0x81, 1, 2, 3, 4, u8{'x' ^ 1}};
         if (!conn || conn->recv_buf.write(frame, sizeof(frame)) != sizeof(frame)) return false;
         on_ws_client_recv<SmallLoop>(
             &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(frame)));
@@ -206,7 +206,7 @@ TEST(websocket, lifecycle_open_precedes_coalesced_message_and_close_precedes_ret
     conn->ws_close_handler = &observe_session_close;
     conn->ws_handler = &observe_session_message;
     lifecycle_observation = {};
-    const u8 kFrame[] = {0x81, 0x81, 1, 2, 3, 4, static_cast<u8>('x' ^ 1)};
+    const u8 kFrame[] = {0x81, 0x81, 1, 2, 3, 4, u8{'x' ^ 1}};
     REQUIRE_EQ(conn->recv_buf.write(kFrame, sizeof(kFrame)), sizeof(kFrame));
     on_ws_101_sent<WsLifecycleLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, 64));
     CHECK_EQ(lifecycle_observation.opened, 1u);
@@ -362,28 +362,9 @@ TEST(websocket, closing_ping_replies_to_sender_before_coalesced_ack) {
     f.sent(false);
     // A late message is ignored, then Ping gets a local Pong. The Close behind
     // it remains buffered until the Pong send retires, without duplicate Close.
-    const u8 wire[] = {0x81,
-                       0x81,
-                       1,
-                       2,
-                       3,
-                       4,
-                       static_cast<u8>('z' ^ 1),
-                       0x89,
-                       0x81,
-                       1,
-                       2,
-                       3,
-                       4,
-                       static_cast<u8>('p' ^ 1),
-                       0x88,
-                       0x82,
-                       1,
-                       2,
-                       3,
-                       4,
-                       static_cast<u8>(3 ^ 1),
-                       static_cast<u8>(232 ^ 2)};
+    const u8 wire[] = {0x81, 0x81, 1, 2, 3,         4,           u8{'z' ^ 1}, 0x89,
+                       0x81, 1,    2, 3, 4,         u8{'p' ^ 1}, 0x88,        0x82,
+                       1,    2,    3, 4, u8{3 ^ 1}, u8{232 ^ 2}};
     REQUIRE(f.receive(true, wire, sizeof(wire)));
     CHECK(f.conn->ws_upstream_send_pending);
     CHECK_FALSE(f.conn->ws_close_client_received);
@@ -519,7 +500,7 @@ TEST(websocket, malformed_close_ack_fails_without_waiting_for_more_input) {
     REQUIRE(f.start());
     f.sent(true);
     f.sent(false);
-    const u8 invalid[] = {0x88, 0x82, 1, 2, 3, 4, static_cast<u8>(3 ^ 1), static_cast<u8>(238 ^ 2)};
+    const u8 invalid[] = {0x88, 0x82, 1, 2, 3, 4, u8{3 ^ 1}, u8{238 ^ 2}};
     REQUIRE(f.receive(true, invalid, sizeof(invalid)));
     CHECK_EQ(f.conn->fd, -1);
     CHECK_EQ(ws_close_observation.calls, 1u);
@@ -533,7 +514,7 @@ TEST(websocket, acknowledgement_wait_deadline_is_not_refreshed_by_closing_contro
     f.sent(true);
     f.sent(false);
     const auto kStarted = f.conn->ws_shutdown_started_tick;
-    const u8 ping[] = {0x89, 0x81, 1, 2, 3, 4, static_cast<u8>('p' ^ 1)};
+    const u8 ping[] = {0x89, 0x81, 1, 2, 3, 4, u8{'p' ^ 1}};
     for (u32 tick = 0; tick < kWsShutdownDrainTimeoutSeconds; ++tick) {
         REQUIRE(f.receive(true, ping, sizeof(ping)));
         f.sent(true);
@@ -570,7 +551,7 @@ TEST(websocket, handler_close_drain_deadline_expires_before_http_yield) {
     conn->ws_c2u.from_client = true;
 
     // One masked text byte; both Close sends remain pending in MockBackend.
-    const u8 kMaskedFrame[] = {0x81, 0x81, 1, 2, 3, 4, static_cast<u8>('x' ^ 1)};
+    const u8 kMaskedFrame[] = {0x81, 0x81, 1, 2, 3, 4, u8{'x' ^ 1}};
     REQUIRE_EQ(conn->recv_buf.write(kMaskedFrame, sizeof(kMaskedFrame)), sizeof(kMaskedFrame));
     on_ws_client_recv<SmallLoop>(
         &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kMaskedFrame)));
@@ -687,8 +668,8 @@ TEST(websocket, async_deadline_retains_output_until_target_and_cancel_retire) {
                 loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
                 const u32 kConnId = conn->id;
 
-                loop->dispatch(make_ev(
-                    0, IoEventType::Timeout, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1)));
+                loop->dispatch(
+                    make_ev(0, IoEventType::Timeout, i32{kWsShutdownDrainTimeoutSeconds + 1}));
                 CHECK_EQ(conn->fd, -1);
                 CHECK_EQ(conn->pending_ops, 2u);
                 CHECK_EQ(conn->ws_c2u_out, kOutput);
@@ -937,8 +918,7 @@ TEST(websocket, epoll_send_progress_does_not_extend_shutdown_deadline) {
 
     loop->dispatch({conn->id, 1, 0, 0, IoEventType::Send, 0, kEpollSendProgressAux});
     loop->dispatch({conn->id, 0, 0, 0, IoEventType::Recv, 0});
-    loop->dispatch(
-        {0, static_cast<i32>(kWsShutdownDrainTimeoutSeconds), 0, 0, IoEventType::Timeout, 0});
+    loop->dispatch({0, i32{kWsShutdownDrainTimeoutSeconds}, 0, 0, IoEventType::Timeout, 0});
     CHECK(conn->is_ws_tunnel);
     CHECK(conn->ws_shutdown_deadline_armed);
     loop->dispatch({0, 1, 0, 0, IoEventType::Timeout, 0});
@@ -1041,8 +1021,7 @@ TEST(websocket, iouring_dispatch_expires_shutdown_deadline_before_http_yield) {
     loop->timer.add(conn, kWsShutdownDrainTimeoutSeconds);
 
     loop->dispatch({conn->id, 1, 0, 0, IoEventType::Recv, 0});
-    loop->dispatch(
-        {0, static_cast<i32>(kWsShutdownDrainTimeoutSeconds + 1), 0, 0, IoEventType::Timeout, 0});
+    loop->dispatch({0, i32{kWsShutdownDrainTimeoutSeconds + 1}, 0, 0, IoEventType::Timeout, 0});
     CHECK_EQ(conn->state, ConnState::Idle);
     CHECK_FALSE(conn->ws_shutdown_deadline_armed);
     CHECK_EQ(ws_yield_handler_calls, 0u);

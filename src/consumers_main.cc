@@ -40,15 +40,14 @@ struct GeneratedSecret {
     }
     bool generate() {
 #ifdef __linux__
-        if (getrandom(random, sizeof(random), GRND_NONBLOCK) !=
-            static_cast<ssize_t>(sizeof(random)))
+        if (getrandom(random, sizeof(random), GRND_NONBLOCK) != ssize_t{sizeof(random)})
             return false;
 #else
         if (getentropy(random, sizeof(random)) != 0) return false;
 #endif
         constexpr char kDigits[] = "0123456789abcdef";
         for (u32 i = 0; i < sizeof(random); ++i) {
-            const size_t kOffset = static_cast<size_t>(i) * 2;
+            const size_t kOffset = size_t{i} * 2;
             hex[kOffset] = kDigits[random[i] >> 4];
             hex[kOffset + 1] = kDigits[random[i] & 0x0f];
         }

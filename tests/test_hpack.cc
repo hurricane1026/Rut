@@ -128,7 +128,7 @@ TEST(hpack_huffman, all_bytes_stream_roundtrips) {
 }
 
 TEST(hpack_huffman, bounded_header_block_length_uses_full_bit_count) {
-    constexpr i64 kMaxInput = static_cast<i64>(~u32{0});
+    constexpr i64 kMaxInput = i64{~u32{0}};
     constexpr i64 kMaxBits = kMaxInput * 30;
     static_assert(kMaxBits < 0x7fffffffffffffffLL);
     static_assert(hpack::huffman_encoded_bytes_from_bits(kMaxBits) > kMaxInput);

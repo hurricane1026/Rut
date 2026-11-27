@@ -428,7 +428,7 @@ TEST(route_art, atomic_insert_on_pool_exhaustion) {
     // leaf, then attempt another single-leaf insert. The second insert
     // must fail without changing the pool count.
     p1_paths[4][0] = '/';
-    p1_paths[4][1] = static_cast<char>('e');
+    p1_paths[4][1] = char{'e'};
     p1_paths[4][2] = '\0';
     REQUIRE(t.insert(Str{p1_paths[4], 2}, 0, 9000));  // succeeds, fills last slot
     REQUIRE_EQ(t.n4_count(), ArtTrie::kMaxN4);

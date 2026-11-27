@@ -36,8 +36,7 @@ public:
         PasswordWorker& worker, Str password, Str record, u64 now_ms, u32 timeout_ms) {
         u64 deadline = 0;
         if (status != PasswordRequestStatus::Idle || timeout_ms == 0 ||
-            timeout_ms > kMaxTimeoutMs ||
-            add_overflow(now_ms, static_cast<u64>(timeout_ms), &deadline))
+            timeout_ms > kMaxTimeoutMs || add_overflow(now_ms, u64{timeout_ms}, &deadline))
             return false;
         owner = &worker;
         this->deadline = deadline;

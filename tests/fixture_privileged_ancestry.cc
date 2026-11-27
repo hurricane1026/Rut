@@ -130,7 +130,7 @@ bool parse_retained_anchor_stat(const std::string& text, RetainedAnchorEvidence&
         if (field == 22) {
             unsigned long long start = 0;
             if (!(fields >> start)) return false;
-            evidence.start = static_cast<std::uint64_t>(start);
+            evidence.start = std::uint64_t{start};
         } else {
             long long ignored = 0;
             if (!(fields >> ignored)) return false;

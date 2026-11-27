@@ -1060,7 +1060,7 @@ static DockerProcSnapshot snapshot_docker_child_proc(
         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(budget).count());
     const auto deadline = started + budget;
     char base[48];
-    snprintf(base, sizeof(base), "/proc/%ld/", static_cast<long>(pid));
+    snprintf(base, sizeof(base), "/proc/%ld/", long{pid});
     auto add_item = [&](const char* field, const char* name, bool command_line = false) {
         if (proc_snapshot_deadline_expired(snapshot, deadline)) return;
         char path[64];
@@ -2271,7 +2271,7 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
         }
         const int report[2] = {opened, high_fd_is_closed ? 1 : 0};
         const ssize_t wrote = write(3, report, sizeof(report));
-        if (wrote != static_cast<ssize_t>(sizeof(report))) _exit(3);
+        if (wrote != ssize_t{sizeof(report)}) _exit(3);
         for (;;) pause();
     }
     close(ready_pipe[1]);
@@ -2282,7 +2282,7 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
     } while (count < 0 && errno == EINTR);
     close(ready_pipe[0]);
     if (inherited_high_fd >= 0) close(inherited_high_fd);
-    if (count != static_cast<ssize_t>(sizeof(report))) {
+    if (count != ssize_t{sizeof(report)}) {
         (void)kill(child, SIGKILL);
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
@@ -2637,7 +2637,7 @@ static bool run_docker_info_preflight_self_check(std::string& error,
     snprintf(socket_link_path,
              sizeof(socket_link_path),
              "/proc/%ld/fd/%d",
-             static_cast<long>(getpid()),
+             long{getpid()},
              socket_pair[0]);
     char socket_target[64];
     const ssize_t socket_target_size =
@@ -2753,8 +2753,7 @@ static bool run_docker_info_preflight_self_check(std::string& error,
     }
     // The child has three standard descriptors, the readiness pipe, and the
     // proc directory contributes two dot entries to the bounded scan.
-    const int opened_fds_to_reach_entry_limit =
-        static_cast<int>(kDockerProcSnapshotDirEntryLimit) - 6;
+    const int opened_fds_to_reach_entry_limit = int{kDockerProcSnapshotDirEntryLimit} - 6;
     const bool enough_fds_to_reach_entry_limit =
         entry_limited_opened >= opened_fds_to_reach_entry_limit;
     const size_t entry_control_descriptors = static_cast<size_t>(entry_limited_opened) + 4u;
@@ -3099,7 +3098,7 @@ static bool run_docker_info_preflight_self_check(std::string& error,
     const bool stdio_snapshot_ok =
         read_docker_snapshot(log, stdio_snapshot, stdio_snapshot_error, stdio_snapshot_state);
     unlink(log.c_str());
-    if (collision_read != static_cast<ssize_t>(sizeof(collision_report)) ||
+    if (collision_read != ssize_t{sizeof(collision_report)} ||
         collision_report.magic != kStdioCollisionMagic ||
         collision_report.outcome != static_cast<int32_t>(DockerInfoOutcome::Exited) ||
         !WIFEXITED(collision_report.child_status) ||
@@ -3680,7 +3679,7 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
                                                   static_cast<unsigned char>(port >> 8),
                                                   static_cast<unsigned char>(port & 0xff)};
                 ssize_t written = 0;
-                while (written < static_cast<ssize_t>(sizeof(payload))) {
+                while (written < ssize_t{sizeof(payload)}) {
                     const ssize_t n =
                         write(ready_pipe[1], payload + written, sizeof(payload) - written);
                     if (n <= 0) _exit(48);
@@ -3694,7 +3693,7 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     unsigned char ready[3] = {};
     ssize_t received = 0;
     const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (received < static_cast<ssize_t>(sizeof(ready))) {
+    while (received < ssize_t{sizeof(ready)}) {
         const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       ready_deadline - std::chrono::steady_clock::now())
                                       .count();
@@ -3710,7 +3709,7 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     Child child;
     child.pid = control;
     bool ok = true;
-    if (received != static_cast<ssize_t>(sizeof(ready)) || ready[0] != 1) {
+    if (received != ssize_t{sizeof(ready)} || ready[0] != 1) {
         error = "stalling control did not reach readiness";
         ok = false;
     }
@@ -9160,7 +9159,7 @@ static bool capture_nginx_default_buffering_complete(
         const u64 observation_complete_ns = steady_now_ns();
         if (observation_complete_ns < observation.request_prefix_sent_ns ||
             observation_complete_ns - observation.request_prefix_sent_ns <
-                static_cast<u64>(request_buffering_observation_ms) * 1'000'000ull) {
+                u64{request_buffering_observation_ms} * 1'000'000ull) {
             error = "default request-buffering observation ended before its required duration";
             return false;
         }
@@ -41426,7 +41425,7 @@ static const ExactLoopbackPinnedActionProfile kBodyfulReturnPinnedActionProfile{
     kExactLoopbackBodyfulFallbackRequest,
     kExactLocalCloseResponseNormalized,
     200u,
-    static_cast<u32>(sizeof(kExactLocalCloseResponseNormalized) - 1u),
+    u32{sizeof(kExactLocalCloseResponseNormalized) - 1u},
     false,
     "local bodyful 200"};
 static_assert(sizeof(kExactLocalCloseResponseNormalized) - 1u == 159u);
@@ -56168,7 +56167,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                                *program,
                                load_error,
                                rut::jit::OptLevel::O2,
-                               static_cast<u64>(captured_stdout.size())) ||
+                               u64{captured_stdout.size()}) ||
         !rut::access_log_sink_spec_valid(program->access_log) || !program->access_log.present ||
         program->config.route_count != 3u || program->config.upstream_count != 1u ||
         program->config.upstreams[0].addr_count != 1u ||
@@ -56344,8 +56343,8 @@ static bool validate_custom_hide_timeout_loaded_program(
         static constexpr char kSelectedHeadRequest[] =
             "HEAD /buffered-timeout?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\n";
         static_assert(sizeof(kSelectedHeadRequest) - 1u == 61u);
-        const auto selected_head = invoke(
-            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const auto selected_head =
+            invoke(*head, kSelectedHeadRequest, u32{sizeof(kSelectedHeadRequest) - 1u});
         const u16 selected_bundle_id = selected_head.next_state;
         if (!predicate(*head,
                        selected_head,
@@ -56374,8 +56373,8 @@ static bool validate_custom_hide_timeout_loaded_program(
         const auto selected_head_mode = selected_response_policy.head_mode;
         const auto selected_buffering = selected_bundle.response_buffering;
         const auto validate_restored_head = [&](const char* label) {
-            const auto restored = invoke(
-                *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+            const auto restored =
+                invoke(*head, kSelectedHeadRequest, u32{sizeof(kSelectedHeadRequest) - 1u});
             if (!same_result_identity(restored) ||
                 !predicate(*head,
                            restored,
@@ -56390,8 +56389,8 @@ static bool validate_custom_hide_timeout_loaded_program(
             return true;
         };
         selected_bundle.response_read_timeout_seconds = 1u;
-        const auto timeout_mutant = invoke(
-            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const auto timeout_mutant =
+            invoke(*head, kSelectedHeadRequest, u32{sizeof(kSelectedHeadRequest) - 1u});
         if (predicate(*head,
                       timeout_mutant,
                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
@@ -56406,8 +56405,8 @@ static bool validate_custom_hide_timeout_loaded_program(
         if (!validate_restored_head("response_read_timeout")) return false;
 
         selected_response_policy.head_mode = rut::ResponsePolicyHeadMode::Reject;
-        const auto head_mode_mutant = invoke(
-            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const auto head_mode_mutant =
+            invoke(*head, kSelectedHeadRequest, u32{sizeof(kSelectedHeadRequest) - 1u});
         if (predicate(*head,
                       head_mode_mutant,
                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
@@ -56423,8 +56422,8 @@ static bool validate_custom_hide_timeout_loaded_program(
 
         selected_bundle.response_buffering =
             rut::ForwardResponseBufferingMode::CompleteContentLength;
-        const auto buffering_mutant = invoke(
-            *head, kSelectedHeadRequest, static_cast<u32>(sizeof(kSelectedHeadRequest) - 1u));
+        const auto buffering_mutant =
+            invoke(*head, kSelectedHeadRequest, u32{sizeof(kSelectedHeadRequest) - 1u});
         if (predicate(*head,
                       buffering_mutant,
                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
@@ -56536,7 +56535,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                                *mutant,
                                mutant_error,
                                rut::jit::OptLevel::O2,
-                               static_cast<u64>(mutant_source.size()))) {
+                               u64{mutant_source.size()})) {
         error = "#616 same-length custom-name mutant did not load successfully (stage=" +
                 std::to_string(static_cast<u32>(mutant_error.stage));
         if (mutant_error.diag.detail.ptr != nullptr)
@@ -56790,7 +56789,7 @@ static bool run_converter_request_length_rut_side(
                                    *loaded.value,
                                    load_error,
                                    rut::jit::OptLevel::O2,
-                                   static_cast<u64>(persisted.size())) ||
+                                   u64{persisted.size()}) ||
             (access_log_off && loaded.value->access_log.present) ||
             (custom_hide_header && !loaded.value->access_log.present)) {
             error = access_log_off ? "#591 loaded Off RUT unexpectedly exposed an access-log sink"
@@ -62234,8 +62233,8 @@ static bool validate_timeout_head_phase_observation(const TimeoutHeadPhaseObserv
         value.phase == TimeoutHeadPhase::ZeroProgressHold
             ? 0u
             : (value.phase == TimeoutHeadPhase::DelayedPartialHeaderHold
-                   ? static_cast<u32>(sizeof(TimeoutHeadPhaseRecorder::kPartialHeader) - 1u)
-                   : static_cast<u32>(sizeof(kHeadBackendResponse) - 1u));
+                   ? u32{sizeof(TimeoutHeadPhaseRecorder::kPartialHeader) - 1u}
+                   : u32{sizeof(kHeadBackendResponse) - 1u});
     if (!normalize_date(normalized) || normalized.size() != expected_response_size ||
         memcmp(normalized.data(), expected_response, expected_response_size) != 0 ||
         value.upstream != expected_upstream || value.accepted != 1u || value.requests != 1u ||
@@ -68593,7 +68592,7 @@ static bool validate_explicit_off_loaded_program(const std::string& source_path,
                                *program,
                                load_error,
                                rut::jit::OptLevel::O2,
-                               static_cast<u64>(captured_stdout.size())) ||
+                               u64{captured_stdout.size()}) ||
         !program->has_listener || program->listener.address != rut::ListenerAddress::IPv4Exact ||
         program->listener.ipv4_host != 0x7f000001u || program->listener.port != frontend_port ||
         !rut::access_log_sink_spec_valid(program->access_log) || !program->access_log.present ||
@@ -73013,7 +73012,7 @@ static bool run_converter_default_buffering_206_range_incomplete_body_inactivity
     const ssize_t poisoned_count =
         poisoned_fd < 0 ? -1 : read(poisoned_fd, poisoned_bytes, sizeof(poisoned_bytes));
     if (poisoned_fd >= 0) close(poisoned_fd);
-    if (poisoned_count != static_cast<ssize_t>(sizeof(kPoisonedSource) - 1u) ||
+    if (poisoned_count != ssize_t{sizeof(kPoisonedSource) - 1u} ||
         memcmp(poisoned_bytes, kPoisonedSource, sizeof(kPoisonedSource) - 1u) != 0) {
         error = std::string(kDiagnostic) + " poisoned source was not observed after load";
         return false;

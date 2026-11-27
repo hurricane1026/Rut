@@ -347,14 +347,14 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
 
     auto* sq_base = static_cast<u8*>(sq_ring_ptr);
-    sq_head = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.head));
-    sq_tail = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.tail));
-    sq_flags = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.flags));
-    sq_ring_mask = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.ring_mask));
-    sq_array = reinterpret_cast<u32*>(sq_base + static_cast<i64>(params.sq_off.array));
+    sq_head = reinterpret_cast<u32*>(sq_base + i64{params.sq_off.head});
+    sq_tail = reinterpret_cast<u32*>(sq_base + i64{params.sq_off.tail});
+    sq_flags = reinterpret_cast<u32*>(sq_base + i64{params.sq_off.flags});
+    sq_ring_mask = reinterpret_cast<u32*>(sq_base + i64{params.sq_off.ring_mask});
+    sq_array = reinterpret_cast<u32*>(sq_base + i64{params.sq_off.array});
 
     // Map SQEs
-    sqes_sz = static_cast<u64>(params.sq_entries) * sizeof(io_uring_sqe);
+    sqes_sz = u64{params.sq_entries} * sizeof(io_uring_sqe);
     if (sqes_sz > SIZE_MAX) {
         shutdown();
         return core::make_unexpected(Error::make(EOVERFLOW, Error::Source::IoUring));
@@ -395,10 +395,10 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
 
     auto* cq_base = static_cast<u8*>(cq_ring_ptr);
-    cq_head = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.head));
-    cq_tail = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.tail));
-    cq_ring_mask = reinterpret_cast<u32*>(cq_base + static_cast<i64>(params.cq_off.ring_mask));
-    cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + static_cast<i64>(params.cq_off.cqes));
+    cq_head = reinterpret_cast<u32*>(cq_base + i64{params.cq_off.head});
+    cq_tail = reinterpret_cast<u32*>(cq_base + i64{params.cq_off.tail});
+    cq_ring_mask = reinterpret_cast<u32*>(cq_base + i64{params.cq_off.ring_mask});
+    cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + i64{params.cq_off.cqes});
 
     // Terminal-recv quarantine inventory (see the header): a FIFO ring sized for
     // the worst case of one window per CQ slot, plus an 8-byte-per-connection
@@ -409,7 +409,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
         shutdown();
         return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
     }
-    const u64 windows_sz = static_cast<u64>(cq_ring_entries) * sizeof(DownstreamRecvTerminalWindow);
+    const u64 windows_sz = u64{cq_ring_entries} * sizeof(DownstreamRecvTerminalWindow);
     void* windows_mem =
         mmap(nullptr, windows_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (windows_mem == MAP_FAILED) {
@@ -420,7 +420,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
     downstream_recv_terminal_windows = static_cast<DownstreamRecvTerminalWindow*>(windows_mem);
     downstream_recv_terminal_window_capacity = cq_ring_entries;
-    const u64 slots_sz = static_cast<u64>(connection_capacity) * sizeof(DownstreamRecvTerminalSlot);
+    const u64 slots_sz = u64{connection_capacity} * sizeof(DownstreamRecvTerminalSlot);
     void* slots_mem =
         mmap(nullptr, slots_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (slots_mem == MAP_FAILED) {
@@ -465,7 +465,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
 core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Allocate buffer memory: kProvidedBufCount * kProvidedBufSize
-    u64 total_buf_sz = static_cast<u64>(kProvidedBufCount) * kProvidedBufSize;
+    u64 total_buf_sz = u64{kProvidedBufCount} * kProvidedBufSize;
     buf_base = static_cast<u8*>(mmap(nullptr,
                                      total_buf_sz,
                                      PROT_READ | PROT_WRITE,
@@ -521,13 +521,12 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
     // Fill the ring with buffer entries
     for (u32 i = 0; i < kProvidedBufCount; i++) {
         io_uring_buf* buf = &buf_ring->bufs[i];
-        buf->addr = reinterpret_cast<u64>(buf_base +
-                                          static_cast<i64>(i) * static_cast<i64>(kProvidedBufSize));
+        buf->addr = reinterpret_cast<u64>(buf_base + i64{i} * i64{kProvidedBufSize});
         buf->len = kProvidedBufSize;
         buf->bid = static_cast<u16>(i);
     }
     // Advance the ring tail to make all buffers available
-    __atomic_store_n(&buf_ring->tail, static_cast<u16>(kProvidedBufCount), __ATOMIC_RELEASE);
+    __atomic_store_n(&buf_ring->tail, u16{kProvidedBufCount}, __ATOMIC_RELEASE);
 
     setup_extra_buf_ring(kLargeProvidedBufCount,
                          kLargeProvidedBufSize,
@@ -544,7 +543,7 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
 void IoUringBackend::setup_extra_buf_ring(
     u32 count, u32 size, u16 group, u32 id_base, io_uring_buf_ring*& ring_out, u8*& base_out) {
     // Buffer memory is faulted in on first use: idle shards keep it unresident.
-    const u64 total_buf_sz = static_cast<u64>(count) * size;
+    const u64 total_buf_sz = u64{count} * size;
     void* base =
         mmap(nullptr, total_buf_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (base == MAP_FAILED) return;
@@ -575,7 +574,7 @@ void IoUringBackend::setup_extra_buf_ring(
     auto* data = static_cast<u8*>(base);
     for (u32 i = 0; i < count; i++) {
         io_uring_buf* buf = &ring->bufs[i];
-        buf->addr = reinterpret_cast<u64>(data + static_cast<i64>(i) * static_cast<i64>(size));
+        buf->addr = reinterpret_cast<u64>(data + i64{i} * i64{size});
         buf->len = size;
         buf->bid = static_cast<u16>(static_cast<i64>(id_base) + static_cast<i64>(i));
     }
@@ -599,11 +598,10 @@ void IoUringBackend::return_buffer(u16 buf_id) {
     }
     // Add buffer back to the provided ring
     u16 tail = __atomic_load_n(&buf_ring->tail, __ATOMIC_RELAXED);
-    u16 mask = static_cast<u16>(static_cast<i64>(kProvidedBufCount) - 1);  // power of 2
+    u16 mask = u16{i64{kProvidedBufCount} - 1};  // power of 2
 
     io_uring_buf* buf = &buf_ring->bufs[tail & mask];
-    buf->addr = reinterpret_cast<u64>(buf_base + static_cast<i64>(buf_id) *
-                                                     static_cast<i64>(kProvidedBufSize));
+    buf->addr = reinterpret_cast<u64>(buf_base + i64{buf_id} * i64{kProvidedBufSize});
     buf->len = kProvidedBufSize;
     buf->bid = buf_id;
 
@@ -958,7 +956,7 @@ void IoUringBackend::probe_nop_inject_result() {
         rc = io_uring_enter(ring_fd, 0, 1, IORING_ENTER_GETEVENTS);
         if (rc < 0 && rc != -EINTR) return;  // wait() drops the sentinel completion
     }
-    nop_inject_result = cq_entries[head.slot(*cq_ring_mask)].res == static_cast<i32>(kProbeResult);
+    nop_inject_result = cq_entries[head.slot(*cq_ring_mask)].res == i32{kProbeResult};
     __atomic_store_n(cq_head, head.advanced_by(1).value, __ATOMIC_RELEASE);
 }
 
@@ -1000,7 +998,7 @@ bool IoUringBackend::add_send_after_direct_write(i32 fd,
         sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
         sqe->fd = fd;
         sqe->addr = vector ? reinterpret_cast<u64>(&vector->message)
-                           : reinterpret_cast<u64>(buf + static_cast<i64>(written));
+                           : reinterpret_cast<u64>(buf + i64{written});
         sqe->len =
             vector ? 1u : static_cast<u32>(static_cast<i64>(len) - static_cast<i64>(written));
     }
@@ -1404,8 +1402,7 @@ u32 IoUringBackend::wait(IoEvent* events,
         if (downstream_recv_terminal_out_of_range_windows == 0) return -1;
         for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
             const auto& window = downstream_recv_terminal_windows
-                [(static_cast<i64>(downstream_recv_terminal_window_start) + static_cast<i64>(i)) &
-                 ring_mask];
+                [(i64{downstream_recv_terminal_window_start} + i64{i}) & ring_mask];
             if (window.user_data == user_data && window.tail_exclusive != head.value) {
                 window_tail = window.tail_exclusive;
                 return 0;
@@ -1634,7 +1631,7 @@ u32 IoUringBackend::wait(IoEvent* events,
         // --- #3: Timer tick handling ---
         if (conn_id == kTimerConnId && type == IoEventType::Timeout) {
             timer_read_armed = false;
-            if (cqe->res == static_cast<i32>(sizeof(timer_ticks_buf))) {
+            if (cqe->res == i32{sizeof(timer_ticks_buf)}) {
                 // Clamp tick count to avoid i32 overflow after long stalls
                 i32 ticks =
                     (timer_ticks_buf > 0x7FFFFFFF) ? 0x7FFFFFFF : static_cast<i32>(timer_ticks_buf);
@@ -1743,7 +1740,7 @@ u32 IoUringBackend::wait(IoEvent* events,
                     deadline_copy_eligible =
                         overflow == 0 ||
                         conn.response_body_tail.append(*response_pool,
-                                                       src + static_cast<i64>(prefix_copy),
+                                                       src + i64{prefix_copy},
                                                        overflow,
                                                        conn.buffered_response_bulk_after());
                     if (deadline_copy_eligible && prefix_copy != 0) {
@@ -2229,9 +2226,8 @@ u32 IoUringBackend::wait(IoEvent* events,
                         sqe->opcode = ss.vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
                         sqe->msg_flags = MSG_NOSIGNAL | ss.msg_flags;
                         sqe->fd = ss.fd;
-                        sqe->addr =
-                            ss.vector ? reinterpret_cast<u64>(&ss.vector->message)
-                                      : reinterpret_cast<u64>(ss.src + static_cast<i64>(ss.offset));
+                        sqe->addr = ss.vector ? reinterpret_cast<u64>(&ss.vector->message)
+                                              : reinterpret_cast<u64>(ss.src + i64{ss.offset});
                         sqe->len = ss.vector ? 1u : ss.remaining;
                         sqe->user_data =
                             type == IoEventType::UpstreamSend
@@ -2344,7 +2340,7 @@ void IoUringBackend::shutdown() {
         timer_fd = -1;
     }
     if (buf_base != nullptr) {
-        munmap(buf_base, static_cast<u64>(kProvidedBufCount) * kProvidedBufSize);
+        munmap(buf_base, u64{kProvidedBufCount} * kProvidedBufSize);
         buf_base = nullptr;
     }
     if (buf_ring != nullptr) {
@@ -2353,7 +2349,7 @@ void IoUringBackend::shutdown() {
         buf_ring = nullptr;
     }
     if (large_buf_base != nullptr) {
-        munmap(large_buf_base, static_cast<u64>(kLargeProvidedBufCount) * kLargeProvidedBufSize);
+        munmap(large_buf_base, u64{kLargeProvidedBufCount} * kLargeProvidedBufSize);
         large_buf_base = nullptr;
     }
     if (large_buf_ring != nullptr) {
@@ -2362,16 +2358,15 @@ void IoUringBackend::shutdown() {
         large_buf_ring = nullptr;
     }
     if (downstream_recv_terminal_windows != nullptr) {
-        munmap(downstream_recv_terminal_windows,
-               static_cast<u64>(downstream_recv_terminal_window_capacity) *
-                   sizeof(DownstreamRecvTerminalWindow));
+        munmap(
+            downstream_recv_terminal_windows,
+            u64{downstream_recv_terminal_window_capacity} * sizeof(DownstreamRecvTerminalWindow));
         downstream_recv_terminal_windows = nullptr;
         downstream_recv_terminal_window_capacity = 0;
     }
     if (downstream_recv_terminal_slots != nullptr) {
         munmap(downstream_recv_terminal_slots,
-               static_cast<u64>(downstream_recv_terminal_slot_capacity) *
-                   sizeof(DownstreamRecvTerminalSlot));
+               u64{downstream_recv_terminal_slot_capacity} * sizeof(DownstreamRecvTerminalSlot));
         downstream_recv_terminal_slots = nullptr;
         downstream_recv_terminal_slot_capacity = 0;
     }

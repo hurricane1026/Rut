@@ -54,7 +54,7 @@ template void expire_connect_attempt<IoUringEventLoop>(IoUringEventLoop*, Connec
 bool h2_apply_forward_request_overrides(Connection& conn, const RouteConfig* config) {
     if (conn.target_transform_recorded &&
         (config == nullptr || !config->target_transform_id_is_valid(conn.target_transform_id) ||
-         config->target_transforms[static_cast<i64>(conn.target_transform_id) - 1].mode ==
+         config->target_transforms[i64{conn.target_transform_id} - 1].mode ==
              ForwardTargetTransformMode::CleanPrefix ||
          !materialize_request_target_transform(conn, *config)))
         return false;
@@ -176,7 +176,7 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
                 static_cast<u32>(static_cast<i64>(host_end) - static_cast<i64>(start) - 1);
             char host[128];
             if (host_len >= sizeof(host)) return false;
-            __builtin_memcpy(host, data + static_cast<i64>(start) + 1, host_len);
+            __builtin_memcpy(host, data + i64{start} + 1, host_len);
             host[host_len] = '\0';
             in6_addr address{};
             if (inet_pton(AF_INET6, host, &address) != 1) return false;
@@ -194,8 +194,8 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
                                   c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
                                   c == '=';
             if (c == '%') {
-                if (static_cast<i64>(i) + 2 >= static_cast<i64>(host_end)) return false;
-                const u8 h = data[static_cast<i64>(i) + 1], l = data[static_cast<i64>(i) + 2];
+                if (i64{i} + 2 >= i64{host_end}) return false;
+                const u8 h = data[i64{i} + 1], l = data[i64{i} + 2];
                 const bool hex_h =
                     (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
                 const bool hex_l =
@@ -408,7 +408,7 @@ void capture_request_metadata(Connection& conn) {
                 canon_len =
                     static_cast<u32>(static_cast<i64>(copy_len) - static_cast<i64>(canon_off));
             }
-            conn.req_path_canon = Str{conn.req_path + static_cast<i64>(canon_off), canon_len};
+            conn.req_path_canon = Str{conn.req_path + i64{canon_off}, canon_len};
         } else {
             conn.req_path_canon = {nullptr, 0};
         }
@@ -423,12 +423,12 @@ void capture_request_metadata(Connection& conn) {
                     : 0;
             chunk_consumed = kBodyInBuf;
             if (kBodyInBuf > 0) {
-                const u8* body_start = data + static_cast<i64>(parser.header_end);
+                const u8* body_start = data + i64{parser.header_end};
                 u32 pos = 0;
                 while (pos < kBodyInBuf) {
                     u32 consumed = 0, out_start = 0, out_len = 0;
                     const ChunkStatus kChunkStatus = conn.req_chunk_parser.feed(
-                        body_start + static_cast<i64>(pos),
+                        body_start + i64{pos},
                         static_cast<u32>(static_cast<i64>(kBodyInBuf) - static_cast<i64>(pos)),
                         &consumed,
                         &out_start,
@@ -493,16 +493,14 @@ void capture_request_metadata(Connection& conn) {
 
     u32 method_len = 0;
     conn.req_method = parse_log_method_fallback(data, kLen, &method_len);
-    if (method_len == 0 || static_cast<i64>(method_len) + 1 >= static_cast<i64>(kLen) ||
-        data[method_len] != ' ')
-        return;
+    if (method_len == 0 || i64{method_len} + 1 >= i64{kLen} || data[method_len] != ' ') return;
 
     const u32 kPathStart = static_cast<u32>(static_cast<i64>(method_len) + 1);
     u32 path_len = 0;
-    while (static_cast<i64>(kPathStart) + static_cast<i64>(path_len) < static_cast<i64>(kLen) &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != ' ' &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != '\r' &&
-           data[static_cast<i64>(kPathStart) + static_cast<i64>(path_len)] != '\n') {
+    while (i64{kPathStart} + i64{path_len} < i64{kLen} &&
+           data[i64{kPathStart} + i64{path_len}] != ' ' &&
+           data[i64{kPathStart} + i64{path_len}] != '\r' &&
+           data[i64{kPathStart} + i64{path_len}] != '\n') {
         path_len++;
     }
 
@@ -562,7 +560,7 @@ PipelineTransitionResult pipeline_shift(Connection& conn) {
     if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
     const PipelineTransitionResult kTransition = pipeline_advance(conn);
     if (kTransition != PipelineTransitionResult::Advanced) return kTransition;
-    const u8* src = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
+    const u8* src = conn.recv_buf.data() + i64{conn.req_initial_send_len};
     conn.reset_request_receive_buffer();
     u8* dst = conn.recv_buf.write_ptr();
     __builtin_memmove(dst, src, kLeftover);
@@ -582,7 +580,7 @@ bool pipeline_stash(Connection& conn) {
         conn.pipeline_stash_len = 0;
         return false;
     }
-    const u8* src = conn.recv_buf.data() + static_cast<i64>(conn.req_initial_send_len);
+    const u8* src = conn.recv_buf.data() + i64{conn.req_initial_send_len};
     conn.send_buf.append_prefix(src, kLeftover);
     conn.pipeline_stash_len = static_cast<u16>(kLeftover);
     return true;
@@ -596,9 +594,9 @@ PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transitio
         if (kStatus != PipelineTransitionResult::Advanced) return kStatus;
     }
     const u32 kStashOff = conn.retry_req_send_len;
-    const u8* src = conn.send_buf.data() + static_cast<i64>(kStashOff);
+    const u8* src = conn.send_buf.data() + i64{kStashOff};
     const u32 kExisting = conn.recv_buf.len();
-    if (static_cast<i64>(kStashLen) + static_cast<i64>(kExisting) > conn.recv_buf.capacity())
+    if (i64{kStashLen} + i64{kExisting} > conn.recv_buf.capacity())
         return PipelineTransitionResult::LimitExceeded;
     if (count_transition) {
         const PipelineTransitionResult kTransition = pipeline_advance(conn);
@@ -618,9 +616,9 @@ PipelineTransitionResult pipeline_recover(Connection& conn, bool count_transitio
         // tunnel install while an io_uring multishot recv stayed armed) came
         // AFTER the stash, so they must follow it — not be dropped. Shift them up
         // by kStashLen and prepend the stash. base == recv_buf.data().
-        u8* base = conn.recv_buf.write_ptr() - static_cast<i64>(kExisting);
+        u8* base = conn.recv_buf.write_ptr() - i64{kExisting};
         conn.clear_raw_request_target_witness();
-        __builtin_memmove(base + static_cast<i64>(kStashLen), base, kExisting);
+        __builtin_memmove(base + i64{kStashLen}, base, kExisting);
         __builtin_memmove(base, src, kStashLen);
         conn.recv_buf.set_len(
             static_cast<u32>(static_cast<i64>(kStashLen) + static_cast<i64>(kExisting)));
@@ -1222,7 +1220,7 @@ u32 consume_upstream_sent(Connection& conn) {
         return 0;
     }
     const u32 kRemaining = static_cast<u32>(static_cast<i64>(kTotal) - static_cast<i64>(kSent));
-    const u8* src = conn.upstream_recv_buf.data() + static_cast<i64>(kSent);
+    const u8* src = conn.upstream_recv_buf.data() + i64{kSent};
     conn.upstream_recv_buf.reset();
     u8* dst = conn.upstream_recv_buf.write_ptr();
     __builtin_memmove(dst, src, kRemaining);

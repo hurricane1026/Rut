@@ -1067,7 +1067,7 @@ TEST(h2_request, authority_overrides_redundant_host_field) {
 
 TEST(h2_request, authority_drives_host_scoped_route_selection) {
     RouteConfig config;
-    auto* handler = reinterpret_cast<jit::HandlerFn>(static_cast<uintptr_t>(1));
+    auto* handler = reinterpret_cast<jit::HandlerFn>(uintptr_t{1});
     REQUIRE(config.add_jit_handler(
         "/scope", 'G', handler, false, ForwardPreflightMode::None, 0, Str{"authority.test", 14}));
     REQUIRE(config.add_static("/scope", 'G', 204));
@@ -1562,7 +1562,7 @@ TEST(http2_conn, settings_invalid_length_and_window_delta_do_not_establish_peer)
     CHECK_FALSE(r.close);
     Http2Stream* stream = c.find_stream(1);
     REQUIRE(stream != nullptr);
-    stream->send_window = static_cast<i32>(kMaxWindowSize);
+    stream->send_window = i32{kMaxWindowSize};
     Http2Settings settings;
     settings.set_defaults();
     settings.initial_window_size = kMaxWindowSize;

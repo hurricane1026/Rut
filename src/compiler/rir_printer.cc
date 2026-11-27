@@ -848,7 +848,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
@@ -887,11 +887,11 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqSetTargetTransform:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::CtxStoreSlotI32:
             buf.put(' ');
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
@@ -1062,7 +1062,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
                 print_value_ref(buf, inst.operands[1]);
             }
             buf.put_cstr(", inst=");
-            buf.put_i64(static_cast<i64>(inst.imm.i32_val));
+            buf.put_i64(i64{inst.imm.i32_val});
             break;
         case Opcode::HashHmacSha256:
             buf.put(' ');

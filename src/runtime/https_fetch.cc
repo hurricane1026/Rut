@@ -86,9 +86,9 @@ void BoundedJsonResponse::reset_dns() {
 
 bool strong_etag_valid(Str value) {
     if (!value.ptr || value.len < 2 || value.len > 128 || value.ptr[0] != '"' ||
-        value.ptr[static_cast<i64>(value.len) - 1] != '"')
+        value.ptr[i64{value.len} - 1] != '"')
         return false;
-    for (u32 i = 1; static_cast<i64>(i) + 1 < static_cast<i64>(value.len); ++i) {
+    for (u32 i = 1; i64{i} + 1 < i64{value.len}; ++i) {
         const auto kByte = static_cast<u8>(value.ptr[i]);
         if (kByte != 0x21 && (kByte < 0x23 || kByte > 0x7e)) return false;
     }
@@ -97,9 +97,9 @@ bool strong_etag_valid(Str value) {
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
     if (result_ != Result::More || (bytes.len && !bytes.ptr) ||
-        static_cast<i64>(bytes.len) > static_cast<i64>(kMaxWire) - static_cast<i64>(wire_len_))
+        i64{bytes.len} > i64{kMaxWire} - i64{wire_len_})
         return result_ = Result::Error;
-    if (bytes.len) __builtin_memcpy(wire_ + static_cast<i64>(wire_len_), bytes.ptr, bytes.len);
+    if (bytes.len) __builtin_memcpy(wire_ + i64{wire_len_}, bytes.ptr, bytes.len);
     wire_len_ = static_cast<u32>(static_cast<i64>(wire_len_) + static_cast<i64>(bytes.len));
     return result_ = consume();
 }
@@ -143,8 +143,8 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                 if (++type_count != 1) return Result::Error;
                 u32 end = 0;
                 while (end < header.value.len && header.value.ptr[end] != ';') ++end;
-                while (end && (header.value.ptr[static_cast<i64>(end) - 1] == ' ' ||
-                               header.value.ptr[static_cast<i64>(end) - 1] == '\t'))
+                while (end && (header.value.ptr[i64{end} - 1] == ' ' ||
+                               header.value.ptr[i64{end} - 1] == '\t'))
                     end = static_cast<u32>(static_cast<i64>(end) - 1);
                 const Str kType{header.value.ptr, end};
                 if (dns_ && !equal_ci(header.value, lit_str("application/dns-message")))
@@ -175,18 +175,14 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         for (u32 steps = 0; steps <= kMaxWire; ++steps) {
             u32 consumed = 0, start = 0, length = 0;
             const auto kStatus = chunks_.feed(
-                reinterpret_cast<const u8*>(wire_ + static_cast<i64>(offset_)),
+                reinterpret_cast<const u8*>(wire_ + i64{offset_}),
                 static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_)),
                 &consumed,
                 &start,
                 &length);
-            if (static_cast<i64>(length) >
-                static_cast<i64>(kBodyLimit) - static_cast<i64>(body_len_))
-                return Result::Error;
+            if (i64{length} > i64{kBodyLimit} - i64{body_len_}) return Result::Error;
             if (length)
-                __builtin_memcpy(body_ + static_cast<i64>(body_len_),
-                                 wire_ + static_cast<i64>(offset_) + static_cast<i64>(start),
-                                 length);
+                __builtin_memcpy(body_ + i64{body_len_}, wire_ + i64{offset_} + i64{start}, length);
             body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(length));
             offset_ = static_cast<u32>(static_cast<i64>(offset_) + static_cast<i64>(consumed));
             if (kStatus == ChunkStatus::Error) return Result::Error;
@@ -199,13 +195,10 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
     }
     const u32 kAvailable =
         static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_));
-    if (static_cast<i64>(kAvailable) > static_cast<i64>(kBodyLimit) - static_cast<i64>(body_len_) ||
-        (sized_ &&
-         static_cast<i64>(kAvailable) > static_cast<i64>(expected_) - static_cast<i64>(body_len_)))
+    if (i64{kAvailable} > i64{kBodyLimit} - i64{body_len_} ||
+        (sized_ && i64{kAvailable} > i64{expected_} - i64{body_len_}))
         return Result::Error;
-    if (kAvailable)
-        __builtin_memcpy(
-            body_ + static_cast<i64>(body_len_), wire_ + static_cast<i64>(offset_), kAvailable);
+    if (kAvailable) __builtin_memcpy(body_ + i64{body_len_}, wire_ + i64{offset_}, kAvailable);
     body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(kAvailable));
     offset_ = wire_len_;
     return sized_ && body_len_ == expected_ ? Result::Complete : Result::More;
@@ -342,8 +335,8 @@ bool HttpsFetch::set_dns_query(Str query) {
         endpoint_.tls.server_name,
         endpoint_.port,
         query.len);
-    const i64 kLength = static_cast<i64>(kHeaderLength) + static_cast<i64>(query.len);
-    if (kHeaderLength <= 0 || kLength > static_cast<i64>(sizeof(request_))) return false;
+    const i64 kLength = i64{kHeaderLength} + i64{query.len};
+    if (kHeaderLength <= 0 || kLength > i64{sizeof(request_)}) return false;
     __builtin_memcpy(request_ + kHeaderLength, query.ptr, query.len);
     request_len_ = static_cast<u32>(kLength);
     return true;
@@ -433,7 +426,7 @@ bool HttpsFetch::write(HttpsFetch& self) {
     ERR_clear_error();
     const int kResult = SSL_write(
         self.ssl_,
-        self.request_ + static_cast<i64>(self.sent_),
+        self.request_ + i64{self.sent_},
         static_cast<int>(static_cast<i64>(self.request_len_) - static_cast<i64>(self.sent_)));
     if (kResult <= 0) return retry_ssl(self.ssl_, kResult) ? false : self.fail();
     self.sent_ = static_cast<u32>(static_cast<i64>(self.sent_) + kResult);

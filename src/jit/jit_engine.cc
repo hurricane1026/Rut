@@ -128,7 +128,7 @@ static bool extract_regex_pattern(LLVMValueRef global, const char** out_ptr, u32
 JitEngine::RegexSlot* JitEngine::alloc_regex_slot() {
     if (regex_slot_count == regex_slot_cap) {
         u32 next_cap = regex_slot_cap ? regex_slot_cap * 2 : 16;
-        size_t bytes = static_cast<size_t>(next_cap) * sizeof(RegexSlot*);
+        size_t bytes = size_t{next_cap} * sizeof(RegexSlot*);
         auto** next =
             static_cast<RegexSlot**>(realloc(reinterpret_cast<void*>(regex_slots), bytes));
         if (!next) return nullptr;
@@ -468,7 +468,7 @@ void* JitEngine::lookup(const char* name) {
     // Cast via uintptr_t. The NOLINT suppresses performance-no-int-to-ptr
     // which is unavoidable here — the LLVM C API returns addresses as u64.
     return reinterpret_cast<void*>(  // NOLINT(performance-no-int-to-ptr)
-        static_cast<uintptr_t>(addr));
+        uintptr_t{addr});
 }
 
 void JitEngine::shutdown() {

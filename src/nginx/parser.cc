@@ -427,20 +427,20 @@ public:
                 diagnostic.span.start > diagnostic.span.end || diagnostic.span.line == 0 ||
                 diagnostic.span.col == 0)
                 return invalid(http_origin, lit_str("http diagnostic span is out of bounds"));
-            if (http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.start ||
-                http_origin.start > (~static_cast<u32>(0)) - diagnostic.span.end)
+            if (http_origin.start > (~u32{0}) - diagnostic.span.start ||
+                http_origin.start > (~u32{0}) - diagnostic.span.end)
                 return invalid(http_origin, lit_str("http diagnostic offset overflow"));
             diagnostic.span.start += http_origin.start;
             diagnostic.span.end += http_origin.start;
             if (diagnostic.span.line == 1) {
                 if (http_origin.line == 0 || http_origin.col == 0 ||
-                    http_origin.col > (~static_cast<u32>(0)) - (diagnostic.span.col - 1u))
+                    http_origin.col > (~u32{0}) - (diagnostic.span.col - 1u))
                     return invalid(http_origin, lit_str("http diagnostic column overflow"));
                 diagnostic.span.line = http_origin.line;
                 diagnostic.span.col += http_origin.col - 1u;
             } else {
                 if (http_origin.line == 0 ||
-                    http_origin.line > (~static_cast<u32>(0)) - (diagnostic.span.line - 1u))
+                    http_origin.line > (~u32{0}) - (diagnostic.span.line - 1u))
                     return invalid(http_origin, lit_str("http diagnostic line overflow"));
                 diagnostic.span.line += http_origin.line - 1u;
             }
@@ -449,8 +449,7 @@ public:
 
         const HttpProfile http = parsed.value();
         if (http.span.start > http_source.len || http.span.end > http_source.len ||
-            http.span.start > http.span.end ||
-            http_origin.start > (~static_cast<u32>(0)) - http.span.end)
+            http.span.start > http.span.end || http_origin.start > (~u32{0}) - http.span.end)
             return invalid(http_origin, lit_str("http span is out of bounds"));
         const u32 http_end = http_origin.start + http.span.end;
         NginxHttpConfig result{};

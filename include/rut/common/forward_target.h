@@ -16,9 +16,8 @@ inline bool forward_target_valid(Str target) {
         const u8 kValue = static_cast<u8>(target.ptr[i]);
         if (kValue <= 0x20 || kValue == 0x7f || kValue == '#') return false;
         if (kValue == '%') {
-            if (static_cast<i64>(target.len) - static_cast<i64>(i) < 3 ||
-                !hex(target.ptr[static_cast<i64>(i) + 1]) ||
-                !hex(target.ptr[static_cast<i64>(i) + 2]))
+            if (i64{target.len} - i64{i} < 3 || !hex(target.ptr[i64{i} + 1]) ||
+                !hex(target.ptr[i64{i} + 2]))
                 return false;
             i = static_cast<u32>(static_cast<i64>(i) + 2);
         }

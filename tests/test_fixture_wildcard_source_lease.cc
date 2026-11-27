@@ -186,19 +186,17 @@ bool canonical_creation_test() {
     if (!ok) return false;
     struct stat directory_status{};
     struct stat source_status{};
-    ok = check(
-        fstat(directory.fd, &directory_status) == 0 &&
-            fstat(lease.descriptor(), &source_status) == 0 &&
-            lease.directory_identity().device ==
-                static_cast<std::uint64_t>(directory_status.st_dev) &&
-            lease.directory_identity().inode ==
-                static_cast<std::uint64_t>(directory_status.st_ino) &&
-            lease.source_identity().device == static_cast<std::uint64_t>(source_status.st_dev) &&
-            lease.source_identity().inode == static_cast<std::uint64_t>(source_status.st_ino) &&
-            lease.source_identity().mode == static_cast<std::uint64_t>(source_status.st_mode) &&
-            lease.source_identity().uid == getuid() && lease.source_identity().gid == getgid() &&
-            lease.source_identity().size == expected_source().size(),
-        "canonical lease did not record complete identity metadata");
+    ok = check(fstat(directory.fd, &directory_status) == 0 &&
+                   fstat(lease.descriptor(), &source_status) == 0 &&
+                   lease.directory_identity().device == std::uint64_t{directory_status.st_dev} &&
+                   lease.directory_identity().inode == std::uint64_t{directory_status.st_ino} &&
+                   lease.source_identity().device == std::uint64_t{source_status.st_dev} &&
+                   lease.source_identity().inode == std::uint64_t{source_status.st_ino} &&
+                   lease.source_identity().mode == std::uint64_t{source_status.st_mode} &&
+                   lease.source_identity().uid == getuid() &&
+                   lease.source_identity().gid == getgid() &&
+                   lease.source_identity().size == expected_source().size(),
+               "canonical lease did not record complete identity metadata");
     if (!ok) return false;
     const off_t selected_offset = 7;
     ok = check(lseek(lease.descriptor(), selected_offset, SEEK_SET) == selected_offset,

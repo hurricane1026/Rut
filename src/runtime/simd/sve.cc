@@ -61,7 +61,7 @@ u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
             i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
             for (i64 i = pos; i < scan_end; i++) {
                 if (buf[i] == '\r') return i;
-                if (!kHeaderValueTable[buf[i]]) return static_cast<u32>(-1);
+                if (!kHeaderValueTable[buf[i]]) return UINT32_MAX;
             }
         }
         pos += static_cast<i64>(vl);
@@ -96,7 +96,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
                     *canon_end_out = (canon_end != end) ? canon_end : i;
                     return static_cast<u32>(i);
                 }
-                if (!kUriTable[b]) return static_cast<u32>(-1);
+                if (!kUriTable[b]) return UINT32_MAX;
                 if ((b == '?' || b == '#') && canon_end == end) canon_end = static_cast<u32>(i);
             }
         }
@@ -121,17 +121,17 @@ u32 scan_header_name(const u8* buf, u32 pos_in, u32 end) {
             i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
             for (i64 i = pos; i < scan_end; i++) {
                 if (buf[i] == ':') return static_cast<u32>(i);
-                if (!kTokenTable[buf[i]]) return static_cast<u32>(-1);
+                if (!kTokenTable[buf[i]]) return UINT32_MAX;
             }
         }
         // No colon — validate all bytes
         i64 scan_end = pos + static_cast<i64>(remaining < vl ? remaining : vl);
         for (i64 j = pos; j < scan_end; j++) {
-            if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
+            if (!kTokenTable[buf[j]]) return UINT32_MAX;
         }
         pos += static_cast<i64>(vl);
     }
-    return static_cast<u32>(-1);
+    return UINT32_MAX;
 }
 
 }  // namespace rut::simd

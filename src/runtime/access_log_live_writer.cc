@@ -215,8 +215,7 @@ SourceLiveAccessLogNotifyStatus SourceLiveAccessLogSession::notify(u32 ring_inde
     const u64 one = 1u;
     for (;;) {
         const ssize_t written = ::write(data_signal_fd_, &one, sizeof(one));
-        if (written == static_cast<ssize_t>(sizeof(one)))
-            return SourceLiveAccessLogNotifyStatus::Notified;
+        if (written == ssize_t{sizeof(one)}) return SourceLiveAccessLogNotifyStatus::Notified;
         if (written < 0 && errno == EINTR) continue;
         if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
             return SourceLiveAccessLogNotifyStatus::Coalesced;
@@ -408,7 +407,7 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
     while (written < line_length) {
         const ssize_t result =
             ::write(output_.get(),
-                    line + static_cast<i64>(written),
+                    line + i64{written},
                     static_cast<size_t>(static_cast<i64>(line_length) - static_cast<i64>(written)));
         if (result > 0) {
             written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(result));
@@ -457,7 +456,7 @@ bool SourceLiveAccessLogSession::drain_event_counter(i32 fd) {
     u64 counter = 0u;
     for (;;) {
         const ssize_t result = ::read(fd, &counter, sizeof(counter));
-        if (result == static_cast<ssize_t>(sizeof(counter))) continue;
+        if (result == ssize_t{sizeof(counter)}) continue;
         if (result < 0 && errno == EINTR) continue;
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
         publish_writer_fatal(
@@ -486,7 +485,7 @@ bool SourceLiveAccessLogSession::signal_event(i32 fd, u8 ring_index, bool produc
     const u64 one = 1u;
     for (;;) {
         const ssize_t result = ::write(fd, &one, sizeof(one));
-        if (result == static_cast<ssize_t>(sizeof(one))) return true;
+        if (result == ssize_t{sizeof(one)}) return true;
         if (result < 0 && errno == EINTR) continue;
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
         publish_fatal(SourceLiveAccessLogFatalKind::Notify,

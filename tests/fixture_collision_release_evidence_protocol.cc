@@ -226,7 +226,7 @@ Bytes envelope(const Envelope& value, std::size_t body_length) {
                             value.target.pid,
                             value.target.start,
                             value.target.netns,
-                            static_cast<u64>(body_length)})
+                            u64{body_length}})
         put(bytes, field);
     return bytes;
 }
@@ -287,8 +287,7 @@ bool bounded_string(const std::string& value, std::size_t maximum) {
 
 bool capture_body(const Bytes& bytes, std::size_t& position, u64 length, std::string& value) {
     return length <= kMaxCapture && length == bytes.size() - position &&
-           get_bytes(bytes, position, static_cast<std::size_t>(length), value) &&
-           at_end(bytes, position);
+           get_bytes(bytes, position, std::size_t{length}, value) && at_end(bytes, position);
 }
 
 bool valid_header(const CollisionHeader7& value) {
@@ -306,9 +305,9 @@ bool cleanup_phase(const Cleanup14& value, bool evidence_closed) {
            value.child_settled == 1u && value.handoff_attempted == 1u &&
            value.handoff_closed == 1u && value.null_attempted == 1u && value.null_closed == 1u &&
            value.capture_settle_attempted == 1u && value.capture_settled == 1u &&
-           value.capture_close_attempted == static_cast<u64>(evidence_closed) &&
-           value.capture_closed == static_cast<u64>(evidence_closed) &&
-           value.diagnostic_phase == 0u && value.diagnostic_error == 0u;
+           value.capture_close_attempted == u64{evidence_closed} &&
+           value.capture_closed == u64{evidence_closed} && value.diagnostic_phase == 0u &&
+           value.diagnostic_error == 0u;
 }
 
 }  // namespace

@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     char directory[4096];
     // Leave room for program.so and its temporary object file below.
     if (snprintf(directory, sizeof(directory), "%s/rut-compile-XXXXXX", temporary) >=
-        static_cast<int>(sizeof(directory) - 16)) {
+        int{sizeof(directory) - 16}) {
         fprintf(stderr, "rut-compile temporary directory is too long\n");
         return 1;
     }

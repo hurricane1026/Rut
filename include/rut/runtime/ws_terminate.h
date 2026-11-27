@@ -19,8 +19,7 @@
 namespace rut {
 struct WsDeflateCodec;
 
-inline constexpr u32 kWsMaxCloseReasonBytes =
-    static_cast<u32>(static_cast<i64>(kWsMaxControlPayload) - 2);
+inline constexpr u32 kWsMaxCloseReasonBytes = u32{i64{kWsMaxControlPayload} - 2};
 
 // Default remains the ordinary-slice payload budget. Explicit larger limits
 // use existing bulk storage; reserve the worst-case masked frame header.

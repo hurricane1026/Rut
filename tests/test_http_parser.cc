@@ -4292,7 +4292,7 @@ TEST(http_parser, request_body_override_bounds_intermediate_header_expansion) {
     const char* raw = "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length:3\r\n\r\nabc";
     const u32 raw_len = static_cast<u32>(strlen(raw));
     char buffer[128];
-    for (u32 i = 0; i < static_cast<u32>(sizeof(buffer)); i++) buffer[i] = static_cast<char>(0x5a);
+    for (u32 i = 0; i < u32{sizeof(buffer)}; i++) buffer[i] = char{0x5a};
     memcpy(buffer, raw, raw_len);
     u32 total = raw_len;
     u32 header_end = request_header_end(buffer);

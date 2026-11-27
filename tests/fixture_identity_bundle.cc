@@ -138,7 +138,7 @@ static bool parse_proc_stat(const std::string& text,
         } else if (field == 22) {
             unsigned long long start = 0;
             if (!(fields >> start)) return false;
-            manifest.start = static_cast<u64>(start);
+            manifest.start = u64{start};
         } else {
             long long ignored = 0;
             if (!(fields >> ignored)) return false;
@@ -447,8 +447,8 @@ static void encode_manifest(std::vector<unsigned char>& output, const RoleManife
     put64(output, static_cast<u64>(manifest.ppid));
     put64(output, static_cast<u64>(manifest.pgid));
     put64(output, static_cast<u64>(manifest.sid));
-    put64(output, static_cast<u64>(manifest.uid));
-    put64(output, static_cast<u64>(manifest.gid));
+    put64(output, u64{manifest.uid});
+    put64(output, u64{manifest.gid});
     put64(output, manifest.netns);
     put64(output, manifest.exe_dev);
     put64(output, manifest.exe_ino);
@@ -512,8 +512,8 @@ static bool validate_role(const RoleBundle& role, std::string& error) {
     // hardlink attestation are deliberately outside this transport core.
     struct stat executable{};
     if (fstat(role.fds[static_cast<size_t>(FdSlot::Executable)], &executable) != 0 ||
-        static_cast<u64>(executable.st_dev) != m.exe_dev ||
-        static_cast<u64>(executable.st_ino) != m.exe_ino || !S_ISREG(executable.st_mode))
+        u64{executable.st_dev} != m.exe_dev || u64{executable.st_ino} != m.exe_ino ||
+        !S_ISREG(executable.st_mode))
         return invalid("executable stat invalid");
     std::string netns_link;
     if (!fd_link(role.fds[static_cast<size_t>(FdSlot::Netns)], netns_link) ||
@@ -778,9 +778,9 @@ bool open_role(
         error = "identity bundle executable/netns stat failed";
         return false;
     }
-    role_bundle.manifest.netns = static_cast<u64>(netns.st_ino);
-    role_bundle.manifest.exe_dev = static_cast<u64>(executable.st_dev);
-    role_bundle.manifest.exe_ino = static_cast<u64>(executable.st_ino);
+    role_bundle.manifest.netns = u64{netns.st_ino};
+    role_bundle.manifest.exe_dev = u64{executable.st_dev};
+    role_bundle.manifest.exe_ino = u64{executable.st_ino};
     role_bundle.manifest.argv_length = cmdline.size();
     role_bundle.manifest.argv_hash = hash_bytes(cmdline);
     if (!validate_role(role_bundle, error)) {
@@ -823,9 +823,9 @@ bool adopt_role(Role role,
         error = "inherited identity bundle executable/netns stat failed";
         return false;
     }
-    role_bundle.manifest.netns = static_cast<u64>(netns.st_ino);
-    role_bundle.manifest.exe_dev = static_cast<u64>(executable.st_dev);
-    role_bundle.manifest.exe_ino = static_cast<u64>(executable.st_ino);
+    role_bundle.manifest.netns = u64{netns.st_ino};
+    role_bundle.manifest.exe_dev = u64{executable.st_dev};
+    role_bundle.manifest.exe_ino = u64{executable.st_ino};
     role_bundle.manifest.argv_length = cmdline.size();
     role_bundle.manifest.argv_hash = hash_bytes(cmdline);
     if (!validate_role(role_bundle, error)) {
@@ -982,7 +982,7 @@ static std::vector<unsigned char> encode_dropped_header() {
     put32(output, kDroppedMagic);
     put16(output, kDroppedVersion);
     put16(output, static_cast<u16>(Role::Dropped));
-    put16(output, static_cast<u16>(kDroppedFdCount));
+    put16(output, u16{kDroppedFdCount});
     put16(output, 0);
     put32(output, 0);
     return output;

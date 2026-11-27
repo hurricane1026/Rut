@@ -179,7 +179,7 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
     if (!valid || !(seen & 1)) return false;
     char port_suffix[7]{};
     if (endpoint.port != 443)
-        snprintf(port_suffix, sizeof(port_suffix), ":%u", static_cast<unsigned>(endpoint.port));
+        snprintf(port_suffix, sizeof(port_suffix), ":%u", unsigned{endpoint.port});
     const int prefix = snprintf(out,
                                 cap,
                                 "%.*s %s HTTP/1.1\r\nHost: %s%s\r\nAccept-Encoding: "
@@ -226,8 +226,8 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
 
 core::Expected<void, Error> HttpCallWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
-    const i64 storage_size = static_cast<i64>(sizeof(Slot)) * static_cast<i64>(kCapacity) + 64;
-    auto allocated = storage.init(static_cast<u64>(storage_size));
+    const i64 storage_size = i64{sizeof(Slot)} * i64{kCapacity} + 64;
+    auto allocated = storage.init(u64{storage_size});
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
@@ -263,13 +263,10 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
         if (state == Empty || slot.connection != connection ||
             (generation && slot.generation != generation))
             continue;
-        while (state != Empty && state != Cancelled &&
-               !__atomic_compare_exchange_n(&slot.state,
-                                            &state,
-                                            static_cast<u32>(Cancelled),
-                                            false,
-                                            __ATOMIC_ACQ_REL,
-                                            __ATOMIC_ACQUIRE)) {
+        while (
+            state != Empty && state != Cancelled &&
+            !__atomic_compare_exchange_n(
+                &slot.state, &state, u32{Cancelled}, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         }
     }
 }
@@ -294,7 +291,7 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
     u64 elapsed = 0;
     if (found) {
         if (now < found->started || sub_overflow(now, found->started, &elapsed) ||
-            elapsed >= static_cast<u64>(found->timeout)) {
+            elapsed >= u64{found->timeout}) {
             cancel(connection, generation);
             reply.status = -2;
             return reply;
@@ -302,7 +299,7 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
         if (__atomic_load_n(&found->state, __ATOMIC_ACQUIRE) == Done) {
             reply = found->reply;
             OPENSSL_cleanse(&found->reply, sizeof(found->reply));
-            __atomic_store_n(&found->state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+            __atomic_store_n(&found->state, u32{Empty}, __ATOMIC_RELEASE);
             return reply;
         }
     } else {
@@ -322,7 +319,7 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
             slot.timeout = timeout;
             slot.reply = {};
             found = &slot;
-            __atomic_store_n(&slot.state, static_cast<u32>(Queued), __ATOMIC_RELEASE);
+            __atomic_store_n(&slot.state, u32{Queued}, __ATOMIC_RELEASE);
             break;
         }
     }
@@ -354,14 +351,14 @@ void HttpCallWorker::run() {
                 ::new (&fetch) HttpsFetch();
                 OPENSSL_cleanse(slot.request, sizeof(slot.request));
                 OPENSSL_cleanse(&slot.reply, sizeof(slot.reply));
-                __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                __atomic_store_n(&slot.state, u32{Empty}, __ATOMIC_RELEASE);
                 continue;
             }
             if (state == Queued) {
                 u32 expected = Queued;
                 if (!__atomic_compare_exchange_n(&slot.state,
                                                  &expected,
-                                                 static_cast<u32>(Running),
+                                                 u32{Running},
                                                  false,
                                                  __ATOMIC_ACQ_REL,
                                                  __ATOMIC_ACQUIRE))
@@ -381,12 +378,8 @@ void HttpCallWorker::run() {
             fetch.~HttpsFetch();
             ::new (&fetch) HttpsFetch();
             u32 expected = Running;
-            __atomic_compare_exchange_n(&slot.state,
-                                        &expected,
-                                        static_cast<u32>(Done),
-                                        false,
-                                        __ATOMIC_RELEASE,
-                                        __ATOMIC_RELAXED);
+            __atomic_compare_exchange_n(
+                &slot.state, &expected, u32{Done}, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
         }
         nanosleep(&idle, nullptr);
     }

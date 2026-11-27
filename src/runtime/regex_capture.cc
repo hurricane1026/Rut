@@ -93,7 +93,7 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
     Match matches[64]{};
     u32 count = 0;
     u32 search = 0;
-    i64 size = static_cast<i64>(subject.len);
+    i64 size = i64{subject.len};
     while (search <= subject.len) {
         re2::StringView found;
         if (!regex.Match(
@@ -128,15 +128,15 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
     i64 written = 0;
     for (u32 i = 0; i < count; ++i) {
         const auto match = matches[i];
-        const i64 length = static_cast<i64>(match.start) - static_cast<i64>(copied);
+        const i64 length = i64{match.start} - i64{copied};
         if (length) __builtin_memcpy(data + written, text.ptr + copied, length);
         written += length;
         if (replacement.len) __builtin_memcpy(data + written, replacement.ptr, replacement.len);
-        written += static_cast<i64>(replacement.len);
-        copied = static_cast<i64>(match.end);
+        written += i64{replacement.len};
+        copied = i64{match.end};
     }
-    if (static_cast<i64>(text.len) > copied)
-        __builtin_memcpy(data + written, text.ptr + copied, static_cast<i64>(text.len) - copied);
+    if (i64{text.len} > copied)
+        __builtin_memcpy(data + written, text.ptr + copied, i64{text.len} - copied);
     *output = {data, static_cast<u32>(size)};
     return 1;
 }

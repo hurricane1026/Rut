@@ -62,7 +62,7 @@ struct EpochLoopF {
         if (conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u) !=
             sizeof(kRequest) - 1u)
             return false;
-        loop.dispatch(make_ev(conn.id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1u)));
+        loop.dispatch(make_ev(conn.id, IoEventType::Recv, i32{sizeof(kRequest) - 1u}));
         return true;
     }
 };

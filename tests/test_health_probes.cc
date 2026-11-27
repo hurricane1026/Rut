@@ -117,8 +117,7 @@ struct ProbeRig {
 
     bool respond(Socket& peer, const char* response) {
         const u32 kLength = static_cast<u32>(strlen(response));
-        if (send(peer.fd, response, kLength, MSG_NOSIGNAL) != static_cast<ssize_t>(kLength))
-            return false;
+        if (send(peer.fd, response, kLength, MSG_NOSIGNAL) != ssize_t{kLength}) return false;
         return until([&] { return !probe_in_flight(0, 0); });
     }
 

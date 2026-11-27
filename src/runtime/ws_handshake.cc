@@ -127,12 +127,10 @@ bool offered_protocol_exists(const u8* storage, u32 offers_len, Str candidate) {
     i64 start = 0;
     while (start < offers_len) {
         i64 end = start;
-        while (end < offers_len && storage[static_cast<i64>(kWsHandshakeAcceptLength) + end] != ',')
-            ++end;
-        if (end - start == static_cast<i64>(candidate.len) &&
-            __builtin_memcmp(storage + static_cast<i64>(kWsHandshakeAcceptLength) + start,
-                             candidate.ptr,
-                             candidate.len) == 0)
+        while (end < offers_len && storage[i64{kWsHandshakeAcceptLength} + end] != ',') ++end;
+        if (end - start == i64{candidate.len} &&
+            __builtin_memcmp(
+                storage + i64{kWsHandshakeAcceptLength} + start, candidate.ptr, candidate.len) == 0)
             return true;
         start = end + 1;
     }
@@ -155,18 +153,15 @@ bool append_request_protocols(const ParsedRequest& request,
             const Str kToken = trim_ows({kValue.ptr + start, static_cast<u32>(end - start)});
             if (!protocol_token_valid(kToken)) return false;
             const i64 kSeparator = out == 0 ? 0 : 1;
-            if (out > static_cast<i64>(storage_capacity) -
-                          static_cast<i64>(kWsHandshakeAcceptLength) ||
-                kSeparator + static_cast<i64>(kToken.len) >
-                    static_cast<i64>(storage_capacity) -
-                        static_cast<i64>(kWsHandshakeAcceptLength) - out)
+            if (out > i64{storage_capacity} - i64{kWsHandshakeAcceptLength} ||
+                kSeparator + i64{kToken.len} >
+                    i64{storage_capacity} - i64{kWsHandshakeAcceptLength} - out)
                 return false;
             if (kSeparator) {
-                storage[static_cast<i64>(kWsHandshakeAcceptLength) + out] = ',';
+                storage[i64{kWsHandshakeAcceptLength} + out] = ',';
                 ++out;
             }
-            __builtin_memcpy(
-                storage + static_cast<i64>(kWsHandshakeAcceptLength) + out, kToken.ptr, kToken.len);
+            __builtin_memcpy(storage + i64{kWsHandshakeAcceptLength} + out, kToken.ptr, kToken.len);
             out += i64{kToken.len};
             if (end == kValue.len) break;
             start = end + 1;
@@ -185,8 +180,7 @@ bool encode_accept(Str key, u8* out, u32 out_capacity) {
     u32 encoded_len = 0;
     return rut_crypto_digest_parts_v1(
                RUT_CRYPTO_SHA1_V1, kParts, 2, nullptr, 0, 0, digest, sizeof(digest), &digest_len) &&
-           digest_len == sizeof(digest) &&
-           static_cast<i64>(out_capacity) >= static_cast<i64>(kWsHandshakeAcceptLength) + 1 &&
+           digest_len == sizeof(digest) && i64{out_capacity} >= i64{kWsHandshakeAcceptLength} + 1 &&
            rut_crypto_base64_encode_v1(digest, sizeof(digest), out, out_capacity, &encoded_len) &&
            encoded_len == kWsHandshakeAcceptLength;
 }
@@ -242,8 +236,7 @@ WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
                                                  u8* storage,
                                                  u32 capacity,
                                                  u32* offers_len) {
-    if (!offers_len ||
-        (storage && static_cast<i64>(capacity) < static_cast<i64>(kWsHandshakeAcceptLength) + 1))
+    if (!offers_len || (storage && i64{capacity} < i64{kWsHandshakeAcceptLength} + 1))
         return WsHandshakeRequestResult::BadRequest;
     *offers_len = 0;
     i32 versions = 0;
@@ -304,8 +297,7 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
     if (downstream_deflate) *downstream_deflate = {};
     if (request == nullptr || header_len == 0 || header_len > SlicePool::kSliceSize ||
         out_offers_len == nullptr ||
-        (storage != nullptr &&
-         static_cast<i64>(storage_capacity) < static_cast<i64>(kWsHandshakeAcceptLength) + 1))
+        (storage != nullptr && i64{storage_capacity} < i64{kWsHandshakeAcceptLength} + 1))
         return WsHandshakeRequestResult::BadRequest;
     *out_offers_len = 0;
     HttpParser parser{};
@@ -403,8 +395,7 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr ||
-        static_cast<i64>(offers_len) >
-            static_cast<i64>(SlicePool::kSliceSize) - static_cast<i64>(kWsHandshakeAcceptLength) ||
+        i64{offers_len} > i64{SlicePool::kSliceSize} - i64{kWsHandshakeAcceptLength} ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)
@@ -469,7 +460,7 @@ u32 ws_build_h1_handshake(const ParsedRequest& request,
         return 0;
     i64 used = 0;
     auto put = [&](Str text) {
-        if (static_cast<i64>(text.len) > static_cast<i64>(capacity) - used) return false;
+        if (i64{text.len} > i64{capacity} - used) return false;
         __builtin_memcpy(output + used, text.ptr, text.len);
         used += i64{text.len};
         return true;
@@ -503,10 +494,9 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
     bool selected = false;
     while (read < header_len) {
         i64 end = read;
-        while (end + 1 < static_cast<i64>(header_len) &&
-               (request[end] != '\r' || request[end + 1] != '\n'))
+        while (end + 1 < i64{header_len} && (request[end] != '\r' || request[end + 1] != '\n'))
             ++end;
-        if (end + 1 >= static_cast<i64>(header_len)) return 0;
+        if (end + 1 >= i64{header_len}) return 0;
         const i64 kNext = end + 2;
         i64 colon = read;
         while (colon < end && request[colon] != ':') colon++;
@@ -550,7 +540,7 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
     }
     if (!selected) return 0;
     __builtin_memmove(request + write,
-                      request + static_cast<i64>(header_len),
+                      request + i64{header_len},
                       static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
     return static_cast<u32>(write);
 }

@@ -195,7 +195,7 @@ constexpr HuffFsm kFsm = build_fsm();
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
         // RUT_INTEGER_RANGE: acc <= UINT32_MAX and at most 7 bits are added at shift <= 28.
-        acc += static_cast<i64>(kB & 0x7f) << shift;
+        acc += i64{kB & 0x7f} << shift;
         if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
         shift += 7;
@@ -295,7 +295,7 @@ constexpr HuffFsm kFsm = build_fsm();
     if (kHdr == 0) return 0;
     const auto kConsumed = range_int(kHdr) + range_int(slen);
     if (kConsumed.value() > len) return 0;  // truncated payload
-    const u8* data = in + static_cast<i64>(kHdr);
+    const u8* data = in + i64{kHdr};
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
         if (!range_int(kN).to(out_len)) return 0;
@@ -317,7 +317,7 @@ constexpr HuffFsm kFsm = build_fsm();
     }
     const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
     for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
-    return kHdr + static_cast<i64>(len);
+    return kHdr + i64{len};
 }
 
 namespace {
@@ -477,12 +477,11 @@ void dyn_clear(DynamicTable& d) {
 
 [[nodiscard]] bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
     if (i >= d.nent) return false;
-    const i64 kEntry = static_cast<i64>(d.nent) - 1 - static_cast<i64>(i);
+    const i64 kEntry = i64{d.nent} - 1 - i64{i};
     const DynamicTable::Entry& e = d.ents[kEntry];
-    name->ptr = reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off));
+    name->ptr = reinterpret_cast<const char*>(d.buf + i64{e.off});
     name->len = e.nlen;
-    value->ptr =
-        reinterpret_cast<const char*>(d.buf + static_cast<i64>(e.off) + static_cast<i64>(e.nlen));
+    value->ptr = reinterpret_cast<const char*>(d.buf + i64{e.off} + i64{e.nlen});
     value->len = e.vlen;
     return true;
 }
@@ -491,7 +490,7 @@ void dyn_clear(DynamicTable& d) {
 [[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
     if (idx <= kStaticCount) {
-        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
+        const StaticEntry& e = kStatic[i64{idx} - 1];
         *name = {e.name, e.nlen};
         *value = {e.value, e.vlen};
         return true;
@@ -505,7 +504,7 @@ void dyn_clear(DynamicTable& d) {
     Str value;
     if (idx <= kStaticCount) {
         if (idx == 0) return false;
-        const StaticEntry& e = kStatic[static_cast<i64>(idx) - 1];
+        const StaticEntry& e = kStatic[i64{idx} - 1];
         *name = {e.name, e.nlen};
         return true;
     }
@@ -593,7 +592,7 @@ void DynamicTable::init(u32 settings_max) {
             u32 idx = 0;
             const u32 kC = decode_integer(in + pos, input_length, 7, &idx);
             if (kC == 0 || idx == 0) return false;
-            pos += static_cast<i64>(kC);
+            pos += i64{kC};
             Str name, value;
             if (!resolve_full(dyn, idx, &name, &value)) return false;
             if (hc >= max_headers) return false;
@@ -605,7 +604,7 @@ void DynamicTable::init(u32 settings_max) {
             u32 sz = 0;
             const u32 kC = decode_integer(in + pos, input_length, 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
-            pos += static_cast<i64>(kC);
+            pos += i64{kC};
             if (!dyn_set_max_size(dyn, sz)) return false;
             continue;
         }
@@ -616,7 +615,7 @@ void DynamicTable::init(u32 settings_max) {
         u32 nidx = 0;
         const u32 kNc = decode_integer(in + pos, input_length, kPrefix, &nidx);
         if (kNc == 0) return false;
-        pos += static_cast<i64>(kNc);
+        pos += i64{kNc};
 
         Str name;
         if (nidx == 0) {
@@ -628,9 +627,9 @@ void DynamicTable::init(u32 settings_max) {
             const u32 kSc =
                 decode_string(in + pos, input_length, out_buf + op, output_length, &nlen);
             if (kSc == 0) return false;
-            pos += static_cast<i64>(kSc);
+            pos += i64{kSc};
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += static_cast<i64>(nlen);
+            op += i64{nlen};
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
@@ -642,18 +641,18 @@ void DynamicTable::init(u32 settings_max) {
             return false;
         const u32 kVc = decode_string(in + pos, input_length, out_buf + op, output_length, &vlen);
         if (kVc == 0) return false;
-        pos += static_cast<i64>(kVc);
+        pos += i64{kVc};
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
-        op += static_cast<i64>(vlen);
+        op += i64{vlen};
 
         if (kIncremental) {
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
-                if (op + static_cast<i64>(name.len) > static_cast<i64>(out_cap)) return false;
+                if (op + i64{name.len} > i64{out_cap}) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += static_cast<i64>(name.len);
+                op += i64{name.len};
             }
             if (!dyn_add(dyn, name, value)) return false;
         }

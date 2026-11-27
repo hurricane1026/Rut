@@ -24,7 +24,7 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
     };
     static constexpr char kHex[] = "0123456789ABCDEF";
     i64 path_end = 0;
-    while (path_end < static_cast<i64>(input.len) && input.ptr[path_end] != '?') ++path_end;
+    while (path_end < i64{input.len} && input.ptr[path_end] != '?') ++path_end;
     i64 decoded = 0;
     for (i64 i = 0; i < path_end; ++i) {
         if (input.ptr[i] != '%') {
@@ -65,7 +65,7 @@ inline bool normalize_forward_target(Str input, char* output, u32 capacity, u32*
         write += kSize;
     }
     if (trailing_slash && write > 1) output[write++] = '/';
-    const i64 kQueryLength = static_cast<i64>(input.len) - path_end;
+    const i64 kQueryLength = i64{input.len} - path_end;
     if (kQueryLength != 0)
         __builtin_memmove(output + write, input.ptr + path_end, static_cast<u32>(kQueryLength));
     *length = static_cast<u32>(write + kQueryLength);

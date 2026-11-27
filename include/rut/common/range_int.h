@@ -15,15 +15,15 @@ concept RangeSource =
     __is_same(T, i32) || __is_same(T, u32) || __is_same(T, i64);
 
 template <RangeSource T>
-inline constexpr bool kRangeSourceSigned = static_cast<T>(-1) < T{0};
+inline constexpr bool kRangeSourceSigned =
+    __is_same(T, i8) || __is_same(T, i16) || __is_same(T, i32) || __is_same(T, i64);
 
 template <RangeSource T>
 inline constexpr __int128_t kRangeSourceEnd =
     __int128_t{1} << (sizeof(T) * __CHAR_BIT__ - kRangeSourceSigned<T>);
 
 template <RangeSource T>
-inline constexpr i64 kRangeSourceBegin =
-    kRangeSourceSigned<T> ? static_cast<i64>(-kRangeSourceEnd<T>) : 0;
+inline constexpr i64 kRangeSourceBegin = kRangeSourceSigned<T> ? i64{-kRangeSourceEnd<T>} : 0;
 
 struct RangeProof {};
 inline constexpr RangeProof kRangeProof{};
@@ -100,7 +100,7 @@ public:
     }
 
     template <i64 Factor>
-        requires(Factor >= 0 && static_cast<__int128_t>(Begin) * Factor >= INT64_MIN &&
+        requires(Factor >= 0 && __int128_t{Begin} * Factor >= INT64_MIN &&
                  (End - 1) * Factor <= INT64_MAX)
     constexpr auto scaled_by() const {
         // RUT_INTEGER_RANGE: the requires clause bounds the product of both endpoints.
@@ -175,8 +175,8 @@ public:
     // Only expose the conversion if the destination can represent every value.
     template <detail::RangeSource T>
         requires(Begin >= detail::kRangeSourceBegin<T> && End <= detail::kRangeSourceEnd<T>)
-    constexpr T to() const {
-        return static_cast<T>(value_);
+    [[nodiscard]] constexpr T to() const {
+        return value_;
     }
 
     // A narrower destination for a value whose range is known only at runtime.
@@ -187,7 +187,7 @@ public:
             if (value_ < detail::kRangeSourceBegin<T>) return false;
         if constexpr (End > detail::kRangeSourceEnd<T>)
             if (value_ >= detail::kRangeSourceEnd<T>) return false;
-        *out = static_cast<T>(value_);
+        *out = value_;
         return true;
     }
 
@@ -198,10 +198,10 @@ public:
                                                                    value_ / Divisor);
     }
 
-    constexpr u64 to_u64() const
+    [[nodiscard]] constexpr u64 to_u64() const
         requires(Begin >= 0)
     {
-        return static_cast<u64>(value_);
+        return value_;
     }
 
     // out must point to writable storage. Write only if the ABI type can hold the value.
@@ -211,16 +211,16 @@ public:
     [[nodiscard]] constexpr bool try_to_signed(T* out) const {
         constexpr auto kLimit = __int128_t{1} << (sizeof(T) * __CHAR_BIT__ - 1);
         if constexpr (Begin < -kLimit || End > kLimit) {
-            constexpr i64 kMin = static_cast<i64>(-kLimit);
-            constexpr i64 kMax = static_cast<i64>(kLimit - 1);
+            constexpr i64 kMin = i64{-kLimit};
+            constexpr i64 kMax = i64{kLimit - 1};
             if (value_ < kMin || value_ > kMax) return false;
         }
-        *out = static_cast<T>(value_);
+        *out = value_;
         return true;
     }
 
     template <i64 OtherBegin, __int128_t OtherEnd>
-        requires(static_cast<__int128_t>(Begin) + OtherBegin >= INT64_MIN &&
+        requires(__int128_t{Begin} + OtherBegin >= INT64_MIN &&
                  End + OtherEnd - 1 <= kI64ExclusiveEnd)
     constexpr auto operator+(range_int<OtherBegin, OtherEnd> other) const {
         // RUT_INTEGER_RANGE: the requires clause bounds the sum of both operand ranges.

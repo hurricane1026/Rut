@@ -32,10 +32,10 @@ bool offered(const ParsedRequest& request, Str required) {
             u32 end = start;
             while (end < h.value.len && h.value.ptr[end] != ',') ++end;
             u32 last = end;
-            while (last > start && (h.value.ptr[static_cast<i64>(last) - 1] == ' ' ||
-                                    h.value.ptr[static_cast<i64>(last) - 1] == '\t'))
+            while (last > start &&
+                   (h.value.ptr[i64{last} - 1] == ' ' || h.value.ptr[i64{last} - 1] == '\t'))
                 last = static_cast<u32>(static_cast<i64>(last) - 1);
-            if (Str{h.value.ptr + static_cast<i64>(start),
+            if (Str{h.value.ptr + i64{start},
                     static_cast<u32>(static_cast<i64>(last) - static_cast<i64>(start))}
                     .eq(required))
                 return true;
@@ -288,7 +288,7 @@ bool ws_h2_process(GrpcExchange& exchange, bool from_client) {
     }
     if (consumed) {
         length = static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(consumed));
-        if (length) __builtin_memmove(input, input + static_cast<i64>(consumed), length);
+        if (length) __builtin_memmove(input, input + i64{consumed}, length);
         Connection* owner = from_client ? exchange.downstream : exchange.upstream;
         if (owner && owner->h2 && !owner->h2->grpc.websocket_http1 &&
             !owner->h2->grpc.websocket_http1_downstream &&
@@ -324,14 +324,13 @@ const u8* ws_h2_output(GrpcExchange& exchange, bool from_client, u32* length) {
                                static_cast<i64>(session.output_offset[kIndex]));
     if (!*length) return nullptr;
     return (from_client ? session.callback.ws_c2u_out : session.callback.ws_u2c_out) +
-           static_cast<i64>(session.output_offset[kIndex]);
+           i64{session.output_offset[kIndex]};
 }
 
 bool ws_h2_consume_output(GrpcExchange& exchange, bool from_client, u32 length) {
     auto& session = *exchange.ws;
     const u32 kIndex = from_client ? 0 : 1;
-    if (static_cast<i64>(length) > static_cast<i64>(session.output_length[kIndex]) -
-                                       static_cast<i64>(session.output_offset[kIndex]))
+    if (i64{length} > i64{session.output_length[kIndex]} - i64{session.output_offset[kIndex]})
         return false;
     session.output_offset[kIndex] = static_cast<u32>(
         static_cast<i64>(session.output_offset[kIndex]) + static_cast<i64>(length));

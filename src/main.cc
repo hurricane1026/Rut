@@ -172,7 +172,7 @@ static void write_memlock_limit(rlim_t v) {
     if (v == RLIM_INFINITY) {
         write_str("unlimited");
     } else {
-        write_u64(static_cast<u64>(v) / 1024);
+        write_u64(u64{v} / 1024);
         write_str(" KiB");
     }
 }
@@ -1336,7 +1336,7 @@ int main(int argc, char** argv) {
                 access_log_level = 0;
                 cli_access_log_level_present = true;
                 for (const char* p = argv[i]; *p >= '0' && *p <= '9'; p++)
-                    access_log_level = access_log_level * 10 + static_cast<i32>(*p - '0');
+                    access_log_level = access_log_level * 10 + i32{*p - '0'};
             } else if (str_eq(argv[i], "--opt")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--opt requires a numeric argument (0-3)\n");

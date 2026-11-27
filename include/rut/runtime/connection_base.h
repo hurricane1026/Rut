@@ -550,9 +550,7 @@ struct ConnectionBase {
         auto reanchor = [&](Str& value) {
             if (value.ptr == nullptr) return;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < old_base ||
-                ptr + static_cast<i64>(value.len) > old_base + static_cast<i64>(old_len))
-                return;
+            if (ptr < old_base || ptr + i64{value.len} > old_base + i64{old_len}) return;
             value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
         };
         reanchor(req_path_override);
@@ -567,9 +565,7 @@ struct ConnectionBase {
             auto& value = resp_header_mutations[i].value;
             if (value.ptr == nullptr) continue;
             const auto* ptr = reinterpret_cast<const u8*>(value.ptr);
-            if (ptr < old_base ||
-                ptr + static_cast<i64>(value.len) > old_base + static_cast<i64>(old_len))
-                continue;
+            if (ptr < old_base || ptr + i64{value.len} > old_base + i64{old_len}) continue;
             value.ptr = reinterpret_cast<const char*>(new_base + (ptr - old_base));
         }
     }
@@ -873,10 +869,8 @@ struct ConnectionBase {
         return context;
     }
     // Dedicated inline control storage is never reused while its send is pending.
-    u8 ws_close_frame_client[static_cast<i64>(kWsMaxHeaderSize) +
-                             static_cast<i64>(kWsMaxControlPayload)];
-    u8 ws_close_frame_upstream[static_cast<i64>(kWsMaxHeaderSize) +
-                               static_cast<i64>(kWsMaxControlPayload)];
+    u8 ws_close_frame_client[i64{kWsMaxHeaderSize} + i64{kWsMaxControlPayload}];
+    u8 ws_close_frame_upstream[i64{kWsMaxHeaderSize} + i64{kWsMaxControlPayload}];
 
     // JIT handler state.
     //   handler_state: current state-machine index; handler reads this at
@@ -901,7 +895,7 @@ struct ConnectionBase {
     u16 jit_ready_state = 0;
     bool jit_ready_queued = false;
     alignas(alignof(u64)) u8
-        handler_ctx_storage[sizeof(jit::HandlerCtx) + static_cast<i64>(kMaxJitHandlerSlots) * 8]{};
+        handler_ctx_storage[sizeof(jit::HandlerCtx) + i64{kMaxJitHandlerSlots} * 8]{};
 
     jit::HandlerCtx* reset_jit_ctx() {
         __builtin_memset(handler_ctx_storage, 0, sizeof(handler_ctx_storage));
@@ -1213,8 +1207,8 @@ struct ConnectionBase {
             response_read_deadline_post_commit_inflight_body != len ||
             response_read_deadline_post_commit_downstream_submitted <
                 response_read_deadline_post_commit_downstream_completed ||
-            static_cast<i64>(response_read_deadline_post_commit_downstream_submitted) -
-                    static_cast<i64>(response_read_deadline_post_commit_downstream_completed) !=
+            i64{response_read_deadline_post_commit_downstream_submitted} -
+                    i64{response_read_deadline_post_commit_downstream_completed} !=
                 len ||
             response_read_deadline_post_commit_origin_received <=
                 response_read_deadline_post_commit_downstream_completed)
@@ -1699,10 +1693,9 @@ struct ConnectionBase {
             count > capacity || req_header_end > count || req_initial_send_len > count ||
             req_raw_target_offset >= req_header_end)
             return invalid;
-        const i64 target_end =
-            static_cast<i64>(req_raw_target_offset) + static_cast<i64>(req_raw_target_length);
-        if (target_end >= static_cast<i64>(req_header_end) ||
-            target_end > static_cast<i64>(count) || target_end > static_cast<i64>(capacity))
+        const i64 target_end = i64{req_raw_target_offset} + i64{req_raw_target_length};
+        if (target_end >= i64{req_header_end} || target_end > i64{count} ||
+            target_end > i64{capacity})
             return invalid;
 
         const u8* base = recv_buf.data();
@@ -1767,9 +1760,9 @@ struct ConnectionBase {
         // Bounds above are proven before these bytes are examined.
         const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
         const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
-        if ((!h10 && !h11) || base[static_cast<i64>(req_raw_target_offset) - 1] != ' ' ||
+        if ((!h10 && !h11) || base[i64{req_raw_target_offset} - 1] != ' ' ||
             base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
-            target_end + 11 > static_cast<i64>(req_header_end) || base[target_end + 1] != 'H' ||
+            target_end + 11 > i64{req_header_end} || base[target_end + 1] != 'H' ||
             base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
             base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
             base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
@@ -1777,7 +1770,7 @@ struct ConnectionBase {
             base[target_end + 9] != '\r' || base[target_end + 10] != '\n')
             return invalid;
         return {RawRequestTargetWitnessState::Valid,
-                {reinterpret_cast<const char*>(base + static_cast<i64>(req_raw_target_offset)),
+                {reinterpret_cast<const char*>(base + i64{req_raw_target_offset}),
                  req_raw_target_length}};
     }
 
@@ -2124,7 +2117,7 @@ struct ConnectionBase {
         const auto* next = response_body_tail.head->next;
         return response_send_vector.first_source == buffered_response_data() &&
                response_send_vector.second_source ==
-                   ResponseBodyChain::payload(next) + static_cast<i64>(next->offset) &&
+                   ResponseBodyChain::payload(next) + i64{next->offset} &&
                response_send_vector.first_size == first && response_send_vector.total_size == len;
     }
     u32 buffered_response_len() const {

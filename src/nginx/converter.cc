@@ -416,7 +416,7 @@ FrontendResult<bool> validate_proxy_buffering(const Server& server) {
             return unsupported(buffering.span,
                                lit_str("proxy_buffering off metadata does not match its source"));
         const u64 fresh_timeout_value_start64 =
-            static_cast<u64>(server.span.start) + fresh_timeout.value_span.start;
+            u64{server.span.start} + fresh_timeout.value_span.start;
         if (fresh_timeout_value_start64 > UINT32_MAX ||
             fresh_timeout.value_span.end - fresh_timeout.value_span.start != 2u ||
             trusted_source_at(source_base, static_cast<u32>(fresh_timeout_value_start64))[0] !=
@@ -2246,20 +2246,19 @@ bool rebase_http_diagnostic(const Diagnostic& local,
     if (span.start > source_len || span.end > source_len || span.start > span.end ||
         span.line == 0 || span.col == 0)
         return false;
-    if (!is_valid_span(origin) || origin.start > ~static_cast<u32>(0) - span.start ||
-        origin.start > ~static_cast<u32>(0) - span.end)
+    if (!is_valid_span(origin) || origin.start > ~u32{0} - span.start ||
+        origin.start > ~u32{0} - span.end)
         return false;
     rebased = local;
     rebased.span.start += origin.start;
     rebased.span.end += origin.start;
     if (span.line == 1) {
-        if (origin.line == 0 || origin.col == 0 ||
-            origin.col > ~static_cast<u32>(0) - (span.col - 1u))
+        if (origin.line == 0 || origin.col == 0 || origin.col > ~u32{0} - (span.col - 1u))
             return false;
         rebased.span.line = origin.line;
         rebased.span.col += origin.col - 1u;
     } else {
-        if (origin.line == 0 || origin.line > ~static_cast<u32>(0) - (span.line - 1u)) return false;
+        if (origin.line == 0 || origin.line > ~u32{0} - (span.line - 1u)) return false;
         rebased.span.line += origin.line - 1u;
     }
     return true;
@@ -2389,7 +2388,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                        "Bad Request",
                        11,
                        kBadRequestBody,
-                       static_cast<u32>(__builtin_strlen(kBadRequestBody))) ||
+                       u32{__builtin_strlen(kBadRequestBody)}) ||
         !put_unmatched(writer,
                        "CONNECT",
                        7,
@@ -2397,7 +2396,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                        "Not Allowed",
                        11,
                        kNotAllowedBody,
-                       static_cast<u32>(__builtin_strlen(kNotAllowedBody))) ||
+                       u32{__builtin_strlen(kNotAllowedBody)}) ||
         !put_unmatched(writer,
                        "",
                        0,
@@ -2405,7 +2404,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
                        "Bad Request",
                        11,
                        kBadRequestBody,
-                       static_cast<u32>(__builtin_strlen(kBadRequestBody))))
+                       u32{__builtin_strlen(kBadRequestBody)}))
         return fail_overflow();
 
     if (is_root) {
@@ -2472,7 +2471,7 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
              "\"nginx/1.29.7\",\n") ||
         !put("            content_type: \"text/html\", target_path: \"") ||
         !writer.put(location_path) || !put("\", body: b\"") ||
-        !writer.put_lit(kRedirect301Body, static_cast<u32>(__builtin_strlen(kRedirect301Body))) ||
+        !writer.put_lit(kRedirect301Body, u32{__builtin_strlen(kRedirect301Body)}) ||
         !put("\"})\n") || !put("    } else {\n") ||
         !put("        return forward(nginx_upstream, load_balance: .roundRobin,") ||
         (proxy_location.value() == ProxyLocationProfile::PrefixWithUri &&

@@ -502,7 +502,7 @@ bool transact_loopback(u16 port,
 i64 monotonic_ns() {
     struct timespec now{};
     (void)clock_gettime(CLOCK_MONOTONIC, &now);
-    return static_cast<i64>(now.tv_sec) * 1'000'000'000LL + static_cast<i64>(now.tv_nsec);
+    return i64{now.tv_sec} * 1'000'000'000LL + i64{now.tv_nsec};
 }
 
 // Milliseconds to wait in one poll step: at most 100, 0 once the deadline has passed.

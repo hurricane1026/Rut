@@ -132,7 +132,7 @@ TEST(ws_bulk, complete_payloads_span_io_slices_in_both_directions_without_trunca
                     REQUIRE(owner.pool.init(16, 0, 0, 4));
                     owner.conn.ws_max_message_size = size;
                     REQUIRE(owner.conn.alloc_ws_buffers(owner.pool));
-                    std::vector<u8> payload(size, static_cast<u8>('a'));
+                    std::vector<u8> payload(size, u8{'a'});
                     payload[16383] = 0xe2;
                     payload[16384] = 0x82;
                     payload[16385] = 0xac;

@@ -437,7 +437,7 @@ void child_main(int ready_fd,
                 const int close_result = close(fd);  // Exactly one real attempt.
                 if (prepared && close_attempt_evidence != nullptr)
                     *close_attempt_evidence =
-                        close_result == 0 ? static_cast<int>(*close_attempt_evidence + 1) : -1;
+                        close_result == 0 ? int{*close_attempt_evidence + 1} : -1;
                 errno = EINTR;
                 _exit(126);
             }
@@ -474,8 +474,7 @@ void child_main(int ready_fd,
         }
     }
     if (delay_ms != 0) {
-        timespec delay{static_cast<time_t>(delay_ms / 1000u),
-                       static_cast<long>((delay_ms % 1000u) * 1000000u)};
+        timespec delay{time_t{delay_ms / 1000u}, long{(delay_ms % 1000u) * 1000000u}};
         while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
         }
     }
@@ -488,8 +487,8 @@ void child_main(int ready_fd,
         _exit(121);
     }
     if (post_ready_delay_ms != 0) {
-        timespec delay{static_cast<time_t>(post_ready_delay_ms / 1000u),
-                       static_cast<long>((post_ready_delay_ms % 1000u) * 1000000u)};
+        timespec delay{time_t{post_ready_delay_ms / 1000u},
+                       long{(post_ready_delay_ms % 1000u) * 1000000u}};
         while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
         }
     }
@@ -503,8 +502,8 @@ void child_main(int ready_fd,
     }
     if (close(release_fd) != 0 && prepared) _exit(129);
     if (release == kRelease && post_release_delay_ms != 0) {
-        timespec delay{static_cast<time_t>(post_release_delay_ms / 1000u),
-                       static_cast<long>((post_release_delay_ms % 1000u) * 1000000u)};
+        timespec delay{time_t{post_release_delay_ms / 1000u},
+                       long{(post_release_delay_ms % 1000u) * 1000000u}};
         while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
         }
     }
@@ -521,7 +520,7 @@ void child_main(int ready_fd,
             for (;;) {
                 const ssize_t written = write(exec_status_fd, frame, sizeof(frame));
                 if (written < 0 && errno == EINTR) continue;
-                return written == static_cast<ssize_t>(sizeof(frame));
+                return written == ssize_t{sizeof(frame)};
             }
         };
         if (continuation.status_injection != 0) {
@@ -1616,8 +1615,8 @@ bool PausedChildLease::cleanup(std::chrono::steady_clock::time_point deadline,
         owned_sigkill_sent_ = true;
         if (settlement_) settlement_->sigkill_sent = true;
         if (post_sigkill_delay_ms_ != 0) {
-            timespec delay{static_cast<time_t>(post_sigkill_delay_ms_ / 1000u),
-                           static_cast<long>((post_sigkill_delay_ms_ % 1000u) * 1000000u)};
+            timespec delay{time_t{post_sigkill_delay_ms_ / 1000u},
+                           long{(post_sigkill_delay_ms_ % 1000u) * 1000000u}};
             while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
             }
         }

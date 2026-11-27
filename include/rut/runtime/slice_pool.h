@@ -170,7 +170,7 @@ struct SlicePool {
         study_bulk_borrowed = study_bulk_peak_borrowed = study_bulk_peak_cached = 0;
 
         // Reserve VA for slice data — PROT_NONE, no physical pages
-        base_size = static_cast<u64>(n) * kSliceSize;
+        base_size = u64{n} * kSliceSize;
         void* data_mem = mmap(nullptr, base_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (data_mem == MAP_FAILED) {
             return core::make_unexpected(Error::from_errno(Error::Source::SlicePool));
@@ -178,7 +178,7 @@ struct SlicePool {
         base = static_cast<u8*>(data_mem);
 
         // Commit free stack (small: n * 4 bytes ≈ 128KB for 32K slices)
-        stack_size = static_cast<u64>(n) * sizeof(u32);
+        stack_size = u64{n} * sizeof(u32);
         void* stack_mem =
             mmap(nullptr, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (stack_mem == MAP_FAILED) {
@@ -189,7 +189,7 @@ struct SlicePool {
         free_stack = static_cast<u32*>(stack_mem);
 
         // Commit in-use tracking map (n bytes ≈ 32KB for 32K slices)
-        map_size = static_cast<u64>(n);
+        map_size = u64{n};
         void* map_mem =
             mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (map_mem == MAP_FAILED) {
@@ -206,7 +206,7 @@ struct SlicePool {
         // and committed eagerly, like free_stack/in_use_map above. The bulk
         // data region itself (bulk_base) stays lazy — mapped on first use.
         if (bulk_max_count > 0) {
-            bulk_free_size = static_cast<u64>(bulk_max_count) * sizeof(u32);
+            bulk_free_size = u64{bulk_max_count} * sizeof(u32);
             void* bulk_free_mem = mmap(nullptr,
                                        bulk_free_size,
                                        PROT_READ | PROT_WRITE,
@@ -226,7 +226,7 @@ struct SlicePool {
             bulk_free = static_cast<u32*>(bulk_free_mem);
 
             const u32 words = static_cast<u32>((static_cast<i64>(bulk_max_count) + 63) / 64);
-            bulk_in_use_size = static_cast<u64>(words) * sizeof(u64);
+            bulk_in_use_size = u64{words} * sizeof(u64);
             void* bulk_in_use_mem = mmap(nullptr,
                                          bulk_in_use_size,
                                          PROT_READ | PROT_WRITE,
@@ -271,7 +271,7 @@ struct SlicePool {
     u8* alloc() {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
-        u8* ptr = base + static_cast<i64>(idx) * kSliceSize;
+        u8* ptr = base + i64{idx} * kSliceSize;
         if (cached_count != 0) --cached_count;
         if (in_use_map) in_use_map[idx] = 1;
         return ptr;
@@ -300,7 +300,7 @@ struct SlicePool {
 
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
         return bulk_base != nullptr && ptr >= bulk_base &&
-               ptr < bulk_base + static_cast<i64>(bulk_max_count) * kBulkSliceSize;
+               ptr < bulk_base + i64{bulk_max_count} * kBulkSliceSize;
     }
 
     // Byte capacity of a buffer handed out by alloc() or alloc_bulk().
@@ -322,7 +322,7 @@ struct SlicePool {
             return;
         }
         if (!ptr || !base || !free_stack || count == 0) return;
-        if (ptr < base || ptr >= base + static_cast<i64>(count) * kSliceSize) return;
+        if (ptr < base || ptr >= base + i64{count} * kSliceSize) return;
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
         uintptr_t raw_offset = 0;
@@ -366,7 +366,7 @@ struct SlicePool {
     [[nodiscard]] bool bound_slice_valid(const u8* ptr) const {
 #ifdef __linux__
         if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
-        if (ptr < base || ptr >= base + static_cast<i64>(count) * kSliceSize) return false;
+        if (ptr < base || ptr >= base + i64{count} * kSliceSize) return false;
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
         uintptr_t raw_offset = 0;
@@ -415,7 +415,7 @@ struct SlicePool {
     // Release all mmap'd memory.
     void destroy() {
         if (bulk_base) {
-            munmap(bulk_base, static_cast<u64>(bulk_max_count) * kBulkSliceSize);
+            munmap(bulk_base, u64{bulk_max_count} * kBulkSliceSize);
             bulk_base = nullptr;
         }
         if (bulk_free) {
@@ -457,7 +457,7 @@ struct SlicePool {
             const u32 position = static_cast<u32>(static_cast<i64>(bulk_free_top) -
                                                   static_cast<i64>(bulk_cached_count));
             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
-            u8* ptr = bulk_base + static_cast<i64>(idx) * kBulkSliceSize;
+            u8* ptr = bulk_base + i64{idx} * kBulkSliceSize;
 #ifdef __linux__
             if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
                 clear_bulk_bytes(ptr, kBulkSliceSize);
@@ -496,7 +496,7 @@ private:
         if (study_bulk_borrowed > study_bulk_peak_borrowed)
             study_bulk_peak_borrowed = study_bulk_borrowed;
         if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
-        u8* const ptr = bulk_base + static_cast<i64>(idx) * kBulkSliceSize;
+        u8* const ptr = bulk_base + i64{idx} * kBulkSliceSize;
         if ((entry & kDeferredBodyClear) != 0) {
             u32 dirty = 0;
             __builtin_memcpy(&dirty, ptr, sizeof(dirty));
@@ -537,7 +537,7 @@ private:
         // the reservation. bulk_free/bulk_in_use (the small index/bitmap
         // bookkeeping) were already committed eagerly in init().
         void* mem = mmap(nullptr,
-                         static_cast<u64>(bulk_max_count) * kBulkSliceSize,
+                         u64{bulk_max_count} * kBulkSliceSize,
                          PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
                          -1,
@@ -611,17 +611,16 @@ private:
         if (count >= max_count) return false;
 
         u32 step = kGrowStep;
-        if (static_cast<i64>(count) + static_cast<i64>(step) > static_cast<i64>(max_count))
+        if (i64{count} + i64{step} > i64{max_count})
             step = static_cast<u32>(static_cast<i64>(max_count) - static_cast<i64>(count));
 
         // mprotect the next chunk of the reserved VA region
-        u8* chunk = base + static_cast<i64>(count) * kSliceSize;
-        u64 chunk_size = static_cast<u64>(step) * kSliceSize;
+        u8* chunk = base + i64{count} * kSliceSize;
+        u64 chunk_size = u64{step} * kSliceSize;
         if (mprotect(chunk, chunk_size, PROT_READ | PROT_WRITE) != 0) return false;
 
         // Add new slices to free stack
-        for (u32 i = count; static_cast<i64>(i) < static_cast<i64>(count) + static_cast<i64>(step);
-             i++) {
+        for (u32 i = count; i64{i} < i64{count} + i64{step}; i++) {
             free_stack[free_top++] = i;
         }
         count = static_cast<u32>(static_cast<i64>(count) + static_cast<i64>(step));

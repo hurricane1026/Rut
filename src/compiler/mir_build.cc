@@ -2677,7 +2677,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                     auto loop_binding =
                         push_ctx_binding(&ctx, fl.loop_var_ref_index, elem.value(), fl.span);
                     if (!loop_binding) return core::make_unexpected(loop_binding.error());
-                    iter_slots[slot_base + ai].first_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[slot_base + ai].first_rel = u32{steps.len - top_base};
                     const auto stamp = [&](RouteStep* step) {
                         step->top_loop = top_loop;
                         step->iter_slot = slot_base + ai;
@@ -2808,13 +2808,13 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                         if (!steps.push(step))
                             return frontend_error(FrontendError::TooManyItems, fl.span);
                     }
-                    iter_slots[slot_base + ai].after_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[slot_base + ai].after_rel = u32{steps.len - top_base};
                     if (loop_done) break;
                 }
                 // `break` leaves the whole instance, so every iteration of this
                 // instance shares the position after its last emitted step.
                 for (u32 ai = slot_base; ai < slot_base + iter_count; ai++)
-                    iter_slots[ai].exit_rel = static_cast<u32>(steps.len - top_base);
+                    iter_slots[ai].exit_rel = u32{steps.len - top_base};
                 return {};
             };
             for (u32 gi = 0; gi < source_route.guards.len; gi++) {
@@ -2836,7 +2836,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             }
             for (u32 fi = 0; fi < source_route.for_loops.len; fi++) {
                 if (for_loop_is_child[fi]) continue;
-                const u32 top_base = static_cast<u32>(steps.len);
+                const u32 top_base = u32{steps.len};
                 auto emitted = emit_for_loop(emit_for_loop,
                                              fi,
                                              nullptr,

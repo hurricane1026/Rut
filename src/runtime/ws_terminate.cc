@@ -124,11 +124,11 @@ bool ws_json_number_text_matches_at_path(
                     (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
                 break;
             case WsJsonStringMatch::Suffix:
-                matches = expected.len <= kActual.len &&
-                          (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
-                                                           static_cast<i64>(expected.len),
-                                                       expected.ptr,
-                                                       expected.len) == 0);
+                matches =
+                    expected.len <= kActual.len &&
+                    (expected.len == 0 || memcmp(kActual.ptr + i64{kActual.len} - i64{expected.len},
+                                                 expected.ptr,
+                                                 expected.len) == 0);
                 break;
             case WsJsonStringMatch::Contains:
                 matches = expected.len == 0 ||
@@ -171,11 +171,11 @@ bool ws_json_stringify_matches_at_path(
                       (expected.len == 0 || memcmp(kActual.ptr, expected.ptr, expected.len) == 0);
             break;
         case WsJsonStringMatch::Suffix:
-            matches = expected.len <= kActual.len &&
-                      (expected.len == 0 || memcmp(kActual.ptr + static_cast<i64>(kActual.len) -
-                                                       static_cast<i64>(expected.len),
-                                                   expected.ptr,
-                                                   expected.len) == 0);
+            matches =
+                expected.len <= kActual.len &&
+                (expected.len == 0 || memcmp(kActual.ptr + i64{kActual.len} - i64{expected.len},
+                                             expected.ptr,
+                                             expected.len) == 0);
             break;
         case WsJsonStringMatch::Contains:
             matches = expected.len == 0 ||
@@ -220,8 +220,7 @@ bool ws_json_string_matches_at_path(
                 case WsJsonStringMatch::Suffix:
                     matches = expected.len <= decoded.len &&
                               (expected.len == 0 ||
-                               memcmp(document.scratch + static_cast<i64>(decoded.len) -
-                                          static_cast<i64>(expected.len),
+                               memcmp(document.scratch + i64{decoded.len} - i64{expected.len},
                                       expected.ptr,
                                       expected.len) == 0);
                     break;
@@ -415,16 +414,11 @@ namespace {
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
     if (kHeaderLength == 0) return false;
-    if (static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength) +
-            static_cast<i64>(output_len) >
-        static_cast<i64>(out_cap))
-        return false;
-    for (u32 i = 0; i < kHeaderLength; i++)
-        out[static_cast<i64>(*produced) + static_cast<i64>(i)] = hdr[i];
-    u8* dst = out + static_cast<i64>(*produced) + static_cast<i64>(kHeaderLength);
+    if (i64{*produced} + i64{kHeaderLength} + i64{output_len} > i64{out_cap}) return false;
+    for (u32 i = 0; i < kHeaderLength; i++) out[i64{*produced} + i64{i}] = hdr[i];
+    u8* dst = out + i64{*produced} + i64{kHeaderLength};
     for (u32 i = 0; i < prefix.len; i++) dst[i] = static_cast<u8>(prefix.ptr[i]);
-    for (u32 i = 0; i < payload_len; i++)
-        dst[static_cast<i64>(prefix.len) + static_cast<i64>(i)] = payload[i];
+    for (u32 i = 0; i < payload_len; i++) dst[i64{prefix.len} + i64{i}] = payload[i];
     const auto suffix_offset = range_int(prefix.len) + range_int(payload_len);
     for (u32 i = 0; i < suffix.len; i++)
         dst[(suffix_offset + range_int(i)).index()] = static_cast<u8>(suffix.ptr[i]);
@@ -455,7 +449,7 @@ namespace {
         header.header_len > frame_len ||
         header.payload_len != (range_int(frame_len) - range_int(header.header_len)).value())
         return false;
-    u8* const kPayload = out + static_cast<i64>(begin) + static_cast<i64>(header.header_len);
+    u8* const kPayload = out + i64{begin} + i64{header.header_len};
     if (st.masked) ws_unmask(kPayload, static_cast<u64>(header.payload_len), header.mask_key);
     u32 length = 0;
     const auto kStatus = ws_deflate_payload(*st.encoder,
@@ -688,7 +682,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
 
     for (;;) {
         const u32 avail = static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(*consumed));
-        const u8* p = in + static_cast<i64>(*consumed);
+        const u8* p = in + i64{*consumed};
 
         WsFrameHeader h;
         if (st.partial_data_frame) {
@@ -798,7 +792,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 if (needed > available_output) break;
             }
         }
-        const u8* payload = p + static_cast<i64>(header_len);
+        const u8* payload = p + i64{header_len};
 
         if (ws_opcode_is_control(h.opcode)) {
             // Copy + unmask the control payload (<=125 bytes) so we can validate it and
@@ -871,7 +865,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
 #endif
         } else {
             // message_total includes this entire frame, so it is at least remain.
-            u8* dst = msg_buf + (message_total - static_cast<i64>(remain));
+            u8* dst = msg_buf + (message_total - i64{remain});
             for (u32 i = 0; i < chunk; i++) dst[i] = payload[i];
             if (st.masked)
                 ws_unmask_chunk(dst, chunk, h.mask_key, static_cast<u64>(st.partial_payload_len));
@@ -926,7 +920,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             static_cast<i64>(action_value) <
                 static_cast<i64>(first_policy) + static_cast<i64>(kWsMaxClosePolicies);
         if (policy_close && static_cast<i64>(action_value) - static_cast<i64>(first_policy) >=
-                                static_cast<i64>(st.close_policy_count))
+                                i64{st.close_policy_count})
             return WsInspectStatus::Error;
         const u8 first_text_policy = static_cast<u8>(WsFrameAction::ForwardTextPolicy0);
         const bool policy_forward =
@@ -935,7 +929,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 static_cast<i64>(first_text_policy) + static_cast<i64>(kWsMaxForwardTexts);
         if (policy_forward &&
             static_cast<i64>(action_value) - static_cast<i64>(first_text_policy) >=
-                static_cast<i64>(st.forward_text_count))
+                i64{st.forward_text_count})
             return WsInspectStatus::Error;
 #if RUT_ENABLE_WEBSOCKET
         const u32 kOutputBegin = *produced;
@@ -1067,8 +1061,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                 static_cast<u32>(static_cast<i64>(2) + static_cast<i64>(kSelected.reason.len));
             // Preserve the legacy empty-status fallback only for code-only closes.
             // A configured reason must fit whole; never truncate UTF-8 or silently discard it.
-            if (static_cast<i64>(*produced) + static_cast<i64>(hdr) + static_cast<i64>(body) >
-                static_cast<i64>(out_cap)) {
+            if (i64{*produced} + i64{hdr} + i64{body} > i64{out_cap}) {
                 if (kSelected.reason.len != 0) return WsInspectStatus::Error;
                 body = 0;
             }
@@ -1124,7 +1117,7 @@ WsClosingRead ws_read_closing(
 #endif
     if (st.received_close) return WsClosingRead::Close;
     while (*consumed < in_len) {
-        const u8* p = in + static_cast<i64>(*consumed);
+        const u8* p = in + i64{*consumed};
         const u32 kAvailable =
             static_cast<u32>(static_cast<i64>(in_len) - static_cast<i64>(*consumed));
         WsFrameHeader header;
@@ -1137,15 +1130,14 @@ WsClosingRead ws_read_closing(
             if (kStatus == ParseStatus::Error) return WsClosingRead::Error;
         }
         if (ws_opcode_is_control(header.opcode)) {
-            if (st.partial_data_frame ||
-                header.payload_len > static_cast<i64>(kWsMaxControlPayload))
+            if (st.partial_data_frame || header.payload_len > i64{kWsMaxControlPayload})
                 return WsClosingRead::Error;
             const u32 kPayloadLen = static_cast<u32>(header.payload_len);
             const u32 kTotal = static_cast<u32>(static_cast<i64>(header.header_len) +
                                                 static_cast<i64>(kPayloadLen));
             if (kAvailable < kTotal) return WsClosingRead::NeedMore;
             u8 body[kWsMaxControlPayload];
-            memcpy(body, p + static_cast<i64>(header.header_len), kPayloadLen);
+            memcpy(body, p + i64{header.header_len}, kPayloadLen);
             if (header.masked) ws_unmask(body, kPayloadLen, header.mask_key);
             if (header.opcode == WsOpcode::Close) {
                 u16 code = 1005;

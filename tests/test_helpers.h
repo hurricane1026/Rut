@@ -1298,7 +1298,7 @@ inline bool send_all(i32 fd, const char* d, u32 len) {
 inline i64 test_mono_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+    return i64{ts.tv_sec} * 1000 + ts.tv_nsec / 1'000'000;
 }
 
 inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
@@ -1313,7 +1313,7 @@ inline i32 recv_timeout(i32 fd, char* buf, u32 len, i32 ms) {
         if (left < 1) left = 1;
         struct timeval tv;
         tv.tv_sec = left / 1000;
-        tv.tv_usec = static_cast<long>(left % 1000) * 1000L;
+        tv.tv_usec = long{left % 1000} * 1000L;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ssize_t n = recv(fd, buf, len, 0);
         if (n >= 0) return static_cast<i32>(n);
@@ -1369,7 +1369,7 @@ struct LoopThread {
     static i64 mono_ms() {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return static_cast<i64>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000;
+        return i64{ts.tv_sec} * 1000 + ts.tv_nsec / 1'000'000;
     }
     static void* run(void* arg) {
         auto* lt = static_cast<LoopThread*>(arg);
@@ -1453,8 +1453,7 @@ static void inject_upstream_response(Loop& loop, Connection& conn) {
     u8* dst = conn.upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
     conn.upstream_recv_buf.commit(kMockHttpResponseLen);
-    IoEvent ev =
-        make_ev(conn.id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    IoEvent ev = make_ev(conn.id, IoEventType::UpstreamRecv, i32{kMockHttpResponseLen});
     // Inject directly without going through inject_and_dispatch (which would
     // overwrite our carefully crafted upstream_recv_buf with garbage bytes).
     loop.backend.inject(ev);

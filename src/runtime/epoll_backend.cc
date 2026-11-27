@@ -688,7 +688,7 @@ bool EpollBackend::add_send_upstream(
     // its completion slot without needing a separate reservation counter.
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
 
-    if (nw == static_cast<ssize_t>(len)) {
+    if (nw == ssize_t{len}) {
         return queue_pending_completion(pending_completions,
                                         pending_count,
                                         conn_id,
@@ -824,7 +824,7 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool mo
     // producer can append; partial/EAGAIN uses epoll and consumes no slot.
     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
 
-    if (nw == static_cast<ssize_t>(len)) {
+    if (nw == ssize_t{len}) {
         return queue_pending_completion(
             pending_completions, pending_count, conn_id, IoEventType::Send, static_cast<i32>(nw));
     }
@@ -1230,7 +1230,7 @@ u32 EpollBackend::wait(
             i32 fd = (type == IoEventType::HandlerTimer) ? yield_timer_fd : timer_fd;
             u64 ticks = 0;
             ssize_t rr = read(fd, &ticks, sizeof(ticks));
-            if (rr != static_cast<ssize_t>(sizeof(ticks))) continue;
+            if (rr != ssize_t{sizeof(ticks)}) continue;
             if (out < max_events) {
                 events[out] = {};
                 events[out].conn_id = 0;
@@ -1610,7 +1610,7 @@ u32 EpollBackend::wait(
                     ssize_t nw;
                     do {
                         nw = send(ss.fd,
-                                  ss.src + static_cast<i64>(ss.offset),
+                                  ss.src + i64{ss.offset},
                                   ss.remaining,
                                   MSG_NOSIGNAL | ss.msg_flags);
                     } while (nw < 0 && errno == EINTR);

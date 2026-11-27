@@ -248,7 +248,7 @@ bool receive_frame(int fd,
     worker::Frame candidate;
     candidate.type = kEvidenceFrameType;
     std::memcpy(candidate.token.bytes.data(), header.data() + 12u, worker::kTokenBytes);
-    candidate.payload.resize(static_cast<std::size_t>(length));
+    candidate.payload.resize(std::size_t{length});
     if (!read_exact(fd,
                     candidate.payload.data(),
                     candidate.payload.size(),

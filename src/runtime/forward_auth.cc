@@ -145,13 +145,10 @@ void ForwardAuthWorker::cancel(u32 connection, u64 generation) {
         if (state == Empty || slot.connection != connection ||
             (generation && slot.generation != generation))
             continue;
-        while (state != Empty && state != Cancelled &&
-               !__atomic_compare_exchange_n(&slot.state,
-                                            &state,
-                                            static_cast<u32>(Cancelled),
-                                            false,
-                                            __ATOMIC_ACQ_REL,
-                                            __ATOMIC_ACQUIRE)) {
+        while (
+            state != Empty && state != Cancelled &&
+            !__atomic_compare_exchange_n(
+                &slot.state, &state, u32{Cancelled}, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         }
     }
 }
@@ -178,7 +175,7 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     if (found) {
         const bool elapsed_invalid = now < found->started_ms ||
                                      sub_overflow(now, found->started_ms, &elapsed) ||
-                                     elapsed >= static_cast<u64>(found->timeout_ms);
+                                     elapsed >= u64{found->timeout_ms};
         if (elapsed_invalid) {
             cancel(connection, generation);
             ForwardAuthReply reply;
@@ -188,7 +185,7 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
         if (__atomic_load_n(&found->state, __ATOMIC_ACQUIRE) == Done) {
             const auto kReply = found->reply;
             OPENSSL_cleanse(&found->reply, sizeof(found->reply));
-            __atomic_store_n(&found->state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+            __atomic_store_n(&found->state, u32{Empty}, __ATOMIC_RELEASE);
             return kReply;
         }
     } else {
@@ -232,7 +229,7 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
             slot.started_ms = now;
             slot.timeout_ms = timeout;
             slot.reply = {};
-            __atomic_store_n(&slot.state, static_cast<u32>(Queued), __ATOMIC_RELEASE);
+            __atomic_store_n(&slot.state, u32{Queued}, __ATOMIC_RELEASE);
             found = &slot;
             break;
         }
@@ -263,14 +260,14 @@ void ForwardAuthWorker::run() {
                 ::new (&fetch) HttpsFetch();
                 OPENSSL_cleanse(slot.request, sizeof(slot.request));
                 OPENSSL_cleanse(&slot.reply, sizeof(slot.reply));
-                __atomic_store_n(&slot.state, static_cast<u32>(Empty), __ATOMIC_RELEASE);
+                __atomic_store_n(&slot.state, u32{Empty}, __ATOMIC_RELEASE);
                 continue;
             }
             if (state == Queued) {
                 u32 expected = Queued;
                 if (!__atomic_compare_exchange_n(&slot.state,
                                                  &expected,
-                                                 static_cast<u32>(Running),
+                                                 u32{Running},
                                                  false,
                                                  __ATOMIC_ACQ_REL,
                                                  __ATOMIC_ACQUIRE))
@@ -287,7 +284,7 @@ void ForwardAuthWorker::run() {
                     expected = Running;
                     __atomic_compare_exchange_n(&slot.state,
                                                 &expected,
-                                                static_cast<u32>(Done),
+                                                u32{Done},
                                                 false,
                                                 __ATOMIC_RELEASE,
                                                 __ATOMIC_RELAXED);
@@ -322,12 +319,8 @@ void ForwardAuthWorker::run() {
             fetch.~HttpsFetch();
             ::new (&fetch) HttpsFetch();
             u32 expected = Running;
-            __atomic_compare_exchange_n(&slot.state,
-                                        &expected,
-                                        static_cast<u32>(Done),
-                                        false,
-                                        __ATOMIC_RELEASE,
-                                        __ATOMIC_RELAXED);
+            __atomic_compare_exchange_n(
+                &slot.state, &expected, u32{Done}, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
         }
         nanosleep(&kIdle, nullptr);
     }

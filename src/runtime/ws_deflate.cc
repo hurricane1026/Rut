@@ -162,8 +162,7 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
     *output_len = 0;
     if (!codec.decoding || !output || capacity < codec.decoded_limit || (!input && length))
         return WsDeflateStatus::Error;
-    if (static_cast<i64>(length) > static_cast<i64>(ws_deflate_wire_limit(codec.decoded_limit)) -
-                                       static_cast<i64>(codec.wire_bytes)) {
+    if (i64{length} > i64{ws_deflate_wire_limit(codec.decoded_limit)} - i64{codec.wire_bytes}) {
         codec.decoding = false;
         codec.failed = true;
         return WsDeflateStatus::Limit;
@@ -175,8 +174,8 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
     do {
         const u32 remaining = static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(offset));
         const u32 kTake =
-            remaining < sizeof(codec.scratch) ? remaining : static_cast<u32>(sizeof(codec.scratch));
-        const u8* source = input ? input + static_cast<i64>(offset) : nullptr;
+            remaining < sizeof(codec.scratch) ? remaining : u32{sizeof(codec.scratch)};
+        const u8* source = input ? input + i64{offset} : nullptr;
         if (mask_key && kTake) {
             memcpy(codec.scratch, source, kTake);
             const auto phase = bounded_remainder<4>(mask_offset) + bounded_remainder<4>(offset);
@@ -224,9 +223,7 @@ WsDeflateStatus ws_deflate_payload(
         static_cast<u32>(static_cast<i64>(capacity) - static_cast<i64>(stream.avail_out));
     static constexpr u8 kTail[] = {0, 0, 0xff, 0xff};
     if (kWritten < sizeof(kTail) ||
-        memcmp(output + static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)),
-               kTail,
-               sizeof(kTail)) != 0)
+        memcmp(output + i64{kWritten} - i64{sizeof(kTail)}, kTail, sizeof(kTail)) != 0)
         return WsDeflateStatus::Error;
     *output_len = static_cast<u32>(static_cast<i64>(kWritten) - static_cast<i64>(sizeof(kTail)));
     return WsDeflateStatus::Ok;

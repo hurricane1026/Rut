@@ -13,7 +13,7 @@ const NativeHelperSymbol kSymbols[] = {
 }  // namespace
 
 const NativeHelperSymbol* native_helper_symbols(u32& count) {
-    count = static_cast<u32>(sizeof(kSymbols) / sizeof(kSymbols[0]));
+    count = u32{sizeof(kSymbols) / sizeof(kSymbols[0])};
     return kSymbols;
 }
 

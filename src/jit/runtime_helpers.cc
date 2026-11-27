@@ -514,8 +514,7 @@ extern "C" u64 rut_helper_net_call(void* connection,
                                       opening ? Str{} : Str{data, data_length},
                                       amount,
                                       timeout);
-    if (reply.status == NetReply::kPending)
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+    if (reply.status == NetReply::kPending) return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status != 0) return 0;
     *scalar = reply.scalar;
     if (reply.length) {
@@ -560,7 +559,7 @@ extern "C" u64 rut_helper_http_call(void* connection,
     if (http_call_policy({policy, policy_len}, endpoint))
         reply = http_call_for_request(connection, endpoint, {request, request_len}, timeout);
     if (reply.status == static_cast<i32>(0x80000000u))
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     Str result{reply.document, reply.length};
     if (reply.status != 0) {
         result = reply.status == -2 ? lit_str("{\"ok\":false,\"status\":0,\"error\":\"timeout\"}")
@@ -625,7 +624,7 @@ extern "C" u64 rut_helper_forward_auth_header(void* connection,
                                                  kTargetLength.max(range_int<0, 1>{}).to<u32>()},
                                                 timeout_ms);
     if (reply.status == static_cast<i32>(0x80000000u))
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status == 1) {
         const u32 name_length = static_cast<u32>(__builtin_strlen(policy.identity_header));
         rut_helper_req_set_owned_header(connection,
@@ -660,7 +659,7 @@ extern "C" u64 rut_helper_password_verify_header(void* connection,
     const auto reply = verify_password_for_request(
         connection, {password, password_length}, {record, record_length}, timeout_ms);
     if (reply.status == PasswordRequestStatus::Pending)
-        return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
+        return (u64{reply.retry_ms} << 32) | 0x80000000u;
     if (reply.status == PasswordRequestStatus::Matched) return 1;
     if (reply.status == PasswordRequestStatus::Rejected) return 0;
     if (reply.status == PasswordRequestStatus::TimedOut) return 0xfffffffeu;
@@ -1767,7 +1766,7 @@ extern "C" void rut_helper_jwt_issue_hs256(void* conn,
                                          {subject, subject_len},
                                          {issuer, issuer_len},
                                          {audience, audience_len},
-                                         static_cast<i64>(now.tv_sec),
+                                         i64{now.tv_sec},
                                          ttl_seconds,
                                          token,
                                          sizeof(token),
@@ -1831,7 +1830,7 @@ extern "C" void rut_helper_jwt_issue_hs256_with_id(void* conn,
                                                  {issuer, issuer_len},
                                                  {audience, audience_len},
                                                  {token_id, token_id_len},
-                                                 static_cast<i64>(now.tv_sec),
+                                                 i64{now.tv_sec},
                                                  ttl_seconds,
                                                  token,
                                                  sizeof(token),
@@ -1898,7 +1897,7 @@ extern "C" void rut_helper_jwt_issue_hs256_with_id_and_scope(void* conn,
                                                            {audience, audience_len},
                                                            {token_id, token_id_len},
                                                            {scope, scope_len},
-                                                           static_cast<i64>(now.tv_sec),
+                                                           i64{now.tv_sec},
                                                            ttl_seconds,
                                                            token,
                                                            sizeof(token),
@@ -2074,7 +2073,7 @@ rut::u8 rut_helper_signed_request_valid(rut::u8 method,
                                             {body, body_len},
                                             {key_id, key_id_len},
                                             {key, key_len},
-                                            static_cast<rut::i64>(kNow.tv_sec));
+                                            rut::i64{kNow.tv_sec});
 }
 
 u8 rut_helper_hmac_sha256_matches(const char* message,
@@ -2239,11 +2238,11 @@ struct RegexScratchCache {
         rut::MmapBackend backend;
         u64 new_slots_size = 0;
         auto* new_slots = reinterpret_cast<RegexScratchSlot*>(
-            backend.acquire(static_cast<u64>(new_cap) * sizeof(RegexScratchSlot), &new_slots_size));
+            backend.acquire(u64{new_cap} * sizeof(RegexScratchSlot), &new_slots_size));
         if (new_slots == nullptr) return false;
         u64 new_index_size = 0;
-        auto* new_index = reinterpret_cast<RegexScratchIndexEntry*>(backend.acquire(
-            static_cast<u64>(new_index_cap) * sizeof(RegexScratchIndexEntry), &new_index_size));
+        auto* new_index = reinterpret_cast<RegexScratchIndexEntry*>(
+            backend.acquire(u64{new_index_cap} * sizeof(RegexScratchIndexEntry), &new_index_size));
         if (new_index == nullptr) {
             backend.release(reinterpret_cast<u8*>(new_slots), new_slots_size);
             return false;
@@ -3027,7 +3026,7 @@ extern "C" u8 rut_helper_jwt_claims_valid_with_lifetime(const char* claims,
                                           {claims, claims_len},
                                           {issuer, issuer_len},
                                           {audience, audience_len},
-                                          static_cast<i64>(now.tv_sec),
+                                          i64{now.tv_sec},
                                           max_age_seconds,
                                           max_lifetime_seconds)
                ? 1u
@@ -3408,10 +3407,8 @@ extern "C" void rut_helper_json(void* conn,
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
             now.tv_nsec >= 1000000000)
             return;
-        scalar = oauth_introspection_valid(
-                     document, {a, a_len}, {b, b_len}, static_cast<i64>(now.tv_sec))
-                     ? 1
-                     : 0;
+        scalar =
+            oauth_introspection_valid(document, {a, a_len}, {b, b_len}, i64{now.tv_sec}) ? 1 : 0;
         view = {"", 0};
     } else if (operation == json::Op::Sha256HexValid) {
         scalar = rut_helper_sha256_hex_valid(a, a_len);
@@ -3436,10 +3433,8 @@ extern "C" void rut_helper_json(void* conn,
         if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
             now.tv_nsec >= 1000000000)
             return;
-        scalar = jwt_claims_valid(
-                     document, {a, a_len}, {b, b_len}, {c, c_len}, static_cast<i64>(now.tv_sec))
-                     ? 1
-                     : 0;
+        scalar =
+            jwt_claims_valid(document, {a, a_len}, {b, b_len}, {c, c_len}, i64{now.tv_sec}) ? 1 : 0;
         // This boolean operation borrows no output and needs no JSON arena.
         view = {"", 0};
     } else if (operation == json::Op::JwtVerifyRs256) {
@@ -3456,7 +3451,7 @@ extern "C" void rut_helper_json(void* conn,
                                 {b, b_len},
                                 document,
                                 {a, a_len},
-                                static_cast<i64>(now.tv_sec),
+                                i64{now.tv_sec},
                                 payload,
                                 sizeof(payload),
                                 &length))
@@ -3477,7 +3472,7 @@ extern "C" void rut_helper_json(void* conn,
                                 {b, b_len},
                                 document,
                                 {a, a_len},
-                                static_cast<i64>(now.tv_sec),
+                                i64{now.tv_sec},
                                 payload,
                                 sizeof(payload),
                                 &length))

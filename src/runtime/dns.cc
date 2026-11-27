@@ -25,7 +25,7 @@ u16 word(const u8* p) {
     return (range_int(p[0]).scaled_by<256>() + range_int(p[1])).to<u16>();
 }
 u32 number(const u8* p) {
-    return (static_cast<u32>(word(p)) << 16) | word(p + 2);
+    return (u32{word(p)} << 16) | word(p + 2);
 }
 void put(u8* p, u16 v) {
     p[0] = range_int(v).divided_by<256>().to<u8>();
@@ -65,7 +65,7 @@ bool name_at(const u8* p, u32 len, u32& offset, char* out) {
             return false;
         if (used) out[used++] = '.';
         for (u32 i = 0; i < kN; ++i) {
-            const char kC = lower(p[static_cast<i64>(at++)]);
+            const char kC = lower(p[i64{at++}]);
             if ((kC < 'a' || kC > 'z') && (kC < '0' || kC > '9') && kC != '-') return false;
             out[used++] = kC;
         }
@@ -100,7 +100,7 @@ bool dns_hostname(char* name) {
         const char kC = lower(name[i]);
         name[i] = kC;
         if (!kC || kC == '.') {
-            if (!label || label > 63 || name[static_cast<i64>(i) - 1] == '-') return false;
+            if (!label || label > 63 || name[i64{i} - 1] == '-') return false;
             label = 0;
         } else {
             if (((kC < 'a' || kC > 'z') && (kC < '0' || kC > '9') && kC != '-') ||
@@ -132,12 +132,12 @@ u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
             return 0;
         const u8 kN = label.to<u8>();
         p[at++] = kN;
-        memcpy(p + static_cast<i64>(at), name + static_cast<i64>(start), kN);
+        memcpy(p + i64{at}, name + i64{start}, kN);
         at = (range_int(at) + range_int(kN)).min(range_int(capacity)).to<u32>();
         start = (range_int(i) + range_int<1, 2>{}).min(range_int(capacity)).to<u32>();
     }
     p[at++] = 0;
-    put(p + static_cast<i64>(at), 1);
+    put(p + i64{at}, 1);
     put(p + (range_int(at) + range_int<2, 3>{}).value(), 1);
     return (range_int(at) + range_int<4, 5>{}).min(range_int(capacity)).to<u32>();
 }
@@ -170,10 +170,10 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         const auto data = range_int(at) + range_int<10, 11>{};
         if (data.value() > len) return DnsAnswer::Invalid;
         r.data = data.min(range_int(len)).to<u32>();
-        r.type = word(p + static_cast<i64>(at) + 2) == 1 ? word(p + static_cast<i64>(at)) : 0;
-        r.ttl = number(p + static_cast<i64>(at) + 4);
+        r.type = word(p + i64{at} + 2) == 1 ? word(p + i64{at}) : 0;
+        r.ttl = number(p + i64{at} + 4);
         if (r.ttl & 0x80000000u) r.ttl = 0;
-        r.size = word(p + static_cast<i64>(at) + 8);
+        r.size = word(p + i64{at} + 8);
         const auto end = data + range_int(r.size);
         if (end.value() > len) return DnsAnswer::Invalid;
         at = end.min(range_int(len)).to<u32>();
@@ -189,7 +189,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             if (r.type == 1) {
                 if (r.size != 4) return DnsAnswer::Invalid;
                 u32 address = 0;
-                memcpy(&address, p + static_cast<i64>(r.data), 4);
+                memcpy(&address, p + i64{r.data}, 4);
                 bool duplicate = false;
                 for (u32 j = 0; j < result.count; ++j) duplicate |= result.addresses[j] == address;
                 if (!duplicate) {
@@ -206,8 +206,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             } else if (r.type == 5) {
                 u32 pos = r.data;
                 char candidate[254]{};
-                if (!name_at(p, len, pos, candidate) ||
-                    static_cast<i64>(pos) != static_cast<i64>(r.data) + static_cast<i64>(r.size) ||
+                if (!name_at(p, len, pos, candidate) || i64{pos} != i64{r.data} + i64{r.size} ||
                     !dns_hostname(candidate) || (alias && strcmp(candidate, target) != 0))
                     return DnsAnswer::Invalid;
                 memcpy(target, candidate, sizeof(target));
@@ -371,7 +370,7 @@ int DnsResolver::resolve(
             if (q.size < 12 || q.size > 4096) return retry();
             return 0;
         }
-        if (static_cast<i64>(q.received) != static_cast<i64>(q.size) + 2) return 0;
+        if (i64{q.received} != i64{q.size} + 2) return 0;
         length = q.size;
         memmove(q.packet, q.packet + 2, length);
     }

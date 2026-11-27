@@ -89,18 +89,17 @@ bool standard_webhook_valid(Str id,
                 valid = false;
             ++comma;
         }
-        if (comma == begin || comma == end ||
-            static_cast<i64>(comma) + 1 == static_cast<i64>(end)) {
+        if (comma == begin || comma == end || i64{comma} + 1 == i64{end}) {
             valid = false;
             break;
         }
         for (u32 i = static_cast<u32>(static_cast<i64>(comma) + 1); i < end; ++i)
             if (signature.ptr[i] < 0x21 || signature.ptr[i] > 0x7e || signature.ptr[i] == ',')
                 valid = false;
-        if (Str{signature.ptr + static_cast<i64>(begin),
+        if (Str{signature.ptr + i64{begin},
                 static_cast<u32>(static_cast<i64>(comma) - static_cast<i64>(begin))}
                 .eq(lit_str("v1"))) {
-            const Str value{signature.ptr + static_cast<i64>(comma) + 1,
+            const Str value{signature.ptr + i64{comma} + 1,
                             static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(comma) - 1)};
             if (value.len != 44 || value.ptr[43] != '=') {
                 valid = false;
@@ -125,7 +124,6 @@ bool standard_webhook_valid_now(Str id, Str timestamp, Str signature, Str body, 
     if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec <= 0 || now.tv_nsec < 0 ||
         now.tv_nsec >= 1000000000)
         return false;
-    return standard_webhook_valid(
-        id, timestamp, signature, body, raw_key, static_cast<i64>(now.tv_sec), 300);
+    return standard_webhook_valid(id, timestamp, signature, body, raw_key, i64{now.tv_sec}, 300);
 }
 }  // namespace rut

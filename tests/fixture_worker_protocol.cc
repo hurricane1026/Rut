@@ -211,7 +211,7 @@ bool read_proc(pid_t pid, ProcIdentity& result, bool require_capabilities_clear)
         if (field == 22) {
             unsigned long long value = 0;
             if (!(fields >> value)) return false;
-            start = static_cast<u64>(value);
+            start = u64{value};
         } else if (field == 6) {
             long value = 0;
             if (!(fields >> value)) return false;
@@ -457,7 +457,7 @@ bool decode_report(const std::vector<unsigned char>& payload, Report& report) {
     if (!get16(payload, at, exe_length) || !get16(payload, at, argv_length) ||
         !get16(payload, at, mode_length) || !get16(payload, at, reserved) || reserved != 0)
         return false;
-    const size_t total = static_cast<size_t>(exe_length) + argv_length + mode_length;
+    const size_t total = size_t{exe_length} + argv_length + mode_length;
     if (total != payload.size() - at) return false;
     report.exe.assign(reinterpret_cast<const char*>(payload.data() + at), exe_length);
     at += exe_length;

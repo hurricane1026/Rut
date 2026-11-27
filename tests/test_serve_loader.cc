@@ -7924,8 +7924,7 @@ TEST(serve_loader, websocket_guard_close_coexists_with_default_text_rewrite) {
         st.forward_text = route.ws_forward_text;
         st.close_policies = route.ws_close_policies;
         st.close_policy_count = route.ws_close_policy_count;
-        const u8 input[] = {
-            0x81, 3, 'b', 'a', blocked ? static_cast<u8>('d') : static_cast<u8>('r')};
+        const u8 input[] = {0x81, 3, 'b', 'a', blocked ? u8{'d'} : u8{'r'}};
         u8 out[128], msg[32];
         u32 used = 0, produced = 0;
         const auto status = ws_inspect(st,
@@ -8934,7 +8933,7 @@ TEST(serve_loader, verified_request_framing_selection_publishes_only_through_pub
         REQUIRE_FALSE(conn->request_policy_body_pending);
         REQUIRE(conn->upstream_connect_armed);
         REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Validated);
-        const u32 body_len = body == nullptr ? 0u : static_cast<u32>(sizeof(kBody));
+        const u32 body_len = body == nullptr ? 0u : u32{sizeof(kBody)};
         REQUIRE_EQ(conn->recv_buf.len(), expected_head_len + body_len);
         CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), expected_head, expected_head_len), 0);
         if (body != nullptr)

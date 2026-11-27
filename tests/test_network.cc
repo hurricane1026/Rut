@@ -1333,8 +1333,7 @@ TEST(jit_response, h1_json_failure_preserves_method_version_and_terminal_send) {
                 conn->keep_alive = true;
                 char body[SmallLoop::kBufSize]{};
                 memset(body, 'x', sizeof(body));
-                conn->jit_response_body = {body,
-                                           failure == 2 ? static_cast<u32>(sizeof(body)) : 2u};
+                conn->jit_response_body = {body, failure == 2 ? u32{sizeof(body)} : 2u};
                 conn->jit_response_body_valid = failure != 0;
                 if (failure == 1) {
                     conn->resp_header_mutation_overflow = true;
@@ -1540,8 +1539,7 @@ TEST(response_policy, suppress_body_abandon_is_idempotent_and_ignores_late_event
     on_upstream_response<SmallLoop>(
         &loop,
         *conn,
-        IoEvent{
-            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+        IoEvent{conn->id, i32{sizeof(kResponse) - 1}, 0, 0, IoEventType::UpstreamRecv, 0});
 
     CHECK(conn->upstream_abandoned);
     CHECK_FALSE(conn->upstream_keep_alive);
@@ -3713,7 +3711,7 @@ TEST(response_read_timeout,
         DeferredPreflightMockLoop loop;
         loop.setup();
         loop.listener_context = {
-            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
         auto config = std::make_unique<RouteConfig>();
         REQUIRE(configure_deferred_preflight_test_route(*config));
         const RouteConfig* active = config.get();
@@ -3748,7 +3746,7 @@ TEST(response_read_timeout,
         DeferredPreflightMockLoop loop;
         loop.setup();
         loop.listener_context = {
-            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
         auto config = std::make_unique<RouteConfig>();
         REQUIRE(configure_deferred_preflight_test_route(*config));
         const RouteConfig* active = config.get();
@@ -3936,7 +3934,7 @@ TEST(response_buffering, bounded_aliases_complete_content_length_exactly) {
         for (const u8 method : {static_cast<u8>(LogHttpMethod::Get),
                                 static_cast<u8>(LogHttpMethod::Head),
                                 static_cast<u8>(LogHttpMethod::Post)}) {
-            for (const u8 route_method : {kRouteMethodGet, static_cast<u8>(kRouteMethodGet + 1)}) {
+            for (const u8 route_method : {kRouteMethodGet, u8{kRouteMethodGet + 1}}) {
                 SmallLoop loop;
                 loop.setup();
                 auto* conn = loop.alloc_conn();
@@ -5285,7 +5283,7 @@ TEST(request_policy, preserve_host_lowercase_invalid_host_rejects_before_waiting
         REQUIRE_LE(header_len + sizeof(partial_body), sizeof(wire));
         __builtin_memcpy(wire, header, header_len);
         __builtin_memcpy(wire + header_len, partial_body, sizeof(partial_body));
-        const u32 wire_len = header_len + static_cast<u32>(sizeof(partial_body));
+        const u32 wire_len = header_len + u32{sizeof(partial_body)};
         REQUIRE_EQ(conn.recv_buf.write(wire, wire_len), wire_len);
         capture_request_metadata(conn);
     };
@@ -5384,7 +5382,7 @@ TEST(request_policy, preserve_host_lowercase_header_only_rejections_reject_befor
         REQUIRE_LE(header_len + sizeof(partial_body), sizeof(wire));
         __builtin_memcpy(wire, header, header_len);
         __builtin_memcpy(wire + header_len, partial_body, sizeof(partial_body));
-        const u32 wire_len = header_len + static_cast<u32>(sizeof(partial_body));
+        const u32 wire_len = header_len + u32{sizeof(partial_body)};
         REQUIRE_EQ(conn.recv_buf.write(wire, wire_len), wire_len);
         capture_request_metadata(conn);
     };
@@ -7176,7 +7174,7 @@ TEST(redirect, h1_serializer_preserves_query_and_actual_authority) {
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     const RedirectPolicySpec policy = make_test_redirect_policy();
@@ -7218,7 +7216,7 @@ TEST(redirect, h1_fixed_serializer_owns_authority_discards_query_and_orders_head
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
@@ -7266,7 +7264,7 @@ TEST(redirect, h1_fixed_302_wire_dispatch_errors_and_h2_rejection_are_bounded) {
         SmallLoop loop;
         loop.setup();
         loop.listener_context = {
-            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+            ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
         rut::test::RouteConfigFixture cfg_owner;
         REQUIRE(cfg_owner.config);
         RouteConfig& cfg = *cfg_owner.config;
@@ -7348,8 +7346,7 @@ TEST(redirect, h1_fixed_302_wire_dispatch_errors_and_h2_rejection_are_bounded) {
         const MockOp* remainder = loop.backend.last_op(MockOp::Send);
         REQUIRE(remainder != nullptr);
         CHECK_EQ(remainder->send_len, 342u - kPartial);
-        loop.inject_and_dispatch(
-            make_ev(completed_id, IoEventType::Send, static_cast<i32>(342u - kPartial)));
+        loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, i32{342u - kPartial}));
         CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 
         auto* failed = loop.alloc_conn();
@@ -7394,7 +7391,7 @@ TEST(redirect, h1_serializer_rejects_ambiguous_input_atomically) {
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_redirect_policy()), 1u);
@@ -7457,7 +7454,7 @@ TEST(redirect, h1_serializer_capacity_and_policy_fail_closed) {
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_redirect_policy()), 1u);
@@ -7501,7 +7498,7 @@ TEST(redirect, h1_immediate_success_has_no_upstream_side_effect) {
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_redirect_policy()), 1u);
@@ -7541,7 +7538,7 @@ TEST(redirect, h1_fixed_action_partial_send_and_epipe_are_local_and_terminal) {
     SmallLoop loop;
     loop.setup();
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
@@ -7605,7 +7602,7 @@ TEST(redirect, h1_timer_resume_uses_pinned_config_and_succeeds) {
     ShardEpoch epoch{};
     loop.epoch = &epoch;
     loop.listener_context = {
-        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, static_cast<u16>(8080)};
+        ListenerAddress::IPv4Wildcard, ListenerTransport::Cleartext, u16{8080}};
     rut::test::RouteConfigFixture pinned_owner;
     REQUIRE(pinned_owner.config);
     RouteConfig& pinned = *pinned_owner.config;
@@ -7738,8 +7735,8 @@ TEST(http2, h2_forward_copies_synth_before_json_arena_release) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     RouteEntry route{};
@@ -8082,13 +8079,13 @@ TEST(http2, timer_resume_owned_body_commits_hpack_for_next_response) {
     h2.nstreams = 2;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.streams[1] = {3,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     JitDispatchOutcome yielded{};
@@ -8370,7 +8367,7 @@ static bool dispatch_complete_http1_test_request(SmallLoop& loop, Connection& co
     if (conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u) !=
         sizeof(kRequest) - 1u)
         return false;
-    loop.dispatch(make_ev(conn.id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1u)));
+    loop.dispatch(make_ev(conn.id, IoEventType::Recv, i32{sizeof(kRequest) - 1u}));
     return true;
 }
 
@@ -8942,8 +8939,7 @@ TEST(proxy, full_cycle) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
 
     // Response sent to client → back to reading (keep-alive)
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
     CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 }
@@ -10603,8 +10599,8 @@ TEST(http2, local_stream_window_errors_notify_reset_once) {
     no_room.nstreams = 1;
     no_room.streams[0] = {1,
                           Http2StreamState::Open,
-                          static_cast<i32>(kDefaultInitialWindowSize),
-                          static_cast<i32>(kDefaultInitialWindowSize),
+                          i32{kDefaultInitialWindowSize},
+                          i32{kDefaultInitialWindowSize},
                           true};
     H2ResetCapture no_room_capture{};
     no_room.cb_ctx = &no_room_capture;
@@ -10633,8 +10629,8 @@ TEST(http2, local_stream_window_errors_notify_reset_once) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     H2ResetCapture capture{};
     h2.cb_ctx = &capture;
@@ -10660,11 +10656,8 @@ TEST(http2, local_stream_window_errors_notify_reset_once) {
     overflow.init();
     overflow.preface_seen = true;
     overflow.nstreams = 1;
-    overflow.streams[0] = {1,
-                           Http2StreamState::Open,
-                           static_cast<i32>(kMaxWindowSize),
-                           static_cast<i32>(kDefaultInitialWindowSize),
-                           true};
+    overflow.streams[0] = {
+        1, Http2StreamState::Open, i32{kMaxWindowSize}, i32{kDefaultInitialWindowSize}, true};
     H2ResetCapture overflow_capture{};
     overflow.cb_ctx = &overflow_capture;
     overflow.on_reset = &h2_reset_capture;
@@ -10794,8 +10787,8 @@ TEST(http2, outbound_owner_refuses_after_continuation_and_keeps_control_sync) {
     fragmented.nstreams = 1;
     fragmented.streams[0] = {3,
                              Http2StreamState::Open,
-                             static_cast<i32>(kDefaultInitialWindowSize),
-                             static_cast<i32>(kDefaultInitialWindowSize),
+                             i32{kDefaultInitialWindowSize},
+                             i32{kDefaultInitialWindowSize},
                              true};
     fragmented.cont_stream = 3;
     fragmented.cont_refuse = true;
@@ -10871,8 +10864,8 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -10930,8 +10923,8 @@ TEST(http2, head_return_status_keeps_length_without_body_owners) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     RouteConfig cfg{};
@@ -10977,8 +10970,8 @@ TEST(http2, configured_205_body_is_suppressed) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -11111,8 +11104,8 @@ TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -11160,18 +11153,18 @@ TEST(http2, bodyless_then_owned_response_appends_transactionally) {
     h2.nstreams = 2;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.streams[1] = {3,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.streams[2] = {5,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -11220,8 +11213,8 @@ TEST(http2, outbound_pump_distinguishes_invalid_owner_from_window_block) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.outbound_stream = 1;
     h2.outbound_body_len = 1;
@@ -11259,8 +11252,8 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.async_stream = 1;
     h2.preface_seen = true;
@@ -11337,8 +11330,7 @@ TEST(http2, proxy_finish_preserves_body_after_upstream_teardown) {
     window_update[kFrameHeaderSize + 3] = 9;
     conn->recv_buf.reset();
     REQUIRE_EQ(conn->recv_buf.write(window_update, sizeof(window_update)), sizeof(window_update));
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(window_update))));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Recv, i32{sizeof(window_update)}));
     REQUIRE_GT(conn->send_buf.len(), 0u);
     Http2FrameHeader data_frame{};
     REQUIRE_EQ(parse_frame_header(conn->send_buf.data(), conn->send_buf.len(), &data_frame),
@@ -11369,8 +11361,8 @@ TEST(http2, cache_hit_finish_does_not_report_origin_passive_health) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.async_stream = 1;
     conn->h2 = &h2;
@@ -11408,8 +11400,8 @@ TEST(http2, connect_fail_502_commits_chain_headers_only_for_connect_failure) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.async_stream = 1;
     conn->h2 = &h2;
@@ -11470,8 +11462,8 @@ TEST(http2, ordinary_timeout_applies_committed_headers_only_before_response_byte
         h2.nstreams = 1;
         h2.streams[0] = {1,
                          Http2StreamState::Open,
-                         static_cast<i32>(kDefaultInitialWindowSize),
-                         static_cast<i32>(kDefaultInitialWindowSize),
+                         i32{kDefaultInitialWindowSize},
+                         i32{kDefaultInitialWindowSize},
                          true};
         h2.async_stream = 1;
         conn->h2 = &h2;
@@ -11543,8 +11535,8 @@ TEST(http2, connect_fail_mutation_invalid_or_zero_count_overflow_is_500) {
         h2.nstreams = 1;
         h2.streams[0] = {1,
                          Http2StreamState::Open,
-                         static_cast<i32>(kDefaultInitialWindowSize),
-                         static_cast<i32>(kDefaultInitialWindowSize),
+                         i32{kDefaultInitialWindowSize},
+                         i32{kDefaultInitialWindowSize},
                          true};
         h2.async_stream = 1;
         conn->h2 = &h2;
@@ -11617,8 +11609,8 @@ TEST(http2, proxy_finish_bodyless_and_head_preserve_framing_and_epoch) {
         h2.nstreams = 1;
         h2.streams[0] = {1,
                          Http2StreamState::Open,
-                         static_cast<i32>(kDefaultInitialWindowSize),
-                         static_cast<i32>(kDefaultInitialWindowSize),
+                         i32{kDefaultInitialWindowSize},
+                         i32{kDefaultInitialWindowSize},
                          true};
         h2.async_stream = 1;
         h2.preface_seen = true;
@@ -11691,8 +11683,8 @@ TEST(http2, proxy_finish_guarded_failure_preserves_pending_synth) {
         h2.nstreams = 1;
         h2.streams[0] = {1,
                          Http2StreamState::Open,
-                         static_cast<i32>(kDefaultInitialWindowSize),
-                         static_cast<i32>(kDefaultInitialWindowSize),
+                         i32{kDefaultInitialWindowSize},
+                         i32{kDefaultInitialWindowSize},
                          true};
         h2.async_stream = 1;
         h2.preface_seen = true;
@@ -11830,8 +11822,8 @@ TEST(http2, initial_owned_submit_failure_captures_proxy_body_headers) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.async_stream = 1;
     h2.preface_seen = true;
@@ -11873,8 +11865,8 @@ TEST(http2, owned_response_submit_failures_release_owner_and_epoch) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -11905,8 +11897,8 @@ TEST(http2, owned_response_data_submit_failure_after_headers_cqe_closes) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     h2.async_stream = 1;
     h2.preface_seen = true;
@@ -11957,8 +11949,8 @@ TEST(http2, proxy_synth_capacity_boundary_is_exact) {
         h2.nstreams = 1;
         h2.streams[0] = {1,
                          Http2StreamState::Open,
-                         static_cast<i32>(kDefaultInitialWindowSize),
-                         static_cast<i32>(kDefaultInitialWindowSize),
+                         i32{kDefaultInitialWindowSize},
+                         i32{kDefaultInitialWindowSize},
                          true};
         h2.async_stream = 1;
         h2.preface_seen = true;
@@ -12072,8 +12064,8 @@ TEST(http2, rst_owner_processes_next_headers_after_parked_cancel) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -12170,8 +12162,8 @@ TEST(http2, window_update_owner_processes_next_headers_after_local_reset) {
     h2.nstreams = 1;
     h2.streams[0] = {1,
                      Http2StreamState::Open,
-                     static_cast<i32>(kDefaultInitialWindowSize),
-                     static_cast<i32>(kDefaultInitialWindowSize),
+                     i32{kDefaultInitialWindowSize},
+                     i32{kDefaultInitialWindowSize},
                      true};
     conn->h2 = &h2;
     conn->epoch_held = true;
@@ -13985,7 +13977,7 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     const u32 sq_before_header1 = guard.sq_tail;
 
     on_header_received<IoUringEventLoop>(
-        &loop, *conn, {conn->id, static_cast<i32>(kBurstLen), 0, 0, IoEventType::Recv, 1});
+        &loop, *conn, {conn->id, i32{kBurstLen}, 0, 0, IoEventType::Recv, 1});
 
     REQUIRE_GE(conn->fd, 0);
     REQUIRE_EQ(g_pipelined_sync_sendfile_handler_calls, 1u);
@@ -14537,8 +14529,7 @@ TEST(tls_iouring, strict_tls_parked_needread_close_cancels_recv_only_with_corrup
             REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
             stage_strict_tls_send_owner(
                 conn, frame, ResponseReadDeadlineSendKind::Body, logical_generation);
-            conn.tls_send_owner_generation =
-                logical_generation + static_cast<u32>(corrupt_tls_generation);
+            conn.tls_send_owner_generation = logical_generation + u32{corrupt_tls_generation};
             conn.tls_send_owner_fd = conn.fd;
             conn.tls_send_owner_handler_generation = conn.handler_gen;
             conn.tls_send_src = frame.src;
@@ -15034,7 +15025,7 @@ TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     g_tls_pending_send_called = false;
     g_tls_pending_send_result = 0;
 
-    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(sizeof(kCiphertext)), raw_generation));
+    loop.dispatch(tls_send_event(conn.id, i32{sizeof(kCiphertext)}, raw_generation));
 
     CHECK(g_tls_pending_send_called);
     CHECK_EQ(g_tls_pending_send_result, 5u);  // fires with the plaintext length
@@ -15172,7 +15163,7 @@ TEST(tls_iouring, ws_send_sq_full_closes_the_connection_once_after_encryption) {
     IoEvent recv = {};
     recv.conn_id = conn.id;
     recv.type = IoEventType::UpstreamRecv;
-    recv.result = static_cast<i32>(sizeof(kUpstreamBytes) - 1);
+    recv.result = i32{sizeof(kUpstreamBytes) - 1};
     on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, recv);
 
     CHECK_EQ(conn.fd, -1);
@@ -15500,7 +15491,7 @@ TEST(tls_iouring, logical_want_read_close_submits_only_recv_cancel_and_reclaims_
                 conn.is_ws_tunnel = true;
                 IoEvent upstream_recv{};
                 upstream_recv.conn_id = conn.id;
-                upstream_recv.result = static_cast<i32>(sizeof(kUpstreamData) - 1);
+                upstream_recv.result = i32{sizeof(kUpstreamData) - 1};
                 upstream_recv.type = IoEventType::UpstreamRecv;
                 on_ws_upstream_recv<IoUringEventLoop>(&loop, conn, upstream_recv);
             } else {
@@ -15814,7 +15805,7 @@ TEST(tls_iouring, single_shot_full_prefix_keeps_appended_suffix_immutable) {
     conn.fd = 42;
     conn.tls_active = true;
     conn.keep_alive = false;
-    conn.tls_engine.ssl = reinterpret_cast<SSL*>(static_cast<uintptr_t>(1));
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(uintptr_t{1});
     conn.tls_engine.handshake_done = true;
     conn.tls_handshake_complete = true;
     conn.recv_armed = true;  // keep the storage-only fixture out of recv setup
@@ -15852,7 +15843,7 @@ TEST(tls_iouring, single_shot_full_prefix_keeps_appended_suffix_immutable) {
     loop.backend.send_state[conn.id].remaining = 0;
     guard.sq_head = guard.sq_tail;
     loop.backend.pending = 0;
-    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(prefix_len), first_generation));
+    loop.dispatch(tls_send_event(conn.id, i32{prefix_len}, first_generation));
     REQUIRE(conn.tls_out_inflight);
     const u32 suffix_generation = conn.tls_out_inflight_generation;
     REQUIRE_NE(suffix_generation, first_generation);
@@ -15865,7 +15856,7 @@ TEST(tls_iouring, single_shot_full_prefix_keeps_appended_suffix_immutable) {
     guard.sq_head = guard.sq_tail;
     loop.backend.pending = 0;
     g_tls_pending_send_called = false;
-    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(suffix_len), suffix_generation));
+    loop.dispatch(tls_send_event(conn.id, i32{suffix_len}, suffix_generation));
     CHECK(g_tls_pending_send_called);
     CHECK_EQ(g_tls_pending_send_result, 1u);
     CHECK_FALSE(conn.tls_out_inflight);
@@ -16094,8 +16085,7 @@ TEST(proxy, keepalive_two_cycles) {
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 100));
         inject_upstream_response(loop, *conn);
-        loop.inject_and_dispatch(
-            make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+        loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
         CHECK_EQ(conn->state, ConnState::ReadingHeader);
     }
 }
@@ -16255,8 +16245,7 @@ TEST(recv_buf, buffer_state_through_proxy_cycle) {
     CHECK(!conn->upstream_recv_buf.is_released());
 
     // send to client → back to ReadingHeader
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
     // Buffer still valid for next request
     CHECK(conn->recv_buf.valid());
@@ -16407,8 +16396,7 @@ TEST(recv_semantic, proxy_recv_buf_lifetime) {
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // Proxy response sent → on_proxy_response_sent resets upstream_recv_buf and recv_buf.
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(conn->upstream_recv_buf.len(), 0u);  // reset by on_proxy_response_sent
     CHECK_EQ(conn->recv_buf.len(), 0u);           // reset by on_proxy_response_sent (keep-alive)
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
@@ -16761,7 +16749,7 @@ TEST(uring_buf, recv_without_has_buf) {
     c->recv_buf.write(data, sizeof(data) - 1);
 
     // Dispatch recv event — callback should see recv_buf data
-    IoEvent ev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(sizeof(data) - 1));
+    IoEvent ev = make_ev(c->id, IoEventType::Recv, i32{sizeof(data) - 1});
     loop.dispatch(ev);
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_GT(c->send_buf.len(), 0u);
@@ -18571,7 +18559,7 @@ TEST(slab_pool, alloc_with_id_empty) {
     CHECK_EQ(idx, 0u);  // idx set to 0 on failure
 
     // Cleanup
-    pool.free(static_cast<u32>(0));
+    pool.free(u32{0});
     pool.destroy();
 }
 
@@ -18672,7 +18660,7 @@ TEST(slab_pool, invalid_free_guards) {
     CHECK_EQ(pool.in_use(), 1u);
 
     TestObj outside{};
-    pool.free(static_cast<u32>(99));  // idx >= Cap
+    pool.free(u32{99});  // idx >= Cap
     CHECK_EQ(pool.in_use(), 1u);
 
     pool.free(&outside);  // pointer outside pool
@@ -18685,7 +18673,7 @@ TEST(slab_pool, invalid_free_guards) {
     CHECK_EQ(pool.in_use(), 0u);
 
     pool.destroy();
-    pool.free(static_cast<u32>(0));  // !free_stack guard after destroy
+    pool.free(u32{0});  // !free_stack guard after destroy
 }
 
 TEST(slab_pool, init_objects_mmap_failure) {
@@ -18972,7 +18960,7 @@ TEST(upstream_reuse, post_first_response_eof_publishes_failure_without_retry) {
     policy.body = {"reused failure", 14};
     REQUIRE_EQ(cfg.add_failure_policy(policy), 1u);
 
-    for (const i32 terminal_result : {static_cast<i32>(0), -ECONNRESET}) {
+    for (const i32 terminal_result : {i32{0}, -ECONNRESET}) {
         SmallLoop loop;
         loop.setup();
         loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
@@ -19344,9 +19332,7 @@ TEST(upstream_reuse, non_idempotent_empty_response_failure_closes_pipelined_clie
             // stashes same-batch GET2 when present, and resets recv_buf to the
             // request boundary before any late downstream bytes can arrive.
             rut::on_upstream_request_sent<SmallLoop>(
-                &loop,
-                *conn,
-                make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kPostLen)));
+                &loop, *conn, make_ev(conn->id, IoEventType::UpstreamSend, i32{kPostLen}));
             REQUIRE(conn->request_upload_complete);
             REQUIRE_EQ(conn->retry_req_send_len, kPostLen);
             REQUIRE_EQ(conn->recv_buf.len(), 0u);
@@ -19473,7 +19459,7 @@ TEST(upstream_reuse, response_preserves_stash_offset_until_pipeline_recover) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
 
     CHECK_EQ(c->retry_req_send_len, len1);
     REQUIRE(rut::pipeline_recover(*c) == rut::PipelineTransitionResult::Advanced);
@@ -19519,7 +19505,7 @@ TEST(upstream_reuse, response_drops_retry_snapshot_from_send_buf) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
 
     CHECK_EQ(c->retry_req_send_len, 0u);
     CHECK_EQ(c->send_buf.len(), 0u);
@@ -19564,7 +19550,7 @@ TEST(upstream_reuse, response_keeps_pipeline_stash_then_recover_empties_send_buf
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
 
     CHECK_EQ(c->retry_req_send_len, len1);  // stash offset survives the response byte
     CHECK_EQ(c->pipeline_stash_len, len2);
@@ -19619,7 +19605,7 @@ TEST(response_headers, forward_mutation_snapshot_released_at_exchange_completion
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
 
     // First response byte: the marker is gone but the borrowed value is still backed.
     CHECK_EQ(c->retry_req_send_len, 0u);
@@ -19681,7 +19667,7 @@ TEST(response_headers, forward_mutation_release_keeps_pipeline_stash_and_serves_
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
     REQUIRE_EQ(c->retry_req_send_len, len1);
     REQUIRE_EQ(c->send_buf.len(), len1 + len2);
 
@@ -19751,7 +19737,7 @@ TEST(response_headers, forward_mutation_release_keeps_two_request_stash_until_re
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
     REQUIRE_EQ(c->retry_req_send_len, len1);
     REQUIRE_EQ(c->pipeline_stash_len, len2 + len3);
 
@@ -19836,7 +19822,7 @@ TEST(upstream_reuse, retry_replays_snapshot_byte_exact_then_response_drops_it) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(resp) - 1}));
     CHECK_EQ(c->retry_req_send_len, 0u);
     CHECK_EQ(c->send_buf.len(), 0u);
     if (c->upstream_fd >= 0) close(c->upstream_fd);
@@ -20086,8 +20072,8 @@ TEST(response_policy, buffered_request_requires_successful_upload) {
         static constexpr char kRequestZero[] =
             "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
         const char* request = zero_content_length ? kRequestZero : kRequest;
-        const u32 request_len = zero_content_length ? static_cast<u32>(sizeof(kRequestZero) - 1)
-                                                    : static_cast<u32>(sizeof(kRequest) - 1);
+        const u32 request_len =
+            zero_content_length ? u32{sizeof(kRequestZero) - 1} : u32{sizeof(kRequest) - 1};
         REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
                    request_len);
         c->req_initial_send_len = c->recv_buf.len();
@@ -20299,7 +20285,7 @@ TEST(upstream_reuse, overlong_response_not_reusable) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(kResp) - 1}));
     CHECK(!c->upstream_keep_alive);  // overlong body → not reusable
 }
 
@@ -20320,7 +20306,7 @@ TEST(upstream_reuse, no_body_response_with_surplus_not_reusable) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(kResp) - 1}));
     CHECK(!c->upstream_keep_alive);  // surplus after no-body headers → not reusable
 }
 
@@ -20343,7 +20329,7 @@ TEST(upstream_reuse, keepalive_request_pools_clean_response) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(kResp) - 1}));
     CHECK(c->upstream_keep_alive);  // request + response both keep-alive → reusable
 }
 
@@ -20372,7 +20358,7 @@ TEST(upstream_reuse, connection_close_request_not_pooled) {
     rut::on_upstream_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kResp) - 1)));
+        make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(kResp) - 1}));
     CHECK(!c->upstream_keep_alive);  // request asked origin to close → never pooled
 }
 
@@ -20487,8 +20473,7 @@ TEST(upstream_reuse, upstream_order_profile_honors_response_connection_close) {
     on_upstream_response<SmallLoop>(
         &loop,
         *conn,
-        IoEvent{
-            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+        IoEvent{conn->id, i32{sizeof(kResponse) - 1}, 0, 0, IoEventType::UpstreamRecv, 0});
 
     // The response was accepted and published downstream -- this is not a
     // rejection test.
@@ -20636,8 +20621,7 @@ TEST(upstream_reuse, upstream_order_profile_accepts_duplicate_connection_and_hon
     on_upstream_response<SmallLoop>(
         &loop,
         *conn,
-        IoEvent{
-            conn->id, static_cast<i32>(sizeof(kResponse) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+        IoEvent{conn->id, i32{sizeof(kResponse) - 1}, 0, 0, IoEventType::UpstreamRecv, 0});
 
     // The duplicate `Connection` header did not turn this into a rejection.
     CHECK_EQ(conn->resp_status, 200u);
@@ -22466,7 +22450,7 @@ TEST(streaming, http10_until_close) {
 
     // Body chunk.
     u8 body[64];
-    for (u32 i = 0; i < 64; i++) body[i] = static_cast<u8>('A');
+    for (u32 i = 0; i < 64; i++) body[i] = u8{'A'};
     inject_custom_recv(loop, *conn, IoEventType::UpstreamRecv, body, 64);
     CHECK_EQ(conn->on_send, &on_response_body_sent<SmallLoop>);
 
@@ -23116,8 +23100,7 @@ TEST(streaming, stale_upstream_recv_ignored_in_header_reading) {
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
 
     // Send completion → back to ReadingHeader (keep-alive).
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
     CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
 
@@ -24933,9 +24916,7 @@ TEST(pre_route_local_response,
     const RouteConfig* reused_active = &config;
     loop.config_ptr = &reused_active;
     on_header_received<SmallLoop>(
-        &loop,
-        *reused,
-        make_ev(reused_id, IoEventType::Recv, static_cast<i32>(sizeof(kTrace) - 1u)));
+        &loop, *reused, make_ev(reused_id, IoEventType::Recv, i32{sizeof(kTrace) - 1u}));
     loop.config_ptr = nullptr;
     CHECK_EQ(loop.conns[reused_id].fd, -1);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
@@ -25052,7 +25033,7 @@ TEST(exact_local_response,
     on_header_received<SmallLoop>(
         &loop,
         *sequential,
-        make_ev(sequential->id, IoEventType::Recv, static_cast<i32>(sizeof(kSequentialHead) - 1)));
+        make_ev(sequential->id, IoEventType::Recv, i32{sizeof(kSequentialHead) - 1}));
     REQUIRE_EQ(sequential->resp_status, 200u);
     REQUIRE_FALSE(sequential->keep_alive);
     loop.config_ptr = nullptr;
@@ -25085,11 +25066,10 @@ TEST(exact_local_response,
                sizeof(kSequentialDelete) - 1u);
     const RouteConfig* sequential_delete_config = valid.get();
     loop.config_ptr = &sequential_delete_config;
-    on_header_received<SmallLoop>(&loop,
-                                  *sequential_delete,
-                                  make_ev(sequential_delete_id,
-                                          IoEventType::Recv,
-                                          static_cast<i32>(sizeof(kSequentialDelete) - 1u)));
+    on_header_received<SmallLoop>(
+        &loop,
+        *sequential_delete,
+        make_ev(sequential_delete_id, IoEventType::Recv, i32{sizeof(kSequentialDelete) - 1u}));
     loop.config_ptr = nullptr;
     CHECK_EQ(loop.conns[sequential_delete_id].fd, -1);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
@@ -25125,8 +25105,7 @@ TEST(exact_local_response,
     on_header_received<SmallLoop>(
         &loop,
         *sequential_put,
-        make_ev(
-            sequential_put_id, IoEventType::Recv, static_cast<i32>(sizeof(kSequentialPut) - 1u)));
+        make_ev(sequential_put_id, IoEventType::Recv, i32{sizeof(kSequentialPut) - 1u}));
     loop.config_ptr = nullptr;
     CHECK_EQ(loop.conns[sequential_put_id].fd, -1);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
@@ -25159,11 +25138,10 @@ TEST(exact_local_response,
                sizeof(kSequentialPatch) - 1u);
     const RouteConfig* sequential_patch_config = valid.get();
     loop.config_ptr = &sequential_patch_config;
-    on_header_received<SmallLoop>(&loop,
-                                  *sequential_patch,
-                                  make_ev(sequential_patch_id,
-                                          IoEventType::Recv,
-                                          static_cast<i32>(sizeof(kSequentialPatch) - 1u)));
+    on_header_received<SmallLoop>(
+        &loop,
+        *sequential_patch,
+        make_ev(sequential_patch_id, IoEventType::Recv, i32{sizeof(kSequentialPatch) - 1u}));
     loop.config_ptr = nullptr;
     CHECK_EQ(loop.conns[sequential_patch_id].fd, -1);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
@@ -25190,9 +25168,7 @@ TEST(exact_local_response,
     const RouteConfig* coalesced_config = valid.get();
     loop.config_ptr = &coalesced_config;
     on_header_received<SmallLoop>(
-        &loop,
-        *coalesced,
-        make_ev(coalesced_id, IoEventType::Recv, static_cast<i32>(sizeof(kCoalesced) - 1)));
+        &loop, *coalesced, make_ev(coalesced_id, IoEventType::Recv, i32{sizeof(kCoalesced) - 1}));
     REQUIRE_EQ(coalesced->resp_status, 204u);
     const u32 first_response_len = coalesced->send_buf.len();
     loop.inject_and_dispatch(
@@ -25505,10 +25481,8 @@ TEST(exact_local_response,
         "GET /health/check/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
         "HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     static_assert(sizeof(kOverflowTarget) - 1 > kMaxExactPathViewLen);
-    dispatch_and_finish(*config,
-                        kOverflowRequest,
-                        204,
-                        {kOverflowTarget, static_cast<u32>(sizeof(kOverflowTarget) - 1)});
+    dispatch_and_finish(
+        *config, kOverflowRequest, 204, {kOverflowTarget, u32{sizeof(kOverflowTarget) - 1}});
 
     auto normalized_only = std::make_unique<RouteConfig>();
     REQUIRE(normalized_only->add_static("/", kRouteMethodGet, 204));
@@ -25592,9 +25566,7 @@ TEST(exact_local_response,
     const RouteConfig* active = config.get();
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop,
-        *reused,
-        make_ev(reused_id, IoEventType::Recv, static_cast<i32>(sizeof(kSuccessor) - 1)));
+        &loop, *reused, make_ev(reused_id, IoEventType::Recv, i32{sizeof(kSuccessor) - 1}));
     loop.config_ptr = nullptr;
     REQUIRE_EQ(reused->resp_status, 204u);
     REQUIRE(reused->checked_raw_request_target().target.eq(lit_str("/health/check")));
@@ -25616,9 +25588,7 @@ TEST(exact_local_response,
     const RouteConfig* pipelined_active = config.get();
     loop.config_ptr = &pipelined_active;
     on_header_received<SmallLoop>(
-        &loop,
-        *pipelined,
-        make_ev(pipelined_id, IoEventType::Recv, static_cast<i32>(sizeof(kPipelined) - 1)));
+        &loop, *pipelined, make_ev(pipelined_id, IoEventType::Recv, i32{sizeof(kPipelined) - 1}));
     REQUIRE_EQ(pipelined->resp_status, 204u);
     const u32 pipelined_first_len = pipelined->send_buf.len();
     loop.inject_and_dispatch(
@@ -26715,7 +26685,7 @@ TEST(exact_local_response,
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kEnd), sizeof(kEnd) - 1),
                sizeof(kEnd) - 1);
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kEnd) - 1)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kEnd) - 1}));
     REQUIRE_GE(conn->fd, 0);
     CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
     CHECK_FALSE(conn->http1_pipeline_boundary_owners_settled);
@@ -26736,7 +26706,7 @@ TEST(exact_local_response,
     on_header_received<SmallLoop>(
         &loop,
         *depth_zero,
-        make_ev(depth_zero->id, IoEventType::Recv, static_cast<i32>(sizeof(kDepthZero) - 1)));
+        make_ev(depth_zero->id, IoEventType::Recv, i32{sizeof(kDepthZero) - 1}));
     CHECK_FALSE(depth_zero->http1_pipeline_boundary_owners_settled);
 }
 
@@ -26949,9 +26919,7 @@ TEST(unmatched_local_response,
         conn->recv_buf.write(reinterpret_cast<const u8*>(kKeepAlive), sizeof(kKeepAlive) - 1),
         sizeof(kKeepAlive) - 1);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kKeepAlive) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kKeepAlive) - 1}));
     REQUIRE_EQ(conn->resp_status, 200u);
     REQUIRE(conn->keep_alive);
     CHECK(conn->request_config == &config);
@@ -27000,7 +26968,7 @@ TEST(unmatched_local_response,
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClose), sizeof(kClose) - 1),
                sizeof(kClose) - 1);
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kClose) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kClose) - 1}));
     REQUIRE_EQ(conn->resp_status, 200u);
     REQUIRE_FALSE(conn->keep_alive);
     const u32 second_wire_len = conn->send_buf.len();
@@ -27177,9 +27145,7 @@ TEST(unmatched_local_response,
         loop.backend.clear_ops();
         loop.backend.fail_send = !fail_resubmit;
         on_header_received<StrictLocalSendFailureLoop>(
-            &loop,
-            *conn,
-            make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+            &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
 
         if (fail_resubmit) {
             REQUIRE_EQ(loop.close_calls, 0u);
@@ -27249,7 +27215,7 @@ TEST(unmatched_local_response,
     loop.backend.fail_send = true;
 
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
 
     CHECK_EQ(loop.close_calls, 1u);
     CHECK(loop.close_saw_request_inflight);
@@ -27308,7 +27274,7 @@ TEST(unmatched_local_response,
     const u32 conn_id = conn->id;
     const u32 free_before = loop.free_top;
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
     REQUIRE_EQ(loop.close_calls, 0u);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);
@@ -27382,7 +27348,7 @@ TEST(unmatched_local_response,
     loop.close_during_submit = true;
 
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
 
     CHECK_EQ(loop.close_calls, 1u);
     CHECK(loop.close_saw_request_inflight);
@@ -27439,7 +27405,7 @@ TEST(unmatched_local_response,
     const u32 conn_id = conn->id;
     const u32 free_before = loop.free_top;
     on_header_received<StrictLocalSendFailureLoop>(
-        &loop, *conn, make_ev(conn_id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn_id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
     REQUIRE_EQ(loop.close_calls, 0u);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     REQUIRE_EQ(conn->on_send, &on_response_sent<StrictLocalSendFailureLoop>);
@@ -28229,7 +28195,7 @@ TEST(unmatched_local_response, reload_publication_is_consumed_and_inflight_reque
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
     REQUIRE_EQ(conn->resp_status, 400u);
     CHECK(conn->request_config == configured.get());
     CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
@@ -28255,9 +28221,7 @@ TEST(unmatched_local_response, reload_publication_is_consumed_and_inflight_reque
     REQUIRE_EQ(successor->recv_buf.write(reinterpret_cast<const u8*>(kGet), sizeof(kGet) - 1),
                sizeof(kGet) - 1);
     on_header_received<SmallLoop>(
-        &loop,
-        *successor,
-        make_ev(successor->id, IoEventType::Recv, static_cast<i32>(sizeof(kGet) - 1)));
+        &loop, *successor, make_ev(successor->id, IoEventType::Recv, i32{sizeof(kGet) - 1}));
     CHECK_EQ(successor->resp_status, 200u);
     CHECK(successor->request_config == omitted.get());
 }
@@ -28282,7 +28246,7 @@ TEST(unmatched_local_response, representation200_reload_keeps_owned_bytes_pinned
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
                sizeof(kRequest) - 1);
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
     REQUIRE_EQ(conn->resp_status, 200u);
     CHECK(conn->request_config == configured.get());
     CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
@@ -28304,9 +28268,7 @@ TEST(unmatched_local_response, representation200_reload_keeps_owned_bytes_pinned
         conn->recv_buf.write(reinterpret_cast<const u8*>(kSuccessor), sizeof(kSuccessor) - 1),
         sizeof(kSuccessor) - 1);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kSuccessor) - 1)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kSuccessor) - 1}));
     CHECK(conn->request_config == omitted.get());
     CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
                        conn->send_buf.len(),
@@ -28617,7 +28579,7 @@ TEST(pipeline, long_burst_rebases_each_settled_boundary_past_depth_limit) {
     conn->recv_buf.reset();
     for (u32 r = 0; r < kRequestCount; r++)
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet), kGetLen), kGetLen);
-    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(kGetLen * kRequestCount));
+    IoEvent ev = make_ev(conn->id, IoEventType::Recv, i32{kGetLen * kRequestCount});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -28729,7 +28691,7 @@ TEST(pipeline, burst_past_depth_limit_serves_and_accounts_every_request) {
     for (u32 i = 1; i < kRequestCount; i++)
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet), kGetLen), kGetLen);
     const u32 total_len = kGetLen * kRequestCount;
-    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total_len));
+    IoEvent ev = make_ev(conn->id, IoEventType::Recv, i32{total_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -28985,7 +28947,7 @@ TEST(http1_header_admission, initial_incomplete_45_then_57_is_neutral_and_dispat
     http1_header_admission_handler_calls = 0;
     loop.backend.clear_ops();
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kPrefix) - 1u}));
 
     REQUIRE_EQ(conn->fd, 42);
     CHECK_EQ(conn->pipeline_depth, 0u);
@@ -29019,7 +28981,7 @@ TEST(http1_header_admission, initial_incomplete_45_then_57_is_neutral_and_dispat
                sizeof(kSuffix) - 1u);
     loop.backend.clear_ops();
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kSuffix) - 1u)));
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, i32{sizeof(kSuffix) - 1u}));
 
     REQUIRE_EQ(conn->recv_buf.len(), sizeof(kRequest) - 1u);
     CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kRequest, sizeof(kRequest) - 1u), 0);
@@ -29136,7 +29098,7 @@ TEST(http1_header_admission, full_submit_failure_eof_and_negative_fail_closed) {
                    sizeof(kPrefix) - 1u);
         loop.backend.clear_ops();
         on_header_received<SmallLoop>(
-            &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+            &loop, *conn, make_ev(id, IoEventType::Recv, i32{sizeof(kPrefix) - 1u}));
         CHECK_EQ(loop.conns[id].fd, -1);
         CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
@@ -29154,7 +29116,7 @@ TEST(http1_header_admission, full_submit_failure_eof_and_negative_fail_closed) {
         REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1u),
                    sizeof(kPrefix) - 1u);
         on_header_received<FailRecvAsyncSmallLoop>(
-            &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kPrefix) - 1u)));
+            &loop, *conn, make_ev(id, IoEventType::Recv, i32{sizeof(kPrefix) - 1u}));
         CHECK_EQ(loop.conns[id].fd, -1);
         CHECK_EQ(loop.free_top, FailRecvAsyncSmallLoop::kMaxConns);
     }
@@ -29235,7 +29197,7 @@ TEST(pipeline, fragmented_successor_defers_request_generation_token_until_comple
     static constexpr char kTail[] = "\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1u),
                sizeof(kTail) - 1u);
-    loop.dispatch(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kTail) - 1u)));
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, i32{sizeof(kTail) - 1u}));
     REQUIRE_EQ(conn->handler_gen, 2u);
     CHECK_EQ(conn->pipeline_depth, 1u);
     CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
@@ -29259,9 +29221,7 @@ TEST(pipeline, malformed_depth_one_never_publishes_request_generation_token) {
     conn->recv_buf.reset();
     REQUIRE_EQ(conn->recv_buf.write(kMalformed, sizeof(kMalformed) - 1u), sizeof(kMalformed) - 1u);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kMalformed) - 1u), 0, 0, IoEventType::Recv, 0});
+        &loop, *conn, {conn->id, i32{sizeof(kMalformed) - 1u}, 0, 0, IoEventType::Recv, 0});
     CHECK_EQ(conn->handler_gen, 12u);
     CHECK(conn->req_malformed);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
@@ -29285,9 +29245,7 @@ TEST(pipeline, parse_error_depth_one_never_publishes_request_generation_token) {
     REQUIRE_EQ(conn->recv_buf.write(kParseError, sizeof(kParseError) - 1u),
                sizeof(kParseError) - 1u);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kParseError) - 1u), 0, 0, IoEventType::Recv, 0});
+        &loop, *conn, {conn->id, i32{sizeof(kParseError) - 1u}, 0, 0, IoEventType::Recv, 0});
     CHECK_EQ(conn->handler_gen, 18u);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
 }
@@ -29305,9 +29263,7 @@ TEST(pipeline, fragmented_depth_greater_than_one_clears_stale_request_generation
     conn->recv_buf.reset();
     REQUIRE_EQ(conn->recv_buf.write(kPartial, sizeof(kPartial) - 1u), sizeof(kPartial) - 1u);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 0});
+        &loop, *conn, {conn->id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 0});
     CHECK_EQ(conn->handler_gen, 13u);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
     CHECK_EQ(conn->pipeline_depth, 2u);
@@ -29327,9 +29283,7 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
                sizeof(kRequest) - 1u);
     on_header_received<SmallLoop>(
-        &loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        &loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 0});
     REQUIRE_EQ(conn->handler_gen, 0u);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
 
@@ -29535,8 +29489,7 @@ TEST(buffer_isolation, persists_across_keepalive) {
     // the client send.
     inject_upstream_response(loop, *conn);
     CHECK_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, i32{kMockHttpResponseLen}));
 
     // Connection should be back to reading the next request (keep-alive).
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
@@ -29749,8 +29702,7 @@ TEST(drain, proxy_response_sent_closes) {
     // Enable drain before final send
     loop.draining = true;
     u32 cid = c->id;
-    loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed during drain
 }
 
@@ -29780,7 +29732,7 @@ TEST(drain, response_header_rewrite_keepalive) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -29813,7 +29765,7 @@ TEST(drain, response_inject_connection_close_header) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -29856,7 +29808,7 @@ TEST(drain, response_short_connection_value_injects_close) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -29914,7 +29866,7 @@ TEST(streaming, request_body_cl_multi_chunk_send_recv) {
     u32 hdr_end = 57;    // offset past \r\n\r\n
     u32 body_in_buf = 12;
     u32 req_len = hdr_end + body_in_buf;
-    u32 available = static_cast<u32>(sizeof(req) - 1);
+    u32 available = u32{sizeof(req) - 1};
     u32 copy_len = req_len < available ? req_len : available;
 
     c->recv_buf.reset();
@@ -30251,7 +30203,7 @@ TEST(streaming, response_header_sent_dispatches_buffered_body) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -30287,7 +30239,7 @@ TEST(streaming, upstream_response_malformed_502) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < sizeof(bad_resp) - 1; j++) dst[j] = static_cast<u8>(bad_resp[j]);
     c->upstream_recv_buf.commit(sizeof(bad_resp) - 1);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(bad_resp) - 1));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{sizeof(bad_resp) - 1});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -30314,7 +30266,7 @@ TEST(streaming, upstream_response_chunked_initial_error_502) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -30364,10 +30316,7 @@ TEST(streaming, malformed_response_async_close_preserves_cancel_accounting) {
         sizeof(kMalformed) - 1);
     c->set_slots(nullptr, nullptr, &on_upstream_response<AsyncSmallLoop>, nullptr);
     on_upstream_response<AsyncSmallLoop>(
-        &loop,
-        *c,
-        IoEvent{
-            c->id, static_cast<i32>(sizeof(kMalformed) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+        &loop, *c, IoEvent{c->id, i32{sizeof(kMalformed) - 1}, 0, 0, IoEventType::UpstreamRecv, 0});
 
     CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_EQ(c->upstream_fd, -1);
@@ -30417,10 +30366,7 @@ TEST(streaming, malformed_response_epoll_detaches_and_retires_episode) {
         sizeof(kMalformed) - 1);
     c->set_slots(nullptr, nullptr, &on_upstream_response<EpollEventLoop>, nullptr);
     on_upstream_response<EpollEventLoop>(
-        loop,
-        *c,
-        IoEvent{
-            c->id, static_cast<i32>(sizeof(kMalformed) - 1), 0, 0, IoEventType::UpstreamRecv, 0});
+        loop, *c, IoEvent{c->id, i32{sizeof(kMalformed) - 1}, 0, 0, IoEventType::UpstreamRecv, 0});
 
     CHECK_EQ(c->resp_status, kStatusBadGateway);
     CHECK_EQ(c->upstream_fd, -1);
@@ -30652,7 +30598,7 @@ TEST(send, partial_send_continues) {
     REQUIRE(full_send_len > first_partial + second_partial);
 
     u32 cid = c->id;
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(first_partial)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, i32{first_partial}));
     CHECK_NE(loop.conns[cid].fd, -1);  // still open
     CHECK_EQ(loop.conns[cid].on_send, &on_response_sent<SmallLoop>);
     auto* send_op = loop.backend.last_op(MockOp::Send);
@@ -30662,7 +30608,7 @@ TEST(send, partial_send_continues) {
 
     // Second completion is also partial for the remaining chunk.
     REQUIRE(send_op->send_len > second_partial);
-    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, static_cast<i32>(second_partial)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, i32{second_partial}));
     CHECK_NE(loop.conns[cid].fd, -1);  // still open
     send_op = loop.backend.last_op(MockOp::Send);
     REQUIRE(send_op != nullptr);
@@ -31245,7 +31191,7 @@ TEST(access_request_size,
     CHECK_EQ(__builtin_memcmp(upstream_send->send_buf, kUpstreamRequest, kUpstreamRequestLen), 0);
 
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+        make_ev(conn->id, IoEventType::UpstreamSend, i32{kUpstreamRequestLen}));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
@@ -31294,7 +31240,7 @@ TEST(access_request_size,
     const RouteConfig* active = &local_config;
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop, *reused, make_ev(reused->id, IoEventType::Recv, static_cast<i32>(kLocalRequestLen)));
+        &loop, *reused, make_ev(reused->id, IoEventType::Recv, i32{kLocalRequestLen}));
     loop.config_ptr = nullptr;
     REQUIRE_EQ(reused->state, ConnState::Sending);
     CHECK_EQ(reused->resp_status, 204u);
@@ -31441,7 +31387,7 @@ TEST(access_request_size,
     CHECK_FALSE(ring.pop(absent));
 
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+        make_ev(conn->id, IoEventType::UpstreamSend, i32{kUpstreamRequestLen}));
     inject_upstream_response(loop, *conn);
     REQUIRE_EQ(conn->state, ConnState::Sending);
     const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
@@ -31604,8 +31550,7 @@ TEST(access_request_size,
     CHECK_FALSE(ring.pop(absent));
 
     const u32 completed_id = conn->id;
-    loop.inject_and_dispatch(
-        make_ev(completed_id, IoEventType::Send, static_cast<i32>(kLegacy502Len)));
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, i32{kLegacy502Len}));
 
     AccessLogEntry access{};
     REQUIRE(ring.pop(access));
@@ -31726,7 +31671,7 @@ TEST(access_request_size,
     CHECK_FALSE(ring.pop(absent));
 
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+        make_ev(conn->id, IoEventType::UpstreamSend, i32{kUpstreamRequestLen}));
 
     CHECK(conn->upstream_reused);
     CHECK(conn->request_upload_complete);
@@ -31787,7 +31732,7 @@ TEST(access_request_size,
     CHECK_FALSE(ring.pop(absent));
 
     loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kUpstreamRequestLen)));
+        make_ev(conn->id, IoEventType::UpstreamSend, i32{kUpstreamRequestLen}));
     CHECK(conn->request_upload_complete);
     CHECK_EQ(conn->retry_req_send_len, kUpstreamRequestLen);
     CHECK_EQ(conn->recv_buf.len(), 0u);
@@ -31804,8 +31749,7 @@ TEST(access_request_size,
     REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kUpstreamResponse),
                                              kUpstreamResponseLen),
                kUpstreamResponseLen);
-    loop.backend.inject(
-        make_ev(conn->id, IoEventType::UpstreamRecv, static_cast<i32>(kUpstreamResponseLen)));
+    loop.backend.inject(make_ev(conn->id, IoEventType::UpstreamRecv, i32{kUpstreamResponseLen}));
     IoEvent events[1]{};
     REQUIRE_EQ(loop.backend.wait(events, 1), 1u);
     loop.dispatch(events[0]);
@@ -31911,9 +31855,7 @@ TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_iso
     const RouteConfig* active = &config;
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop,
-        *first,
-        make_ev(first_id, IoEventType::Recv, static_cast<i32>(sizeof(kSuccessor) - 1u)));
+        &loop, *first, make_ev(first_id, IoEventType::Recv, i32{sizeof(kSuccessor) - 1u}));
     loop.config_ptr = nullptr;
     REQUIRE_NE(first->access_log_target_snapshot.episode, first_episode);
     loop.inject_and_dispatch(
@@ -31941,9 +31883,7 @@ TEST(access_log_snapshot, production_start_successors_pipeline_and_reuse_are_iso
         sizeof(kPipeline) - 1u);
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop,
-        *pipelined,
-        make_ev(pipeline_id, IoEventType::Recv, static_cast<i32>(sizeof(kPipeline) - 1u)));
+        &loop, *pipelined, make_ev(pipeline_id, IoEventType::Recv, i32{sizeof(kPipeline) - 1u}));
     const u32 pipeline_first_episode = pipelined->access_log_target_snapshot.episode;
     REQUIRE_NE(pipeline_first_episode, 0u);
     loop.inject_and_dispatch(
@@ -32371,9 +32311,9 @@ TEST(raw_request_target_witness, http_version_wire_and_metadata_are_bound_fail_c
 
     const u32 target_end = c.req_raw_target_offset + c.req_raw_target_length;
     const u32 minor_offset = target_end + 8u;
-    recv[minor_offset] = static_cast<u8>('1');
+    recv[minor_offset] = u8{'1'};
     require_invalid();
-    recv[minor_offset] = static_cast<u8>('0');
+    recv[minor_offset] = u8{'0'};
     require_valid();
 
     static constexpr char kHttp11[] = "GET /version//raw?x=%2F HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -32383,19 +32323,19 @@ TEST(raw_request_target_witness, http_version_wire_and_metadata_are_bound_fail_c
 
     const u32 h11_target_end = c.req_raw_target_offset + c.req_raw_target_length;
     const u32 h11_minor_offset = h11_target_end + 8u;
-    recv[h11_minor_offset] = static_cast<u8>('0');
+    recv[h11_minor_offset] = u8{'0'};
     require_invalid();
-    recv[h11_minor_offset] = static_cast<u8>('1');
+    recv[h11_minor_offset] = u8{'1'};
     require_valid();
 
-    recv[h11_minor_offset] = static_cast<u8>('2');
+    recv[h11_minor_offset] = u8{'2'};
     require_invalid();
-    recv[h11_minor_offset] = static_cast<u8>('1');
+    recv[h11_minor_offset] = u8{'1'};
     require_valid();
 
-    recv[h11_target_end + 4u] = static_cast<u8>('X');
+    recv[h11_target_end + 4u] = u8{'X'};
     require_invalid();
-    recv[h11_target_end + 4u] = static_cast<u8>('P');
+    recv[h11_target_end + 4u] = u8{'P'};
     require_valid();
 
     c.req_http_version = 255;
@@ -34144,7 +34084,7 @@ bool fill_real_tcp_send_queue(i32 sender, i32 peer, u8 pattern, u32& accepted) {
     __builtin_memset(filler, pattern, sizeof(filler));
     accepted = 0;
     for (u32 call = 0; call < kMaxSendCalls && accepted < kMaxFill; call++) {
-        const u32 requested = std::min<u32>(sizeof(filler), static_cast<u32>(kMaxFill - accepted));
+        const u32 requested = std::min<u32>(sizeof(filler), u32{kMaxFill - accepted});
         const ssize_t nw = send(sender, filler, requested, MSG_NOSIGNAL);
         if (nw > 0) {
             accepted += static_cast<u32>(nw);
@@ -35855,7 +35795,7 @@ TEST(connection_lifecycle,
     const RouteConfig* active = &config;
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop, *conn, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kSecond) - 1u)));
+        &loop, *conn, make_ev(id, IoEventType::Recv, i32{sizeof(kSecond) - 1u}));
     loop.config_ptr = nullptr;
     REQUIRE_EQ(conn->downstream_completed_request_count, 1u);
     const u32 second_wire_len = conn->send_buf.len();
@@ -35877,7 +35817,7 @@ TEST(connection_lifecycle,
                sizeof(kFailed) - 1u);
     loop.config_ptr = &active;
     on_header_received<SmallLoop>(
-        &loop, *reused, make_ev(id, IoEventType::Recv, static_cast<i32>(sizeof(kFailed) - 1u)));
+        &loop, *reused, make_ev(id, IoEventType::Recv, i32{sizeof(kFailed) - 1u}));
     loop.config_ptr = nullptr;
     REQUIRE_EQ(reused->downstream_completed_request_count, 0u);
     loop.inject_and_dispatch(make_ev(id, IoEventType::Send, -EPIPE));
@@ -36293,7 +36233,7 @@ TEST(streaming, request_body_chunked_error_closes) {
     u8* dst = c->recv_buf.write_ptr();
     for (u32 j = 0; j < req_len; j++) dst[j] = static_cast<u8>(req[j]);
     c->recv_buf.commit(req_len);
-    IoEvent rev = make_ev(c->id, IoEventType::Recv, static_cast<i32>(req_len));
+    IoEvent rev = make_ev(c->id, IoEventType::Recv, i32{req_len});
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -36312,7 +36252,7 @@ TEST(streaming, request_body_chunked_error_closes) {
     for (u32 j = 0; j < bad_len; j++) dst[j] = static_cast<u8>(bad_chunk[j]);
     c->recv_buf.commit(bad_len);
     u32 cid = c->id;
-    rev = make_ev(cid, IoEventType::Recv, static_cast<i32>(bad_len));
+    rev = make_ev(cid, IoEventType::Recv, i32{bad_len});
     loop.backend.inject(rev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -36357,13 +36297,13 @@ TEST(streaming, response_body_sent_dispatches_buffered_body) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < resp_len; j++) dst[j] = static_cast<u8>(resp[j]);
     c->upstream_recv_buf.commit(resp_len);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(resp_len));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{resp_len});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(resp_len)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{resp_len}));
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 128));
     const u32 sent = c->upstream_send_len;
     dst = c->upstream_recv_buf.write_ptr();
@@ -36907,10 +36847,8 @@ TEST(local_response_persistence, ordinary_jit_connection_close_owns_send_until_t
             conn->recv_buf.write(reinterpret_cast<const u8*>(kRequests), sizeof(kRequests) - 1),
             sizeof(kRequests) - 1);
         response_read_timeout_later_handler_calls = 0;
-        loop.dispatch(make_ev_more(conn->id,
-                                   IoEventType::Recv,
-                                   static_cast<i32>(sizeof(kRequests) - 1),
-                                   recv_stays_live ? 1 : 0));
+        loop.dispatch(make_ev_more(
+            conn->id, IoEventType::Recv, i32{sizeof(kRequests) - 1}, recv_stays_live ? 1 : 0));
 
         REQUIRE_EQ(conn->state, ConnState::Sending);
         REQUIRE_EQ(conn->on_send, &on_response_sent<AsyncSmallLoop>);
@@ -37870,7 +37808,7 @@ TEST(early_response, body_done_with_pending_dispatches_directly) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
     c->upstream_recv_buf.commit(kMockHttpResponseLen);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{kMockHttpResponseLen});
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -37987,7 +37925,7 @@ TEST(early_response, consume_upstream_sent_preserves_new_data) {
     // Write 200 bytes of "body" into upstream_recv_buf
     c->upstream_recv_buf.reset();
     u8* dst = c->upstream_recv_buf.write_ptr();
-    for (u32 j = 0; j < 200; j++) dst[j] = static_cast<u8>('A');
+    for (u32 j = 0; j < 200; j++) dst[j] = u8{'A'};
     c->upstream_recv_buf.commit(200);
     // Simulate on_response_body_recvd sending 200 bytes
     c->upstream_send_len = 200;
@@ -37995,7 +37933,7 @@ TEST(early_response, consume_upstream_sent_preserves_new_data) {
     c->resp_body_sent += 200;
     // Simulate UpstreamRecv appending 50 more bytes during the send
     dst = c->upstream_recv_buf.write_ptr();
-    for (u32 j = 0; j < 50; j++) dst[j] = static_cast<u8>('B');
+    for (u32 j = 0; j < 50; j++) dst[j] = u8{'B'};
     c->upstream_recv_buf.commit(50);
     CHECK_EQ(c->upstream_recv_buf.len(), 250u);
     // consume_upstream_sent should eat 200, leave 50
@@ -38073,7 +38011,7 @@ TEST(early_response, pipeline_preserved_when_body_done) {
     dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
     c->upstream_recv_buf.commit(kMockHttpResponseLen);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{kMockHttpResponseLen});
     loop.backend.inject(ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -38148,7 +38086,7 @@ TEST(early_response, recv_buf_cleared_after_stash) {
     dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < kMockHttpResponseLen; j++) dst[j] = static_cast<u8>(kMockHttpResponse[j]);
     c->upstream_recv_buf.commit(kMockHttpResponseLen);
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kMockHttpResponseLen));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{kMockHttpResponseLen});
     loop.backend.inject(ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -39386,7 +39324,7 @@ TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
     on_body_send_with_early_response<SmallLoop>(
         static_cast<void*>(&loop),
         *c,
-        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(sizeof(first) - 1)));
+        make_ev(c->id, IoEventType::UpstreamSend, i32{sizeof(first) - 1}));
 
     CHECK_EQ(c->retry_req_send_len, sizeof(first) - 1);
     CHECK_EQ(c->pipeline_stash_len, sizeof(next) - 1);
@@ -39645,8 +39583,7 @@ TEST(slot_hygiene, on_send_cleared_after_proxy_response_sent) {
     REQUIRE(c != nullptr);
     inject_upstream_response(loop, *c);
     CHECK(c->on_send != nullptr);
-    loop.inject_and_dispatch(
-        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(c->on_send, nullptr);
 }
 
@@ -39833,8 +39770,7 @@ TEST(proxy_response, ordinary_h1_recv_rearm_failure_closes_at_each_header_transi
                 on_upstream_request_sent<AsyncSmallLoop>(
                     &loop,
                     *conn,
-                    make_ev(
-                        id, IoEventType::UpstreamSend, static_cast<i32>(sizeof(kRequest) - 1u)));
+                    make_ev(id, IoEventType::UpstreamSend, i32{sizeof(kRequest) - 1u}));
                 break;
             }
             case Transition::IncompleteHeader: {
@@ -39844,8 +39780,7 @@ TEST(proxy_response, ordinary_h1_recv_rearm_failure_closes_at_each_header_transi
                 on_upstream_response<AsyncSmallLoop>(
                     &loop,
                     *conn,
-                    make_ev(
-                        id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kPartial) - 1u)));
+                    make_ev(id, IoEventType::UpstreamRecv, i32{sizeof(kPartial) - 1u}));
                 break;
             }
             case Transition::Interim: {
@@ -39855,8 +39790,7 @@ TEST(proxy_response, ordinary_h1_recv_rearm_failure_closes_at_each_header_transi
                 on_upstream_response<AsyncSmallLoop>(
                     &loop,
                     *conn,
-                    make_ev(
-                        id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kInterim) - 1u)));
+                    make_ev(id, IoEventType::UpstreamRecv, i32{sizeof(kInterim) - 1u}));
                 break;
             }
             case Transition::HeaderToBody: {
@@ -39867,9 +39801,7 @@ TEST(proxy_response, ordinary_h1_recv_rearm_failure_closes_at_each_header_transi
                 conn->resp_body_mode = BodyMode::ContentLength;
                 conn->resp_body_remaining = 12;
                 on_response_header_sent<AsyncSmallLoop>(
-                    &loop,
-                    *conn,
-                    make_ev(id, IoEventType::Send, static_cast<i32>(sizeof(kHeader) - 1u)));
+                    &loop, *conn, make_ev(id, IoEventType::Send, i32{sizeof(kHeader) - 1u}));
                 break;
             }
         }
@@ -40506,7 +40438,7 @@ TEST(local_response_persistence, yielded_jit_uses_pinned_request_and_publication
         REQUIRE_EQ(
             conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
             sizeof(kRequest) - 1);
-        loop.dispatch(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kRequest) - 1)));
+        loop.dispatch(make_ev(conn->id, IoEventType::Recv, i32{sizeof(kRequest) - 1}));
         REQUIRE_EQ(conn->state, ConnState::ExecHandler);
         CHECK_EQ(conn->request_config, &pinned);
 
@@ -40808,8 +40740,7 @@ TEST(state_invariant, proxy_dispatch_keeps_slots_consistent) {
     inject_upstream_response(loop, *c);
     check_sending_response_invariant(_tc, c);
 
-    loop.inject_and_dispatch(
-        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     check_reading_header_invariant(_tc, c);
 }
 
@@ -40861,7 +40792,7 @@ TEST(state_invariant, error_responses_drop_proxy_slots) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < blen; j++) dst[j] = static_cast<u8>(kBad[j]);
     c->upstream_recv_buf.commit(blen);
-    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(blen)));
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, i32{blen}));
 
     CHECK_EQ(c->resp_status, kStatusBadGateway);
     check_sending_response_invariant(_tc, c);
@@ -40899,11 +40830,11 @@ TEST(state_invariant, streaming_response_body_wait_is_explicit_sending_exception
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp[j]);
     c->upstream_recv_buf.commit(rlen);
-    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, i32{rlen}));
     CHECK_EQ(c->on_send, &on_response_header_sent<SmallLoop>);
     check_sending_response_invariant(_tc, c);
 
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(rlen)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{rlen}));
     check_sending_waiting_upstream_body_invariant(_tc, c);
 
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 500));
@@ -40931,7 +40862,7 @@ TEST(state_invariant, early_response_during_body_send_has_one_upstream_slot) {
     u8* dst = c->upstream_recv_buf.write_ptr();
     for (u32 j = 0; j < rlen; j++) dst[j] = static_cast<u8>(kResp413[j]);
     c->upstream_recv_buf.commit(rlen);
-    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
+    loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, i32{rlen}));
 
     check_proxying_upstream_send_only_invariant(
         _tc, c, &on_body_send_with_early_response<SmallLoop>);
@@ -41321,7 +41252,7 @@ TEST(state_invariant, response_sent_clears_send_buf_before_downstream_send_wait)
     static const char kReq[] = "GET /x HTTP/1.1\r\nHost: example\r\n\r\n";
     u8* dst = c->recv_buf.write_ptr();
     for (u32 i = 0; i < sizeof(kReq) - 1; i++) dst[i] = static_cast<u8>(kReq[i]);
-    c->recv_buf.commit(static_cast<u32>(sizeof(kReq) - 1));
+    c->recv_buf.commit(u32{sizeof(kReq) - 1});
 
     loop.backend.clear_ops();
     on_header_received<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::Recv, sizeof(kReq) - 1));
@@ -41666,10 +41597,8 @@ TEST(iouring_episode, relay_completion_decoder_preserves_high_bits_and_rejects_z
 TEST(state_invariant, upstream_event_token_layout_round_trips_and_separates_generations) {
     for (const IoEventType type :
          {IoEventType::UpstreamConnect, IoEventType::UpstreamRecv, IoEventType::UpstreamSend}) {
-        for (const u8 aux : {static_cast<u8>(0),
-                             kPauseCancelAux,
-                             kLocalSubmitFailureAux,
-                             kUpstreamRetirementCancelAux}) {
+        for (const u8 aux :
+             {u8{0}, kPauseCancelAux, kLocalSubmitFailureAux, kUpstreamRetirementCancelAux}) {
             for (const u32 conn_id : {0u, kIoUserDataMaxConnId}) {
                 for (const u32 episode : {1u, kIoUserDataMaxUpstreamEpisode}) {
                     const UpstreamEventToken source{conn_id, type, episode, aux};
@@ -41963,7 +41892,7 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     CHECK_EQ(loop->relay_budget_calls, 8u);
     // Pending ordinary work that has not reached the observation limit must
     // not prevent a runnable body from using its remaining turn budget.
-    loop->ordinary_cq_wait_limit_ns = ~static_cast<u64>(0);
+    loop->ordinary_cq_wait_limit_ns = ~u64{0};
     loop->flush_deferred_relay_reads();
     CHECK_EQ(loop->deferred_relay_read_count, 0u);
     CHECK_EQ(loop->relay_pulled_bytes, sizeof(expected));
@@ -43857,7 +43786,7 @@ TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body
     on_upstream_response<IoUringEventLoop>(loop,
                                            conn,
                                            {conn.id,
-                                            static_cast<i32>(sizeof(kNoClose) - 1u),
+                                            i32{sizeof(kNoClose) - 1u},
                                             0,
                                             0,
                                             IoEventType::UpstreamRecv,
@@ -43895,7 +43824,7 @@ TEST(iouring_upstream_response,
     on_upstream_response<IoUringEventLoop>(loop,
                                            conn,
                                            {conn.id,
-                                            static_cast<i32>(sizeof(kHeader) - 1u),
+                                            i32{sizeof(kHeader) - 1u},
                                             0,
                                             0,
                                             IoEventType::UpstreamRecv,
@@ -44013,7 +43942,7 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
         cqe.user_data =
             encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, episode, 0});
         cqe.res = static_cast<i32>(len);
-        cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+        cqe.flags = IORING_CQE_F_BUFFER | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
         __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
     };
     auto large_bytes = [&](u16 buf_id) {
@@ -44024,7 +43953,7 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
 
     // A full-slice completion is copied intact and its buffer returns to the
     // dedicated ring, never the ordinary one.
-    constexpr u16 kBufId = static_cast<u16>(kLargeProvidedBufIdBase + 5u);
+    constexpr u16 kBufId = u16{kLargeProvidedBufIdBase + 5u};
     REQUIRE(backend.provided_buffer_id_valid(kBufId));
     CHECK_EQ(backend.provided_buffer_size(kBufId), kLargeProvidedBufSize);
     for (u32 i = 0; i < kLargeProvidedBufSize; i++)
@@ -44045,7 +43974,7 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
 
     // A stale episode's selected buffer is returned without touching the slice.
     conn.upstream_recv_buf.reset();
-    append_cqe(static_cast<u16>(kBufId + 1u), 64u, conn.upstream_episode + 1u);
+    append_cqe(u16{kBufId + 1u}, 64u, conn.upstream_episode + 1u);
     backend.pending = 0;
     REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
@@ -44193,7 +44122,7 @@ TEST(iouring_upstream_recv, complete_buffered_direct_body_rejects_same_cqe_overr
         auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
         cqe.user_data = encode_upstream_event_token(
             {conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
-        cqe.res = static_cast<i32>(kLen);
+        cqe.res = i32{kLen};
         cqe.flags = 0;
         __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
         backend.pending = 0;
@@ -44251,7 +44180,7 @@ TEST(iouring_upstream_recv, bounded_terminal_discards_late_direct_bytes_without_
     auto& cqe = backend.cq_entries[tail & *backend.cq_ring_mask];
     cqe.user_data =
         encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
-    cqe.res = static_cast<i32>(kLate);
+    cqe.res = i32{kLate};
     cqe.flags = 0;
     __atomic_store_n(backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
     backend.pending = 0;
@@ -44312,7 +44241,7 @@ TEST(iouring_upstream_recv, pending_close_retains_chain_target_until_late_write_
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
     cqe.user_data = encode_upstream_event_token({id, IoEventType::UpstreamRecv, episode, 0});
-    cqe.res = static_cast<i32>(kLen);
+    cqe.res = i32{kLen};
     cqe.flags = 0;
     __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
     backend.pending = 0;
@@ -44454,7 +44383,7 @@ TEST(iouring_upstream_recv, backend_marks_only_empty_ring_enobufs) {
     REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), SlicePool::kSliceSize);
     conn.upstream_recv_buf.commit(SlicePool::kSliceSize - 1u);
     constexpr u16 kBufId = 3;
-    append_cqe(8, IORING_CQE_F_BUFFER | (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT));
+    append_cqe(8, IORING_CQE_F_BUFFER | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT));
     backend.pending = 0;
     REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(events[0].result, -ENOBUFS);
@@ -44907,7 +44836,7 @@ TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and
     REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u), sizeof(kFirst) - 1u);
 
     const IoEvent first{conn.id,
-                        static_cast<i32>(sizeof(kFirst) - 1u),
+                        i32{sizeof(kFirst) - 1u},
                         0,
                         0,
                         IoEventType::UpstreamRecv,
@@ -44928,7 +44857,7 @@ TEST(iouring_upstream_recv, terminal_dispatch_rearms_once_across_reuse_clear_and
     static constexpr u8 kSecond[] = "1.1 ";
     REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u), sizeof(kSecond) - 1u);
     const IoEvent second{conn.id,
-                         static_cast<i32>(sizeof(kSecond) - 1u),
+                         i32{sizeof(kSecond) - 1u},
                          0,
                          0,
                          IoEventType::UpstreamRecv,
@@ -44982,7 +44911,7 @@ TEST(iouring_upstream_recv, pipelined_header_rearm_preserves_send_stash_and_offs
             REQUIRE_EQ(conn.upstream_recv_buf.write(kFirst, sizeof(kFirst) - 1u),
                        sizeof(kFirst) - 1u);
             loop->dispatch({id,
-                            static_cast<i32>(sizeof(kFirst) - 1u),
+                            i32{sizeof(kFirst) - 1u},
                             0,
                             0,
                             IoEventType::UpstreamRecv,
@@ -45006,7 +44935,7 @@ TEST(iouring_upstream_recv, pipelined_header_rearm_preserves_send_stash_and_offs
             REQUIRE_EQ(conn.upstream_recv_buf.write(kSecond, sizeof(kSecond) - 1u),
                        sizeof(kSecond) - 1u);
             loop->dispatch({id,
-                            static_cast<i32>(sizeof(kSecond) - 1u),
+                            i32{sizeof(kSecond) - 1u},
                             0,
                             0,
                             IoEventType::UpstreamRecv,
@@ -45728,15 +45657,14 @@ bool harvest_http1_boundary_recv(IoUringEventLoop* loop,
     constexpr u16 kBufId = 29;
     if (result > 0) {
         if (bytes == nullptr || len != static_cast<u32>(result) || len > 4096) return false;
-        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufId) * 4096, bytes, len);
+        __builtin_memcpy(loop->backend.buf_base + u64{kBufId} * 4096, bytes, len);
     }
     const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
     cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
     cqe.res = result;
     cqe.flags = more ? IORING_CQE_F_MORE : 0;
-    if (result > 0)
-        cqe.flags |= IORING_CQE_F_BUFFER | (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT);
+    if (result > 0) cqe.flags |= IORING_CQE_F_BUFFER | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent events[2]{};
@@ -45781,13 +45709,12 @@ struct RawDownstreamRecvBatch {
         if (bytes == nullptr || len == 0 || len > kProvidedBufSize) return false;
         const u16 buf_id = forced_buf_id == UINT16_MAX ? next_buf_id++ : forced_buf_id;
         if (buf_id >= kProvidedBufCount) return false;
-        __builtin_memcpy(
-            guard.loop->backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize, bytes, len);
+        __builtin_memcpy(guard.loop->backend.buf_base + u64{buf_id} * kProvidedBufSize, bytes, len);
         u32 cursor = tail();
         auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
         cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
         cqe.res = static_cast<i32>(len);
-        cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT) |
+        cqe.flags = IORING_CQE_F_BUFFER | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT) |
                     (more ? IORING_CQE_F_MORE : 0u);
         __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
         return true;
@@ -46667,17 +46594,15 @@ TEST(iouring_downstream_recv_barrier, tls_ciphertext_and_upstream_classification
     static constexpr u8 kTwo[] = "up-two";
     auto append_upstream = [&](const u8* bytes, u32 len, u16 buf_id) {
         __builtin_memcpy(
-            fixture.guard.loop->backend.buf_base + static_cast<u64>(buf_id) * kProvidedBufSize,
-            bytes,
-            len);
+            fixture.guard.loop->backend.buf_base + u64{buf_id} * kProvidedBufSize, bytes, len);
         const u32 cursor = fixture.tail();
         auto& cqe = fixture.guard.loop->backend
                         .cq_entries[cursor & *fixture.guard.loop->backend.cq_ring_mask];
         cqe.user_data = IoUringBackend::encode_upstream_user_data(
             conn.id, IoEventType::UpstreamRecv, conn.upstream_episode);
         cqe.res = static_cast<i32>(len);
-        cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                    (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+        cqe.flags =
+            IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
         __atomic_store_n(fixture.guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
     };
     append_upstream(kOne, sizeof(kOne) - 1u, 201);
@@ -46719,7 +46644,7 @@ TEST(iouring_downstream_recv_barrier, marker_mutation_and_invalid_buffer_fail_st
     invalid.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
     invalid.res = 1;
     invalid.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                    (static_cast<u32>(kProvidedBufCount) << IORING_CQE_BUFFER_SHIFT);
+                    (u32{kProvidedBufCount} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(fixture.guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
     IoEvent event{};
     REQUIRE_EQ(fixture.wait(&event, 1), 1u);
@@ -46739,9 +46664,9 @@ TEST(iouring_downstream_recv_barrier, recv_aux_and_cancel_metadata_mutations_fai
         {kDownstreamCloseCancelAux + 1u, 0, 0},
         {kDownstreamCloseCancelAux,
          1,
-         IORING_CQE_F_BUFFER | (static_cast<u32>(kValidBufId) << IORING_CQE_BUFFER_SHIFT)},
+         IORING_CQE_F_BUFFER | (u32{kValidBufId} << IORING_CQE_BUFFER_SHIFT)},
         {kDownstreamCloseCancelAux, 1, IORING_CQE_F_MORE},
-        {0, 0, IORING_CQE_F_BUFFER | (static_cast<u32>(kValidBufId) << IORING_CQE_BUFFER_SHIFT)},
+        {0, 0, IORING_CQE_F_BUFFER | (u32{kValidBufId} << IORING_CQE_BUFFER_SHIFT)},
     };
     for (const auto& mutation : mutations) {
         RawDownstreamRecvBatch fixture;
@@ -47179,7 +47104,7 @@ TEST(iouring_downstream_ring_empty, dropped_bytes_enobufs_is_not_a_ring_empty_te
     memset(fill, 'x', sizeof(fill));
     while (conn.recv_buf.write_avail() > 0) {
         const u32 avail = conn.recv_buf.write_avail();
-        const u32 n = avail < sizeof(fill) ? avail : static_cast<u32>(sizeof(fill));
+        const u32 n = avail < sizeof(fill) ? avail : u32{sizeof(fill)};
         REQUIRE_EQ(conn.recv_buf.write(fill, n), n);
     }
     static constexpr u8 kBytes[] = "GET / HTTP/1.1\r\n";
@@ -47690,8 +47615,7 @@ bool harvest_prebuilt_d2_composition_batch(IoUringEventLoop* loop,
 
     constexpr u16 kBufId = 30;
     if (request2_len > 4096) return false;
-    __builtin_memcpy(
-        loop->backend.buf_base + static_cast<u64>(kBufId) * 4096, request2, request2_len);
+    __builtin_memcpy(loop->backend.buf_base + u64{kBufId} * 4096, request2, request2_len);
 
     u32 tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     const u32 mask = *loop->backend.cq_ring_mask;
@@ -47724,8 +47648,7 @@ bool harvest_prebuilt_d2_composition_batch(IoUringEventLoop* loop,
     if (!header_first) append_header();
     append(encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0}),
            static_cast<i32>(request2_len),
-           IORING_CQE_F_MORE | IORING_CQE_F_BUFFER |
-               (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT));
+           IORING_CQE_F_MORE | IORING_CQE_F_BUFFER | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT));
     __atomic_store_n(loop->backend.cq_tail, tail, __ATOMIC_RELEASE);
 
     loop->backend.pending = 0;
@@ -48906,9 +48829,7 @@ TEST(response_read_deadline_request_framing_selection,
         response_read_deadline_get_framing_selection_handler_calls = 0;
         REQUIRE(deferred_canonical_selection_state_is_neutral(*conn));
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kNoClRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kNoClRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
         REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
         REQUIRE_EQ(conn->request_policy_id, kId3);
         REQUIRE_EQ(conn->response_read_deadline_upload.request_policy_id, kId3);
@@ -48984,9 +48905,7 @@ TEST(response_read_deadline_request_framing_selection,
         conn->pending_ops = 1;
         response_read_deadline_get_framing_selection_handler_calls = 0;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kPositivePrefix) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kPositivePrefix) - 1u}, 0, 0, IoEventType::Recv, 1});
         REQUIRE_EQ(response_read_deadline_get_framing_selection_handler_calls, 1u);
         REQUIRE_EQ(conn->request_policy_id, kId1);
         REQUIRE(conn->request_policy_body_pending);
@@ -49011,7 +48930,7 @@ TEST(response_read_deadline_request_framing_selection,
         send.offset = send.remaining;
         send.remaining = 0;
         loop->dispatch({conn->id,
-                        static_cast<i32>(sizeof(kPositiveWire) - 1u),
+                        i32{sizeof(kPositiveWire) - 1u},
                         0,
                         0,
                         IoEventType::UpstreamSend,
@@ -49064,7 +48983,7 @@ TEST(response_read_deadline_request_framing_selection,
     response_read_deadline_framing_selection_handler_calls = 0;
     loop.backend.clear_ops();
     on_header_received<DeferredPreflightMockLoop>(
-        &loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        &loop, *conn, {id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 0});
 
     REQUIRE_EQ(response_read_deadline_framing_selection_handler_calls, 1u);
     REQUIRE_EQ(loop.free_top, DeferredPreflightMockLoop::kMaxConns - 1u);
@@ -49156,7 +49075,7 @@ TEST(response_read_deadline_request_framing_selection,
         on_header_received<DeferredPreflightMockLoop>(
             &rejected_loop,
             *rejected,
-            {rejected_id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+            {rejected_id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 0});
 
         CHECK_EQ(response_read_deadline_framing_selection_handler_calls, 0u);
         CHECK_EQ(rejected_loop.free_top, DeferredPreflightMockLoop::kMaxConns);
@@ -49528,12 +49447,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
     on_header_received<IoUringEventLoop>(
         loop,
         *conn,
-        {conn->id,
-         static_cast<i32>(sizeof(kRequest1) + sizeof(kSuccessor) - 2u),
-         0,
-         0,
-         IoEventType::Recv,
-         1});
+        {conn->id, i32{sizeof(kRequest1) + sizeof(kSuccessor) - 2u}, 0, 0, IoEventType::Recv, 1});
 
     REQUIRE_EQ(response_coalesced_phase1_handler_calls, 1u);
     CHECK_EQ(response_coalesced_phase1_handler_len, sizeof(kRequest1) - 1u);
@@ -49622,12 +49536,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
     on_header_received<IoUringEventLoop>(
         loop,
         *conn,
-        {conn->id,
-         static_cast<i32>(sizeof(kRequest1) + sizeof(kSuccessor) - 2u),
-         0,
-         0,
-         IoEventType::Recv,
-         1});
+        {conn->id, i32{sizeof(kRequest1) + sizeof(kSuccessor) - 2u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE(conn->upstream_connect_armed);
     const u32 episode = conn->upstream_episode;
     conn->upstream_connect_armed = false;
@@ -49761,15 +49670,14 @@ TEST(response_read_deadline_coalesced_get_phase1,
         const u32 backend_pending = loop->backend.pending;
         conn->recv_armed = true;
         conn->pending_ops = 1;
-        on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id,
-             static_cast<i32>(sizeof(kRequest1) + sizeof(kSuccessor) - 2u),
-             0,
-             0,
-             IoEventType::Recv,
-             1});
+        on_header_received<IoUringEventLoop>(loop,
+                                             *conn,
+                                             {conn->id,
+                                              i32{sizeof(kRequest1) + sizeof(kSuccessor) - 2u},
+                                              0,
+                                              0,
+                                              IoEventType::Recv,
+                                              1});
         REQUIRE(conn->upstream_connect_armed);
         CHECK_EQ(conn->request_policy_id, vector.policy);
         const u32 upload_len_expected = static_cast<u32>(__builtin_strlen(vector.upload));
@@ -50061,7 +49969,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         Connection& conn = *fixture.conn;
         const u32 id = conn.id;
         const u32 stash_len = sizeof(kStart) - 1u;
-        const u32 request2_len = conn.recv_buf.capacity() + static_cast<u32>(overflow);
+        const u32 request2_len = conn.recv_buf.capacity() + u32{overflow};
         REQUIRE_GT(request2_len, stash_len + sizeof(kEnd) - 1u);
         const u32 pad_len = request2_len - stash_len - (sizeof(kEnd) - 1u);
         std::vector<u8> late(pad_len + sizeof(kEnd) - 1u, 'p');
@@ -50361,9 +50269,7 @@ TEST(response_read_deadline_coalesced_get_phase1,
         conn->recv_armed = true;
         conn->pending_ops = 1;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequests) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kRequests) - 1u}, 0, 0, IoEventType::Recv, 1});
         REQUIRE(conn->upstream_connect_armed);
         const u32 episode = conn->upstream_episode;
         conn->upstream_connect_armed = false;
@@ -50393,17 +50299,16 @@ TEST(response_read_deadline_coalesced_get_phase1,
                                                         0,
                                                         episode});
         } else {
-            on_early_upstream_recvd_send_inflight<IoUringEventLoop>(
-                loop,
-                *conn,
-                {conn->id,
-                 static_cast<i32>(sizeof(kEarly) - 1u),
-                 0,
-                 0,
-                 IoEventType::UpstreamRecv,
-                 1,
-                 0,
-                 episode});
+            on_early_upstream_recvd_send_inflight<IoUringEventLoop>(loop,
+                                                                    *conn,
+                                                                    {conn->id,
+                                                                     i32{sizeof(kEarly) - 1u},
+                                                                     0,
+                                                                     0,
+                                                                     IoEventType::UpstreamRecv,
+                                                                     1,
+                                                                     0,
+                                                                     episode});
         }
         CHECK_EQ(loop->conns[conn->id].fd, -1);
         u8 wire[8]{};
@@ -50564,9 +50469,7 @@ bool stage_preconnect_connect_submit(IoUringEventLoop* loop,
     out->backend_pending = loop->backend.pending;
     if (!loop->submit_recv(*conn)) return false;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     if (conn->fd < 0 || conn->upstream_fd < 0 || !conn->upstream_connect_armed ||
         !conn->recv_armed || conn->pending_ops != 2 || conn->on_recv != nullptr ||
         conn->on_upstream_send != &on_upstream_connected<IoUringEventLoop>)
@@ -52756,9 +52659,7 @@ TEST(http1_pipeline_generation_activation,
     REQUIRE_EQ(conn.recv_buf.write(kLastFragment, sizeof(kLastFragment) - 1u),
                sizeof(kLastFragment) - 1u);
     on_header_received<IoUringEventLoop>(
-        loop,
-        conn,
-        {conn.id, static_cast<i32>(sizeof(kLastFragment) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, conn, {conn.id, i32{sizeof(kLastFragment) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE_GE(conn.fd, 0);
     CHECK_EQ(conn.http1_pipeline_request_generation, conn.handler_gen);
     CHECK(conn.upstream_connect_armed);
@@ -53235,7 +53136,7 @@ TEST(iouring_validated_failure_pipeline,
     __atomic_store_n(loop->backend.sq_tail, fixture.sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = fixture.backend_pending;
     const u32 tail_before_terminal_recv = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 0});
+    loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 0});
 
     REQUIRE_GE(conn.fd, 0);
     CHECK(conn.send_armed);
@@ -53339,7 +53240,7 @@ TEST(iouring_validated_failure_pipeline,
         REQUIRE_EQ(conn.recv_buf.write(kRemainder, sizeof(kRemainder) - 1u),
                    sizeof(kRemainder) - 1u);
         loop->dispatch({id,
-                        static_cast<i32>(sizeof(kRemainder) - 1u),
+                        i32{sizeof(kRemainder) - 1u},
                         0,
                         0,
                         IoEventType::Recv,
@@ -53765,7 +53666,7 @@ TEST(iouring_connect_completion_failure,
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
-    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(conn.resp_status, 204u);
     CHECK(conn.send_armed);
     CHECK(conn.recv_armed);
@@ -54062,7 +53963,7 @@ TEST(iouring_connect_completion_failure,
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
-    loop->dispatch({id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(conn.resp_status, 204u);
     CHECK(conn.send_armed);
     CHECK(conn.recv_armed);
@@ -54143,9 +54044,7 @@ TEST(iouring_preconnect_failure,
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -54183,8 +54082,7 @@ TEST(iouring_preconnect_failure,
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
-    loop->dispatch(
-        {conn->id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    loop->dispatch({conn->id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(conn->resp_status, 204u);
     CHECK(conn->send_armed);
     CHECK(conn->recv_armed);
@@ -54232,9 +54130,7 @@ TEST(iouring_preconnect_failure,
     {
         test_fault::ScopedIoUringSubmitFailure connect_failure(/*connect_failures=*/1);
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -54291,9 +54187,7 @@ TEST(iouring_preconnect_failure, head_socket_create_suppresses_body_and_keeps_al
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     }
     REQUIRE(conn->send_armed);
     REQUIRE_EQ(conn->resp_status, 502u);
@@ -54343,9 +54237,7 @@ TEST(iouring_preconnect_failure, complete_buffered_get_socket_create_honors_expl
     {
         test_fault::ScopedSocketFailure socket_failure;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     }
     REQUIRE(conn->send_armed);
     CHECK_EQ(conn->resp_status, 502u);
@@ -54411,9 +54303,7 @@ TEST(iouring_preconnect_failure,
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE(conn->request_policy_body_pending);
     REQUIRE(conn->recv_armed);
     REQUIRE_EQ(conn->pending_ops, 1u);
@@ -54490,9 +54380,7 @@ TEST(iouring_preconnect_failure,
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE(conn->request_policy_body_pending);
     REQUIRE(conn->recv_armed);
     REQUIRE_EQ(conn->pending_ops, 1u);
@@ -54531,8 +54419,7 @@ TEST(iouring_preconnect_failure,
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
-    loop->dispatch(
-        {conn->id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    loop->dispatch({conn->id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(conn->resp_status, 205u);
     CHECK(conn->send_armed);
     CHECK(conn->recv_armed);
@@ -54655,8 +54542,7 @@ TEST(iouring_preconnect_failure,
     REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedSocketFailure socket_failure;
-        loop->dispatch(
-            {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        loop->dispatch({conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 0});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -54680,8 +54566,7 @@ TEST(iouring_preconnect_failure,
     static constexpr u8 kSuccessor[] =
         "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u), sizeof(kSuccessor) - 1u);
-    loop->dispatch(
-        {conn->id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+    loop->dispatch({conn->id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(conn->resp_status, 204u);
     CHECK(conn->send_armed);
     CHECK(conn->recv_armed);
@@ -54727,7 +54612,7 @@ TEST(iouring_preconnect_failure,
     REQUIRE(loop->submit_recv(*conn));
     {
         test_fault::ScopedIoUringSubmitFailure connect_failure(/*connect_failures=*/1);
-        loop->dispatch({id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 0});
+        loop->dispatch({id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 0});
     }
 
     REQUIRE_GE(conn->fd, 0);
@@ -54782,9 +54667,7 @@ TEST(iouring_preconnect_failure,
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE_EQ(conn->on_recv, &on_request_policy_body_recvd<IoUringEventLoop>);
     REQUIRE(conn->recv_armed);
     REQUIRE_EQ(conn->pending_ops, 1u);
@@ -54837,9 +54720,7 @@ TEST(iouring_preconnect_failure,
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE_EQ(conn->on_recv, &on_request_policy_body_recvd<IoUringEventLoop>);
     REQUIRE(conn->recv_armed);
     REQUIRE_EQ(conn->pending_ops, 1u);
@@ -55836,7 +55717,7 @@ bool stage_strict_parse_failure(IoUringEventLoop* loop,
     conn->upstream_episode = out->episode;
     conn->recv_armed = true;
     conn->upstream_recv_armed = live_upstream_recv;
-    conn->pending_ops = 1u + static_cast<u32>(live_upstream_recv);
+    conn->pending_ops = 1u + u32{live_upstream_recv};
     conn->set_slots(nullptr,
                     nullptr,
                     live_upstream_recv ? &on_upstream_response<IoUringEventLoop> : nullptr,
@@ -56033,7 +55914,7 @@ TEST(iouring_prebuilt, exact_masks_and_buffer_dispositions_drain_in_both_orders)
         {kUpstreamOpConnect, Http1RequestBufferDisposition::PrefixInRecv, false, false},
         {kUpstreamOpSend, Http1RequestBufferDisposition::PrefixInRecv, true, false},
         {kUpstreamOpRecv, Http1RequestBufferDisposition::ExistingPipeline, false, true},
-        {static_cast<u8>(kUpstreamOpSend | kUpstreamOpRecv),
+        {u8{kUpstreamOpSend | kUpstreamOpRecv},
          Http1RequestBufferDisposition::RetrySendBuf,
          true,
          false},
@@ -56339,7 +56220,7 @@ TEST(iouring_prebuilt, wrong_disposition_for_each_transport_phase_is_transaction
          Http1RequestBufferDisposition::RetrySendBuf,
          Http1RequestBufferDisposition::PrefixInRecv,
          Http1RequestBufferDisposition::ExistingPipeline},
-        {static_cast<u8>(kUpstreamOpSend | kUpstreamOpRecv),
+        {u8{kUpstreamOpSend | kUpstreamOpRecv},
          Http1RequestBufferDisposition::RetrySendBuf,
          Http1RequestBufferDisposition::ExistingPipeline,
          Http1RequestBufferDisposition::PrefixInRecv},
@@ -56613,7 +56494,7 @@ TEST(iouring_parse_failure, malformed_positive_uses_d2_and_resumes_once_after_bo
         conn.upstream_slot_held = true;
         conn.upstream_slot_uid = 0;
         loop->dispatch({conn.id,
-                        static_cast<i32>(sizeof(kMalformed) - 1u),
+                        i32{sizeof(kMalformed) - 1u},
                         0,
                         0,
                         IoEventType::UpstreamRecv,
@@ -58580,7 +58461,7 @@ TEST(iouring_response_read_timer,
             REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
                        sizeof(kOrigin) - 1u);
             const IoEvent response = response_read_copy_event(
-                conn, static_cast<i32>(sizeof(kOrigin) - 1u), true, 0, sizeof(kOrigin) - 1u);
+                conn, i32{sizeof(kOrigin) - 1u}, true, 0, sizeof(kOrigin) - 1u);
             const IoEvent target = inert_response_read_timer_event(conn.id, timer_generation);
             const IoEvent cancel = inert_response_read_timer_event(
                 conn.id, timer_generation | kResponseReadTimerCancelBit);
@@ -59193,7 +59074,7 @@ TEST(response_read_deadline, fresh_recv_arm_owns_exact_bundle_episode_and_timer_
     REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
     Connection& conn = *fixture.conn;
     conn.upstream_recv_armed = false;
-    conn.pending_ops = static_cast<u32>(conn.recv_armed);
+    conn.pending_ops = u32{conn.recv_armed};
     conn.upstream_attempts = 1;
     REQUIRE(conn.next_response_read_deadline_generation());
     conn.response_read_deadline_bundle_id = 2;
@@ -59235,7 +59116,7 @@ TEST(response_read_deadline, fresh_arm_rejects_nonfresh_states_and_sq_pressure) 
     REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture));
     Connection& conn = *fixture.conn;
     conn.upstream_recv_armed = false;
-    conn.pending_ops = static_cast<u32>(conn.recv_armed);
+    conn.pending_ops = u32{conn.recv_armed};
     conn.upstream_attempts = 1;
     REQUIRE(conn.next_response_read_deadline_generation());
     auto restore_owner = [&]() {
@@ -59306,7 +59187,7 @@ TEST(response_read_deadline, matching_response_wins_expiry_in_both_batch_orders)
 
         const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout, 0};
         const IoEvent response = response_read_copy_event(
-            conn, static_cast<i32>(sizeof(kOrigin) - 1u), true, 0, sizeof(kOrigin) - 1u);
+            conn, i32{sizeof(kOrigin) - 1u}, true, 0, sizeof(kOrigin) - 1u);
         const IoEvent events[2] = {timeout_first ? timeout : response,
                                    timeout_first ? response : timeout};
         loop->dispatch_batch(events, 2);
@@ -59428,7 +59309,7 @@ TEST(response_read_deadline, fragmented_f_more_headers_refresh_then_complete_cro
                sizeof(kPartial) - 1u);
     const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const IoEvent partial = response_read_copy_event(
-        *fixture.conn, static_cast<i32>(sizeof(kPartial) - 1u), true, 0, sizeof(kPartial) - 1u);
+        *fixture.conn, i32{sizeof(kPartial) - 1u}, true, 0, sizeof(kPartial) - 1u);
     loop->dispatch_batch(&partial, 1);
 
     Connection& conn = loop->conns[id];
@@ -59443,7 +59324,7 @@ TEST(response_read_deadline, fragmented_f_more_headers_refresh_then_complete_cro
     const u32 begin = conn.upstream_recv_buf.len();
     REQUIRE_EQ(conn.upstream_recv_buf.write(kFinish, sizeof(kFinish) - 1u), sizeof(kFinish) - 1u);
     const IoEvent finish = response_read_copy_event(
-        conn, static_cast<i32>(sizeof(kFinish) - 1u), true, begin, conn.upstream_recv_buf.len());
+        conn, i32{sizeof(kFinish) - 1u}, true, begin, conn.upstream_recv_buf.len());
     loop->dispatch_batch(&finish, 1);
     CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::None);
     CHECK_EQ(conn.resp_status, 200u);
@@ -59611,14 +59492,8 @@ TEST(response_read_deadline, stale_owner_never_wins_and_client_close_reclaims_on
         REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, sizeof(kOrigin) - 1u),
                    sizeof(kOrigin) - 1u);
         const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-        loop->dispatch({id,
-                        static_cast<i32>(sizeof(kOrigin) - 1u),
-                        0,
-                        0,
-                        IoEventType::UpstreamRecv,
-                        1,
-                        0,
-                        episode});
+        loop->dispatch(
+            {id, i32{sizeof(kOrigin) - 1u}, 0, 0, IoEventType::UpstreamRecv, 1, 0, episode});
         CHECK_EQ(loop->conns[id].fd, -1);
         CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
         __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
@@ -59733,9 +59608,8 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     Connection& conn = *fixture.conn;
     const u16 buf_id = 13;
     static constexpr u8 kFragment[] = "HTTP/1.1";
-    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
-                     kFragment,
-                     sizeof(kFragment) - 1u);
+    __builtin_memcpy(
+        loop->backend.buf_base + u64{buf_id} * 4096, kFragment, sizeof(kFragment) - 1u);
     auto inject_cqe = [&](i32 result, u32 flags, u32 event_episode = 0, u8 aux = 0) {
         const u32 tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
         auto& cqe = loop->backend.cq_entries[tail & *loop->backend.cq_ring_mask];
@@ -59749,9 +59623,8 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
         __atomic_store_n(loop->backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
         loop->backend.pending = 0;
     };
-    inject_cqe(static_cast<i32>(sizeof(kFragment) - 1u),
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    inject_cqe(i32{sizeof(kFragment) - 1u},
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     neutral.copy_witness = IoEventCopyWitness::Invalid;
     neutral.copy_deadline_generation = 77;
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
@@ -59766,9 +59639,8 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
 
     auto expect_zero_copy = [&]() {
         const u32 before = conn.upstream_recv_buf.len();
-        inject_cqe(1,
-                   IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                       (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+        inject_cqe(
+            1, IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
         REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
         CHECK_EQ(neutral.result, -ENOBUFS);
         CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
@@ -59807,8 +59679,7 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     conn.response_read_deadline_profile =
         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
     inject_cqe(1,
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, -ENOBUFS);
     CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
@@ -59818,8 +59689,7 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     const u32 before_method_forgery = conn.upstream_recv_buf.len();
     conn.response_read_deadline_method = static_cast<u8>(LogHttpMethod::Post);
     inject_cqe(1,
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, -ENOBUFS);
     CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
@@ -59830,9 +59700,8 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     // A kernel result cannot authorize reading beyond the one selected
     // provided buffer, even when the destination has ample capacity.
     const u32 before_oversized = conn.upstream_recv_buf.len();
-    inject_cqe(static_cast<i32>(kProvidedBufSize + 1u),
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+    inject_cqe(i32{kProvidedBufSize + 1u},
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, -ENOBUFS);
     CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
@@ -59846,8 +59715,7 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     const u32 before_ineligible = conn.upstream_recv_buf.len();
     conn.upstream_recv_paused_for_send = true;
     inject_cqe(4,
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, -ENOBUFS);
     CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
@@ -59858,18 +59726,16 @@ TEST(response_read_deadline, backend_copy_witness_is_atomic_and_reused_slots_cle
     // and the CQE is unusable evidence rather than a partial success.
     conn.upstream_recv_buf.commit(conn.upstream_recv_buf.write_avail());
     const u32 full_len = conn.upstream_recv_buf.len();
-    loop->backend.buf_base[static_cast<u64>(buf_id) * 4096] = 'x';
+    loop->backend.buf_base[u64{buf_id} * 4096] = 'x';
     inject_cqe(1,
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT));
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT));
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, -ENOBUFS);
     CHECK_EQ(neutral.copy_witness, IoEventCopyWitness::Invalid);
     CHECK_EQ(conn.upstream_recv_buf.len(), full_len);
 
     inject_cqe(1,
-               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                   (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT),
+               IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT),
                conn.upstream_episode - 1u);
     REQUIRE_EQ(loop->backend.wait(&neutral, 1, loop->conns, IoUringEventLoop::kMaxConns), 1u);
     CHECK_EQ(neutral.result, 1);
@@ -59932,7 +59798,7 @@ TEST(response_read_deadline, tls_complete_get_copy_owner_requires_full_profile_w
         static constexpr u16 kBufferId = 13;
         static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         static_assert(sizeof(kResponse) - 1u <= kProvidedBufSize);
-        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufferId) * kProvidedBufSize,
+        __builtin_memcpy(loop->backend.buf_base + u64{kBufferId} * kProvidedBufSize,
                          kResponse,
                          sizeof(kResponse) - 1u);
         auto inject_cqe = [&]() {
@@ -59940,9 +59806,9 @@ TEST(response_read_deadline, tls_complete_get_copy_owner_requires_full_profile_w
             auto& cqe = loop->backend.cq_entries[tail & *loop->backend.cq_ring_mask];
             cqe.user_data = IoUringBackend::encode_upstream_user_data(
                 conn.id, IoEventType::UpstreamRecv, conn.upstream_episode);
-            cqe.res = static_cast<i32>(sizeof(kResponse) - 1u);
+            cqe.res = i32{sizeof(kResponse) - 1u};
             cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                        (static_cast<u32>(kBufferId) << IORING_CQE_BUFFER_SHIFT);
+                        (u32{kBufferId} << IORING_CQE_BUFFER_SHIFT);
             __atomic_store_n(loop->backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
             // The fixture's SQEs are staged but intentionally never submitted.
             loop->backend.pending = 0;
@@ -62314,8 +62180,7 @@ TEST(response_read_deadline_fixed_upload_head_timeout_unreachable,
 
                 REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                            sizeof(kSuccessor) - 1u);
-                loop->dispatch(
-                    {id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+                loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
                 CHECK_EQ(conn.resp_status, 205u);
                 CHECK(conn.send_armed);
                 CHECK_EQ(health->fails, 0u);
@@ -64757,9 +64622,7 @@ TEST(response_read_deadline_fixed_upload,
         REQUIRE_EQ(conn->recv_buf.write(kPrefix, sizeof(kPrefix) - 1u), sizeof(kPrefix) - 1u);
         response_read_deadline_fixed_upload_handler_calls = 0;
         on_header_received<IoUringEventLoop>(
-            loop,
-            *conn,
-            {conn->id, static_cast<i32>(sizeof(kPrefix) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {conn->id, i32{sizeof(kPrefix) - 1u}, 0, 0, IoEventType::Recv, 1});
         REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
         REQUIRE(conn->request_policy_body_pending);
         REQUIRE_EQ(conn->req_body_remaining, 2u);
@@ -64882,7 +64745,7 @@ TEST(response_read_deadline_fixed_upload,
         const u32 pending = loop->backend.pending;
         response_read_deadline_fixed_upload_handler_calls = 0;
         on_header_received<IoUringEventLoop>(
-            loop, *conn, {id, static_cast<i32>(sizeof(kPartial) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop, *conn, {id, i32{sizeof(kPartial) - 1u}, 0, 0, IoEventType::Recv, 1});
         REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
         REQUIRE(conn->request_policy_body_pending);
         REQUIRE_EQ(conn->req_body_remaining, 2u);
@@ -65060,9 +64923,7 @@ TEST(response_read_deadline_fixed_upload,
     const u32 backend_pending_before = loop->backend.pending;
     response_read_deadline_fixed_upload_handler_calls = 0;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE_EQ(response_read_deadline_fixed_upload_handler_calls, 1u);
     REQUIRE(conn->upstream_connect_armed);
 
@@ -65166,9 +65027,7 @@ TEST(response_read_deadline_fixed_upload,
     const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     const u32 backend_pending_before = loop->backend.pending;
     on_header_received<IoUringEventLoop>(
-        loop,
-        *conn,
-        {conn->id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE(conn->upstream_connect_armed);
 
     auto harvest = [&](IoEventType type, i32 result, IoEvent* out) {
@@ -66141,7 +66000,7 @@ TEST(response_read_deadline_fixed_upload,
         on_upstream_response<IoUringEventLoop>(loop,
                                                conn,
                                                {id,
-                                                static_cast<i32>(sizeof(kResponse) - 1u),
+                                                i32{sizeof(kResponse) - 1u},
                                                 0,
                                                 0,
                                                 IoEventType::UpstreamRecv,
@@ -66721,7 +66580,7 @@ TEST(response_buffering_runtime,
             on_upstream_response<IoUringEventLoop>(loop,
                                                    conn,
                                                    {id,
-                                                    static_cast<i32>(sizeof(kResponse) - 1u),
+                                                    i32{sizeof(kResponse) - 1u},
                                                     0,
                                                     0,
                                                     IoEventType::UpstreamRecv,
@@ -66807,7 +66666,7 @@ TEST(response_read_deadline_non_head_cl0,
         on_upstream_response<IoUringEventLoop>(loop,
                                                conn,
                                                {conn.id,
-                                                static_cast<i32>(sizeof(kMalformed) - 1u),
+                                                i32{sizeof(kMalformed) - 1u},
                                                 0,
                                                 0,
                                                 IoEventType::UpstreamRecv,
@@ -67677,7 +67536,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn->recv_buf.write(kTrace, sizeof(kTrace) - 1u), sizeof(kTrace) - 1u);
     response_buffering_runtime_handler_calls = 0;
     on_header_received<IoUringEventLoop>(
-        loop, *conn, {conn->id, static_cast<i32>(sizeof(kTrace) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {conn->id, i32{sizeof(kTrace) - 1u}, 0, 0, IoEventType::Recv, 1});
     REQUIRE_EQ(response_buffering_runtime_handler_calls, 1u);
     static constexpr char kExpectedTrace[] =
         "TRACE /buffered?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: value\r\n\r\n";
@@ -67691,7 +67550,7 @@ TEST(response_buffering_runtime,
 
 TEST(response_buffering_d2,
      configured_timeout_rejects_stale_or_forged_request_policy_before_downstream_send) {
-    for (const u8 mutation : {static_cast<u8>(0), static_cast<u8>(1), static_cast<u8>(2)}) {
+    for (const u8 mutation : {u8{0}, u8{1}, u8{2}}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -67743,7 +67602,7 @@ TEST(response_buffering_d2,
 
 TEST(response_buffering_d2,
      cl0_success_rejects_stale_or_forged_request_policy_before_downstream_send) {
-    for (const u8 mutation : {static_cast<u8>(0), static_cast<u8>(1), static_cast<u8>(2)}) {
+    for (const u8 mutation : {u8{0}, u8{1}, u8{2}}) {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
@@ -67819,7 +67678,7 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn->recv_buf.write(kRequest, sizeof(kRequest) - 1u), sizeof(kRequest) - 1u);
     response_buffering_runtime_handler_calls = 0;
     on_header_received<IoUringEventLoop>(
-        loop, *conn, {id, static_cast<i32>(sizeof(kRequest) - 1u), 0, 0, IoEventType::Recv, 1});
+        loop, *conn, {id, i32{sizeof(kRequest) - 1u}, 0, 0, IoEventType::Recv, 1});
     CHECK_EQ(response_buffering_runtime_handler_calls, 1u);
     CHECK_EQ(loop->conns[id].fd, -1);
     CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
@@ -68017,16 +67876,10 @@ TEST(response_buffering_runtime,
 #endif
 
 TEST(response_buffering_runtime, complete_content_length_status_allowlist_is_exact) {
-    for (const u16 status : {static_cast<u16>(200), static_cast<u16>(201), static_cast<u16>(202)})
+    for (const u16 status : {u16{200}, u16{201}, u16{202}})
         CHECK(complete_content_length_response_status_is_admitted(status));
-    for (const u16 status : {static_cast<u16>(199),
-                             static_cast<u16>(203),
-                             static_cast<u16>(204),
-                             static_cast<u16>(205),
-                             static_cast<u16>(206),
-                             static_cast<u16>(304),
-                             static_cast<u16>(400),
-                             static_cast<u16>(500)})
+    for (const u16 status :
+         {u16{199}, u16{203}, u16{204}, u16{205}, u16{206}, u16{304}, u16{400}, u16{500}})
         CHECK_FALSE(complete_content_length_response_status_is_admitted(status));
 }
 
@@ -68596,7 +68449,7 @@ TEST(iouring_response_read_timer,
             REQUIRE_EQ(conn.response_read_deadline_send_len, first_release);
         }
 
-        const u32 tail_bytes = static_cast<u32>(sizeof(body)) - first_bytes;
+        const u32 tail_bytes = u32{sizeof(body)} - first_bytes;
         begin = conn.upstream_recv_buf.len();
         REQUIRE_EQ(conn.upstream_recv_buf.write(body + first_bytes, tail_bytes), tail_bytes);
         const IoEvent completion = response_read_copy_event(
@@ -69422,20 +69275,20 @@ TEST(response_buffering_runtime, coherent_single_range_206_raw_and_pinned_tuple_
             const size_t at =
                 locate(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), "bytes 0-3/12");
             REQUIRE_NE(at, std::string::npos);
-            upstream[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
-            upstream[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+            upstream[at + sizeof("bytes ") - 1u] = u8{'1'};
+            upstream[at + sizeof("bytes 0-") - 1u] = u8{'4'};
         } else if (mutation == Mutation::PinnedTuple) {
             const size_t at = locate(
                 conn.response_header_buf.data(), conn.response_header_buf.len(), "bytes 0-3/12");
             REQUIRE_NE(at, std::string::npos);
-            conn.response_header_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
-            conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+            conn.response_header_slice[at + sizeof("bytes ") - 1u] = u8{'1'};
+            conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = u8{'4'};
         } else if (mutation == Mutation::PinnedStatus) {
             const size_t at = locate(conn.response_header_buf.data(),
                                      conn.response_header_buf.len(),
                                      "HTTP/1.1 206 Partial Content");
             REQUIRE_EQ(at, 0u);
-            conn.response_header_slice[sizeof("HTTP/1.1 20") - 1u] = static_cast<u8>('0');
+            conn.response_header_slice[sizeof("HTTP/1.1 20") - 1u] = u8{'0'};
         }
         CHECK_EQ(complete_content_length_raw_origin_matches_pinned(
                      conn, parser.header_end, response.content_length),
@@ -69471,8 +69324,8 @@ TEST(response_buffering_runtime,
                               conn.response_header_buf.len());
     const size_t at = headers.find("bytes 0-3/12");
     REQUIRE_NE(at, std::string::npos);
-    conn.response_header_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
-    conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = static_cast<u8>('4');
+    conn.response_header_slice[at + sizeof("bytes ") - 1u] = u8{'1'};
+    conn.response_header_slice[at + sizeof("bytes 0-") - 1u] = u8{'4'};
     CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
     cleanup_prebuilt_d2(loop, fixture);
 }
@@ -70152,7 +70005,7 @@ TEST(response_buffering_runtime, coherent_single_range_206_expiry_rejects_mutate
                            conn.upstream_recv_buf.len());
     const size_t range = wire.find("bytes 0-4/12");
     REQUIRE_NE(range, std::string::npos);
-    conn.upstream_recv_slice[range + sizeof("bytes 0-4/") - 1u] = static_cast<u8>('3');
+    conn.upstream_recv_slice[range + sizeof("bytes 0-4/") - 1u] = u8{'3'};
     conn.response_read_timer_last_progress_ns = monotonic_ns() - 6'000'000'000ull;
     const IoEvent timer =
         inert_response_read_timer_event(conn.id, conn.response_read_timer_owner_generation);
@@ -70587,9 +70440,9 @@ TEST(response_buffering_runtime,
             const size_t at = wire.find("bytes 0-4/12");
             REQUIRE_NE(at, std::string::npos);
             if (mutation == Mutation::RawHeader)
-                conn.upstream_recv_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
+                conn.upstream_recv_slice[at + sizeof("bytes ") - 1u] = u8{'1'};
             else
-                conn.response_header_slice[at + sizeof("bytes ") - 1u] = static_cast<u8>('1');
+                conn.response_header_slice[at + sizeof("bytes ") - 1u] = u8{'1'};
         }
         const u32 id = conn.id;
         const IoEvent eof{id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
@@ -72549,10 +72402,10 @@ TEST(response_buffering_runtime,
     CHECK_FALSE(response_policy_safe_content_type({"a\x01z", 3}));
     CHECK_FALSE(response_policy_safe_content_type({"a\x7fz", 3}));
     std::string control = "Content-Type: a";
-    control.push_back(static_cast<char>(0x01));
+    control.push_back(char{0x01});
     control += "z\r\n";
     std::string del = "Content-Type: a";
-    del.push_back(static_cast<char>(0x7f));
+    del.push_back(char{0x7f});
     del += "z\r\n";
     CHECK_FALSE(build(origin(control)).ok);
     CHECK_FALSE(build(origin(del)).ok);
@@ -72652,7 +72505,7 @@ TEST(response_buffering_runtime,
         } else if (mutation == Mutation::PinnedValue) {
             const size_t at = forged.find(canonical);
             REQUIRE_NE(at, std::string::npos);
-            forged[at + sizeof("Content-Type: ") - 1u] = static_cast<char>(0x7f);
+            forged[at + sizeof("Content-Type: ") - 1u] = char{0x7f};
         } else if (mutation == Mutation::PinnedDuplicate) {
             const size_t at = forged.rfind("\r\n");
             REQUIRE_NE(at, std::string::npos);
@@ -72864,21 +72717,21 @@ TEST(response_buffering_runtime,
             REQUIRE_GT(conn.response_header_buf.len(), kStatusLast);
             REQUIRE_EQ(conn.response_header_buf.data()[kStatusLast], static_cast<u8>('2'));
             conn.response_header_slice[kStatusLast] =
-                mutation == Mutation::PinnedStatus ? static_cast<u8>('1') : static_cast<u8>('0');
+                mutation == Mutation::PinnedStatus ? u8{'1'} : u8{'0'};
             if (mutation == Mutation::ScalarAndPinnedStatus) conn.resp_status = 200u;
         } else if (mutation == Mutation::PinnedReason) {
             REQUIRE_GT(conn.response_header_buf.len(), kReasonFirst);
             REQUIRE_EQ(conn.response_header_buf.data()[kReasonFirst], static_cast<u8>('A'));
-            conn.response_header_slice[kReasonFirst] = static_cast<u8>('X');
+            conn.response_header_slice[kReasonFirst] = u8{'X'};
         } else if (mutation == Mutation::RawStatus) {
             REQUIRE_EQ(conn.upstream_recv_buf.data()[kStatusLast], static_cast<u8>('2'));
-            conn.upstream_recv_slice[kStatusLast] = static_cast<u8>('1');
+            conn.upstream_recv_slice[kStatusLast] = u8{'1'};
         } else if (mutation == Mutation::RawReason) {
             REQUIRE_EQ(conn.upstream_recv_buf.data()[kReasonFirst], static_cast<u8>('A'));
-            conn.upstream_recv_slice[kReasonFirst] = static_cast<u8>('X');
+            conn.upstream_recv_slice[kReasonFirst] = u8{'X'};
         } else if (mutation == Mutation::RawContentLength) {
             REQUIRE_EQ(conn.upstream_recv_buf.data()[kContentLengthDigit], static_cast<u8>('4'));
-            conn.upstream_recv_slice[kContentLengthDigit] = static_cast<u8>('5');
+            conn.upstream_recv_slice[kContentLengthDigit] = u8{'5'};
         } else if (mutation == Mutation::RawHeaderBoundary) {
             REQUIRE_GT(raw_header_end, 1u);
             --raw_header_end;
@@ -73546,15 +73399,14 @@ TEST(response_buffering_runtime,
 
     auto& backend = loop->backend;
     const u16 prefix_buf_id = 10;
-    __builtin_memcpy(
-        backend.buf_base + static_cast<u64>(prefix_buf_id) * 4096, kPrefix, sizeof(kPrefix) - 1u);
+    __builtin_memcpy(backend.buf_base + u64{prefix_buf_id} * 4096, kPrefix, sizeof(kPrefix) - 1u);
     const u32 prefix_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& prefix_cqe = backend.cq_entries[prefix_cq_tail & *backend.cq_ring_mask];
     prefix_cqe.user_data =
         encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     prefix_cqe.res = sizeof(kPrefix) - 1u;
-    prefix_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                       (static_cast<u32>(prefix_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    prefix_cqe.flags =
+        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{prefix_buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(backend.cq_tail, prefix_cq_tail + 1u, __ATOMIC_RELEASE);
     backend.pending = 0;
     IoEvent prefix_event{};
@@ -73570,14 +73422,13 @@ TEST(response_buffering_runtime,
     REQUIRE_EQ(conn.upstream_recv_buf.write_avail(), 10u);
 
     const u16 buf_id = 11;
-    __builtin_memcpy(
-        backend.buf_base + static_cast<u64>(buf_id) * 4096, kOverflow, sizeof(kOverflow) - 1u);
+    __builtin_memcpy(backend.buf_base + u64{buf_id} * 4096, kOverflow, sizeof(kOverflow) - 1u);
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
     cqe.user_data =
         encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     cqe.res = sizeof(kOverflow) - 1u;
-    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    cqe.flags = IORING_CQE_F_BUFFER | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
     backend.pending = 0;
 
@@ -73603,16 +73454,14 @@ TEST(response_buffering_runtime,
     // logical body order while the header/prefix slice remains the owner.
     static constexpr u8 kFinalBody[] = "mnopqr";
     const u16 final_buf_id = 13;
-    __builtin_memcpy(backend.buf_base + static_cast<u64>(final_buf_id) * 4096,
-                     kFinalBody,
-                     sizeof(kFinalBody) - 1u);
+    __builtin_memcpy(
+        backend.buf_base + u64{final_buf_id} * 4096, kFinalBody, sizeof(kFinalBody) - 1u);
     const u32 final_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& final_cqe = backend.cq_entries[final_cq_tail & *backend.cq_ring_mask];
     final_cqe.user_data =
         encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     final_cqe.res = sizeof(kFinalBody) - 1u;
-    final_cqe.flags =
-        IORING_CQE_F_BUFFER | (static_cast<u32>(final_buf_id) << IORING_CQE_BUFFER_SHIFT);
+    final_cqe.flags = IORING_CQE_F_BUFFER | (u32{final_buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(backend.cq_tail, final_cq_tail + 1u, __ATOMIC_RELEASE);
     backend.pending = 0;
     IoEvent final_event{};
@@ -73688,15 +73537,14 @@ TEST(response_buffering_runtime, backend_wait_overflow_allocation_failure_is_ato
     std::vector<u8*> held;
     while (u8* slice = loop->pool.alloc()) held.push_back(slice);
     const u16 buf_id = 12;
-    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(buf_id) * 4096,
-                     kOverflow,
-                     sizeof(kOverflow) - 1u);
+    __builtin_memcpy(
+        loop->backend.buf_base + u64{buf_id} * 4096, kOverflow, sizeof(kOverflow) - 1u);
     const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
     cqe.user_data =
         encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, conn.upstream_episode, 0});
     cqe.res = sizeof(kOverflow) - 1u;
-    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    cqe.flags = IORING_CQE_F_BUFFER | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent event{};
@@ -74015,7 +73863,7 @@ static bool normalize_strict_imf_fixdate_header(u8* data, u32 len) {
     const auto is_digit = [](u8 c) { return c >= '0' && c <= '9'; };
     const auto two_digits = [&](u32 offset) {
         return is_digit(date[offset]) && is_digit(date[offset + 1u])
-                   ? static_cast<u32>((date[offset] - '0') * 10u + date[offset + 1u] - '0')
+                   ? u32{(date[offset] - '0') * 10u + date[offset + 1u] - '0'}
                    : 100u;
     };
     if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
@@ -75369,7 +75217,7 @@ TEST(response_read_deadline_get_positive_cl,
         REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
         REQUIRE(arm_staged_response_read_deadline(loop, fixture));
         Connection& conn = *fixture.conn;
-        const u32 declared = exact_cl + static_cast<u32>(overflow);
+        const u32 declared = exact_cl + u32{overflow};
         const int n = snprintf(
             header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", declared);
         REQUIRE_GT(n, 0);
@@ -75656,7 +75504,7 @@ TEST(response_read_deadline_get_cl0, duration_absent_parse_error_keeps_legacy_lo
     on_upstream_response<IoUringEventLoop>(loop,
                                            conn,
                                            {conn.id,
-                                            static_cast<i32>(sizeof(kMalformed) - 1u),
+                                            i32{sizeof(kMalformed) - 1u},
                                             0,
                                             0,
                                             IoEventType::UpstreamRecv,
@@ -76587,16 +76435,14 @@ TEST(iouring_retirement, provided_more_target_first_and_unowned_records_are_isol
     // buffer exactly once and reject the old token before copying any byte.
     const u16 buf_id = 9;
     static constexpr char kOldBytes[] = "old-body";
-    __builtin_memcpy(
-        loop->backend.buf_base + static_cast<u64>(buf_id) * 4096, kOldBytes, sizeof(kOldBytes) - 1);
+    __builtin_memcpy(loop->backend.buf_base + u64{buf_id} * 4096, kOldBytes, sizeof(kOldBytes) - 1);
     const u16 buf_tail_before = __atomic_load_n(&loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE);
     const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
     cqe.user_data =
         encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kRetiringEpisode, 0});
     cqe.res = sizeof(kOldBytes) - 1;
-    cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
     // Keep the synthetic CQE isolated from the queued timer/cancel SQEs.
     loop->backend.pending = 0;
@@ -77684,9 +77530,8 @@ TEST(iouring_retirement, drained_latest_tombstone_replaces_twice_and_denies_olde
         // after the E2 -> E3 replacement.
         constexpr u16 kOldBufId = 39;
         static constexpr char kOldBytes[] = "retirement-one-body";
-        __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kOldBufId) * 4096,
-                         kOldBytes,
-                         sizeof(kOldBytes) - 1);
+        __builtin_memcpy(
+            loop->backend.buf_base + u64{kOldBufId} * 4096, kOldBytes, sizeof(kOldBytes) - 1);
         const u16 buf_tail_before =
             __atomic_load_n(&loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE);
         u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -77694,8 +77539,8 @@ TEST(iouring_retirement, drained_latest_tombstone_replaces_twice_and_denies_olde
         old_recv_cqe.user_data =
             encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kFirst, 0});
         old_recv_cqe.res = sizeof(kOldBytes) - 1;
-        old_recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                             (static_cast<u32>(kOldBufId) << IORING_CQE_BUFFER_SHIFT);
+        old_recv_cqe.flags =
+            IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{kOldBufId} << IORING_CQE_BUFFER_SHIFT);
         __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
         loop->backend.pending = 0;
         IoEvent harvested[2]{};
@@ -78601,7 +78446,7 @@ TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_success
     CHECK_EQ(successor_token.type, IoEventType::UpstreamRecv);
     constexpr u16 kSuccessorBufId = 36;
     static constexpr char kSuccessorBytes[] = "new";
-    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kSuccessorBufId) * 4096,
+    __builtin_memcpy(loop->backend.buf_base + u64{kSuccessorBufId} * 4096,
                      kSuccessorBytes,
                      sizeof(kSuccessorBytes) - 1);
     u32 successor_cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -78609,8 +78454,7 @@ TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_success
     successor_cqe.user_data =
         encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kCurrent, 0});
     successor_cqe.res = sizeof(kSuccessorBytes) - 1;
-    successor_cqe.flags =
-        IORING_CQE_F_BUFFER | (static_cast<u32>(kSuccessorBufId) << IORING_CQE_BUFFER_SHIFT);
+    successor_cqe.flags = IORING_CQE_F_BUFFER | (u32{kSuccessorBufId} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, successor_cq_tail + 1, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent successor_events[2]{};
@@ -78687,7 +78531,7 @@ TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_success
     // backend.wait must fence mutation before tombstone dispatch swallows it.
     static constexpr char kUnownedRecvBytes[] = "ghost";
     constexpr u16 kUnownedBufId = 38;
-    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kUnownedBufId) * 4096,
+    __builtin_memcpy(loop->backend.buf_base + u64{kUnownedBufId} * 4096,
                      kUnownedRecvBytes,
                      sizeof(kUnownedRecvBytes) - 1);
     u32 unowned_cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -78696,8 +78540,8 @@ TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_success
     unowned_recv_cqe.user_data =
         encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kCurrent, 0});
     unowned_recv_cqe.res = sizeof(kUnownedRecvBytes) - 1;
-    unowned_recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                             (static_cast<u32>(kUnownedBufId) << IORING_CQE_BUFFER_SHIFT);
+    unowned_recv_cqe.flags =
+        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{kUnownedBufId} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, unowned_cq_tail + 1, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent unowned_events[2]{};
@@ -78736,16 +78580,15 @@ TEST(iouring_boundary, inactive_tombstone_routes_only_documented_current_success
     // provided buffer or advance/resubmit partial-send state.
     static constexpr char kForgedBytes[] = "bad";
     constexpr u16 kBufId = 37;
-    __builtin_memcpy(loop->backend.buf_base + static_cast<u64>(kBufId) * 4096,
-                     kForgedBytes,
-                     sizeof(kForgedBytes) - 1);
+    __builtin_memcpy(
+        loop->backend.buf_base + u64{kBufId} * 4096, kForgedBytes, sizeof(kForgedBytes) - 1);
     u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& recv_cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
     recv_cqe.user_data =
         encode_upstream_event_token({conn->id, IoEventType::UpstreamRecv, kCurrent, 99});
     recv_cqe.res = sizeof(kForgedBytes) - 1;
-    recv_cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                     (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT);
+    recv_cqe.flags =
+        IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent harvested[2]{};
@@ -79135,7 +78978,7 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
     // F_MORE record leaves the recv target armed, exactly as a partial origin
     // body does when strict HEAD commits its header-only response.
     loop->dispatch({conn_id,
-                    static_cast<i32>(sizeof(kOriginResponse) - 1),
+                    i32{sizeof(kOriginResponse) - 1},
                     0,
                     0,
                     IoEventType::UpstreamRecv,
@@ -79187,16 +79030,14 @@ TEST(iouring_retirement, production_paired_head_success_retires_before_old_preco
     // fenced by the already-advanced episode before it can copy old bytes.
     constexpr u16 kBufId = 13;
     static constexpr char kOldBytes[] = "old-body";
-    __builtin_memcpy(
-        loop->backend.buf_base + static_cast<u64>(kBufId) * 4096, kOldBytes, sizeof(kOldBytes) - 1);
+    __builtin_memcpy(loop->backend.buf_base + u64{kBufId} * 4096, kOldBytes, sizeof(kOldBytes) - 1);
     const u16 buf_tail_before = __atomic_load_n(&loop->backend.buf_ring->tail, __ATOMIC_ACQUIRE);
     const u32 cq_tail = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = loop->backend.cq_entries[cq_tail & *loop->backend.cq_ring_mask];
     cqe.user_data =
         encode_upstream_event_token({conn_id, IoEventType::UpstreamRecv, kRetiringEpisode, 0});
     cqe.res = sizeof(kOldBytes) - 1;
-    cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE |
-                (static_cast<u32>(kBufId) << IORING_CQE_BUFFER_SHIFT);
+    cqe.flags = IORING_CQE_F_BUFFER | IORING_CQE_F_MORE | (u32{kBufId} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(loop->backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
     loop->backend.pending = 0;
     IoEvent events[2]{};
@@ -79364,14 +79205,8 @@ TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_requ
 
     // The request upload was staged as already complete above; from this live
     // response CQE onward, exercise the production reusable paired boundary.
-    loop->dispatch({id,
-                    static_cast<i32>(sizeof(kOriginResponse) - 1),
-                    0,
-                    0,
-                    IoEventType::UpstreamRecv,
-                    1,
-                    0,
-                    kFirst});
+    loop->dispatch(
+        {id, i32{sizeof(kOriginResponse) - 1}, 0, 0, IoEventType::UpstreamRecv, 1, 0, kFirst});
     REQUIRE_EQ(conn->upstream_retiring_episode, kFirst);
     REQUIRE_EQ(conn->upstream_episode, kSecond);
     REQUIRE(conn->upstream_retirement_active);
@@ -79420,14 +79255,8 @@ TEST(iouring_retirement, production_callbacks_compose_two_boundaries_before_requ
     REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kOriginResponse),
                                              sizeof(kOriginResponse) - 1),
                sizeof(kOriginResponse) - 1);
-    loop->dispatch({id,
-                    static_cast<i32>(sizeof(kOriginResponse) - 1),
-                    0,
-                    0,
-                    IoEventType::UpstreamRecv,
-                    1,
-                    0,
-                    kSecond});
+    loop->dispatch(
+        {id, i32{sizeof(kOriginResponse) - 1}, 0, 0, IoEventType::UpstreamRecv, 1, 0, kSecond});
     REQUIRE_EQ(conn->upstream_retiring_episode, kSecond);
     REQUIRE_EQ(conn->upstream_episode, kThird);
     REQUIRE(conn->upstream_retirement_active);
@@ -80090,7 +79919,7 @@ TEST(iouring_episode, malformed_upstream_cqe_is_tagged_stale_and_returns_buffer)
     conns[0].upstream_recv_buf.bind(storage, sizeof(storage));
     const u16 buf_id = 7;
     const u16 buf_tail_before = __atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE);
-    for (u32 i = 0; i < 5; i++) backend.buf_base[static_cast<u32>(buf_id) * 4096 + i] = 'x';
+    for (u32 i = 0; i < 5; i++) backend.buf_base[u32{buf_id} * 4096 + i] = 'x';
 
     const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
     auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
@@ -80099,7 +79928,7 @@ TEST(iouring_episode, malformed_upstream_cqe_is_tagged_stale_and_returns_buffer)
     cqe.user_data =
         static_cast<u64>(static_cast<u8>(IoEventType::UpstreamRecv)) | (static_cast<u64>(0) << 8);
     cqe.res = 5;
-    cqe.flags = IORING_CQE_F_BUFFER | (static_cast<u32>(buf_id) << IORING_CQE_BUFFER_SHIFT);
+    cqe.flags = IORING_CQE_F_BUFFER | (u32{buf_id} << IORING_CQE_BUFFER_SHIFT);
     __atomic_store_n(backend.cq_tail, cq_tail + 1, __ATOMIC_RELEASE);
 
     IoEvent events[8]{};
@@ -80320,7 +80149,7 @@ TEST(state_invariant, stale_handler_timer_rejects_24bit_generation_wrap) {
     CHECK_EQ(c->pending_ops, 1u);
     CHECK_EQ(c->pending_handler_fn, &state_invariant_wait_recv_then_status);
 
-    loop.dispatch(make_ev(c->id, IoEventType::HandlerTimer, static_cast<i32>(0x01000001u)));
+    loop.dispatch(make_ev(c->id, IoEventType::HandlerTimer, i32{0x01000001u}));
     CHECK(!c->yield_armed);
     CHECK_EQ(c->pending_handler_fn, nullptr);
     CHECK_EQ(c->resp_status, 500u);
@@ -80972,8 +80801,7 @@ static void run_async_local_failure(rut::test::TestCase* _tc,
         on_upstream_response<Loop>(
             &loop,
             *conn,
-            make_ev(
-                conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kBadResponse) - 1)));
+            make_ev(conn->id, IoEventType::UpstreamRecv, i32{sizeof(kBadResponse) - 1}));
     }
     check_ordinary_local_error(
         _tc, *conn, failure == OrdinaryAsyncFailure::RewriteFailure ? 500 : 502, is_head);
@@ -83565,7 +83393,7 @@ TEST(request_body_overflow, iouring_connect_owner_partial_chunked_refresh) {
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK(c->req_body_lossy_successor);
     CHECK_GT(c->req_initial_send_len, partial_len);
-    const u32 expected_boundary = static_cast<u32>(sizeof(kPartial) - 1 + sizeof(kTail) - 1 - 4);
+    const u32 expected_boundary = u32{sizeof(kPartial) - 1 + sizeof(kTail) - 1 - 4};
     CHECK_EQ(c->req_initial_send_len, expected_boundary);
     CHECK_EQ(c->req_chunk_parser.state, ChunkedParser::State::Complete);
     CHECK_EQ(c->recv_buf.len() - c->req_initial_send_len, 4u);
@@ -83732,7 +83560,7 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1), sizeof(kResponse) - 1);
     loop->dispatch({c->id,
-                    static_cast<i32>(sizeof(kResponse) - 1),
+                    i32{sizeof(kResponse) - 1},
                     0,
                     0,
                     IoEventType::UpstreamRecv,
@@ -83757,7 +83585,7 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_EQ(loop->backend.send_state[c->id].remaining, response_send_len);
     loop->backend.send_state[c->id].offset = response_send_len;
     loop->backend.send_state[c->id].remaining = 0;
-    loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
+    loop->dispatch({c->id, i32{response_send_len}, 0, 0, IoEventType::Send, 0, 0});
     CHECK_EQ(c->fd, -1);
     close(downstream[1]);
     close(upstream[1]);
@@ -83813,14 +83641,8 @@ TEST(request_body_overflow, iouring_initial_send_suffix_excludes_lossy_successor
     CHECK_EQ(c->req_body_remaining, 3u);
     CHECK_FALSE(c->request_upload_complete);
 
-    loop->dispatch({c->id,
-                    static_cast<i32>(initial_len),
-                    0,
-                    0,
-                    IoEventType::UpstreamSend,
-                    0,
-                    0,
-                    c->upstream_episode});
+    loop->dispatch(
+        {c->id, i32{initial_len}, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
     const auto& suffix_send = loop->backend.upstream_send_state[c->id];
     REQUIRE_EQ(suffix_send.src, c->recv_buf.data());
     CHECK_EQ(suffix_send.remaining, 3u);
@@ -83878,8 +83700,7 @@ TEST(request_body_overflow, iouring_chunked_initial_send_forwards_terminator_onl
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK(c->req_body_lossy_successor);
     CHECK_FALSE(c->keep_alive);
-    loop->dispatch(
-        {c->id, static_cast<i32>(sizeof(kPrefix) - 1), 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    loop->dispatch({c->id, i32{sizeof(kPrefix) - 1}, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
     const auto& suffix_send = loop->backend.upstream_send_state[c->id];
     REQUIRE_EQ(suffix_send.remaining, (sizeof(kSuffix) - 1u) - 4u);  // CRLF + terminating chunk
     CHECK_EQ(__builtin_memcmp(suffix_send.src, "\r\n0\r\n\r\n", suffix_send.remaining), 0);
@@ -83937,8 +83758,7 @@ TEST(request_body_overflow, iouring_chunked_intermediate_send_forwards_terminato
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK(c->req_body_lossy_successor);
     CHECK_FALSE(c->keep_alive);
-    loop->dispatch(
-        {c->id, static_cast<i32>(sizeof(kPrefix) - 1), 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    loop->dispatch({c->id, i32{sizeof(kPrefix) - 1}, 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
     const auto& suffix_send = loop->backend.upstream_send_state[c->id];
     REQUIRE_EQ(suffix_send.remaining, (sizeof(kSuffix) - 1u) - 4u);  // CRLF + terminating chunk
     CHECK_EQ(__builtin_memcmp(suffix_send.src, "\r\n0\r\n\r\n", suffix_send.remaining), 0);
@@ -84053,7 +83873,7 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1), sizeof(kResponse) - 1);
     loop->dispatch({c->id,
-                    static_cast<i32>(sizeof(kResponse) - 1),
+                    i32{sizeof(kResponse) - 1},
                     0,
                     0,
                     IoEventType::UpstreamRecv,
@@ -84073,7 +83893,7 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     CHECK_EQ(response_send.type, IoEventType::Send);
     loop->backend.send_state[c->id].offset = response_send_len;
     loop->backend.send_state[c->id].remaining = 0;
-    loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
+    loop->dispatch({c->id, i32{response_send_len}, 0, 0, IoEventType::Send, 0, 0});
     CHECK_EQ(c->fd, -1);
     close(downstream[1]);
     close(upstream[1]);
@@ -84320,7 +84140,7 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1),
                        sizeof(kResponse) - 1);
             loop->dispatch({c->id,
-                            static_cast<i32>(sizeof(kResponse) - 1),
+                            i32{sizeof(kResponse) - 1},
                             0,
                             0,
                             IoEventType::UpstreamRecv,
@@ -84333,8 +84153,7 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
             loop->backend.send_state[c->id].offset = response_len;
             loop->backend.send_state[c->id].remaining = 0;
-            loop->dispatch(
-                {c->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0, 0, 0});
+            loop->dispatch({c->id, i32{response_len}, 0, 0, IoEventType::Send, 0, 0, 0});
             CHECK_EQ(c->fd, -1);
         }
         close(downstream[1]);
@@ -84812,8 +84631,7 @@ TEST(state_transition, proxy_keepalive_to_reading_header) {
     auto* c = setup_proxy_conn(loop);
     REQUIRE(c != nullptr);
     inject_upstream_response(loop, *c);
-    loop.inject_and_dispatch(
-        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_SLOTS(c, &on_header_received<SmallLoop>, nullptr, nullptr, nullptr);
 }
 
@@ -84997,8 +84815,7 @@ TEST(coverage, pipeline_stash_overflow_closes) {
     for (u32 j = 0; j < fill; j++) rb[j] = 'X';
     c->recv_buf.commit(fill);
     u32 cid = c->id;
-    loop.inject_and_dispatch(
-        make_ev(cid, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(cid, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK_EQ(loop.conns[cid].fd, -1);  // closed (overflow)
 }
 
@@ -85165,7 +84982,7 @@ TEST(response_headers, malformed_initial_chunk_is_rejected_before_mutated_header
     c->upstream_recv_buf.reset();
     REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResp), kLen), kLen);
 
-    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(kLen));
+    IoEvent ev = make_ev(c->id, IoEventType::UpstreamRecv, i32{kLen});
     loop.backend.inject(ev);
     IoEvent events[8];
     const u32 n = loop.backend.wait(events, 8);
@@ -85241,8 +85058,7 @@ TEST(coverage, proxy_response_sent_pipeline_recover) {
     for (u32 j = 0; j < 10 && j < sizeof(kReq) - 1; j++) sb[j] = static_cast<u8>(kReq[j]);
     c->send_buf.commit(10);
     // Send response → proxy_response_sent → pipeline_recover
-    loop.inject_and_dispatch(
-        make_ev(c->id, IoEventType::Send, static_cast<i32>(kMockHttpResponseLen)));
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Send, i32{kMockHttpResponseLen}));
     CHECK(c->fd >= 0);
 }
 
@@ -85719,7 +85535,7 @@ TEST(route_coverage, capture_stage_and_write) {
     c->recv_buf.reset();
     const char req[] = "GET /cap HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85748,7 +85564,7 @@ TEST(route_coverage, drain_connection_close) {
     c->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85778,7 +85594,7 @@ TEST(route_coverage, with_metrics_and_access_log) {
     c->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85806,7 +85622,7 @@ TEST(route_coverage, firewall_deny_rule_returns_403) {
     c->recv_buf.reset();
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85833,8 +85649,7 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     blocked->recv_buf.reset();
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     blocked->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent blocked_ev = {
-        blocked->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent blocked_ev = {blocked->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(blocked_ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85849,8 +85664,7 @@ TEST(route_coverage, firewall_allowlist_blocks_non_members) {
     allowed->peer_addr = htonl(0x7f000001);  // 127.0.0.1
     allowed->recv_buf.reset();
     allowed->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent allowed_ev = {
-        allowed->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent allowed_ev = {allowed->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(allowed_ev);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -85875,7 +85689,7 @@ TEST(route_coverage, firewall_port_rejects_in_request_path) {
     c->recv_buf.reset();
     const char req[] = "GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -85907,7 +85721,7 @@ TEST(route_coverage, firewall_cidr_allow_and_deny_rules) {
         c->peer_addr = peer_addr;
         c->recv_buf.reset();
         c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-        IoEvent ev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+        IoEvent ev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
         loop.backend.inject(ev);
         u32 n = loop.backend.wait(events, 8);
         for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -86515,7 +86329,7 @@ TEST(async_coverage, proxy_full_cycle) {
     conn->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {conn->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {conn->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86538,7 +86352,7 @@ TEST(async_coverage, proxy_connect_502) {
     conn->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     conn->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {conn->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {conn->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86652,7 +86466,7 @@ TEST(async_coverage, static_routes) {
     c->recv_buf.reset();
     const char req[] = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86679,7 +86493,7 @@ TEST(async_coverage, capture_write) {
     c->recv_buf.reset();
     const char req[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86705,7 +86519,7 @@ TEST(async_coverage, with_metrics_and_access_log) {
     c->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86727,7 +86541,7 @@ TEST(async_coverage, drain_connection_close) {
     c->recv_buf.reset();
     const char req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86756,7 +86570,7 @@ TEST(route_coverage, proxy_route_creates_socket) {
     c->recv_buf.reset();
     const char req[] = "GET /api/test HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86794,7 +86608,7 @@ TEST(route_coverage, proxy_route_connect_submit_failure_sends_502) {
     c->recv_buf.reset();
     const char req[] = "GET /api/test HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86829,7 +86643,7 @@ TEST(async_coverage, proxy_route_creates_socket) {
     c->recv_buf.reset();
     const char req[] = "GET /api/x HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req), sizeof(req) - 1);
-    IoEvent rev = {c->id, static_cast<i32>(sizeof(req) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev = {c->id, i32{sizeof(req) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86855,7 +86669,7 @@ TEST(async_coverage, pipeline_two_requests) {
     c->recv_buf.reset();
     const char req1[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req1), sizeof(req1) - 1);
-    IoEvent rev1 = {c->id, static_cast<i32>(sizeof(req1) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev1 = {c->id, i32{sizeof(req1) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev1);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
@@ -86868,7 +86682,7 @@ TEST(async_coverage, pipeline_two_requests) {
     c->recv_buf.reset();
     const char req2[] = "GET /second HTTP/1.1\r\nHost: x\r\n\r\n";
     c->recv_buf.write(reinterpret_cast<const u8*>(req2), sizeof(req2) - 1);
-    IoEvent rev2 = {c->id, static_cast<i32>(sizeof(req2) - 1), 0, 0, IoEventType::Recv, 0};
+    IoEvent rev2 = {c->id, i32{sizeof(req2) - 1}, 0, 0, IoEventType::Recv, 0};
     loop.backend.inject(rev2);
     n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
@@ -88269,8 +88083,7 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
             REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
             REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                        sizeof(kSuccessor) - 1u);
-            loop->dispatch(
-                {id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
             CHECK_EQ(conn.resp_status, 204u);
             CHECK(conn.send_armed);
             cleanup_prebuilt_d2(loop, fixture);
@@ -88463,7 +88276,7 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
                 event.aux = 1;
                 break;
             case Mutation::Result:
-                event.result = static_cast<i32>(len - 1u);
+                event.result = i32{len - 1u};
                 break;
             case Mutation::Type:
                 event.type = IoEventType::UpstreamSend;
@@ -88728,12 +88541,8 @@ TEST(response_read_deadline_fixed_upload_head_batch,
                             REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
                             REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                                        sizeof(kSuccessor) - 1u);
-                            loop->dispatch({id,
-                                            static_cast<i32>(sizeof(kSuccessor) - 1u),
-                                            0,
-                                            0,
-                                            IoEventType::Recv,
-                                            1});
+                            loop->dispatch(
+                                {id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
                             CHECK_EQ(conn.resp_status, 204u);
                             CHECK(conn.send_armed);
                         }
@@ -88964,8 +88773,7 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
             REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
             REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                        sizeof(kSuccessor) - 1u);
-            loop->dispatch(
-                {id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
             CHECK_EQ(conn.resp_status, 204u);
             CHECK(conn.send_armed);
             cleanup_prebuilt_d2(loop, fixture);
@@ -89020,14 +88828,14 @@ TEST(response_read_deadline_fixed_upload_head_configured_failure_live_unreachabl
                 conn.request_config = &replacement;
                 break;
             case Mutation::Header:
-                const_cast<u8*>(conn.response_header_buf.data())[0] = static_cast<u8>('X');
+                const_cast<u8*>(conn.response_header_buf.data())[0] = u8{'X'};
                 break;
             case Mutation::Date: {
                 u8* data = const_cast<u8*>(conn.response_header_buf.data());
                 bool found = false;
                 for (u32 i = 0; i + 6u < conn.response_header_buf.len(); ++i) {
                     if (__builtin_memcmp(data + i, "Date: ", 6) == 0) {
-                        data[i + 6u] = static_cast<u8>('X');
+                        data[i + 6u] = u8{'X'};
                         found = true;
                         break;
                     }
@@ -89184,8 +88992,7 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
             REQUIRE_EQ(conn.state, ConnState::ReadingHeader);
             REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
                        sizeof(kSuccessor) - 1u);
-            loop->dispatch(
-                {id, static_cast<i32>(sizeof(kSuccessor) - 1u), 0, 0, IoEventType::Recv, 1});
+            loop->dispatch({id, i32{sizeof(kSuccessor) - 1u}, 0, 0, IoEventType::Recv, 1});
             CHECK_EQ(conn.resp_status, 204u);
             CHECK(conn.send_armed);
             cleanup_prebuilt_d2(loop, fixture);

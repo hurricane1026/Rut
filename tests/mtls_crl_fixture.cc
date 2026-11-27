@@ -114,8 +114,7 @@ bool verify_leaf(rut::TlsServerContext* ctx,
                  const char* name,
                  bool expected) {
     char path[1024];
-    if (snprintf(path, sizeof(path), "%s/%s", directory, name) >= static_cast<int>(sizeof(path)))
-        return false;
+    if (snprintf(path, sizeof(path), "%s/%s", directory, name) >= int{sizeof(path)}) return false;
     FILE* input = fopen(path, "r");
     X509* cert = input ? PEM_read_X509(input, nullptr, nullptr, nullptr) : nullptr;
     if (input) fclose(input);
@@ -132,9 +131,8 @@ bool verify_leaf(rut::TlsServerContext* ctx,
 int verify_contexts(const char* testdata, const char* fixtures) {
     char certificate[1024], key[1024], path[1024];
     if (snprintf(certificate, sizeof(certificate), "%s/localhost_cert.pem", testdata) >=
-            static_cast<int>(sizeof(certificate)) ||
-        snprintf(key, sizeof(key), "%s/localhost_key.pem", testdata) >=
-            static_cast<int>(sizeof(key)))
+            int{sizeof(certificate)} ||
+        snprintf(key, sizeof(key), "%s/localhost_key.pem", testdata) >= int{sizeof(key)})
         return 1;
     struct Case {
         const char* name;
@@ -153,8 +151,8 @@ int verify_contexts(const char* testdata, const char* fixtures) {
                            {"delta.pem", false, false, false},
                            {"indirect.pem", false, false, false}};
     for (const auto& item : kCases) {
-        if (item.name && snprintf(path, sizeof(path), "%s/%s", fixtures, item.name) >=
-                             static_cast<int>(sizeof(path)))
+        if (item.name &&
+            snprintf(path, sizeof(path), "%s/%s", fixtures, item.name) >= int{sizeof(path)})
             return 1;
         auto created = rut::create_tls_server_context(
             certificate, key, false, certificate, item.name ? path : nullptr);
@@ -182,8 +180,7 @@ int verify_contexts(const char* testdata, const char* fixtures) {
                                        {"wrong-issuer.pem", false},
                                        {"expired.pem", false}};
     for (const auto& item : kStrictCases) {
-        if (snprintf(path, sizeof(path), "%s/%s", fixtures, item.name) >=
-            static_cast<int>(sizeof(path)))
+        if (snprintf(path, sizeof(path), "%s/%s", fixtures, item.name) >= int{sizeof(path)})
             return 1;
         auto created =
             rut::create_tls_server_context(certificate, key, false, certificate, path, true);
@@ -211,14 +208,12 @@ int main(int argc, char** argv) {
     if (argc != 3 && argc != 4) return 2;
     if (argc == 4 && strcmp(argv[3], "--verify") == 0) return verify_contexts(argv[1], argv[2]);
     char path[1024];
-    if (snprintf(path, sizeof(path), "%s/localhost_cert.pem", argv[1]) >=
-        static_cast<int>(sizeof(path)))
+    if (snprintf(path, sizeof(path), "%s/localhost_cert.pem", argv[1]) >= int{sizeof(path)})
         return 2;
     FILE* in = fopen(path, "r");
     X509* issuer = in ? PEM_read_X509(in, nullptr, nullptr, nullptr) : nullptr;
     if (in) fclose(in);
-    if (snprintf(path, sizeof(path), "%s/localhost_key.pem", argv[1]) >=
-        static_cast<int>(sizeof(path))) {
+    if (snprintf(path, sizeof(path), "%s/localhost_key.pem", argv[1]) >= int{sizeof(path)}) {
         X509_free(issuer);
         return 2;
     }
@@ -248,8 +243,7 @@ int main(int argc, char** argv) {
         ok = ok && duplicate && ASN1_INTEGER_set(X509_get_serialNumber(duplicate), 999) == 1 &&
              X509_set_pubkey(duplicate, other) == 1 &&
              X509_sign(duplicate, other, EVP_sha256()) > 0;
-        if (snprintf(path, sizeof(path), "%s/ambiguous-ca.pem", argv[2]) >=
-            static_cast<int>(sizeof(path)))
+        if (snprintf(path, sizeof(path), "%s/ambiguous-ca.pem", argv[2]) >= int{sizeof(path)})
             ok = false;
         FILE* bundle = ok ? fopen(path, "w") : nullptr;
         ok = ok && bundle && PEM_write_X509(bundle, issuer) == 1 &&

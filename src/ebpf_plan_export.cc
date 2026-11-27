@@ -150,8 +150,8 @@ bool export_ebpf_bytecode(const NativeProgram& program,
     const void* const kData[] = {code.parser, code.verdict, handoff.verdict, handoff.commit};
     const u32 kLengths[] = {sizeof(code.parser),
                             sizeof(code.verdict),
-                            handoff.verdict_count * static_cast<u32>(sizeof(ebpf::Instruction)),
-                            handoff.commit_count * static_cast<u32>(sizeof(ebpf::Instruction))};
+                            handoff.verdict_count * u32{sizeof(ebpf::Instruction)},
+                            handoff.commit_count * u32{sizeof(ebpf::Instruction)}};
     for (u32 i = 0; i < 5; ++i) {
         const int kLength =
             snprintf(outputs.paths[i], sizeof(outputs.paths[i]), "%s.%s", prefix, kSuffixes[i]);

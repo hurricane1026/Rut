@@ -1001,8 +1001,7 @@ TEST(RirVerifier, RejectsInvalidEncodedYieldKind) {
 
     b.set_insert_point(fn, entry);
     VOK(b.emit_yield_event(static_cast<u8>(jit::YieldKind::Timer), 50, 1));
-    fn->blocks[entry.id].insts[0].imm.i64_val =
-        (static_cast<i64>(99) << 48) | (static_cast<i64>(1) << 32) | 50;
+    fn->blocks[entry.id].insts[0].imm.i64_val = (i64{99} << 48) | (i64{1} << 32) | 50;
 
     b.set_insert_point(fn, resume);
     VOK(b.emit_ret_status(204));

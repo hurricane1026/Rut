@@ -253,7 +253,7 @@ static Str stash_owned_string(std::deque<std::string>& store, const std::string&
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
 static bool validate_regex_literal(Str pattern, std::string* error) {
     std::string wrapped;
-    wrapped.reserve(static_cast<size_t>(pattern.len) + 7);
+    wrapped.reserve(size_t{pattern.len} + 7);
     wrapped.append("^(?:", 4);
     wrapped.append(pattern.ptr, pattern.len);
     wrapped.append(")$", 2);
@@ -3604,7 +3604,7 @@ static WsOutputLiteralBounds ws_output_literal_bounds(
     if (value.kind == HirExprKind::StringConcat && value.lhs && value.rhs) {
         const auto kLhs = ws_output_literal_bounds(*value.lhs, locals, count, visits, depth + 1);
         const auto kRhs = ws_output_literal_bounds(*value.rhs, locals, count, visits, depth + 1);
-        const u64 kSize = static_cast<u64>(kLhs.minimum) + kRhs.minimum;
+        const u64 kSize = u64{kLhs.minimum} + kRhs.minimum;
         return {kSize > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kSize),
                 kLhs.valid_utf8 && kRhs.valid_utf8,
                 kLhs.complete && kRhs.complete};
@@ -3770,7 +3770,7 @@ static FrontendResult<HirExpr> analyze_bitwise_namespace_call(const AstExpr& exp
         if (pipe_lhs == nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
-        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+        if (arg.int_value <= 0 || arg.int_value > i32{kMaxTupleSlots})
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot out of range"));
@@ -5561,7 +5561,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                       arg.span,
                                       lit_str("placeholder outside pipe"));
             const i64 kSlot = arg.int_value;
-            if (kSlot <= 0 || kSlot > static_cast<i64>(kMaxTupleSlots))
+            if (kSlot <= 0 || kSlot > i64{kMaxTupleSlots})
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot out of range"));
@@ -5572,7 +5572,7 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
                                           lit_str("non-tuple source with non-unit placeholder"));
                 return *pipe_placeholder_source;
             }
-            if (kSlot > static_cast<i64>(pipe_placeholder_source->tuple_len))
+            if (kSlot > i64{pipe_placeholder_source->tuple_len})
                 return frontend_error(FrontendError::UnsupportedSyntax,
                                       arg.span,
                                       lit_str("placeholder slot exceeds tuple arity"));
@@ -14305,7 +14305,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         if (pipe_lhs == nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, arg.span, lit_str("placeholder outside pipe"));
-        if (arg.int_value <= 0 || arg.int_value > static_cast<i32>(kMaxTupleSlots))
+        if (arg.int_value <= 0 || arg.int_value > i32{kMaxTupleSlots})
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   arg.span,
                                   lit_str("placeholder slot out of range"));
@@ -15722,7 +15722,7 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
     };
     auto placeholder_slot_expr =
         [&](const HirExpr& source, i32 slot, Span span) -> FrontendResult<HirExpr> {
-        if (slot <= 0 || slot > static_cast<i32>(kMaxTupleSlots))
+        if (slot <= 0 || slot > i32{kMaxTupleSlots})
             return fail_call(span, "placeholder slot out of range", nullptr);
         if (source.type != HirTypeKind::Tuple) {
             if (slot != 1)
@@ -20461,7 +20461,7 @@ static FrontendResult<void> analyze_wait_any_stmt_control(const AstStatement& st
     wait.span = stmt.span;
     wait.event_kind = WaitEventKind::Any;
     wait.ms = timer_ms;
-    wait.arm_mask = static_cast<u8>(kWaitEventArmRecv | kWaitEventArmTimer);
+    wait.arm_mask = u8{kWaitEventArmRecv | kWaitEventArmTimer};
     const u32 wait_index = route.waits.len;
     if (!route.waits.push(wait)) return frontend_error(FrontendError::TooManyItems, stmt.span);
 
@@ -26274,7 +26274,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             timer_count++;
             // A selector outside the process shard range would compile into a
             // timer that never fires on any shard.
-            if (item.timer.shard >= static_cast<i32>(kMaxShards))
+            if (item.timer.shard >= i32{kMaxShards})
                 return frontend_error(
                     FrontendError::UnsupportedSyntax,
                     item.timer.span,

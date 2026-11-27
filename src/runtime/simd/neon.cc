@@ -84,15 +84,15 @@ u32 scan_header_value(const u8* buf, u32 pos_in, u32 end) {
             const u32 cr_byte = static_cast<u32>(__builtin_ctzll(cr_mask)) >> 2;
             const u64 pre_cr_nibbles = cr_byte == 0 ? 0 : ~(~0ULL << (cr_byte * 4));
             const u64 real_bad = bad_mask & pre_cr_nibbles & ~cr_mask;
-            if (real_bad) return static_cast<u32>(-1);
+            if (real_bad) return UINT32_MAX;
             return static_cast<u32>(pos + static_cast<i64>(cr_byte));
         }
-        if (bad_mask) return static_cast<u32>(-1);
+        if (bad_mask) return UINT32_MAX;
         pos += 16;
     }
     while (pos < static_cast<i64>(end)) {
         if (buf[pos] == '\r') return pos;
-        if (!kHeaderValueTable[buf[pos]]) return static_cast<u32>(-1);
+        if (!kHeaderValueTable[buf[pos]]) return UINT32_MAX;
         pos++;
     }
     return end;
@@ -127,7 +127,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
             const u32 sp_byte = static_cast<u32>(__builtin_ctzll(sp_mask)) >> 2;
             const u64 pre_sp_nibbles = sp_byte == 0 ? 0 : ~(~0ULL << (sp_byte * 4));
             const u64 real_bad = bad_mask & pre_sp_nibbles & ~sp_mask;
-            if (real_bad) return static_cast<u32>(-1);
+            if (real_bad) return UINT32_MAX;
             if (canon_end == end) {
                 const u64 qf_before_sp = qf_mask & pre_sp_nibbles;
                 canon_end = qf_before_sp
@@ -138,7 +138,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
             *canon_end_out = canon_end;
             return static_cast<u32>(pos + static_cast<i64>(sp_byte));
         }
-        if (bad_mask) return static_cast<u32>(-1);
+        if (bad_mask) return UINT32_MAX;
         if (qf_mask && canon_end == end) {
             canon_end = static_cast<u32>(pos + static_cast<i64>(__builtin_ctzll(qf_mask) >> 2));
         }
@@ -150,7 +150,7 @@ u32 scan_uri(const u8* buf, u32 pos_in, u32 end, u32* canon_end_out) {
             *canon_end_out = (canon_end != end) ? canon_end : pos;
             return static_cast<u32>(pos);
         }
-        if (!kUriTable[b]) return static_cast<u32>(-1);
+        if (!kUriTable[b]) return UINT32_MAX;
         if ((b == '?' || b == '#') && canon_end == end) canon_end = static_cast<u32>(pos);
         pos++;
     }
@@ -168,20 +168,20 @@ u32 scan_header_name(const u8* buf, u32 pos_in, u32 end) {
         if (neon_any(cmp)) {
             for (i64 i = 0; i < 16 && pos + i < static_cast<i64>(end); i++) {
                 if (buf[pos + i] == ':') return static_cast<u32>(pos + i);
-                if (!kTokenTable[buf[pos + i]]) return static_cast<u32>(-1);
+                if (!kTokenTable[buf[pos + i]]) return UINT32_MAX;
             }
         }
         for (i64 j = pos; j < pos + 16; j++) {
-            if (!kTokenTable[buf[j]]) return static_cast<u32>(-1);
+            if (!kTokenTable[buf[j]]) return UINT32_MAX;
         }
         pos += 16;
     }
     while (pos < static_cast<i64>(end)) {
         if (buf[pos] == ':') return static_cast<u32>(pos);
-        if (!kTokenTable[buf[pos]]) return static_cast<u32>(-1);
+        if (!kTokenTable[buf[pos]]) return UINT32_MAX;
         pos++;
     }
-    return static_cast<u32>(-1);
+    return UINT32_MAX;
 }
 
 }  // namespace rut::simd

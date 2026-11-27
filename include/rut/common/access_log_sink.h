@@ -34,7 +34,7 @@ struct AccessLogSinkSpec {
     AccessLogFormatProfile format = AccessLogFormatProfile::None;
     AccessLogPublicationProfile publication = AccessLogPublicationProfile::None;
     u16 path_len = 0;
-    char path[static_cast<u32>(static_cast<i64>(kAccessLogSinkPathMax) + 1)]{};
+    char path[u32{i64{kAccessLogSinkPathMax} + 1}]{};
 };
 static_assert(sizeof(AccessLogSinkSpec::path) == 256u);
 
@@ -86,7 +86,7 @@ inline bool access_log_sink_spec_valid(const AccessLogSinkSpec& spec) {
         return false;
     if (!access_log_sink_path_valid({spec.path, spec.path_len})) return false;
     const auto kTail = range_int(spec.path_len) + range_int<1, 2>{};
-    for (i64 i = kTail.value(); i < static_cast<i64>(sizeof(spec.path)); i++)
+    for (i64 i = kTail.value(); i < i64{sizeof(spec.path)}; i++)
         if (spec.path[i] != '\0') return false;
     return true;
 }

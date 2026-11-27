@@ -18,7 +18,7 @@ Str auth_payload(Str authorization, Str scheme) {
     u32 begin = static_cast<u32>(static_cast<i64>(scheme.len) + 1);
     while (begin < authorization.len && authorization.ptr[begin] == ' ')
         begin = static_cast<u32>(static_cast<i64>(begin) + 1);
-    return {authorization.ptr + static_cast<i64>(begin),
+    return {authorization.ptr + i64{begin},
             static_cast<u32>(static_cast<i64>(authorization.len) - static_cast<i64>(begin))};
 }
 
@@ -81,7 +81,7 @@ bool basic_matches(Str authorization, Str credentials) {
     if (kToken.ptr == nullptr || kToken.len != kExpectedLen) return false;
     // Encode the trusted credential instead of decoding attacker-controlled data.
     // Exact comparison also rejects malformed/noncanonical padding and pad bits.
-    u8 encoded[static_cast<i64>(((static_cast<i64>(kMaxBasicCredentialBytes) + 2) / 3) * 4 + 1)];
+    u8 encoded[i64{((i64{kMaxBasicCredentialBytes} + 2) / 3) * 4 + 1}];
     u32 written = 0;
     const bool encoded_ok =
         rut_crypto_base64_encode_v1(reinterpret_cast<const u8*>(credentials.ptr),

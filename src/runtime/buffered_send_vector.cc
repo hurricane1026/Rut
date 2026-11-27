@@ -15,12 +15,12 @@ consteval bool suffix_matches(
         return false;
     if (sent < n)
         return v.message.msg_iov == v.parts && v.message.msg_iovlen == 2 &&
-               v.parts[0].iov_base == first + static_cast<i64>(sent) &&
+               v.parts[0].iov_base == first + i64{sent} &&
                v.parts[0].iov_len == static_cast<u64>(i64{n} - i64{sent}) &&
                v.parts[1].iov_base == second && v.parts[1].iov_len == m;
     if (sent < total)
         return v.message.msg_iov == v.parts + 1 && v.message.msg_iovlen == 1 &&
-               v.parts[1].iov_base == second + (static_cast<i64>(sent) - static_cast<i64>(n)) &&
+               v.parts[1].iov_base == second + (i64{sent} - i64{n}) &&
                v.parts[1].iov_len == static_cast<u64>(total - i64{sent});
     return v.message.msg_iov == v.parts + 2 && v.message.msg_iovlen == 0;
 }
@@ -30,8 +30,8 @@ consteval bool vector_cursor_contract() {
     u8 second[4]{};
     for (u32 n = 1; n <= sizeof(first); ++n) {
         for (u32 m = 1; m <= sizeof(second); ++m) {
-            for (u32 start = 0; start <= static_cast<i64>(n) + static_cast<i64>(m); ++start) {
-                for (u32 end = start; end <= static_cast<i64>(n) + static_cast<i64>(m); ++end) {
+            for (u32 start = 0; start <= i64{n} + i64{m}; ++start) {
+                for (u32 end = start; end <= i64{n} + i64{m}; ++end) {
                     BufferedSendVector v{};
                     if (!v.bind(first, n, second, m)) return false;
                     if (!v.matches(first,

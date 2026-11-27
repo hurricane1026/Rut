@@ -26,7 +26,7 @@ inline std::string base64(const unsigned char* bytes, unsigned int length) {
 }
 
 inline std::string format_date(long long unix_seconds) {
-    const time_t seconds = static_cast<time_t>(unix_seconds);
+    const time_t seconds = time_t{unix_seconds};
     struct tm utc{};
     if (gmtime_r(&seconds, &utc) == nullptr) return {};
     static constexpr const char* kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};

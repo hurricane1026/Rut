@@ -83,7 +83,7 @@ void h1ws_h2_sent(void* lp, Connection& c, IoEvent ev) {
     if (c.send_progress < c.send_buf.len()) {
         const u32 pending =
             (range_int(remaining) - range_int(sent)).max(range_int<0, 1>{}).to<u32>();
-        if (!client_send(loop, c, c.send_buf.data() + static_cast<i64>(c.send_progress), pending))
+        if (!client_send(loop, c, c.send_buf.data() + i64{c.send_progress}, pending))
             loop->close_conn(c);
         return;
     }
@@ -283,13 +283,13 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
             while (end < header.value.len && header.value.ptr[end] != ',') ++end;
             const u32 token_len =
                 (range_int(end) - range_int(start)).max(range_int<0, 1>{}).to<u32>();
-            Str token{header.value.ptr + static_cast<i64>(start), token_len};
+            Str token{header.value.ptr + i64{start}, token_len};
             while (token.len && (token.ptr[0] == ' ' || token.ptr[0] == '\t')) {
                 ++token.ptr;
                 --token.len;
             }
             while (token.len) {
-                const char last = token.ptr[static_cast<i64>(token.len) - 1];
+                const char last = token.ptr[i64{token.len} - 1];
                 if (last != ' ' && last != '\t') break;
                 --token.len;
             }
@@ -383,10 +383,10 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
             }
             for (u32 j = 0; j < h.name.len; ++j) {
                 const char kCh = h.name.ptr[j];
-                names[static_cast<i64>(used) + static_cast<i64>(j)] =
+                names[i64{used} + i64{j}] =
                     kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
             }
-            hs[n++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
+            hs[n++] = {{names + i64{used}, h.name.len}, h.value};
             used = (range_int(used) + range_int(h.name.len))
                        .min(range_int<sizeof(names), i64{sizeof(names)} + 1>{})
                        .to<u32>();
@@ -412,7 +412,7 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
         const auto& target = cfg->upstreams[uid];
         const u32 kNameLength = target.name_len < sizeof(c.upstream_name) - 1
                                     ? target.name_len
-                                    : static_cast<u32>(sizeof(c.upstream_name) - 1);
+                                    : u32{sizeof(c.upstream_name) - 1};
         __builtin_memcpy(c.upstream_name, target.name, kNameLength);
         c.upstream_name[kNameLength] = '\0';
         c.set_slots(&h1ws_h2_received<Loop>, nullptr, nullptr, nullptr);
