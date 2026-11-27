@@ -172,7 +172,7 @@ static int gate_wait_for_request_two(int fd) {
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_PEEK);
             return 0;
         }
-        const size_t available = (size_t)received;
+        const size_t available = received;
         const size_t compare = available < expected_length ? available : expected_length;
         if (memcmp(peek, gate->request_two, compare) != 0 || available > expected_length) {
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
@@ -262,8 +262,7 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
             rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_RECV);
         return real_recv_fn(fd, data, length, flags);
     }
-    if ((uint32_t)peeked != expected_length ||
-        memcmp(peek, gate->request_two, expected_length) != 0) {
+    if (peeked != expected_length || memcmp(peek, gate->request_two, expected_length) != 0) {
         rut_downstream_gate_fail(gate, RUT_DOWNSTREAM_GATE_ERROR_REQUEST_MISMATCH);
         return real_recv_fn(fd, data, length, flags);
     }
@@ -274,7 +273,7 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
     // independently equal the entire configured R1||R2 wire.
     const ssize_t received = real_recv_fn(fd, data, length, flags);
     const int received_errno = errno;
-    if (received != (ssize_t)expected_length ||
+    if (received < 0 || received != expected_length ||
         memcmp(data, gate->request_two, expected_length) != 0) {
         rut_downstream_gate_fail(gate,
                                  received < 0 ? RUT_DOWNSTREAM_GATE_ERROR_RECV
@@ -287,7 +286,7 @@ static ssize_t gate_coalesced_ingress_recv(int fd, void* data, size_t length, in
     gate->intercepted_pid = (uint32_t)getpid();
     gate->intercepted_ppid = (uint32_t)getppid();
     gate->intercepted_operation = RUT_DOWNSTREAM_GATE_OP_RECV;
-    gate->intercepted_length = (uint64_t)received;
+    gate->intercepted_length = expected_length;
     gate->intercepted_prefix_length = expected_length < RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY
                                           ? expected_length
                                           : RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY;
@@ -347,8 +346,7 @@ ssize_t writev(int fd, const struct iovec* iov, int count) {
     unsigned char prefix[RUT_DOWNSTREAM_GATE_PREFIX_CAPACITY];
     uint64_t total = 0;
     size_t prefix_length = 0;
-    if (count > 0)
-        prefix_length = gate_copy_iov_prefix(prefix, sizeof(prefix), iov, (size_t)count, &total);
+    if (count > 0) prefix_length = gate_copy_iov_prefix(prefix, sizeof(prefix), iov, count, &total);
     gate_inside++;
     gate_before_publication(fd, RUT_DOWNSTREAM_GATE_OP_WRITEV, total, prefix, prefix_length);
     gate_inside--;

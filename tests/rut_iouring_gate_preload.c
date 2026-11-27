@@ -428,9 +428,8 @@ static int setup_params_valid(const struct io_uring_params* params) {
         return 0;
 
     const uint64_t cq_size =
-        (uint64_t)params->cq_off.cqes + (uint64_t)params->cq_entries * sizeof(struct io_uring_cqe);
-    const uint64_t sq_size =
-        (uint64_t)params->sq_off.array + (uint64_t)params->sq_entries * sizeof(uint32_t);
+        params->cq_off.cqes + (uint64_t)params->cq_entries * sizeof(struct io_uring_cqe);
+    const uint64_t sq_size = params->sq_off.array + (uint64_t)params->sq_entries * sizeof(uint32_t);
     if (cq_size > SIZE_MAX || sq_size > SIZE_MAX || params->sq_off.head != 0 ||
         params->sq_off.tail != sizeof(uint32_t) ||
         params->sq_off.ring_mask != 4U * sizeof(uint32_t) ||
