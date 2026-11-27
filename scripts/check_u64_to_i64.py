@@ -20,9 +20,10 @@ INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 RANGE_CAST_MESSAGE = 'narrow a range_int with a range-checked conversion'
 BIT_CAST_MESSAGE = 'use a value conversion for integer or enum bit casts'
 NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
+VOID_DISCARD_MESSAGE = 'void cast discards a [[nodiscard]] result'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
 MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE,
-            ADDRESS_MESSAGE, BIT_CAST_MESSAGE, *ARITHMETIC_MESSAGES)
+            ADDRESS_MESSAGE, BIT_CAST_MESSAGE, VOID_DISCARD_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -162,12 +163,9 @@ def main():
                     '-isystem', ROOT / 'include', '-std=c++23',
                     ROOT / 'scripts/clang/integer_arithmetic_cases.cc'], check=True)
     nodiscard_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-nodiscard']
-    if args.nodiscard_inventory or args.nodiscard_base:
-        subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
-                        str(args.plugin.resolve()), *nodiscard_check, '-Xclang', '-verify',
-                        '-std=c++23', ROOT / 'scripts/clang/nodiscard_cases.cc'], check=True)
-    else:
-        nodiscard_check = []
+    subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
+                    str(args.plugin.resolve()), *nodiscard_check, '-Xclang', '-verify',
+                    '-std=c++23', ROOT / 'scripts/clang/nodiscard_cases.cc'], check=True)
     nodiscard_changed = (changed_source_lines(args.nodiscard_base, check_deleted_attributes=True)
                          if args.nodiscard_base else {})
     base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
@@ -242,9 +240,10 @@ def main():
             f'{path.relative_to(ROOT)}:{line}:{column}: {message}\n'
             for path, line, column, _, message in nodiscard
         ))
-    if nodiscard_check:
-        enforced = sum(site[-1] == NODISCARD_MESSAGE for site in failures)
-        print(f'{enforced} changed declarations missing [[nodiscard]] ({len(nodiscard)} in production)')
+    enforced = sum(site[-1] == NODISCARD_MESSAGE for site in failures)
+    print(f'{enforced} changed declarations missing [[nodiscard]] ({len(nodiscard)} in production)')
+    discards = sum(site[-1] == VOID_DISCARD_MESSAGE for site in failures)
+    print(f'{discards} void casts discarding [[nodiscard]] results')
 
     if args.range_cast_inventory:
         args.range_cast_inventory.write_text(''.join(

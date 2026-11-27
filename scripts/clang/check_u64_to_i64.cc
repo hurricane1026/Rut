@@ -789,10 +789,44 @@ class NodiscardVisitor : public RecursiveASTVisitor<NodiscardVisitor> {
     ASTContext& context;
     llvm::DenseSet<unsigned> reported;
 
+    bool discards_nodiscard(const Expr* expr) const {
+        expr = expr->IgnoreParenImpCasts();
+        if (const auto* call = dyn_cast<CallExpr>(expr)) return call->hasUnusedResultAttr(context);
+        if (const auto* construct = dyn_cast<CXXConstructExpr>(expr))
+            return Expr::getUnusedResultAttrImpl(construct->getConstructor(), expr->getType())
+                       .second != nullptr;
+        if (isa<InitListExpr>(expr))
+            return Expr::getUnusedResultAttrImpl(nullptr, expr->getType()).second != nullptr;
+        if (const auto* cast = dyn_cast<ExplicitCastExpr>(expr))
+            return cast->getCastKind() != CK_ToVoid &&
+                   discards_nodiscard(cast->getSubExprAsWritten());
+        if (const auto* conditional = dyn_cast<AbstractConditionalOperator>(expr))
+            return discards_nodiscard(conditional->getTrueExpr()) ||
+                   discards_nodiscard(conditional->getFalseExpr());
+        if (const auto* binary = dyn_cast<BinaryOperator>(expr);
+            binary && binary->getOpcode() == BO_Comma)
+            return discards_nodiscard(binary->getRHS());
+        return false;
+    }
+
 public:
     explicit NodiscardVisitor(ASTContext& context) : context(context) {}
 
     bool shouldVisitTemplateInstantiations() const { return true; }
+
+    bool VisitExplicitCastExpr(const ExplicitCastExpr* cast) {
+        const auto loc = cast->getExprLoc();
+        if (cast->getCastKind() != CK_ToVoid || loc.isInvalid() ||
+            context.getSourceManager().isInSystemHeader(loc) ||
+            !discards_nodiscard(cast->getSubExprAsWritten()) ||
+            !reported.insert(loc.getRawEncoding()).second)
+            return true;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
+                                                    "void cast discards a [[nodiscard]] result");
+        diagnostics.Report(loc, id) << cast->getSourceRange();
+        return true;
+    }
 
     bool VisitFunctionDecl(const FunctionDecl* decl) {
         const auto loc = decl->getLocation();
