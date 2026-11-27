@@ -56,9 +56,10 @@ uint32_t rut_crypto_hmac_sha256_matches_v1(const uint8_t* message,
                                            uint32_t signature_len,
                                            const uint8_t* prefix,
                                            uint32_t prefix_len) {
+    const int64_t prefix_size = prefix_len;
     if ((!message && message_len) || message_len > 1024u * 1024u || !key || !key_len ||
-        key_len > 4096 || !signature || prefix_len > 64 || (!prefix && prefix_len) ||
-        signature_len != (uint32_t)((int64_t)prefix_len + 64))
+        key_len > 4096 || !signature || prefix_size > 64 || (!prefix && prefix_size) ||
+        signature_len != prefix_size + 64)
         return 0;
     for (uint32_t i = 0; i < prefix_len; ++i)
         if (signature[i] != prefix[i]) return 0;
@@ -73,8 +74,8 @@ uint32_t rut_crypto_hmac_sha256_matches_v1(const uint8_t* message,
                                                        encoded,
                                                        sizeof(encoded),
                                                        &length);
-    const uint32_t matches = computed && length == 64 &&
-                             rut_crypto_equal_v1(encoded, signature + (int64_t)prefix_len, length);
+    const uint32_t matches =
+        computed && length == 64 && rut_crypto_equal_v1(encoded, signature + prefix_size, length);
     rut_crypto_clear_v1(encoded, sizeof(encoded));
     return matches;
 }
