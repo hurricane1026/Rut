@@ -108,9 +108,10 @@ struct UpstreamPool {
             UpstreamConn& c = conns[i];
             u32 idle = 0;
             (void)__builtin_sub_overflow(now_sec, static_cast<u32>(c.parked_time), &idle);
+            u64 idle_us = 0;
             if (idle_timeout_configured
-                    ? now_us >= c.parked_time &&
-                          now_us - c.parked_time >= static_cast<u64>(max_idle_sec) * 1000000u
+                    ? !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                          idle_us >= static_cast<u64>(max_idle_sec) * 1000000u
                     : idle >= max_idle_sec) {
                 ::close(c.fd);
                 release_slot(i);
@@ -142,9 +143,10 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
-            const bool expired =
-                idle_timeout_configured && idle_timeout_sec != 0 && now_us >= c.parked_time &&
-                now_us - c.parked_time >= static_cast<u64>(idle_timeout_sec) * 1000000u;
+            u64 idle_us = 0;
+            const bool expired = idle_timeout_configured && idle_timeout_sec != 0 &&
+                                 !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                                 idle_us >= static_cast<u64>(idle_timeout_sec) * 1000000u;
             release_slot(i);
             if (expired) {
                 ::close(fd);
@@ -195,7 +197,9 @@ private:
     static u64 clock_us() {
         timespec ts{};
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return static_cast<u64>(ts.tv_sec) * 1000000u + static_cast<u64>(ts.tv_nsec) / 1000u;
+        u64 now_us = static_cast<u64>(ts.tv_sec) * 1000000u;
+        (void)__builtin_add_overflow(now_us, static_cast<u64>(ts.tv_nsec) / 1000u, &now_us);
+        return now_us;
     }
 
     bool pop_free_slot(u32& slot) {
