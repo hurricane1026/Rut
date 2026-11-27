@@ -110,12 +110,7 @@ public:
 
     // The conversion functions require a writable output and write only on success.
     [[nodiscard]] static constexpr bool try_from_i64(i64 value, range_int* out) {
-        if constexpr (Begin == 0) {
-            // A negative i64 maps above every nonnegative i64.
-            if (static_cast<u64>(value) >= static_cast<u64>(End)) return false;
-        } else if (value < Begin || value >= End) {
-            return false;
-        }
+        if (value < Begin || value >= End) return false;
         out->value_ = value;
         return true;
     }
@@ -124,12 +119,11 @@ public:
         if constexpr (End <= 0) {
             return false;
         } else {
-            constexpr u64 kMax = static_cast<u64>(End - 1);
-            if (value > kMax) return false;
+            constexpr i64 kMax = End - 1;
             if constexpr (Begin > 0) {
-                if (value < static_cast<u64>(Begin)) return false;
+                if (value < u64{Begin}) return false;
             }
-            return try_u64_to_i64(value, &out->value_);
+            return try_u64_to_i64<kMax>(value, &out->value_);
         }
     }
 

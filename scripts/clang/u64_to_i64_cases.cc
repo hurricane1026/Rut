@@ -56,6 +56,24 @@ i64 checked_before_use(u64 value) {
     return value;
 }
 
+template <u64 Max>
+i64 checked_template_bound(u64 value) {
+    if (value > Max) return 0;
+    // expected-warning@+1 {{u64 to i64 conversion requires a range proof}}
+    return value;
+}
+
+void use_checked_template_bound(u64 value) {
+    consume(checked_template_bound<INT64_MAX>(value));
+    consume(checked_template_bound<UINT64_MAX>(value));
+}
+
+static_assert([] {
+    i64 value = 0;
+    return try_u64_to_i64<7>(7, &value) && value == 7 && !try_u64_to_i64<7>(8, &value) &&
+           value == 7;
+}());
+
 void unknown_limit(u64 limit) {
     for (u64 i = 0; i < limit; ++i) {
         // expected-warning@+1 {{u64 to i64 conversion requires a range proof}}

@@ -130,7 +130,9 @@ bool proves_bound(ASTContext& context, const Expr* condition, const VarDecl* cur
         rhs = lhs;
     }
     if (!taken) op = BinaryOperator::negateComparisonOp(op);
-    return (op == BO_LT || op == BO_LE || op == BO_EQ) && fits_i64(context, rhs, op == BO_LT);
+    // A dependent upper bound is checked when the visitor sees the instantiated body.
+    return (op == BO_LT || op == BO_LE || op == BO_EQ) &&
+           (rhs->isValueDependent() || fits_i64(context, rhs, op == BO_LT));
 }
 
 class SignedConversionVisitor : public RecursiveASTVisitor<SignedConversionVisitor> {

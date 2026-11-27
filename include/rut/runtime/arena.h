@@ -117,16 +117,19 @@ struct Arena {
         return {};
     }
 
-    // Bump allocate, 8-byte aligned. Negative requests convert above the
-    // unsigned limit enforced by the shared allocation entry point.
+    // Bump allocate, 8-byte aligned.
     [[nodiscard]] void* alloc(i64 requested_size) {
-        return alloc_unsigned(static_cast<u64>(requested_size));
+        AllocationSize size;
+        if (!current || !AllocationSize::try_from_i64(requested_size, &size)) return nullptr;
+        return alloc_aligned(size);
     }
 
     template <typename Size>
         requires(__is_same(Size, unsigned long) || __is_same(Size, unsigned long long))
     [[nodiscard]] void* alloc(Size requested_size) {
-        return alloc_unsigned(requested_size);
+        AllocationSize size;
+        if (!current || !AllocationSize::try_from_u64(requested_size, &size)) return nullptr;
+        return alloc_aligned(size);
     }
 
     // Typed bump alloc + placement new.
@@ -194,15 +197,15 @@ struct Arena {
     u64 space_allocated() const { return total_allocated; }
 
 private:
-    [[nodiscard]] void* alloc_unsigned(u64 requested_size) {
-        if (!current) return nullptr;
-        constexpr i64 kAlignment = 8;
-        constexpr auto kAlignmentPadding =
-            range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
-        range_int<0, kI64ExclusiveEnd - (kAlignment - 1)> request;
-        if (!decltype(request)::try_from_u64(requested_size, &request)) return nullptr;
-        const auto padded = request + kAlignmentPadding;
-        const i64 aligned_size = padded.value() / kAlignment * kAlignment;
+    static constexpr i64 kAllocationAlignment = 8;
+    using AllocationSize = range_int<0, kI64ExclusiveEnd - (kAllocationAlignment - 1)>;
+
+    [[nodiscard]] void* alloc_aligned(AllocationSize request) {
+        constexpr auto kPadding =
+            range_int<kAllocationAlignment - 1,
+                      kAllocationAlignment>::constant<kAllocationAlignment - 1>();
+        const auto padded = request + kPadding;
+        const i64 aligned_size = padded.value() / kAllocationAlignment * kAllocationAlignment;
         if (aligned_size <= current->remaining()) {
             void* p = current->data() + current->used;
             current->used += aligned_size;

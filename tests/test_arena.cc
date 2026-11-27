@@ -262,6 +262,7 @@ TEST(arena, requests_outside_signed_block_range_do_not_acquire_or_advance) {
     CHECK_EQ(arena.alloc(-1), nullptr);
     CHECK_EQ(arena.alloc(kSignedMax), nullptr);      // Alignment exceeds i64.
     CHECK_EQ(arena.alloc(kSignedMax - 7), nullptr);  // Block header exceeds i64.
+    CHECK_EQ(arena.alloc(u64{kSignedMax}), nullptr);
     CHECK_EQ(arena.alloc(UINT64_MAX), nullptr);
     CHECK_EQ(arena.backend.acquire_count, 1u);
     CHECK_EQ(arena.current, first);
