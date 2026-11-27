@@ -14,13 +14,15 @@ template <typename Size>
                                            Size used,
                                            const char* data,
                                            Size len) {
-    Size remaining;
-    if (data == nullptr || sub_overflow(used, len, &remaining)) return false;
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(pool);
-    const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
-    uintptr_t offset = 0;
-    if (sub_overflow(ptr, begin, &offset)) return false;
-    return offset <= remaining;
+    // A span of length len can start no later than used - len.
+    Size last_start_offset;
+    if (data == nullptr || sub_overflow(used, len, &last_start_offset)) return false;
+
+    const auto pool_address = reinterpret_cast<uintptr_t>(pool);
+    const auto data_address = reinterpret_cast<uintptr_t>(data);
+    uintptr_t start_offset;
+    return !sub_overflow(data_address, pool_address, &start_offset) &&
+           start_offset <= last_start_offset;
 }
 
 }  // namespace rut
