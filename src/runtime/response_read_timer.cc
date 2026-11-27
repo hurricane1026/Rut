@@ -12,8 +12,7 @@ namespace {
 
 [[nodiscard]] consteval bool timer_rearm_contract() {
     constexpr i64 kMs = 1'000'000;
-    constexpr u64 kMaxDelay =
-        range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}.scaled_by<kMs>().to_u64();
+    constexpr i64 kMaxDelay = range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}.scaled_by<kMs>().value();
     // Hold the deadline at UINT64_MAX and move now across rounding, expiry,
     // and saturation boundaries. Check the interval represented by the
     // result independently of the division used in production.
@@ -32,7 +31,7 @@ namespace {
         const auto kCovered = range_int(kDelay).scaled_by<kMs>();
         if (kRemaining == 0) {
             if (kDelay != 0) return false;
-        } else if (kRemaining > kMaxDelay) {
+        } else if (kRemaining > u64{kMaxDelay}) {
             if (kDelay != UINT32_MAX) return false;
         } else if (kDelay == 0 || kCovered.to_u64() < kRemaining ||
                    (kCovered - range_int<kMs, kMs + 1>{}).max(range_int<0, 1>{}).to_u64() >=
@@ -92,7 +91,7 @@ static_assert(timer_ownership_conserved(),
 // second completion in either order and a replay after both have arrived.
 [[nodiscard]] consteval bool timer_batch_observation_contract() {
     constexpr u32 kGeneration = 7;
-    constexpr u32 kIncoming[] = {0, kGeneration, kGeneration + (1u << 16)};
+    constexpr u32 kIncoming[] = {0, kGeneration, i64{kGeneration} + (1 << 16)};
     for (unsigned prior = 0; prior < 4; ++prior) {
         for (unsigned kind = 1; kind <= 2; ++kind) {
             for (const u32 kId : kIncoming) {

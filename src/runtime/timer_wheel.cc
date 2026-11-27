@@ -27,7 +27,7 @@ static_assert(!has_raw_tick_arithmetic<decltype(TimerWheel::cursor)>);
     if (incremented_address != &wheel.cursor || wheel.cursor != Tick{}) return false;
     Tick* decremented_address = &--wheel.cursor;
     if (decremented_address != &wheel.cursor || wheel.cursor != Tick{UINT32_MAX}) return false;
-    return wheel.slot_after(0) == TimerWheel::kSlots - 1 && wheel.tick_after(1) == Tick{} &&
+    return wheel.slot_after(0) == i64{TimerWheel::kSlots} - 1 && wheel.tick_after(1) == Tick{} &&
            wheel.slot_after(1) == 0 && wheel.tick_after(UINT32_MAX) == Tick{UINT32_MAX - 1} &&
            TimerWheel::elapsed_ticks(Tick{UINT32_MAX - 1}, Tick{1}) == 3;
 }
@@ -47,7 +47,7 @@ static_assert(TimerWheel::remaining_ticks(3, 1) == 2 && TimerWheel::remaining_ti
             TimerWheel::yield_fallback_seconds(last_ms.to<u32>()) != seconds)
             return false;
     }
-    constexpr u32 kLastMs = TimerWheel::kSlots * 1000;
+    constexpr i64 kLastMs = i64{TimerWheel::kSlots} * 1000;
     return TimerWheel::yield_fallback_seconds(kLastMs - 999) == 0 &&
            TimerWheel::yield_fallback_seconds(kLastMs) == 0 &&
            TimerWheel::yield_fallback_seconds(0xffffffffu) == 0;

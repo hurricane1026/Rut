@@ -13,7 +13,7 @@ namespace {
     constexpr i64 kCycle = i64{1} << 32;
     const auto kWindow = idle_trim_window(cursor, timeout);
     u32 next = kWindow.begin;
-    constexpr u32 kMaxAge = IdleTrimWindow::kMinIdleTicks + IdleTrimWindow::kAgeWindow;
+    constexpr i64 kMaxAge = i64{IdleTrimWindow::kMinIdleTicks} + i64{IdleTrimWindow::kAgeWindow};
     for (u32 age = TimerWheel::kSlots; age > 0;) {
         --age;
         if (timeout >= TimerWheel::kSlots || age >= timeout ||
@@ -29,9 +29,9 @@ namespace {
 }
 
 [[nodiscard]] consteval bool window_contract() {
-    constexpr u32 kCursors[] = {0, TimerWheel::kSlots - 1, 0xfffffff0u, 0xffffffffu};
+    constexpr u32 kCursors[] = {0, i64{TimerWheel::kSlots} - 1, 0xfffffff0u, 0xffffffffu};
     for (const u32 kCursor : kCursors) {
-        for (u32 timeout = 0; timeout <= TimerWheel::kSlots + 1; ++timeout)
+        for (u32 timeout = 0; timeout <= i64{TimerWheel::kSlots} + 1; ++timeout)
             if (!matches_armed_timers(kCursor, timeout)) return false;
         if (!matches_armed_timers(kCursor, 0xffffffffu)) return false;
     }
