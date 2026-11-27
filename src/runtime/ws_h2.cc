@@ -1,6 +1,7 @@
 #include "rut/runtime/ws_h2.h"
 
 #include "core/placement_new.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
@@ -47,7 +48,7 @@ bool begin_close(WsH2Session& session, u16 code, Str reason) {
     auto& c = session.callback;
     if (c.ws_closing) return true;
     u64 deadline = 0;
-    if (__builtin_add_overflow(monotonic_us(), u64{5000000}, &deadline)) return false;
+    if (add_overflow(monotonic_us(), u64{5000000}, &deadline)) return false;
     if (!c.ws_close_payload.assign(code, reason)) return false;
     c.ws_closing = true;
     c.ws_close_client_need = c.ws_close_upstream_need = true;

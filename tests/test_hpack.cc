@@ -81,6 +81,18 @@ TEST(hpack_int, decode_truncated_is_error) {
     CHECK_EQ(hpack::decode_integer(buf, 1, 5, &v), 0u);
 }
 
+TEST(hpack_int, rejects_invalid_prefix_width_without_publishing) {
+    const u8 invalid_widths[] = {0, 9, 64, 255};
+    for (const u8 width : invalid_widths) {
+        u8 bytes[6] = {42};
+        u32 value = 123;
+        CHECK_EQ(hpack::decode_integer(bytes, sizeof(bytes), width, &value), 0u);
+        CHECK_EQ(value, 123u);
+        CHECK_EQ(hpack::encode_integer(bytes, 1, width, 0), 0u);
+        CHECK_EQ(bytes[0], 42);
+    }
+}
+
 TEST(hpack_int, decode_overflow_is_error) {
     // A continuation that pushes the value past 32 bits must fail.
     u8 buf[] = {0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10};

@@ -121,6 +121,10 @@ TEST(drain_prob, always_true_zero_period) {
     }
 }
 
+TEST(drain_prob, clock_before_drain_start_closes) {
+    CHECK(should_drain_close(1, UINT64_MAX, 0, 30));
+}
+
 TEST(drain_prob, none_at_start) {
     // At elapsed == 0, threshold < 0 is never true → no closes.
     rut::u32 closed = 0;

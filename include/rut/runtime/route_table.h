@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/byte_span.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
@@ -1025,10 +1026,10 @@ private:
         const uintptr_t normalized_address = reinterpret_cast<uintptr_t>(slash_normalized_path.ptr);
         uintptr_t raw_end = 0;
         uintptr_t normalized_end = 0;
-        if (__builtin_add_overflow(raw_address, static_cast<uintptr_t>(raw_target.len), &raw_end) ||
-            __builtin_add_overflow(normalized_address,
-                                   static_cast<uintptr_t>(slash_normalized_path.len),
-                                   &normalized_end))
+        if (add_overflow(raw_address, static_cast<uintptr_t>(raw_target.len), &raw_end) ||
+            add_overflow(normalized_address,
+                         static_cast<uintptr_t>(slash_normalized_path.len),
+                         &normalized_end))
             return invalid;
         if (raw_target.ptr[0] != '/' || slash_normalized_path.ptr[0] != '/') return invalid;
         bool previous_slash = false;
@@ -1698,11 +1699,11 @@ public:
             return false;
         const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
         uintptr_t end = 0;
-        if (__builtin_add_overflow(begin, static_cast<uintptr_t>(redirect_policy_bytes_used), &end))
+        if (add_overflow(begin, static_cast<uintptr_t>(redirect_policy_bytes_used), &end))
             return false;
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
         uintptr_t remaining = 0;
-        if (__builtin_sub_overflow(end, ptr, &remaining)) return false;
+        if (sub_overflow(end, ptr, &remaining)) return false;
         return ptr >= begin && ptr <= end && value.len <= remaining;
     }
 

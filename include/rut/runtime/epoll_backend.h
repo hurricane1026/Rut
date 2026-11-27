@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_capacity.h"
@@ -67,7 +68,8 @@ struct EpollBackend {
     }
     static void reset_fd_interest(FdInterest& r) {
         u32 next = 0;
-        (void)__builtin_add_overflow(r.gen, u32{1}, &next);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(r.gen, u32{1}, &next);
         r = {-1, 0, 0, next};
     }
 

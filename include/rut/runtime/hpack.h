@@ -13,12 +13,13 @@ namespace rut::hpack {
 // Decode a prefix-encoded integer from in[0..len). prefix_bits in [1,8] is the
 // number of bits the integer occupies in the first octet. Stores the value in
 // *out and returns the number of octets consumed. Returns 0 on error
-// (truncated input or a value exceeding 32 bits).
+// (invalid prefix width, truncated input, or a value exceeding 32 bits).
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out);
 
 // Encode `value` with prefix_bits into out (needs up to 6 octets). prefix_top
 // supplies the high (8 - prefix_bits) flag bits OR'd into the first octet; its
-// low prefix_bits MUST be zero. Returns octets written.
+// low prefix_bits MUST be zero. Returns octets written, or 0 if the prefix
+// is outside [1, 8].
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top);
 
 // --- Huffman (§5.2 / App. B) ---

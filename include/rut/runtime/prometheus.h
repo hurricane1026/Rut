@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/format_integer.h"
 #include "rut/runtime/metrics.h"
@@ -163,7 +164,8 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     w.str("# TYPE rut_grpc_duration_seconds histogram\n");
     u64 grpc_cumulative = 0;
     for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
-        (void)__builtin_add_overflow(grpc_cumulative, m.grpc_latency.buckets[i], &grpc_cumulative);
+        // RUT_INTEGER_RANGE: legacy metrics accumulation discards the overflow status.
+        (void)add_overflow(grpc_cumulative, m.grpc_latency.buckets[i], &grpc_cumulative);
         w.str("rut_grpc_duration_seconds_bucket{le=\"");
         w.str(kPromLatencyLe[i]);
         w.str("\"} ");
@@ -181,7 +183,8 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     w.str("# TYPE rut_request_duration_seconds histogram\n");
     u64 cumulative = 0;
     for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
-        (void)__builtin_add_overflow(cumulative, m.request_latency.buckets[i], &cumulative);
+        // RUT_INTEGER_RANGE: legacy metrics accumulation discards the overflow status.
+        (void)add_overflow(cumulative, m.request_latency.buckets[i], &cumulative);
         w.str("rut_request_duration_seconds_bucket{le=\"");
         w.str(kPromLatencyLe[i]);
         w.str("\"} ");

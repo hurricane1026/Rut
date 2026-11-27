@@ -1,7 +1,9 @@
 #include "rut/runtime/forward_auth.h"
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/https_fetch.h"
@@ -173,7 +175,7 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     u64 elapsed = 0;
     if (found) {
         const bool elapsed_invalid = now < found->started_ms ||
-                                     __builtin_sub_overflow(now, found->started_ms, &elapsed) ||
+                                     sub_overflow(now, found->started_ms, &elapsed) ||
                                      elapsed >= static_cast<u64>(found->timeout_ms);
         if (elapsed_invalid) {
             cancel(connection, generation);
@@ -236,9 +238,9 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     if (!found) return {};
     ForwardAuthReply reply;
     reply.status = static_cast<i32>(0x80000000u);
-    u64 remaining = 0;
-    (void)__builtin_sub_overflow(static_cast<u64>(found->timeout_ms), elapsed, &remaining);
-    reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
+    // Any existing slot with elapsed >= timeout returned above.
+    const auto kRemaining = range_int(found->timeout_ms) - range_int(static_cast<u32>(elapsed));
+    reply.retry_ms = kRemaining.value() < 10 ? static_cast<u32>(kRemaining.value()) : 10;
     return reply;
 }
 void* ForwardAuthWorker::entry(void* self) {

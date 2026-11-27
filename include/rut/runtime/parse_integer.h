@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -7,13 +9,15 @@ namespace integer_detail {
 
 inline u64 wrap_add(u64 a, u64 b) {
     u64 result = 0;
-    (void)__builtin_add_overflow(a, b, &result);
+    // RUT_INTEGER_RANGE: packed decimal arithmetic uses the low 64 bits.
+    (void)add_overflow(a, b, &result);
     return result;
 }
 
 inline u64 wrap_sub(u64 a, u64 b) {
     u64 result = 0;
-    (void)__builtin_sub_overflow(a, b, &result);
+    // RUT_INTEGER_RANGE: packed decimal arithmetic uses the low 64 bits.
+    (void)sub_overflow(a, b, &result);
     return result;
 }
 
@@ -80,7 +84,7 @@ inline bool parse_integer(Str text, i64& output) {
                 __builtin_memcpy(&zeros, data, sizeof(zeros));
                 if (zeros != 0x3030303030303030ULL) break;
                 data += static_cast<i64>(8);
-                (void)__builtin_sub_overflow(length, 8u, &length);
+                length = static_cast<u32>((range_int(length) - range_int<8, 9>{}).value());
             }
             while (length && *data == '0') {
                 ++data;
@@ -94,7 +98,7 @@ inline bool parse_integer(Str text, i64& output) {
                 if (!Digits::read16(data, block)) return false;
                 number = block;
                 data += static_cast<i64>(16);
-                (void)__builtin_sub_overflow(length, 16u, &length);
+                length = static_cast<u32>((range_int(length) - range_int<16, 17>{}).value());
             }
         }
         while (length >= 8) {
@@ -102,14 +106,14 @@ inline bool parse_integer(Str text, i64& output) {
             if (!Digits::read8(data, block)) return false;
             number = integer_detail::wrap_add(number * 100000000, block);
             data += static_cast<i64>(8);
-            (void)__builtin_sub_overflow(length, 8u, &length);
+            length = static_cast<u32>((range_int(length) - range_int<8, 9>{}).value());
         }
         if (length >= 4) {
             u32 block;
             if (!integer_detail::digits4(data, block)) return false;
             number = integer_detail::wrap_add(number * 10000, block);
             data += static_cast<i64>(4);
-            (void)__builtin_sub_overflow(length, 4u, &length);
+            length = static_cast<u32>((range_int(length) - range_int<4, 5>{}).value());
         }
     }
     while (length--) {
@@ -120,13 +124,15 @@ inline bool parse_integer(Str text, i64& output) {
     }
     constexpr u64 kPositiveLimit = Wide ? 9223372036854775807ULL : 2147483647ULL;
     u64 max_magnitude = 0;
-    (void)__builtin_add_overflow(kPositiveLimit, static_cast<u64>(negative), &max_magnitude);
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)add_overflow(kPositiveLimit, static_cast<u64>(negative), &max_magnitude);
     if (number > max_magnitude) return false;
     // Form the two's-complement representation with unsigned arithmetic, including
     // INT64_MIN, then preserve its bits without a signed overflow.
     u64 magnitude = 0;
     if (negative)
-        (void)__builtin_sub_overflow(u64{0}, number, &magnitude);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)sub_overflow(u64{0}, number, &magnitude);
     else
         magnitude = number;
     output = __builtin_bit_cast(i64, magnitude);

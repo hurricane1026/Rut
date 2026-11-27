@@ -111,10 +111,10 @@ struct WsMessageAssembler {
 // Feed one DATA or CONTINUATION frame header (control frames are rejected here). On
 // Complete, *out_opcode = the message opcode (Text/Binary) and *out_total_len = the full
 // reassembled payload length. `max_message_size` == 0 means unbounded.
-WsMessageStatus ws_message_feed(WsMessageAssembler& m,
-                                const WsFrameHeader& h,
-                                u64 max_message_size,
-                                WsOpcode* out_opcode,
-                                u64* out_total_len);
+[[nodiscard]] WsMessageStatus ws_message_feed(WsMessageAssembler& m,
+                                              const WsFrameHeader& h,
+                                              u64 max_message_size,
+                                              WsOpcode* out_opcode,
+                                              u64* out_total_len);
 
 }  // namespace rut

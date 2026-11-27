@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "runtime/simd/simd.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/route_canon.h"
 
@@ -80,13 +81,13 @@ static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
         return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
     u32 val = 0;
     for (u32 i = 0; i < len; i++) {
-        const i64 d = static_cast<i64>(p[i]) - '0';
-        if (UNLIKELY(d < 0 || d > 9))
+        const auto digit = range_int(p[i]) - range_int<'0', '1'>{};
+        if (UNLIKELY(digit.value() < 0 || digit.value() > 9))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
-        // Pre-multiply overflow check: val * 10 + d <= 0xFFFFFFFF
-        if (UNLIKELY(static_cast<i64>(val) > (0xFFFFFFFFLL - d) / 10))
+        const auto next = range_int(val).scaled_by<10>() + digit;
+        if (UNLIKELY(next.value() > UINT32_MAX))
             return core::make_unexpected(Error::make(ERANGE, Error::Source::HttpParser));
-        val = static_cast<u32>(static_cast<i64>(val) * 10 + d);
+        val = static_cast<u32>(next.value());
     }
     return val;
 }

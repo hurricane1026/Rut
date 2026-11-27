@@ -108,7 +108,7 @@ def main():
             probe.unlink()
         for before, after in [
             ("raw_offset > capacity", "static_cast<u32>(raw_offset) > capacity"),
-            ("if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;",
+            ("if (add_overflow(kOffset, count, &kEnd)) return false;",
              "kEnd = kOffset + count;"),
             ("if (kEnd > capacity) return false;", "if (kEnd >= capacity) return false;"),
             ("if (kEnd > node_dirty) node_dirty = kEnd;", "node_dirty = kEnd;"),
@@ -273,9 +273,10 @@ def main():
         header = "rut/runtime/response_read_timer.h"
         check(compiler, root, overlay, source=runtime)
         for before, after in [
-            ("const u64 kMillis = rounded;",
-             "const u64 kMillis = (remaining + 999'999) / 1'000'000;"),
-            ("const u64 kMillis = rounded;", "const u64 kMillis = remaining / 1'000'000;"),
+            ("(bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64()",
+             "(kRounded + 1'000'000) / 1'000'000"),
+            ("(bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64()",
+             "(kRounded + 1) / 1'000'000"),
             ("kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis)", "static_cast<u32>(kMillis)"),
             ("now_ns >= deadline", "now_ns > deadline"),
             ("last_progress_ns == 0 || ", ""),

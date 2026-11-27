@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/integer_conversion.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
@@ -673,10 +674,9 @@ public:
     u8 health_probe_backend_cursor[RouteConfig::kMaxUpstreams]{};
     static u64 deadline_after(u64 now, u32 interval_ms) {
         u64 delay = 0;
-        if (__builtin_mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay))
-            return UINT64_MAX;
+        if (mul_overflow(static_cast<u64>(interval_ms), u64{1'000'000}, &delay)) return UINT64_MAX;
         u64 deadline = 0;
-        if (__builtin_add_overflow(now, delay, &deadline)) return UINT64_MAX;
+        if (add_overflow(now, delay, &deadline)) return UINT64_MAX;
         return deadline;
     }
     const RouteConfig* health_armed_config = nullptr;
@@ -1120,7 +1120,7 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 } else {
                     u64 deadline = 0;
-                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                    if (add_overflow(start, static_cast<u64>(period), &deadline))
                         deadline = UINT64_MAX;
                     if (monotonic_secs() < deadline) continue;
                     force_close_all();
@@ -1173,16 +1173,16 @@ public:
     void epoch_enter() {
         if (epoch) {
             u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
             u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }

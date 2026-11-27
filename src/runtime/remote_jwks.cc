@@ -1,5 +1,6 @@
 #include "rut/runtime/remote_jwks.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/platform/socket.h"
 #include <new>
@@ -361,10 +362,9 @@ bool jwks_observe_time(u64& previous_ms, u64 now_ms) {
 
 u64 jwks_refresh_deadline(u64 completed_ms, u32 interval_seconds) {
     u64 interval_ms = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(interval_seconds), u64{1000}, &interval_ms))
-        return ~u64{0};
+    if (mul_overflow(static_cast<u64>(interval_seconds), u64{1000}, &interval_ms)) return ~u64{0};
     u64 deadline = 0;
-    return __builtin_add_overflow(completed_ms, interval_ms, &deadline) ? ~u64{0} : deadline;
+    return add_overflow(completed_ms, interval_ms, &deadline) ? ~u64{0} : deadline;
 }
 
 u32 JwksRetry::failure(const RemoteJwks& policy, u32 server_hint) {
@@ -438,10 +438,9 @@ u32 jwks_response_retry_after(const ParsedResponse& response, u32 cap_seconds) {
 bool jwks_cache_fresh(u64 now, u64 last_success, u32 max_age_seconds) {
     if (!now || !last_success || now < last_success) return false;
     u64 max_age_ms = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(max_age_seconds), u64{1000}, &max_age_ms))
-        return false;
+    if (mul_overflow(static_cast<u64>(max_age_seconds), u64{1000}, &max_age_ms)) return false;
     u64 age = 0;
-    return !__builtin_sub_overflow(now, last_success, &age) && age < max_age_ms;
+    return !sub_overflow(now, last_success, &age) && age < max_age_ms;
 }
 
 namespace {
@@ -778,14 +777,14 @@ bool JwksFetch::start_http(HttpsFetch& fetch, u64 now) {
     }
     u64 elapsed = 0;
     u32 stage_timeout;
-    if (__builtin_sub_overflow(now, started_, &elapsed) ||
-        __builtin_sub_overflow(timeout_, elapsed, &stage_timeout) || stage_timeout == 0)
+    if (sub_overflow(now, started_, &elapsed) || sub_overflow(timeout_, elapsed, &stage_timeout) ||
+        stage_timeout == 0)
         return fail();
     u64 discovery_timeout_wide = 0;
     u32 kDiscoveryTimeout = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
-                               u64{1000},
-                               &discovery_timeout_wide) ||
+    if (mul_overflow(static_cast<u64>(configuration_.discovery_timeout_seconds),
+                     u64{1000},
+                     &discovery_timeout_wide) ||
         discovery_timeout_wide > UINT32_MAX)
         kDiscoveryTimeout = UINT32_MAX;
     else
@@ -1132,7 +1131,7 @@ void JwksFetch::advance(u64 now) {
         return;
     }
     u64 elapsed = 0;
-    if (__builtin_sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) {
+    if (sub_overflow(now, started_, &elapsed) || elapsed >= timeout_) {
         (void)fail();
         return;
     }
@@ -1141,9 +1140,9 @@ void JwksFetch::advance(u64 now) {
     if (kDnsActive) {
         u64 dns_timeout_wide = 0;
         u32 kDnsTimeout = 0;
-        if (__builtin_mul_overflow(static_cast<u64>(configuration_.dns_timeout_seconds),
-                                   u64{1000},
-                                   &dns_timeout_wide) ||
+        if (mul_overflow(static_cast<u64>(configuration_.dns_timeout_seconds),
+                         u64{1000},
+                         &dns_timeout_wide) ||
             dns_timeout_wide > UINT32_MAX)
             kDnsTimeout = UINT32_MAX;
         else

@@ -1,3 +1,4 @@
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
@@ -328,14 +329,14 @@ void capture_request_metadata(Connection& conn) {
         uintptr_t target_end = 0;
         const bool target_address_range_valid =
             base_address >= 4096 &&
-            !__builtin_add_overflow(base_address, static_cast<uintptr_t>(kLen), &target_end) &&
+            !add_overflow(base_address, static_cast<uintptr_t>(kLen), &target_end) &&
             target_address >= base_address && target_address <= target_end;
         if (target_address_range_valid) {
             uintptr_t offset_ptr = 0;
-            if (__builtin_sub_overflow(target_address, base_address, &offset_ptr)) return;
+            if (sub_overflow(target_address, base_address, &offset_ptr)) return;
             const u64 offset = offset_ptr;
             u64 end = 0;
-            if (__builtin_add_overflow(offset, static_cast<u64>(req.path.len), &end)) return;
+            if (add_overflow(offset, static_cast<u64>(req.path.len), &end)) return;
             if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
                 data[static_cast<u32>(offset)] == '/' && req.path_canon.ptr != nullptr) {
                 raw_target_offset = static_cast<u32>(offset);
@@ -1116,7 +1117,7 @@ bool format_response_with_body_and_headers(Connection& conn,
     u64 needed = 0;
     bool needed_overflow = false;
     auto add_needed = [&](u64 value) {
-        if (!needed_overflow) needed_overflow = __builtin_add_overflow(needed, value, &needed);
+        if (!needed_overflow) needed_overflow = add_overflow(needed, value, &needed);
     };
     add_needed(kStatusLineFixed);
     add_needed(reason_len);

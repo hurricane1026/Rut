@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/error.h"
@@ -160,7 +161,8 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
     }
     if (last != nullptr) {
         u32 next = 0;
-        (void)__builtin_add_overflow(last->gen, u32{1}, &next);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(last->gen, u32{1}, &next);
         *last = {fd, events, ev.data.u64, next};
     }
     return 0;

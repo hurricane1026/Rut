@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/runtime/http_parser.h"
 #include <cstddef>
@@ -116,10 +117,10 @@ inline bool access_log_header_view_in_bounds(Str view,
         return false;
     const uintptr_t begin = reinterpret_cast<uintptr_t>(receive_data);
     uintptr_t end = 0;
-    if (__builtin_add_overflow(begin, static_cast<uintptr_t>(header_end), &end)) return false;
+    if (add_overflow(begin, static_cast<uintptr_t>(header_end), &end)) return false;
     const uintptr_t address = reinterpret_cast<uintptr_t>(view.ptr);
     uintptr_t remaining = 0;
-    if (address < begin || address > end || __builtin_sub_overflow(end, address, &remaining) ||
+    if (address < begin || address > end || sub_overflow(end, address, &remaining) ||
         static_cast<uintptr_t>(view.len) > remaining)
         return false;
     return true;

@@ -162,14 +162,9 @@ bool parse_http_date(Str value, u64& seconds) {
 
 bool fresh_enough(u64 timestamp, i64 now) {
     if (now <= 0) return false;
-    const u64 kCurrent = static_cast<u64>(now);
-    u64 delta = 0;
-    if (timestamp > kCurrent) {
-        (void)__builtin_sub_overflow(timestamp, kCurrent, &delta);
-    } else {
-        (void)__builtin_sub_overflow(kCurrent, timestamp, &delta);
-    }
-    return delta <= 300;
+    // RUT_INTEGER_RANGE: the untrusted timestamp can use the full u64 range.
+    const auto kDelta = __int128_t{timestamp} - __int128_t{now};
+    return kDelta >= -300 && kDelta <= 300;
 }
 
 bool matches_canonical_base64(Str value, const u8* bytes, u32 length) {

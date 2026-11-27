@@ -2,6 +2,8 @@
 
 // Included after the bounded exchange pumps. An H1 downstream has one virtual
 // stream in its metadata owner; the physical socket remains an H1/TLS socket.
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/callbacks.h"
 
 namespace rut {
@@ -19,10 +21,9 @@ inline u32 h1ws_h2_response(Connection& c,
     u32 used = 0;
     auto put = [&](Str value) {
         u32 available = 0;
-        if (__builtin_sub_overflow(capacity, used, &available) || value.len > available)
-            return false;
+        if (sub_overflow(capacity, used, &available) || value.len > available) return false;
         __builtin_memcpy(output + static_cast<i64>(used), value.ptr, value.len);
-        (void)__builtin_add_overflow(used, value.len, &used);
+        used = static_cast<u32>((range_int(used) + range_int(value.len)).value());
         return true;
     };
     Str status{};
@@ -59,7 +60,7 @@ void h1ws_h2_complete_http(Loop* loop, Connection& c, GrpcExchange& x) {
         c.downstream_req_size = c.req_size =
             c.ws_client_header_len ? c.ws_client_header_len : c.req_header_end;
         u64 kBytes = 0;
-        if (__builtin_add_overflow(x.response_headers_len, x.staged_response_bytes, &kBytes))
+        if (add_overflow(x.response_headers_len, x.staged_response_bytes, &kBytes))
             kBytes = UINT64_MAX;
         on_request_complete(
             loop, c, c.resp_status, kBytes > 0xffffffffu ? 0xffffffffu : static_cast<u32>(kBytes));
@@ -71,15 +72,14 @@ void h1ws_h2_sent(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     u32 remaining = 0;
     const u32 sent = ev.result > 0 ? static_cast<u32>(ev.result) : 0;
-    if (ev.result <= 0 || __builtin_sub_overflow(c.send_buf.len(), c.send_progress, &remaining) ||
+    if (ev.result <= 0 || sub_overflow(c.send_buf.len(), c.send_progress, &remaining) ||
         sent > remaining) {
         loop->close_conn(c);
         return;
     }
-    (void)__builtin_add_overflow(c.send_progress, sent, &c.send_progress);
+    c.send_progress = static_cast<u32>((range_int(c.send_progress) + range_int(sent)).value());
     if (c.send_progress < c.send_buf.len()) {
-        u32 pending = 0;
-        (void)__builtin_sub_overflow(remaining, sent, &pending);
+        const u32 pending = static_cast<u32>((range_int(remaining) - range_int(sent)).value());
         if (!client_send(loop, c, c.send_buf.data() + static_cast<i64>(c.send_progress), pending))
             loop->close_conn(c);
         return;
@@ -152,10 +152,13 @@ void h1ws_h2_drive(Loop* loop, Connection& c) {
         const u8* output = grpc_output(*x, false, &length);
         if (length) {
             const u32 kAmount = length < c.send_buf.capacity() ? length : c.send_buf.capacity();
+            if (!grpc_count_bytes(&x->staged_response_bytes, kAmount)) {
+                g.busy = false;
+                loop->close_conn(c);
+                return;
+            }
             c.send_buf.write(output, kAmount);
             grpc_consume_output(*x, false, kAmount);
-            (void)__builtin_add_overflow(
-                x->staged_response_bytes, static_cast<u64>(kAmount), &x->staged_response_bytes);
         } else if (!x->download_len && x->response_end && !x->response_end_sent) {
             if (!x->ws_accepted) {
                 h1ws_h2_complete_http(loop, c, *x);
@@ -215,9 +218,14 @@ void h1ws_h2_received(void* lp, Connection& c, IoEvent ev) {
         loop->close_conn(c);
         return;
     }
+    constexpr i64 kCapacity = sizeof(x->upload);
+    const auto kAvailable = range_int<kCapacity, kCapacity + 1>{} - range_int(x->upload_len);
+    if (kAvailable.value() < 0) {
+        loop->close_conn(c);
+        return;
+    }
     g.busy = true;
-    u32 length = 0;
-    (void)__builtin_sub_overflow(static_cast<u32>(sizeof(x->upload)), x->upload_len, &length);
+    u32 length = static_cast<u32>(kAvailable.value());
     if (length > c.recv_buf.len()) length = c.recv_buf.len();
     if (length) {
         const bool kEnd = g.websocket_http1_eof && length == c.recv_buf.len();
@@ -270,8 +278,7 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
         while (start < header.value.len) {
             u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') ++end;
-            u32 token_len = 0;
-            (void)__builtin_sub_overflow(end, start, &token_len);
+            const u32 token_len = static_cast<u32>((range_int(end) - range_int(start)).value());
             Str token{header.value.ptr + static_cast<i64>(start), token_len};
             while (token.len && (token.ptr[0] == ' ' || token.ptr[0] == '\t')) {
                 ++token.ptr;
@@ -283,7 +290,8 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
                 --token.len;
             }
             if (http_header_name_eq_ci(name.ptr, name.len, token.ptr, token.len)) return true;
-            (void)__builtin_add_overflow(end, 1u, &start);
+            if (end == header.value.len) break;
+            start = static_cast<u32>((range_int(end) + range_int<1, 2>{}).value());
         }
     }
     return false;
@@ -364,7 +372,7 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
             if (h1ws_h2_hop_header(request, h.name)) continue;
             u32 available = 0;
             if (n == Http2Conn::kMaxHeadersPerReq ||
-                __builtin_sub_overflow(static_cast<u32>(sizeof(names)), used, &available) ||
+                sub_overflow(static_cast<u32>(sizeof(names)), used, &available) ||
                 h.name.len > available) {
                 reject(400);
                 return true;
@@ -375,7 +383,7 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
                     kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
             }
             hs[n++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
-            (void)__builtin_add_overflow(used, h.name.len, &used);
+            used = static_cast<u32>((range_int(used) + range_int(h.name.len)).value());
         }
         ParsedRequest translated{};
         Str protocol{};

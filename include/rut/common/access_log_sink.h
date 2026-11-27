@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include <type_traits>
 
@@ -38,10 +39,11 @@ struct AccessLogSinkSpec {
 static_assert(sizeof(AccessLogSinkSpec::path) == 256u);
 
 inline bool access_log_sink_path_valid(Str path) {
-    u32 last = 0;
     if (path.ptr == nullptr || path.len < 2u || path.len > kAccessLogSinkPathMax ||
-        path.ptr[0] != '/' || __builtin_sub_overflow(path.len, 1u, &last) || path.ptr[last] == '/')
+        path.ptr[0] != '/')
         return false;
+    const auto kLast = range_int(path.len) - range_int<1, 2>{};
+    if (path.ptr[kLast.value()] == '/') return false;
     if (path.eq({"/dev/stderr", 11u})) return false;
 
     u32 segment_start = 1u;
@@ -55,13 +57,13 @@ inline bool access_log_sink_path_valid(Str path) {
             if (c != '/') continue;
         }
 
-        u32 segment_len = 0;
-        (void)__builtin_sub_overflow(i, segment_start, &segment_len);
-        if (segment_len == 0u || (segment_len == 1u && path.ptr[segment_start] == '.') ||
-            (segment_len == 2u && path.ptr[segment_start] == '.' &&
+        const auto kSegmentLength = (range_int(i) - range_int(segment_start)).value();
+        if (kSegmentLength == 0 || (kSegmentLength == 1 && path.ptr[segment_start] == '.') ||
+            (kSegmentLength == 2 && path.ptr[segment_start] == '.' &&
              path.ptr[static_cast<i64>(segment_start) + 1] == '.'))
             return false;
-        (void)__builtin_add_overflow(i, 1u, &segment_start);
+        // i <= path.len, which is bounded by the validated path capacity.
+        segment_start = static_cast<u32>((range_int(i) + range_int<1, 2>{}).value());
     }
     return true;
 }
@@ -81,9 +83,8 @@ inline bool access_log_sink_spec_valid(const AccessLogSinkSpec& spec) {
         spec.path_len > kAccessLogSinkPathMax || spec.path[spec.path_len] != '\0')
         return false;
     if (!access_log_sink_path_valid({spec.path, spec.path_len})) return false;
-    u32 tail = 0;
-    (void)__builtin_add_overflow(spec.path_len, 1u, &tail);
-    for (u32 i = tail; i < sizeof(spec.path); i++)
+    const auto kTail = range_int(spec.path_len) + range_int<1, 2>{};
+    for (i64 i = kTail.value(); i < static_cast<i64>(sizeof(spec.path)); i++)
         if (spec.path[i] != '\0') return false;
     return true;
 }

@@ -1,4 +1,5 @@
 #pragma once
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
@@ -45,7 +46,7 @@ struct BufferedSendVector {
                second_source == parts[1].iov_base && total_size == total &&
                message.msg_iov == parts && message.msg_iovlen == 2 && parts[0].iov_base == first &&
                parts[0].iov_len != 0 && parts[1].iov_base != nullptr && parts[1].iov_len != 0 &&
-               !__builtin_sub_overflow(total, parts[0].iov_len, &second_size) &&
+               !sub_overflow(total, parts[0].iov_len, &second_size) &&
                parts[1].iov_len == second_size;
     }
     [[nodiscard]] constexpr bool advance(u32 n) {
@@ -59,8 +60,8 @@ struct BufferedSendVector {
                        : static_cast<u32>((range_int(total_size) - range_int(first_size)).value());
             size_t remaining;
             u32 offset;
-            if (__builtin_sub_overflow(part.iov_len, kStep, &remaining) ||
-                __builtin_sub_overflow(kSize, remaining, &offset))
+            if (sub_overflow(part.iov_len, kStep, &remaining) ||
+                sub_overflow(kSize, remaining, &offset))
                 return false;
             part.iov_len = remaining;
             part.iov_base = const_cast<u8*>(source + range_int(offset).value());

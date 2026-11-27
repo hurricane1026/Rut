@@ -3,6 +3,8 @@
 // HTTP/2 WebSocket transport adapters. Included after the shared bounded
 // exchange pump. HTTP/1 upstreams own a dedicated Connection and its ordinary
 // send slice, so cancellation never frees bytes referenced by kernel I/O.
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/chunked_parser.h"
 
 #include <sys/socket.h>
@@ -187,13 +189,14 @@ inline bool h2ws_h1_response_headers(Connection& c,
                 while (last > start && (connection.value.ptr[static_cast<i64>(last) - 1] == ' ' ||
                                         connection.value.ptr[static_cast<i64>(last) - 1] == '\t'))
                     --last;
-                u32 token_len = 0;
-                (void)__builtin_sub_overflow(last, start, &token_len);
+                const u32 token_len =
+                    static_cast<u32>((range_int(last) - range_int(start)).value());
                 nominated |= http_header_name_eq_ci(h.name.ptr,
                                                     h.name.len,
                                                     connection.value.ptr + static_cast<i64>(start),
                                                     token_len);
-                (void)__builtin_add_overflow(end, 1u, &start);
+                if (end == connection.value.len) break;
+                start = static_cast<u32>((range_int(end) + range_int<1, 2>{}).value());
             }
         }
         if (nominated && kUpgraded &&
@@ -202,8 +205,8 @@ inline bool h2ws_h1_response_headers(Connection& c,
             return false;
         if (nominated) continue;
         u32 available = 0;
-        if (*count >= Http2Conn::kMaxHeadersPerReq ||
-            __builtin_sub_overflow(capacity, used, &available) || h.name.len > available)
+        if (*count >= Http2Conn::kMaxHeadersPerReq || sub_overflow(capacity, used, &available) ||
+            h.name.len > available)
             return false;
         for (u32 j = 0; j < h.name.len; ++j) {
             const char kCh = h.name.ptr[j];
@@ -211,7 +214,7 @@ inline bool h2ws_h1_response_headers(Connection& c,
                 kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
         }
         headers[(*count)++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
-        (void)__builtin_add_overflow(used, h.name.len, &used);
+        used = static_cast<u32>((range_int(used) + range_int(h.name.len)).value());
     }
     if (!kUpgraded) {
         c.resp_body_mode = response.status_code == 304   ? BodyMode::None
@@ -302,15 +305,17 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
     }
     while (g.websocket_http1_headers && !x->response_end && c.recv_buf.len() &&
            x->download_len < sizeof(x->download)) {
-        u32 n = 0;
-        (void)__builtin_sub_overflow(static_cast<u32>(sizeof(x->download)), x->download_len, &n);
+        constexpr i64 kCapacity = sizeof(x->download);
+        const auto kAvailable = range_int<kCapacity, kCapacity + 1>{} - range_int(x->download_len);
+        u32 n = static_cast<u32>(kAvailable.value());
         if (n > c.recv_buf.len()) n = c.recv_buf.len();
         u32 consumed = n, start = 0, produced = n;
         if (!x->ws_accepted) {
             if (c.resp_body_mode == BodyMode::ContentLength) {
                 if (n > c.resp_body_remaining) n = c.resp_body_remaining;
                 consumed = produced = n;
-                (void)__builtin_sub_overflow(c.resp_body_remaining, n, &c.resp_body_remaining);
+                c.resp_body_remaining =
+                    static_cast<u32>((range_int(c.resp_body_remaining) - range_int(n)).value());
             } else if (c.resp_body_mode == BodyMode::Chunked) {
                 const auto kResult =
                     c.resp_chunk_parser.feed(c.recv_buf.data(), n, &consumed, &start, &produced);
@@ -329,7 +334,8 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
             __builtin_memcpy(x->download + static_cast<i64>(x->download_len),
                              c.recv_buf.data() + static_cast<i64>(start),
                              produced);
-        (void)__builtin_add_overflow(x->download_len, produced, &x->download_len);
+        x->download_len =
+            static_cast<u32>((range_int(x->download_len) + range_int(produced)).value());
         if (x->ws && x->ws_accepted && !ws_h2_process(*x, false)) x->failure = 13;
         c.consume_request_receive_buffer(consumed);
         if (!x->ws_accepted && c.resp_body_mode == BodyMode::ContentLength &&

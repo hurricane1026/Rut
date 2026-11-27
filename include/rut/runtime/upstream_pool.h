@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/route_table.h"
@@ -128,11 +129,10 @@ struct UpstreamPool {
         for (u32 i = idle_head; i != kNoSlot;) {
             const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
-            u32 idle = 0;
-            (void)__builtin_sub_overflow(now_sec, static_cast<u32>(c.parked_time), &idle);
+            const u32 idle = wrapping_sub(now_sec, static_cast<u32>(c.parked_time));
             u64 idle_us = 0;
             if (idle_timeout_configured
-                    ? !__builtin_sub_overflow(now_us, c.parked_time, &idle_us) &&
+                    ? !sub_overflow(now_us, c.parked_time, &idle_us) &&
                           idle_us >= static_cast<u64>(max_idle_sec) * 1000000u
                     : idle >= max_idle_sec) {
                 ::close(c.fd);

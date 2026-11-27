@@ -1,5 +1,6 @@
 #include "rut/runtime/ws_terminate.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/common/utf8.h"
@@ -410,7 +411,7 @@ namespace {
     u8 hdr[kWsMaxHeaderSize];
     u32 output_len;
     const auto decoration_len = range_int(prefix.len) + range_int(suffix.len);
-    if (__builtin_add_overflow(len, decoration_len.value(), &output_len)) return false;
+    if (add_overflow(len, decoration_len.value(), &output_len)) return false;
     const u32 payload_len = static_cast<u32>(len);
     const u32 kHeaderLength =
         ws_write_header(hdr, op, /*fin=*/true, masked, key, output_len, compressed);
@@ -447,7 +448,7 @@ namespace {
                                             u32 scratch_capacity) {
     if (!st.encoder || *produced == begin) return true;
     u32 frame_len;
-    if (__builtin_sub_overflow(*produced, begin, &frame_len)) return false;
+    if (sub_overflow(*produced, begin, &frame_len)) return false;
     WsFrameHeader header{};
     if (ws_parse_header(out + range_int(begin).value(), frame_len, st.masked, &header) !=
             ParseStatus::Complete ||
@@ -730,7 +731,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if (kCompressed) {
                 u32 remaining_wire;
                 if (!st.decoder ||
-                    __builtin_sub_overflow(
+                    sub_overflow(
                         ws_deflate_wire_limit(kDecodedLimit), h.payload_len, &remaining_wire) ||
                     st.assembler.accumulated_len > remaining_wire)
                     return WsInspectStatus::Error;
@@ -746,7 +747,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // Control payloads are small and processed whole; data payloads can span reads.
         const u32 header_len = st.partial_data_frame ? 0 : h.header_len;
         u32 remain;
-        if (__builtin_sub_overflow(h.payload_len, st.partial_payload_len, &remain))
+        if (sub_overflow(h.payload_len, st.partial_payload_len, &remain))
             return WsInspectStatus::Error;
         const auto frame_size = range_int(header_len) + range_int(remain);
         const i64 frame_total = frame_size.value();
@@ -757,8 +758,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // frame and the assembler state untouched for the next call.
         if (*produced != 0) {
             u32 available_output;
-            if (__builtin_sub_overflow(out_cap, *produced, &available_output))
-                return WsInspectStatus::Error;
+            if (sub_overflow(out_cap, *produced, &available_output)) return WsInspectStatus::Error;
             if (ws_opcode_is_control(h.opcode)) {
                 if (frame_total > available_output) break;
             } else if (h.fin) {
@@ -794,7 +794,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                     (range_int<2, 3>::constant<2>() + range_int(reason_size)).to_u64();
                 if (reason_size != 0 && close_size > data_size) data_size = close_size;
                 u64 needed;
-                if (__builtin_add_overflow(data_size, kWsMaxHeaderSize, &needed))
+                if (add_overflow(data_size, kWsMaxHeaderSize, &needed))
                     return WsInspectStatus::Error;
                 if (needed > available_output) break;
             }
@@ -976,7 +976,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
             u32 output_size;
             const auto decoration_len =
                 range_int(rewrite.prefix.len) + range_int(rewrite.suffix.len);
-            if (__builtin_add_overflow(kPayloadSize, decoration_len.value(), &output_size) ||
+            if (add_overflow(kPayloadSize, decoration_len.value(), &output_size) ||
                 rewrite.source == WsTextSource::Dynamic ||
                 !ws_valid_text_rewrite(rewrite, st.max_message_size) ||
                 (rewrite.source == WsTextSource::MessageText && !utf8_valid(msg_buf, total)) ||
@@ -1178,13 +1178,13 @@ WsClosingRead ws_read_closing(
         const u32 kLimit = kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : kDecodedLimit;
         u32 remaining_wire;
         if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
-            __builtin_sub_overflow(kLimit, header.payload_len, &remaining_wire) ||
+            sub_overflow(kLimit, header.payload_len, &remaining_wire) ||
             st.assembler.accumulated_len > remaining_wire)
             return WsClosingRead::Error;
         st.compressed_message = kCompressed;
         const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
         u32 remaining;
-        if (__builtin_sub_overflow(header.payload_len, st.partial_payload_len, &remaining))
+        if (sub_overflow(header.payload_len, st.partial_payload_len, &remaining))
             return WsClosingRead::Error;
         const u32 kAvailablePayload =
             static_cast<u32>(static_cast<i64>(kAvailable) - static_cast<i64>(kHeaderLen));

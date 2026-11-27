@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -8,7 +10,8 @@ struct ConnectionBase;              // forward decl
 using Connection = ConnectionBase;  // alias (matches connection.h)
 
 constexpr u32 timer_seconds_from_ms(u32 ms) {
-    return static_cast<u32>((static_cast<i64>(ms) + 999) / 1000);
+    const auto kRounded = range_int(ms) + range_int<999, 1000>{};
+    return static_cast<u32>(kRounded.value() / 1000);
 }
 
 // Timer wheel — O(1) add, refresh, tick.
@@ -35,14 +38,14 @@ struct TimerWheel {
     enum class Tick : u32 {};
     Tick cursor;  // Absolute tick modulo 2^32. Only its low bits select a slot.
 
-    // Tick is a modular timestamp. Widen before each step, then select the low 32 bits.
+    // Tick is a modular timestamp. Advancement and elapsed ticks follow the same rollover.
     friend constexpr Tick& operator++(Tick& t) {
-        t = Tick{static_cast<u32>(static_cast<i64>(t) + 1)};
+        t = Tick{wrapping_add(static_cast<u32>(t), u32{1})};
         return t;
     }
 
     friend constexpr Tick& operator--(Tick& t) {
-        t = Tick{static_cast<u32>(static_cast<i64>(t) - 1)};
+        t = Tick{wrapping_sub(static_cast<u32>(t), u32{1})};
         return t;
     }
 
@@ -59,9 +62,7 @@ struct TimerWheel {
     }
 
     constexpr Tick tick_after(u32 seconds) const {
-        u32 result;
-        (void)__builtin_add_overflow(static_cast<u32>(cursor), seconds, &result);
-        return Tick{result};
+        return Tick{wrapping_add(static_cast<u32>(cursor), seconds)};
     }
 
     constexpr u32 slot_after(u32 seconds) const {
@@ -70,14 +71,12 @@ struct TimerWheel {
 
     // Elapsed ticks for intervals shorter than one complete 32-bit cycle.
     static constexpr u32 elapsed_ticks(Tick start, Tick now) {
-        u32 result;
-        (void)__builtin_sub_overflow(static_cast<u32>(now), static_cast<u32>(start), &result);
-        return result;
+        return wrapping_sub(static_cast<u32>(now), static_cast<u32>(start));
     }
 
     static constexpr u32 remaining_ticks(u32 timeout, u32 elapsed) {
-        u32 remaining;
-        return __builtin_sub_overflow(timeout, elapsed, &remaining) ? 0 : remaining;
+        if (elapsed >= timeout) return 0;
+        return static_cast<u32>((range_int(timeout) - range_int(elapsed)).value());
     }
 
     void init() {

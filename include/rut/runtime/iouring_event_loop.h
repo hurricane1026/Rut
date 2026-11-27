@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
@@ -154,7 +155,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
 
     void study_note_first_response(const Connection& c, u64 now_us) {
         u64 request_age = 0;
-        if (c.req_start_us == 0 || __builtin_sub_overflow(now_us, c.req_start_us, &request_age) ||
+        if (c.req_start_us == 0 || sub_overflow(now_us, c.req_start_us, &request_age) ||
             request_age > 60ull * 1000000u)
             return;
         u32 rng = study_phase_rng;
@@ -166,7 +167,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         auto& slot = study_request_slots[c.id & 127u];
         if (slot.req_us != 0 && slot.conn_id != c.id) {
             u64 slot_age = 0;
-            if (!__builtin_sub_overflow(now_us, slot.req_us, &slot_age) && slot_age < 1000000u) {
+            if (!sub_overflow(now_us, slot.req_us, &slot_age) && slot_age < 1000000u) {
                 ++study_small_phase_drops;
                 return;
             }
@@ -196,11 +197,11 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         u64 first_phase_us = 0;
         u64 final_phase_us = 0;
         u64 queue_phase_us = 0;
-        if (__builtin_sub_overflow(now, snapshot.first_us, &final_phase_us) ||
-            __builtin_sub_overflow(snapshot.first_us, snapshot.req_us, &first_phase_us) ||
+        if (sub_overflow(now, snapshot.first_us, &final_phase_us) ||
+            sub_overflow(snapshot.first_us, snapshot.req_us, &first_phase_us) ||
             first_phase_us < snapshot.upstream_us ||
-            __builtin_sub_overflow(first_phase_us, snapshot.upstream_us, &queue_phase_us) ||
-            __builtin_sub_overflow(now, snapshot.req_us, &total_us))
+            sub_overflow(first_phase_us, snapshot.upstream_us, &queue_phase_us) ||
+            sub_overflow(now, snapshot.req_us, &total_us))
             return;
         const u64 phases[4] = {total_us, queue_phase_us, snapshot.upstream_us, final_phase_us};
         ++study_small_phase_samples;
@@ -212,7 +213,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
                 ++bin;
             }
             ++study_small_phase_hist[k][bin];
-            __builtin_add_overflow(
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(
                 study_small_phase_sum_us[k], phases[k], &study_small_phase_sum_us[k]);
             if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
         }
@@ -245,7 +247,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
             ++bin;
         }
         ++study_wait_hist[kind][bin];
-        __builtin_add_overflow(study_wait_sum_ns[kind], ns, &study_wait_sum_ns[kind]);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(study_wait_sum_ns[kind], ns, &study_wait_sum_ns[kind]);
         if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
     }
     void study_record_syscall(u32 kind, u64 ns) {
@@ -800,7 +803,7 @@ public:
                 u32 period = drain_period_.load(std::memory_order_relaxed);
                 u64 deadline = 0;
                 const bool deadline_overflow =
-                    __builtin_add_overflow(start, static_cast<u64>(period), &deadline);
+                    add_overflow(start, static_cast<u64>(period), &deadline);
                 if (active_count() == 0) {
                     running_.store(false, std::memory_order_relaxed);
                 } else if (deadline_overflow || monotonic_secs() >= deadline) {
@@ -892,14 +895,16 @@ public:
     void epoch_enter() {
         if (epoch) {
             u64 next = 0;
-            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
             u64 next = 0;
-            __builtin_add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -4296,7 +4301,7 @@ public:
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
                     u64 ordinary_wait_ns = 0;
-                    if (__builtin_sub_overflow(now, ordinary_since_ns, &ordinary_wait_ns)) break;
+                    if (sub_overflow(now, ordinary_since_ns, &ordinary_wait_ns)) break;
                     if (ordinary_wait_ns >= ordinary_cq_wait_limit_ns) {
                         ++study_relay_yields;
                         break;
@@ -4340,8 +4345,7 @@ public:
             }
             if (study_queue_started[c.id] != 0) {
                 u64 queue_wait_ns = 0;
-                if (!__builtin_sub_overflow(
-                        monotonic_ns(), study_queue_started[c.id], &queue_wait_ns))
+                if (!sub_overflow(monotonic_ns(), study_queue_started[c.id], &queue_wait_ns))
                     study_record_wait(2, queue_wait_ns);
                 study_queue_started[c.id] = 0;
             }
@@ -4359,11 +4363,12 @@ public:
         }
         const i64 relay_calls =
             static_cast<i64>(start_calls) - static_cast<i64>(relay_budget_calls);
-        __builtin_add_overflow(
-            study_relay_calls, static_cast<u64>(relay_calls), &study_relay_calls);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(study_relay_calls, static_cast<u64>(relay_calls), &study_relay_calls);
         u64 flush_phase_ns = 0;
-        if (!__builtin_sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
-            __builtin_add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
+        if (!sub_overflow(monotonic_ns(), phase_started, &flush_phase_ns))
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(study_flush_phase_ns, flush_phase_ns, &study_flush_phase_ns);
     }
 
     void clear_deferred_relay_read(u32 id) {
@@ -4511,7 +4516,7 @@ public:
             const int splice_errno = errno;
             if (sampled) {
                 u64 syscall_ns = 0;
-                if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+                if (!sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
                     study_record_syscall(0, syscall_ns);
             }
             errno = splice_errno;
@@ -4533,9 +4538,11 @@ public:
             }
             r.segment_len = static_cast<u32>(n);
             relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
-            __builtin_add_overflow(relay_pulled_bytes, static_cast<u64>(n), &relay_pulled_bytes);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(relay_pulled_bytes, static_cast<u64>(n), &relay_pulled_bytes);
             r.segment_sent = 0;
-            __builtin_add_overflow(r.body_bytes, static_cast<u64>(r.segment_len), &r.body_bytes);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(r.body_bytes, static_cast<u64>(r.segment_len), &r.body_bytes);
             c.resp_body_remaining = static_cast<u32>(static_cast<i64>(c.resp_body_remaining) -
                                                      static_cast<i64>(r.segment_len));
             refresh_relay_progress_timer(c);
@@ -4563,7 +4570,7 @@ public:
         const int splice_errno = errno;
         if (sampled) {
             u64 syscall_ns = 0;
-            if (!__builtin_sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
+            if (!sub_overflow(monotonic_ns(), syscall_start, &syscall_ns))
                 study_record_syscall(1, syscall_ns);
         }
         errno = splice_errno;
@@ -4580,11 +4587,13 @@ public:
         }
         r.segment_sent = static_cast<u32>(static_cast<i64>(r.segment_sent) + n);
         relay_budget_bytes = static_cast<u32>(static_cast<i64>(relay_budget_bytes) - n);
-        __builtin_add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(relay_written_bytes, static_cast<u64>(n), &relay_written_bytes);
         if (study_inside_cq)
-            __builtin_add_overflow(
-                study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
-        __builtin_add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(study_cq_splice_bytes, static_cast<u64>(n), &study_cq_splice_bytes);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)add_overflow(c.resp_body_sent, static_cast<u64>(n), &c.resp_body_sent);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
@@ -5301,8 +5310,8 @@ public:
                     return static_cast<u16>(static_cast<i64>(i) + 1);
             return 0;
         }
-        u32 hash = 0;
-        __builtin_mul_overflow(cid, 2654435761u, &hash);
+        // RUT_INTEGER_RANGE: multiplicative hash takes the low 32 bits.
+        const u32 hash = static_cast<u32>(__int128_t{cid} * 2654435761);
         u32 slot = hash & kResponseReadOwnerIndexMask;
         for (u32 probes = 0; probes < kResponseReadOwnerIndexSize; ++probes) {
             const u16 index = response_read_batch_owner_index[slot];
@@ -5318,8 +5327,8 @@ public:
         const u16 index = static_cast<u16>(++response_read_batch_owner_count);
         if (response_read_batch_owner_index_active) {
             const u32 cid = response_read_batch_owners[static_cast<i64>(index) - 1].conn_id;
-            u32 hash = 0;
-            __builtin_mul_overflow(cid, 2654435761u, &hash);
+            // RUT_INTEGER_RANGE: multiplicative hash takes the low 32 bits.
+            const u32 hash = static_cast<u32>(__int128_t{cid} * 2654435761);
             u32 slot = hash & kResponseReadOwnerIndexMask;
             while (response_read_batch_owner_index[slot] != 0)
                 slot = static_cast<u32>((static_cast<i64>(slot) + 1) & kResponseReadOwnerIndexMask);
@@ -5636,9 +5645,9 @@ public:
                         owner.expected_copy_end = ev.copy_end;
                         const u64 positive = static_cast<u64>(ev.result);
                         u64 total_positive = 0;
-                        if (__builtin_add_overflow(static_cast<u64>(owner.positive_bytes),
-                                                   positive,
-                                                   &total_positive) ||
+                        if (add_overflow(static_cast<u64>(owner.positive_bytes),
+                                         positive,
+                                         &total_positive) ||
                             total_positive > UINT32_MAX)
                             owner.bounded_terminal_custody_invalid = true;
                         else
@@ -7531,8 +7540,9 @@ public:
         }
         study_inside_cq = false;
         u64 cq_phase_ns = 0;
-        if (!__builtin_sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
-            __builtin_add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
+        if (!sub_overflow(monotonic_ns(), study_turn_started_ns, &cq_phase_ns))
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(study_cq_phase_ns, cq_phase_ns, &study_cq_phase_ns);
         resolve_response_body_idle_expiries();
         this->resolve_upstream_write_idle_expiries(slots_initialized);
         settle_response_read_deadline_batch();
@@ -7917,7 +7927,8 @@ public:
                                                  &close_send_cancel_owned);
             c.upstream_close_cancel_owned |= close_cancel_mask;
             c.response_read_deadline_send_close_cancel_owned |= close_send_cancel_owned;
-            __builtin_add_overflow(c.pending_ops, submitted, &c.pending_ops);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(c.pending_ops, submitted, &c.pending_ops);
         }
         if (c.fd >= 0) {
             ::close(c.fd);
@@ -8072,7 +8083,7 @@ public:
         else if (conn.yield_timeout_armed)
             return true;  // Reuse the existing kernel timespec owner.
         u64 rounded_ns = 0;
-        if (__builtin_add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
+        if (add_overflow(delay_ns, 999'999ull, &rounded_ns)) rounded_ns = UINT64_MAX;
         const u64 ms_wide = rounded_ns / 1'000'000ull;
         u32 ms = ms_wide > UINT32_MAX ? UINT32_MAX : static_cast<u32>(ms_wide);
         if (ms == 0) ms = 1;
@@ -8485,7 +8496,7 @@ public:
             // The time budget is checked after the node, so every tick makes progress.
             const u64 flush_cost = static_cast<u64>(idle_trim_nranges) * kIdleTrimFlushNsPerRange;
             u64 projected_deadline = 0;
-            if (__builtin_add_overflow(monotonic_ns(), flush_cost, &projected_deadline) ||
+            if (add_overflow(monotonic_ns(), flush_cost, &projected_deadline) ||
                 projected_deadline >= deadline_ns)
                 return false;
             if (at_end) return true;
@@ -8509,7 +8520,7 @@ public:
         const auto kWindow = idle_trim_window(static_cast<u32>(timer.cursor), keepalive_timeout);
         if (kWindow.begin == kWindow.end) return;
         u64 deadline_ns = 0;
-        if (__builtin_add_overflow(monotonic_ns(), idle_trim_budget_ns, &deadline_ns))
+        if (add_overflow(monotonic_ns(), idle_trim_budget_ns, &deadline_ns))
             deadline_ns = UINT64_MAX;
         u32 examined = 0;
         u32 queued = 0;
@@ -9317,7 +9328,7 @@ public:
                     study_poll_started[wait_kind][conn.id] = 0;
                     if (!cancel && started != 0) {
                         u64 wait_ns = 0;
-                        if (!__builtin_sub_overflow(monotonic_ns(), started, &wait_ns))
+                        if (!sub_overflow(monotonic_ns(), started, &wait_ns))
                             study_record_wait(wait_kind, wait_ns);
                     }
                     --conn.pending_ops;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/request_policy.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/connection_capacity.h"
@@ -153,8 +154,7 @@ inline bool complete_content_length_parse_u64(Str value, u32* position, u64* out
         if (byte < '0' || byte > '9') break;
         const u64 digit = static_cast<u64>(static_cast<i64>(byte) - static_cast<i64>('0'));
         u64 scaled = 0;
-        if (__builtin_mul_overflow(parsed, u64{10}, &scaled) ||
-            __builtin_add_overflow(scaled, digit, &parsed))
+        if (mul_overflow(parsed, u64{10}, &scaled) || add_overflow(scaled, digit, &parsed))
             return false;
         ++cursor;
     }
@@ -211,9 +211,8 @@ inline CompleteContentLengthResponseClassification classify_complete_content_len
         return {};
     u64 range_length = 0;
     u64 expected_length = static_cast<u64>(response.content_length);
-    if (__builtin_sub_overflow(classification.last, classification.first, &range_length) ||
-        __builtin_sub_overflow(expected_length, u64{1}, &expected_length) ||
-        range_length != expected_length)
+    if (sub_overflow(classification.last, classification.first, &range_length) ||
+        sub_overflow(expected_length, u64{1}, &expected_length) || range_length != expected_length)
         return {};
     classification.response_class = CompleteContentLengthResponseClass::CoherentSingleRange206;
     return classification;

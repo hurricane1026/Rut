@@ -1,5 +1,6 @@
 #include "rut/runtime/idle_trim_window.h"
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/timer_wheel.h"
 
@@ -18,12 +19,11 @@ consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
             static_cast<i64>(age) - static_cast<i64>(IdleTrimWindow::kMinIdleTicks) >=
                 static_cast<i64>(IdleTrimWindow::kAgeWindow))
             continue;
-        u32 kArmedAt;
-        (void)__builtin_sub_overflow(cursor, age, &kArmedAt);
-        u32 kExpected;
-        (void)__builtin_add_overflow(kArmedAt, timeout, &kExpected);
+        const auto kArmedAt = range_int(cursor) - range_int(age);
+        const auto kExpiry = kArmedAt + range_int(timeout);
+        const u32 kExpected = static_cast<u32>(kExpiry.value());
         if (next == kWindow.end || next != kExpected) return false;
-        (void)__builtin_add_overflow(next, u32{1}, &next);
+        next = static_cast<u32>((range_int(next) + range_int<1, 2>{}).value());
     }
     return next == kWindow.end;
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 
 #include <time.h>
@@ -27,16 +28,16 @@ inline u64 monotonic_secs() {
 // needing a PRNG — cheap and good enough for drain distribution.
 inline bool should_drain_close(u32 conn_id, u64 drain_start, u64 now, u32 period_secs) {
     if (period_secs == 0) return true;
-    u64 elapsed = 0;
-    (void)__builtin_sub_overflow(now, drain_start, &elapsed);
-    if (elapsed >= period_secs) return true;
+    // RUT_INTEGER_RANGE: both monotonic timestamps may occupy the full u64 range.
+    const auto kElapsed = __int128_t{now} - __int128_t{drain_start};
+    if (kElapsed < 0 || kElapsed >= period_secs) return true;
 
     // Hash conn_id to get a pseudo-random threshold in [0, period_secs).
     // If threshold < elapsed, close this connection.
     // This gives ~(elapsed/period) fraction of connections closing each tick.
-    u32 hash = conn_id * 2654435761u;  // Knuth multiplicative hash
+    const u32 hash = wrapping_mul(conn_id, u32{2654435761u});
     u32 threshold = hash % period_secs;
-    return threshold < static_cast<u32>(elapsed);
+    return threshold < static_cast<u32>(kElapsed);
 }
 
 }  // namespace rut

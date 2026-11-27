@@ -1,5 +1,6 @@
 #include "rut/runtime/es256_policy.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/shard_limits.h"
 #include "rut/common/types.h"
 #include "rut/runtime/json.h"
@@ -306,7 +307,7 @@ bool Es256Policies::verify(u32 shard,
             u64 age = 0;
             if (!monotonic_ms || !remote->last_success || remote->empty ||
                 monotonic_ms < remote->last_success ||
-                __builtin_sub_overflow(monotonic_ms, remote->last_success, &age) ||
+                sub_overflow(monotonic_ms, remote->last_success, &age) ||
                 age >= static_cast<u64>(policies[i].remote().max_age_seconds) * 1000)
                 return false;
             if (remote->use_alternate) verifiers = &remote->alternate;

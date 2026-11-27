@@ -1,5 +1,7 @@
 #include "rut/runtime/access_log_live_writer.h"
 
+#include "rut/common/checked_arithmetic.h"
+
 #include <errno.h>
 #include <poll.h>
 #ifdef __APPLE__
@@ -141,8 +143,7 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
         }
         const u64 published = bindings[i].ring->published_pos.load(std::memory_order_acquire);
         const u64 committed = bindings[i].ring->committed_pos.load(std::memory_order_acquire);
-        u64 pending = 0;
-        (void)__builtin_sub_overflow(published, committed, &pending);
+        const u64 pending = wrapping_sub(published, committed);
         if (pending > LiveAccessLogRing::kCapacity)
             return core::make_unexpected(SourceLiveAccessLogStartError{
                 SourceLiveAccessLogStartErrorKind::InvalidRingState, static_cast<u8>(i), 0});

@@ -1,5 +1,6 @@
 #include "rut/runtime/response_body_chain.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
@@ -135,15 +136,14 @@ consteval bool direct_write_extent_contract() {
             u32 node_dirty = 6;
             u64 kOffset = 0;
             const bool kValid =
-                kAddress >= kBegin && !__builtin_sub_overflow(kAddress, kBegin, &kOffset) &&
+                kAddress >= kBegin && !sub_overflow(kAddress, kBegin, &kOffset) &&
                 kOffset <= kCapacity &&
                 kCount <= (range_int(kCapacity) - range_int(static_cast<u32>(kOffset))).value();
             if (detail::record_direct_write_extent(
                     kBegin, kAddress, kCapacity, kCount, tail_dirty, node_dirty) != kValid)
                 return false;
             u64 kEnd = 0;
-            if (kValid && __builtin_add_overflow(kOffset, static_cast<u64>(kCount), &kEnd))
-                return false;
+            if (kValid && add_overflow(kOffset, static_cast<u64>(kCount), &kEnd)) return false;
             if (tail_dirty != (kEnd > 2 ? kEnd : 2) || node_dirty != (kEnd > 6 ? kEnd : 6))
                 return false;
         }

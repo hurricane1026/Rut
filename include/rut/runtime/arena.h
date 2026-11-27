@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
@@ -34,7 +35,7 @@ struct MmapBackend {
         // Page-align
         if (size > static_cast<u64>(-1) - 4095) return nullptr;
         u64 aligned = 0;
-        if (__builtin_add_overflow(size, static_cast<u64>(4095), &aligned)) return nullptr;
+        if (add_overflow(size, static_cast<u64>(4095), &aligned)) return nullptr;
         size = aligned & ~static_cast<u64>(4095);
         void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
@@ -129,7 +130,7 @@ struct Arena {
             return p;
         }
         i64 needed;
-        if (__builtin_add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
+        if (add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
         // alloc_block releases undersized blocks before returning, so any returned block
         // has at least aligned_size bytes of payload.
         Block* b = alloc_block(needed, current);
@@ -218,7 +219,7 @@ private:
         b->size = block_size.value();
         b->used = 0;
         u64 next_total = 0;
-        if (__builtin_add_overflow(total_allocated, actual_size, &next_total)) {
+        if (add_overflow(total_allocated, actual_size, &next_total)) {
             backend.release(mem, actual_size);
             return nullptr;
         }

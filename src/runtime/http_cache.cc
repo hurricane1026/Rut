@@ -1,5 +1,6 @@
 #include "rut/runtime/http_cache.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/range_int.h"
 #include "rut/runtime/format_integer.h"
@@ -270,14 +271,14 @@ struct ResponseInfo {
     const u64 kLifetimeUs = range_int(ttl).scaled_by<1'000'000>().to_u64();
     const u64 kDateUs = static_cast<u64>(date) * 1000000;
     u64 kApparent = 0;
-    if (wall > kDateUs && __builtin_sub_overflow(wall, kDateUs, &kApparent)) return false;
+    if (wall > kDateUs && sub_overflow(wall, kDateUs, &kApparent)) return false;
     const u64 age_us = range_int(age).scaled_by<1'000'000>().to_u64();
     u64 max_delay = 0;
-    if (__builtin_sub_overflow(~u64{0}, age_us, &max_delay) || delay > max_delay) return false;
+    if (sub_overflow(~u64{0}, age_us, &max_delay) || delay > max_delay) return false;
     u64 kAge = 0;
-    if (__builtin_add_overflow(age_us, delay, &kAge)) return false;
+    if (add_overflow(age_us, delay, &kAge)) return false;
     const u64 kInitial = kApparent > kAge ? kApparent : kAge;
-    if (__builtin_sub_overflow(kLifetimeUs, kInitial, &info.remaining_us) || info.remaining_us == 0)
+    if (sub_overflow(kLifetimeUs, kInitial, &info.remaining_us) || info.remaining_us == 0)
         return false;
     info.age_us = kInitial;
     return true;
@@ -318,10 +319,9 @@ bool copy_response(const HttpCacheStorage::Record& entry,
             return false;
     }
     u64 elapsed = 0;
-    if (now >= entry.stored_us && __builtin_sub_overflow(now, entry.stored_us, &elapsed))
-        return false;
+    if (now >= entry.stored_us && sub_overflow(now, entry.stored_us, &elapsed)) return false;
     u64 age_total = 0;
-    if (__builtin_add_overflow(entry.initial_age_us, elapsed, &age_total)) return false;
+    if (add_overflow(entry.initial_age_us, elapsed, &age_total)) return false;
     const u64 kAge = age_total / 1000000;
     char digits[20];
     u32 count = 0;
@@ -417,20 +417,19 @@ bool HttpCachePolicy::read_response(const Key& key,
                                     u32 capacity,
                                     u32& written) {
     u64 kElapsed = ~u64{0};
-    if (now_us >= record.stored_us && __builtin_sub_overflow(now_us, record.stored_us, &kElapsed))
+    if (now_us >= record.stored_us && sub_overflow(now_us, record.stored_us, &kElapsed))
         return false;
     u64 kAgeUs = ~u64{0};
     u64 max_age = 0;
-    if (__builtin_sub_overflow(~u64{0}, record.initial_age_us, &max_age)) return false;
-    if (kElapsed <= max_age && __builtin_add_overflow(kElapsed, record.initial_age_us, &kAgeUs))
-        return false;
+    if (sub_overflow(~u64{0}, record.initial_age_us, &max_age)) return false;
+    if (kElapsed <= max_age && add_overflow(kElapsed, record.initial_age_us, &kAgeUs)) return false;
     const bool kFresh =
         now_us < record.expires_us && now_us >= record.stored_us &&
         kAgeUs <= static_cast<u64>(static_cast<i64>(key.max_age) * 1000000) &&
         key.min_fresh <= kMaxTtl &&
         static_cast<u64>(static_cast<i64>(key.min_fresh) * 1000000) < ([&] {
             u64 remaining = 0;
-            return __builtin_sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
+            return sub_overflow(record.expires_us, now_us, &remaining) ? 0 : remaining;
         }());
     return kFresh &&
            copy_response(record, now_us, keep_alive, key.http10, output, capacity, written);
@@ -456,7 +455,7 @@ bool HttpCachePolicy::prepare_record(
     const Fill& fill, const u8* response, u32 length, u64 now_us, u64 wall_us, Record& record) {
     if (!response || length > kMaxResponse || now_us < fill.started_us) return false;
     u64 kElapsed = 0;
-    if (__builtin_sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
+    if (sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
         length != static_cast<u32>(static_cast<i64>(info.header_end) +
@@ -464,10 +463,9 @@ bool HttpCachePolicy::prepare_record(
         return false;
     const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;
-    if (__builtin_sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining)
-        return false;
+    if (sub_overflow(~u64{0}, kRemainingUs, &max_remaining) || now_us > max_remaining) return false;
     u64 expires_us = 0;
-    if (__builtin_add_overflow(now_us, kRemainingUs, &expires_us)) return false;
+    if (add_overflow(now_us, kRemainingUs, &expires_us)) return false;
     record = {response, length, now_us, expires_us, info.age_us};
     return true;
 }
@@ -486,9 +484,8 @@ u64 http_cache_wall_us() {
                ? ([&] {
                      u64 whole = 0;
                      u64 fractional = static_cast<u64>(now.tv_nsec) / 1000;
-                     if (__builtin_mul_overflow(
-                             static_cast<u64>(now.tv_sec), u64{1000000}, &whole) ||
-                         __builtin_add_overflow(whole, fractional, &whole))
+                     if (mul_overflow(static_cast<u64>(now.tv_sec), u64{1000000}, &whole) ||
+                         add_overflow(whole, fractional, &whole))
                          return u64{0};
                      return whole;
                  }())

@@ -1,5 +1,6 @@
 #include "rut/runtime/ws_deflate.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
@@ -35,7 +36,7 @@ namespace {
 [[nodiscard]] voidpf codec_alloc(voidpf opaque, uInt items, uInt size) {
     auto& codec = *static_cast<WsDeflateCodec*>(opaque);
     u32 bytes;
-    if (__builtin_mul_overflow(items, size, &bytes)) return nullptr;
+    if (mul_overflow(items, size, &bytes)) return nullptr;
     constexpr i64 kAlignment = 16;
     constexpr auto kPadding = range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
     const auto padded = range_int(codec.used) + kPadding;

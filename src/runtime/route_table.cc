@@ -1,6 +1,7 @@
 #include "rut/runtime/route_table.h"
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_policy_head_mode.h"
 #include "rut/common/forward_preflight.h"
@@ -254,7 +255,7 @@ bool RouteConfig::copy_validated_strict_local_response_table_from_owned(const Ro
         const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr);
         if (address < source_base) return false;
         uintptr_t wide_offset = 0;
-        if (__builtin_sub_overflow(address, source_base, &wide_offset)) return false;
+        if (sub_overflow(address, source_base, &wide_offset)) return false;
         if (wide_offset > source.strict_local_response_bytes_used ||
             wide_offset > kStrictLocalResponseBytesPoolBytes)
             return false;

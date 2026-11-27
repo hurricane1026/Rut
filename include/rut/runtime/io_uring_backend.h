@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/connection_capacity.h"
@@ -24,11 +25,7 @@ namespace rut {
 struct IoUringPosition {
     u32 value;
 
-    constexpr IoUringPosition advanced_by(u32 count) const {
-        u32 next = 0;
-        (void)__builtin_add_overflow(value, count, &next);
-        return {next};
-    }
+    constexpr IoUringPosition advanced_by(u32 count) const { return {wrapping_add(value, count)}; }
 
     constexpr bool operator==(const IoUringPosition&) const = default;
 
@@ -37,9 +34,7 @@ struct IoUringPosition {
         return *this;
     }
 
-    constexpr u32 distance_to(u32 end) const {
-        return static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(value));
-    }
+    constexpr u32 distance_to(u32 end) const { return wrapping_sub(end, value); }
 
     constexpr u32 slot(u32 mask) const { return value & mask; }
 };

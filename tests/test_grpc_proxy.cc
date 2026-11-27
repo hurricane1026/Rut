@@ -36,6 +36,17 @@
 
 using namespace rut;
 
+TEST(grpc_accounting, overflow_leaves_the_last_exact_total) {
+    u64 bytes = UINT64_MAX - 1;
+    CHECK(grpc_count_bytes(&bytes, 1));
+    CHECK_EQ(bytes, UINT64_MAX);
+    CHECK(!grpc_count_bytes(&bytes, 1));
+    CHECK_EQ(bytes, UINT64_MAX);
+}
+
+static_assert(grpc_elapsed_us(UINT64_MAX, 0) == UINT64_MAX);
+static_assert(grpc_elapsed_us(0, UINT64_MAX) == 0);
+
 namespace {
 bool grpc_temp_template(char* path, size_t capacity, const char* name) {
     const char* directory = std::getenv("TMPDIR");

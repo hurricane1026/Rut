@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/format_integer.h"
 #include "rut/runtime/parse_integer.h"
@@ -483,8 +484,8 @@ struct Document {
             const u32 digit = static_cast<u32>(s.ptr[i] - '0');
             if (n == 429496729u && digit > 5) return false;
             u64 next = 0;
-            if (__builtin_mul_overflow(n, u64{10}, &next) ||
-                __builtin_add_overflow(next, static_cast<u64>(digit), &next))
+            if (mul_overflow(n, u64{10}, &next) ||
+                add_overflow(next, static_cast<u64>(digit), &next))
                 return false;
             n = next;
         }

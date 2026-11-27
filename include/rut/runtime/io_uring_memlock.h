@@ -20,6 +20,8 @@
 // every function takes `page_bytes`: pass sysconf(_SC_PAGESIZE) for an estimate
 // of the running host.
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 #include <linux/io_uring.h>
@@ -65,28 +67,30 @@ struct IoUringRingSizes {
 // Smallest power of two >= n; saturates at 2^31 (the largest u32 power of two).
 constexpr u32 io_uring_next_pow2(u32 n) {
     u32 p = 1;
+    // RUT_INTEGER_RANGE: the shifted power of two starts below 2^31.
     while (p < n && p < (1u << 31)) p <<= 1;
     return p;
 }
 
 constexpr IoUringRingSizes io_uring_ring_sizes(u32 capacity) {
-    // Widen before doubling so a huge capacity cannot wrap.
-    const u64 want = static_cast<u64>(capacity) * 2;
+    const auto want = range_int(capacity).scaled_by<2>();
     u32 cq = kMaxIoUringCqEntries;
-    if (want < kMaxIoUringCqEntries) cq = io_uring_next_pow2(static_cast<u32>(want));
+    if (want.value() < kMaxIoUringCqEntries)
+        cq = io_uring_next_pow2(static_cast<u32>(want.value()));
     if (cq < kMinIoUringCqEntries) cq = kMinIoUringCqEntries;
     return {kIoUringSqEntries, cq};
 }
 
 namespace iouring_memlock_detail {
+// RUT_INTEGER_RANGE: an unrepresentable estimate must remain above any finite limit.
 constexpr u64 saturating_add(u64 a, u64 b) {
     u64 result = 0;
-    return __builtin_add_overflow(a, b, &result) ? ~u64(0) : result;
+    return add_overflow(a, b, &result) ? ~u64(0) : result;
 }
 
 constexpr u64 saturating_mul(u64 a, u64 b) {
     u64 result = 0;
-    return __builtin_mul_overflow(a, b, &result) ? ~u64(0) : result;
+    return mul_overflow(a, b, &result) ? ~u64(0) : result;
 }
 
 // Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
@@ -95,13 +99,12 @@ constexpr u64 saturating_mul(u64 a, u64 b) {
 // wider cache lines have a larger header; with power-of-two entry counts the
 // CQE and SQ index arrays fill whole pages, so any header up to one page rounds
 // to the same result.
-static constexpr u64 kRingsHeaderBytes = 320;
+static constexpr i64 kRingsHeaderBytes = 320;
 constexpr u64 round_up_page(u64 n, u64 page_bytes) {
     if (page_bytes == 0) return 0;
     const u64 remainder = n % page_bytes;
     if (remainder == 0) return n;
-    u64 increment = 0;
-    (void)__builtin_sub_overflow(page_bytes, remainder, &increment);
+    const u64 increment = static_cast<u64>(__int128_t{page_bytes} - __int128_t{remainder});
     return iouring_memlock_detail::saturating_add(n, increment);
 }
 }  // namespace iouring_memlock_detail
@@ -110,21 +113,20 @@ constexpr u64 round_up_page(u64 n, u64 page_bytes) {
 // rounded up to pages as the kernel maps them.
 constexpr u64 io_uring_ring_locked_bytes(u32 sq_entries, u32 cq_entries, u64 page_bytes) {
     using namespace iouring_memlock_detail;
-    const u64 sqes = round_up_page(
-        saturating_mul(static_cast<u64>(sq_entries), sizeof(io_uring_sqe)), page_bytes);
-    const u64 rings = round_up_page(
-        saturating_add(
-            kRingsHeaderBytes,
-            saturating_add(saturating_mul(static_cast<u64>(cq_entries), sizeof(io_uring_cqe)),
-                           saturating_mul(static_cast<u64>(sq_entries), sizeof(u32)))),
-        page_bytes);
+    const auto kSq = range_int(sq_entries);
+    const auto kCq = range_int(cq_entries);
+    constexpr auto kHeader = range_int<kRingsHeaderBytes, kRingsHeaderBytes + 1>{};
+    const auto kRings =
+        kHeader + kCq.scaled_by<sizeof(io_uring_cqe)>() + kSq.scaled_by<sizeof(u32)>();
+    const u64 sqes = round_up_page(kSq.scaled_by<sizeof(io_uring_sqe)>().to_u64(), page_bytes);
+    const u64 rings = round_up_page(kRings.to_u64(), page_bytes);
     return saturating_add(sqes, rings);
 }
 
 // One registered provided-buffer ring: `entries` 16-byte io_uring_buf slots.
 constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries, u64 page_bytes) {
     return iouring_memlock_detail::round_up_page(
-        iouring_memlock_detail::saturating_mul(static_cast<u64>(entries), 16), page_bytes);
+        range_int(entries).scaled_by<sizeof(io_uring_buf)>().to_u64(), page_bytes);
 }
 
 // Per-shard charge a shard cannot start without: the ring plus the primary

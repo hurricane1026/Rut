@@ -1,5 +1,6 @@
 #include "rut/runtime/ws_frame.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/http_parser.h"
@@ -42,7 +43,7 @@ ParseStatus ws_parse_header(
     if (require_mask != masked) return ParseStatus::Error;
 
     i64 payload_len = 0;
-    i32 offset = 2;
+    u8 offset = 2;
     if (len7 < 126) {
         payload_len = len7;
     } else if (len7 == 126) {
@@ -56,18 +57,23 @@ ParseStatus ws_parse_header(
         if (len < 10) return ParseStatus::Incomplete;
         // §5.2: the most significant bit of a 64-bit length MUST be 0.
         u64 wire_length = 0;
-        for (i32 i = 0; i < 8; ++i) wire_length = (wire_length << 8) | buf[2 + i];
+        for (u8 i = 0; i < 8; ++i) {
+            const auto kPosition = range_int<2, 3>{} + range_int(i);
+            // RUT_INTEGER_RANGE: each iteration appends one of exactly eight wire bytes.
+            wire_length = (wire_length << 8) | buf[kPosition.value()];
+        }
         if (!try_u64_to_i64(wire_length, &payload_len)) return ParseStatus::Error;
         offset = 10;
         // Minimal-length rule: a 64-bit length that fits in 16 bits is non-canonical.
         if (payload_len <= 0xFFFF) return ParseStatus::Error;
     }
 
+    u32 header_length = offset;
     if (masked) {
-        if (len < (range_int(offset) + range_int<4, 5>::constant<4>()).value())
-            return ParseStatus::Incomplete;
-        for (i32 i = 0; i < 4; ++i) out->mask_key[i] = buf[offset + i];
-        offset += 4;
+        const auto kMaskedLength = range_int(offset) + range_int<4, 5>{};
+        if (len < kMaskedLength.value()) return ParseStatus::Incomplete;
+        header_length = kMaskedLength.to<u32>();
+        __builtin_memmove(out->mask_key, buf + range_int(offset).value(), sizeof(out->mask_key));
     } else {
         for (i32 i = 0; i < 4; ++i) out->mask_key[i] = 0;
     }
@@ -76,7 +82,7 @@ ParseStatus ws_parse_header(
     out->masked = masked;
     out->opcode = opcode;
     out->payload_len = payload_len;
-    out->header_len = static_cast<u32>(offset);
+    out->header_len = header_length;
     out->compressed = kCompressed;
     return ParseStatus::Complete;
 }
@@ -117,7 +123,7 @@ u32 ws_write_header(u8* out,
 
     out[0] = static_cast<u8>((fin ? 0x80 : 0x00) | (compressed ? 0x40 : 0) | static_cast<u8>(op));
     const u8 mask_bit = masked ? 0x80 : 0x00;
-    i32 offset;
+    u8 offset;
     if (payload_len <= 125) {
         out[1] = static_cast<u8>(mask_bit | static_cast<u8>(payload_len));
         offset = 2;
@@ -128,12 +134,17 @@ u32 ws_write_header(u8* out,
         offset = 4;
     } else {
         out[1] = static_cast<u8>(mask_bit | 127);
-        for (i32 i = 0; i < 8; ++i) out[2 + i] = static_cast<u8>(payload_len >> ((7 - i) * 8));
+        for (u8 i = 0; i < 8; ++i) {
+            const auto kPosition = range_int<2, 3>{} + range_int(i);
+            const auto kShift = (range_int<7, 8>{} - range_int(i)).scaled_by<8>();
+            // RUT_INTEGER_RANGE: the loop bounds the shift count to [0, 56].
+            out[kPosition.value()] = static_cast<u8>(payload_len >> kShift.value());
+        }
         offset = 10;
     }
     if (masked) {
-        for (i32 i = 0; i < 4; ++i) out[offset + i] = mask_key[i];
-        offset += 4;
+        __builtin_memmove(out + range_int(offset).value(), mask_key, 4);
+        return (range_int(offset) + range_int<4, 5>{}).to<u32>();
     }
     return static_cast<u32>(offset);
 }
@@ -158,10 +169,9 @@ WsMessageStatus ws_message_feed(WsMessageAssembler& m,
         m.in_fragmented = true;
     }
 
-    // Reject integer overflow even with an unbounded size, and enforce the configured
-    // cap without underflow if a caller supplies a smaller cap on a later fragment.
+    // RUT_INTEGER_RANGE: an unbounded message may use the full u64 accumulator.
     u64 total = 0;
-    if (__builtin_add_overflow(m.accumulated_len, h.payload_len, &total) ||
+    if (add_overflow(m.accumulated_len, h.payload_len, &total) ||
         (max_message_size != 0 && total > max_message_size)) {
         m.reset();
         return WsMessageStatus::Error;

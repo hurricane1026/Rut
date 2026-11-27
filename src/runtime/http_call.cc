@@ -1,6 +1,8 @@
 #include "rut/runtime/http_call.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/json.h"
 #include <new>
 
@@ -289,7 +291,7 @@ HttpCallReply HttpCallWorker::call(u32 connection,
     }
     u64 elapsed = 0;
     if (found) {
-        if (now < found->started || __builtin_sub_overflow(now, found->started, &elapsed) ||
+        if (now < found->started || sub_overflow(now, found->started, &elapsed) ||
             elapsed >= static_cast<u64>(found->timeout)) {
             cancel(connection, generation);
             reply.status = -2;
@@ -327,9 +329,9 @@ HttpCallReply HttpCallWorker::call(u32 connection,
         return reply;
     }
     reply.status = static_cast<i32>(0x80000000u);
-    u64 remaining = 0;
-    (void)__builtin_sub_overflow(static_cast<u64>(found->timeout), elapsed, &remaining);
-    reply.retry_ms = static_cast<u32>(remaining < 10 ? remaining : 10);
+    // Any existing slot with elapsed >= timeout returned above.
+    const auto kRemaining = range_int(found->timeout) - range_int(static_cast<u32>(elapsed));
+    reply.retry_ms = kRemaining.value() < 10 ? static_cast<u32>(kRemaining.value()) : 10;
     return reply;
 }
 void* HttpCallWorker::entry(void* self) {

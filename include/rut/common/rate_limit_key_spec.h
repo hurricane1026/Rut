@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 
 // Rate-limit metering-key spec — the description of a route's "counting unit".
@@ -88,7 +89,7 @@ inline u64 rate_limit_emit_interval_us(u32 max, u32 window_sec) {
     if (max == 0 || window_sec == 0) return 0;
     const u64 numerator = static_cast<u64>(window_sec) * 1000000ull;
     u64 rounded = 0;
-    if (__builtin_add_overflow(numerator, static_cast<u64>(static_cast<i64>(max) - 1), &rounded))
+    if (add_overflow(numerator, static_cast<u64>(static_cast<i64>(max) - 1), &rounded))
         return UINT64_MAX;
     return rounded / max;
 }

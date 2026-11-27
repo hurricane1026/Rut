@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/runtime/slice_pool.h"
 
 namespace rut {
@@ -10,10 +11,10 @@ constexpr bool record_direct_write_extent(
     u64 begin, u64 address, u32 capacity, u32 count, u32& tail_dirty, u32& node_dirty) {
     if (address < begin) return false;
     u64 raw_offset = 0;
-    if (__builtin_sub_overflow(address, begin, &raw_offset) || raw_offset > capacity) return false;
+    if (sub_overflow(address, begin, &raw_offset) || raw_offset > capacity) return false;
     const u32 kOffset = static_cast<u32>(raw_offset);
     u32 kEnd = 0;
-    if (__builtin_add_overflow(kOffset, count, &kEnd)) return false;
+    if (add_overflow(kOffset, count, &kEnd)) return false;
     if (kEnd > capacity) return false;
     if (kEnd > tail_dirty) tail_dirty = kEnd;
     if (kEnd > node_dirty) node_dirty = kEnd;

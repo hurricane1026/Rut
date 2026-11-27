@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -108,12 +109,11 @@ struct Buffer {
         if (released_) __builtin_trap();
         if (!ptr_) return 0;
         if (len_ > cap_) __builtin_trap();
-        u32 avail = 0;
-        (void)__builtin_sub_overflow(cap_, len_, &avail);
-        u32 to_write = n < avail ? n : avail;
+        const u32 kAvail = static_cast<u32>((range_int(cap_) - range_int(len_)).value());
+        u32 to_write = n < kAvail ? n : kAvail;
         if (to_write > 0) {
             __builtin_memmove(ptr_ + static_cast<i64>(len_), src, to_write);
-            (void)__builtin_add_overflow(len_, to_write, &len_);
+            len_ = static_cast<u32>((range_int(len_) + range_int(to_write)).value());
         }
         return to_write;
     }
@@ -155,18 +155,16 @@ struct Buffer {
     u32 write_avail() const noexcept {
         if (released_) __builtin_trap();
         if (!ptr_ || len_ > cap_) return 0;
-        u32 available = 0;
-        (void)__builtin_sub_overflow(cap_, len_, &available);
-        return available;
+        return static_cast<u32>((range_int(cap_) - range_int(len_)).value());
     }
 
     // Commit n bytes written directly via write_ptr().
     // Call after recv() returns — advances len_ without copying.
     void commit(u32 n) noexcept {
         if (released_) __builtin_trap();
-        u32 end = 0;
-        if (!ptr_ || __builtin_add_overflow(len_, n, &end) || end > cap_) __builtin_trap();
-        len_ = end;
+        const auto kEnd = range_int(len_) + range_int(n);
+        if (!ptr_ || kEnd.value() > cap_) __builtin_trap();
+        len_ = static_cast<u32>(kEnd.value());
     }
 
     // Set the absolute length after an in-place edit (e.g. rewriting the
@@ -186,10 +184,9 @@ struct Buffer {
             len_ = 0;
             return;
         }
-        u32 remaining = 0;
-        (void)__builtin_sub_overflow(len_, n, &remaining);
-        __builtin_memmove(ptr_, ptr_ + static_cast<i64>(n), remaining);
-        len_ = remaining;
+        const u32 kRemaining = static_cast<u32>((range_int(len_) - range_int(n)).value());
+        __builtin_memmove(ptr_, ptr_ + static_cast<i64>(n), kRemaining);
+        len_ = kRemaining;
     }
 
     // Read-only data pointer for kernel send() / zero-copy forwarding.

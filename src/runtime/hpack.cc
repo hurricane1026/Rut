@@ -1,5 +1,7 @@
 #include "rut/runtime/hpack.h"
 
+#include "rut/common/range_int.h"
+
 namespace rut::hpack {
 
 namespace {
@@ -171,8 +173,9 @@ constexpr HuffFsm kFsm = build_fsm();
 }  // namespace
 
 u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
-    if (len == 0) return 0;
-    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
+    if (len == 0 || prefix_bits == 0 || prefix_bits > 8) return 0;
+    // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
+    const u32 kMask = static_cast<u32>((i32{1} << prefix_bits) - 1);
     u32 value = in[0] & kMask;
     if (value < kMask) {
         *out = value;
@@ -185,6 +188,7 @@ u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
     while (true) {
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
+        // RUT_INTEGER_RANGE: acc <= UINT32_MAX and at most 7 bits are added at shift <= 28.
         acc += static_cast<i64>(kB & 0x7f) << shift;
         if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
@@ -196,13 +200,16 @@ u32 decode_integer(const u8* in, u32 len, u8 prefix_bits, u32* out) {
 }
 
 u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
-    const u32 kMask = static_cast<u32>((i64{1} << prefix_bits) - i64{1});
+    if (prefix_bits == 0 || prefix_bits > 8) return 0;
+    // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
+    const u32 kMask = static_cast<u32>((i32{1} << prefix_bits) - 1);
     if (value < kMask) {
         out[0] = static_cast<u8>(prefix_top | value);
         return 1;
     }
     out[0] = static_cast<u8>(prefix_top | kMask);
-    i64 remainder = static_cast<i64>(value) - static_cast<i64>(kMask);
+    const auto kRemainder = range_int(value) - range_int(kMask);
+    u32 remainder = static_cast<u32>(kRemainder.value());
     i64 i = 1;
     while (remainder >= 128) {
         out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
@@ -245,6 +252,8 @@ i64 huffman_encode(u8* out, const u8* src, u32 len) {
 }
 
 i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
+    // The signed result reports -1 on failure and otherwise carries the exact length.
+    if (cap > INT32_MAX) cap = INT32_MAX;
     i16 node = 0;
     u32 o = 0;
     for (u32 i = 0; i < len; i++) {
@@ -276,9 +285,8 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
     u32 slen = 0;
     const u32 kHdr = decode_integer(in, len, 7, &slen);
     if (kHdr == 0) return 0;
-    if (static_cast<i64>(kHdr) > static_cast<i64>(len) ||
-        static_cast<i64>(slen) > static_cast<i64>(len) - static_cast<i64>(kHdr))
-        return 0;  // truncated payload
+    const auto kConsumed = range_int(kHdr) + range_int(slen);
+    if (kConsumed.value() > len) return 0;  // truncated payload
     const u8* data = in + static_cast<i64>(kHdr);
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
@@ -289,7 +297,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
         for (i64 i = 0; i < slen; i++) out[i] = data[i];
         *out_len = slen;
     }
-    return static_cast<u32>(static_cast<i64>(kHdr) + static_cast<i64>(slen));
+    return static_cast<u32>(kConsumed.value());
 }
 
 i64 encode_string(u8* out, const u8* src, u32 len) {

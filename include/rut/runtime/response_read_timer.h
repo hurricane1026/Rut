@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/io_event.h"
 
 #include <stdint.h>
@@ -8,17 +10,17 @@ namespace rut {
 
 // An early completion rearms for the remaining interval, rounded up to a
 // millisecond. Missing, unrepresentable or elapsed deadlines cannot rearm.
-constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
+[[nodiscard]] constexpr u32 response_read_timer_remaining_ms(u64 last_progress_ns,
+                                                             u64 timeout_ns,
+                                                             u64 now_ns) {
     u64 deadline = 0;
-    if (last_progress_ns == 0 || __builtin_add_overflow(last_progress_ns, timeout_ns, &deadline) ||
+    // RUT_INTEGER_RANGE: both timestamps can use the full u64 range.
+    if (last_progress_ns == 0 || add_overflow(last_progress_ns, timeout_ns, &deadline) ||
         now_ns >= deadline)
         return 0;
-    u64 remaining = 0;
-    (void)__builtin_sub_overflow(deadline, now_ns, &remaining);
-    u64 rounded = 0;
-    (void)__builtin_sub_overflow(remaining, 1, &rounded);
-    (void)__builtin_add_overflow(rounded / 1'000'000, 1, &rounded);
-    const u64 kMillis = rounded;
+    // The guard establishes now_ns < deadline, so both differences fit u64.
+    const u64 kRounded = static_cast<u64>(__int128_t{deadline} - __int128_t{now_ns} - 1);
+    const auto kMillis = (bounded_quotient<1'000'000>(kRounded) + range_int<1, 2>{}).to_u64();
     return kMillis > UINT32_MAX ? UINT32_MAX : static_cast<u32>(kMillis);
 }
 

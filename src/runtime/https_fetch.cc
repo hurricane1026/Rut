@@ -1,5 +1,6 @@
 #include "rut/runtime/https_fetch.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/platform/socket.h"
 
@@ -37,11 +38,9 @@ u64 jwt_monotonic_ms() {
         now.tv_nsec >= 1000000000 || static_cast<u64>(now.tv_sec) > (~u64{0} - 999) / 1000)
         return 0;
     u64 seconds_ms = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(now.tv_sec), u64{1000}, &seconds_ms)) return 0;
+    if (mul_overflow(static_cast<u64>(now.tv_sec), u64{1000}, &seconds_ms)) return 0;
     u64 result = 0;
-    return __builtin_add_overflow(seconds_ms, static_cast<u64>(now.tv_nsec) / 1000000, &result)
-               ? 0
-               : result;
+    return add_overflow(seconds_ms, static_cast<u64>(now.tv_nsec) / 1000000, &result) ? 0 : result;
 }
 
 bool HttpsEndpoint::valid() const {
@@ -392,7 +391,7 @@ void HttpsFetch::advance(u64 monotonic_ms) {
     if (state_ != State::Busy) return;
     u64 elapsed = 0;
     if (!monotonic_ms || monotonic_ms < started_ ||
-        __builtin_sub_overflow(monotonic_ms, started_, &elapsed) || elapsed >= timeout_ms_) {
+        sub_overflow(monotonic_ms, started_, &elapsed) || elapsed >= timeout_ms_) {
         (void)fail();
         return;
     }

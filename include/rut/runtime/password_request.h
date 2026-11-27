@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/password_worker.h"
 
@@ -35,7 +36,7 @@ public:
         u64 deadline = 0;
         if (status != PasswordRequestStatus::Idle || timeout_ms == 0 ||
             timeout_ms > kMaxTimeoutMs ||
-            __builtin_add_overflow(now_ms, static_cast<u64>(timeout_ms), &deadline))
+            add_overflow(now_ms, static_cast<u64>(timeout_ms), &deadline))
             return false;
         owner = &worker;
         this->deadline = deadline;

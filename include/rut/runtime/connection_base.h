@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/buffer.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
@@ -618,7 +619,7 @@ struct ConnectionBase {
             if (ptr >= source &&
                 ptr + static_cast<i64>(value.len) <= source + static_cast<i64>(source_len)) {
                 u32 next_needed = 0;
-                if (__builtin_add_overflow(needed, value.len, &next_needed)) return false;
+                if (add_overflow(needed, value.len, &next_needed)) return false;
                 needed = next_needed;
             }
         }
@@ -1709,7 +1710,7 @@ struct ConnectionBase {
         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
         uintptr_t address_end = 0;
         if (base != recv_slice || address < 4096 ||
-            __builtin_add_overflow(address, static_cast<uintptr_t>(capacity), &address_end))
+            add_overflow(address, static_cast<uintptr_t>(capacity), &address_end))
             return invalid;
 
         const char* method = nullptr;

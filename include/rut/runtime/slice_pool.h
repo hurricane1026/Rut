@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -325,7 +326,7 @@ struct SlicePool {
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
         uintptr_t raw_offset = 0;
-        if (__builtin_sub_overflow(address, begin, &raw_offset)) return;
+        if (sub_overflow(address, begin, &raw_offset)) return;
         u64 offset = raw_offset;
         if (offset % kSliceSize != 0) return;  // not slice-aligned
         if (free_top >= max_count) return;     // overflow guard
@@ -369,7 +370,7 @@ struct SlicePool {
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
         uintptr_t raw_offset = 0;
-        if (__builtin_sub_overflow(address, begin, &raw_offset)) return false;
+        if (sub_overflow(address, begin, &raw_offset)) return false;
         const u64 offset = raw_offset;
         if (offset % kSliceSize != 0) return false;
         return in_use_map[offset / kSliceSize];
@@ -477,7 +478,7 @@ private:
     static_assert(kMaxBulkSlices < kDeferredBodyClear);
 
     void clear_bulk_bytes(u8* ptr, u32 dirty) {
-        if (__builtin_add_overflow(
+        if (add_overflow(
                 study_body_bulk_clear_bytes, static_cast<u64>(dirty), &study_body_bulk_clear_bytes))
             study_body_bulk_clear_bytes = UINT64_MAX;
         __builtin_memset(ptr, 0, dirty);
@@ -557,7 +558,7 @@ private:
         const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
         const uintptr_t begin = reinterpret_cast<uintptr_t>(bulk_base);
         uintptr_t raw_offset = 0;
-        if (__builtin_sub_overflow(address, begin, &raw_offset)) return;
+        if (sub_overflow(address, begin, &raw_offset)) return;
         const u64 offset = raw_offset;
         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);

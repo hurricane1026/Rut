@@ -177,6 +177,20 @@ TEST(dns, resolver_rejects_host_larger_than_query_storage) {
     CHECK_EQ(expires, 0u);
 }
 
+TEST(dns, maximum_hostname_and_exact_question_capacity) {
+    char host[255]{};
+    memset(host, 'a', 254);
+    host[63] = host[127] = host[191] = host[253] = '.';
+    CHECK(dns_hostname(host));
+    CHECK_EQ(strlen(host), 253u);
+    u8 question[271]{};
+    CHECK_EQ(dns_question(host, 123, question, sizeof(question) - 1), 0u);
+    CHECK_EQ(dns_question(host, 123, question, sizeof(question)), sizeof(question));
+
+    host[253] = 'a';
+    CHECK(!dns_hostname(host));
+}
+
 TEST(dns, hostname_policy_normalizes_and_rejects_ambiguous_or_dynamic_targets) {
     NetEndpoint e;
     CHECK(net_endpoint(

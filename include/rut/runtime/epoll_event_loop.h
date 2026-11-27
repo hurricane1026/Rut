@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
@@ -47,10 +48,9 @@ inline u64 monotonic_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     u64 seconds = 0;
-    if (__builtin_mul_overflow(static_cast<u64>(ts.tv_sec), u64{1'000'000'000}, &seconds))
-        return UINT64_MAX;
+    if (mul_overflow(static_cast<u64>(ts.tv_sec), u64{1'000'000'000}, &seconds)) return UINT64_MAX;
     u64 result = 0;
-    if (__builtin_add_overflow(seconds, static_cast<u64>(ts.tv_nsec), &result)) return UINT64_MAX;
+    if (add_overflow(seconds, static_cast<u64>(ts.tv_nsec), &result)) return UINT64_MAX;
     return result;
 }
 
@@ -411,7 +411,7 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 } else {
                     u64 deadline = 0;
-                    if (__builtin_add_overflow(start, static_cast<u64>(period), &deadline))
+                    if (add_overflow(start, static_cast<u64>(period), &deadline))
                         deadline = UINT64_MAX;
                     if (monotonic_secs() < deadline) continue;
                     force_close_all();
@@ -458,16 +458,16 @@ public:
     void epoch_enter() {
         if (epoch) {
             u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
     void epoch_leave() {
         if (epoch) {
             u64 next = 0;
-            (void)__builtin_add_overflow(
-                epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)add_overflow(epoch->epoch.load(std::memory_order_relaxed), u64{1}, &next);
             epoch->epoch.store(next, std::memory_order_release);
         }
     }
@@ -1070,9 +1070,9 @@ public:
         backend.pause_recv(conn.id);
         u64 now = epoll_yield::monotonic_ns();
         u64 delay_ns = 0;
-        if (__builtin_mul_overflow(static_cast<u64>(ms), u64{1'000'000}, &delay_ns)) return false;
+        if (mul_overflow(static_cast<u64>(ms), u64{1'000'000}, &delay_ns)) return false;
         u64 deadline = 0;
-        if (__builtin_add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
+        if (add_overflow(now, delay_ns, &deadline)) deadline = UINT64_MAX;
         if (yield_heap.push(deadline, conn.handler_gen, conn.id)) {
             conn.yield_armed = true;
             rearm_yield_timerfd();
@@ -1123,8 +1123,7 @@ public:
         if (!conn.ws_shutdown_deadline_armed)
             timer.remove(&conn);  // precise timer owns the wakeup; off the keepalive wheel
         u64 kDeadline = 0;
-        if (__builtin_add_overflow(epoll_yield::monotonic_ns(), delay_ns, &kDeadline))
-            kDeadline = UINT64_MAX;
+        if (add_overflow(epoll_yield::monotonic_ns(), delay_ns, &kDeadline)) kDeadline = UINT64_MAX;
         if (yield_heap.push(kDeadline, conn.handler_gen, conn.id)) {
             rearm_yield_timerfd();
             return true;

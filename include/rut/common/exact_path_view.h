@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/types.h"
 
 namespace rut {
@@ -48,7 +49,7 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
 
     const uintptr_t raw_begin = reinterpret_cast<uintptr_t>(raw.ptr);
     uintptr_t raw_end = 0;
-    if (__builtin_add_overflow(raw_begin, static_cast<uintptr_t>(raw.len), &raw_end))
+    if (add_overflow(raw_begin, static_cast<uintptr_t>(raw.len), &raw_end))
         return ExactPathNormalizationResult::InvalidInput;
 
     if (raw.ptr[0] != '/') return ExactPathNormalizationResult::InvalidInput;
@@ -78,8 +79,8 @@ inline ExactPathNormalizationResult normalize_exact_path_slashes(Str raw,
     const uintptr_t output_len_begin = reinterpret_cast<uintptr_t>(output_len);
     uintptr_t output_end = 0;
     uintptr_t output_len_end = 0;
-    if (__builtin_add_overflow(output_begin, static_cast<uintptr_t>(normalized_len), &output_end) ||
-        __builtin_add_overflow(
+    if (add_overflow(output_begin, static_cast<uintptr_t>(normalized_len), &output_end) ||
+        add_overflow(
             output_len_begin, static_cast<uintptr_t>(sizeof(*output_len)), &output_len_end))
         return ExactPathNormalizationResult::InvalidInput;
     const auto ranges_overlap = [](uintptr_t first_begin,

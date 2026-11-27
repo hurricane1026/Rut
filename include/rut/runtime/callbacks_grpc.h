@@ -2,6 +2,8 @@
 
 // Included after callbacks_h2.h. All sends copy into the Connection's owned
 // send slice: retiring an RPC never frees memory referenced by an async SQE.
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/receive_headroom.h"
@@ -11,6 +13,20 @@
 #include "rut/runtime/ws_handshake.h"
 
 namespace rut {
+[[nodiscard]] inline bool grpc_count_bytes(u64* total, u32 count) {
+    u64 next = 0;
+    // RUT_INTEGER_RANGE: a streaming RPC can accumulate the full u64 range.
+    if (add_overflow(*total, count, &next)) return false;
+    *total = next;
+    return true;
+}
+
+constexpr u64 grpc_elapsed_us(u64 now, u64 start) {
+    if (now < start) return 0;
+    // RUT_INTEGER_RANGE: the ordered full-width timestamps have an exact u64 difference.
+    return static_cast<u64>(__int128_t{now} - __int128_t{start});
+}
+
 template <typename Loop>
 inline bool current_health_generation(Loop*, const RouteConfig*);
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
@@ -181,9 +197,7 @@ template <typename Loop>
 void grpc_observe(Loop* loop, GrpcExchange& x) {
     if (!x.observed) return;
     x.observed = false;
-    const u64 now = monotonic_us();
-    u64 kElapsed = 0;
-    if (now >= x.started_us) (void)__builtin_sub_overflow(now, x.started_us, &kElapsed);
+    const u64 kElapsed = grpc_elapsed_us(monotonic_us(), x.started_us);
     const u8 kStatus = x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1;
     if (loop->metrics) loop->metrics->on_grpc_complete(kStatus, kElapsed);
     auto& entry = x.log_entry;
@@ -495,9 +509,8 @@ inline void grpc_detach_upstream_exchange(Loop* loop, Http2Conn& h, GrpcExchange
 }
 inline bool grpc_idle_upstream_should_close(
     const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
-    u64 idle = 0;
-    if (now_us >= g.idle_since_us) (void)__builtin_sub_overflow(now_us, g.idle_since_us, &idle);
-    return g.active == 0 && (draining || peer_goaway || idle >= keepalive_us);
+    const u64 kIdle = grpc_elapsed_us(now_us, g.idle_since_us);
+    return g.active == 0 && (draining || peer_goaway || kIdle >= keepalive_us);
 }
 template <typename Loop>
 void grpc_response_headers(
@@ -738,22 +751,23 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         h.consume_data(sid, len);
         return;
     }
-    if (static_cast<i64>(len) >
-        static_cast<i64>(sizeof(x->download)) - static_cast<i64>(x->download_len)) {
+    const auto kBuffered = range_int(x->download_len) + range_int(len);
+    if (kBuffered.value() > static_cast<i64>(sizeof(x->download))) {
         x->failure = 8;
         x->response_end = true;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
-    if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
-    x->download_len = static_cast<u32>(static_cast<i64>(x->download_len) + static_cast<i64>(len));
-    (void)__builtin_add_overflow(x->response_bytes, static_cast<u64>(len), &x->response_bytes);
-    if (x->has_response_length && x->response_bytes > x->expected_response_bytes) x->failure = 13;
+    if (!grpc_count_bytes(&x->response_bytes, len) ||
+        (x->has_response_length && x->response_bytes > x->expected_response_bytes))
+        x->failure = 13;
     if (x->failure == 13) {
         x->response_end = true;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
+    if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
+    x->download_len = static_cast<u32>(kBuffered.value());
     if (x->ws && x->ws_accepted) {
         if (!ws_h2_process(*x, false)) x->failure = 13;
         if (end) ws_h2_eof(*x, false);
@@ -1201,13 +1215,13 @@ bool grpc_start_impl(Loop* loop,
     if (kWebsocket) {
         u64 seconds = 30;
         if constexpr (requires { loop->upstream_timeout; }) seconds = loop->upstream_timeout;
-        if (__builtin_add_overflow(deadline_base, seconds * 1000000ULL, &deadline)) return false;
+        if (add_overflow(deadline_base, seconds * 1000000ULL, &deadline)) return false;
     }
     for (u32 i = 0; i < nh; i++) {
         if (kWebsocket || !hs[i].name.eq({"grpc-timeout", 12})) continue;
         u64 timeout = 0;
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
-        if (__builtin_add_overflow(deadline_base, timeout, &deadline)) return false;
+        if (add_overflow(deadline_base, timeout, &deadline)) return false;
     }
     const u32 backend =
         (target.hc_require_initial_success || target.failover_mask != 0) &&
@@ -1502,18 +1516,21 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             u32 n = 0;
             bool done = false;
             if (total > cap) break;
-            const u32 room = static_cast<u32>(static_cast<i64>(cap) - static_cast<i64>(total));
+            const u32 room = static_cast<u32>((range_int(cap) - range_int(total)).value());
+            auto write_error = [&] {
+                return x->websocket ? h2_websocket_error(out + static_cast<i64>(total),
+                                                         room,
+                                                         x->downstream_stream,
+                                                         x->failure,
+                                                         x->response_headers_sent)
+                                    : grpc_error_headers(out + static_cast<i64>(total),
+                                                         room,
+                                                         x->downstream_stream,
+                                                         x->failure,
+                                                         x->response_headers_sent);
+            };
             if (x->failure) {
-                n = x->websocket ? h2_websocket_error(out + static_cast<i64>(total),
-                                                      room,
-                                                      x->downstream_stream,
-                                                      x->failure,
-                                                      x->response_headers_sent)
-                                 : grpc_error_headers(out + static_cast<i64>(total),
-                                                      room,
-                                                      x->downstream_stream,
-                                                      x->failure,
-                                                      x->response_headers_sent);
+                n = write_error();
                 done = n != 0;
             } else if (!x->response_headers_sent && x->response_headers_len) {
                 if (x->response_headers_len > room) continue;
@@ -1534,13 +1551,20 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     amount = h.peer_settings.max_frame_size;
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
-                n = http2_write_data(
-                    out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
-                (void)__builtin_add_overflow(
-                    x->staged_response_bytes, static_cast<u64>(amount), &x->staged_response_bytes);
-                grpc_consume_output(*x, false, amount);
-                stream->send_window -= static_cast<i32>(amount);
-                h.conn_send_window -= static_cast<i64>(amount);
+                if (!grpc_count_bytes(&x->staged_response_bytes, amount)) {
+                    x->failure = 13;
+                    n = write_error();
+                    done = n != 0;
+                } else {
+                    n = http2_write_data(
+                        out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
+                    grpc_consume_output(*x, false, amount);
+                    stream->send_window = static_cast<i32>(
+                        (range_int(stream->send_window) - range_int(amount)).value());
+                    // RUT_INTEGER_RANGE: the i64 window is positive and amount is capped to it.
+                    h.conn_send_window =
+                        static_cast<i64>(__int128_t{h.conn_send_window} - __int128_t{amount});
+                }
             } else if (x->websocket && x->response_headers_sent && !output_len &&
                        !x->download_len && x->response_end && !x->response_end_sent &&
                        room >= kFrameHeaderSize) {
@@ -1601,13 +1625,14 @@ void grpc_kick_downstream(Loop* loop, Connection& down) {
 template <typename Loop>
 void grpc_request_data(
     Loop* loop, Connection& down, GrpcExchange& x, const u8* data, u32 len, bool end) {
-    (void)__builtin_add_overflow(x.request_bytes, static_cast<u64>(len), &x.request_bytes);
+    const bool kCounted = grpc_count_bytes(&x.request_bytes, len);
     if (x.failure || !x.upstream) {
+        if (!kCounted && !x.failure) x.failure = 13;
         down.h2->consume_data(x.downstream_stream, len);
         return;
     }
-    if (static_cast<i64>(len) >
-            static_cast<i64>(sizeof(x.upload)) - static_cast<i64>(x.upload_len) ||
+    const auto kBuffered = range_int(x.upload_len) + range_int(len);
+    if (!kCounted || kBuffered.value() > static_cast<i64>(sizeof(x.upload)) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
         down.h2->consume_data(x.downstream_stream, len);
@@ -1616,7 +1641,7 @@ void grpc_request_data(
         return;
     }
     if (len) __builtin_memcpy(x.upload + static_cast<i64>(x.upload_len), data, len);
-    x.upload_len = static_cast<u32>(static_cast<i64>(x.upload_len) + static_cast<i64>(len));
+    x.upload_len = static_cast<u32>(kBuffered.value());
     if (x.ws) {
         if (!ws_h2_process(x, true)) x.failure = 13;
         if (end) ws_h2_eof(x, true);
@@ -1684,7 +1709,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     if (!earliest) return;
     const u64 now = monotonic_us();
     u64 delay = 1;
-    if (earliest > now && __builtin_sub_overflow(earliest, now, &delay)) {
+    if (earliest > now && sub_overflow(earliest, now, &delay)) {
         g.timer_deadline_us = 0;
         return;
     }
@@ -1823,9 +1848,7 @@ void grpc_tick(Loop* loop, Connection& conn) {
         return;
     }
     if (h.grpc.upstream) {
-        u64 connected_age = 0;
-        if (now >= h.grpc.connected_at_us)
-            (void)__builtin_sub_overflow(now, h.grpc.connected_at_us, &connected_age);
+        const u64 connected_age = grpc_elapsed_us(now, h.grpc.connected_at_us);
         const bool stale_config =
             h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
         if (((h.grpc.connecting || !h.peer_settings_seen) &&

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/forward_target.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
@@ -105,9 +106,8 @@ inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success
     if (h->fails < 0xffff) h->fails++;
     if (h->fails >= kBackendFailThreshold) {
         u64 eject_until = 0;
-        h->eject_until_us = __builtin_add_overflow(now_us, kBackendEjectCooldownUs, &eject_until)
-                                ? ~u64{0}
-                                : eject_until;
+        h->eject_until_us =
+            add_overflow(now_us, kBackendEjectCooldownUs, &eject_until) ? ~u64{0} : eject_until;
     }
 }
 
@@ -2246,7 +2246,7 @@ inline void throttle_advance(Connection& conn, u32 len) {
     const i64 delta_ns = static_cast<i64>(len) * static_cast<i64>(1'000'000'000) /
                          static_cast<i64>(conn.throttle_down_bps);
     u64 next_tat = 0;
-    if (__builtin_add_overflow(kBase, static_cast<u64>(delta_ns), &next_tat)) next_tat = UINT64_MAX;
+    if (add_overflow(kBase, static_cast<u64>(delta_ns), &next_tat)) next_tat = UINT64_MAX;
     conn.throttle_tat_ns = next_tat;
 }
 
@@ -2388,7 +2388,8 @@ bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remain
     const u64 kNowNs = monotonic_ns();
     if (conn.throttle_tat_ns <= kNowNs) return false;  // not ahead → budget available
     u64 kDelayNs = 0;
-    (void)__builtin_sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
     conn.throttle_paused = true;
     conn.throttle_pending_len = pending_remaining;  // stash for resume
     if constexpr (requires { loop->pause_upstream_recv(conn); }) {
@@ -2431,7 +2432,8 @@ void throttle_resume(Loop* loop, Connection& conn) {
         if (conn.throttle_tat_ns > kNowNs) {
             // Budget not recovered yet — re-park for the remaining deficit.
             u64 kDelayNs = 0;
-            (void)__builtin_sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)sub_overflow(conn.throttle_tat_ns, kNowNs, &kDelayNs);
             bool armed = false;
             if constexpr (requires { loop->arm_throttle_timer(conn, kDelayNs); }) {
                 armed = loop->arm_throttle_timer(conn, kDelayNs);
@@ -2495,10 +2497,12 @@ inline bool http_cache_cors_mutations_admitted(const Connection& conn) {
         // Reject even a zero-length view pointing into a buffer we will rewrite.
         u64 distance = 0;
         if (begin >= base) {
-            (void)__builtin_sub_overflow(begin, base, &distance);
+            // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+            (void)sub_overflow(begin, base, &distance);
             return distance < buffer.capacity();
         }
-        (void)__builtin_sub_overflow(base, begin, &distance);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)sub_overflow(base, begin, &distance);
         return value.len > distance;
     };
     for (u32 i = 0; i < conn.resp_header_mutation_count; ++i) {
@@ -2894,7 +2898,7 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 inline u32 request_completion_duration_us(u64 now_us, u64 start_us, bool owns_completion) {
     if (!owns_completion) return 0;
     u64 duration_us = 0;
-    if (__builtin_sub_overflow(now_us, start_us, &duration_us)) return 0;
+    if (sub_overflow(now_us, start_us, &duration_us)) return 0;
     return duration_us > UINT32_MAX ? UINT32_MAX : static_cast<u32>(duration_us);
 }
 
@@ -3930,9 +3934,11 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    (void)__builtin_add_overflow(
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)add_overflow(
         conn.downstream_req_size, static_cast<u64>(consume), &conn.downstream_req_size);
-    (void)__builtin_add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
@@ -4021,9 +4027,11 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     }
     conn.req_body_remaining =
         static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
-    (void)__builtin_add_overflow(
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)add_overflow(
         conn.downstream_req_size, static_cast<u64>(consume), &conn.downstream_req_size);
-    (void)__builtin_add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    (void)add_overflow(conn.req_size, static_cast<u64>(consume), &conn.req_size);
     conn.req_initial_send_len = static_cast<u32>(
         static_cast<i64>(conn.req_header_end) +
         (static_cast<i64>(conn.req_content_length) - static_cast<i64>(conn.req_body_remaining)));
@@ -6489,6 +6497,12 @@ void expire_connect_attempt(Loop* loop, Connection& c) {
         loop->close_conn(c);
         return;
     }
+    const u64 now_us = monotonic_us();
+    // RUT_INTEGER_RANGE: the monotonic clock and retry deadline use the full u64 range.
+    if (add_overflow(now_us, u64{3'000'000}, &c.connect_retry_deadline_us)) {
+        loop->close_conn(c);
+        return;
+    }
     if constexpr (requires { loop->begin_upstream_retirement(c, kUpstreamOpConnect); }) {
         if (!loop->begin_upstream_retirement(c, kUpstreamOpConnect)) {
             loop->close_conn(c);
@@ -6516,9 +6530,6 @@ void expire_connect_attempt(Loop* loop, Connection& c) {
     c.connect_retry_attempts = c.upstream_attempts;
     c.connect_retry_backend_idx = c.upstream_backend_idx;
     c.connect_retry_attempted_backends = c.upstream_attempted_backends;
-    const u64 now_us = monotonic_us();
-    if (__builtin_add_overflow(now_us, u64{3'000'000}, &c.connect_retry_deadline_us))
-        c.connect_retry_deadline_us = ~u64{0};
     c.set_slots(&on_connect_retry_downstream<Loop>, nullptr, nullptr, nullptr);
     loop->timer.refresh(&c, 1);
 }
@@ -7446,13 +7457,13 @@ inline bool apply_request_header_overrides(Connection& conn) {
     // memory, so they never alias recv_buf and this never trips for compiled .rut.)
     const uintptr_t kBufLo = reinterpret_cast<uintptr_t>(buf);
     uintptr_t kBufHi = 0;
-    if (__builtin_add_overflow(kBufLo, static_cast<uintptr_t>(conn.recv_buf.capacity()), &kBufHi))
+    if (add_overflow(kBufLo, static_cast<uintptr_t>(conn.recv_buf.capacity()), &kBufHi))
         return false;
     auto aliases_recv_buf = [&](const Str& s) {
         if (s.ptr == nullptr) return false;
         const uintptr_t p = reinterpret_cast<uintptr_t>(s.ptr);
         uintptr_t end = 0;
-        if (__builtin_add_overflow(p, static_cast<uintptr_t>(s.len), &end)) return true;
+        if (add_overflow(p, static_cast<uintptr_t>(s.len), &end)) return true;
         return p < kBufHi && end > kBufLo;
     };
 
@@ -7613,7 +7624,7 @@ inline void strip_ws_extensions(Connection& conn) {
     auto& arena = conn.json_arena;
     auto allocate = [&] [[nodiscard]] (u32 bytes) -> char* {
         u32 remaining;
-        if (__builtin_sub_overflow(u32{262144}, bytes, &remaining)) return nullptr;
+        if (sub_overflow(u32{262144}, bytes, &remaining)) return nullptr;
         if (arena.backend.pool == nullptr || (!arena.current && !arena.init(arena.backend.pool)) ||
             arena.space_used() > remaining)
             return nullptr;
@@ -7722,13 +7733,12 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(data);
     uintptr_t limit = 0;
-    if (__builtin_add_overflow(base, static_cast<uintptr_t>(total), &limit)) return false;
+    if (add_overflow(base, static_cast<uintptr_t>(total), &limit)) return false;
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
     uintptr_t path_remaining = 0;
     uintptr_t path_offset = 0;
-    if (path_addr < base || path_addr > limit ||
-        __builtin_sub_overflow(limit, path_addr, &path_remaining) ||
-        req.path.len > path_remaining || __builtin_sub_overflow(path_addr, base, &path_offset))
+    if (path_addr < base || path_addr > limit || sub_overflow(limit, path_addr, &path_remaining) ||
+        req.path.len > path_remaining || sub_overflow(path_addr, base, &path_offset))
         return false;
     const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = req.path.len;
@@ -8870,7 +8880,7 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     auto append = [&](const u8* p, u32 n) {
         if (measuring) {
             u32 next = 0;
-            if (__builtin_add_overflow(measured_len, n, &next)) return false;
+            if (add_overflow(measured_len, n, &next)) return false;
             measured_len = next;
             return true;
         }
@@ -9230,8 +9240,7 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
             const Header& parsed_header = req.headers[measured_index++];
             const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
             uintptr_t data_end = 0;
-            if (__builtin_add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end))
-                return false;
+            if (add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end)) return false;
             const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
             const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
             if (colon == measured_hs || colon == measured_le ||
@@ -9239,10 +9248,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                 name_addr != reinterpret_cast<uintptr_t>(measured_hs) || raw_addr < data_addr ||
                 raw_addr > data_end || ([&] {
                     uintptr_t raw_end = 0;
-                    return __builtin_add_overflow(
-                               raw_addr,
-                               static_cast<uintptr_t>(parsed_header.raw_value.len),
-                               &raw_end) ||
+                    return add_overflow(raw_addr,
+                                        static_cast<uintptr_t>(parsed_header.raw_value.len),
+                                        &raw_end) ||
                            raw_end > data_end;
                 }()) ||
                 parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
@@ -9377,18 +9385,16 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
                 const Header& parsed_header = req.headers[parsed_header_index];
                 const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
                 uintptr_t data_end = 0;
-                if (__builtin_add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end))
-                    return false;
+                if (add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end)) return false;
                 const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
                 const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
                 if (parsed_header.name.len != name_len ||
                     name_addr != reinterpret_cast<uintptr_t>(hs) || raw_addr < data_addr ||
                     raw_addr > data_end || ([&] {
                         uintptr_t raw_end = 0;
-                        return __builtin_add_overflow(
-                                   raw_addr,
-                                   static_cast<uintptr_t>(parsed_header.raw_value.len),
-                                   &raw_end) ||
+                        return add_overflow(raw_addr,
+                                            static_cast<uintptr_t>(parsed_header.raw_value.len),
+                                            &raw_end) ||
                                raw_end > data_end;
                     }()) ||
                     parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
@@ -10679,7 +10685,7 @@ void h2_on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // until the full request is written, then read the response.
     Http2Conn* h2 = conn.h2;
     u32 next_sent = 0;
-    if (__builtin_add_overflow(h2->async_synth_sent, static_cast<u32>(ev.result), &next_sent) ||
+    if (add_overflow(h2->async_synth_sent, static_cast<u32>(ev.result), &next_sent) ||
         next_sent > h2->async_synth_len) {
         h2_proxy_fail(loop, conn, 502);
         return;
@@ -15058,9 +15064,8 @@ inline bool redirect_legacy_authority_matches_listener(const RedirectAuthorityVi
     const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
     uintptr_t path_offset = 0;
     u32 remaining;
-    if (__builtin_sub_overflow(path_addr, base, &path_offset) ||
-        __builtin_sub_overflow(conn.recv_buf.len(), path_offset, &remaining) ||
-        out_req->path.len > remaining)
+    if (sub_overflow(path_addr, base, &path_offset) ||
+        sub_overflow(conn.recv_buf.len(), path_offset, &remaining) || out_req->path.len > remaining)
         return false;
     const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;
@@ -16222,7 +16227,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     if (conn.upstream_start_us != 0) {
         const u64 first_response_us = monotonic_us();
         u64 elapsed_us = 0;
-        (void)__builtin_sub_overflow(first_response_us, conn.upstream_start_us, &elapsed_us);
+        // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+        (void)sub_overflow(first_response_us, conn.upstream_start_us, &elapsed_us);
         conn.upstream_us = static_cast<u32>(elapsed_us);
         conn.upstream_start_us = 0;
         if constexpr (requires { loop->study_note_first_response(conn, first_response_us); }) {

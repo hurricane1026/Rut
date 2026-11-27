@@ -1,5 +1,6 @@
 #include "rut/runtime/access_log.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/integer_conversion.h"
 #include "rut/common/range_int.h"
 #include "rut/runtime/access_log_host.h"
@@ -27,7 +28,7 @@ namespace rut {
 
 static u64 saturating_mul_u64(u64 value, u64 scale) {
     u64 result = 0;
-    return __builtin_mul_overflow(value, scale, &result) ? UINT64_MAX : result;
+    return mul_overflow(value, scale, &result) ? UINT64_MAX : result;
 }
 
 static u64 timespec_to_units(const timespec& ts, u64 scale) {
@@ -38,7 +39,7 @@ static u64 timespec_to_units(const timespec& ts, u64 scale) {
     const u64 whole = saturating_mul_u64(seconds, scale);
     if (whole == UINT64_MAX) return UINT64_MAX;
     u64 result = 0;
-    if (__builtin_add_overflow(whole, fraction, &result)) return UINT64_MAX;
+    if (add_overflow(whole, fraction, &result)) return UINT64_MAX;
     return result;
 }
 

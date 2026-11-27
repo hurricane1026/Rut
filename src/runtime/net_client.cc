@@ -1,5 +1,6 @@
 #include "rut/runtime/net_client.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/platform/socket.h"
 #include "rut/runtime/https_fetch.h"
 #include "rut/runtime/json.h"
@@ -133,7 +134,8 @@ void NetClientWorker::adopt_config(const void* config) {
     // Epoch zero disables reuse. Never wrap into an old pool generation.
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_RELAXED);
     u64 next = 0;
-    if (epoch) (void)__builtin_add_overflow(epoch, u64{1}, &next);
+    // RUT_INTEGER_RANGE: existing caller discards the overflow status.
+    if (epoch) (void)add_overflow(epoch, u64{1}, &next);
     __atomic_store_n(&pool_epoch, next, __ATOMIC_RELEASE);
 }
 void NetClientWorker::cancel(u32 owner, u64 generation) {
@@ -187,8 +189,8 @@ NetReply NetClientWorker::call(u32 owner,
             }
             u64 elapsed = 0;
             u64 remaining;
-            if (__builtin_sub_overflow(now, s.started, &elapsed) ||
-                __builtin_sub_overflow(s.timeout, elapsed, &remaining) || remaining == 0) {
+            if (sub_overflow(now, s.started, &elapsed) ||
+                sub_overflow(s.timeout, elapsed, &remaining) || remaining == 0) {
                 __atomic_store_n(&s.phase, static_cast<u32>(Cancelled), __ATOMIC_RELEASE);
                 reply.status = -2;
                 return reply;
@@ -288,10 +290,9 @@ void NetClientWorker::sweep(u64 now) {
     const u64 epoch = __atomic_load_n(&pool_epoch, __ATOMIC_ACQUIRE);
     for (auto& p : parked) {
         u64 idle = 0;
-        if (p.fd >= 0 &&
-            (!now || !epoch || p.epoch != epoch || now < p.since ||
-             (__builtin_sub_overflow(now, p.since, &idle) || idle >= p.endpoint.pool_idle_ms) ||
-             (p.dns_expires && now >= p.dns_expires)))
+        if (p.fd >= 0 && (!now || !epoch || p.epoch != epoch || now < p.since ||
+                          (sub_overflow(now, p.since, &idle) || idle >= p.endpoint.pool_idle_ms) ||
+                          (p.dns_expires && now >= p.dns_expires)))
             close(p);
     }
 }
@@ -315,7 +316,7 @@ bool NetClientWorker::borrow(Slot& s) {
             continue;
         const u64 now = jwt_monotonic_ms();
         u64 idle = 0;
-        if (!now || now < p.since || __builtin_sub_overflow(now, p.since, &idle) ||
+        if (!now || now < p.since || sub_overflow(now, p.since, &idle) ||
             idle >= p.endpoint.pool_idle_ms || !clean(p.fd, p.ssl)) {
             close(p);
             continue;
@@ -388,7 +389,7 @@ void NetClientWorker::run() {
             const u64 now = jwt_monotonic_ms();
             bool complete = false;
             u64 elapsed = 0;
-            if (!now || now < s.started || __builtin_sub_overflow(now, s.started, &elapsed) ||
+            if (!now || now < s.started || sub_overflow(now, s.started, &elapsed) ||
                 elapsed >= s.timeout) {
                 s.reply.status = -2;
                 complete = true;
