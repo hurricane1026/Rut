@@ -705,6 +705,16 @@ set_tests_properties(test_cli_connection_capacity PROPERTIES
     TIMEOUT 45)
 endif()
 
+add_test(
+    NAME test_cli_upstream_pool_capacity
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_upstream_pool_capacity.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_upstream_pool_capacity PROPERTIES
+    LABELS "cli"
+    RUN_SERIAL TRUE
+    TIMEOUT 45)
+
 # Single-shard exclusive listeners and multi-shard SO_REUSEPORT startup.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(

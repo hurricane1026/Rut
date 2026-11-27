@@ -16506,7 +16506,8 @@ struct ScopedProxyLoop {
                i32 iters,
                bool enable_reuse = false,
                const ListenerSpec* declared_listener = nullptr,
-               TlsServerContext* tls = nullptr) {
+               TlsServerContext* tls = nullptr,
+               u32 upstream_capacity = UpstreamPool::kMaxConns) {
         loop = create_real_loop();
         if (loop == nullptr) return false;
         auto lfd_result = create_listen_socket(0);
@@ -16524,7 +16525,7 @@ struct ScopedProxyLoop {
         loop->tls_server = tls;
         if (enable_reuse) {
             pool = new UpstreamPool();
-            pool->init();
+            pool->init(upstream_capacity);
             loop->upstream = pool;  // enable HTTP/1 idle upstream connection reuse
         }
         if (declared_listener != nullptr) {
@@ -17196,6 +17197,46 @@ TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
     CHECK_EQ(proxy.pool->idle_count, 1u);      // parked for the next request
 
     proxy.teardown();
+}
+
+// A zero limit closes each completed upstream; a positive limit permits reuse.
+TEST(proxy_reuse, configurable_idle_capacity_controls_reuse) {
+    for (u32 capacity : {0u, 1u}) {
+        KeepAliveCountingUpstream backend;
+        REQUIRE(backend.setup());
+        RouteConfig cfg{};
+        auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+        REQUIRE(uid.has_value());
+        REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+        const RouteConfig* active = &cfg;
+        ScopedProxyLoop proxy;
+        REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, nullptr, nullptr, capacity));
+        i32 c = connect_to(proxy.port);
+        REQUIRE(c >= 0);
+        set_socket_timeouts(c, 2);
+        for (int i = 0; i < 3; ++i) {
+            const char req[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+            REQUIRE(send_all(c, req, sizeof(req) - 1));
+            char buf[1024];
+            u32 n = 0;
+            u32 header_end = 0;
+            while (n < sizeof(buf) && header_end == 0) {
+                REQUIRE_EQ(recv_timeout(c, buf + n, 1, 2000), 1);
+                ++n;
+                if (n >= 4 && buf[n - 4] == '\r' && buf[n - 3] == '\n' && buf[n - 2] == '\r' &&
+                    buf[n - 1] == '\n')
+                    header_end = n;
+            }
+            REQUIRE_GT(header_end, 0u);
+            CHECK(buf_contains(buf, n, "200", 3));
+            for (u32 j = 0; j < 2; ++j) REQUIRE_EQ(recv_timeout(c, buf, 1, 2000), 1);
+        }
+        close(c);
+        usleep(50000);
+        CHECK_EQ(backend.accept_count.load(), capacity == 0 ? 3 : 1);
+        CHECK_EQ(proxy.pool->idle_count, capacity);
+        proxy.teardown();
+    }
 }
 
 // Once a response byte arrives over a reused upstream, the retry copy of the forwarded

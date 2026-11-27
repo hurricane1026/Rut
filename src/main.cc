@@ -399,6 +399,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    u32 connection_capacity,
                                    bool upstream_idle_timeout_set,
                                    u32 upstream_idle_timeout,
+                                   u32 upstream_pool_capacity,
                                    TlsServerContext* tls_server,
                                    bool allow_io_uring_fallback,
                                    const char* access_log_path,
@@ -456,7 +457,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         }
         shards[i].owns_listen_fd = true;
 
-        auto rc = shards[i].init(i, lfd, pool_prealloc, connection_capacity);
+        auto rc =
+            shards[i].init(i, lfd, pool_prealloc, connection_capacity, upstream_pool_capacity);
         if (rc) {
             shards[i].upstream->idle_timeout_configured = upstream_idle_timeout_set;
             shards[i].upstream->idle_timeout_sec = upstream_idle_timeout;
@@ -997,6 +999,8 @@ int main(int argc, char** argv) {
     u32 connection_capacity = kDefaultConnectionCapacity;
     bool upstream_idle_timeout_set = false;
     u32 upstream_idle_timeout = 0;
+    u32 upstream_pool_capacity = UpstreamPool::kMaxConns;
+    bool upstream_pool_capacity_specified = false;
     const char* tls_cert_path = nullptr;
     const char* tls_key_path = nullptr;
     const char* tls_client_ca_path = nullptr;
@@ -1035,7 +1039,7 @@ int main(int argc, char** argv) {
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
     //                      [--shards N] [--no-pin] [--drain N]
-    //                      [--max-connections-per-shard N]
+    //                      [--max-connections-per-shard N] [--upstream-keepalive-pool-size N]
     //                      [--tls-cert PATH] [--tls-key PATH] [--tls-client-ca PATH]
     //                      [--tls-client-crl PATH] [--tls-client-crl-verify-issuer]
     //                      [--access-log PATH | --access-log-syslog ENDPOINT]
@@ -1223,6 +1227,30 @@ int main(int argc, char** argv) {
 #endif
                 connection_capacity = parsed;
                 i++;
+            } else if (str_eq(argv[i], "--upstream-keepalive-pool-size")) {
+                if (upstream_pool_capacity_specified) {
+                    write_str("--upstream-keepalive-pool-size specified twice\n");
+                    return 1;
+                }
+                upstream_pool_capacity_specified = true;
+                const char* value = argv[i + 1];
+                if (!is_all_digits(value)) {
+                    write_str(
+                        "--upstream-keepalive-pool-size requires a decimal integer between 0 and "
+                        "4096\n");
+                    return 1;
+                }
+                u32 parsed = 0;
+                for (const char* p = value; *p; ++p) {
+                    const u32 digit = static_cast<u32>(*p - '0');
+                    if (parsed > (UpstreamPool::kMaxConns - digit) / 10u) {
+                        write_str("--upstream-keepalive-pool-size must be between 0 and 4096\n");
+                        return 1;
+                    }
+                    parsed = parsed * 10u + digit;
+                }
+                upstream_pool_capacity = parsed;
+                ++i;
             } else if (str_eq(argv[i], "--access-log")) {
                 if (i + 1 >= argc || starts_with_dash_dash(argv[i + 1])) {
                     write_str("--access-log requires a path argument\n");
@@ -1318,7 +1346,8 @@ int main(int argc, char** argv) {
                 str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level") ||
                 str_eq(argv[i], "--access-log-syslog") ||
                 str_eq(argv[i], "--access-log-syslog-format") || str_eq(argv[i], "--opt") ||
-                str_eq(argv[i], "--max-connections-per-shard")) {
+                str_eq(argv[i], "--max-connections-per-shard") ||
+                str_eq(argv[i], "--upstream-keepalive-pool-size")) {
                 if (str_eq(argv[i], "--max-connections-per-shard"))
                     write_str("--max-connections-per-shard capacity requires an argument\n");
                 else {
@@ -1672,6 +1701,7 @@ int main(int argc, char** argv) {
                                           connection_capacity,
                                           upstream_idle_timeout_set,
                                           upstream_idle_timeout,
+                                          upstream_pool_capacity,
                                           tls_server,
                                           false,
                                           access_log_path,
@@ -1708,6 +1738,7 @@ int main(int argc, char** argv) {
             connection_capacity,
             upstream_idle_timeout_set,
             upstream_idle_timeout,
+            upstream_pool_capacity,
             tls_server,
             tls_server != nullptr && backend_selection == BackendSelection::Auto,
             access_log_path,
@@ -1732,6 +1763,7 @@ int main(int argc, char** argv) {
                                                  connection_capacity,
                                                  upstream_idle_timeout_set,
                                                  upstream_idle_timeout,
+                                                 upstream_pool_capacity,
                                                  tls_server,
                                                  false,
                                                  access_log_path,
@@ -1756,6 +1788,7 @@ int main(int argc, char** argv) {
                                              connection_capacity,
                                              upstream_idle_timeout_set,
                                              upstream_idle_timeout,
+                                             upstream_pool_capacity,
                                              tls_server,
                                              false,
                                              access_log_path,

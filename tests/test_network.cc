@@ -17579,6 +17579,39 @@ TEST(tls, server_socket_bio_reports_epipe_without_sigpipe) {
 
 // === UpstreamPool ===
 
+TEST(upstream_pool, endpoint_capacity_and_release) {
+    UpstreamPool pool;
+    pool.init(1);
+    i32 a[2], b[2], c[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, a), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, b), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, c), 0);
+    REQUIRE(pool.put_idle(a[0], 1, 0, 0));
+    CHECK(!pool.put_idle(b[0], 1, 0, 0));
+    CHECK(!pool.put_idle(b[0], RouteConfig::kMaxUpstreams, 0, 0));
+    CHECK(!pool.put_idle(b[0], 1, UpstreamTarget::kMaxBackends, 0));
+    REQUIRE(pool.put_idle(b[0], 1, 1, 0));
+    REQUIRE(pool.put_idle(c[0], 2, 0, 0));
+    CHECK_EQ(pool.take_idle(1, 0), a[0]);
+    REQUIRE(pool.put_idle(a[0], 1, 0, 0));
+    pool.sweep(10, 1);
+    CHECK_EQ(pool.idle_count, 0u);
+    for (i32* sv : {a, b, c}) close(sv[1]);
+    i32 fd = dup(2);
+    REQUIRE(fd >= 0);
+    REQUIRE(pool.put_idle(fd, 1, 0, 0));
+    pool.drain();
+    fd = dup(2);
+    REQUIRE(fd >= 0);
+    REQUIRE(pool.put_idle(fd, 1, 0, 0));
+    pool.shutdown();
+    pool.init(0);
+    fd = dup(2);
+    REQUIRE(fd >= 0);
+    CHECK(!pool.put_idle(fd, 1, 0, 0));
+    CHECK_EQ(close(fd), 0);  // rejected ownership remains with caller
+}
+
 TEST(upstream_pool, put_take_roundtrip) {
     UpstreamPool pool;
     pool.init();
