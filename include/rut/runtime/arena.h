@@ -117,39 +117,16 @@ struct Arena {
         return {};
     }
 
-    // Bump allocate, 8-byte aligned.
+    // Bump allocate, 8-byte aligned. Negative requests convert above the
+    // unsigned limit enforced by the shared allocation entry point.
     [[nodiscard]] void* alloc(i64 requested_size) {
-        if (!current) return nullptr;
-        constexpr i64 kAlignment = 8;
-        constexpr auto kAlignmentPadding =
-            range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
-        range_int<0, kI64ExclusiveEnd - (kAlignment - 1)> request;
-        if (!decltype(request)::try_from_i64(requested_size, &request)) return nullptr;
-        const auto padded = request + kAlignmentPadding;
-        const i64 aligned_size = padded.value() / kAlignment * kAlignment;
-        if (aligned_size <= current->remaining()) {
-            void* p = current->data() + current->used;
-            current->used += aligned_size;
-            return p;
-        }
-        i64 needed;
-        if (add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
-        // alloc_block releases undersized blocks before returning, so any returned block
-        // has at least aligned_size bytes of payload.
-        Block* b = alloc_block(needed, current);
-        if (!b) return nullptr;
-        b->used = aligned_size;
-        current = b;
-        return b->data();
+        return alloc_unsigned(static_cast<u64>(requested_size));
     }
 
-    // Validate a full-width unsigned size at callers such as sizeof and mmap.
     template <typename Size>
         requires(__is_same(Size, unsigned long) || __is_same(Size, unsigned long long))
     [[nodiscard]] void* alloc(Size requested_size) {
-        i64 size;
-        if (!try_u64_to_i64(requested_size, &size)) return nullptr;
-        return alloc(size);
+        return alloc_unsigned(requested_size);
     }
 
     // Typed bump alloc + placement new.
@@ -217,6 +194,31 @@ struct Arena {
     u64 space_allocated() const { return total_allocated; }
 
 private:
+    [[nodiscard]] void* alloc_unsigned(u64 requested_size) {
+        if (!current) return nullptr;
+        constexpr i64 kAlignment = 8;
+        constexpr auto kAlignmentPadding =
+            range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
+        range_int<0, kI64ExclusiveEnd - (kAlignment - 1)> request;
+        if (!decltype(request)::try_from_u64(requested_size, &request)) return nullptr;
+        const auto padded = request + kAlignmentPadding;
+        const i64 aligned_size = padded.value() / kAlignment * kAlignment;
+        if (aligned_size <= current->remaining()) {
+            void* p = current->data() + current->used;
+            current->used += aligned_size;
+            return p;
+        }
+        i64 needed;
+        if (add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
+        // alloc_block releases undersized blocks before returning, so any returned block
+        // has at least aligned_size bytes of payload.
+        Block* b = alloc_block(needed, current);
+        if (!b) return nullptr;
+        b->used = aligned_size;
+        current = b;
+        return b->data();
+    }
+
     [[nodiscard]] Block* alloc_block(i64 needed, Block* prev) {
         u64 actual_size = 0;
         u8* mem = backend.acquire(static_cast<u64>(needed), &actual_size);
