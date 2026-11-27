@@ -28,6 +28,26 @@ inline constexpr i64 kRangeSourceBegin =
 struct RangeProof {};
 inline constexpr RangeProof kRangeProof{};
 
+constexpr __int128_t min_product(__int128_t a, __int128_t b, __int128_t c, __int128_t d) {
+    const auto kFirst = a < b ? a : b;
+    const auto kSecond = c < d ? c : d;
+    return kFirst < kSecond ? kFirst : kSecond;
+}
+
+constexpr __int128_t max_product(__int128_t a, __int128_t b, __int128_t c, __int128_t d) {
+    const auto kFirst = a > b ? a : b;
+    const auto kSecond = c > d ? c : d;
+    return kFirst > kSecond ? kFirst : kSecond;
+}
+
+template <i64 A, __int128_t B, i64 C, __int128_t D>
+struct ProductRange {
+    static constexpr auto kMin =
+        min_product(__int128_t{A} * C, A*(D - 1), (B - 1) * C, (B - 1) * (D - 1));
+    static constexpr auto kMax =
+        max_product(__int128_t{A} * C, A*(D - 1), (B - 1) * C, (B - 1) * (D - 1));
+};
+
 }  // namespace detail
 
 // An i64 in the half-open interval [Begin, End). Omitting End leaves the
@@ -83,8 +103,9 @@ public:
         requires(Factor >= 0 && static_cast<__int128_t>(Begin) * Factor >= INT64_MIN &&
                  (End - 1) * Factor <= INT64_MAX)
     constexpr auto scaled_by() const {
-        return range_int<Begin * Factor, (End - 1) * Factor + 1>(detail::kRangeProof,
-                                                                 value_ * Factor);
+        // RUT_INTEGER_RANGE: the requires clause bounds the product of both endpoints.
+        const i64 kResult = value_ * Factor;
+        return range_int<Begin * Factor, (End - 1) * Factor + 1>(detail::kRangeProof, kResult);
     }
 
     // The conversion functions require a writable output and write only on success.
@@ -108,6 +129,13 @@ public:
     }
 
     constexpr i64 value() const { return value_; }
+
+    // Only expose the conversion if the destination can represent every value.
+    template <detail::RangeSource T>
+        requires(Begin >= detail::kRangeSourceBegin<T> && End <= detail::kRangeSourceEnd<T>)
+    constexpr T to() const {
+        return static_cast<T>(value_);
+    }
 
     constexpr u64 to_u64() const
         requires(Begin >= 0)
@@ -134,15 +162,27 @@ public:
         requires(static_cast<__int128_t>(Begin) + OtherBegin >= INT64_MIN &&
                  End + OtherEnd - 1 <= kI64ExclusiveEnd)
     constexpr auto operator+(range_int<OtherBegin, OtherEnd> other) const {
-        return range_int<Begin + OtherBegin, End + OtherEnd - 1>(detail::kRangeProof,
-                                                                 value_ + other.value());
+        // RUT_INTEGER_RANGE: the requires clause bounds the sum of both operand ranges.
+        const i64 kResult = value_ + other.value();
+        return range_int<Begin + OtherBegin, End + OtherEnd - 1>(detail::kRangeProof, kResult);
     }
 
     template <i64 OtherBegin, __int128_t OtherEnd>
         requires(Begin - (OtherEnd - 1) >= INT64_MIN && End - OtherBegin <= kI64ExclusiveEnd)
     constexpr auto operator-(range_int<OtherBegin, OtherEnd> other) const {
-        return range_int<Begin - (OtherEnd - 1), End - OtherBegin>(detail::kRangeProof,
-                                                                   value_ - other.value());
+        // RUT_INTEGER_RANGE: the requires clause bounds the difference of both operand ranges.
+        const i64 kResult = value_ - other.value();
+        return range_int<Begin - (OtherEnd - 1), End - OtherBegin>(detail::kRangeProof, kResult);
+    }
+
+    template <i64 OtherBegin, __int128_t OtherEnd>
+        requires(detail::ProductRange<Begin, End, OtherBegin, OtherEnd>::kMin >= INT64_MIN &&
+                 detail::ProductRange<Begin, End, OtherBegin, OtherEnd>::kMax <= INT64_MAX)
+    constexpr auto operator*(range_int<OtherBegin, OtherEnd> other) const {
+        using Product = detail::ProductRange<Begin, End, OtherBegin, OtherEnd>;
+        // RUT_INTEGER_RANGE: the requires clause checks all four endpoint products.
+        const i64 kResult = value_ * other.value();
+        return range_int<Product::kMin, Product::kMax + 1>(detail::kRangeProof, kResult);
     }
 };
 

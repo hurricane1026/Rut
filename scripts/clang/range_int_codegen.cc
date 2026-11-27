@@ -1,3 +1,4 @@
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 
 using namespace rut;
@@ -128,6 +129,66 @@ Full compare_add(Signed left, Small right) {
 
 Full compare_subtract(Signed left, Small right) {
     return left - right;
+}
+
+Full compare_multiply(Signed left, Small right) {
+    return left * right;
+}
+
+bool compare_checked_add(i64 left, i64 right, i64* out) {
+#ifdef RUT_USE_RANGE_INT
+    return add_overflow(left, right, out);
+#else
+    return __builtin_add_overflow(left, right, out);
+#endif
+}
+
+bool compare_checked_subtract(u64 left, u64 right, u64* out) {
+#ifdef RUT_USE_RANGE_INT
+    return sub_overflow(left, right, out);
+#else
+    return __builtin_sub_overflow(left, right, out);
+#endif
+}
+
+bool compare_checked_multiply(i32 left, i32 right, i32* out) {
+#ifdef RUT_USE_RANGE_INT
+    return mul_overflow(left, right, out);
+#else
+    return __builtin_mul_overflow(left, right, out);
+#endif
+}
+
+u32 compare_wrapping_add(u32 left, u32 right) {
+#ifdef RUT_USE_RANGE_INT
+    return wrapping_add(left, right);
+#else
+    return left + right;
+#endif
+}
+
+u64 compare_wrapping_sub(u64 left, u64 right) {
+#ifdef RUT_USE_RANGE_INT
+    return wrapping_sub(left, right);
+#else
+    return left - right;
+#endif
+}
+
+u64 compare_wrapping_multiply(u64 left, u64 right) {
+#ifdef RUT_USE_RANGE_INT
+    return wrapping_mul(left, right);
+#else
+    return left * right;
+#endif
+}
+
+u32 compare_proven_narrow(u16 left, u16 right) {
+#ifdef RUT_USE_RANGE_INT
+    return (range_int(left) + range_int(right)).to<u32>();
+#else
+    return u32{left} + u32{right};
+#endif
 }
 
 Full compare_scale(Signed value) {
