@@ -703,3 +703,23 @@ TEST(buffer, allocation_and_offsets_above_u32) {
     CHECK_EQ(buffer.len(), 0);
     CHECK_EQ(munmap(allocation, kCapacity), 0);
 }
+
+TEST(buffer, negative_copy_lengths_leave_state_unchanged) {
+    u8 storage[4]{};
+    const u8 src[] = {1, 2};
+    u8 out[] = {9, 9};
+    Buffer buffer(storage, sizeof(storage));
+    REQUIRE_EQ(buffer.write(src, sizeof(src)), 2);
+    CHECK_EQ(buffer.write(src, INT64_MIN), 0);
+    CHECK_EQ(buffer.read(out, -1), 0);
+    buffer.consume(-1);
+    CHECK_EQ(buffer.len(), 2);
+    CHECK_EQ(buffer.write_avail(), 2);
+    CHECK_EQ(out[0], 9);
+    CHECK_EQ(storage[0], 1);
+
+    const auto view = buffer.release();
+    CHECK_EQ(view.read(out, INT64_MIN), 0);
+    CHECK_EQ(view.len(), 2);
+    CHECK_EQ(out[0], 9);
+}

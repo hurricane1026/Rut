@@ -48,11 +48,10 @@ struct BasicView {
 
     // Read: copy data out of the view.
     [[nodiscard]] Size read(u8* dst, i64 max) const noexcept {
-        range_int<0> limit;
-        if (!ptr_ || !range_int<0>::try_from_i64(max, &limit)) return 0;
-        const auto kRead = len_.min(limit);
-        if (kRead.value()) __builtin_memmove(dst, ptr_, kRead.to_u64());
-        return kRead.template to<Size>();
+        BufferLength<Size> count;
+        if (!ptr_ || !len_.try_nonempty_prefix(max, &count)) return 0;
+        __builtin_memmove(dst, ptr_, count.to_u64());
+        return count.template to<Size>();
     }
 
     [[nodiscard]] const u8* data() const noexcept { return ptr_; }
@@ -131,11 +130,10 @@ public:
     void append_prefix(const u8* src, i64 n) noexcept { copy_prefix(src, n, nullptr); }
 
     [[nodiscard]] Size read(u8* dst, i64 max) const noexcept {
-        range_int<0> limit;
-        if (!ptr_ || !range_int<0>::try_from_i64(max, &limit)) return 0;
-        const auto kRead = len_.min(limit);
-        if (kRead.value()) __builtin_memmove(dst, ptr_, kRead.to_u64());
-        return kRead.template to<Size>();
+        BufferLength<Size> count;
+        if (!ptr_ || !len_.try_nonempty_prefix(max, &count)) return 0;
+        __builtin_memmove(dst, ptr_, count.to_u64());
+        return count.template to<Size>();
     }
 
     // Release: create BasicView<Size>, lock writes. BasicView<Size> destructor auto-unlocks.
@@ -174,29 +172,24 @@ public:
         if (released_) commit_failed("buffer has a live view", n);
         if (!ptr_) commit_failed("buffer has no storage", n);
         const auto kAvailable = available();
-        range_int<0> written;
-        if (!range_int<0>::try_from_i64(n, &written) || n > kAvailable.value())
-            commit_failed("write exceeds capacity", n);
-        advance(kAvailable, written.min(kAvailable));
+        Length written;
+        if (!kAvailable.try_count(n, &written)) commit_failed("write exceeds capacity", n);
+        advance(kAvailable, written);
     }
 
     // Set the absolute length after an in-place edit.
     void set_len(i64 n) noexcept {
-        if (released_ || !ptr_ || n > cap_.value() || !Length::try_from_i64(n, &len_))
-            __builtin_trap();
+        if (released_ || !ptr_ || !cap_.try_count(n, &len_)) __builtin_trap();
     }
 
     // Drop the first n already-consumed bytes, shifting the remainder to the front.
     void consume(i64 n) noexcept {
         if (released_) __builtin_trap();
-        range_int<0> consumed;
-        if (!range_int<0>::try_from_i64(n, &consumed) || n == 0) return;
-        if (n >= len_.value()) {
-            len_ = {};
-            return;
-        }
-        const auto kRemaining = (len_ - consumed.min(len_)).max(range_int<0, 1>{});
-        __builtin_memmove(ptr_, ptr_ + consumed.index(), kRemaining.to_u64());
+        Length consumed;
+        if (!len_.try_nonempty_prefix(n, &consumed)) return;
+        const auto kRemaining = (len_ - consumed).max(range_int<0, 1>{});
+        if (kRemaining.value())
+            __builtin_memmove(ptr_, ptr_ + consumed.index(), kRemaining.to_u64());
         len_ = kRemaining;
     }
 
@@ -242,15 +235,12 @@ private:
     void copy_prefix(const u8* src, i64 n, Length* copied) noexcept {
         if (released_) __builtin_trap();
         if (!ptr_) return;
-        range_int<0> requested;
-        if (!range_int<0>::try_from_i64(n, &requested)) return;
         const auto kAvailable = available();
-        const auto kWritten = kAvailable.min(requested);
-        if (kWritten.value()) {
-            __builtin_memmove(ptr_ + len_.index(), src, kWritten.to_u64());
-            advance(kAvailable, kWritten);
-        }
-        if (copied) *copied = kWritten;
+        Length written;
+        if (!kAvailable.try_nonempty_prefix(n, &written)) return;
+        __builtin_memmove(ptr_ + len_.index(), src, written.to_u64());
+        advance(kAvailable, written);
+        if (copied) *copied = written;
     }
 
     [[noreturn, gnu::cold, gnu::noinline]] void commit_failed(const char* reason,

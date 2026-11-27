@@ -110,7 +110,12 @@ public:
 
     // The conversion functions require a writable output and write only on success.
     [[nodiscard]] static constexpr bool try_from_i64(i64 value, range_int* out) {
-        if (value < Begin || value >= End) return false;
+        if constexpr (Begin == 0) {
+            // A negative i64 maps above every nonnegative i64.
+            if (static_cast<u64>(value) >= static_cast<u64>(End)) return false;
+        } else if (value < Begin || value >= End) {
+            return false;
+        }
         out->value_ = value;
         return true;
     }
@@ -126,6 +131,26 @@ public:
             }
             return try_u64_to_i64(value, &out->value_);
         }
+    }
+
+    // Accept a count no larger than this limit, including zero.
+    [[nodiscard]] constexpr bool try_count(i64 count, range_int* out) const
+        requires(Begin == 0)
+    {
+        if (static_cast<u64>(count) > to_u64()) return false;
+        out->value_ = count;
+        return true;
+    }
+
+    // Select the prefix that fits and skip empty copies with the same guard
+    // that rejects negative requests.
+    [[nodiscard]] constexpr bool try_nonempty_prefix(i64 requested, range_int* out) const
+        requires(Begin == 0)
+    {
+        const i64 kPrefix = requested < value_ ? requested : value_;
+        if (kPrefix <= 0) return false;
+        out->value_ = kPrefix;
+        return true;
     }
 
     constexpr i64 value() const { return value_; }
