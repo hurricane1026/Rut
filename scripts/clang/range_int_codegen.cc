@@ -433,4 +433,22 @@ u32 compare_max_for_narrowing(u32 used, u32 consumed) {
 #endif
 }
 
+bool compare_narrow_to_u32(i64 value, u32* out) {
+#ifdef RUT_USE_RANGE_INT
+    return range_int(value).to(out);
+#else
+    if (value < 0 || value > UINT32_MAX) return false;
+    *out = static_cast<u32>(value);
+    return true;
+#endif
+}
+
+u32 compare_divided_by_for_narrowing(u32 value) {
+#ifdef RUT_USE_RANGE_INT
+    return (range_int(value) + range_int<999, 1000>{}).divided_by<1000>().to<u32>();
+#else
+    return static_cast<u32>((i64{value} + 999) / 1000);
+#endif
+}
+
 }  // extern "C"

@@ -85,9 +85,8 @@ static inline core::Expected<u32, Error> parse_uint(const u8* p, u32 len) {
         if (UNLIKELY(digit.value() < 0 || digit.value() > 9))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::HttpParser));
         const auto next = range_int(val).scaled_by<10>() + digit;
-        if (UNLIKELY(next.value() > UINT32_MAX))
+        if (UNLIKELY(!next.to(&val)))
             return core::make_unexpected(Error::make(ERANGE, Error::Source::HttpParser));
-        val = static_cast<u32>(next.value());
     }
     return val;
 }

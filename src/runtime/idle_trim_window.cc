@@ -10,6 +10,7 @@ namespace {
 // Independently arm one timer at every possible age, from oldest to
 // youngest. Compare its expiry to the next tick the sweep plans to visit.
 consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
+    constexpr i64 kCycle = i64{1} << 32;
     const auto kWindow = idle_trim_window(cursor, timeout);
     u32 next = kWindow.begin;
     for (u32 age = TimerWheel::kSlots; age != 0;) {
@@ -19,11 +20,11 @@ consteval bool matches_armed_timers(u32 cursor, u32 timeout) {
             static_cast<i64>(age) - static_cast<i64>(IdleTrimWindow::kMinIdleTicks) >=
                 static_cast<i64>(IdleTrimWindow::kAgeWindow))
             continue;
-        const auto kArmedAt = range_int(cursor) - range_int(age);
-        const auto kExpiry = kArmedAt + range_int(timeout);
-        const u32 kExpected = static_cast<u32>(kExpiry.value());
+        const auto kExpiry = range_int(cursor) - range_int(age) + range_int(timeout) +
+                             range_int<kCycle, kCycle + 1>{};
+        const u32 kExpected = bounded_remainder<kCycle>(kExpiry.to_u64()).to<u32>();
         if (next == kWindow.end || next != kExpected) return false;
-        next = static_cast<u32>((range_int(next) + range_int<1, 2>{}).value());
+        next = bounded_remainder<kCycle>((range_int(next) + range_int<1, 2>{}).to_u64()).to<u32>();
     }
     return next == kWindow.end;
 }

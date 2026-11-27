@@ -111,12 +111,15 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
     constexpr auto kOne = range_int<1, 2>{};
     constexpr auto kTwo = range_int<2, 3>{};
     constexpr auto kThree = range_int<3, 4>{};
-    auto after = [&](auto step) { return (range_int(pos) + step).value(); };
+    const auto end = range_int(source.len);
+    const auto location_limit = (end + kOne).min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{});
+    auto position_after = [&](auto step) { return range_int(pos) + step; };
+    auto after = [&](auto step) { return position_after(step).value(); };
     // Callers prove that the step consumes existing bytes. The length
     // guard leaves room for the one-based line and column at EOF.
     auto advance = [&](auto step) {
-        pos = static_cast<u32>(after(step));
-        col = static_cast<u32>((range_int(col) + step).value());
+        pos = position_after(step).min(end).template to<u32>();
+        col = (range_int(col) + step).min(location_limit).template to<u32>();
     };
 
     while (pos < source.len) {
@@ -124,8 +127,8 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
 
         if (is_space(c)) {
             if (c == '\n') {
-                line = static_cast<u32>((range_int(line) + kOne).value());
-                pos = static_cast<u32>(after(kOne));
+                line = (range_int(line) + kOne).min(location_limit).to<u32>();
+                pos = position_after(kOne).min(end).to<u32>();
                 col = 1;
             } else {
                 advance(kOne);
@@ -150,10 +153,10 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             source.ptr[after(kTwo)] == '"') {
             const u32 literal_start = pos;
             const u32 literal_col = col;
-            const u32 quote_start = static_cast<u32>(after(kTwo));
+            const u32 quote_start = position_after(kTwo).min(end).to<u32>();
             advance(kThree);
-            tok.start = static_cast<u32>((range_int(quote_start) + kOne).value());
-            tok.col = static_cast<u32>((range_int(tok.col) + kThree).value());
+            tok.start = (range_int(quote_start) + kOne).min(end).to<u32>();
+            tok.col = (range_int(tok.col) + kThree).min(location_limit).to<u32>();
             while (pos < source.len) {
                 const char cur = source.ptr[pos];
                 if (cur == '"') break;
@@ -261,16 +264,16 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
             u32 unit_end = pos;
             if (after(kOne) < source.len && source.ptr[pos] == 'm' &&
                 source.ptr[after(kOne)] == 's' && is_boundary(after(kTwo))) {
-                unit_end = static_cast<u32>(after(kTwo));
+                unit_end = position_after(kTwo).min(end).to<u32>();
                 dur_matched = true;
             } else if (pos < source.len && is_boundary(after(kOne)) &&
                        (source.ptr[pos] == 's' || source.ptr[pos] == 'm' ||
                         source.ptr[pos] == 'h')) {
-                unit_end = static_cast<u32>(after(kOne));
+                unit_end = position_after(kOne).min(end).to<u32>();
                 dur_matched = true;
             }
             if (dur_matched) {
-                advance(range_int(unit_end) - range_int(pos));
+                advance((range_int(unit_end) - range_int(pos)).max(range_int<0, 1>{}));
                 tok.end = pos;
                 tok.text = source.slice(tok.start, tok.end);
                 // Duration is a distinct domain literal with decimal digits
@@ -315,8 +318,8 @@ FrontendResult<void> lex_into(Str source, LexedTokens& out) {
                                       Span{quote_start, pos, tok.line, tok.col});
             }
             tok.type = TokenType::StringLit;
-            tok.start = static_cast<u32>((range_int(quote_start) + kOne).value());
-            tok.col = static_cast<u32>((range_int(tok.col) + kOne).value());
+            tok.start = (range_int(quote_start) + kOne).min(end).to<u32>();
+            tok.col = (range_int(tok.col) + kOne).min(location_limit).to<u32>();
             tok.end = pos;
             tok.text = source.slice(tok.start, tok.end);
             advance(kOne);

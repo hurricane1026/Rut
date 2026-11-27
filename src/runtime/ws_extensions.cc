@@ -250,7 +250,9 @@ u32 ws_rewrite_extensions(
     }
     // Shift the tail after scanning the old header; shrinking must not destroy
     // fields still being read, and growing must not overwrite early frame bytes.
-    memmove(buffer + new_header.value(), buffer + header.value(), static_cast<u32>(tail.value()));
+    memmove(buffer + new_header.value(),
+            buffer + header.value(),
+            tail.max(range_int<0, 1>{}).to<u32>());
     if (extension_value.len) {
         memcpy(buffer + static_cast<i64>(written), kPrefix.ptr, kPrefix.len);
         written = static_cast<u32>(static_cast<i64>(written) + static_cast<i64>(kPrefix.len));
@@ -261,7 +263,7 @@ u32 ws_rewrite_extensions(
         written = static_cast<u32>(static_cast<i64>(written) + 2);
     }
     memcpy(buffer + static_cast<i64>(written), "\r\n", 2);
-    return static_cast<u32>(new_header.value());
+    return new_header.max(range_int<0, 1>{}).min(range_int(capacity)).to<u32>();
 }
 
 Str ws_selected_subprotocol(const u8* header, u32 header_len) {

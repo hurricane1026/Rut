@@ -92,12 +92,16 @@ private:
         // Every call consumes an existing byte, and the entry points leave
         // room for one-based line and column positions at end of input.
         if (source_.ptr[pos_] == '\n') {
-            line_ = static_cast<u32>((range_int(line_) + kOne).value());
+            line_ = (range_int(line_) + kOne)
+                        .min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{})
+                        .to<u32>();
             col_ = 1;
         } else {
-            col_ = static_cast<u32>((range_int(col_) + kOne).value());
+            col_ = (range_int(col_) + kOne)
+                       .min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{})
+                       .to<u32>();
         }
-        pos_ = static_cast<u32>((range_int(pos_) + kOne).value());
+        pos_ = (range_int(pos_) + kOne).min(range_int<UINT32_MAX, i64{UINT32_MAX} + 1>{}).to<u32>();
     }
 
     void skip_space_and_comments() {
@@ -139,8 +143,7 @@ bool parse_canonical_ipv4_endpoint(Str endpoint, u32* ipv4_host, Str* port) {
         while (pos < endpoint.len && endpoint.ptr[pos] >= '0' && endpoint.ptr[pos] <= '9') {
             if ((range_int(pos) - range_int(start)).value() == 3) return false;
             const auto kNext = append_decimal_digit(value, endpoint.ptr[pos]);
-            if (kNext.value() > UINT8_MAX) return false;
-            value = static_cast<u8>(kNext.value());
+            if (!kNext.to(&value)) return false;
             pos++;
         }
         const auto kDigits = range_int(pos) - range_int(start);
@@ -1187,8 +1190,7 @@ private:
         for (u32 i = 0; i < text.len; i++) {
             if (text.ptr[i] < '0' || text.ptr[i] > '9') return false;
             const auto kNext = append_decimal_digit(value, text.ptr[i]);
-            if (kNext.value() > UINT16_MAX) return false;
-            value = static_cast<u16>(kNext.value());
+            if (!kNext.to(&value)) return false;
         }
         if (value == 0) return false;
         *out = value;
@@ -1216,7 +1218,8 @@ private:
             u8 seconds = 0;
             // At most two decimal digits reach this loop.
             for (u32 i = 0; i < pos; i++)
-                seconds = static_cast<u8>(append_decimal_digit(seconds, text.ptr[i]).value());
+                if (!append_decimal_digit(seconds, text.ptr[i]).to(&seconds))
+                    return TimeoutParseStatus::Invalid;
             *out = seconds;
             return TimeoutParseStatus::Ok;
         }
@@ -1248,9 +1251,8 @@ private:
             while (pos < text.len && text.ptr[pos] >= '0' && text.ptr[pos] <= '9') {
                 if (digits == 3) return UrlParseStatus::InvalidInteger;
                 const auto kNext = append_decimal_digit(value, text.ptr[pos++]);
-                if (kNext.value() > UINT8_MAX) return UrlParseStatus::InvalidInteger;
-                value = static_cast<u8>(kNext.value());
-                digits = static_cast<u8>((range_int(digits) + kOne).value());
+                if (!kNext.to(&value)) return UrlParseStatus::InvalidInteger;
+                digits = (range_int(digits) + kOne).min(range_int<3, 4>{}).to<u8>();
             }
             if (digits == 0) return UrlParseStatus::InvalidInteger;
             out.address[octet] = value;
@@ -1271,10 +1273,10 @@ private:
         if (pos == text.len) return UrlParseStatus::Ok;
         if (text.ptr[pos] != '/') return UrlParseStatus::InvalidInteger;
         out.uri = text.slice(pos, text.len);
-        out.uri_span = Span{static_cast<u32>((range_int(span.start) + range_int(pos)).value()),
-                            span.end,
-                            span.line,
-                            static_cast<u32>((range_int(span.col) + range_int(pos)).value())};
+        out.uri_span = Span{0, span.end, span.line, 0};
+        if (!(range_int(span.start) + range_int(pos)).to(&out.uri_span.start) ||
+            !(range_int(span.col) + range_int(pos)).to(&out.uri_span.col))
+            return UrlParseStatus::InvalidInteger;
         if (!parser_proxy_pass_replacement_uri_is_modeled(out.uri))
             return UrlParseStatus::InvalidUri;
         out.has_uri = true;

@@ -125,8 +125,6 @@ def main():
     parser.add_argument('--require-arithmetic-proofs', action='store_true',
                         help='fail on unannotated native arithmetic in the audit scope')
     parser.add_argument('--overflow-base', help='audit checked arithmetic on C++ lines added since the merge base')
-    parser.add_argument('--range-cast-migration-base',
-                        help='starting revision for an existing range_int migration')
     parser.add_argument('--range-cast-inventory', type=Path,
                         help='write all explicit narrowing casts derived from range_int::value()')
     args = parser.parse_args()
@@ -148,19 +146,6 @@ def main():
     base = (subprocess.check_output(['git', 'merge-base', args.overflow_base, 'HEAD'],
                                     cwd=ROOT, text=True).strip() if args.overflow_base else None)
     changed = changed_source_lines(base) if base else {}
-    range_cast_base = base
-    if args.range_cast_migration_base:
-        candidate = args.range_cast_migration_base
-        ancestry = subprocess.run(['git', 'merge-base', '--is-ancestor', candidate, 'HEAD'],
-                                  cwd=ROOT, check=False)
-        if ancestry.returncode not in (0, 1):
-            raise SystemExit('could not determine range cast migration ancestry')
-        if ancestry.returncode == 0 and (not base or subprocess.run(
-            ['git', 'merge-base', '--is-ancestor', base, candidate], cwd=ROOT, check=False
-        ).returncode == 0):
-            range_cast_base = candidate
-    range_cast_changed = (changed_source_lines(range_cast_base)
-                          if range_cast_base and range_cast_base != base else changed)
     if not changed:
         overflow_check = []
 
@@ -217,16 +202,7 @@ def main():
         args.inventory.write_text(''.join(row + '\n' for row in sorted(rows)))
     arithmetic = [site for site in sites if site[-1] in ARITHMETIC_MESSAGES]
     range_casts = [site for site in sites if site[-1] == RANGE_CAST_MESSAGE]
-    failures = [site for site in sites
-                if site[-1] not in (*ARITHMETIC_MESSAGES, RANGE_CAST_MESSAGE)]
-    for site in range_casts:
-        path, line, _, span, _ = site
-        first, last = (span[0], span[2]) if span else (line, line)
-        if not range_cast_base or any(
-            interval.start <= last and first < interval.stop
-            for interval in range_cast_changed.get(path, ()) if interval
-        ):
-            failures.append(site)
+    failures = [site for site in sites if site[-1] not in ARITHMETIC_MESSAGES]
     if args.range_cast_inventory:
         args.range_cast_inventory.write_text(''.join(
             f'{path.relative_to(ROOT)}:{line}:{column}: {message}\n'
@@ -254,9 +230,7 @@ def main():
     if args.overflow_base:
         unchecked = sum(message == OVERFLOW_MESSAGE for *_, message in failures)
         print(f'{unchecked} unchecked arithmetic result paths on changed lines')
-    new_range_casts = sum(message == RANGE_CAST_MESSAGE for *_, message in failures)
-    print(f'{new_range_casts} explicit narrowing casts without a range_int conversion '
-          f'in the enforced scope ({len(range_casts)} across production)')
+    print(f'{len(range_casts)} explicit narrowing casts without a range_int conversion')
     indices = sum(message == INDEX_MESSAGE for *_, message in failures)
     print(f'{indices} array indices bypass range_int::index() or at()')
     direct = check_builtin_locations()

@@ -40,12 +40,13 @@ namespace {
     constexpr i64 kAlignment = 16;
     constexpr auto kPadding = range_int<kAlignment - 1, kAlignment>::constant<kAlignment - 1>();
     const auto padded = range_int(codec.used) + kPadding;
-    const i64 start = padded.value() / kAlignment * kAlignment;
+    const auto aligned = padded.divided_by<kAlignment>().scaled_by<kAlignment>();
+    const i64 start = aligned.value();
     constexpr i64 kCapacity = SlicePool::kBulkSliceSize;
     if (start > kCapacity || bytes > kCapacity - start) return nullptr;
     u8* const kResult = reinterpret_cast<u8*>(&codec) + start;
     memset(kResult, 0, bytes);
-    codec.used = static_cast<u32>(start + range_int(bytes).value());
+    codec.used = (aligned + range_int(bytes)).min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     return kResult;
 }
 void codec_free(voidpf, voidpf) {}

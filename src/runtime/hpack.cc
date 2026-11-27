@@ -209,7 +209,7 @@ u32 encode_integer(u8* out, u32 value, u8 prefix_bits, u8 prefix_top) {
     }
     out[0] = static_cast<u8>(prefix_top | kMask);
     const auto kRemainder = range_int(value) - range_int(kMask);
-    u32 remainder = static_cast<u32>(kRemainder.value());
+    u32 remainder = kRemainder.max(range_int<0, 1>{}).to<u32>();
     i64 i = 1;
     while (remainder >= 128) {
         out[i++] = static_cast<u8>((remainder & 0x7f) | 0x80);
@@ -297,7 +297,7 @@ u32 decode_string(const u8* in, u32 len, u8* out, u32 cap, u32* out_len) {
         for (i64 i = 0; i < slen; i++) out[i] = data[i];
         *out_len = slen;
     }
-    return static_cast<u32>(kConsumed.value());
+    return kConsumed.min(range_int(len)).to<u32>();
 }
 
 i64 encode_string(u8* out, const u8* src, u32 len) {

@@ -240,7 +240,7 @@ ForwardAuthReply ForwardAuthWorker::authorize(u32 connection,
     reply.status = static_cast<i32>(0x80000000u);
     // Any existing slot with elapsed >= timeout returned above.
     const auto kRemaining = range_int(found->timeout_ms) - range_int(static_cast<u32>(elapsed));
-    reply.retry_ms = kRemaining.value() < 10 ? static_cast<u32>(kRemaining.value()) : 10;
+    reply.retry_ms = kRemaining.min(range_int<10, 11>{}).max(range_int<0, 1>{}).to<u32>();
     return reply;
 }
 void* ForwardAuthWorker::entry(void* self) {

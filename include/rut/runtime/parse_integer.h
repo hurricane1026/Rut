@@ -84,7 +84,7 @@ inline bool parse_integer(Str text, i64& output) {
                 __builtin_memcpy(&zeros, data, sizeof(zeros));
                 if (zeros != 0x3030303030303030ULL) break;
                 data += static_cast<i64>(8);
-                length = static_cast<u32>((range_int(length) - range_int<8, 9>{}).value());
+                length = (range_int(length) - range_int<8, 9>{}).max(range_int<0, 1>{}).to<u32>();
             }
             while (length && *data == '0') {
                 ++data;
@@ -98,7 +98,7 @@ inline bool parse_integer(Str text, i64& output) {
                 if (!Digits::read16(data, block)) return false;
                 number = block;
                 data += static_cast<i64>(16);
-                length = static_cast<u32>((range_int(length) - range_int<16, 17>{}).value());
+                length = (range_int(length) - range_int<16, 17>{}).max(range_int<0, 1>{}).to<u32>();
             }
         }
         while (length >= 8) {
@@ -106,14 +106,14 @@ inline bool parse_integer(Str text, i64& output) {
             if (!Digits::read8(data, block)) return false;
             number = integer_detail::wrap_add(number * 100000000, block);
             data += static_cast<i64>(8);
-            length = static_cast<u32>((range_int(length) - range_int<8, 9>{}).value());
+            length = (range_int(length) - range_int<8, 9>{}).max(range_int<0, 1>{}).to<u32>();
         }
         if (length >= 4) {
             u32 block;
             if (!integer_detail::digits4(data, block)) return false;
             number = integer_detail::wrap_add(number * 10000, block);
             data += static_cast<i64>(4);
-            length = static_cast<u32>((range_int(length) - range_int<4, 5>{}).value());
+            length = (range_int(length) - range_int<4, 5>{}).max(range_int<0, 1>{}).to<u32>();
         }
     }
     while (length--) {

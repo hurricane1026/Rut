@@ -7789,14 +7789,22 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
         range_int(spec.replace_prefix.len) + range_int(suffix_len) + range_int(query_len);
     const auto length_delta = new_target_len - range_int(target_len);
     const i64 delta = length_delta.value();
-    const i64 final_total = (range_int(total) + length_delta).value();
-    if (new_target_len.value() > UINT32_MAX || final_total < 0 ||
-        static_cast<u64>(final_total) > conn.recv_buf.capacity())
+    const auto final_total = range_int(total) + length_delta;
+    if (new_target_len.value() > UINT32_MAX || final_total.value() < 0 ||
+        final_total.value() > conn.recv_buf.capacity())
         return false;
 
     const u32 target_end =
         static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(target_len));
-    const u32 new_target_end = static_cast<u32>((range_int(target_start) + new_target_len).value());
+    u32 new_target_end;
+    u32 header_end;
+    u32 initial_send_len;
+    u32 buffer_len;
+    if (!(range_int(target_start) + new_target_len).to(&new_target_end) ||
+        !(range_int(conn.req_header_end) + length_delta).to(&header_end) ||
+        !(range_int(conn.req_initial_send_len) + length_delta).to(&initial_send_len) ||
+        !final_total.to(&buffer_len))
+        return false;
     const u32 suffix_start =
         static_cast<u32>(static_cast<i64>(target_start) + static_cast<i64>(spec.strip_prefix.len));
     const u32 suffix_dest = static_cast<u32>(static_cast<i64>(target_start) +
@@ -7823,10 +7831,9 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     }
     __builtin_memcpy(
         data + static_cast<i64>(target_start), spec.replace_prefix.ptr, spec.replace_prefix.len);
-    conn.recv_buf.set_len(static_cast<u32>(final_total));
-    conn.req_header_end = static_cast<u32>(static_cast<i64>(conn.req_header_end) + delta);
-    conn.req_initial_send_len =
-        static_cast<u32>(static_cast<i64>(conn.req_initial_send_len) + delta);
+    conn.recv_buf.set_len(buffer_len);
+    conn.req_header_end = header_end;
+    conn.req_initial_send_len = initial_send_len;
     if (conn.response_mutations_snapshotted) conn.retry_req_snapshot_replayable = false;
     conn.target_transform_recorded = false;
     conn.target_transform_id = 0;

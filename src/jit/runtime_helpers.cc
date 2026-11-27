@@ -250,13 +250,13 @@ void rut_helper_req_path(const u8* req_data, u32 req_len, const char** out_ptr, 
         *out_len = 1;
         return;
     }
-    i = static_cast<u32>((range_int(i) + range_int<1, 2>{}).value());
+    i = (range_int(i) + range_int<1, 2>{}).min(range_int(req_len)).to<u32>();
     u32 path_start = i;
     while (i < req_len && req_data[i] != ' ' && req_data[i] != '\r') {
         i++;
     }
     *out_ptr = reinterpret_cast<const char*>(req_data + path_start);
-    *out_len = static_cast<u32>((range_int(i) - range_int(path_start)).value());
+    *out_len = (range_int(i) - range_int(path_start)).max(range_int<0, 1>{}).to<u32>();
 }
 
 void rut_helper_req_path_only(const u8* req_data, u32 req_len, const char** out_ptr, u32* out_len) {
@@ -610,19 +610,19 @@ extern "C" u64 rut_helper_forward_auth_header(void* connection,
     while (start < length && data[start] != ' ') ++start;
     if (start == length) return 0xffffffffu;
     const Str method{reinterpret_cast<const char*>(data), start};
-    start = static_cast<u32>((range_int(start) + range_int<1, 2>{}).value());
+    start = (range_int(start) + range_int<1, 2>{}).min(range_int(length)).to<u32>();
     u32 end = start;
     while (end < length && data[end] != ' ') ++end;
     if (end == length) return 0xffffffffu;
     const auto kTargetLength = range_int(end) - range_int(start);
-    const auto reply = forward_auth_for_request(
-        connection,
-        {header, header_length},
-        policy,
-        {credential, credential_length},
-        method,
-        {reinterpret_cast<const char*>(data + start), static_cast<u32>(kTargetLength.value())},
-        timeout_ms);
+    const auto reply = forward_auth_for_request(connection,
+                                                {header, header_length},
+                                                policy,
+                                                {credential, credential_length},
+                                                method,
+                                                {reinterpret_cast<const char*>(data + start),
+                                                 kTargetLength.max(range_int<0, 1>{}).to<u32>()},
+                                                timeout_ms);
     if (reply.status == static_cast<i32>(0x80000000u))
         return (static_cast<u64>(reply.retry_ms) << 32) | 0x80000000u;
     if (reply.status == 1) {

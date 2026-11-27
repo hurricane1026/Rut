@@ -837,7 +837,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
                             st.mask_rng)) {
                 return WsInspectStatus::Error;
             }
-            *consumed = static_cast<u32>((range_int(*consumed) + frame_size).value());
+            if (!(range_int(*consumed) + frame_size).to(consumed)) return WsInspectStatus::Error;
             if (h.opcode == WsOpcode::Close) return WsInspectStatus::Close;
             continue;
         }
@@ -880,8 +880,8 @@ WsInspectStatus ws_inspect(WsInspector& st,
         // The wire bound above caps this frame, and chunk is at most the remainder.
         const u32 received = static_cast<u32>(st.partial_payload_len);
         st.partial_payload_len = (range_int(received) + range_int(chunk)).value();
-        *consumed = static_cast<u32>(
-            (range_int(*consumed) + range_int(header_len) + range_int(chunk)).value());
+        if (!(range_int(*consumed) + range_int(header_len) + range_int(chunk)).to(consumed))
+            return WsInspectStatus::Error;
         if (st.partial_payload_len < h.payload_len) {
             st.partial_data_frame = true;
             st.partial_header = h;
@@ -1191,8 +1191,8 @@ WsClosingRead ws_read_closing(
         const u32 kTake = remaining < kAvailablePayload ? remaining : kAvailablePayload;
         const u32 received = static_cast<u32>(st.partial_payload_len);
         st.partial_payload_len = (range_int(received) + range_int(kTake)).value();
-        *consumed = static_cast<u32>(
-            (range_int(*consumed) + range_int(kHeaderLen) + range_int(kTake)).value());
+        if (!(range_int(*consumed) + range_int(kHeaderLen) + range_int(kTake)).to(consumed))
+            return WsClosingRead::Error;
         if (st.partial_payload_len != header.payload_len) {
             st.partial_header = header;
             st.partial_data_frame = true;

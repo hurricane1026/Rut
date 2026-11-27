@@ -160,6 +160,25 @@ public:
         return static_cast<T>(value_);
     }
 
+    // A narrower destination for a value whose range is known only at runtime.
+    // A failed conversion leaves the caller's output unchanged.
+    template <detail::RangeSource T>
+    [[nodiscard]] constexpr bool to(T* out) const {
+        if constexpr (Begin < detail::kRangeSourceBegin<T>)
+            if (value_ < detail::kRangeSourceBegin<T>) return false;
+        if constexpr (End > detail::kRangeSourceEnd<T>)
+            if (value_ >= detail::kRangeSourceEnd<T>) return false;
+        *out = static_cast<T>(value_);
+        return true;
+    }
+
+    template <i64 Divisor>
+        requires(Divisor > 0)
+    constexpr auto divided_by() const {
+        return range_int<Begin / Divisor, (End - 1) / Divisor + 1>(detail::kRangeProof,
+                                                                   value_ / Divisor);
+    }
+
     constexpr u64 to_u64() const
         requires(Begin >= 0)
     {

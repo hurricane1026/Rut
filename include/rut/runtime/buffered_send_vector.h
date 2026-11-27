@@ -21,8 +21,8 @@ struct BufferedSendVector {
         first_source = first;
         second_source = second;
         first_size = first_len;
-        const i64 total = (range_int(first_len) + range_int(second_len)).value();
-        if (total > static_cast<i64>(UINT32_MAX)) {
+        const auto total = range_int(first_len) + range_int(second_len);
+        if (!total.to(&total_size)) {
             first_source = nullptr;
             second_source = nullptr;
             first_size = 0;
@@ -32,7 +32,6 @@ struct BufferedSendVector {
             parts[1] = {};
             return false;
         }
-        total_size = static_cast<u32>(total);
         message = {};
         parts[0] = {const_cast<u8*>(first), first_len};
         parts[1] = {const_cast<u8*>(second), second_len};
@@ -55,9 +54,10 @@ struct BufferedSendVector {
             const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
             const bool kFirst = &part == parts;
             const u8* source = kFirst ? first_source : second_source;
-            const u32 kSize =
-                kFirst ? first_size
-                       : static_cast<u32>((range_int(total_size) - range_int(first_size)).value());
+            const u32 kSize = kFirst ? first_size
+                                     : (range_int(total_size) - range_int(first_size))
+                                           .max(range_int<0, 1>{})
+                                           .to<u32>();
             size_t remaining;
             u32 offset;
             if (sub_overflow(part.iov_len, kStep, &remaining) ||
@@ -65,7 +65,7 @@ struct BufferedSendVector {
                 return false;
             part.iov_len = remaining;
             part.iov_base = const_cast<u8*>(source + range_int(offset).value());
-            n = static_cast<u32>((range_int(n) - range_int(kStep)).value());
+            n = (range_int(n) - range_int(kStep)).max(range_int<0, 1>{}).to<u32>();
             if (part.iov_len == 0) {
                 ++message.msg_iov;
                 --message.msg_iovlen;

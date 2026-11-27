@@ -20,14 +20,19 @@ struct IdleTrimWindow {
 constexpr IdleTrimWindow idle_trim_window(u32 cursor, u32 timeout) {
     if (timeout >= TimerWheel::kSlots || timeout <= IdleTrimWindow::kMinIdleTicks) return {};
     const u32 kYoungest = IdleTrimWindow::kMinIdleTicks;
-    constexpr auto kAge = range_int(IdleTrimWindow::kMinIdleTicks) +
-                          range_int(IdleTrimWindow::kAgeWindow) - range_int<1, 2>{};
-    constexpr u32 kMaxAge = static_cast<u32>(kAge.value());
-    const u32 kOldest = timeout <= kMaxAge
-                            ? static_cast<u32>((range_int(timeout) - range_int<1, 2>{}).value())
-                            : kMaxAge;
-    const u32 kFirstOffset = static_cast<u32>((range_int(timeout) - range_int(kOldest)).value());
-    const u32 kLastOffset = static_cast<u32>((range_int(timeout) - range_int(kYoungest)).value());
+    constexpr auto kAge =
+        range_int<kYoungest, i64{kYoungest} + 1>{} +
+        range_int<IdleTrimWindow::kAgeWindow, i64{IdleTrimWindow::kAgeWindow} + 1>{} -
+        range_int<1, 2>{};
+    constexpr u32 kMaxAge = kAge.to<u32>();
+    const u32 kOldest =
+        timeout <= kMaxAge
+            ? (range_int(timeout) - range_int<1, 2>{}).max(range_int<0, 1>{}).to<u32>()
+            : kMaxAge;
+    const u32 kFirstOffset =
+        (range_int(timeout) - range_int(kOldest)).max(range_int<0, 1>{}).to<u32>();
+    const u32 kLastOffset =
+        (range_int(timeout) - range_int(kYoungest)).max(range_int<0, 1>{}).to<u32>();
     return {wrapping_add(cursor, kFirstOffset),
             wrapping_add(wrapping_add(cursor, kLastOffset), u32{1})};
 }

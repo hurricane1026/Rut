@@ -102,11 +102,13 @@ u8 capture_regex_replace(void* raw, SliceArena& arena, Str subject, Str replacem
         if (count == 64 || !found.data()) return 0;
         const i64 start_offset = found.data() - text.ptr;
         if (start_offset < search || start_offset > text.len) return 0;
-        const u32 start = static_cast<u32>(start_offset);
-        const auto available = range_int(text.len) - range_int(start);
-        if (found.size() > static_cast<u64>(available.value())) return 0;
-        const auto length = range_int(static_cast<u32>(found.size()));
-        const u32 end = static_cast<u32>((range_int(start) + length).value());
+        u32 start;
+        if (!range_int(start_offset).to(&start)) return 0;
+        const auto available = (range_int(text.len) - range_int(start)).max(range_int<0, 1>{});
+        if (found.size() > available.to_u64()) return 0;
+        range_int<0, i64{UINT32_MAX} + 1> length;
+        if (!decltype(length)::try_from_u64(found.size(), &length)) return 0;
+        const u32 end = (range_int(start) + length).min(range_int(text.len)).to<u32>();
         matches[count++] = {start, end};
         size += (range_int(replacement.len) - length).value();
         if (end == start) {

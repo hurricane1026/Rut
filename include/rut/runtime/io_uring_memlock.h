@@ -74,9 +74,8 @@ constexpr u32 io_uring_next_pow2(u32 n) {
 
 constexpr IoUringRingSizes io_uring_ring_sizes(u32 capacity) {
     const auto want = range_int(capacity).scaled_by<2>();
-    u32 cq = kMaxIoUringCqEntries;
-    if (want.value() < kMaxIoUringCqEntries)
-        cq = io_uring_next_pow2(static_cast<u32>(want.value()));
+    u32 cq = io_uring_next_pow2(
+        want.min(range_int<kMaxIoUringCqEntries, i64{kMaxIoUringCqEntries} + 1>{}).to<u32>());
     if (cq < kMinIoUringCqEntries) cq = kMinIoUringCqEntries;
     return {kIoUringSqEntries, cq};
 }

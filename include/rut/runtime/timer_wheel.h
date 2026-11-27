@@ -11,7 +11,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 
 constexpr u32 timer_seconds_from_ms(u32 ms) {
     const auto kRounded = range_int(ms) + range_int<999, 1000>{};
-    return static_cast<u32>(kRounded.value() / 1000);
+    return kRounded.divided_by<1000>().to<u32>();
 }
 
 // Timer wheel — O(1) add, refresh, tick.
@@ -76,7 +76,7 @@ struct TimerWheel {
 
     static constexpr u32 remaining_ticks(u32 timeout, u32 elapsed) {
         if (elapsed >= timeout) return 0;
-        return static_cast<u32>((range_int(timeout) - range_int(elapsed)).value());
+        return (range_int(timeout) - range_int(elapsed)).max(range_int<0, 1>{}).to<u32>();
     }
 
     void init() {

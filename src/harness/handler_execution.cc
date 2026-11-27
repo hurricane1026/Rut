@@ -1,5 +1,6 @@
 #include "rut/harness/handler_execution.h"
 
+#include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/jit/runtime_helpers.h"
 
@@ -138,19 +139,16 @@ HandlerExecutionResult drive_handler_deterministically(const DeterministicHandle
         return out;
     }
     environment.now_us = initial_time.to_u64();
-    // The signed start time and the full u64 duration fit together in i128.
-    const __int128_t requested_deadline =
-        static_cast<__int128_t>(initial_time.value()) + harness.limits.max_virtual_time_us;
-    if (requested_deadline > UINT64_MAX) {
+    u64 requested_deadline;
+    if (add_overflow(environment.now_us, harness.limits.max_virtual_time_us, &requested_deadline)) {
         out.harness.outcome = Outcome::Invalid;
         copy_detail(out.harness.detail,
                     sizeof(out.harness.detail),
                     "virtual deadline overflows the handler clock");
         return out;
     }
-    const u64 virtual_deadline_us = requested_deadline > kMaxHandlerTimeUs
-                                        ? kMaxHandlerTimeUs
-                                        : static_cast<u64>(requested_deadline);
+    const u64 virtual_deadline_us =
+        requested_deadline > kMaxHandlerTimeUs ? kMaxHandlerTimeUs : requested_deadline;
     const u64* previous_virtual_clock = rut_helper_time_set_virtual_clock(&environment.now_us);
     struct VirtualClockRestore {
         const u64* previous;

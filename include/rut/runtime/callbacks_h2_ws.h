@@ -190,13 +190,15 @@ inline bool h2ws_h1_response_headers(Connection& c,
                                         connection.value.ptr[static_cast<i64>(last) - 1] == '\t'))
                     --last;
                 const u32 token_len =
-                    static_cast<u32>((range_int(last) - range_int(start)).value());
+                    (range_int(last) - range_int(start)).max(range_int<0, 1>{}).to<u32>();
                 nominated |= http_header_name_eq_ci(h.name.ptr,
                                                     h.name.len,
                                                     connection.value.ptr + static_cast<i64>(start),
                                                     token_len);
                 if (end == connection.value.len) break;
-                start = static_cast<u32>((range_int(end) + range_int<1, 2>{}).value());
+                start = (range_int(end) + range_int<1, 2>{})
+                            .min(range_int(connection.value.len))
+                            .to<u32>();
             }
         }
         if (nominated && kUpgraded &&
@@ -214,7 +216,7 @@ inline bool h2ws_h1_response_headers(Connection& c,
                 kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
         }
         headers[(*count)++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
-        used = static_cast<u32>((range_int(used) + range_int(h.name.len)).value());
+        used = (range_int(used) + range_int(h.name.len)).min(range_int(capacity)).to<u32>();
     }
     if (!kUpgraded) {
         c.resp_body_mode = response.status_code == 304   ? BodyMode::None
@@ -307,15 +309,16 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
            x->download_len < sizeof(x->download)) {
         constexpr i64 kCapacity = sizeof(x->download);
         const auto kAvailable = range_int<kCapacity, kCapacity + 1>{} - range_int(x->download_len);
-        u32 n = static_cast<u32>(kAvailable.value());
+        u32 n = kAvailable.max(range_int<0, 1>{}).to<u32>();
         if (n > c.recv_buf.len()) n = c.recv_buf.len();
         u32 consumed = n, start = 0, produced = n;
         if (!x->ws_accepted) {
             if (c.resp_body_mode == BodyMode::ContentLength) {
                 if (n > c.resp_body_remaining) n = c.resp_body_remaining;
                 consumed = produced = n;
-                c.resp_body_remaining =
-                    static_cast<u32>((range_int(c.resp_body_remaining) - range_int(n)).value());
+                c.resp_body_remaining = (range_int(c.resp_body_remaining) - range_int(n))
+                                            .max(range_int<0, 1>{})
+                                            .to<u32>();
             } else if (c.resp_body_mode == BodyMode::Chunked) {
                 const auto kResult =
                     c.resp_chunk_parser.feed(c.recv_buf.data(), n, &consumed, &start, &produced);
@@ -330,12 +333,17 @@ void h2ws_h1_received(void* lp, Connection& c, IoEvent ev) {
                 break;
             }
         }
+        u32 buffered;
+        if (!(range_int(x->download_len) + range_int(produced)).to(&buffered) ||
+            buffered > kCapacity) {
+            x->failure = 13;
+            break;
+        }
         if (produced)
             __builtin_memcpy(x->download + static_cast<i64>(x->download_len),
                              c.recv_buf.data() + static_cast<i64>(start),
                              produced);
-        x->download_len =
-            static_cast<u32>((range_int(x->download_len) + range_int(produced)).value());
+        x->download_len = buffered;
         if (x->ws && x->ws_accepted && !ws_h2_process(*x, false)) x->failure = 13;
         c.consume_request_receive_buffer(consumed);
         if (!x->ws_accepted && c.resp_body_mode == BodyMode::ContentLength &&

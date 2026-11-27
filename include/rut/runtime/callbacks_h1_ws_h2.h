@@ -23,7 +23,7 @@ inline u32 h1ws_h2_response(Connection& c,
         u32 available = 0;
         if (sub_overflow(capacity, used, &available) || value.len > available) return false;
         __builtin_memcpy(output + static_cast<i64>(used), value.ptr, value.len);
-        used = static_cast<u32>((range_int(used) + range_int(value.len)).value());
+        used = (range_int(used) + range_int(value.len)).min(range_int(capacity)).to<u32>();
         return true;
     };
     Str status{};
@@ -77,9 +77,11 @@ void h1ws_h2_sent(void* lp, Connection& c, IoEvent ev) {
         loop->close_conn(c);
         return;
     }
-    c.send_progress = static_cast<u32>((range_int(c.send_progress) + range_int(sent)).value());
+    c.send_progress =
+        (range_int(c.send_progress) + range_int(sent)).min(range_int(c.send_buf.len())).to<u32>();
     if (c.send_progress < c.send_buf.len()) {
-        const u32 pending = static_cast<u32>((range_int(remaining) - range_int(sent)).value());
+        const u32 pending =
+            (range_int(remaining) - range_int(sent)).max(range_int<0, 1>{}).to<u32>();
         if (!client_send(loop, c, c.send_buf.data() + static_cast<i64>(c.send_progress), pending))
             loop->close_conn(c);
         return;
@@ -225,7 +227,7 @@ void h1ws_h2_received(void* lp, Connection& c, IoEvent ev) {
         return;
     }
     g.busy = true;
-    u32 length = static_cast<u32>(kAvailable.value());
+    u32 length = kAvailable.max(range_int<0, 1>{}).to<u32>();
     if (length > c.recv_buf.len()) length = c.recv_buf.len();
     if (length) {
         const bool kEnd = g.websocket_http1_eof && length == c.recv_buf.len();
@@ -278,7 +280,8 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
         while (start < header.value.len) {
             u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') ++end;
-            const u32 token_len = static_cast<u32>((range_int(end) - range_int(start)).value());
+            const u32 token_len =
+                (range_int(end) - range_int(start)).max(range_int<0, 1>{}).to<u32>();
             Str token{header.value.ptr + static_cast<i64>(start), token_len};
             while (token.len && (token.ptr[0] == ' ' || token.ptr[0] == '\t')) {
                 ++token.ptr;
@@ -291,7 +294,7 @@ inline bool h1ws_h2_hop_header(const ParsedRequest& req, Str name) {
             }
             if (http_header_name_eq_ci(name.ptr, name.len, token.ptr, token.len)) return true;
             if (end == header.value.len) break;
-            start = static_cast<u32>((range_int(end) + range_int<1, 2>{}).value());
+            start = (range_int(end) + range_int<1, 2>{}).min(range_int(header.value.len)).to<u32>();
         }
     }
     return false;
@@ -383,7 +386,9 @@ bool h1ws_h2_start(Loop* loop, Connection& c, const RouteEntry* route, u16 uid) 
                     kCh >= 'A' && kCh <= 'Z' ? static_cast<char>(kCh + 'a' - 'A') : kCh;
             }
             hs[n++] = {{names + static_cast<i64>(used), h.name.len}, h.value};
-            used = static_cast<u32>((range_int(used) + range_int(h.name.len)).value());
+            used = (range_int(used) + range_int(h.name.len))
+                       .min(range_int<sizeof(names), i64{sizeof(names)} + 1>{})
+                       .to<u32>();
         }
         ParsedRequest translated{};
         Str protocol{};

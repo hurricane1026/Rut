@@ -191,7 +191,8 @@ bool http_date(Str value, i64* seconds) {
     };
     const auto last_year = range_int(year) - kOne;
     const auto year_days = (range_int(year) - kEpochYear).scaled_by<365>();
-    const auto leap_days = leap_years(static_cast<u32>(last_year.value())) - leap_years(1969u);
+    const auto leap_days =
+        leap_years(last_year.max(range_int<0, 1>{}).to<u32>()) - leap_years(1969u);
     i32 days_in_year = static_cast<i32>(day) - 1;
     for (i32 i = 0; i < static_cast<i32>(month); ++i)
         days_in_year += kDays[i] + (i == 1 && kLeap ? 1 : 0);

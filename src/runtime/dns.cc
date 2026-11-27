@@ -121,18 +121,19 @@ u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
     u32 at = 12, start = 0;
     for (u32 i = 0; i <= kLen; ++i) {
         if (name[i] && name[i] != '.') continue;
-        const auto kLabelSize = range_int(i) - range_int(start);
-        if (kLabelSize.value() <= 0 || kLabelSize.value() > 63) return 0;
-        const u8 kN = static_cast<u8>(kLabelSize.value());
-        p[at++] = static_cast<u8>(kN);
+        range_int<1, 64> label;
+        if (!decltype(label)::try_from_i64((range_int(i) - range_int(start)).value(), &label))
+            return 0;
+        const u8 kN = label.to<u8>();
+        p[at++] = kN;
         memcpy(p + static_cast<i64>(at), name + static_cast<i64>(start), kN);
-        at = static_cast<u32>((range_int(at) + range_int(kN)).value());
-        start = static_cast<u32>((range_int(i) + range_int<1, 2>{}).value());
+        at = (range_int(at) + range_int(kN)).min(range_int(capacity)).to<u32>();
+        start = (range_int(i) + range_int<1, 2>{}).min(range_int(capacity)).to<u32>();
     }
     p[at++] = 0;
     put(p + static_cast<i64>(at), 1);
     put(p + (range_int(at) + range_int<2, 3>{}).value(), 1);
-    return static_cast<u32>((range_int(at) + range_int<4, 5>{}).value());
+    return (range_int(at) + range_int<4, 5>{}).min(range_int(capacity)).to<u32>();
 }
 DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& result) {
     result = {};
@@ -144,7 +145,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         (range_int(at) + range_int<4, 5>{}).value() > len || word(p + range_int(at).value()) != 1 ||
         word(p + (range_int(at) + range_int<2, 3>{}).value()) != 1)
         return DnsAnswer::Invalid;
-    at = static_cast<u32>((range_int(at) + range_int<4, 5>{}).value());
+    at = (range_int(at) + range_int<4, 5>{}).min(range_int(len)).to<u32>();
     if (word(p + 2) & 0x0200) return DnsAnswer::Truncated;
     if (word(p + 2) & 15) return DnsAnswer::Failure;
     const u16 kAnswers = word(p + 6);

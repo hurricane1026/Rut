@@ -67,8 +67,7 @@ static bool parse_u32_token(const char* s, u32 len, u32* out) {
         if (s[i] < '0' || s[i] > '9') return false;
         const auto digit = range_int(static_cast<u8>(s[i])) - range_int<'0', '1'>{};
         const auto next = range_int(v).scaled_by<10>() + digit;
-        if (next.value() > UINT32_MAX) return false;
-        v = static_cast<u32>(next.value());
+        if (!next.to(&v)) return false;
     }
     *out = v;
     return true;
@@ -191,8 +190,9 @@ static bool rir_function_needs_uncaptured_transport_metadata(const rir::Function
 static bool copy_str_into_arena(MmapArena& arena, const char* src, u32 len, Str* out) {
     // The array count includes a terminator and must fit the Arena's u32 API.
     const auto kCount = range_int(len) + range_int<1, 2>{};
-    if (kCount.value() > UINT32_MAX) return false;
-    char* mem = arena.alloc_array<char>(static_cast<u32>(kCount.value()));
+    u32 count;
+    if (!kCount.to(&count)) return false;
+    char* mem = arena.alloc_array<char>(count);
     if (!mem) return false;
     for (u32 i = 0; i < len; i++) mem[i] = src[i];
     mem[len] = '\0';

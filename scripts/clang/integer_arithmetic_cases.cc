@@ -195,3 +195,13 @@ u32 unchecked_range_conversion_through_alias(range_int<0, 10> source) {
     // expected-warning@+1 {{narrow a range_int with a range-checked conversion}}
     return u32(value);
 }
+
+static_assert([] {
+    u8 result = 17;
+    if (range_int(u16{256}).to(&result) || result != 17) return false;
+    if (range_int(i16{-1}).to(&result) || result != 17) return false;
+    return range_int(u16{255}).to(&result) && result == 255;
+}());
+static_assert((range_int(u32{UINT32_MAX}) + range_int<999, 1000>{}).divided_by<1000>().to<u32>() ==
+              4294968);
+static_assert(range_int<-10, 10>::constant<-9>().divided_by<2>().value() == -4);

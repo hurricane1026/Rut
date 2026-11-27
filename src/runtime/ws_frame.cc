@@ -138,7 +138,7 @@ u32 ws_write_header(u8* out,
             const auto kPosition = range_int<2, 3>{} + range_int(i);
             const auto kShift = (range_int<7, 8>{} - range_int(i)).scaled_by<8>();
             // RUT_INTEGER_RANGE: the loop bounds the shift count to [0, 56].
-            out[kPosition.index()] = static_cast<u8>(payload_len >> kShift.value());
+            out[kPosition.index()] = bounded_remainder<256>(payload_len >> kShift.value()).to<u8>();
         }
         offset = 10;
     }

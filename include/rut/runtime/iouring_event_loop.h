@@ -3879,7 +3879,7 @@ public:
                     buf,
                     first,
                     ResponseBodyChain::payload(next) + range_int(next->offset).value(),
-                    static_cast<u32>((range_int(len) - range_int(first)).value()))) {
+                    (range_int(len) - range_int(first)).max(range_int<0, 1>{}).to<u32>())) {
                 if (deadline_send) c.clear_response_read_deadline_send_owner();
                 return false;
             }

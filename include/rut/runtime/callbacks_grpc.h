@@ -767,7 +767,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         return;
     }
     if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
-    x->download_len = static_cast<u32>(kBuffered.value());
+    constexpr i64 kCapacity = sizeof(x->download);
+    x->download_len = kBuffered.min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     if (x->ws && x->ws_accepted) {
         if (!ws_h2_process(*x, false)) x->failure = 13;
         if (end) ws_h2_eof(*x, false);
@@ -1516,7 +1517,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             u32 n = 0;
             bool done = false;
             if (total > cap) break;
-            const u32 room = static_cast<u32>((range_int(cap) - range_int(total)).value());
+            const u32 room = (range_int(cap) - range_int(total)).max(range_int<0, 1>{}).to<u32>();
             auto write_error = [&] {
                 return x->websocket ? h2_websocket_error(out + static_cast<i64>(total),
                                                          room,
@@ -1559,8 +1560,9 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     n = http2_write_data(
                         out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
                     grpc_consume_output(*x, false, amount);
-                    stream->send_window = static_cast<i32>(
-                        (range_int(stream->send_window) - range_int(amount)).value());
+                    stream->send_window = (range_int(stream->send_window) - range_int(amount))
+                                              .max(range_int<0, 1>{})
+                                              .to<i32>();
                     // RUT_INTEGER_RANGE: the i64 window is positive and amount is capped to it.
                     h.conn_send_window =
                         static_cast<i64>(__int128_t{h.conn_send_window} - __int128_t{amount});
@@ -1641,7 +1643,8 @@ void grpc_request_data(
         return;
     }
     if (len) __builtin_memcpy(x.upload + static_cast<i64>(x.upload_len), data, len);
-    x.upload_len = static_cast<u32>(kBuffered.value());
+    constexpr i64 kCapacity = sizeof(x.upload);
+    x.upload_len = kBuffered.min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     if (x.ws) {
         if (!ws_h2_process(x, true)) x.failure = 13;
         if (end) ws_h2_eof(x, true);
