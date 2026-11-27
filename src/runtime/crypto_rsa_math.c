@@ -12,7 +12,7 @@ uint32_t rut_crypto_error_scope_begin_internal(void) {
 }
 void rut_crypto_error_scope_end_internal(uint32_t marked) {
     if (marked)
-        (void)ERR_pop_to_mark();
+        ERR_pop_to_mark();
     else
         ERR_clear_error();
 }
@@ -21,7 +21,8 @@ void rut_crypto_rsa_key_free_internal(EVP_PKEY* key) {
     EVP_PKEY_free(key);
 }
 uint32_t rut_crypto_rsa_key_bits_internal(const EVP_PKEY* key) {
-    return key ? (uint32_t)EVP_PKEY_bits(key) : 0;
+    const int bits = key ? EVP_PKEY_bits(key) : 0;
+    return bits > 0 ? bits : 0;
 }
 
 EVP_PKEY* rut_crypto_rsa_load_der_internal(const uint8_t* der, uint32_t length) {
@@ -133,7 +134,8 @@ uint32_t rut_crypto_rsa_workspace_init_internal(EVP_PKEY* source,
         goto fail;
     BN_zero(*input);
     BN_zero(*output);
-    *bytes = (uint32_t)((bits + 7) / 8);
+    /* The loaded RSA modulus has between 2048 and 4096 bits. */
+    *bytes = (bits + 7) / 8;
     return 1;
 fail:
     rut_crypto_rsa_workspace_reset_internal(
