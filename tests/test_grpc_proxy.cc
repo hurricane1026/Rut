@@ -44,6 +44,9 @@ TEST(grpc_accounting, overflow_leaves_the_last_exact_total) {
     CHECK_EQ(bytes, UINT64_MAX);
 }
 
+static_assert(grpc_stream_slot(GrpcProxyState::kStreamSlots - 1, 1).to<u32>() == 0);
+static_assert(grpc_stream_slot(UINT32_MAX, UINT32_MAX).to<u32>() == 62);
+
 static_assert(grpc_elapsed_us(UINT64_MAX, 0) == UINT64_MAX);
 static_assert(grpc_elapsed_us(0, UINT64_MAX) == 0);
 

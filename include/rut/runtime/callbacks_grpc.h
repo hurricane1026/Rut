@@ -21,6 +21,11 @@ namespace rut {
     return true;
 }
 
+[[nodiscard]] constexpr auto grpc_stream_slot(u32 cursor, u32 offset) {
+    const auto kPosition = range_int{cursor} + range_int{offset};
+    return bounded_remainder<GrpcProxyState::kStreamSlots>(kPosition.to_u64());
+}
+
 [[nodiscard]] constexpr u64 grpc_elapsed_us(u64 now, u64 start) {
     u64 elapsed = 0;
     if (sub_overflow(now, start, &elapsed)) return 0;
@@ -780,7 +785,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
-    if (len) __builtin_memcpy(x->download + static_cast<i64>(x->download_len), data, len);
+    if (len) __builtin_memcpy(x->download + range_int{x->download_len}.index(), data, len);
     x->download_len = kBuffered.min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     if (x->ws && x->ws_accepted) {
         if (!ws_h2_process(*x, false)) x->failure = 13;
@@ -949,10 +954,9 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
             if (x->failure || (x->response_end && !x->ws_accepted)) continue;
             if (x->upstream_stream < next_header) next_header = x->upstream_stream;
         }
-        for (u32 step = 0; step < 64; step++) {
-            const u32 i =
-                static_cast<u32>((static_cast<i64>(g.cursor) + static_cast<i64>(step)) % 64);
-            auto* x = g.streams[i];
+        for (u32 step = 0; step < GrpcProxyState::kStreamSlots; ++step) {
+            const auto kSlot = grpc_stream_slot(g.cursor, step);
+            auto* x = kSlot.at(g.streams);
             if (!x || x->failure || (x->response_end && !x->ws_accepted)) continue;
             auto* stream = h.find_stream(x->upstream_stream);
             if (!stream) continue;
@@ -1003,7 +1007,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                                     : Http2StreamState::HalfClosedLocal;
             }
             if (n) {
-                g.cursor = static_cast<u32>((static_cast<i64>(i) + 1) % 64);
+                g.cursor = grpc_stream_slot(kSlot.to<u32>(), 1).to<u32>();
                 break;
             }
         }
@@ -1518,10 +1522,9 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
     else {
         auto& h = *down.h2;
         u32 total = 0;
-        for (u32 step = 0; step < 64; step++) {
-            const u32 i =
-                static_cast<u32>((static_cast<i32>(h.grpc.cursor) + static_cast<i32>(step)) % 64);
-            auto* x = h.grpc.streams[i];
+        for (u32 step = 0; step < GrpcProxyState::kStreamSlots; ++step) {
+            const auto kSlot = grpc_stream_slot(h.grpc.cursor, step);
+            auto* x = kSlot.at(h.grpc.streams);
             if (!x) continue;
             if (x->websocket && x->response_end_sent && !x->failure) {
                 if (x->request_end_sent) grpc_release(loop, x, false);
@@ -1537,14 +1540,15 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             u32 n = 0;
             bool done = false;
             if (total > cap) break;
+            u8* const kFrameOut = out + range_int{total}.index();
             const u32 room = (range_int(cap) - range_int(total)).max(range_int<0, 1>{}).to<u32>();
             auto write_error = [&] {
-                return x->websocket ? h2_websocket_error(out + static_cast<i64>(total),
+                return x->websocket ? h2_websocket_error(kFrameOut,
                                                          room,
                                                          x->downstream_stream,
                                                          x->failure,
                                                          x->response_headers_sent)
-                                    : grpc_error_headers(out + static_cast<i64>(total),
+                                    : grpc_error_headers(kFrameOut,
                                                          room,
                                                          x->downstream_stream,
                                                          x->failure,
@@ -1556,7 +1560,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             } else if (!x->response_headers_sent && x->response_headers_len) {
                 if (x->response_headers_len > room) continue;
                 n = x->response_headers_len;
-                __builtin_memcpy(out + static_cast<i64>(total), x->response_headers, n);
+                __builtin_memcpy(kFrameOut, x->response_headers, n);
                 x->response_headers_sent = true;
                 done = x->response_end && !x->download_len && !x->response_trailers_len &&
                        (!x->websocket || (x->response_headers[4] & http2_flag::kEndStream));
@@ -1577,8 +1581,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     n = write_error();
                     done = n != 0;
                 } else {
-                    n = http2_write_data(
-                        out + static_cast<i64>(total), x->downstream_stream, output, amount, false);
+                    n = http2_write_data(kFrameOut, x->downstream_stream, output, amount, false);
                     grpc_consume_output(*x, false, amount);
                     stream->send_window = (range_int(stream->send_window) - range_int(amount))
                                               .max(range_int<0, 1>{})
@@ -1590,8 +1593,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             } else if (x->websocket && x->response_headers_sent && !output_len &&
                        !x->download_len && x->response_end && !x->response_end_sent &&
                        room >= kFrameHeaderSize) {
-                n = http2_write_data(
-                    out + static_cast<i64>(total), x->downstream_stream, nullptr, 0, true);
+                n = http2_write_data(kFrameOut, x->downstream_stream, nullptr, 0, true);
                 done = x->request_end_sent || !x->ws_accepted;
                 // Keep the mapping for a peer that has not half-closed yet.
                 if (!done) {
@@ -1601,7 +1603,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             } else if (x->response_headers_sent && !x->download_len && x->response_trailers_len) {
                 if (x->response_trailers_len > room) continue;
                 n = x->response_trailers_len;
-                __builtin_memcpy(out + static_cast<i64>(total), x->response_trailers, n);
+                __builtin_memcpy(kFrameOut, x->response_trailers, n);
                 done = true;
             }
             total = static_cast<u32>(static_cast<i64>(total) + static_cast<i64>(n));
@@ -1616,11 +1618,10 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             }
             if (up && up->h2 && !up->h2->grpc.busy && !up->h2->grpc.connecting) {
                 // Produce the returned response-window credit before the next read.
-                grpc_on_upstream_data<Loop>(
-                    static_cast<void*>(loop), *up, {up->id, 1, 0, 0, IoEventType::Recv, 0});
+                grpc_on_upstream_data<Loop>(loop, *up, {up->id, 1, 0, 0, IoEventType::Recv, 0});
             }
             if (n) {
-                h.grpc.cursor = static_cast<u32>((static_cast<i64>(i) + 1) % 64);
+                h.grpc.cursor = grpc_stream_slot(kSlot.to<u32>(), 1).to<u32>();
                 break;
             }
         }
@@ -1636,12 +1637,11 @@ void grpc_kick_downstream(Loop* loop, Connection& down) {
                       loop->upstream_release(u16{});
                   }) {
         if (down.h2->grpc.websocket_http1_downstream) {
-            h1ws_h2_received<Loop>(
-                static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+            h1ws_h2_received<Loop>(loop, down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
             return;
         }
     }
-    on_h2_data<Loop>(static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
+    on_h2_data<Loop>(loop, down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
 template <typename Loop>
@@ -1653,8 +1653,9 @@ void grpc_request_data(
         if (!down.h2->consume_data(x.downstream_stream, len) && !x.failure) x.failure = 13;
         return;
     }
+    constexpr i64 kCapacity = sizeof(x.upload);
     const auto kBuffered = range_int(x.upload_len) + range_int(len);
-    if (!kCounted || kBuffered.value() > static_cast<i64>(sizeof(x.upload)) ||
+    if (!kCounted || kBuffered.value() > kCapacity ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
         (void)down.h2->consume_data(x.downstream_stream, len);
@@ -1662,8 +1663,7 @@ void grpc_request_data(
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len) __builtin_memcpy(x.upload + static_cast<i64>(x.upload_len), data, len);
-    constexpr i64 kCapacity = sizeof(x.upload);
+    if (len) __builtin_memcpy(x.upload + range_int{x.upload_len}.index(), data, len);
     x.upload_len = kBuffered.min(range_int<kCapacity, kCapacity + 1>{}).to<u32>();
     if (x.ws) {
         if (!ws_h2_process(x, true)) x.failure = 13;

@@ -105,9 +105,11 @@ struct GrpcExchange {
 // Only upstream sessions join the shard-local pool; mappings keep stream IDs
 // independent on the two hops, allowing multiple downstream clients to share it.
 struct GrpcProxyState {
+    static constexpr u32 kStreamSlots = 64;
+
     TlsClientContext client_tls;
     bool tls_verified;
-    GrpcExchange* streams[64];
+    GrpcExchange* streams[kStreamSlots];
     ConnectionBase* pool_next;
     u32 active;
     u32 cursor;
