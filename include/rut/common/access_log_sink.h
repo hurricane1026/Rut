@@ -39,10 +39,11 @@ struct AccessLogSinkSpec {
 static_assert(sizeof(AccessLogSinkSpec::path) == 256u);
 
 inline bool access_log_sink_path_valid(Str path) {
-    if (path.ptr == nullptr || path.len < 2u || path.len > kAccessLogSinkPathMax ||
+    range_int<2, i64{kAccessLogSinkPathMax} + 1> length;
+    if (path.ptr == nullptr || !decltype(length)::try_from_i64(path.len, &length) ||
         path.ptr[0] != '/')
         return false;
-    const auto kLast = range_int(path.len) - range_int<1, 2>{};
+    const range_int<1, kAccessLogSinkPathMax> kLast = length - range_int<1, 2>{};
     if (path.ptr[kLast.value()] == '/') return false;
     if (path.eq({"/dev/stderr", 11u})) return false;
 

@@ -844,6 +844,9 @@ TEST(frontend, access_log_path_boundaries_and_invalid_inventory_fail_closed) {
         CHECK_EQ(hir.error().span.end, 19u + static_cast<u32>(path.size()));
     }
 
+    CHECK_FALSE(access_log_sink_path_valid({"", 0}));
+    CHECK_FALSE(access_log_sink_path_valid({"/", 1}));
+    CHECK(access_log_sink_path_valid({"/a", 2}));
     const char embedded_nul[] = {'/', 'a', '\0', 'b'};
     CHECK_FALSE(access_log_sink_path_valid({embedded_nul, sizeof(embedded_nul)}));
 }
