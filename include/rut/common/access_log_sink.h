@@ -47,7 +47,8 @@ inline bool access_log_sink_path_valid(Str path) {
     if (path.ptr[kLast.index()] == '/') return false;
     if (path.eq({"/dev/stderr", 11u})) return false;
 
-    u32 segment_start = 1u;
+    constexpr auto kOne = range_int<1, 2>{};
+    range_int<1, i64{UINT32_MAX} + 2> segment_start;
     for (u32 i = 1u; i <= path.len; i++) {
         if (i != path.len) {
             const char c = path.ptr[i];
@@ -58,13 +59,13 @@ inline bool access_log_sink_path_valid(Str path) {
             if (c != '/') continue;
         }
 
-        const auto kSegmentLength = (range_int(i) - range_int(segment_start)).value();
-        if (kSegmentLength == 0 || (kSegmentLength == 1 && path.ptr[segment_start] == '.') ||
-            (kSegmentLength == 2 && path.ptr[segment_start] == '.' &&
-             path.ptr[static_cast<i64>(segment_start) + 1] == '.'))
+        const auto kSegmentLength = (range_int(i) - segment_start).value();
+        if (kSegmentLength == 0 ||
+            (kSegmentLength == 1 && path.ptr[segment_start.index()] == '.') ||
+            (kSegmentLength == 2 && path.ptr[segment_start.index()] == '.' &&
+             path.ptr[(segment_start + kOne).index()] == '.'))
             return false;
-        // i <= path.len, which is bounded by the validated path capacity.
-        segment_start = static_cast<u32>((range_int(i) + range_int<1, 2>{}).value());
+        segment_start = range_int(i) + kOne;
     }
     return true;
 }
