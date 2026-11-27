@@ -1,5 +1,6 @@
 #include "rut/runtime/access_log.h"
 
+#include "rut/common/integer_conversion.h"
 #include "rut/runtime/access_log_host.h"
 #include <atomic>
 
@@ -481,7 +482,8 @@ static bool resolve_syslog_address(const char* endpoint, AccessLogSyslogDestinat
         const size_t length = strnlen(path, sizeof(local.sun_path));
         if (path[0] != '/' || length == sizeof(local.sun_path)) return false;
         local.sun_family = AF_UNIX;
-        const i64 path_length = static_cast<i64>(length);
+        i64 path_length = 0;
+        if (!try_u64_to_i64(static_cast<u64>(length), path_length)) return false;
         const i64 address_length =
             static_cast<i64>(offsetof(sockaddr_un, sun_path)) + path_length + 1;
         out.address_length = static_cast<socklen_t>(address_length);
@@ -585,7 +587,11 @@ void AccessLogFlusher::send_syslog(const AccessLogEntry& entry, const char* line
                                  syslog_.hostname,
                                  syslog_.process_id);
     } else {
-        const auto seconds = static_cast<time_t>(entry.timestamp_us / 1000000);
+        time_t seconds = 0;
+        if (__builtin_add_overflow(entry.timestamp_us / 1000000, u64{0}, &seconds)) {
+            record_syslog_failure();
+            return;
+        }
         tm local{};
         if (!localtime_r(&seconds, &local) || local.tm_mon < 0 || local.tm_mon >= 12) {
             record_syslog_failure();
