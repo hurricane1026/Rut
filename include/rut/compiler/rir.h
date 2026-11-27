@@ -622,6 +622,7 @@ struct Module {
         bool has_address;
         u32 ip;
         u16 port;
+        Str dns_host{};
         // Extra load-balancing endpoints (primary = ip/port). The
         // compile→config helper appends these via add_upstream_backend.
         static constexpr u32 kMaxExtraBackends = 7;

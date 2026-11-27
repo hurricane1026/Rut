@@ -49,6 +49,7 @@ struct HirUpstream {
     bool has_address = false;
     u32 ip = 0;
     u16 port = 0;
+    Str dns_host{};
     // Extra load-balancing endpoints beyond the primary (ip, port), from
     // `{ backends: [...] }`. Each forward site selects its explicit policy.
     // ips in host byte order, matching RouteConfig::add_upstream_backend.

@@ -76,6 +76,9 @@ struct UpstreamTarget {
 
     struct sockaddr_in addrs[kMaxBackends];
     u32 addr_count;
+    // Nonempty only for a native artifact awaiting cold-start DNS resolution.
+    char dns_host[254]{};
+    u16 dns_port = 0;
     u16 weights[kMaxBackends]{1, 1, 1, 1, 1, 1, 1, 1};
     // Short name for logging/debugging (e.g., "api-v1")
     char name[kMaxUpstreamNameLen];

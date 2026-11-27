@@ -1786,6 +1786,20 @@ plaintext HTTP/1 request-body writes. Partial writes refresh the idle deadline;
 waiting for client data does not. A timeout returns 504 and retires the request.
 Native artifact version 38 requires rebuilding older artifacts.
 
+A native CLI gateway may declare one DNS upstream with
+`upstream api { host: "api.example", port: 8080 }`. Before creating listeners
+or shards, the gateway resolves a bounded IPv4 A/CNAME snapshot and assigns equal
+weight to up to eight distinct addresses. The compiler never queries DNS. The
+snapshot remains fixed after TTL expiry; live refresh, AAAA/SRV, DNS names in
+backend lists, and consistent-hash selection for DNS targets are absent. The
+name selects dial addresses only: HTTP Host, health-check authority, TLS SNI,
+and certificate identity retain their explicit existing configuration. Failure,
+no answer, timeout, or more than eight addresses prevents startup. The default
+resolver reads IPv4 nameservers from `/etc/resolv.conf`; an administrator can
+instead specify `--upstream-dns-resolver 127.0.0.1:1053` as an IPv4:port.
+DNS queries share one three-second startup deadline. Native artifact version 39
+requires rebuilding older artifacts.
+
 Native artifact version 30 records the upstream response-header timeout. An
 upstream may set `response_header_timeout: 2s` (1–63 whole seconds). For ordinary
 HTTP/1 requests with a fully buffered upload, no buffered pipelined successor at

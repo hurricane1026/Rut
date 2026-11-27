@@ -381,3 +381,28 @@ TEST(dns, ttl_expiry_retires_pooled_connection_and_zero_ttl_never_parks) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(dns, distinct_address_overflow_is_reported_without_counting_duplicates) {
+    u8 packet[512]{};
+    const u32 question = dns_question("cache.example", 7, packet, sizeof(packet));
+    REQUIRE(question > 0);
+    u32 end = question;
+    const u8 record[] = {0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 127, 0, 0, 1};
+    put(packet + 2, 0x8180);
+    put(packet + 6, 10);
+    for (u32 i = 0; i < 10; ++i) {
+        memcpy(packet + end, record, sizeof(record));
+        packet[end + 15] = static_cast<u8>(i == 9 ? 1 : i + 1);
+        end = static_cast<u32>(static_cast<i64>(end) + sizeof(record));
+    }
+    DnsResult result;
+    CHECK(dns_answer(packet, end, "cache.example", 7, result) == DnsAnswer::Addresses);
+    CHECK_EQ(result.count, 8u);
+    CHECK(result.overflow);
+    put(packet + 6, 9);
+    end = static_cast<u32>(static_cast<i64>(end) - sizeof(record));
+    packet[end - 1] = 1;
+    CHECK(dns_answer(packet, end, "cache.example", 7, result) == DnsAnswer::Addresses);
+    CHECK_EQ(result.count, 8u);
+    CHECK_FALSE(result.overflow);
+}

@@ -1583,6 +1583,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
         up.has_address = module.upstreams[i].has_address;
         up.ip = module.upstreams[i].ip;
         up.port = module.upstreams[i].port;
+        up.dns_host = module.upstreams[i].dns_host;
         up.extra_count = module.upstreams[i].extra_count;
         for (u32 b = 0; b < up.extra_count; b++) {
             up.extra_ips[b] = module.upstreams[i].extra_ips[b];

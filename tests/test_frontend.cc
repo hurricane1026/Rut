@@ -50332,6 +50332,55 @@ TEST(frontend, upstream_connect_attempts_bounds_and_prebound) {
     CHECK_FALSE(parse_file_heap(duplicate.value()));
 }
 
+TEST(frontend, upstream_dns_is_native_artifact_only_and_static_hash_rejected) {
+    auto tokens =
+        lex(lit("upstream api { host: \"Api.Example.\" port: 8080 }\n"
+                "route GET \"/\" { return forward(api, load_balance: .roundRobin) }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->upstreams[0].dns_host.eq(lit("Api.Example.")));
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    CHECK_FALSE(populate_route_config(cfg, rir.module));
+    REQUIRE(populate_route_config_for_native_artifact(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].addr_count, 0u);
+    CHECK_EQ(strcmp(cfg.upstreams[0].dns_host, "api.example"), 0);
+    CHECK_EQ(cfg.upstreams[0].dns_port, 8080u);
+    rir.destroy();
+    auto hash_tokens =
+        lex(lit("upstream api { host: \"api.example\" port: 8080 }\n"
+                "route GET \"/\" { return forward(api, load_balance: .consistentHash, "
+                "hash_key: req.path, hash_seed: \"0123456789abcdef0123456789abcdef\") }"));
+    REQUIRE(hash_tokens);
+    auto hash_ast = parse_file_heap(hash_tokens.value());
+    REQUIRE(hash_ast);
+    CHECK_FALSE(analyze_file_heap(hash_ast.value()));
+    for (const char* source :
+         {"upstream api at \"service.test:8080\"",
+          "upstream api { backends: [\"service.test:8080\"] }",
+          "upstream api { host: \"service.test\" port: 8080 failover: [\"127.0.0.1:8081\"] }"}) {
+        auto unsupported = lex(lit(source));
+        REQUIRE(unsupported);
+        auto unsupported_ast = parse_file_heap(unsupported.value());
+        CHECK(!unsupported_ast || !analyze_file_heap(unsupported_ast.value()));
+    }
+    for (const char* address : {"127.0.0.999", "bad..example", "-bad.example", "1.2.3.4.5"}) {
+        char source[256];
+        snprintf(source, sizeof(source), "upstream api { host: \"%s\" port: 80 }", address);
+        auto invalid = lex(lit(source));
+        REQUIRE(invalid);
+        auto invalid_ast = parse_file_heap(invalid.value());
+        REQUIRE(invalid_ast);
+        CHECK_FALSE(analyze_file_heap(invalid_ast.value()));
+    }
+}
+
 TEST(frontend, upstream_response_header_timeout_bounds_and_prebound) {
     for (const char* value : {"1s", "1000ms", "63s", "1m"}) {
         char source[160];

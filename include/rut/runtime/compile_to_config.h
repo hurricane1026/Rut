@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/compiler/password_profile.h"
+#include "rut/runtime/dns.h"
 #include "rut/runtime/json.h"
 #include "rut/runtime/timer_wheel.h"
 
@@ -433,7 +434,8 @@ namespace detail {
 
 inline bool populate_verified_route_config(RouteConfig& cfg,
                                            const rir::Module& mod,
-                                           bool retain_response_body_views = false) {
+                                           bool retain_response_body_views = false,
+                                           bool allow_unresolved_dns = false) {
     // Bodies / header sets / routes must always start empty — there's
     // no "merge" semantics for those tables, and a non-zero count
     // would break the compile-time body_idx / headers_idx invariants.
@@ -571,6 +573,18 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
 
     for (u32 i = 0; i < mod.upstream_count; ++i) {
         const auto& up = mod.upstreams[i];
+        if (up.dns_host.len != 0) {
+            if (!allow_unresolved_dns || !upstreams_empty || !up.dns_host.ptr ||
+                up.dns_host.len >= 254 || !up.has_address || up.port == 0 || up.extra_count != 0 ||
+                up.weight_count != 0 || up.failover_mask != 0)
+                return false;
+            char name[254]{};
+            for (u32 j = 0; j < up.dns_host.len; ++j) {
+                if (up.dns_host.ptr[j] == 0) return false;
+                name[j] = up.dns_host.ptr[j];
+            }
+            if (!dns_hostname(name)) return false;
+        }
         if (up.failover_mask == 0) continue;
         if (!up.has_address || up.extra_count >= UpstreamTarget::kMaxBackends) return false;
         UpstreamTarget target{};
@@ -615,6 +629,14 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             auto r = cfg.add_upstream(name_buf, up.ip, up.port);
             if (!r.has_value()) return false;
             if (r.value() != i) return false;
+            if (up.dns_host.len != 0) {
+                auto& target = cfg.upstreams[i];
+                for (u32 j = 0; j < up.dns_host.len; ++j) target.dns_host[j] = up.dns_host.ptr[j];
+                target.dns_host[up.dns_host.len] = 0;
+                if (!dns_hostname(target.dns_host)) return false;
+                target.dns_port = up.port;
+                target.addr_count = 0;
+            }
             // Append any extra load-balancing endpoints (primary was the
             // ip/port above). add_upstream_backend fails only on a full
             // backend list, which the frontend already bounds.
@@ -905,9 +927,10 @@ inline bool populate_es256_configurations(RouteConfig& cfg, const rir::Module& m
 // non-owning pointers into `mod`; keep the module and its backing storage alive
 // until every reader of cfg has retired (the serving loader's LoadedProgram
 // pins it through RouteConfig's RCU lifetime).
-inline bool populate_route_config(RouteConfig& cfg,
-                                  const rir::Module& mod,
-                                  bool retain_response_body_views = false) {
+inline bool populate_route_config_impl(RouteConfig& cfg,
+                                       const rir::Module& mod,
+                                       bool retain_response_body_views,
+                                       bool allow_unresolved_dns) {
     if (!rir::verify_module(mod).ok) return false;
     std::unique_ptr<RouteConfig> strict_local_response_probe;
     if (module_has_strict_local_response_metadata(mod)) {
@@ -931,8 +954,8 @@ inline bool populate_route_config(RouteConfig& cfg,
     std::unique_ptr<u8[]> before(new (std::nothrow) u8[snapshot_bytes]);
     if (!before) return false;
     __builtin_memcpy(before.get(), static_cast<const void*>(&cfg), snapshot_bytes);
-    const bool populated =
-        detail::populate_verified_route_config(cfg, mod, retain_response_body_views);
+    const bool populated = detail::populate_verified_route_config(
+        cfg, mod, retain_response_body_views, allow_unresolved_dns);
     const bool strict_copied =
         populated &&
         (!strict_local_response_probe ||
@@ -941,6 +964,18 @@ inline bool populate_route_config(RouteConfig& cfg,
                              detail::populate_es256_configurations(cfg, mod);
     if (!auth_copied) __builtin_memcpy(static_cast<void*>(&cfg), before.get(), snapshot_bytes);
     return auth_copied;
+}
+
+inline bool populate_route_config(RouteConfig& cfg,
+                                  const rir::Module& mod,
+                                  bool retain_response_body_views = false) {
+    return populate_route_config_impl(cfg, mod, retain_response_body_views, false);
+}
+
+// Only the native compiler producer may serialize unresolved targets. They must
+// be resolved and validated by the parent before the configuration is served.
+inline bool populate_route_config_for_native_artifact(RouteConfig& cfg, const rir::Module& mod) {
+    return populate_route_config_impl(cfg, mod, true, true);
 }
 
 // Populate response bodies as views into the RIR module. Use this for bodies

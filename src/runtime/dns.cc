@@ -165,9 +165,17 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             if (strcmp(r.owner, result.canonical) != 0) continue;
             if (r.type == 1) {
                 if (r.size != 4) return DnsAnswer::Invalid;
-                if (result.count < 8) {
-                    memcpy(&result.addresses[result.count], p + static_cast<i64>(r.data), 4);
-                    result.count = static_cast<u32>(static_cast<i64>(result.count) + 1);
+                u32 address = 0;
+                memcpy(&address, p + static_cast<i64>(r.data), 4);
+                bool duplicate = false;
+                for (u32 j = 0; j < result.count; ++j) duplicate |= result.addresses[j] == address;
+                if (!duplicate) {
+                    if (result.count < 8) {
+                        result.addresses[result.count] = address;
+                        result.count = static_cast<u32>(static_cast<i64>(result.count) + 1);
+                    } else {
+                        result.overflow = true;
+                    }
                 }
                 if (r.ttl < result.ttl) result.ttl = r.ttl;
             } else if (r.type == 5) {

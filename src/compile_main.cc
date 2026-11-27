@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
                                     error,
                                     static_cast<rut::jit::OptLevel>(argv[2][0] - '0'),
                                     ~rut::u64{0},
+                                    true,
                                     true);
     if (!ok) {
         char message[512];
@@ -77,6 +78,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "%s: %s\n", argv[1], message);
     }
 #if RUT_ENABLE_EBPF
+    if (ok && kEbpfPlan) {
+        for (rut::u32 i = 0; i < program.config.upstream_count; ++i) {
+            if (program.config.upstreams[i].dns_host[0]) {
+                fprintf(stderr, "upstream DNS is unavailable in offline eBPF plans\n");
+                ok = false;
+                break;
+            }
+        }
+    }
     if (ok && kEbpfPlan) {
         ok = rut::build_ebpf_plan(
             program.rir.module,

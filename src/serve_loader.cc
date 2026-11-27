@@ -189,7 +189,8 @@ bool load_rut_program(const char* path,
                       LoadError& err,
                       jit::OptLevel opt,
                       u64 max_source_bytes,
-                      bool retain_native_module) {
+                      bool retain_native_module,
+                      bool allow_unresolved_native_dns) {
     err = LoadError{};
     out.has_listener = false;
     out.listener = ListenerSpec{};
@@ -455,7 +456,11 @@ bool load_rut_program(const char* path,
     // register_jit_routes then resolves each handler symbol and adds
     // the routes. Both fail closed.
     err.stage = LoadStage::Register;
-    if (!populate_route_config_with_retained_body_views(out.config, out.rir.module)) return false;
+    if (allow_unresolved_native_dns && retain_native_module) {
+        if (!populate_route_config_for_native_artifact(out.config, out.rir.module)) return false;
+    } else if (!populate_route_config_with_retained_body_views(out.config, out.rir.module)) {
+        return false;
+    }
     if (!out.rs256.load(out.config.rs256_configurations, out.config.rs256_configuration_count))
         return false;
     out.config.rs256 = &out.rs256;

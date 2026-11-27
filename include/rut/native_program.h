@@ -29,7 +29,9 @@ bool load_native_program(const char* source,
                          char* error,
                          u32 error_size,
                          u8 opt = 2,
-                         bool request_ebpf_plan = false);
+                         bool request_ebpf_plan = false,
+                         u32 upstream_dns_server = 0,
+                         u16 upstream_dns_port = 53);
 // Diagnostic/export only; these APIs do not attach programs to business sockets.
 bool write_ebpf_plan_json(const NativeProgram& program, int fd);
 bool export_ebpf_bytecode(const NativeProgram& program,
