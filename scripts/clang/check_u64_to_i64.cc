@@ -144,6 +144,18 @@ public:
 
     bool shouldVisitTemplateInstantiations() const { return true; }
 
+    bool VisitBuiltinBitCastExpr(BuiltinBitCastExpr* cast) {
+        if (context.getSourceManager().isInSystemHeader(cast->getExprLoc()) ||
+            !cast->getSubExpr()->getType()->isIntegralOrEnumerationType() ||
+            !cast->getType()->isIntegralOrEnumerationType())
+            return true;
+        auto& diagnostics = context.getDiagnostics();
+        const auto id = diagnostics.getCustomDiagID(
+            DiagnosticsEngine::Warning, "use a value conversion for integer or enum bit casts");
+        diagnostics.Report(cast->getExprLoc(), id) << cast->getSourceRange();
+        return true;
+    }
+
     bool VisitCastExpr(CastExpr* cast) {
         if (cast->getCastKind() != CK_IntegralCast) return true;
         const Expr* input = cast->getSubExpr();

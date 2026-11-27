@@ -18,10 +18,11 @@ ARITHMETIC_MESSAGE = 'integer arithmetic needs a range proof'
 NARROWING_MESSAGE = 'integer arithmetic result may not fit the destination'
 INDEX_MESSAGE = 'use range_int::index() or at() for array indexing'
 RANGE_CAST_MESSAGE = 'narrow a range_int with a range-checked conversion'
+BIT_CAST_MESSAGE = 'use a value conversion for integer or enum bit casts'
 NODISCARD_MESSAGE = 'non-void functions require [[nodiscard]]'
 ARITHMETIC_MESSAGES = (ARITHMETIC_MESSAGE, NARROWING_MESSAGE)
 MESSAGES = (MESSAGE, OVERFLOW_MESSAGE, INDEX_MESSAGE, RANGE_CAST_MESSAGE, NODISCARD_MESSAGE,
-            ADDRESS_MESSAGE, *ARITHMETIC_MESSAGES)
+            ADDRESS_MESSAGE, BIT_CAST_MESSAGE, *ARITHMETIC_MESSAGES)
 DIAGNOSTIC = re.compile(
     r'^(.+?):(\d+):(\d+):(?:\{(\d+):(\d+)-(\d+):(\d+)\}:)?'
     rf' warning: ({"|".join(map(re.escape, MESSAGES))})$', re.M
@@ -277,6 +278,8 @@ def main():
     print(f'{indices} array indices bypass range_int::index() or at()')
     addresses = sum(message == ADDRESS_MESSAGE for *_, message in failures)
     print(f'{addresses} address additions without bounded offsets or raw-span validation')
+    bit_casts = sum(message == BIT_CAST_MESSAGE for *_, message in failures)
+    print(f'{bit_casts} integer or enum bit casts')
     direct = check_builtin_locations()
     for location in direct:
         print(location)

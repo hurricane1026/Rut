@@ -287,3 +287,20 @@ static_assert([] {
            out == INT64_MAX && !try_u64_to_i64(u64{INT64_MAX} + 1, &out) && out == INT64_MAX &&
            !try_u64_to_i64(UINT64_MAX, &out) && out == INT64_MAX;
 }());
+
+// A representation cast must not bypass the checks for numeric conversions.
+i64 bit_cast_to_signed(u64 value) {
+    // expected-warning@+1 {{use a value conversion for integer or enum bit casts}}
+    return __builtin_bit_cast(i64, value);
+}
+
+enum class ByteTag : u8 {};
+u8 bit_cast_enum(ByteTag tag) {
+    // expected-warning@+1 {{use a value conversion for integer or enum bit casts}}
+    return __builtin_bit_cast(u8, tag);
+}
+
+static_assert(byte_value('A') == 65);
+static_assert(signed_wrapping_value(u64{1} << 63) == INT64_MIN);
+static_assert(signed_wrapping_value(UINT64_MAX) == -1);
+static_assert(signed_wrapping_value(u64{INT64_MAX}) == INT64_MAX);
