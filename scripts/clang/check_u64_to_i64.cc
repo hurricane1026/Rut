@@ -479,28 +479,28 @@ class IntegerArithmeticVisitor : public RecursiveASTVisitor<IntegerArithmeticVis
         diagnostics.Report(loc, id);
     }
 
-    bool index_uses_range_value(const Expr* index, unsigned depth = 0) const {
+    bool uses_range_value(const Expr* index, unsigned depth = 0) const {
         if (depth == 12) return false;
         index = index->IgnoreParens();
         if (const auto* cast = dyn_cast<CastExpr>(index)) {
             if (cast->getCastKind() == CK_IntegralCast ||
                 cast->getCastKind() == CK_LValueToRValue || cast->getCastKind() == CK_NoOp)
-                return index_uses_range_value(cast->getSubExpr(), depth + 1);
+                return uses_range_value(cast->getSubExpr(), depth + 1);
         }
         if (const auto* list = dyn_cast<InitListExpr>(index); list && list->getNumInits() == 1)
-            return index_uses_range_value(list->getInit(0), depth + 1);
+            return uses_range_value(list->getInit(0), depth + 1);
         if (const auto* op = dyn_cast<BinaryOperator>(index)) {
-            if (op->getOpcode() == BO_Comma) return index_uses_range_value(op->getRHS(), depth + 1);
-            return index_uses_range_value(op->getLHS(), depth + 1) ||
-                   index_uses_range_value(op->getRHS(), depth + 1);
+            if (op->getOpcode() == BO_Comma) return uses_range_value(op->getRHS(), depth + 1);
+            return uses_range_value(op->getLHS(), depth + 1) ||
+                   uses_range_value(op->getRHS(), depth + 1);
         }
         if (const auto* op = dyn_cast<UnaryOperator>(index))
-            return index_uses_range_value(op->getSubExpr(), depth + 1);
+            return uses_range_value(op->getSubExpr(), depth + 1);
         if (const auto* choice = dyn_cast<ConditionalOperator>(index))
-            return index_uses_range_value(choice->getTrueExpr(), depth + 1) ||
-                   index_uses_range_value(choice->getFalseExpr(), depth + 1);
+            return uses_range_value(choice->getTrueExpr(), depth + 1) ||
+                   uses_range_value(choice->getFalseExpr(), depth + 1);
         if (const auto* source = variable(index);
-            source && source->hasInit() && index_uses_range_value(source->getInit(), depth + 1)) {
+            source && source->hasInit() && uses_range_value(source->getInit(), depth + 1)) {
             if (source->getType().isConstQualified()) return true;
             if (!source->hasLocalStorage() || !source->getType()->isIntegerType() ||
                 source->getType().isVolatileQualified())
@@ -521,7 +521,7 @@ class IntegerArithmeticVisitor : public RecursiveASTVisitor<IntegerArithmeticVis
     void check_index(const Expr& index) const {
         if (index.isTypeDependent() || index.isValueDependent() ||
             context.getSourceManager().isInSystemHeader(index.getExprLoc()) ||
-            !index_uses_range_value(&index))
+            !uses_range_value(&index))
             return;
         auto& diagnostics = context.getDiagnostics();
         const auto id = diagnostics.getCustomDiagID(
@@ -638,6 +638,22 @@ public:
         const Range result = calculate(kind, a, b);
         if (!fits(result, limits) || !fits(result, type_range(op->getType())))
             report(op->getOperatorLoc());
+        return true;
+    }
+
+    bool VisitExplicitCastExpr(const ExplicitCastExpr* cast) {
+        if (cast->isTypeDependent() || cast->isValueDependent() ||
+            context.getSourceManager().isInSystemHeader(cast->getExprLoc()))
+            return true;
+        const auto* operand = cast->getSubExprAsWritten();
+        if (operand->getType()->isIntegerType() && cast->getType()->isIntegerType() &&
+            !fits(type_range(operand->getType()), type_range(cast->getType())) &&
+            uses_range_value(operand)) {
+            auto& diagnostics = context.getDiagnostics();
+            const auto id = diagnostics.getCustomDiagID(
+                DiagnosticsEngine::Warning, "narrow a range_int with a range-checked conversion");
+            diagnostics.Report(cast->getExprLoc(), id) << cast->getSourceRange();
+        }
         return true;
     }
 

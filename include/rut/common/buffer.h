@@ -109,13 +109,14 @@ struct Buffer {
         if (released_) __builtin_trap();
         if (!ptr_) return 0;
         if (len_ > cap_) __builtin_trap();
-        const u32 kAvail = static_cast<u32>((range_int(cap_) - range_int(len_)).value());
-        u32 to_write = n < kAvail ? n : kAvail;
-        if (to_write > 0) {
-            __builtin_memmove(ptr_ + static_cast<i64>(len_), src, to_write);
-            len_ = static_cast<u32>((range_int(len_) + range_int(to_write)).value());
+        const auto kUsed = range_int(len_);
+        const auto kEnd = (kUsed + range_int(n)).min(range_int(cap_));
+        const u32 kWritten = (kEnd - kUsed).max(range_int<0, 1>{}).to<u32>();
+        if (kWritten > 0) {
+            __builtin_memmove(ptr_ + kUsed.index(), src, kWritten);
+            len_ = kEnd.to<u32>();
         }
-        return to_write;
+        return kWritten;
     }
 
     // Read: const — Buffer owner can also read
@@ -149,13 +150,13 @@ struct Buffer {
     // Returns pointer past current data; write_avail() bytes available.
     u8* write_ptr() noexcept {
         if (released_) __builtin_trap();
-        return ptr_ ? ptr_ + static_cast<i64>(len_) : nullptr;
+        return ptr_ ? ptr_ + range_int(len_).index() : nullptr;
     }
 
     u32 write_avail() const noexcept {
         if (released_) __builtin_trap();
-        if (!ptr_ || len_ > cap_) return 0;
-        return static_cast<u32>((range_int(cap_) - range_int(len_)).value());
+        if (!ptr_) return 0;
+        return (range_int(cap_) - range_int(len_)).max(range_int<0, 1>{}).to<u32>();
     }
 
     // Commit n bytes written directly via write_ptr().
@@ -163,8 +164,9 @@ struct Buffer {
     void commit(u32 n) noexcept {
         if (released_) __builtin_trap();
         const auto kEnd = range_int(len_) + range_int(n);
-        if (!ptr_ || kEnd.value() > cap_) __builtin_trap();
-        len_ = static_cast<u32>(kEnd.value());
+        const auto kCapacity = range_int(cap_);
+        if (!ptr_ || kEnd.value() > kCapacity.value()) __builtin_trap();
+        len_ = kEnd.min(kCapacity).to<u32>();
     }
 
     // Set the absolute length after an in-place edit (e.g. rewriting the
@@ -184,8 +186,8 @@ struct Buffer {
             len_ = 0;
             return;
         }
-        const u32 kRemaining = static_cast<u32>((range_int(len_) - range_int(n)).value());
-        __builtin_memmove(ptr_, ptr_ + static_cast<i64>(n), kRemaining);
+        const u32 kRemaining = (range_int(len_) - range_int(n)).max(range_int<0, 1>{}).to<u32>();
+        __builtin_memmove(ptr_, ptr_ + range_int(n).index(), kRemaining);
         len_ = kRemaining;
     }
 

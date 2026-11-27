@@ -130,6 +130,22 @@ public:
 
     constexpr i64 value() const { return value_; }
 
+    template <i64 OtherBegin, __int128_t OtherEnd>
+    constexpr auto min(range_int<OtherBegin, OtherEnd> other) const {
+        constexpr auto kLower = Begin < OtherBegin ? Begin : OtherBegin;
+        constexpr auto kUpper = End < OtherEnd ? End : OtherEnd;
+        return range_int<kLower, kUpper>(detail::kRangeProof,
+                                         value_ < other.value() ? value_ : other.value());
+    }
+
+    template <i64 OtherBegin, __int128_t OtherEnd>
+    constexpr auto max(range_int<OtherBegin, OtherEnd> other) const {
+        constexpr auto kLower = Begin > OtherBegin ? Begin : OtherBegin;
+        constexpr auto kUpper = End > OtherEnd ? End : OtherEnd;
+        return range_int<kLower, kUpper>(detail::kRangeProof,
+                                         value_ > other.value() ? value_ : other.value());
+    }
+
     // A pointer or container index must have a nonnegative lower bound.
     constexpr i64 index() const
         requires(Begin >= 0)

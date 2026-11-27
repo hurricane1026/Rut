@@ -270,10 +270,13 @@ jobs:
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_ring_iterator
           python3 scripts/check_ring_iterators.py build/check_ring_iterator build
           python3 scripts/check_runtime_arithmetic.py build --clang-query clang-query-22 --clang-check clang-check-22 --inventory runtime-arithmetic.txt
-      - name: Check integer range proofs, error returns, and array indices
+      - name: Check integer range proofs, error returns, array indices, and narrowing
         if: matrix.compiler == 'clang' && matrix.shard == 1
         env:
           OVERFLOW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # The in-progress range_int migration already contained narrowing casts.
+          # Git scopes enforcement until the PR base contains the new check.
+          RANGE_CAST_MIGRATION_BASE: 883394207ea3e8bd05858a2fc40983672d8656e4
         run: |
           clang++-22 $(llvm-config-22 --cxxflags) -std=c++17 -fPIC -shared scripts/clang/check_u64_to_i64.cc \
             -lclang-cpp $(llvm-config-22 --ldflags --libs --system-libs) -o build/check_u64_to_i64.so
@@ -287,8 +290,12 @@ jobs:
             fi
             audit_args+=(--overflow-base "$OVERFLOW_BASE")
           fi
+          if git cat-file -e "$RANGE_CAST_MIGRATION_BASE^{commit}" 2>/dev/null; then
+            audit_args+=(--range-cast-migration-base "$RANGE_CAST_MIGRATION_BASE")
+          fi
           python3 scripts/check_u64_to_i64.py build build/check_u64_to_i64.so --clang clang-22 \
-            --arithmetic-inventory integer-arithmetic.txt "${audit_args[@]}"
+            --arithmetic-inventory integer-arithmetic.txt --range-cast-inventory range-casts.txt \
+            "${audit_args[@]}"
       - name: Compare range_int code generation with native integers
         if: matrix.compiler == 'clang' && matrix.shard == 1
         run: |
@@ -301,6 +308,7 @@ jobs:
           path: |
             runtime-arithmetic.txt
             integer-arithmetic.txt
+            range-casts.txt
           if-no-files-found: ignore
 
       # Publish immediately after building so long-running tests do not delay

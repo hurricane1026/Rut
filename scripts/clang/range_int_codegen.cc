@@ -415,4 +415,22 @@ u64 compare_checked_accumulate(const u64* values, u32 size) {
     return total;
 }
 
+u32 compare_min_for_narrowing(u32 used, u32 count, u32 capacity) {
+#ifdef RUT_USE_RANGE_INT
+    return (range_int(used) + range_int(count)).min(range_int(capacity)).to<u32>();
+#else
+    const i64 end = i64{used} + count;
+    return static_cast<u32>(end < capacity ? end : capacity);
+#endif
+}
+
+u32 compare_max_for_narrowing(u32 used, u32 consumed) {
+#ifdef RUT_USE_RANGE_INT
+    return (range_int(used) - range_int(consumed)).max(range_int<0, 1>{}).to<u32>();
+#else
+    const i64 remaining = i64{used} - consumed;
+    return static_cast<u32>(remaining > 0 ? remaining : 0);
+#endif
+}
+
 }  // extern "C"

@@ -79,7 +79,8 @@ int negative_path_index(const int* data, u32 length) {
 
 int negative_index_through_alias(const int* data, range_int<-1, 5> index) {
     const auto at = index.value();
-    // expected-warning@+1 {{use range_int::index() or at() for array indexing}}
+    // expected-warning@+2 {{use range_int::index() or at() for array indexing}}
+    // expected-warning@+1 {{narrow a range_int with a range-checked conversion}}
     return data[static_cast<u32>(at)];
 }
 
@@ -174,3 +175,23 @@ static_assert([] {
     unsigned count = 0;
     return sub_overflow(0u, 1u, &count) && count == ~0u;
 }());
+
+u32 unchecked_range_conversion(u32 used, u32 written) {
+    // expected-warning@+1 {{narrow a range_int with a range-checked conversion}}
+    return static_cast<u32>((range_int(used) + range_int(written)).value());
+}
+
+u32 proven_range_conversion(u32 used, u32 written, u32 capacity) {
+    return (range_int(used) + range_int(written)).min(range_int(capacity)).to<u32>();
+}
+
+static_assert(__is_same(decltype(range_int<-8, 2>{}.min(range_int<4, 10>{})), range_int<-8, 2>));
+static_assert(__is_same(decltype(range_int<-8, 2>{}.max(range_int<4, 10>{})), range_int<4, 10>));
+static_assert(range_int<-8, 2>::constant<1>().min(range_int<-2, 10>::constant<-2>()).value() == -2);
+static_assert(range_int<-8, 2>::constant<1>().max(range_int<-2, 10>::constant<-2>()).value() == 1);
+
+u32 unchecked_range_conversion_through_alias(range_int<0, 10> source) {
+    const auto value = source.value();
+    // expected-warning@+1 {{narrow a range_int with a range-checked conversion}}
+    return u32(value);
+}
