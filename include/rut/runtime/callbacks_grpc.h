@@ -21,10 +21,10 @@ namespace rut {
     return true;
 }
 
-constexpr u64 grpc_elapsed_us(u64 now, u64 start) {
-    if (now < start) return 0;
-    // RUT_INTEGER_RANGE: the ordered full-width timestamps have an exact u64 difference.
-    return static_cast<u64>(__int128_t{now} - __int128_t{start});
+[[nodiscard]] constexpr u64 grpc_elapsed_us(u64 now, u64 start) {
+    u64 elapsed = 0;
+    if (sub_overflow(now, start, &elapsed)) return 0;
+    return elapsed;
 }
 
 template <typename Loop>
