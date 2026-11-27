@@ -1,9 +1,23 @@
 #pragma once
 
 #include "rut/common/checked_arithmetic.h"
-#include "rut/common/types.h"
+#include "rut/common/range_int.h"
 
 namespace rut {
+
+// The caller supplies a live buffer of used bytes. A candidate span may
+// come from elsewhere. Publish its offset only after proving containment.
+[[nodiscard]] inline bool byte_span_offset_within(
+    const void* buffer, u32 used, const void* data, u32 len, u32* out) {
+    if (buffer == nullptr || data == nullptr) return false;
+    const auto begin = reinterpret_cast<uintptr_t>(buffer);
+    const auto address = reinterpret_cast<uintptr_t>(data);
+    u32 offset;
+    if (sub_overflow(address, begin, &offset)) return false;
+    if ((range_int(offset) + range_int(len)).value() > used) return false;
+    *out = offset;
+    return true;
+}
 
 // Empty spans may point to the end of the pool.
 template <typename Size>

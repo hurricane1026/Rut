@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/byte_span.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/forward_target.h"
 #include "rut/common/range_int.h"
@@ -1391,7 +1392,8 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            HttpVersion response_version = HttpVersion::Http11);
 
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
-inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
+[[nodiscard]] inline bool materialize_request_target_transform(Connection& conn,
+                                                               const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
                                     const RouteConfig& config,
                                     u16 policy_id,
@@ -7680,7 +7682,8 @@ inline void strip_ws_extensions(Connection& conn) {
     return true;
 }
 
-inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config) {
+[[nodiscard]] inline bool materialize_request_target_transform(Connection& conn,
+                                                               const RouteConfig& config) {
     if (!conn.target_transform_recorded) return true;
     if (config.target_transform_id_is_valid(conn.target_transform_id) &&
         config.target_transforms[static_cast<u32>(static_cast<i64>(conn.target_transform_id) - 1)]
@@ -7731,17 +7734,10 @@ inline bool materialize_request_target_transform(Connection& conn, const RouteCo
     }
     if (req.version != HttpVersion::Http11) return false;
 
-    const uintptr_t base = reinterpret_cast<uintptr_t>(data);
-    uintptr_t limit = 0;
-    if (add_overflow(base, static_cast<uintptr_t>(total), &limit)) return false;
-    const uintptr_t path_addr = reinterpret_cast<uintptr_t>(req.path.ptr);
-    uintptr_t path_remaining = 0;
-    uintptr_t path_offset = 0;
-    if (path_addr < base || path_addr > limit || sub_overflow(limit, path_addr, &path_remaining) ||
-        req.path.len > path_remaining || sub_overflow(path_addr, base, &path_offset))
-        return false;
-    const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = req.path.len;
+    u32 target_start;
+    if (!byte_span_offset_within(data, total, req.path.ptr, target_len, &target_start))
+        return false;
     if (target_len == 0 || data[target_start] != '/') return false;
 
     for (u32 i = 0; i < target_len; i++) {
@@ -9245,23 +9241,12 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
             while (colon < measured_le && *colon != ':') ++colon;
             const u32 name_len = static_cast<u32>(colon - measured_hs);
             const Header& parsed_header = req.headers[measured_index++];
-            const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
-            uintptr_t data_end = 0;
-            if (add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end)) return false;
-            const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
-            const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
+            // Match the parser spans to boundaries already found in this buffer.
             if (colon == measured_hs || colon == measured_le ||
                 parsed_header.name.len != name_len ||
-                name_addr != reinterpret_cast<uintptr_t>(measured_hs) || raw_addr < data_addr ||
-                raw_addr > data_end || ([&] {
-                    uintptr_t raw_end = 0;
-                    return add_overflow(raw_addr,
-                                        static_cast<uintptr_t>(parsed_header.raw_value.len),
-                                        &raw_end) ||
-                           raw_end > data_end;
-                }()) ||
+                parsed_header.name.ptr != reinterpret_cast<const char*>(measured_hs) ||
                 parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
-                parsed_header.raw_value.len != static_cast<u32>(measured_le - colon - 1))
+                range_int(parsed_header.raw_value.len).value() != measured_le - (colon + 1))
                 return false;
             const bool drop =
                 request_policy_name_eq(measured_hs, name_len, "content-length", 14) ||
@@ -9390,26 +9375,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
             if (trim_sp_preserve_htab) {
                 if (parsed_header_index >= req.header_count) return false;
                 const Header& parsed_header = req.headers[parsed_header_index];
-                const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
-                uintptr_t data_end = 0;
-                if (add_overflow(data_addr, static_cast<uintptr_t>(len), &data_end)) return false;
-                const uintptr_t name_addr = reinterpret_cast<uintptr_t>(parsed_header.name.ptr);
-                const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(parsed_header.raw_value.ptr);
                 if (parsed_header.name.len != name_len ||
-                    name_addr != reinterpret_cast<uintptr_t>(hs) || raw_addr < data_addr ||
-                    raw_addr > data_end || ([&] {
-                        uintptr_t raw_end = 0;
-                        return add_overflow(raw_addr,
-                                            static_cast<uintptr_t>(parsed_header.raw_value.len),
-                                            &raw_end) ||
-                               raw_end > data_end;
-                    }()) ||
-                    parsed_header.raw_value.ptr != reinterpret_cast<const char*>(colon + 1) ||
-                    parsed_header.raw_value.len !=
-                        static_cast<u32>(static_cast<i64>(le - colon) - 1))
+                    parsed_header.name.ptr != reinterpret_cast<const char*>(hs) ||
+                    parsed_header.raw_value.ptr != reinterpret_cast<const char*>(value_start) ||
+                    range_int(parsed_header.raw_value.len).value() != value_end - value_start)
                     return false;
-                value_start = reinterpret_cast<const u8*>(parsed_header.raw_value.ptr);
-                value_end = value_start + static_cast<i64>(parsed_header.raw_value.len);
                 while (value_start < value_end && *value_start == ' ') value_start++;
                 while (value_end > value_start && value_end[-1] == ' ') value_end--;
             } else {
@@ -15067,15 +15037,14 @@ inline bool redirect_legacy_authority_matches_listener(const RedirectAuthorityVi
         out_req->version != HttpVersion::Http11 || out_req->has_content_length ||
         out_req->chunked || out_req->upgrade || out_req->has_upgrade_header)
         return false;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(conn.recv_buf.data());
-    const uintptr_t path_addr = reinterpret_cast<uintptr_t>(out_req->path.ptr);
-    uintptr_t path_offset = 0;
-    u32 remaining;
-    if (sub_overflow(path_addr, base, &path_offset) ||
-        sub_overflow(conn.recv_buf.len(), path_offset, &remaining) || out_req->path.len > remaining)
-        return false;
-    const u32 target_start = static_cast<u32>(path_offset);
     const u32 target_len = out_req->path.len;
+    u32 target_start;
+    if (!byte_span_offset_within(conn.recv_buf.data(),
+                                 conn.recv_buf.len(),
+                                 out_req->path.ptr,
+                                 target_len,
+                                 &target_start))
+        return false;
     if (target_len == 0 || out_req->path.ptr[0] != '/') return false;
 
     u32 host_count = 0;

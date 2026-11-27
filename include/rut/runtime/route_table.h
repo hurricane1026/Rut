@@ -1692,19 +1692,11 @@ public:
 
     // Register foundation-only redirect metadata. Strings are copied into
     // RouteConfig-owned storage; no compiler/RIR pointer escapes here.
-    bool redirect_policy_string_is_owned(Str value) const {
+    [[nodiscard]] bool redirect_policy_string_is_owned(Str value) const {
         if (value.len == 0) return true;
-        if (value.ptr == nullptr || redirect_policy_bytes_used > kRedirectPolicyBytesPoolBytes ||
-            value.len > redirect_policy_bytes_used)
-            return false;
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(redirect_policy_bytes);
-        uintptr_t end = 0;
-        if (add_overflow(begin, static_cast<uintptr_t>(redirect_policy_bytes_used), &end))
-            return false;
-        const uintptr_t ptr = reinterpret_cast<uintptr_t>(value.ptr);
-        uintptr_t remaining = 0;
-        if (sub_overflow(end, ptr, &remaining)) return false;
-        return ptr >= begin && ptr <= end && value.len <= remaining;
+        return redirect_policy_bytes_used <= kRedirectPolicyBytesPoolBytes &&
+               byte_span_within(
+                   redirect_policy_bytes, redirect_policy_bytes_used, value.ptr, value.len);
     }
 
     bool redirect_policy_strings_are_owned(const RedirectPolicySpec& policy) const {

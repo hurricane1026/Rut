@@ -1,3 +1,4 @@
+#include "rut/common/byte_span.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/types.h"
@@ -324,24 +325,13 @@ void capture_request_metadata(Connection& conn) {
     if (parse_status == ParseStatus::Complete) {
         u32 raw_target_offset = 0;
         u32 raw_target_length = 0;
-        const uintptr_t base_address = reinterpret_cast<uintptr_t>(data);
-        const uintptr_t target_address = reinterpret_cast<uintptr_t>(req.path.ptr);
-        uintptr_t target_end = 0;
-        const bool target_address_range_valid =
-            base_address >= 4096 &&
-            !add_overflow(base_address, static_cast<uintptr_t>(kLen), &target_end) &&
-            target_address >= base_address && target_address <= target_end;
-        if (target_address_range_valid) {
-            uintptr_t offset_ptr = 0;
-            if (sub_overflow(target_address, base_address, &offset_ptr)) return;
-            const u64 offset = offset_ptr;
-            u64 end = 0;
-            if (add_overflow(offset, static_cast<u64>(req.path.len), &end)) return;
-            if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
-                data[static_cast<u32>(offset)] == '/' && req.path_canon.ptr != nullptr) {
-                raw_target_offset = static_cast<u32>(offset);
-                raw_target_length = req.path.len;
-            }
+        u32 offset = 0;
+        if (reinterpret_cast<uintptr_t>(data) >= 4096 && req.path.len != 0 &&
+            byte_span_offset_within(data, kLen, req.path.ptr, req.path.len, &offset) &&
+            (range_int(offset) + range_int(req.path.len)).value() < parser.header_end &&
+            data[offset] == '/' && req.path_canon.ptr != nullptr) {
+            raw_target_offset = offset;
+            raw_target_length = req.path.len;
         }
         conn.req_header_end = parser.header_end;
         conn.req_http_version = static_cast<u8>(req.version);

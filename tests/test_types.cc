@@ -18,6 +18,19 @@ TEST(byte_span, checks_pool_boundaries) {
     CHECK(byte_span_within(pool, u16{8}, pool + 7, u16{1}));
 }
 
+TEST(byte_span, publishes_only_contained_offsets) {
+    const char bytes[10]{};
+    const char* buffer = bytes + 1;
+    u32 offset = UINT32_MAX;
+    CHECK(byte_span_offset_within(buffer, 8, buffer + 1, 7, &offset));
+    CHECK_EQ(offset, 1u);
+    CHECK_FALSE(byte_span_offset_within(buffer, 8, buffer + 1, UINT32_MAX, &offset));
+    CHECK_FALSE(byte_span_offset_within(buffer, 8, bytes, 1, &offset));
+    CHECK_EQ(offset, 1u);
+    CHECK(byte_span_offset_within(buffer, 8, buffer + 8, 0, &offset));
+    CHECK_EQ(offset, 8u);
+}
+
 TEST(byte_span, checks_64_bit_length_arithmetic) {
     const char pool[3]{};
     constexpr u64 kLimit32 = u64{1} << 32;
