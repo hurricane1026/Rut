@@ -101,7 +101,7 @@ TEST(block, capacity_equals_size_minus_header) {
     REQUIRE(a.init(4096).has_value());
     auto* b = a.current;
     u64 hdr = (sizeof(MmapArena::Block) + 15) & ~u64(15);
-    CHECK_EQ(b->capacity(), b->size - hdr);
+    CHECK_EQ(b->capacity(), b->size.to_u64() - hdr);
     a.destroy();
 }
 
@@ -179,7 +179,7 @@ TEST(arena, init_reports_mmap_failure) {
 TEST(arena, init_min_256) {
     MmapArena a;
     REQUIRE(a.init(1).has_value());
-    CHECK_GE(a.current->size, 256u);
+    CHECK_GE(a.current->size.to_u64(), 256u);
     a.destroy();
 }
 
@@ -305,7 +305,7 @@ TEST(arena, large_alloc_gets_own_block) {
     REQUIRE(a.init(256).has_value());
     void* p = a.alloc(1024);
     CHECK(p != nullptr);
-    CHECK_GE(a.current->size, 1024u + sizeof(MmapArena::Block));
+    CHECK_GE(a.current->size.to_u64(), 1024u + sizeof(MmapArena::Block));
     a.destroy();
 }
 

@@ -85,8 +85,11 @@ struct Arena {
     struct Block {
         Block* prev;
         // Published blocks satisfy kHeaderSize <= size and 0 <= used <= size - kHeaderSize.
-        i64 size;  // total block size (including this header)
-        i64 used;  // payload bytes reserved so far, also the next allocation offset
+        range_int<0> size;  // total block size (including this header)
+        i64 used;           // payload bytes reserved so far, also the next allocation offset
+
+        static_assert(sizeof(decltype(size)) == sizeof(i64));
+        static_assert(alignof(decltype(size)) == alignof(i64));
 
         static constexpr i64 kHeaderSize = [] {
             constexpr i64 kBlockSize = sizeof(Block);
@@ -94,7 +97,7 @@ struct Arena {
             return (kBlockSize + 15) / 16 * 16;
         }();
         u8* data() { return reinterpret_cast<u8*>(this) + kHeaderSize; }
-        i64 capacity() const { return size - kHeaderSize; }
+        [[nodiscard]] i64 capacity() const { return size.value() - kHeaderSize; }
         i64 remaining() const { return capacity() - used; }
     };
 
@@ -171,19 +174,19 @@ struct Arena {
         if (!current) return;
         while (current->prev) {
             Block* prev = current->prev;
-            backend.release(reinterpret_cast<u8*>(current), static_cast<u64>(current->size));
+            backend.release(reinterpret_cast<u8*>(current), current->size.to_u64());
             current = prev;
         }
         current->used = 0;
         // Only the original block remains. Its validated size is the total.
-        total_allocated = static_cast<u64>(current->size);
+        total_allocated = current->size.to_u64();
     }
 
     // Free everything.
     void destroy() {
         while (current) {
             Block* prev = current->prev;
-            backend.release(reinterpret_cast<u8*>(current), static_cast<u64>(current->size));
+            backend.release(reinterpret_cast<u8*>(current), current->size.to_u64());
             current = prev;
         }
         current = nullptr;
@@ -216,7 +219,7 @@ private:
         }
         auto* b = reinterpret_cast<Block*>(mem);
         b->prev = prev;
-        b->size = block_size.value();
+        b->size = block_size;
         b->used = 0;
         u64 next_total = 0;
         if (add_overflow(total_allocated, actual_size, &next_total)) {
