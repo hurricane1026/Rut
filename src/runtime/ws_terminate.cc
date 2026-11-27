@@ -401,12 +401,11 @@ namespace {
                               const u8* payload,
                               u64 len,
                               bool masked,
-                              u64& mask_rng,
+                              u64& /*mask_rng*/,
                               Str prefix = {},
                               Str suffix = {},
                               bool compressed = false) {
     u8 key[4] = {0, 0, 0, 0};
-    (void)mask_rng;  // Retained for compatibility with the existing inspector API.
     if (masked && RAND_bytes(key, sizeof(key)) != 1) return false;
     u8 hdr[kWsMaxHeaderSize];
     u32 output_len;
@@ -938,7 +937,9 @@ WsInspectStatus ws_inspect(WsInspector& st,
             static_cast<i64>(action_value) - static_cast<i64>(first_text_policy) >=
                 static_cast<i64>(st.forward_text_count))
             return WsInspectStatus::Error;
+#if RUT_ENABLE_WEBSOCKET
         const u32 kOutputBegin = *produced;
+#endif
         if (action == WsFrameAction::Forward) {
             // Re-serialize the whole message as a single (unfragmented) frame.
             if (!emit_frame(
@@ -1085,8 +1086,6 @@ WsInspectStatus ws_inspect(WsInspector& st,
 #if RUT_ENABLE_WEBSOCKET
         if (!compress_emitted_message(st, out, out_cap, kOutputBegin, produced, msg_buf, msg_cap))
             return WsInspectStatus::Error;
-#else
-        (void)kOutputBegin;
 #endif
         // Drop: emit nothing. All continuing verdicts reset for the next message.
         st.message_len = 0;

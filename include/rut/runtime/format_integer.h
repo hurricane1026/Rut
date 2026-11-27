@@ -5,7 +5,7 @@
 
 namespace rut {
 
-inline constexpr char last_decimal_digit(u64 value) {
+[[nodiscard]] inline constexpr char last_decimal_digit(u64 value) {
     static constexpr char kDigits[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'};
     return bounded_remainder<10>(value).at(kDigits);
 }
