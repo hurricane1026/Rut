@@ -12,17 +12,20 @@
 namespace rut {
 namespace {
 
+constexpr auto kAcceptLength = range_int<kWsHandshakeAcceptLength, kWsHandshakeAcceptLength + 1>{};
+constexpr auto kAcceptCapacity = kAcceptLength + range_int<1, 2>{};
+
 bool name_is(Str name, const char* value, u32 length) {
     return name.len == length && http_header_name_eq_ci(name.ptr, name.len, value, length);
 }
 
 Str trim_ows(Str value) {
     if (value.ptr == nullptr) return value;
-    i64 start = 0;
-    i64 end = value.len;
+    u32 start = 0;
+    u32 end = value.len;
     while (start < end && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) ++start;
     while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) --end;
-    return {value.ptr + start, static_cast<u32>(end - start)};
+    return value.slice(start, end);
 }
 
 int base64_value(char value) {
@@ -69,24 +72,23 @@ bool tchar(u8 c) {
 bool protocol_token_valid(Str token) {
     if (token.ptr == nullptr || token.len == 0) return false;
     for (i64 i = 0; i < token.len; i++)
-        if (!tchar(static_cast<u8>(token.ptr[i]))) return false;
+        if (!tchar(byte_value(token.ptr[i]))) return false;
     return true;
 }
 
-bool token_was_offered_before(const ParsedRequest& request,
-                              i64 current_header,
-                              i64 current_start,
-                              Str candidate) {
+[[nodiscard]] bool token_was_offered_before(const ParsedRequest& request,
+                                            i64 current_header,
+                                            u32 current_start,
+                                            Str candidate) {
     for (i64 i = 0; i <= current_header; i++) {
         const Header& header = request.headers[i];
         if (!name_is(header.name, "sec-websocket-protocol", 22)) continue;
-        i64 start = 0;
+        u32 start = 0;
         for (;;) {
-            i64 end = start;
+            u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') end++;
             if (i == current_header && start >= current_start) return false;
-            const Str kPrevious =
-                trim_ows({header.value.ptr + start, static_cast<u32>(end - start)});
+            const Str kPrevious = trim_ows(header.value.slice(start, end));
             if (kPrevious.len == candidate.len &&
                 __builtin_memcmp(kPrevious.ptr, candidate.ptr, candidate.len) == 0)
                 return true;
@@ -98,39 +100,39 @@ bool token_was_offered_before(const ParsedRequest& request,
 }
 
 bool request_protocols_valid(const ParsedRequest& request, u32* out_canonical_len) {
-    i64 canonical_len = 0;
+    u32 canonical_len = 0;
     for (i64 i = 0; i < request.header_count; i++) {
         const Header& header = request.headers[i];
         if (!name_is(header.name, "sec-websocket-protocol", 22)) continue;
-        i64 start = 0;
+        u32 start = 0;
         for (;;) {
-            i64 end = start;
+            u32 end = start;
             while (end < header.value.len && header.value.ptr[end] != ',') end++;
-            const Str kToken = trim_ows({header.value.ptr + start, static_cast<u32>(end - start)});
+            const Str kToken = trim_ows(header.value.slice(start, end));
             if (!protocol_token_valid(kToken) ||
                 token_was_offered_before(request, i, start, kToken))
                 return false;
-            const i64 kSeparator = canonical_len == 0 ? 0 : 1;
-            if (static_cast<i64>(kToken.len) >
-                static_cast<i64>(UINT32_MAX) - canonical_len - kSeparator)
+            const auto separator = canonical_len == 0 ? range_int<0, 2>::constant<0>()
+                                                      : range_int<0, 2>::constant<1>();
+            if (!(range_int{canonical_len} + separator + range_int{kToken.len}).to(&canonical_len))
                 return false;
-            canonical_len += kSeparator + i64{kToken.len};
             if (end == header.value.len) break;
             start = end + 1;
         }
     }
-    if (out_canonical_len != nullptr) *out_canonical_len = static_cast<u32>(canonical_len);
+    if (out_canonical_len != nullptr) *out_canonical_len = canonical_len;
     return true;
 }
 
 bool offered_protocol_exists(const u8* storage, u32 offers_len, Str candidate) {
+    if (offers_len == 0) return false;
+    const u8* offers = storage + kAcceptLength.index();
     i64 start = 0;
     while (start < offers_len) {
         i64 end = start;
-        while (end < offers_len && storage[i64{kWsHandshakeAcceptLength} + end] != ',') ++end;
-        if (end - start == i64{candidate.len} &&
-            __builtin_memcmp(
-                storage + i64{kWsHandshakeAcceptLength} + start, candidate.ptr, candidate.len) == 0)
+        while (end < offers_len && offers[end] != ',') ++end;
+        if (end - start == range_int{candidate.len}.to<i64>() &&
+            __builtin_memcmp(offers + start, candidate.ptr, candidate.len) == 0)
             return true;
         start = end + 1;
     }
@@ -141,33 +143,36 @@ bool append_request_protocols(const ParsedRequest& request,
                               u8* storage,
                               u32 storage_capacity,
                               u32* out_offers_len) {
-    i64 out = 0;
+    u32 offers_capacity;
+    if (!(range_int{storage_capacity} - kAcceptLength).to(&offers_capacity)) return false;
+    const auto capacity = range_int{offers_capacity};
+    u8* const offers = storage + kAcceptLength.index();
+    auto cursor = range_int{u32{0}};
     for (i64 i = 0; i < request.header_count; i++) {
         const Header& header = request.headers[i];
         if (!name_is(header.name, "sec-websocket-protocol", 22)) continue;
         const Str kValue = header.value;
-        i64 start = 0;
+        u32 start = 0;
         for (;;) {
-            i64 end = start;
+            u32 end = start;
             while (end < kValue.len && kValue.ptr[end] != ',') end++;
-            const Str kToken = trim_ows({kValue.ptr + start, static_cast<u32>(end - start)});
+            const Str kToken = trim_ows(kValue.slice(start, end));
             if (!protocol_token_valid(kToken)) return false;
-            const i64 kSeparator = out == 0 ? 0 : 1;
-            if (out > i64{storage_capacity} - i64{kWsHandshakeAcceptLength} ||
-                kSeparator + i64{kToken.len} >
-                    i64{storage_capacity} - i64{kWsHandshakeAcceptLength} - out)
-                return false;
-            if (kSeparator) {
-                storage[i64{kWsHandshakeAcceptLength} + out] = ',';
-                ++out;
-            }
-            __builtin_memcpy(storage + i64{kWsHandshakeAcceptLength} + out, kToken.ptr, kToken.len);
-            out += i64{kToken.len};
+            const bool needs_separator = cursor.value() != 0;
+            const auto separator =
+                needs_separator ? range_int<0, 2>::constant<1>() : range_int<0, 2>::constant<0>();
+            const auto token_start = cursor + separator;
+            const auto next = token_start + range_int{kToken.len};
+            decltype(cursor) end_of_token;
+            if (!capacity.try_count(next.value(), &end_of_token)) return false;
+            if (needs_separator) offers[cursor.index()] = ',';
+            __builtin_memcpy(offers + token_start.index(), kToken.ptr, kToken.len);
+            cursor = end_of_token;
             if (end == kValue.len) break;
             start = end + 1;
         }
     }
-    *out_offers_len = static_cast<u32>(out);
+    *out_offers_len = cursor.to<u32>();
     return true;
 }
 
@@ -180,17 +185,17 @@ bool encode_accept(Str key, u8* out, u32 out_capacity) {
     u32 encoded_len = 0;
     return rut_crypto_digest_parts_v1(
                RUT_CRYPTO_SHA1_V1, kParts, 2, nullptr, 0, 0, digest, sizeof(digest), &digest_len) &&
-           digest_len == sizeof(digest) && i64{out_capacity} >= i64{kWsHandshakeAcceptLength} + 1 &&
+           digest_len == sizeof(digest) && out_capacity >= kAcceptCapacity.to<u32>() &&
            rut_crypto_base64_encode_v1(digest, sizeof(digest), out, out_capacity, &encoded_len) &&
            encoded_len == kWsHandshakeAcceptLength;
 }
 
 bool connection_value_is_valid(Str value, bool* has_upgrade) {
-    i64 start = 0;
+    u32 start = 0;
     for (;;) {
-        i64 end = start;
+        u32 end = start;
         while (end < value.len && value.ptr[end] != ',') end++;
-        const Str kItem = trim_ows({value.ptr + start, static_cast<u32>(end - start)});
+        const Str kItem = trim_ows(value.slice(start, end));
         if (!protocol_token_valid(kItem)) return false;
         if (kItem.len == 7 && http_header_name_eq_ci(kItem.ptr, kItem.len, "upgrade", 7))
             *has_upgrade = true;
@@ -200,17 +205,16 @@ bool connection_value_is_valid(Str value, bool* has_upgrade) {
 }
 
 bool upgrade_protocol_valid(Str protocol, bool* is_websocket) {
-    i64 slash = protocol.len;
-    for (i64 i = 0; i < protocol.len; i++) {
+    u32 slash = protocol.len;
+    for (u32 i = 0; i < protocol.len; i++) {
         if (protocol.ptr[i] != '/') continue;
         if (slash != protocol.len) return false;
         slash = i;
     }
-    const Str kName = {protocol.ptr, static_cast<u32>(slash)};
+    const Str kName = protocol.slice(0, slash);
     if (!protocol_token_valid(kName)) return false;
     if (slash != protocol.len) {
-        const Str kVersion = {protocol.ptr + slash + 1,
-                              static_cast<u32>(static_cast<i64>(protocol.len) - slash - 1)};
+        const Str kVersion = protocol.slice(slash + 1, protocol.len);
         if (!protocol_token_valid(kVersion)) return false;
     } else if (kName.len == 9 && http_header_name_eq_ci(kName.ptr, kName.len, "websocket", 9)) {
         *is_websocket = true;
@@ -219,11 +223,11 @@ bool upgrade_protocol_valid(Str protocol, bool* is_websocket) {
 }
 
 bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
-    i64 start = 0;
+    u32 start = 0;
     for (;;) {
-        i64 end = start;
+        u32 end = start;
         while (end < value.len && value.ptr[end] != ',') end++;
-        const Str kItem = trim_ows({value.ptr + start, static_cast<u32>(end - start)});
+        const Str kItem = trim_ows(value.slice(start, end));
         if (!upgrade_protocol_valid(kItem, offers_websocket)) return false;
         if (end == value.len) return true;
         start = end + 1;
@@ -236,7 +240,7 @@ WsHandshakeRequestResult ws_prepare_h2_handshake(const ParsedRequest& request,
                                                  u8* storage,
                                                  u32 capacity,
                                                  u32* offers_len) {
-    if (!offers_len || (storage && i64{capacity} < i64{kWsHandshakeAcceptLength} + 1))
+    if (!offers_len || (storage && capacity < kAcceptCapacity.to<u32>()))
         return WsHandshakeRequestResult::BadRequest;
     *offers_len = 0;
     i32 versions = 0;
@@ -297,7 +301,7 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
     if (downstream_deflate) *downstream_deflate = {};
     if (request == nullptr || header_len == 0 || header_len > SlicePool::kSliceSize ||
         out_offers_len == nullptr ||
-        (storage != nullptr && i64{storage_capacity} < i64{kWsHandshakeAcceptLength} + 1))
+        (storage != nullptr && storage_capacity < kAcceptCapacity.to<u32>()))
         return WsHandshakeRequestResult::BadRequest;
     *out_offers_len = 0;
     HttpParser parser{};
@@ -363,12 +367,11 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
         for (i64 i = 0; i < parsed.header_count; i++) {
             const Header& header = parsed.headers[i];
             if (!name_is(header.name, "sec-websocket-protocol", 22)) continue;
-            i64 start = 0;
+            u32 start = 0;
             for (;;) {
-                i64 end = start;
+                u32 end = start;
                 while (end < header.value.len && header.value.ptr[end] != ',') end++;
-                offered |= trim_ows({header.value.ptr + start, static_cast<u32>(end - start)})
-                               .eq(required_subprotocol);
+                offered |= trim_ows(header.value.slice(start, end)).eq(required_subprotocol);
                 if (end == header.value.len) break;
                 start = end + 1;
             }
@@ -395,7 +398,8 @@ bool ws_handshake_response_matches(const ParsedResponse& response,
                                    bool opaque_extensions) {
     if (upstream_deflate) *upstream_deflate = {};
     if (storage == nullptr ||
-        i64{offers_len} > i64{SlicePool::kSliceSize} - i64{kWsHandshakeAcceptLength} ||
+        offers_len > (range_int<SlicePool::kSliceSize, SlicePool::kSliceSize + 1>{} - kAcceptLength)
+                         .to<u32>() ||
         (required_subprotocol.len != 0 && !ws_valid_subprotocol(required_subprotocol)) ||
         response.header_count > kMaxHeaders || response.version != HttpVersion::Http11 ||
         response.status_code != 101 || response.headers_truncated)
@@ -458,11 +462,14 @@ u32 ws_build_h1_handshake(const ParsedRequest& request,
         !rut_crypto_base64_encode_v1(nonce, sizeof(nonce), key, sizeof(key), &key_len) ||
         key_len != 24)
         return 0;
-    i64 used = 0;
+    auto used = range_int{u32{0}};
+    const auto limit = range_int{capacity};
     auto put = [&](Str text) {
-        if (i64{text.len} > i64{capacity} - used) return false;
-        __builtin_memcpy(output + used, text.ptr, text.len);
-        used += i64{text.len};
+        const auto end = used + range_int{text.len};
+        decltype(used) next;
+        if (!limit.try_count(end.value(), &next)) return false;
+        __builtin_memcpy(output + used.index(), text.ptr, text.len);
+        used = next;
         return true;
     };
     if (!put(lit_str("GET ")) || !put(request.path) ||
@@ -478,54 +485,53 @@ u32 ws_build_h1_handshake(const ParsedRequest& request,
         if (!put(h.name) || !put(lit_str(": ")) || !put(h.value) || !put(lit_str("\r\n"))) return 0;
     }
     if (!put(lit_str("\r\n")) ||
-        ws_prepare_handshake(
-            output, static_cast<u32>(used), storage, storage_capacity, offers_len) !=
+        ws_prepare_handshake(output, used.to<u32>(), storage, storage_capacity, offers_len) !=
             WsHandshakeRequestResult::Ready)
         return 0;
-    return static_cast<u32>(used);
+    return used.to<u32>();
 }
 
 u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str required_subprotocol) {
     if (request == nullptr || header_len > total_len || header_len < 4 ||
         total_len > SlicePool::kSliceSize || !ws_valid_subprotocol(required_subprotocol))
         return 0;
-    i64 read = 0;
+    const Str headers{reinterpret_cast<const char*>(request), header_len};
+    const auto header_size = range_int{header_len};
+    const auto last = (range_int{header_len} - range_int<1, 2>{}).value();
+    u32 read = 0;
     i64 write = 0;
     bool selected = false;
     while (read < header_len) {
-        i64 end = read;
-        while (end + 1 < i64{header_len} && (request[end] != '\r' || request[end + 1] != '\n'))
-            ++end;
-        if (end + 1 >= i64{header_len}) return 0;
-        const i64 kNext = end + 2;
-        i64 colon = read;
+        u32 end = read;
+        while (end < last && (request[end] != '\r' || request[end + 1] != '\n')) ++end;
+        if (end >= last) return 0;
+        auto next = range_int{end};
+        if (!header_size.try_count((next + range_int<2, 3>{}).value(), &next)) return 0;
+        u32 colon = read;
         while (colon < end && request[colon] != ':') colon++;
         const bool kIsProtocol =
-            colon < end && http_header_name_eq_ci(reinterpret_cast<const char*>(request + read),
-                                                  static_cast<u32>(colon - read),
-                                                  "sec-websocket-protocol",
-                                                  22);
+            colon < end && name_is(headers.slice(read, colon), "sec-websocket-protocol", 22);
         if (kIsProtocol) {
             bool contains = false;
-            i64 start = colon + 1;
+            u32 start = colon + 1;
             while (start < end) {
-                i64 stop = start;
+                u32 stop = start;
                 while (stop < end && request[stop] != ',') stop++;
-                contains |= trim_ows({reinterpret_cast<const char*>(request + start),
-                                      static_cast<u32>(stop - start)})
-                                .eq(required_subprotocol);
+                contains |= trim_ows(headers.slice(start, stop)).eq(required_subprotocol);
+                if (stop == end) break;
                 start = stop + 1;
             }
             if (!selected && contains) {
                 static constexpr char kHeader[] = "Sec-WebSocket-Protocol:";
                 constexpr i64 kHeaderBytes = sizeof(kHeader) - 1;
-                const i64 kLength = kHeaderBytes + i64{required_subprotocol.len} + 2;
-                if (kLength > kNext - read) return 0;
+                const auto length = range_int<kHeaderBytes + 2, kHeaderBytes + 3>{} +
+                                    range_int{required_subprotocol.len};
+                if (length.value() > (next - range_int{read}).value()) return 0;
                 __builtin_memcpy(request + write, kHeader, sizeof(kHeader) - 1);
                 write += kHeaderBytes;
                 __builtin_memcpy(
                     request + write, required_subprotocol.ptr, required_subprotocol.len);
-                write += i64{required_subprotocol.len};
+                write += range_int{required_subprotocol.len}.to<i64>();
                 request[write] = '\r';
                 ++write;
                 request[write] = '\n';
@@ -533,16 +539,20 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
                 selected = true;
             }
         } else {
-            __builtin_memmove(request + write, request + read, static_cast<u32>(kNext - read));
-            write += kNext - read;
+            const auto line = headers.slice(read, next.to<u32>());
+            __builtin_memmove(request + write, line.ptr, line.len);
+            write += range_int{line.len}.to<i64>();
         }
-        read = kNext;
+        read = next.to<u32>();
     }
     if (!selected) return 0;
-    __builtin_memmove(request + write,
-                      request + i64{header_len},
-                      static_cast<u32>(static_cast<i64>(total_len) - static_cast<i64>(header_len)));
-    return static_cast<u32>(write);
+    u32 result;
+    u32 trailing;
+    if (!range_int{write}.to(&result) ||
+        !(range_int{total_len} - range_int{header_len}).to(&trailing))
+        return 0;
+    __builtin_memmove(request + write, request + range_int{header_len}.index(), trailing);
+    return result;
 }
 
 }  // namespace rut
