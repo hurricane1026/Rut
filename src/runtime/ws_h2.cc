@@ -3,6 +3,7 @@
 #include "core/placement_new.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/connection.h"
@@ -32,14 +33,14 @@ bool offered(const ParsedRequest& request, Str required) {
             u32 end = start;
             while (end < h.value.len && h.value.ptr[end] != ',') ++end;
             u32 last = end;
-            while (last > start &&
-                   (h.value.ptr[i64{last} - 1] == ' ' || h.value.ptr[i64{last} - 1] == '\t'))
-                last = static_cast<u32>(static_cast<i64>(last) - 1);
-            if (Str{h.value.ptr + i64{start},
-                    static_cast<u32>(static_cast<i64>(last) - static_cast<i64>(start))}
-                    .eq(required))
-                return true;
-            start = static_cast<u32>(static_cast<i64>(end) + 1);
+            while (last > start) {
+                const char ch = h.value.ptr[range_int{last - 1}.index()];
+                if (ch != ' ' && ch != '\t') break;
+                --last;
+            }
+            if (h.value.slice(start, last).eq(required)) return true;
+            if (end == h.value.len) break;
+            start = end + 1;
         }
     }
     return false;
@@ -264,7 +265,7 @@ bool ws_h2_process(GrpcExchange& exchange, bool from_client) {
     } else if (length) {
         // Closing controls reply to their sender. Do not consume a Ping until
         // its owned reply slot is free; the fixed close deadline bounds stalls.
-        const u32 kReply = static_cast<u32>(1 - static_cast<i64>(kIndex));
+        const u32 kReply = from_client ? 1 : 0;
         if (session.output_length[kReply]) return true;
         u8 ping[kWsMaxControlPayload];
         u32 ping_length = 0;
@@ -287,8 +288,9 @@ bool ws_h2_process(GrpcExchange& exchange, bool from_client) {
         }
     }
     if (consumed) {
-        length = static_cast<u32>(static_cast<i64>(length) - static_cast<i64>(consumed));
-        if (length) __builtin_memmove(input, input + i64{consumed}, length);
+        const auto consumed_bytes = range_int{consumed};
+        if (!(range_int{length} - consumed_bytes).to(&length)) return false;
+        if (length) __builtin_memmove(input, input + consumed_bytes.index(), length);
         Connection* owner = from_client ? exchange.downstream : exchange.upstream;
         if (owner && owner->h2 && !owner->h2->grpc.websocket_http1 &&
             !owner->h2->grpc.websocket_http1_downstream &&
@@ -320,20 +322,24 @@ void ws_h2_eof(GrpcExchange& exchange, bool from_client) {
 const u8* ws_h2_output(GrpcExchange& exchange, bool from_client, u32* length) {
     auto& session = *exchange.ws;
     const u32 kIndex = from_client ? 0 : 1;
-    *length = static_cast<u32>(static_cast<i64>(session.output_length[kIndex]) -
-                               static_cast<i64>(session.output_offset[kIndex]));
+    const auto offset = range_int{session.output_offset[kIndex]};
+    if (!(range_int{session.output_length[kIndex]} - offset).to(length)) {
+        exchange.failure = 13;
+        *length = 0;
+        return nullptr;
+    }
     if (!*length) return nullptr;
     return (from_client ? session.callback.ws_c2u_out : session.callback.ws_u2c_out) +
-           i64{session.output_offset[kIndex]};
+           offset.index();
 }
 
 bool ws_h2_consume_output(GrpcExchange& exchange, bool from_client, u32 length) {
     auto& session = *exchange.ws;
     const u32 kIndex = from_client ? 0 : 1;
-    if (i64{length} > i64{session.output_length[kIndex]} - i64{session.output_offset[kIndex]})
-        return false;
-    session.output_offset[kIndex] = static_cast<u32>(
-        static_cast<i64>(session.output_offset[kIndex]) + static_cast<i64>(length));
+    auto offset = range_int{session.output_offset[kIndex]};
+    const auto limit = range_int{session.output_length[kIndex]};
+    if (!limit.try_count((offset + range_int{length}).value(), &offset)) return false;
+    session.output_offset[kIndex] = offset.to<u32>();
     if (session.output_offset[kIndex] == session.output_length[kIndex]) {
         session.output_length[kIndex] = session.output_offset[kIndex] = 0;
         if (session.output_close[kIndex]) {

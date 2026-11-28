@@ -183,6 +183,23 @@ TEST(http2_websocket, inspected_flow_credit_survives_messages_larger_than_a_stre
     f.down->h2 = nullptr;
 }
 
+TEST(http2_websocket, output_cursor_rejects_out_of_range_lengths) {
+    WsH2Fixture f;
+    REQUIRE(f.start());
+    auto& session = *f.x->ws;
+    session.output_length[0] = 4;
+    session.output_offset[0] = 2;
+
+    CHECK(!ws_h2_consume_output(*f.x, true, UINT32_MAX));
+    CHECK_EQ(session.output_offset[0], 2u);
+
+    session.output_offset[0] = 5;
+    u32 length = 10;
+    CHECK(ws_h2_output(*f.x, true, &length) == nullptr);
+    CHECK_EQ(length, 0u);
+    CHECK_NE(f.x->failure, 0);
+}
+
 TEST(http2_websocket, close_acknowledgements_wait_for_send_completions_and_close_once) {
     WsH2Fixture f;
     REQUIRE(f.start());
