@@ -1,3 +1,5 @@
+#include "core/forward.h"
+
 using Count = unsigned;
 
 unsigned widen(unsigned short n) {
@@ -37,4 +39,13 @@ Count macro_user(int n) {
 Count pasted_macro_user(int n) {
     // expected-warning@+1 {{static_cast is prohibited}}
     return CAST_NAME<Count>(n);
+}
+
+int&& forward_reference(int& value) {
+    return core::forward<int>(value);
+}
+
+int&& direct_reference_cast(int& value) {
+    // expected-warning@+1 {{static_cast is prohibited}}
+    return static_cast<int&&>(value);
 }

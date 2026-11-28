@@ -7,6 +7,19 @@ using core::Expected;
 using core::make_unexpected;
 using core::Unexpected;
 
+inline constexpr bool kForwardPreservesLvalue = [] {
+    int value = 0;
+    return __is_same(decltype(core::forward<int&>(value)), int&) &&
+           __is_same(decltype(core::forward<int>(value)), int&&) &&
+           &core::forward<int&>(value) == &value;
+}();
+static_assert(kForwardPreservesLvalue);
+static_assert(__is_same(decltype(core::forward<int>(0)), int&&));
+static_assert(__is_same(decltype(core::forward<const int>(0)), const int&&));
+template <typename T>
+concept ForwardsTemporary = requires { core::forward<T>(0); };
+static_assert(!ForwardsTemporary<const int&>);
+
 // ── Error type ──────────────────────────────────────────────────────
 
 enum class Err { BadInput, Overflow, NotFound, Timeout };

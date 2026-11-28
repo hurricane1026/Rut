@@ -794,6 +794,13 @@ class IntegerArithmeticAction : public PluginASTAction {
         return true;
     }
 };
+bool is_core_forward(const FunctionDecl& function, const SourceManager& source) {
+    return function.getNumParams() == 1 &&
+           source.getFilename(source.getSpellingLoc(function.getLocation()))
+               .ends_with("/include/core/forward.h") &&
+           function.getQualifiedNameAsString() == "core::forward";
+}
+
 class NodiscardVisitor : public RecursiveASTVisitor<NodiscardVisitor> {
     ASTContext& context;
     llvm::DenseSet<unsigned> reported;
@@ -839,6 +846,8 @@ public:
 
     bool VisitParmVarDecl(const ParmVarDecl* param) {
         const auto* function = dyn_cast<FunctionDecl>(param->getDeclContext());
+        // Forwarding retains the caller's reference category.
+        if (function && is_core_forward(*function, context.getSourceManager())) return true;
         // An overloaded unary operator takes the operand itself.
         if (function && (function->getOverloadedOperator() == OO_PlusPlus ||
                          function->getOverloadedOperator() == OO_MinusMinus))
@@ -919,6 +928,8 @@ public:
             loc = source.getExpansionLoc(cast->getBeginLoc());
         if (loc.isInvalid() || source.isInSystemHeader(loc)) return true;
 
+        if (is_forwarding_primitive(*cast, loc)) return true;
+
         auto& diagnostics = context.getDiagnostics();
         const auto id = isa<CXXStaticCastExpr>(cast)
                             ? diagnostics.getCustomDiagID(DiagnosticsEngine::Warning,
@@ -931,6 +942,25 @@ public:
             source.isWrittenInSameFile(loc, end) && !source.isBeforeInTranslationUnit(end, loc))
             report << SourceRange(loc, end);
         return true;
+    }
+
+private:
+    bool is_forwarding_primitive(const ExplicitCastExpr& cast, SourceLocation loc) const {
+        if (!isa<CXXStaticCastExpr>(cast) || !cast.getTypeAsWritten()->isRValueReferenceType() ||
+            !context.getSourceManager().getFilename(loc).ends_with("/include/core/forward.h"))
+            return false;
+        const auto* argument = dyn_cast<DeclRefExpr>(cast.getSubExpr()->IgnoreParenImpCasts());
+        if (!argument) return false;
+        const auto parents = context.getParents(cast);
+        const auto* result = parents.size() == 1 ? parents[0].get<ReturnStmt>() : nullptr;
+        if (!result) return false;
+        const auto blocks = context.getParents(*result);
+        const auto* body = blocks.size() == 1 ? blocks[0].get<CompoundStmt>() : nullptr;
+        if (!body || body->size() != 1) return false;
+        const auto functions = context.getParents(*body);
+        const auto* function = functions.size() == 1 ? functions[0].get<FunctionDecl>() : nullptr;
+        return function && is_core_forward(*function, context.getSourceManager()) &&
+               argument->getDecl() == function->getParamDecl(0);
     }
 };
 

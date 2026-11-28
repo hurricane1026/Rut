@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "core/forward.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/types.h"
@@ -109,7 +110,7 @@ struct Arena {
     core::Expected<void, Error> init(Args&&... args) {
         total_allocated = 0;
         current = nullptr;
-        auto r = backend.init(static_cast<Args&&>(args)...);
+        auto r = backend.init(core::forward<Args>(args)...);
         if (!r) return r;
         constexpr auto kHeader = range_int<Block::kHeaderSize, Block::kHeaderSize + 1>{};
         current = alloc_block(kHeader, nullptr);
@@ -138,7 +139,7 @@ struct Arena {
         constexpr auto kBytes = range_int<sizeof(T), sizeof(T) + 1>{};
         void* p = alloc(kBytes.template to<i64>());
         if (!p) return nullptr;
-        return ::new (p) T(static_cast<Args&&>(args)...);
+        return ::new (p) T(core::forward<Args>(args)...);
     }
 
     // Array bump alloc, value-initialized via placement new.

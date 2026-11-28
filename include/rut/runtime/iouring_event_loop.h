@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expected.h"
+#include "core/forward.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/trap.h"
@@ -7401,7 +7402,7 @@ private:
 public:
     template <typename Callback>
     void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
-        drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
+        drain_response_read_deadline_body_pump_ready(core::forward<Callback>(callback));
     }
     void test_close_listen() { close_listen(); }
 #endif

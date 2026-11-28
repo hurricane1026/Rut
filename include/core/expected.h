@@ -13,26 +13,12 @@
 
 // Placement new — declaration only; definition lives in a single TU.
 // Guarded so mixed inclusion with <new> or arena.h won't conflict.
+#include "core/forward.h"
 #include "core/placement_new.h"
 
 namespace core {
 
 // ── Type traits (no <type_traits>) ──────────────────────────────────
-
-template <typename T>
-struct RemoveRef {
-    using type = T;
-};
-template <typename T>
-struct RemoveRef<T&> {
-    using type = T;
-};
-template <typename T>
-struct RemoveRef<T&&> {
-    using type = T;
-};
-template <typename T>
-using RemoveRef_t = typename RemoveRef<T>::type;
 
 template <typename T>
 struct RemoveCv {
@@ -71,11 +57,11 @@ struct Unexpected {
     E val;
 
     constexpr explicit Unexpected(const E& e) : val(e) {}
-    constexpr explicit Unexpected(E&& e) : val(static_cast<E&&>(e)) {}
+    constexpr explicit Unexpected(E&& e) : val(core::forward<E>(e)) {}
 
     constexpr const E& value() const& { return val; }
     constexpr E& value() & { return val; }
-    constexpr E&& value() && { return static_cast<E&&>(val); }
+    [[nodiscard]] constexpr E&& value() && { return core::forward<E>(val); }
 };
 
 template <typename E>
@@ -116,14 +102,14 @@ struct Storage {
     // Construct value
     template <typename... Args>
     constexpr void construct_val(Args&&... args) {
-        ::new (static_cast<void*>(buf)) T(static_cast<Args&&>(args)...);
+        ::new (buf) T(core::forward<Args>(args)...);
         has_val = true;
     }
 
     // Construct error
     template <typename... Args>
     constexpr void construct_err(Args&&... args) {
-        ::new (static_cast<void*>(buf)) E(static_cast<Args&&>(args)...);
+        ::new (buf) E(core::forward<Args>(args)...);
         has_val = false;
     }
 
@@ -150,7 +136,7 @@ struct Storage<void, E> {
 
     template <typename... Args>
     constexpr void construct_err(Args&&... args) {
-        ::new (static_cast<void*>(buf)) E(static_cast<Args&&>(args)...);
+        ::new (buf) E(core::forward<Args>(args)...);
         has_val = false;
     }
 
@@ -185,11 +171,11 @@ public:
 
     // Implicit from T (value)
     constexpr Expected(const T& v) { stor_.construct_val(v); }
-    constexpr Expected(T&& v) { stor_.construct_val(static_cast<T&&>(v)); }
+    constexpr Expected(T&& v) { stor_.construct_val(core::forward<T>(v)); }
 
     // From Unexpected<E> (error)
     constexpr Expected(const Unexpected<E>& u) { stor_.construct_err(u.value()); }
-    constexpr Expected(Unexpected<E>&& u) { stor_.construct_err(static_cast<E&&>(u.value())); }
+    constexpr Expected(Unexpected<E>&& u) { stor_.construct_err(core::forward<E>(u.value())); }
 
     // Copy
     constexpr Expected(const Expected& o) {
@@ -202,9 +188,9 @@ public:
     // Move
     constexpr Expected(Expected&& o) {
         if (o.stor_.has_val)
-            stor_.construct_val(static_cast<T&&>(o.stor_.val()));
+            stor_.construct_val(core::forward<T>(o.stor_.val()));
         else
-            stor_.construct_err(static_cast<E&&>(o.stor_.err()));
+            stor_.construct_err(core::forward<E>(o.stor_.err()));
     }
 
     ~Expected() { stor_.destroy(); }
@@ -226,9 +212,9 @@ public:
         if (this != &o) {
             stor_.destroy();
             if (o.stor_.has_val)
-                stor_.construct_val(static_cast<T&&>(o.stor_.val()));
+                stor_.construct_val(core::forward<T>(o.stor_.val()));
             else
-                stor_.construct_err(static_cast<E&&>(o.stor_.err()));
+                stor_.construct_err(core::forward<E>(o.stor_.err()));
         }
         return *this;
     }
@@ -240,7 +226,7 @@ public:
 
     constexpr T& value() & { return stor_.val(); }
     constexpr const T& value() const& { return stor_.val(); }
-    constexpr T&& value() && { return static_cast<T&&>(stor_.val()); }
+    [[nodiscard]] constexpr T&& value() && { return core::forward<T>(stor_.val()); }
 
     constexpr T& operator*() & { return stor_.val(); }
     constexpr const T& operator*() const& { return stor_.val(); }
@@ -249,19 +235,18 @@ public:
 
     constexpr E& error() & { return stor_.err(); }
     constexpr const E& error() const& { return stor_.err(); }
-    constexpr E&& error() && { return static_cast<E&&>(stor_.err()); }
+    [[nodiscard]] constexpr E&& error() && { return core::forward<E>(stor_.err()); }
 
     // ── value_or ────────────────────────────────────────────────────
 
     template <typename U>
     constexpr T value_or(U&& fallback) const& {
-        return has_value() ? value() : static_cast<T>(static_cast<U&&>(fallback));
+        return has_value() ? value() : T(core::forward<U>(fallback));
     }
 
     template <typename U>
     constexpr T value_or(U&& fallback) && {
-        return has_value() ? static_cast<T&&>(stor_.val())
-                           : static_cast<T>(static_cast<U&&>(fallback));
+        return has_value() ? core::forward<T>(stor_.val()) : T(core::forward<U>(fallback));
     }
 
     // ── Monadic operations ──────────────────────────────────────────
@@ -270,69 +255,69 @@ public:
     // Chains operations that can fail. Short-circuits on error.
     template <typename F>
     constexpr auto and_then(F&& f) & {
-        using R = decltype(static_cast<F&&>(f)(stor_.val()));
-        if (has_value()) return static_cast<F&&>(f)(stor_.val());
+        using R = decltype(core::forward<F>(f)(stor_.val()));
+        if (has_value()) return core::forward<F>(f)(stor_.val());
         return R(Unexpected<E>(stor_.err()));
     }
 
     template <typename F>
     constexpr auto and_then(F&& f) const& {
-        using R = decltype(static_cast<F&&>(f)(stor_.val()));
-        if (has_value()) return static_cast<F&&>(f)(stor_.val());
+        using R = decltype(core::forward<F>(f)(stor_.val()));
+        if (has_value()) return core::forward<F>(f)(stor_.val());
         return R(Unexpected<E>(stor_.err()));
     }
 
     template <typename F>
     constexpr auto and_then(F&& f) && {
-        using R = decltype(static_cast<F&&>(f)(static_cast<T&&>(stor_.val())));
-        if (has_value()) return static_cast<F&&>(f)(static_cast<T&&>(stor_.val()));
-        return R(Unexpected<E>(static_cast<E&&>(stor_.err())));
+        using R = decltype(core::forward<F>(f)(core::forward<T>(stor_.val())));
+        if (has_value()) return core::forward<F>(f)(core::forward<T>(stor_.val()));
+        return R(Unexpected<E>(core::forward<E>(stor_.err())));
     }
 
     // or_else: F(E) -> R, where R = decltype(f(error)) and R is constructible from T.
     // Handles/recovers from errors. If *this has a value, returns R(value()).
     template <typename F>
     constexpr auto or_else(F&& f) & {
-        using R = decltype(static_cast<F&&>(f)(stor_.err()));
+        using R = decltype(core::forward<F>(f)(stor_.err()));
         if (has_value()) return R(stor_.val());
-        return static_cast<F&&>(f)(stor_.err());
+        return core::forward<F>(f)(stor_.err());
     }
 
     template <typename F>
     constexpr auto or_else(F&& f) const& {
-        using R = decltype(static_cast<F&&>(f)(stor_.err()));
+        using R = decltype(core::forward<F>(f)(stor_.err()));
         if (has_value()) return R(stor_.val());
-        return static_cast<F&&>(f)(stor_.err());
+        return core::forward<F>(f)(stor_.err());
     }
 
     template <typename F>
     constexpr auto or_else(F&& f) && {
-        using R = decltype(static_cast<F&&>(f)(static_cast<E&&>(stor_.err())));
-        if (has_value()) return R(static_cast<T&&>(stor_.val()));
-        return static_cast<F&&>(f)(static_cast<E&&>(stor_.err()));
+        using R = decltype(core::forward<F>(f)(core::forward<E>(stor_.err())));
+        if (has_value()) return R(core::forward<T>(stor_.val()));
+        return core::forward<F>(f)(core::forward<E>(stor_.err()));
     }
 
     // transform: F(T) -> U (plain value, not Expected)
     // Maps the value. Wraps result in Expected<U, E>.
     template <typename F>
     constexpr auto transform(F&& f) & {
-        using U = decltype(static_cast<F&&>(f)(stor_.val()));
-        if (has_value()) return Expected<U, E>(static_cast<F&&>(f)(stor_.val()));
+        using U = decltype(core::forward<F>(f)(stor_.val()));
+        if (has_value()) return Expected<U, E>(core::forward<F>(f)(stor_.val()));
         return Expected<U, E>(Unexpected<E>(stor_.err()));
     }
 
     template <typename F>
     constexpr auto transform(F&& f) const& {
-        using U = decltype(static_cast<F&&>(f)(stor_.val()));
-        if (has_value()) return Expected<U, E>(static_cast<F&&>(f)(stor_.val()));
+        using U = decltype(core::forward<F>(f)(stor_.val()));
+        if (has_value()) return Expected<U, E>(core::forward<F>(f)(stor_.val()));
         return Expected<U, E>(Unexpected<E>(stor_.err()));
     }
 
     template <typename F>
     constexpr auto transform(F&& f) && {
-        using U = decltype(static_cast<F&&>(f)(static_cast<T&&>(stor_.val())));
-        if (has_value()) return Expected<U, E>(static_cast<F&&>(f)(static_cast<T&&>(stor_.val())));
-        return Expected<U, E>(Unexpected<E>(static_cast<E&&>(stor_.err())));
+        using U = decltype(core::forward<F>(f)(core::forward<T>(stor_.val())));
+        if (has_value()) return Expected<U, E>(core::forward<F>(f)(core::forward<T>(stor_.val())));
+        return Expected<U, E>(Unexpected<E>(core::forward<E>(stor_.err())));
     }
 };
 
@@ -351,7 +336,7 @@ public:
 
     // Error
     constexpr Expected(const Unexpected<E>& u) { stor_.construct_err(u.value()); }
-    constexpr Expected(Unexpected<E>&& u) { stor_.construct_err(static_cast<E&&>(u.value())); }
+    constexpr Expected(Unexpected<E>&& u) { stor_.construct_err(core::forward<E>(u.value())); }
 
     // Copy / Move
     constexpr Expected(const Expected& o) {
@@ -365,7 +350,7 @@ public:
         if (o.stor_.has_val)
             stor_.construct_val();
         else
-            stor_.construct_err(static_cast<E&&>(o.stor_.err()));
+            stor_.construct_err(core::forward<E>(o.stor_.err()));
     }
 
     ~Expected() { stor_.destroy(); }
@@ -387,7 +372,7 @@ public:
             if (o.stor_.has_val)
                 stor_.construct_val();
             else
-                stor_.construct_err(static_cast<E&&>(o.stor_.err()));
+                stor_.construct_err(core::forward<E>(o.stor_.err()));
         }
         return *this;
     }
@@ -397,14 +382,14 @@ public:
 
     constexpr E& error() & { return stor_.err(); }
     constexpr const E& error() const& { return stor_.err(); }
-    constexpr E&& error() && { return static_cast<E&&>(stor_.err()); }
+    [[nodiscard]] constexpr E&& error() && { return core::forward<E>(stor_.err()); }
 };
 
 // ── Helper: construct Unexpected ────────────────────────────────────
 
 template <typename E>
 constexpr Unexpected<RemoveCvRef_t<E>> make_unexpected(E&& e) {
-    return Unexpected<RemoveCvRef_t<E>>(static_cast<E&&>(e));
+    return Unexpected<RemoveCvRef_t<E>>(core::forward<E>(e));
 }
 
 }  // namespace core
@@ -425,25 +410,26 @@ constexpr Unexpected<RemoveCvRef_t<E>> make_unexpected(E&& e) {
 #define TRY_CONCAT(a, b) TRY_CONCAT_(a, b)
 
 // Internal helpers that take a unique suffix generated by __COUNTER__.
-#define TRY_IMPL(expr, uniq)                                                                       \
-    __extension__({                                                                                \
-        auto&& TRY_CONCAT(_try_r_, uniq) = (expr);                                                 \
-        if (!TRY_CONCAT(_try_r_, uniq))                                                            \
-            return ::core::make_unexpected(                                                        \
-                static_cast<decltype(TRY_CONCAT(_try_r_, uniq))&&>(TRY_CONCAT(_try_r_, uniq))      \
-                    .error());                                                                     \
-        auto TRY_CONCAT(_try_v_, uniq) =                                                           \
-            static_cast<decltype(TRY_CONCAT(_try_r_, uniq))&&>(TRY_CONCAT(_try_r_, uniq)).value(); \
-        TRY_CONCAT(_try_v_, uniq);                                                                 \
+#define TRY_IMPL(expr, uniq)                                                                    \
+    __extension__({                                                                             \
+        auto&& TRY_CONCAT(_try_r_, uniq) = (expr);                                              \
+        if (!TRY_CONCAT(_try_r_, uniq))                                                         \
+            return ::core::make_unexpected(                                                     \
+                ::core::forward<decltype(TRY_CONCAT(_try_r_, uniq))>(TRY_CONCAT(_try_r_, uniq)) \
+                    .error());                                                                  \
+        auto TRY_CONCAT(_try_v_, uniq) =                                                        \
+            ::core::forward<decltype(TRY_CONCAT(_try_r_, uniq))>(TRY_CONCAT(_try_r_, uniq))     \
+                .value();                                                                       \
+        TRY_CONCAT(_try_v_, uniq);                                                              \
     })
 
-#define TRY_VOID_IMPL(expr, uniq)                                                             \
-    do {                                                                                      \
-        auto&& TRY_CONCAT(_try_r_, uniq) = (expr);                                            \
-        if (!TRY_CONCAT(_try_r_, uniq))                                                       \
-            return ::core::make_unexpected(                                                   \
-                static_cast<decltype(TRY_CONCAT(_try_r_, uniq))&&>(TRY_CONCAT(_try_r_, uniq)) \
-                    .error());                                                                \
+#define TRY_VOID_IMPL(expr, uniq)                                                               \
+    do {                                                                                        \
+        auto&& TRY_CONCAT(_try_r_, uniq) = (expr);                                              \
+        if (!TRY_CONCAT(_try_r_, uniq))                                                         \
+            return ::core::make_unexpected(                                                     \
+                ::core::forward<decltype(TRY_CONCAT(_try_r_, uniq))>(TRY_CONCAT(_try_r_, uniq)) \
+                    .error());                                                                  \
     } while (0)
 
 // TRY: unwrap Expected<T, E> -> T, early-return on error
