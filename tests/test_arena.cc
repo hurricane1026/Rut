@@ -4,6 +4,7 @@
 #include "fault_injection.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/response_body_chain.h"
+#include "rut/runtime/slab_pool.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
 
@@ -1497,5 +1498,26 @@ TEST(response_body_chain, tls_threshold_keeps_short_bodies_in_slices) {
     CHECK_EQ(offset, sizeof(body));
     CHECK_EQ(pool.bulk_available(), kTestBulk);
     chain.release();
+    pool.destroy();
+}
+
+TEST(slab_pool, rejects_misaligned_and_foreign_pointers_before_freeing) {
+    using Pool = SlabPool<u64, 4>;
+    Pool pool;
+    REQUIRE(pool.init().has_value());
+    u64* slot = pool.alloc();
+    REQUIRE(slot != nullptr);
+    CHECK_EQ(pool.index_of(slot), 3u);
+
+    auto* misaligned = reinterpret_cast<u64*>(reinterpret_cast<u8*>(slot) + 1);
+    u64 foreign = 0;
+    CHECK_EQ(pool.index_of(misaligned), Pool::kInvalidIndex);
+    CHECK_EQ(pool.index_of(&foreign), Pool::kInvalidIndex);
+    pool.free(misaligned);
+    pool.free(&foreign);
+    CHECK_EQ(pool.in_use(), 1u);
+
+    pool.free(slot);
+    CHECK_EQ(pool.in_use(), 0u);
     pool.destroy();
 }

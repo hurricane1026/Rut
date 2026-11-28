@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/expected.h"
+#include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -36,7 +38,10 @@ struct SlabPool {
     core::Expected<void, Error> init() {
         free_top = Cap;
 
-        objects_size = static_cast<u64>(Cap) * sizeof(T);
+        constexpr auto kSlots = range_int<Cap, __int128_t{Cap} + 1>{};
+        static_assert(Cap == 0 || sizeof(T) <= SIZE_MAX / Cap);
+        static_assert(Cap == 0 || sizeof(u32) <= SIZE_MAX / Cap);
+        objects_size = kSlots.to_u64() * sizeof(T);
         void* obj_mem =
             mmap(nullptr, objects_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (obj_mem == MAP_FAILED) {
@@ -45,7 +50,7 @@ struct SlabPool {
         }
         objects = static_cast<T*>(obj_mem);
 
-        stack_size = static_cast<u64>(Cap) * sizeof(u32);
+        stack_size = kSlots.to_u64() * sizeof(u32);
         void* stk_mem =
             mmap(nullptr, stack_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (stk_mem == MAP_FAILED) {
@@ -56,7 +61,7 @@ struct SlabPool {
         }
         free_stack = static_cast<u32*>(stk_mem);
 
-        map_size = static_cast<u64>(Cap);
+        map_size = kSlots.to_u64();
         void* map_mem =
             mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (map_mem == MAP_FAILED) {
@@ -98,24 +103,27 @@ struct SlabPool {
         free_stack[free_top++] = idx;
     }
 
-    void free(T* obj) {
-        if (!obj || !objects || obj < objects || obj >= objects + Cap) return;
-        u32 idx = static_cast<u32>(obj - objects);
-        if (free_top >= Cap) return;
-        if (in_use_map && !in_use_map[idx]) return;  // double-free
-        if (in_use_map) in_use_map[idx] = 0;
-        free_stack[free_top++] = idx;
-    }
+    void free(T* obj) { free(index_of(obj)); }
 
     T& operator[](u32 idx) { return objects[idx]; }
     const T& operator[](u32 idx) const { return objects[idx]; }
-    u32 index_of(const T* obj) const { return static_cast<u32>(obj - objects); }
+
+    static constexpr u32 kInvalidIndex = UINT32_MAX;
+    [[nodiscard]] u32 index_of(const T* obj) const {
+        if (obj == nullptr || objects == nullptr) return kInvalidIndex;
+        uintptr_t offset;
+        if (sub_overflow(
+                reinterpret_cast<uintptr_t>(obj), reinterpret_cast<uintptr_t>(objects), &offset) ||
+            offset >= objects_size || offset % sizeof(T) != 0)
+            return kInvalidIndex;
+        range_int<0, __int128_t{Cap} + 1> index;
+        if (!decltype(index)::try_from_u64(offset / sizeof(T), &index)) return kInvalidIndex;
+        return index.template to<u32>();
+    }
 
     u32 capacity() const { return Cap; }
     u32 available() const { return free_top; }
-    u32 in_use() const {
-        return static_cast<u32>(static_cast<i64>(Cap) - static_cast<i64>(free_top));
-    }
+    [[nodiscard]] u32 in_use() const { return range_int{Cap - free_top}.to<u32>(); }
 
     void destroy() {
         if (in_use_map) {

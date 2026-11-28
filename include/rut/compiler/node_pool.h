@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/range_int.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -96,7 +97,7 @@ public:
             }
             __builtin_memmove(address_order_ + low + 1,
                               address_order_ + low,
-                              static_cast<u64>(chunk_count_ - low) * sizeof(u32));
+                              range_int{chunk_count_ - low}.scaled_by<sizeof(u32)>().to_u64());
             address_order_[low] = chunk_count_++;
         }
         (*this)[len++] = value;
@@ -123,11 +124,13 @@ public:
         if (low == 0) return 0xffffffffu;
         const u32 i = address_order_[low - 1];
         const auto begin = reinterpret_cast<uintptr_t>(chunks_[i]);
-        const u32 remaining = len - i * kChunkSize;
-        const u32 count = remaining < kChunkSize ? remaining : kChunkSize;
-        if (address - begin < sizeof(T) * count && (address - begin) % sizeof(T) == 0)
-            return i * kChunkSize + static_cast<u32>((address - begin) / sizeof(T));
-        return 0xffffffffu;
+        const u32 chunk_start = i * kChunkSize;
+        const auto offset = address - begin;
+        range_int<0, kChunkSize> entry;
+        if (offset % sizeof(T) != 0 || !decltype(entry)::try_from_u64(offset / sizeof(T), &entry) ||
+            entry.value() >= len - chunk_start)
+            return 0xffffffffu;
+        return chunk_start + entry.to<u32>();
     }
 };
 

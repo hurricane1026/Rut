@@ -33,7 +33,6 @@ struct MmapBackend {
     [[nodiscard]] u8* acquire(u64 needed, u64* out_size) {
         u64 size = default_block_size > needed ? default_block_size : needed;
         // Page-align
-        if (size > static_cast<u64>(-1) - 4095) return nullptr;
         u64 aligned = 0;
         if (add_overflow(size, u64{4095}, &aligned)) return nullptr;
         size = aligned & ~u64{4095};
@@ -112,7 +111,8 @@ struct Arena {
         current = nullptr;
         auto r = backend.init(static_cast<Args&&>(args)...);
         if (!r) return r;
-        current = alloc_block(Block::kHeaderSize, nullptr);
+        constexpr auto kHeader = range_int<Block::kHeaderSize, Block::kHeaderSize + 1>{};
+        current = alloc_block(kHeader, nullptr);
         if (!current) return core::make_unexpected(Error::from_errno(Error::Source::Arena));
         return {};
     }
@@ -135,7 +135,8 @@ struct Arena {
     // Typed bump alloc + placement new.
     template <typename T, typename... Args>
     [[nodiscard]] T* alloc_t(Args&&... args) {
-        void* p = alloc(i64{sizeof(T)});
+        constexpr auto kBytes = range_int<sizeof(T), sizeof(T) + 1>{};
+        void* p = alloc(kBytes.template to<i64>());
         if (!p) return nullptr;
         return ::new (p) T(static_cast<Args&&>(args)...);
     }
@@ -143,13 +144,14 @@ struct Arena {
     // Array bump alloc, value-initialized via placement new.
     template <typename T>
     [[nodiscard]] T* alloc_array(u32 count) {
-        i64 bytes;
-        if (mul_overflow(i64{sizeof(T)}, count, &bytes)) return nullptr;
+        const auto elements = range_int{count};
+        if (elements.to_u64() > u64{INT64_MAX} / sizeof(T)) return nullptr;
+        const u64 bytes = elements.to_u64() * sizeof(T);
         auto* a = static_cast<T*>(alloc(bytes));
         if (!a) return nullptr;
         for (u32 i = 0; i < count; i++) {
             // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-            void* slot = static_cast<void*>(a + static_cast<i64>(i));
+            void* slot = a + range_int{i}.index();
             ::new (slot) T{};
         }
         return a;
@@ -213,25 +215,27 @@ private:
         }
         i64 needed;
         if (add_overflow(Block::kHeaderSize, aligned_size, &needed)) return nullptr;
+        range_int<Block::kHeaderSize> block_bytes;
+        if (!decltype(block_bytes)::try_from_i64(needed, &block_bytes)) return nullptr;
         // alloc_block releases undersized blocks before returning, so any returned block
         // has at least aligned_size bytes of payload.
-        Block* b = alloc_block(needed, current);
+        Block* b = alloc_block(block_bytes, current);
         if (!b) return nullptr;
         b->used = aligned_size;
         current = b;
         return b->data();
     }
 
-    [[nodiscard]] Block* alloc_block(i64 needed, Block* prev) {
+    [[nodiscard]] Block* alloc_block(range_int<Block::kHeaderSize> needed, Block* prev) {
         u64 actual_size = 0;
-        u8* mem = backend.acquire(static_cast<u64>(needed), &actual_size);
+        u8* mem = backend.acquire(needed.to_u64(), &actual_size);
         if (!mem) return nullptr;
         // Every block embeds its header before the payload. A backend that
         // reports a short block or a size outside the signed offset range
         // cannot be used.
         range_int<0> block_size;
         if (!decltype(block_size)::try_from_u64(actual_size, &block_size) ||
-            block_size.value() < needed) {
+            block_size.value() < needed.value()) {
             backend.release(mem, actual_size);
             return nullptr;
         }
