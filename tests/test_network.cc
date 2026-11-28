@@ -67902,6 +67902,10 @@ TEST(response_buffering_runtime, bounded_release_target_counts_raw_header_and_co
     CHECK_EQ(bounded_response_release_target(100u, 8092u, 9000u, false), 8092u);
     CHECK_EQ(bounded_response_release_target(5000u, 3191u, 4000u, false), 0u);
     CHECK_EQ(bounded_response_release_target(5000u, 3192u, 4000u, false), 3192u);
+    CHECK_EQ(bounded_response_release_target(UINT32_MAX - 1u, 1u, 1u, false), 0u);
+    CHECK_EQ(bounded_response_release_target(UINT32_MAX, 1u, 1u, false), 1u);
+    CHECK_EQ(bounded_response_release_target(UINT32_MAX, UINT32_MAX, UINT32_MAX, false),
+             4294963201u);
     CHECK_EQ(bounded_response_release_target(100u, 17u, 5000u, true), 17u);
     CHECK_EQ(bounded_response_release_target(100u, 5001u, 5000u, true), 0u);
 }
