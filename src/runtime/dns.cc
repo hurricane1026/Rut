@@ -106,7 +106,7 @@ bool dns_hostname(char* name) {
         const u8 kC = lower(bytes[i]);
         bytes[i] = kC;
         if (!kC || kC == '.') {
-            if (!label || label > 63 || bytes[i - 1] == '-') return false;
+            if (!label || label > 63 || *(bytes + range_int{i}.index() - 1) == '-') return false;
             label = 0;
         } else {
             if (((kC < 'a' || kC > 'z') && (kC < '0' || kC > '9') && kC != '-') ||
@@ -145,7 +145,7 @@ u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
         p[cursor.index()] = kN;
         memcpy(p + label_start.index(), name + range_int{start}.index(), kN);
         at = end.to<u32>();
-        start = i + 1;  // kLen + 18 fits in capacity.
+        if (!(range_int{i} + range_int<1, 2>{}).to(&start)) return 0;
     }
     const auto cursor = range_int{at};
     auto end = cursor;

@@ -89,7 +89,12 @@ ChunkStatus ChunkedParser::feed(
                 // Bulk copy: consume min(remaining input, chunk_remaining).
                 const auto cursor = range_int{pos};
                 const auto remaining = range_int{chunk_remaining};
-                const auto available = range_int{in_len - pos};
+                auto available = cursor;
+                if (!decltype(available)::try_from_i64((range_int{in_len} - cursor).value(),
+                                                       &available)) {
+                    *consumed = pos;
+                    return ChunkStatus::Error;
+                }
                 const auto taken = available.min(remaining);
                 u32 next;
                 u32 left;

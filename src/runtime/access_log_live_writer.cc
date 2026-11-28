@@ -423,7 +423,12 @@ bool SourceLiveAccessLogSession::write_record(u32 ring_index,
     u32 written = 0u;
     while (written < line_length) {
         const auto offset = range_int{written};
-        const auto remaining = range_int{line_length - written};
+        auto remaining = offset;
+        if (!decltype(remaining)::try_from_i64((range_int{line_length} - offset).value(),
+                                               &remaining)) {
+            publish_writer_fatal(SourceLiveAccessLogFatalKind::Write, ring.to<u8>(), EIO);
+            return false;
+        }
         const ssize_t result = ::write(output_.get(), line + offset.index(), remaining.to_u64());
         if (result > 0) {
             range_int<0, i64{UINT32_MAX} + 1> count;

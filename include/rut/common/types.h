@@ -45,8 +45,10 @@ struct Str {
     [[nodiscard]] Str slice(u32 start, u32 end) const {
         // Invalid ranges are an empty view; validate before forming the pointer
         // so a malformed parser span cannot create an out-of-bounds address.
-        if (ptr == nullptr || start > end || end > len) return {nullptr, 0};
-        return {ptr + range_int{start}.index(), range_int{end - start}.to<u32>()};
+        u32 length;
+        if (ptr == nullptr || end > len || !(range_int{end} - range_int{start}).to(&length))
+            return {nullptr, 0};
+        return {ptr + range_int{start}.index(), length};
     }
 };
 

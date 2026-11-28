@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -123,7 +124,13 @@ struct SlabPool {
 
     u32 capacity() const { return Cap; }
     u32 available() const { return free_top; }
-    [[nodiscard]] u32 in_use() const { return range_int{Cap - free_top}.to<u32>(); }
+    [[nodiscard]] u32 in_use() const {
+        constexpr auto capacity = range_int<Cap, i64{Cap} + 1>{};
+        u32 used;
+        if (!(capacity - range_int{free_top}).to(&used))
+            RUT_TRAP("SlabPool free count exceeds capacity");
+        return used;
+    }
 
     void destroy() {
         if (in_use_map) {

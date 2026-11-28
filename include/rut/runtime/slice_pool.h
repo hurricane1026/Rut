@@ -3,6 +3,7 @@
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
+#include "rut/common/trap.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -357,7 +358,9 @@ struct SlicePool {
 #endif
         // Insert below the cached suffix in O(1). Pushing discarded slices on
         // top would strand the cache after a burst and keep faulting cold pages.
-        const u32 boundary = range_int{free_top - cached_count}.to<u32>();
+        u32 boundary;
+        if (!(range_int{free_top} - range_int{cached_count}).to(&boundary))
+            RUT_TRAP("SlicePool cached count exceeds free count");
         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
         free_stack[boundary] = idx;
         ++free_top;
@@ -405,7 +408,7 @@ struct SlicePool {
 
     // Number of in-use slices.
     [[nodiscard]] u32 in_use() const {
-        return count >= free_top ? range_int{count - free_top}.to<u32>() : 0;
+        return (range_int{count} - range_int{free_top}).max(range_int<0, 1>{}).to<u32>();
     }
 
     // Release all mmap'd memory.
@@ -450,7 +453,9 @@ struct SlicePool {
     void study_trim_bulk_idle_cache() {
         if (!study_adaptive_cache || study_bulk_borrowed != 0) return;
         for (u32 n = 0; n != 8 && bulk_cached_count > study_bulk_cache_limit; ++n) {
-            const u32 position = range_int{bulk_free_top - bulk_cached_count}.to<u32>();
+            u32 position;
+            if (!(range_int{bulk_free_top} - range_int{bulk_cached_count}).to(&position))
+                RUT_TRAP("SlicePool cached bulk count exceeds free count");
             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
             u8* ptr = bulk_base + range_int{idx}.scaled_by<kBulkSliceSize>().index();
 #ifdef __linux__
@@ -489,11 +494,8 @@ private:
 
     void clear_bulk_bytes(u8* ptr, u32 dirty) {
         // This diagnostic counter stops counting once full.
-        const u64 bytes = range_int{dirty}.to_u64();
-        if (bytes > UINT64_MAX - study_body_bulk_clear_bytes)
+        if (!try_add_to(&study_body_bulk_clear_bytes, dirty))
             study_body_bulk_clear_bytes = UINT64_MAX;
-        else
-            study_body_bulk_clear_bytes += bytes;
         __builtin_memset(ptr, 0, dirty);
     }
 
@@ -562,8 +564,7 @@ private:
         bulk_base = static_cast<u8*>(mem);
         bulk_free_top = 0;
         bulk_cached_count = 0;
-        for (u32 i = bulk_max_count; i > 0; --i)
-            bulk_free[bulk_free_top++] = range_int{i - 1u}.to<u32>();
+        for (u32 i = bulk_max_count; i > 0;) bulk_free[bulk_free_top++] = --i;
         return true;
     }
 
@@ -605,7 +606,9 @@ private:
 #endif
         // Below the cached suffix, as free() does for slices, so reuse keeps
         // preferring the resident buffers.
-        const u32 boundary = range_int{bulk_free_top - bulk_cached_count}.to<u32>();
+        u32 boundary;
+        if (!(range_int{bulk_free_top} - range_int{bulk_cached_count}).to(&boundary))
+            RUT_TRAP("SlicePool cached bulk count exceeds free count");
         if (bulk_cached_count != 0) bulk_free[bulk_free_top] = bulk_free[boundary];
         bulk_free[boundary] = idx;
         ++bulk_free_top;
@@ -616,10 +619,15 @@ private:
     bool grow() {
         if (count >= max_count) return false;
 
-        const auto step =
-            range_int{max_count - count}.min(range_int<kGrowStep, i64{kGrowStep} + 1>{});
-        // step <= max_count - count, so the sum remains representable.
-        const u32 next_count = count + step.to<u32>();
+        const auto allocated = range_int{count};
+        const auto remaining = range_int{max_count} - allocated;
+        using GrowStep = range_int<1, i64{kGrowStep} + 1>;
+        GrowStep step;
+        u32 next_count;
+        if (!GrowStep::try_from_i64(
+                remaining.min(range_int<kGrowStep, i64{kGrowStep} + 1>{}).value(), &step) ||
+            !(allocated + step).to(&next_count))
+            return false;
 
         // mprotect the next chunk of the reserved VA region
         u8* chunk = base + range_int{count}.scaled_by<kSliceSize>().index();
