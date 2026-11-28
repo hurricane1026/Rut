@@ -34,13 +34,14 @@ bool offered(const ParsedRequest& request, Str required) {
             while (end < h.value.len && h.value.ptr[end] != ',') ++end;
             u32 last = end;
             while (last > start) {
-                const char ch = h.value.ptr[range_int{last - 1}.index()];
+                const char ch = *(h.value.ptr + range_int{last}.index() - 1);
                 if (ch != ' ' && ch != '\t') break;
                 --last;
             }
             if (h.value.slice(start, last).eq(required)) return true;
             if (end == h.value.len) break;
-            start = end + 1;
+            start = end;
+            ++start;
         }
     }
     return false;

@@ -25,7 +25,11 @@ Str trim_ows(Str value) {
     u32 start = 0;
     u32 end = value.len;
     while (start < end && (value.ptr[start] == ' ' || value.ptr[start] == '\t')) ++start;
-    while (end > start && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) --end;
+    while (end > start) {
+        const char last = *(value.ptr + range_int{end}.index() - 1);
+        if (last != ' ' && last != '\t') break;
+        --end;
+    }
     return value.slice(start, end);
 }
 
@@ -94,7 +98,8 @@ bool protocol_token_valid(Str token) {
                 __builtin_memcmp(kPrevious.ptr, candidate.ptr, candidate.len) == 0)
                 return true;
             if (end == header.value.len) break;
-            start = end + 1;
+            start = end;
+            ++start;
         }
     }
     return false;
@@ -118,7 +123,8 @@ bool request_protocols_valid(const ParsedRequest& request, u32* out_canonical_le
             if (!(range_int{canonical_len} + separator + range_int{kToken.len}).to(&canonical_len))
                 return false;
             if (end == header.value.len) break;
-            start = end + 1;
+            start = end;
+            ++start;
         }
     }
     if (out_canonical_len != nullptr) *out_canonical_len = canonical_len;
@@ -135,7 +141,8 @@ bool offered_protocol_exists(const u8* storage, u32 offers_len, Str candidate) {
         if (end - start == range_int{candidate.len}.to<i64>() &&
             __builtin_memcmp(offers + start, candidate.ptr, candidate.len) == 0)
             return true;
-        start = end + 1;
+        start = end;
+        ++start;
     }
     return false;
 }
@@ -170,7 +177,8 @@ bool append_request_protocols(const ParsedRequest& request,
             __builtin_memcpy(offers + token_start.index(), kToken.ptr, kToken.len);
             cursor = end_of_token;
             if (end == kValue.len) break;
-            start = end + 1;
+            start = end;
+            ++start;
         }
     }
     *out_offers_len = cursor.to<u32>();
@@ -201,7 +209,8 @@ bool connection_value_is_valid(Str value, bool* has_upgrade) {
         if (kItem.len == 7 && http_header_name_eq_ci(kItem.ptr, kItem.len, "upgrade", 7))
             *has_upgrade = true;
         if (end == value.len) return true;
-        start = end + 1;
+        start = end;
+        ++start;
     }
 }
 
@@ -215,7 +224,8 @@ bool upgrade_protocol_valid(Str protocol, bool* is_websocket) {
     const Str kName = protocol.slice(0, slash);
     if (!protocol_token_valid(kName)) return false;
     if (slash != protocol.len) {
-        const Str kVersion = protocol.slice(slash + 1, protocol.len);
+        ++slash;
+        const Str kVersion = protocol.slice(slash, protocol.len);
         if (!protocol_token_valid(kVersion)) return false;
     } else if (kName.len == 9 && http_header_name_eq_ci(kName.ptr, kName.len, "websocket", 9)) {
         *is_websocket = true;
@@ -231,7 +241,8 @@ bool request_upgrade_value_is_valid(Str value, bool* offers_websocket) {
         const Str kItem = trim_ows(value.slice(start, end));
         if (!upgrade_protocol_valid(kItem, offers_websocket)) return false;
         if (end == value.len) return true;
-        start = end + 1;
+        start = end;
+        ++start;
     }
 }
 
@@ -374,7 +385,8 @@ WsHandshakeRequestResult ws_prepare_handshake(const u8* request,
                 while (end < header.value.len && header.value.ptr[end] != ',') end++;
                 offered |= trim_ows(header.value.slice(start, end)).eq(required_subprotocol);
                 if (end == header.value.len) break;
-                start = end + 1;
+                start = end;
+                ++start;
             }
         }
         if (!offered) return WsHandshakeRequestResult::BadRequest;
@@ -505,7 +517,9 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
     bool selected = false;
     while (read < header_len) {
         u32 end = read;
-        while (end < last && (request[end] != '\r' || request[end + 1] != '\n')) ++end;
+        while (end < last && (request[end] != '\r' ||
+                              request[(range_int{end} + range_int<1, 2>{}).index()] != '\n'))
+            ++end;
         if (end >= last) return 0;
         auto next = range_int{end};
         if (!header_size.try_count((next + range_int<2, 3>{}).value(), &next)) return 0;
@@ -515,13 +529,15 @@ u32 ws_restrict_subprotocol(u8* request, u32 header_len, u32 total_len, Str requ
             colon < end && name_is(headers.slice(read, colon), "sec-websocket-protocol", 22);
         if (kIsProtocol) {
             bool contains = false;
-            u32 start = colon + 1;
+            u32 start = colon;
+            ++start;
             while (start < end) {
                 u32 stop = start;
                 while (stop < end && request[stop] != ',') stop++;
                 contains |= trim_ows(headers.slice(start, stop)).eq(required_subprotocol);
                 if (stop == end) break;
-                start = stop + 1;
+                start = stop;
+                ++start;
             }
             if (!selected && contains) {
                 static constexpr char kHeader[] = "Sec-WebSocket-Protocol:";

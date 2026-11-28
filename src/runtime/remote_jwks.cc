@@ -54,16 +54,16 @@ HttpsEndpoint dns_https_endpoint(const RemoteJwks& policy) {
 }
 
 [[nodiscard]] bool discovery_issuer_valid(Str issuer) {
-    const u32 length = issuer.len;
+    const i64 length = range_int{issuer.len}.value();
     const char* value = issuer.ptr;
     if (length <= 8 || memcmp(value, "https://", 8) != 0) return false;
-    u32 authority_end = 8;
+    i64 authority_end = 8;
     while (authority_end < length && value[authority_end] != '/') ++authority_end;
-    u32 host_end = 8;
+    i64 host_end = 8;
     while (host_end < authority_end && value[host_end] != ':') ++host_end;
     if (host_end == 8 || host_end - 8 > 253) return false;
     u32 label = 0;
-    for (u32 i = 8; i < host_end; ++i) {
+    for (i64 i = 8; i < host_end; ++i) {
         const char byte = value[i];
         if (byte == '.') {
             if (!label || value[i - 1] == '-') return false;
@@ -79,7 +79,7 @@ HttpsEndpoint dns_https_endpoint(const RemoteJwks& policy) {
     if (!label || value[host_end - 1] == '-') return false;
     if (host_end < authority_end) {
         u16 port = 0;
-        for (u32 i = host_end + 1; i < authority_end; ++i)
+        for (i64 i = host_end + 1; i < authority_end; ++i)
             if (!append_decimal_digit(value[i], &port)) return false;
         if (!port) return false;
     }
@@ -87,7 +87,7 @@ HttpsEndpoint dns_https_endpoint(const RemoteJwks& policy) {
         return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f') ||
                (byte >= 'A' && byte <= 'F');
     };
-    for (u32 i = authority_end; i < length; ++i) {
+    for (i64 i = authority_end; i < length; ++i) {
         const char byte = value[i];
         if (byte == '%') {
             if (length - i < 3 || !hex(value[i + 1]) || !hex(value[i + 2])) return false;
@@ -479,8 +479,9 @@ u16 read16(const u8* data) {
             output[used] = 0;
             return true;
         }
-        const auto label_size = range_int{count};
-        const auto last = range_int{at} + range_int{count - 1};
+        range_int<1, 64> label_size;
+        if (!decltype(label_size)::try_from_u64(count, &label_size)) return false;
+        const auto last = range_int{at} + (label_size - range_int<1, 2>{});
         const auto expanded_size = range_int{used} + label_size + range_int{u8{used != 0}};
         if (last.value() >= wire_size.value() || expanded_size.to_u64() >= sizeof(out) ||
             packet[at] == '-' || packet[last.index()] == '-')
@@ -588,20 +589,22 @@ bool jwks_dns_answer(Str packet,
                      Str query,
                      const RemoteJwks& configuration,
                      JwksDnsAddresses& addresses) {
-    if (!packet.ptr || !query.ptr || query.len < 17 || query.len > 272 ||
+    range_int<17, 273> query_size;
+    if (!packet.ptr || !query.ptr || !decltype(query_size)::try_from_u64(query.len, &query_size) ||
         packet.len > kJwksDnsMessageLimit || packet.len < query.len)
         return false;
     const auto* bytes = reinterpret_cast<const u8*>(packet.ptr);
     if (memcmp(packet.ptr, query.ptr, 2) != 0 || (read16(bytes + 2) & 0xfa4f) != 0x8000 ||
         read16(bytes + 4) != 1 || read16(bytes + 8) || read16(bytes + 10) ||
-        memcmp(packet.ptr + 12, query.ptr + 12, query.len - 12) != 0)
+        memcmp(packet.ptr + 12, query.ptr + 12, (query_size - range_int<12, 13>{}).to_u64()) != 0)
         return false;
     const u32 answers = read16(bytes + 6);
     constexpr u32 kMaxAnswers = 8;
     if (!answers || answers > kMaxAnswers ||
         configuration.allowed_count > RemoteJwks::kMaxDnsAddresses)
         return false;
-    const u16 kRecordType = read16(bytes + range_int{query.len - 4}.index());
+    const auto query_tail = query_size - range_int<4, 5>{};
+    const u16 kRecordType = read16(bytes + query_tail.index());
     if (kRecordType != 1 && kRecordType != 28) return false;
     const bool kAaaa = kRecordType == 28;
     if (!configuration.dns_dual_stack && kAaaa != configuration.dns_aaaa) return false;
@@ -609,7 +612,7 @@ bool jwks_dns_answer(Str packet,
     char current[254]{};
     u32 question_end = 12;
     if (!jwks_dns_name(bytes, packet.len, &question_end, boundaries, current) ||
-        question_end != query.len - 4)
+        question_end != query_tail.to<u32>())
         return false;
     const u8* question_tail = bytes + range_int{question_end}.index();
     if (read16(question_tail) != kRecordType || read16(question_tail + 2) != 1) return false;
@@ -887,7 +890,7 @@ bool JwksFetch::start(u64 now,
             query_ + label_start.index(), host + range_int{begin}.index(), label.to_u64());
         query_length_ = next.to<u32>();
         if (!host[end]) break;
-        begin = end + 1;
+        if (!(range_int{end} + range_int<1, 2>{}).to(&begin)) return fail();
     }
     query_[query_length_++] = 0;
     query_[query_length_++] = 0;

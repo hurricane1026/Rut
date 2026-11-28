@@ -221,7 +221,7 @@ u32 ws_rewrite_extensions(
     const auto header = range_int{header_len};
     u32 tail_length;
     if (!(range_int{total_len} - header).to(&tail_length) ||
-        memcmp(buffer + range_int{header_len - 4}.index(), "\r\n\r\n", 4) != 0)
+        memcmp(buffer + header.index() - 4, "\r\n\r\n", 4) != 0)
         return 0;
     for (u32 i = 0; i < extension_value.len; ++i) {
         const u8 kByte = byte_value(extension_value.ptr[i]);
