@@ -4,19 +4,32 @@
 #include "rut/runtime/format_integer.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/slice_pool.h"
+#include <utility>
 
 namespace rut {
 
 namespace {
 
 [[nodiscard]] u32 read_u32(const u8* p) {
-    return (u32{p[0]} << 24) | (u32{p[1]} << 16) | (u32{p[2]} << 8) | u32{p[3]};
+    return (range_int{p[0]}.scaled_by<(1 << 24)>() + range_int{p[1]}.scaled_by<(1 << 16)>() +
+            range_int{p[2]}.scaled_by<(1 << 8)>() + range_int{p[3]})
+        .to<u32>();
 }
 
-constexpr i64 kMaxWindow = 2147483647;  // 2^31 - 1
-constexpr u32 kShortControlFrame = u32{i64{kFrameHeaderSize} + 4};
-constexpr u32 kLongControlFrame = u32{i64{kFrameHeaderSize} + 8};
-constexpr auto kFrameHeader = range_int<kFrameHeaderSize, i64{kFrameHeaderSize} + 1>{};
+constexpr auto kFrameHeader = range_int<kFrameHeaderSize, kFrameHeaderSize + 1>{};
+constexpr u32 kShortControlFrame = (kFrameHeader + range_int<4, 5>{}).to<u32>();
+constexpr u32 kLongControlFrame = (kFrameHeader + range_int<8, 9>{}).to<u32>();
+using ConnectionWindow = range_int<0, kMaxWindowSize + 1LL>;
+
+[[nodiscard]] bool connection_window_add(i64 current, u32 credit, i64* out) {
+    ConnectionWindow window;
+    ConnectionWindow next;
+    if (!ConnectionWindow::try_from_i64(current, &window) ||
+        !ConnectionWindow::try_from_i64((window + range_int{credit}).value(), &next))
+        return false;
+    *out = next.to<i64>();
+    return true;
+}
 
 }  // namespace
 
@@ -223,9 +236,9 @@ void Http2Conn::init_client() {
 // --- Response serialization ---
 
 namespace {
-[[nodiscard]] constexpr i64 hpack_integer_octets(u32 value, u8 prefix_bits) {
-    const i64 kPrefixMax = (i64{1} << prefix_bits) - i64{1};
-    const i64 kValue = i64{value};
+[[nodiscard]] constexpr i64 hpack_string_length_octets(u32 value) {
+    constexpr auto kPrefixMax = (1 << 7) - 1;
+    const i64 kValue = range_int{value}.to<i64>();
     if (kValue < kPrefixMax) return 1;
     i64 n = 1;
     i64 remainder = kValue - kPrefixMax;
@@ -237,33 +250,34 @@ namespace {
 }
 
 [[nodiscard]] constexpr i64 hpack_field_overhead(u32 name_len, u32 value_len) {
-    return 1 + hpack_integer_octets(name_len, 7) + hpack_integer_octets(value_len, 7);
+    return 1 + hpack_string_length_octets(name_len) + hpack_string_length_octets(value_len);
 }
 }  // namespace
 
 [[nodiscard]] u32 http2_write_headers(
     u8* out, u32 out_cap, u32 stream_id, const hpack::Header* hs, u32 n, bool end_stream) {
     if (out_cap < kFrameHeaderSize) return 0;
+    const i64 output_capacity = range_int{out_cap}.to<i64>();
     i64 o = kFrameHeaderSize;
-    static constexpr u32 kMaxFramePayload = 0x00ffffffu;
     for (u32 i = 0; i < n; i++) {
         // Prefix width follows the actual 32-bit lengths; check in i64 so huge
         // direct inputs are rejected before any pointer arithmetic.
-        const i64 kWorst = o + i64{hs[i].name.len} + i64{hs[i].value.len} +
-                           hpack_field_overhead(hs[i].name.len, hs[i].value.len);
-        if (kWorst > i64{out_cap} || kWorst - kFrameHeader.value() > i64{kMaxFramePayload})
+        const auto field_size = range_int{hs[i].name.len} + range_int{hs[i].value.len};
+        const i64 kWorst =
+            o + field_size.to<i64>() + hpack_field_overhead(hs[i].name.len, hs[i].value.len);
+        if (kWorst > output_capacity || kWorst - kFrameHeader.value() > kMaxAllowedFrameSize)
             return 0;
         const i64 kEncoded = hpack::encode_header(out + o, hs[i].name, hs[i].value);
         // kWorst is a complete write-before bound for encode_header.
         o += kEncoded;
     }
-    range_int<0, i64{kMaxFramePayload} + 1> payload;
+    range_int<0, kMaxAllowedFrameSize + 1> payload;
     if (!decltype(payload)::try_from_i64(o - kFrameHeader.value(), &payload)) return 0;
     u8 flags = http2_flag::kEndHeaders;
     if (end_stream) flags |= http2_flag::kEndStream;
     Http2FrameHeader h;
     h.length = payload.to<u32>();
-    h.type = static_cast<u8>(Http2FrameType::Headers);
+    h.type = std::to_underlying(Http2FrameType::Headers);
     h.flags = flags;
     h.stream_id = stream_id;
     if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
@@ -272,15 +286,16 @@ namespace {
 
 [[nodiscard]] u32 http2_write_data(
     u8* out, u32 stream_id, const u8* data, u32 len, bool end_stream) {
-    range_int<0, i64{kMaxAllowedFrameSize} + 1> payload;
+    range_int<0, kMaxAllowedFrameSize + 1> payload;
     if (!decltype(payload)::try_from_i64(len, &payload)) return 0;
     Http2FrameHeader h;
     h.length = len;
-    h.type = static_cast<u8>(Http2FrameType::Data);
+    h.type = std::to_underlying(Http2FrameType::Data);
     h.flags = end_stream ? http2_flag::kEndStream : 0;
     h.stream_id = stream_id;
     if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
-    for (u32 i = 0; i < len; i++) out[i64{kFrameHeaderSize} + i64{i}] = data[i];
+    u8* const body = out + kFrameHeader.index();
+    for (u32 i = 0; i < len; i++) body[i] = data[i];
     return (kFrameHeader + payload).to<u32>();
 }
 
@@ -297,7 +312,7 @@ namespace {
         tmp[n++] = last_decimal_digit(v);
         v /= 10;
     }
-    for (u32 i = 0; i < n; i++) buf[i] = tmp[i64{n} - 1 - i64{i}];
+    for (u32 i = 0; i < n; i++) buf[i] = tmp[n - 1 - i];
     return n;
 }
 }  // namespace
@@ -324,7 +339,7 @@ namespace {
     sbuf[1] = last_decimal_digit(status / 10);
     sbuf[2] = last_decimal_digit(status);
     const i64 kStatusEncoded =
-        enc.encode(hblock + pending.value(), Str{":status", 7}, Str{sbuf, 3});
+        enc.encode(hblock + pending.index(), Str{":status", 7}, Str{sbuf, 3});
     constexpr auto kCapacity =
         range_int<sizeof(hblock), sizeof(hblock) + 1>::constant<sizeof(hblock)>();
     if (kStatusEncoded < 0 || kStatusEncoded > (kCapacity - pending).value()) return 0;
@@ -339,24 +354,25 @@ namespace {
     // during the loop so the loop can't fill hblock and then overflow on the CL.
     const i64 kClReserve = body_len > 0 ? 14 + 10 + hpack_field_overhead(14, 10) : 0;
     for (u32 i = 0; i < nhdrs; i++) {
-        const i64 kWorst = hb + i64{hdrs[i].name.len} + i64{hdrs[i].value.len} +
+        const auto field_size = range_int{hdrs[i].name.len} + range_int{hdrs[i].value.len};
+        const i64 kWorst = hb + field_size.to<i64>() +
                            hpack_field_overhead(hdrs[i].name.len, hdrs[i].value.len) + kClReserve;
         if (kWorst > kCapacity.value()) return 0;
         // HTTP/2 header names MUST be lowercase (RFC 7540 §8.1.2); the route
         // config (or a proxied upstream) may hold mixed case (HTTP/1 tolerates it).
         // Lowercase into a small buffer before encoding.
-        char lname[256];
+        u8 lname[256];
         Str name = hdrs[i].name;
         if (name.len <= sizeof(lname)) {
             for (u32 j = 0; j < name.len; j++) {
-                const char ch = name.ptr[j];
+                const u8 ch = byte_value(name.ptr[j]);
                 if (ch >= 'A' && ch <= 'Z') {
-                    lname[j] = static_cast<char>(ch | 0x20);
+                    lname[j] = bounded_remainder<256>(ch | 0x20).to<u8>();
                 } else {
                     lname[j] = ch;
                 }
             }
-            name = Str{lname, name.len};
+            name = Str{reinterpret_cast<const char*>(lname), name.len};
         } else {
             // Too long to lowercase in our buffer. Forwarding it verbatim would emit
             // an uppercase (invalid) HTTP/2 name, so reject the response (→ 502)
@@ -374,7 +390,8 @@ namespace {
     if (body_len > 0) {
         char clbuf[10];
         const u32 kClLen = u32_to_dec(body_len, clbuf);
-        const i64 kWorst = hb + 14 + i64{kClLen} + hpack_field_overhead(14, kClLen);
+        const auto field_size = range_int<14, 15>{} + range_int{kClLen};
+        const i64 kWorst = hb + field_size.to<i64>() + hpack_field_overhead(14, kClLen);
         if (kWorst > kCapacity.value()) return 0;  // (reserved above)
         const i64 kClEncoded =
             enc.encode(hblock + hb, Str{"content-length", 14}, Str{clbuf, kClLen});
@@ -383,21 +400,23 @@ namespace {
     }
 
     const bool kEndOnHeaders = headers_only ? end_stream : (body_len == 0);
+    const auto data_size_with_header = kFrameHeader + range_int{body_len};
     const i64 kNeed = kFrameHeader.value() + hb +
-                      (!headers_only && body_len > 0 ? kFrameHeader.value() + i64{body_len} : 0);
-    if (!headers_only && body_len > 0x00ffffffu) return 0;
+                      (!headers_only && body_len > 0 ? data_size_with_header.to<i64>() : 0);
+    if (!headers_only && body_len > kMaxAllowedFrameSize) return 0;
     if (kNeed > out_cap) return 0;
     range_int<0, sizeof(hblock) + 1> header_bytes;
     if (!decltype(header_bytes)::try_from_i64(hb, &header_bytes)) return 0;
 
     Http2FrameHeader h;
     h.length = header_bytes.to<u32>();
-    h.type = static_cast<u8>(Http2FrameType::Headers);
+    h.type = std::to_underlying(Http2FrameType::Headers);
     h.flags = http2_flag::kEndHeaders;
     if (kEndOnHeaders) h.flags |= http2_flag::kEndStream;
     h.stream_id = stream_id;
     if (write_frame_header(out, h) != kFrameHeaderSize) return 0;
-    for (i64 i = 0; i < hb; i++) out[i64{kFrameHeaderSize} + i] = hblock[i];
+    u8* const block = out + kFrameHeader.index();
+    for (u32 i = 0; i < header_bytes.to<u32>(); i++) block[i] = hblock[i];
     const auto headers_size = kFrameHeader + header_bytes;
     if (headers_only || body_len == 0) return headers_size.to<u32>();
     const u32 data_size = http2_write_data(
@@ -494,9 +513,8 @@ namespace {
     while (end < path.len && p[end] != '?' && p[end] != '#') end++;
     u32 start = 0;
     if (start < end && p[start] == '/') ++start;
-    while (end > start && p[i64{end} - 1] == '/') --end;
-    const auto length = (range_int(end) - range_int(start)).max(range_int<0, 1>{});
-    return {p + i64{start}, length.to<u32>()};
+    while (end > start && p[end - 1] == '/') --end;
+    return path.slice(start, end);
 }
 
 [[nodiscard]] bool h2_value_to_u32(Str v, u32* out) {
@@ -685,16 +703,20 @@ struct OutWriter {
     u8* out;
     u32 cap;
     u32 len;
-    [[nodiscard]] bool room(u32 n) const { return i64{n} <= i64{cap} - i64{len}; }
+    [[nodiscard]] bool room(u32 n) const {
+        return range_int{n}.value() <= (range_int{cap} - range_int{len}).value();
+    }
 
     // Fixed-width control frames already have a protocol size. Reserve that
     // exact span before calling their serializers.
     template <u32 Size, typename Write, typename... Args>
     [[nodiscard]] bool emit(Write write, Args... args) {
-        const auto end = range_int(len) + range_int<Size, i64{Size} + 1>{};
-        if (end.value() > cap) return false;
-        write(out + i64{len}, args...);
-        len = end.min(range_int(cap)).template to<u32>();
+        const auto cursor = range_int{len};
+        const auto end = cursor + range_int<Size, __int128_t{Size} + 1>{};
+        auto next = cursor;
+        if (!range_int{cap}.try_count(end.value(), &next)) return false;
+        write(out + cursor.index(), args...);
+        len = next.template to<u32>();
         return true;
     }
 };
@@ -798,11 +820,12 @@ struct OutWriter {
 
 // Append a header-block fragment, guarding the assembly buffer.
 [[nodiscard]] Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
-    constexpr auto kCap =
-        range_int<Http2Conn::kHeaderBlockCap, i64{Http2Conn::kHeaderBlockCap} + 1>{};
-    const auto end = range_int(c.hdr_block_len) + range_int(n);
+    constexpr auto kCap = range_int<Http2Conn::kHeaderBlockCap, Http2Conn::kHeaderBlockCap + 1>{};
+    const auto cursor = range_int{c.hdr_block_len};
+    const auto end = cursor + range_int{n};
     if (end.value() > kCap.value()) return Http2Error::CompressionError;
-    for (u32 i = 0; i < n; i++) c.hdr_block[i64{c.hdr_block_len} + i64{i}] = p[i];
+    u8* const fragment = c.hdr_block + cursor.index();
+    for (u32 i = 0; i < n; i++) fragment[i] = p[i];
     c.hdr_block_len = end.min(kCap).to<u32>();
     return Http2Error::NoError;
 }
@@ -880,17 +903,18 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 if (h.length != 0) return Http2Error::FrameSizeError;
                 return Http2Error::NoError;
             }
-            const i64 kOldIws = c.peer_settings.initial_window_size;
+            const auto old_window = range_int{c.peer_settings.initial_window_size};
             Http2Settings parsed_settings = c.peer_settings;
             const Http2Error kErr = parse_settings(payload, h.length, &parsed_settings);
             if (kErr != Http2Error::NoError) return kErr;
             // Adjust live stream send windows by the INITIAL_WINDOW_SIZE delta.
-            const i64 kDelta = i64{parsed_settings.initial_window_size} - kOldIws;
-            if (kDelta != 0) {
+            const auto delta = range_int{parsed_settings.initial_window_size} - old_window;
+            if (delta.value() != 0) {
                 for (u32 i = 0; i < c.nstreams; i++) {
                     if (c.streams[i].state == Http2StreamState::Closed) continue;
-                    const i64 next = i64{c.streams[i].send_window} + kDelta;
-                    if (next < INT32_MIN || next > kMaxWindow) return Http2Error::FlowControlError;
+                    i32 next;
+                    if (!(range_int{c.streams[i].send_window} + delta).to(&next))
+                        return Http2Error::FlowControlError;
                 }
             }
             // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
@@ -900,11 +924,11 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
             if (!c.hpack_enc.set_table_size(parsed_settings.header_table_size))
                 return Http2Error::InternalError;
             c.peer_settings = parsed_settings;
-            if (kDelta != 0) {
+            if (delta.value() != 0) {
                 for (u32 i = 0; i < c.nstreams; i++) {
                     if (c.streams[i].state == Http2StreamState::Closed) continue;
-                    const i64 next = i64{c.streams[i].send_window} + kDelta;
-                    if (!range_int(next).to(&c.streams[i].send_window))
+                    if (!(range_int{c.streams[i].send_window} + delta)
+                             .to(&c.streams[i].send_window))
                         return Http2Error::FlowControlError;
                 }
             }
@@ -1058,8 +1082,13 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         case Http2FrameType::Data: {
             if (h.stream_id == 0) return Http2Error::ProtocolError;
             // Connection-level flow control counts the whole frame payload.
-            c.conn_recv_window -= i64{h.length};
-            if (c.conn_recv_window < 0) return Http2Error::FlowControlError;
+            ConnectionWindow current;
+            ConnectionWindow remaining_conn;
+            const auto frame_payload = range_int{h.length};
+            if (!ConnectionWindow::try_from_i64(c.conn_recv_window, &current) ||
+                !current.try_count((current - frame_payload).value(), &remaining_conn))
+                return Http2Error::FlowControlError;
+            c.conn_recv_window = remaining_conn.to<i64>();
 
             Http2Stream* s = c.find_stream(h.stream_id);
             if (!s || s->state == Http2StreamState::HalfClosedRemote) {
@@ -1067,7 +1096,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                         write_rst_stream, h.stream_id, Http2Error::StreamClosed))
                     return Http2Error::InternalError;
                 // Still replenish the connection window for the consumed octets.
-                c.conn_recv_window += i64{h.length};
+                c.conn_recv_window = current.to<i64>();
                 if (h.length > 0 &&
                     !w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length))
                     return Http2Error::InternalError;
@@ -1086,7 +1115,6 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
             if (!(range_int(n) - range_int(pad)).to(&n)) return Http2Error::ProtocolError;
 
             if (c.client && !s->got_headers) return Http2Error::ProtocolError;
-            const auto frame_payload = range_int(h.length);
             const auto remaining = range_int(s->recv_window) - frame_payload;
             if (remaining.value() < 0) {
                 const Http2Error reset =
@@ -1126,7 +1154,8 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
             // Auto-replenish for legacy body-buffering handlers.
             if (!(range_int(s->recv_window) + frame_payload).to(&s->recv_window))
                 return Http2Error::FlowControlError;
-            c.conn_recv_window += frame_payload.value();
+            if (!connection_window_add(c.conn_recv_window, h.length, &c.conn_recv_window))
+                return Http2Error::FlowControlError;
             if (h.length > 0) {
                 if (!w.emit<kShortControlFrame>(write_window_update, u32{0}, h.length) ||
                     (!kEndStream &&
@@ -1141,8 +1170,8 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
             const u32 kInc = read_u32(payload) & 0x7fffffffu;
             if (h.stream_id == 0) {
                 if (kInc == 0) return Http2Error::ProtocolError;
-                c.conn_send_window += i64{kInc};
-                if (c.conn_send_window > kMaxWindow) return Http2Error::FlowControlError;
+                if (!connection_window_add(c.conn_send_window, kInc, &c.conn_send_window))
+                    return Http2Error::FlowControlError;
             } else {
                 Http2Stream* s = c.find_stream(h.stream_id);
                 if (!s) {
@@ -1177,7 +1206,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                         const Http2FrameHeader ack{
                             .length = 8,
                             .stream_id = 0,
-                            .type = static_cast<u8>(Http2FrameType::Ping),
+                            .type = std::to_underlying(Http2FrameType::Ping),
                             .flags = http2_flag::kAck,
                         };
                         const u32 kHeaderLen = write_frame_header(out, ack);
@@ -1233,17 +1262,27 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         pos = kClientPrefaceLen;
         preface_seen = true;
         if (!our_settings_sent && w.room(64)) {
-            const u32 written = write_settings_frame(w.out + i64{w.len}, our_settings);
+            const u32 written =
+                write_settings_frame(w.out + range_int{w.len}.index(), our_settings);
             w.len = (range_int(w.len) + range_int(written)).min(range_int(w.cap)).to<u32>();
             our_settings_sent = true;
         }
     }
 
     while (true) {
-        if (conn_recv_credit &&
-            w.emit<kShortControlFrame>(write_window_update, u32{0}, conn_recv_credit)) {
-            conn_recv_window += i64{conn_recv_credit};
-            conn_recv_credit = 0;
+        if (conn_recv_credit && w.room(kShortControlFrame)) {
+            i64 next_window;
+            if (!connection_window_add(conn_recv_window, conn_recv_credit, &next_window)) {
+                goaway_sent = w.emit<kLongControlFrame>(
+                                  write_goaway, last_stream_id, Http2Error::FlowControlError) ||
+                              goaway_sent;
+                *out_written = w.len;
+                return {pos, true};
+            }
+            if (w.emit<kShortControlFrame>(write_window_update, u32{0}, conn_recv_credit)) {
+                conn_recv_window = next_window;
+                conn_recv_credit = 0;
+            }
         }
         for (u32 i = 0; i < nstreams; i++) {
             Http2Stream& s = streams[i];
@@ -1269,8 +1308,8 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         const auto available = range_int(len) - range_int(pos);
         if (available.value() < kFrameHeader.value()) break;
         Http2FrameHeader h;
-        if (parse_frame_header(in + i64{pos}, available.max(range_int<0, 1>{}).to<u32>(), &h) !=
-            ParseStatus::Complete)
+        const auto cursor = range_int{pos};
+        if (parse_frame_header(in + cursor.index(), kFrameHeaderSize, &h) != ParseStatus::Complete)
             break;
         if (h.length > our_settings.max_frame_size) {
             goaway_sent = w.emit<kLongControlFrame>(
@@ -1322,8 +1361,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 break;
         }
 
-        const Http2Error kErr =
-            handle_frame(*this, h, in + range_int{pos}.index() + kFrameHeader.index(), w);
+        const Http2Error kErr = handle_frame(*this, h, in + (cursor + kFrameHeader).index(), w);
         pos = (range_int(pos) + frame_size).min(range_int(len)).to<u32>();
         if (kErr != Http2Error::NoError || recv_credit_failed) {
             goaway_sent = w.emit<kLongControlFrame>(

@@ -3319,6 +3319,21 @@ TEST(http2_conn, connection_window_update_overflow_goaway) {
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK(r.close);
     CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+    CHECK_EQ(c.conn_send_window, kDefaultInitialWindowSize);
+}
+
+TEST(http2_conn, rejects_receive_credit_that_would_overflow_connection_window) {
+    Http2Conn c;
+    c.init_client();
+    c.conn_recv_window = kMaxWindowSize;
+    c.conn_recv_credit = 1;
+
+    u8 out[64];
+    u32 written = 0;
+    CHECK(c.process(nullptr, 0, out, sizeof(out), &written).close);
+    CHECK(has_frame(out, written, Http2FrameType::Goaway, 0, 0));
+    CHECK(!has_frame(out, written, Http2FrameType::WindowUpdate, 0, 0));
+    CHECK_EQ(c.conn_recv_window, kMaxWindowSize);
 }
 
 int main(int argc, char** argv) {
