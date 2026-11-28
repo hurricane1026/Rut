@@ -29943,7 +29943,7 @@ TEST(streaming, request_body_recvd_error_closes) {
     c->upstream_fd = 100;
     c->on_recv = &on_request_body_recvd<SmallLoop>;
     c->req_body_mode = BodyMode::ContentLength;
-    c->req_body_remaining = 50;
+    c->req_body_remaining = i64{UINT32_MAX} + 50;
     u32 cid = c->id;
     loop.inject_and_dispatch(make_ev(cid, IoEventType::Recv, -1));
     CHECK_EQ(loop.conns[cid].fd, -1);
@@ -30037,7 +30037,7 @@ TEST(streaming, request_body_recvd_cl_forwards) {
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 50));
     CHECK_EQ(c->on_upstream_send, &on_request_body_sent<SmallLoop>);
-    CHECK_EQ(c->req_body_remaining, 0u);
+    CHECK_EQ(c->req_body_remaining, i64{UINT32_MAX});
 }
 
 // === Coverage: response body streaming edge cases ===
@@ -30052,14 +30052,15 @@ TEST(streaming, response_body_recvd_cl_partial) {
     c->upstream_fd = 100;
     loop.alloc_upstream_buf(*c);
     c->resp_body_mode = BodyMode::ContentLength;
-    c->resp_body_remaining = 500;
-    c->resp_body_sent = 0;
+    c->resp_body_remaining = i64{UINT32_MAX} + 500;
+    c->resp_body_sent = i64{UINT32_MAX} + 7;
     c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     c->state = ConnState::Proxying;
     loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 200));
     CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
-    CHECK_EQ(c->resp_body_remaining, 300u);
+    CHECK_EQ(c->resp_body_remaining, i64{UINT32_MAX} + 300);
+    CHECK_EQ(c->resp_body_sent, i64{UINT32_MAX} + 7);
 }
 
 TEST(streaming, response_body_recvd_until_close_eof) {
