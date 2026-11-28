@@ -93,7 +93,10 @@ struct HuffTrie {
     }
     t.node_count = 1;  // node 0 = root
     for (u32 s = 0; s < kSymCount; s++) {
-        const i16 symbol = static_cast<i16>(s);
+        range_int<0, kSymCount> bounded_symbol;
+        if (!bounded_symbol.try_from_u64(s, &bounded_symbol))
+            RUT_TRAP("HPACK Huffman symbol exceeds its signed range");
+        const i16 symbol = bounded_symbol.to<i16>();
         const u32 kCode = kHuff[s].code;
         const u8 kBits = kHuff[s].bits;
         i16 node = 0;
