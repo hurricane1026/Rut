@@ -1631,7 +1631,10 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         !h2_inject_content_length(h2->pending_synth,
                                   &h2->pending_synth_len,
                                   h2->pending_body_start,
-                                  static_cast<u32>(h2->pending_body_len),
+                                  range_int(h2->pending_body_len)
+                                      .max(range_int(u32{0}))
+                                      .min(range_int(UINT32_MAX))
+                                      .to<u32>(),
                                   Http2Conn::kBodySynthCap)) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 413);

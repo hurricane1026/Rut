@@ -8621,7 +8621,11 @@ inline bool apply_preserve_host_lowercase_request_policy(Connection& conn, u16 p
     if (req.has_content_length &&
         (req.content_length < 0 || req.content_length > i64{len} - i64{parser.header_end}))
         return false;
-    const u32 body_len = req.has_content_length ? static_cast<u32>(req.content_length) : 0;
+    const u32 body_len = req.has_content_length ? range_int(req.content_length)
+                                                      .max(range_int(u32{0}))
+                                                      .min(range_int(UINT32_MAX))
+                                                      .to<u32>()
+                                                : 0;
     const u8* end = data + i64{parser.header_end};
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;
@@ -9181,7 +9185,11 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     if (req.has_content_length &&
         (req.content_length < 0 || req.content_length > i64{len} - i64{parser.header_end}))
         return false;
-    const u32 body_len = req.has_content_length ? static_cast<u32>(req.content_length) : 0;
+    const u32 body_len = req.has_content_length ? range_int(req.content_length)
+                                                      .max(range_int(u32{0}))
+                                                      .min(range_int(UINT32_MAX))
+                                                      .to<u32>()
+                                                : 0;
     const u8* end = data + i64{parser.header_end};
     const u8* line_end = data;
     while (line_end + 1 < end && !(line_end[0] == '\r' && line_end[1] == '\n')) line_end++;

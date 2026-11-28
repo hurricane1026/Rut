@@ -417,10 +417,12 @@ void capture_request_metadata(Connection& conn) {
             conn.req_body_mode = BodyMode::Chunked;
             conn.req_body_remaining = 0;
             conn.req_chunk_parser.reset();
-            const u32 kBodyInBuf =
-                kLen > parser.header_end
-                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
-                    : 0;
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
             chunk_consumed = kBodyInBuf;
             if (kBodyInBuf > 0) {
                 const u8* body_start = data + i64{parser.header_end};
@@ -453,10 +455,12 @@ void capture_request_metadata(Connection& conn) {
             conn.req_body_mode = BodyMode::ContentLength;
             conn.req_content_length = req.content_length;
             conn.req_body_remaining = req.content_length;
-            const u32 kBodyInBuf =
-                kLen > parser.header_end
-                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
-                    : 0;
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
             if (i64{kBodyInBuf} >= conn.req_body_remaining)
                 conn.req_body_remaining = 0;
             else
@@ -470,10 +474,14 @@ void capture_request_metadata(Connection& conn) {
                     ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
                     : 0;
             const u32 kBodyInInitial = conn.req_content_length <= i64{kBodyInBuf}
-                                           ? static_cast<u32>(conn.req_content_length)
+                                           ? range_int(conn.req_content_length)
+                                                 .max(range_int(u32{0}))
+                                                 .min(range_int(UINT32_MAX))
+                                                 .to<u32>()
                                            : kBodyInBuf;
-            conn.req_initial_send_len = static_cast<u32>(static_cast<i64>(parser.header_end) +
-                                                         static_cast<i64>(kBodyInInitial));
+            conn.req_initial_send_len = (range_int(parser.header_end) + range_int(kBodyInInitial))
+                                            .min(range_int(UINT32_MAX))
+                                            .to<u32>();
         }
         if (conn.req_initial_send_len > 0) {
             conn.downstream_req_size = conn.req_initial_send_len;
