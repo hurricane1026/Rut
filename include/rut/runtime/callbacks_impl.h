@@ -11385,8 +11385,15 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     u32 send_len = kDataLen;
 
     if (conn.resp_body_mode == BodyMode::ContentLength) {
+        if (conn.resp_body_remaining < 0) {
+            loop->close_conn(conn);
+            return;
+        }
         const u32 consume = conn.resp_body_remaining < i64{kDataLen}
-                                ? static_cast<u32>(conn.resp_body_remaining)
+                                ? range_int(conn.resp_body_remaining)
+                                      .max(range_int(u32{0}))
+                                      .min(range_int(UINT32_MAX))
+                                      .to<u32>()
                                 : kDataLen;
         conn.resp_body_remaining -= i64{consume};
         send_len = consume;

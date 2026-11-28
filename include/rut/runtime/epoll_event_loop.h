@@ -840,11 +840,19 @@ public:
                 this->close_conn(c);
                 return;
             }
-            const u32 want = writing
-                                 ? (range_int(r.segment_len) - range_int(r.segment_sent)).to<u32>()
-                                 : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
-                                        ? static_cast<u32>(c.resp_body_remaining)
-                                        : kResponseSpliceChunkSize);
+            if (!writing && c.resp_body_remaining < 0) {
+                this->close_conn(c);
+                return;
+            }
+            const u32 want = writing ? (range_int(r.segment_len) - range_int(r.segment_sent))
+                                           .max(range_int(u32{0}))
+                                           .to<u32>()
+                                     : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
+                                            ? range_int(c.resp_body_remaining)
+                                                  .max(range_int(u32{0}))
+                                                  .min(range_int(UINT32_MAX))
+                                                  .to<u32>()
+                                            : kResponseSpliceChunkSize);
             ssize_t n;
             do {
                 n = writing ? ::splice(r.pipe_read,

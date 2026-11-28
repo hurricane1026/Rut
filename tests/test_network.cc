@@ -30153,6 +30153,32 @@ TEST(streaming, response_body_recvd_cl_partial) {
     CHECK_EQ(c->resp_body_sent, i64{UINT32_MAX} + 7 + 200);
 }
 
+TEST(streaming, negative_content_length_counters_close_before_io) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 100;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = -1;
+    c->on_recv = &on_request_body_recvd<SmallLoop>;
+    loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 1));
+    CHECK_EQ(loop.conns[c->id].fd, -1);
+
+    SmallLoop response_loop;
+    response_loop.setup();
+    response_loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 43));
+    c = response_loop.find_fd(43);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 100;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = -1;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
+    response_loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 1));
+    CHECK_EQ(response_loop.conns[c->id].fd, -1);
+}
+
 TEST(streaming, response_body_recvd_until_close_eof) {
     SmallLoop loop;
     loop.setup();
