@@ -138,6 +138,9 @@ struct IoUringBackend {
 
     // Timer fd for 1-second ticks (drives timer wheel, same as epoll backend)
     i32 timer_fd = -1;
+    i32 background_timer_wake_fd = -1;
+    bool enable_background_timer_wakeup();
+    void wake_background_timers();
     u64 timer_ticks_buf = 0;        // read target for IORING_OP_READ on timer_fd
     bool timer_read_armed = false;  // true if a timer read SQE is in-flight
 
@@ -576,6 +579,8 @@ private:
 
     // Submit IORING_OP_READ on timer_fd to receive next tick.
     void submit_timer_read();
+    void submit_background_timer_poll();
+    bool background_timer_poll_armed = false;
 
     void record_enter_error(i32 result) {
         if (result < 0 && result != -EINTR) fatal_error.store(-result, std::memory_order_release);

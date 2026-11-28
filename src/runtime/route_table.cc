@@ -34,6 +34,15 @@ namespace rut {
 bool RouteConfig::add_timer(
     const char* name, u32 name_len, u32 interval_ms, jit::HandlerFn fn, i32 shard) {
     if (timer_count >= kMaxTimers || fn == nullptr || interval_ms == 0) return false;
+    if (timer_count == 0) {
+        static std::atomic<i64> last_generation{0};
+        i64 previous = last_generation.load(std::memory_order_relaxed);
+        do {
+            if (previous >= INT64_MAX) return false;
+            timer_generation = previous + 1;
+        } while (!last_generation.compare_exchange_weak(
+            previous, timer_generation, std::memory_order_relaxed));
+    }
     TimerEntry& t = timers[timer_count];
     const u32 kN = name_len < sizeof(t.name) - 1 ? name_len : sizeof(t.name) - 1;
     for (u32 i = 0; i < kN; i++) t.name[i] = name[i];

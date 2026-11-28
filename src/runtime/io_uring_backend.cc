@@ -1,5 +1,6 @@
 #include "rut/runtime/io_uring_backend.h"
 
+#include "background_timer_eventfd.h"
 #include "core/expected.h"
 #include "io_uring_send_target.h"
 #include "rut/runtime/access_log.h"
@@ -16,6 +17,7 @@
 #include <linux/io_uring.h>
 #include <poll.h>
 #include <string.h>  // memset
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>  // SOCK_NONBLOCK, SOCK_CLOEXEC
@@ -87,6 +89,7 @@ static bool response_deadline_copy_owner(const Connection& conn, u32 upstream_ep
 static constexpr u32 kTimerConnId = 0xFFFFFE;
 // Sentinel conn_id for cancel completions (must not collide with real conn_ids or timer)
 static constexpr u32 kCancelConnId = 0xFFFFFD;
+static constexpr u32 kBackgroundTimerWakeId = 0xFFFFFC;
 // kPauseCancelAux (the pause-cancel completion tag) is defined in io_event.h so the
 // event loop can recognize it on IoEvent::aux.
 
@@ -270,6 +273,8 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     ring_fd = -1;
     timer_fd = -1;
     timer_read_armed = false;
+    background_timer_wake_fd = -1;
+    background_timer_poll_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
     // mmap-zeroed storage skips member initializers; the window array and side
     // table are not allocated yet, so there is nothing to clear.
@@ -623,6 +628,30 @@ void IoUringBackend::submit_timer_read() {
     sqe_advance_tail(sq_tail);
     pending++;
     timer_read_armed = true;
+}
+
+bool IoUringBackend::enable_background_timer_wakeup() {
+    if (background_timer_wake_fd >= 0) return true;
+    background_timer_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    return background_timer_wake_fd >= 0;
+}
+
+void IoUringBackend::wake_background_timers() {
+    signal_background_timer_eventfd(background_timer_wake_fd);
+}
+
+void IoUringBackend::submit_background_timer_poll() {
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return;
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_POLL_ADD;
+    sqe->fd = background_timer_wake_fd;
+    sqe->poll32_events = POLLIN;
+    sqe->user_data = encode_user_data(kBackgroundTimerWakeId, IoEventType::Timeout);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    background_timer_poll_armed = true;
 }
 
 // --- Operations ---
@@ -1330,6 +1359,11 @@ u32 IoUringBackend::wait(IoEvent* events,
     if (failure_code() != 0) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
+    if (background_timer_wake_fd >= 0 && !background_timer_poll_armed) {
+        submit_background_timer_poll();
+        // Flush a full SQ before sleeping so the mailbox always has a wake source.
+        if (!background_timer_poll_armed) wait_for_event = false;
+    }
 
     // A previous submission (including close-path cancellation) may already
     // have produced CQEs. Harvest them without another enter when there is no
@@ -1534,6 +1568,17 @@ u32 IoUringBackend::wait(IoEvent* events,
                                 conns[conn_id].response_read_deadline_state ==
                                     ResponseReadDeadlineState::BodyComplete));
             if (prior_send) break;
+        }
+
+        if (conn_id == kBackgroundTimerWakeId) {
+            background_timer_poll_armed = false;
+            if (cqe->res >= 0 && (cqe->res & POLLIN) != 0) {
+                drain_background_timer_eventfd(background_timer_wake_fd);
+            } else {
+                protocol_failure();
+            }
+            ++head;
+            continue;
         }
 
         // Cancel CQEs — silently consume, don't emit event
@@ -2338,6 +2383,9 @@ u32 IoUringBackend::wait(IoEvent* events,
 // --- Shutdown ---
 
 void IoUringBackend::shutdown() {
+    if (background_timer_wake_fd >= 0) close(background_timer_wake_fd);
+    background_timer_wake_fd = -1;
+    background_timer_poll_armed = false;
     reset_downstream_recv_wait_state();
     if (timer_fd >= 0) {
         close(timer_fd);

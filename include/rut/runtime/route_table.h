@@ -516,6 +516,7 @@ struct RouteConfig {
     };
     TimerEntry timers[kMaxTimers];
     u32 timer_count = 0;
+    i64 timer_generation = 0;  // Identity of this immutable timer table.
 
     // A shard-pinned timer whose selector is >= the configured shard count can
     // never fire (fire_due_timers only matches selector == shard_id). Called at

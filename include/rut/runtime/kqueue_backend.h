@@ -63,6 +63,8 @@ struct KqueueBackend {
     void quarantine_upstream_episode_on_slot_release(u32 conn_id);
     void arm_yield_timer(u64 deadline_ns);
     void wake();
+    bool enable_background_timer_wakeup() const { return kqueue_fd >= 0; }
+    void wake_background_timers() { wake(); }
     i32 failure_code() const { return failure_.load(std::memory_order_acquire); }
     u32 wait(IoEvent* events,
              u32 max_events,

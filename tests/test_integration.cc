@@ -1940,11 +1940,77 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     usleep(5000);
     loop0->fire_due_timers();
     loop1->fire_due_timers();
-    CHECK_EQ(loop0->timer_fire_count[0], 0u);           // wrong shard: never fires
+    CHECK_EQ(loop0->timer_fire_count[0], 0);            // wrong shard: never fires
     CHECK_EQ(loop0->background_timer_deadline_ns, 0u);  // and needs no timer wakeup
-    CHECK_GE(loop1->timer_fire_count[0], 1u);           // pinned shard fires
+    CHECK_GE(loop1->timer_fire_count[0], 1);            // pinned shard fires
     loop0->pool.destroy();
     loop1->pool.destroy();
+}
+
+TEST(timer, coordinator_dispatches_and_coalesces_by_config) {
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("all", 3, 100, &timer_probe_fn));
+    REQUIRE(cfg.add_timer("remote", 6, 100, &timer_probe_fn, 1));
+    RouteConfig replacement{};
+    REQUIRE(replacement.add_timer("replacement", 11, 100, &timer_probe_fn, 1));
+
+    auto scheduler = std::make_unique<EpollEventLoop>();
+    auto worker = std::make_unique<EpollEventLoop>();
+    REQUIRE(scheduler->pool.init(8));
+    REQUIRE(worker->pool.init(8));
+    scheduler->shard_id = 0;
+    worker->shard_id = 1;
+    const RouteConfig* scheduler_config = &cfg;
+    const RouteConfig* worker_config = &cfg;
+    scheduler->config_ptr = &scheduler_config;
+    worker->config_ptr = &worker_config;
+
+    BackgroundTimerDispatch dispatch{};
+    dispatch.shard_count = 2;
+    i64 wakes = 0;
+    dispatch.targets[1].wake.context = &wakes;
+    dispatch.targets[1].wake.signal = [](void* count) { ++*static_cast<i64*>(count); };
+    scheduler->timer_dispatch = &dispatch;
+    worker->timer_dispatch = &dispatch;
+    scheduler->fire_due_timers();
+
+    auto fire_scheduler = [&] {
+        scheduler->background_timer_deadline_ns = 1;
+        scheduler->timer_deadline_ns[0] = 1;
+        scheduler->timer_deadline_ns[1] = 1;
+        scheduler->fire_due_timers();
+    };
+    REQUIRE(worker->prepare_background_wait());
+    fire_scheduler();
+    fire_scheduler();
+    worker->finish_background_wait();
+    CHECK_EQ(wakes, 1);
+    CHECK_EQ(dispatch.targets[1].coalesced, 2);
+    CHECK_EQ(scheduler->timer_fire_count[0], 2);
+    CHECK_EQ(scheduler->timer_fire_count[1], 0);
+    CHECK_EQ(worker->timer_fire_count[0], 0);
+    worker->fire_due_timers();
+    worker->fire_due_timers();
+    CHECK_EQ(worker->timer_fire_count[0], 1);
+    CHECK_EQ(worker->timer_fire_count[1], 1);
+    CHECK_EQ(worker->background_timer_deadline_ns, 0u);
+
+    fire_scheduler();
+    CHECK_EQ(wakes, 1);  // Active destinations need no wake syscall.
+    worker_config = &replacement;
+    worker->fire_due_timers();
+    CHECK_EQ(worker->timer_fire_count[0], 1);  // Old config's slot 0 is stale.
+    CHECK_EQ(worker->timer_fire_count[1], 1);
+    CHECK_EQ(worker->stale_timer_triggers, 2);
+    scheduler_config = &replacement;
+    scheduler->fire_due_timers();
+    CHECK_GT(scheduler->background_timer_deadline_ns, 1u);
+    fire_scheduler();
+    worker->fire_due_timers();
+    CHECK_EQ(worker->timer_fire_count[0], 2);
+
+    scheduler->pool.destroy();
+    worker->pool.destroy();
 }
 
 TEST(timer, event_loop_fires_due_timer) {
@@ -1958,10 +2024,10 @@ TEST(timer, event_loop_fires_due_timer) {
     g_timer_probe_calls = 0;
 
     loop->fire_due_timers();  // first call arms the deadline (now + 1ms)
-    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    CHECK_EQ(loop->timer_fire_count[0], 0);
     usleep(5000);             // exceed the 1ms interval
     loop->fire_due_timers();  // now due → fire
-    CHECK_GE(loop->timer_fire_count[0], 1u);
+    CHECK_GE(loop->timer_fire_count[0], 1);
     CHECK_GE(g_timer_probe_calls, 1u);
     loop->pool.destroy();
 }
@@ -1982,7 +2048,7 @@ TEST(timer, event_loop_timer_json_allocates_scratch_and_counts_invocation) {
     loop->fire_due_timers();
     CHECK_EQ(g_timer_json_calls, 1u);
     CHECK_EQ(g_timer_json_successes, 1u);
-    CHECK_EQ(loop->timer_fire_count[0], 1u);
+    CHECK_EQ(loop->timer_fire_count[0], 1);
     loop->pool.destroy();
 }
 
@@ -2005,13 +2071,13 @@ TEST(timer, event_loop_timer_pool_failure_skips_and_reschedules) {
     loop->fire_due_timers();
     CHECK_EQ(g_timer_json_calls, 0u);
     CHECK_EQ(g_timer_json_successes, 0u);
-    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    CHECK_EQ(loop->timer_fire_count[0], 0);
     for (u32 i = 0; i < held_count; ++i) loop->pool.free(held[i]);
     usleep(5000);
     loop->fire_due_timers();
     CHECK_EQ(g_timer_json_calls, 1u);
     CHECK_EQ(g_timer_json_successes, 1u);
-    CHECK_EQ(loop->timer_fire_count[0], 1u);
+    CHECK_EQ(loop->timer_fire_count[0], 1);
     loop->pool.destroy();
 }
 #endif
@@ -2032,10 +2098,10 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     g_timer_probe_calls = 0;
 
     loop->fire_due_timers();  // arm
-    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    CHECK_EQ(loop->timer_fire_count[0], 0);
     usleep(5000);
     loop->fire_due_timers();  // now due → fire
-    CHECK_GE(loop->timer_fire_count[0], 1u);
+    CHECK_GE(loop->timer_fire_count[0], 1);
     CHECK_GE(g_timer_probe_calls, 1u);
     loop->pool.destroy();
 }
@@ -2048,13 +2114,13 @@ static u64 precise_timer_probe(void*, jit::HandlerCtx*, const u8*, u32, void*) {
 }
 
 template <typename Loop>
-static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc) {
+static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc, bool remote) {
     RouteConfig cfg{};
-    REQUIRE(cfg.add_timer("pulse", 5, 25, &precise_timer_probe));
+    REQUIRE(cfg.add_timer("pulse", 5, 25, &precise_timer_probe, remote ? 1 : -1));
     auto loop = std::make_unique<Loop>();
     const i32 listener = create_listen_socket(0).value_or(-1);
     REQUIRE(listener >= 0);
-    const auto init = loop->init(0, listener, 0, 32);
+    const auto init = loop->init(remote ? 1 : 0, listener, 0, 32);
     if (!init) {
         close(listener);
         if constexpr (std::is_same_v<Loop, IoUringEventLoop>) {
@@ -2067,6 +2133,22 @@ static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc
     }
     const RouteConfig* active = &cfg;
     loop->config_ptr = &active;
+    BackgroundTimerDispatch dispatch{};
+    dispatch.shard_count = 2;
+    auto scheduler = remote ? std::make_unique<Loop>() : nullptr;
+    if (remote) {
+        const bool attached = loop->attach_background_timers(dispatch);
+        if (!attached) {
+            loop->shutdown();
+            close(listener);
+            REQUIRE(attached);
+            return;
+        }
+        scheduler->shard_id = 0;
+        scheduler->config_ptr = &active;
+        REQUIRE(scheduler->attach_background_timers(dispatch));
+        scheduler->fire_due_timers();
+    }
     precise_timer_calls.store(0, std::memory_order_relaxed);
     pthread_t thread{};
     const i32 started = pthread_create(
@@ -2083,9 +2165,15 @@ static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc
         REQUIRE_EQ(started, 0);
         return;
     }
+    if (remote) {
+        usleep(60000);
+        CHECK_EQ(precise_timer_calls.load(std::memory_order_acquire), 0u);
+    }
     const i64 deadline = test_mono_ms() + 700;
-    while (precise_timer_calls.load(std::memory_order_acquire) < 3 && test_mono_ms() < deadline)
+    while (precise_timer_calls.load(std::memory_order_acquire) < 3 && test_mono_ms() < deadline) {
+        if (scheduler) scheduler->fire_due_timers();
         usleep(5000);
+    }
     const u32 calls = precise_timer_calls.load(std::memory_order_acquire);
     loop->stop();
     pthread_join(thread, nullptr);
@@ -2096,11 +2184,19 @@ static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc
 }
 
 TEST(timer, epoll_wakes_idle_shard_for_background_deadline) {
-    test_precise_background_timer_on_idle_shard<EpollEventLoop>(_tc);
+    test_precise_background_timer_on_idle_shard<EpollEventLoop>(_tc, false);
 }
 
 TEST(timer, io_uring_wakes_idle_shard_for_background_deadline) {
-    test_precise_background_timer_on_idle_shard<IoUringEventLoop>(_tc);
+    test_precise_background_timer_on_idle_shard<IoUringEventLoop>(_tc, false);
+}
+
+TEST(timer, epoll_wakes_idle_target_for_background_dispatch) {
+    test_precise_background_timer_on_idle_shard<EpollEventLoop>(_tc, true);
+}
+
+TEST(timer, io_uring_wakes_idle_target_for_background_dispatch) {
+    test_precise_background_timer_on_idle_shard<IoUringEventLoop>(_tc, true);
 }
 
 // A hot reload swapping *config_ptr must re-arm timer deadlines for the new
@@ -2124,10 +2220,10 @@ TEST(timer, rearms_on_config_swap) {
     active = &cfg_b;
     g_timer_probe_calls = 0;
     loop->fire_due_timers();  // detects the swap → re-arm, no fire
-    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    CHECK_EQ(loop->timer_fire_count[0], 0);
     usleep(5000);
     loop->fire_due_timers();  // B's timer now due → fire
-    CHECK_GE(loop->timer_fire_count[0], 1u);
+    CHECK_GE(loop->timer_fire_count[0], 1);
     loop->pool.destroy();
 }
 

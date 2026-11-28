@@ -4684,15 +4684,22 @@ Parameters:
 - `every:` (required) — interval as Duration
 - `shard: N` (optional) — run on specific shard only; default is every shard
 
-Intervals use positive duration literals with millisecond resolution. Each shard
-bounds its event wait by its earliest timer deadline, independently of the
-connection timeout wheel. Install and reload arm each timer from activation.
+Intervals use positive duration literals with millisecond resolution. Shard 0
+owns the deadlines and bounds its event wait by the earliest one. On each firing
+it publishes to every selected shard, which executes the callback on its own
+event loop. A bounded mailbox coalesces repeat triggers for the same timer while
+the target is busy. Target wakeups are independent of the connection timeout wheel.
+
+Shard 0 arms deadlines when it activates a configuration. Messages carry the
+timer table's generation. A target discards a message whose generation differs
+from its active configuration, including during staggered reload adoption.
 After a delayed firing, the next interval starts from that firing without
 replaying missed periods.
 
 Current callbacks run synchronously on their owning shard with scratch storage.
 Request access, forwarding, and suspending I/O remain unavailable in background
-timer callbacks.
+timer callbacks. See [runtime message dispatch](#87-runtime-message-dispatch)
+for deadline and priority ordering.
 
 #### 3.4.24 Lifecycle Hooks
 
@@ -6687,7 +6694,9 @@ Phase 3: Optimization + Advanced
 
 ### 8.1 Principle
 
-No locks. No mutexes. No condition variables. Four specific cross-shard scenarios, each with a dedicated lock-free solution.
+Keep mutable application state on its owning shard. Specialized mechanisms
+publish configuration, aggregate metrics, or share a bounded counter.
+Cross-shard work dispatch has a separate bounded message path (§8.7).
 
 ### 8.2 Global Rate Limiting
 
@@ -6784,8 +6793,9 @@ if (!(mask & (1 << upstream_id))) skip_upstream();
 
 ### 8.6 Language-Level Exposure
 
-All state types (Cache, LRU, Set, Bloom, Bitmap) are per-shard. No shared
-mutable state. Cross-shard communication uses `notify` — the only primitive:
+All state types (Cache, LRU, Set, Bloom, Bitmap) are per-shard. The following
+`notify` syntax and lowering are a target language contract. The runtime
+message dispatcher in §8.7 can be used independently of this syntax:
 
 ```swift
 // All state is per-shard, single-threaded, zero locking
@@ -6804,8 +6814,151 @@ notify all blacklist.add(ip)    // N-1 relaxed writes, microsecond propagation
 
 The compiler generates:
 - State mutation → plain memory write (per-shard, single thread)
-- `notify all expr` → serialize operation, enqueue to N-1 SPSC ring buffers
-  (relaxed store + release on tail pointer, no seq_cst, no full barrier)
+- `notify all expr` → serialize operation and enqueue to the other shards
+  using the bounded transport in §8.7.
+
+### 8.7 Runtime Message Dispatch
+
+The sender publishes an operation and the destination shard executes it against
+its own state. Shard 0 coordinates background timers. Other runtime producers
+can send directly to the shard that owns their operation. The transport does
+not require a central broker. Background timers are the first runtime consumer.
+The operation registry, other producer links, and reply protocols below are
+extensions to that first consumer.
+
+#### Transport and ownership
+
+- Preallocate a bounded SPSC ring for each enabled directed pair. Initially
+  enable the timer links from shard 0. The producer owns the tail and the
+  consumer owns the head. Place those cursors on separate cache lines and
+  cache the peer cursor locally. Refresh it with an acquire load when the
+  cached cursor gives insufficient space or work for the next batch.
+- Write a batch of slots and publish its tail with one release store. The
+  consumer copies a bounded batch into local storage, then advances its head
+  with one release store. Flush partial batches before the producer yields or
+  blocks, so a single timer message never waits for a batch to fill. Admission
+  uses the producer's available ring capacity, including slots reserved by
+  the current batch. A shard targeting itself admits work into its local
+  ready queue under the same execution rules.
+- Ring traffic uses no mutex, spinlock, shared multi-producer cursor, or atomic
+  read-modify-write (RMW) per slot. Deadline comparison and priority selection
+  use only destination-local data. Seastar's SMP path also batches publication
+  and copies incoming items into local storage before processing. Rut keeps its
+  bounded inline payload and return-on-full API.
+  [Seastar SMP queue declarations](https://github.com/scylladb/seastar/blob/master/include/seastar/core/smp.hh#L189-L221)
+  [Seastar batch processing](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc#L3486-L3584)
+- Admission returns `accepted`, `full`, or `closed` per destination. An
+  accepted message owns a ring slot or local ready slot. A full ring remains
+  intact. A full destination ready queue leaves ingress entries in their rings
+  to propagate backpressure. A broadcast may be partially accepted. Senders
+  handle that per destination without a blocking wait. Rings and wake handles
+  remain alive until all producers have stopped and joined.
+- The first version copies bounded inline payloads. The message contains a
+  registered operation ID and value data. Dispatch resolves the implementation
+  and any state handles on the destination. Borrowed pointers, connection
+  objects, and JIT function addresses never cross the ring.
+
+#### Wakeup synchronization budget
+
+Use one sleep flag on a separate cache line and one wake channel per
+destination. When the destination is busy, a producer batch performs no shared
+RMW or wake syscall. Publish the batch before performing a sequentially
+consistent fence and reading the sleep flag. A producer that sees the flag
+armed tries one strong compare-and-exchange from armed to active. Only the
+winner signals eventfd on Linux or EVFILT_USER on kqueue. Other producers
+continue without spinning.
+
+The destination arms the flag only when its ready queue and ingress appear
+empty and it is about to block. It then performs a sequentially consistent
+fence and rechecks the ingress rings with fresh acquire loads, bypassing cached
+tails. If work appears, it clears the flag and continues. Otherwise it keeps
+the flag armed across the blocking wait and clears it on return. The paired
+store-before-load fences prevent the producer from missing the arm while the
+destination misses the published tail. Wake notifications stay readable until
+the backend consumes them, so a wake posted just before the wait also works.
+Adopt pending config before admitting or executing messages on each turn.
+
+This portable handshake spends one fence per nonempty published batch and
+one per idle sleep attempt. Seastar uses a system-wide barrier on the
+interrupt-mode side to reduce publication cost further. Evaluate that approach
+only if profiling shows the batch fence is material and the platform can
+support the same wakeup proof.
+[Seastar interrupt-mode handshake](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc#L2842-L2864)
+[Seastar wakeup ordering](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc#L3553-L3564)
+
+#### Envelope and execution
+
+| Field | Semantics |
+| --- | --- |
+| Source and destination | Shard IDs. A directed ring identifies both endpoints. |
+| Operation and payload | Registered handler ID and bounded inline arguments. |
+| Deadline | Optional absolute `CLOCK_MONOTONIC` deadline in nanoseconds, measured in the same process on every shard. |
+| Priority | `high`, `normal`, or `low`. Each operation defines which values its producer can set. |
+| Work key | Optional operation-specific identity, such as timer slot and config generation. |
+
+The destination pulls from inbound rings in bounded round-robin batches and
+orders the work it has admitted into its fixed-capacity ready heap. Compare the earliest
+deadline first, with no deadline sorting after any finite deadline. Break ties
+by higher priority, then admission order. A message still in an ingress ring
+enters the ordering once admitted. Operations that need strict execution order
+must enforce it in their own protocol because ready work can be reordered
+even within a source/destination pair.
+
+Execute callbacks on the destination's event loop with a bounded number per
+turn so socket I/O and control-plane work can progress between batches.
+Callbacks are cooperative. Priority affects selection among queued messages,
+and cannot interrupt a running callback. A handler's registered deadline policy
+determines what happens if the message is already late when selected. A soft
+deadline still permits execution. An operation with a hard deadline expires
+before invoking the handler when the destination clock is at or past it. A
+hard deadline governs starting work. Completion deadlines need an explicit
+handler protocol. This is best-effort scheduling, with no latency or starvation
+guarantee under sustained overload.
+
+`accepted` reports admission only. An operation that needs a result sends a
+reply keyed by a request ID through the same transport. It must define reply
+capacity and timeout behavior. The timer path needs no reply. Shutdown closes
+admission and discards queued timer triggers. Running callbacks leave the
+event loop through its normal shutdown sequence.
+
+#### Background timers as the first consumer
+
+Use a soft deadline equal to the scheduled firing time, and `normal` priority
+for existing DSL timers. Shard 0 publishes when that time arrives. An omitted
+`shard:` targets each shard, including shard 0 through its own ready queue.
+`shard: N` targets only N. The receiving shard resolves the timer slot against
+its active config before invoking the callback. If multiple timers have the same
+deadline and priority, shard 0 publishes them in declaration order.
+
+Keep one pending trigger for each timer slot and destination. Shard 0 records
+the last admitted trigger sequence locally. The destination acknowledges that
+sequence with a release store when it starts or discards the trigger. Shard 0
+checks the acknowledgement with an acquire load before admitting another
+occurrence. Only the destination writes the acknowledgement, so coalescing needs
+no shared RMW. Sequences are never reset on config reload. A rejected enqueue
+leaves the sent sequence unchanged. Later
+ticks coalesce while the first trigger is pending, and a running callback can
+have one subsequent trigger queued. The queued message
+retains its original deadline and the generation of the configuration that
+scheduled it. On reload, shard 0 rearms the intervals. A destination discards a
+trigger for a generation it has not adopted or has already replaced. If a
+target ring is full, skip that occurrence for that target and try again next
+period. The runtime records full-ring, coalesced, stale-generation, and
+late-start counts in shard-owned state. Exporting those counters to operators
+is a follow-up.
+
+Timer links carry a typed inline payload containing the config generation,
+timer slot, and trigger sequence. The receiving shard orders the messages in
+its local heap. The existing `timer` syntax needs no change.
+
+Verify wake/arm races, ring wraparound and full rings, ordering
+across producers, priority and deadline ties, hard expiry versus soft late
+execution, stale config generations, and shutdown with queued work. Exercise
+idle destination wakeups on epoll, io_uring, and kqueue. Measure publication
+and drain batch sizes, wake CAS attempts and syscalls, and send-to-start
+latency for both busy and idle destinations. Verify the active-destination
+path has zero wake RMWs and syscalls and that partial batches flush without
+waiting for more traffic.
 
 ---
 

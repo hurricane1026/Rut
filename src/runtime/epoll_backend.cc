@@ -1,5 +1,6 @@
 #include "rut/runtime/epoll_backend.h"
 
+#include "background_timer_eventfd.h"
 #include "core/expected.h"
 #include "epoll_tls_hooks.h"
 #include "rut/runtime/access_log.h"
@@ -12,6 +13,7 @@
 #include <openssl/ssl.h>
 #include <string.h>  // memset
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <time.h>
@@ -21,6 +23,7 @@ namespace rut {
 
 static constexpr u32 kListenConnId = 0xFFFFFF;
 static constexpr u32 kTimerConnId = 0xFFFFFE;
+static constexpr u32 kBackgroundTimerWakeId = 0xFFFFFC;
 
 const EpollTlsHooks* get_epoll_tls_hooks_for_test() __attribute__((weak));
 
@@ -345,6 +348,25 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd, u32 ca
     }
 
     return {};
+}
+
+bool EpollBackend::enable_background_timer_wakeup() {
+    if (background_timer_wake_fd >= 0) return true;
+    const i32 fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) return false;
+    struct epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.u64 = encode_data(kBackgroundTimerWakeId, IoEventType::Timeout, 0);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0) {
+        close(fd);
+        return false;
+    }
+    background_timer_wake_fd = fd;
+    return true;
+}
+
+void EpollBackend::wake_background_timers() {
+    signal_background_timer_eventfd(background_timer_wake_fd);
 }
 
 void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
@@ -1221,6 +1243,8 @@ u32 EpollBackend::wait(
                 events[out].upstream_episode = 0;
                 out++;
             }
+        } else if (conn_id == kBackgroundTimerWakeId) {
+            drain_background_timer_eventfd(background_timer_wake_fd);
         } else if (conn_id == kTimerConnId) {
             // Two timerfds share kTimerConnId; the decoded type disambiguates.
             // HandlerTimer → yield_timer_fd (one-shot, ms precision, per-heap-top).
@@ -1687,6 +1711,8 @@ u32 EpollBackend::wait(
 }
 
 void EpollBackend::shutdown() {
+    if (background_timer_wake_fd >= 0) close(background_timer_wake_fd);
+    background_timer_wake_fd = -1;
     pending_count = 0;
     pending_streak = 0;
     ready_head = 0;

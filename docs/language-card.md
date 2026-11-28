@@ -1828,10 +1828,17 @@ throttle(downstream: 100kb per 1s, burst: 256kb)
 
 // Background / lifecycle
 timer checkHealth, every: 5s, shard: 0 { ... }   // shard: omitted = every shard
-timer sample, every: 250ms { ... }             // millisecond interval, driven by the shard loop
+timer sample, every: 250ms { ... }             // millisecond interval, scheduled by shard 0
 init { ... }         // per-shard, before accepting
 shutdown { ... }     // per-shard, after drain
 ```
+
+Shard 0 schedules background timers and wakes the selected shards. Each selected
+shard executes the callback locally, taking the earliest scheduled firing
+first among admitted work. Timers use normal priority and soft deadlines, so
+a late trigger can still run. A busy shard keeps at most one queued firing per
+timer. Timers restart their intervals on reload and a shard discards messages
+for a different configuration.
 
 ## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
 

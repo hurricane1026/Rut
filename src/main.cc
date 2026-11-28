@@ -417,6 +417,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
     u16 port = listener.port;
     ListenerContext bound_listener_context{};
     Shard<EventLoopType> shards[kMaxShards];
+    BackgroundTimerDispatch timer_dispatch{};
+    timer_dispatch.shard_count = shard_count;
     // Cross-shard metrics registry for the built-in /metrics endpoint. Lives
     // for the whole serve duration (outlives the shard threads, which join
     // before this returns). Only populated under --metrics.
@@ -509,6 +511,15 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
         // from this pointer. A null config keeps the legacy route-less
         // behavior (every request falls through to the default action).
         shards[i].route_config = route_config;
+    }
+
+    for (u32 i = 0; i < shard_count; ++i) {
+        if (shards[i].loop->attach_background_timers(timer_dispatch)) continue;
+        write_str("Failed to initialize background timer wakeup for shard ");
+        write_u32(i);
+        write_str("\n");
+        for (u32 j = 0; j < shard_count; ++j) shards[j].shutdown();
+        return {RunShardsOutcomeKind::Failure};
     }
 
     // Wire the cross-shard metrics registry so any shard can serve an
