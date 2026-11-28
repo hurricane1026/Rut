@@ -25,49 +25,54 @@ u16 word(const u8* p) {
     return (range_int(p[0]).scaled_by<256>() + range_int(p[1])).to<u16>();
 }
 u32 number(const u8* p) {
-    return (u32{word(p)} << 16) | word(p + 2);
+    return (range_int{word(p)}.scaled_by<65536>() + range_int{word(p + 2)}).to<u32>();
 }
 void put(u8* p, u16 v) {
     p[0] = range_int(v).divided_by<256>().to<u8>();
     p[1] = bounded_remainder<256>(v).to<u8>();
 }
-[[nodiscard]] char lower(char c) {
+[[nodiscard]] u8 lower(u8 c) {
     range_int<'A', 'Z' + 1> upper;
-    if (!decltype(upper)::try_from_i64(c, &upper)) return c;
-    const u8 folded = (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
-    return static_cast<char>(folded);
+    if (!decltype(upper)::try_from_u64(c, &upper)) return c;
+    return (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>();
 }
 // Compression pointers must move backwards. Both jumps and expanded names are bounded.
-bool name_at(const u8* p, u32 len, u32& offset, char* out) {
-    u32 at = offset, used = 0, jumps = 0;
-    bool jumped = false;
+[[nodiscard]] bool name_at(const u8* p, u32 len, u32* offset, char (&out)[254]) {
+    u32 at = *offset, used = 0, jumps = 0;
+    u32 compressed_end = 0;
+    auto* output = reinterpret_cast<u8*>(out);
+    const auto wire_size = range_int{len};
     for (u32 labels = 0; labels < 128; ++labels) {
         if (at >= len) return false;
         const u32 kStart = at;
         const u8 kN = p[at++];
         if ((kN & 0xc0) == 0xc0) {
             if (at >= len || ++jumps > 16) return false;
-            const u32 kTarget = ((kN & 63u) << 8) | p[at++];
+            const auto high = bounded_remainder<64>(kN).scaled_by<256>();
+            const u32 kTarget = (high + range_int{p[at++]}).to<u32>();
             if (kTarget < 12 || kTarget >= kStart) return false;
-            if (!jumped) offset = at;
-            jumped = true;
+            if (compressed_end == 0) compressed_end = at;
             at = kTarget;
             continue;
         }
         if (kN & 0xc0) return false;
         if (!kN) {
-            if (!jumped) offset = at;
-            out[used] = 0;
+            *offset = compressed_end == 0 ? at : compressed_end;
+            output[used] = 0;
             return true;
         }
-        if (static_cast<i64>(at) + static_cast<i64>(kN) > static_cast<i64>(len) ||
-            static_cast<i64>(used) + static_cast<i64>(kN) + (used ? 1 : 0) > 253)
+        const auto label = range_int{kN};
+        const auto cursor = range_int{at};
+        const auto destination = range_int{used};
+        const auto separator = range_int{u8{used != 0}};
+        if ((cursor + label).value() > wire_size.value() ||
+            (destination + label + separator).value() >= sizeof(out))
             return false;
-        if (used) out[used++] = '.';
+        if (used) output[used++] = '.';
         for (u32 i = 0; i < kN; ++i) {
-            const char kC = lower(p[i64{at++}]);
+            const u8 kC = lower(p[at++]);
             if ((kC < 'a' || kC > 'z') && (kC < '0' || kC > '9') && kC != '-') return false;
-            out[used++] = kC;
+            output[used++] = kC;
         }
     }
     return false;
@@ -96,11 +101,12 @@ bool dns_hostname(char* name) {
     if (!len || len > 253) return false;
     bool alphabetic = false;
     u32 label = 0;
+    auto* bytes = reinterpret_cast<u8*>(name);
     for (u32 i = 0; i <= len; ++i) {
-        const char kC = lower(name[i]);
-        name[i] = kC;
+        const u8 kC = lower(bytes[i]);
+        bytes[i] = kC;
         if (!kC || kC == '.') {
-            if (!label || label > 63 || name[i64{i} - 1] == '-') return false;
+            if (!label || label > 63 || bytes[i - 1] == '-') return false;
             label = 0;
         } else {
             if (((kC < 'a' || kC > 'z') && (kC < '0' || kC > '9') && kC != '-') ||
@@ -115,7 +121,7 @@ bool dns_hostname(char* name) {
 }
 u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
     if (!name || !p || capacity < 18) return 0;
-    range_int<0, i64{UINT32_MAX} + 1> name_length;
+    range_int<0, UINT32_MAX + 1LL> name_length;
     if (!decltype(name_length)::try_from_u64(strnlen(name, capacity), &name_length) ||
         (name_length + range_int<18, 19>{}).value() > capacity)
         return 0;
@@ -124,6 +130,7 @@ u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
     put(p, id);
     put(p + 2, 0x0100);
     put(p + 4, 1);
+    const auto limit = range_int{capacity};
     u32 at = 12, start = 0;
     for (u32 i = 0; i <= kLen; ++i) {
         if (name[i] && name[i] != '.') continue;
@@ -131,15 +138,23 @@ u32 dns_question(const char* name, u16 id, u8* p, u32 capacity) {
         if (!decltype(label)::try_from_i64((range_int(i) - range_int(start)).value(), &label))
             return 0;
         const u8 kN = label.to<u8>();
-        p[at++] = kN;
-        memcpy(p + i64{at}, name + i64{start}, kN);
-        at = (range_int(at) + range_int(kN)).min(range_int(capacity)).to<u32>();
-        start = (range_int(i) + range_int<1, 2>{}).min(range_int(capacity)).to<u32>();
+        const auto cursor = range_int{at};
+        const auto label_start = cursor + range_int<1, 2>{};
+        auto end = cursor;
+        if (!limit.try_count((label_start + label).value(), &end)) return 0;
+        p[cursor.index()] = kN;
+        memcpy(p + label_start.index(), name + range_int{start}.index(), kN);
+        at = end.to<u32>();
+        start = i + 1;  // kLen + 18 fits in capacity.
     }
-    p[at++] = 0;
-    put(p + i64{at}, 1);
-    put(p + (range_int(at) + range_int<2, 3>{}).value(), 1);
-    return (range_int(at) + range_int<4, 5>{}).min(range_int(capacity)).to<u32>();
+    const auto cursor = range_int{at};
+    auto end = cursor;
+    if (!limit.try_count((cursor + range_int<5, 6>{}).value(), &end)) return 0;
+    u8* const trailer = p + cursor.index();
+    trailer[0] = 0;
+    put(trailer + 1, 1);
+    put(trailer + 3, 1);
+    return end.to<u32>();
 }
 DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& result) {
     result = {};
@@ -147,9 +162,9 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
         return DnsAnswer::Invalid;
     u32 at = 12;
     char question[254]{};
-    if (!name_at(p, len, at, question) || strcmp(question, name) != 0 ||
-        (range_int(at) + range_int<4, 5>{}).value() > len || word(p + range_int(at).value()) != 1 ||
-        word(p + (range_int(at) + range_int<2, 3>{}).value()) != 1)
+    if (!name_at(p, len, &at, question) || strcmp(question, name) != 0 ||
+        (range_int{at} + range_int<4, 5>{}).value() > len || word(p + range_int{at}.index()) != 1 ||
+        word(p + (range_int{at} + range_int<2, 3>{}).index()) != 1)
         return DnsAnswer::Invalid;
     at = (range_int(at) + range_int<4, 5>{}).min(range_int(len)).to<u32>();
     if (word(p + 2) & 0x0200) return DnsAnswer::Truncated;
@@ -166,14 +181,16 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
     Record records[64]{};
     for (u32 i = 0; i < kTotal; ++i) {
         auto& r = records[i];
-        if (!name_at(p, len, at, r.owner)) return DnsAnswer::Invalid;
-        const auto data = range_int(at) + range_int<10, 11>{};
+        if (!name_at(p, len, &at, r.owner)) return DnsAnswer::Invalid;
+        const auto cursor = range_int{at};
+        const auto data = cursor + range_int<10, 11>{};
         if (data.value() > len) return DnsAnswer::Invalid;
         r.data = data.min(range_int(len)).to<u32>();
-        r.type = word(p + i64{at} + 2) == 1 ? word(p + i64{at}) : 0;
-        r.ttl = number(p + i64{at} + 4);
+        const u8* const fields = p + cursor.index();
+        r.type = word(fields + 2) == 1 ? word(fields) : 0;
+        r.ttl = number(fields + 4);
         if (r.ttl & 0x80000000u) r.ttl = 0;
-        r.size = word(p + i64{at} + 8);
+        r.size = word(fields + 8);
         const auto end = data + range_int(r.size);
         if (end.value() > len) return DnsAnswer::Invalid;
         at = end.min(range_int(len)).to<u32>();
@@ -189,7 +206,7 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             if (r.type == 1) {
                 if (r.size != 4) return DnsAnswer::Invalid;
                 u32 address = 0;
-                memcpy(&address, p + i64{r.data}, 4);
+                memcpy(&address, p + range_int{r.data}.index(), 4);
                 bool duplicate = false;
                 for (u32 j = 0; j < result.count; ++j) duplicate |= result.addresses[j] == address;
                 if (!duplicate) {
@@ -206,7 +223,8 @@ DnsAnswer dns_answer(const u8* p, u32 len, const char* name, u16 id, DnsResult& 
             } else if (r.type == 5) {
                 u32 pos = r.data;
                 char candidate[254]{};
-                if (!name_at(p, len, pos, candidate) || i64{pos} != i64{r.data} + i64{r.size} ||
+                const auto end = range_int{r.data} + range_int{r.size};
+                if (!name_at(p, len, &pos, candidate) || pos != end.value() ||
                     !dns_hostname(candidate) || (alias && strcmp(candidate, target) != 0))
                     return DnsAnswer::Invalid;
                 memcpy(target, candidate, sizeof(target));
@@ -293,7 +311,7 @@ int DnsResolver::resolve(
 #endif
         q.question_size = dns_question(q.name, q.id, q.question + 2, sizeof(q.question) - 2);
         if (!q.question_size) return -1;
-        range_int<1, i64{sizeof(q.question)} - 1> length;
+        range_int<1, sizeof(q.question) - 1> length;
         if (!decltype(length)::try_from_i64(q.question_size, &length)) return -1;
         put(q.question, length.to<u16>());
         q.fd = platform::datagram_socket();
@@ -332,45 +350,50 @@ int DnsResolver::resolve(
         q.phase = 5;
         return 0;
     } else if (q.phase == 5) {
-        const auto target = range_int(q.question_size) + range_int<2, 3>{};
-        const auto sent = range_int(q.sent);
-        if (target.value() > i64{sizeof(q.question)} || sent.value() >= target.value())
+        using QuestionLength = range_int<0, sizeof(q.question) + 1>;
+        QuestionLength target;
+        QuestionLength pending_bytes;
+        const auto sent = range_int{q.sent};
+        if (!QuestionLength::try_from_i64((range_int{q.question_size} + range_int<2, 3>{}).value(),
+                                          &target) ||
+            !target.try_count((target - sent).value(), &pending_bytes) ||
+            pending_bytes.value() == 0)
             return retry();
-        const auto pending_bytes = (target - sent).max(range_int<0, 1>{});
         const auto kN =
             send(q.fd, q.question + sent.index(), pending_bytes.to_u64(), platform::kSendFlags);
         if (kN < 0 && pending()) return 0;
-        range_int<1, i64{sizeof(q.question)} + 1> written;
-        if (!decltype(written)::try_from_i64(kN, &written) ||
-            written.value() > pending_bytes.value())
+        QuestionLength written, next;
+        if (kN <= 0 || !pending_bytes.try_count(kN, &written) ||
+            !target.try_count((sent + written).value(), &next))
             return retry();
-        q.sent = (sent + written)
-                     .min(range_int<sizeof(q.question), i64{sizeof(q.question)} + 1>{})
-                     .to<u32>();
+        q.sent = next.to<u32>();
         if (q.sent == target.value()) q.phase = 6;
         return 0;
     } else if (q.phase == 6) {
-        constexpr i64 kCapacity = sizeof(q.packet);
-        range_int<0, kCapacity + 1> target;
-        if (!decltype(target)::try_from_i64(q.received < 2 ? 2 : i64{q.size} + 2, &target))
+        using PacketLength = range_int<0, sizeof(q.packet) + 1>;
+        const auto received = range_int{q.received};
+        constexpr auto kPrefixSize = range_int<2, 3>{};
+        const auto packet_size = range_int{q.size} + kPrefixSize;
+        PacketLength target;
+        PacketLength pending_bytes;
+        if (!PacketLength::try_from_i64(q.received < 2 ? kPrefixSize.value() : packet_size.value(),
+                                        &target) ||
+            !target.try_count((target - received).value(), &pending_bytes) ||
+            pending_bytes.value() == 0)
             return retry();
-        const auto received = range_int(q.received);
-        if (received.value() >= target.value()) return retry();
-        const auto pending_bytes = (target - received).max(range_int<0, 1>{});
         const auto kN = recv(q.fd, q.packet + received.index(), pending_bytes.to_u64(), 0);
         if (kN < 0 && pending()) return 0;
-        range_int<1, i64{sizeof(q.packet)} + 1> read;
-        if (!decltype(read)::try_from_i64(kN, &read) || read.value() > pending_bytes.value())
+        PacketLength read, next;
+        if (kN <= 0 || !pending_bytes.try_count(kN, &read) ||
+            !target.try_count((received + read).value(), &next))
             return retry();
-        q.received = (received + read)
-                         .min(range_int<sizeof(q.packet), i64{sizeof(q.packet)} + 1>{})
-                         .to<u32>();
+        q.received = next.to<u32>();
         if (q.received == 2) {
             q.size = word(q.packet);
             if (q.size < 12 || q.size > 4096) return retry();
             return 0;
         }
-        if (i64{q.received} != i64{q.size} + 2) return 0;
+        if (next.value() != packet_size.value()) return 0;
         length = q.size;
         memmove(q.packet, q.packet + 2, length);
     }
