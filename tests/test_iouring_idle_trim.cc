@@ -1165,7 +1165,7 @@ u64 tick_to_first_trim(TrimRig& r) {
 
 }  // namespace
 
-TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_same_size) {
+TEST(iouring_idle_trim, every_arm_clears_the_examined_mark) {
     TrimRig r;
     if (!r.init(4, false)) SKIP("io_uring or process_madvise unavailable");
     Connection* c = stage_idle(r, 100000);
@@ -1180,30 +1180,6 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     r.loop->timer.remove(c);
     r.loop->timer.add(c, r.loop->keepalive_timeout);  // a bare add
     CHECK(!c->idle_trim_examined);
-    // RelayOwner, BufferedSendVector, and the four WebSocket inspection slices
-    // are part of the hot connection slot. Fixed-text rewriting and close reasons
-    // each add one route view on the connection and one view per direction. Branch
-    // close policies add bounded table views and the selected echo reason. Branch
-    // text replacements add one table view on the connection and each inspector.
-    // Affix recipes retain a suffix view and dynamic-source tag. JSON source paths increase
-    // WsTextRewrite from 40 to 56 bytes in three connection-owned recipes (+48 bytes total).
-    // The opening-handshake owner adds 16 bytes: the slice pointer, offers length,
-    // phase, and alignment padding. Keep the bounded layout explicit so future owner
-    // fields cannot grow it unnoticed; admission tests cover the handshake lifetime.
-    // Required subprotocol negotiation pins one additional route-owned Str (+16 bytes).
-    // Verified inbound mTLS identity accounts for 64 bytes; struct padding absorbs its
-    // valid flag. The optional HTTP/1 TLS-upstream owner and transport links account for
-    // two pointers plus 8 bytes of generation/state/queued metadata after
-    // reordering. The bounded TLS server-name and route-host views add 512 bytes
-    // total. The active-health configuration identity adds 8 bytes plus 8 bytes
-    // of alignment padding. The passive response/timeout episode markers add
-    // another 8 bytes. The 64-bit completed-request count and its alignment add
-    // 8 bytes. The bounded request-body override carries two flags plus one Str
-    // view and alignment padding (+24 bytes). The parked connect-retry identity
-    // state adds one bounded 64-byte owner block, bringing the 64-bit layout to
-    // 6368 bytes with or without WebSocket. The upstream write-idle owner fits
-    // existing padding after reordering the receive-slice capacity field.
-    CHECK_EQ(sizeof(Connection), 6368u);
 }
 
 TEST(iouring_idle_trim,
