@@ -241,8 +241,8 @@ struct ResponseInfo {
     if (parser.parse(wire, length, &response) != ParseStatus::Complete ||
         response.status_code != 200 || response.headers_truncated || response.chunked ||
         !response.has_content_length || response.content_length_count != 1 ||
-        (range_int(parser.header_end) + range_int(response.content_length)).value() >
-            kMaxBufferedResponse)
+        response.content_length < 0 ||
+        response.content_length > i64{kMaxBufferedResponse} - i64{parser.header_end})
         return false;
     info.header_end = parser.header_end;
     Controls policy;
@@ -465,10 +465,13 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
         info.parsed.status_code != 200 || info.parsed.headers_truncated || info.parsed.chunked ||
         !info.parsed.has_content_length || info.parsed.content_length_count != 1)
         return false;
-    const auto response_size = range_int(parser.header_end) + range_int(info.parsed.content_length);
+    if (info.parsed.content_length < 0 ||
+        info.parsed.content_length > i64{kMaxBufferedResponse} - i64{parser.header_end})
+        return false;
+    const u32 response_size = static_cast<u32>(i64{parser.header_end} + info.parsed.content_length);
     using BufferedLength = range_int<0, kMaxBufferedResponse + 1>;
     BufferedLength checked;
-    if (!BufferedLength::try_from_i64(response_size.value(), &checked)) return false;
+    if (!BufferedLength::try_from_i64(i64{response_size}, &checked)) return false;
     total = checked.to<u32>();
     return true;
 }
@@ -479,7 +482,8 @@ bool HttpCachePolicy::prepare_record(
     if (sub_overflow(now_us, fill.started_us, &kElapsed)) return false;
     ResponseInfo info;
     if (!response_info(response, length, fill.ttl, wall_us, kElapsed, info) ||
-        length != (range_int(info.header_end) + range_int(info.parsed.content_length)).value())
+        info.parsed.content_length < 0 || info.header_end > length ||
+        info.parsed.content_length != i64{length - info.header_end})
         return false;
     const u64 kRemainingUs = info.remaining_us;
     u64 max_remaining = 0;

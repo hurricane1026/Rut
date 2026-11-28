@@ -2267,8 +2267,7 @@ inline bool proxy_body_complete(const Connection& conn) {
 // tls_active before touching conn again.
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(newly));
+    conn.resp_body_sent += i64{newly};
     throttle_advance(conn, newly);
     if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial
     conn.upstream_send_len = conn.tls_send_len;
@@ -2921,8 +2920,8 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size;
         entry.req_size = conn.downstream_req_size > i64{UINT32_MAX}
-                              ? UINT32_MAX
-                              : static_cast<u32>(conn.downstream_req_size);
+                             ? UINT32_MAX
+                             : static_cast<u32>(conn.downstream_req_size);
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -3921,8 +3920,7 @@ void on_jit_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     u32 consume = static_cast<u32>(ev.result);
     if (consume > conn.req_body_remaining) consume = conn.req_body_remaining;
-    conn.req_body_remaining =
-        static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
+    conn.req_body_remaining -= i64{consume};
     if (i64{consume} > INT64_MAX - conn.downstream_req_size ||
         i64{consume} > INT64_MAX - conn.req_size) {
         loop->close_conn(conn);
@@ -4016,8 +4014,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     } else if (consume > conn.req_body_remaining) {
         consume = conn.req_body_remaining;
     }
-    conn.req_body_remaining =
-        static_cast<u32>(static_cast<i64>(conn.req_body_remaining) - static_cast<i64>(consume));
+    conn.req_body_remaining -= i64{consume};
     if (i64{consume} > INT64_MAX - conn.downstream_req_size ||
         i64{consume} > INT64_MAX - conn.req_size) {
         loop->close_conn(conn);
@@ -11182,10 +11179,8 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         static_cast<i64>(conn.response_read_deadline_post_commit_downstream_submitted) +
         static_cast<i64>(available));
     conn.response_read_deadline_post_commit_inflight_body = available;
-    conn.resp_body_remaining =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_remaining) - static_cast<i64>(available));
-    conn.resp_body_sent =
-        static_cast<u32>(static_cast<i64>(conn.resp_body_sent) + static_cast<i64>(available));
+    conn.resp_body_remaining -= i64{available};
+    conn.resp_body_sent += i64{available};
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
