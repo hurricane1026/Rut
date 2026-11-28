@@ -1610,6 +1610,23 @@ TEST(http2_conn, settings_invalid_value_goaway) {
     CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
 }
 
+TEST(http2_conn, invalid_settings_with_small_output_still_closes) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.preface_seen = true;
+    const u8 kSetting[]{0, 4, 0x80, 0, 0, 0};  // Invalid initial stream window.
+    u8 frame[32];
+    const u32 frame_size =
+        put_frame(frame, Http2FrameType::Settings, 0, 0, kSetting, sizeof(kSetting));
+    u8 out[8]{};
+    u32 written = 0;
+    const Http2Result result = c.process(frame, frame_size, out, sizeof(out), &written);
+    CHECK(result.close);
+    CHECK_EQ(result.consumed, frame_size);
+    CHECK_FALSE(c.peer_settings_seen);
+}
+
 TEST(http2_conn, settings_invalid_length_and_window_delta_do_not_establish_peer) {
     Http2Conn c;
     Capture cap;

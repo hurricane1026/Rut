@@ -883,13 +883,20 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
 
 }  // namespace
 
-// Handle a single fully-buffered frame. Returns a connection error (non-NoError
-// → caller sends GOAWAY and closes). Stream-level errors emit RST_STREAM here
-// and return NoError.
-[[nodiscard]] static Http2Error handle_frame(Http2Conn& c,
-                                             const Http2FrameHeader& h,
-                                             const u8* payload,
-                                             OutWriter& w) {
+struct FrameResult {
+    Http2Error error;
+    bool wait_for_output;
+
+    constexpr FrameResult(Http2Error error, bool wait_for_output = false)
+        : error(error), wait_for_output(wait_for_output) {}
+};
+
+// A frame that needs more output capacity stays buffered without applying its
+// state changes. Connection errors close after attempting GOAWAY.
+[[nodiscard]] static FrameResult handle_frame(Http2Conn& c,
+                                              const Http2FrameHeader& h,
+                                              const u8* payload,
+                                              OutWriter& w) {
     const auto kType = Http2FrameType{h.type};
 
     // A pending CONTINUATION admits only a CONTINUATION on the same stream.
@@ -919,6 +926,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                         return Http2Error::FlowControlError;
                 }
             }
+            if (!w.room(kFrameHeaderSize)) return {Http2Error::NoError, true};
             // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
             // encoder may index against. React (resize + arm a §6.3 update for the
             // next response header block) so we never index into a table the peer
@@ -1214,7 +1222,7 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                         const u32 kHeaderLen = write_frame_header(out, ack);
                         __builtin_memmove(out + range_int{kHeaderLen}.index(), payload, 8);
                     }))
-                    return Http2Error::InternalError;
+                    return {Http2Error::NoError, true};
             }
             return Http2Error::NoError;
         }
@@ -1343,15 +1351,6 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                                          (h.flags & http2_flag::kEndHeaders) != 0;
         if ((kNewOwnedConflict || kFinalOwnedConflict) && !w.room(kShortControlFrame)) break;
 
-        // Keep valid peer control frames buffered until their ACK fits. Invalid
-        // frames still reach handle_frame so protocol errors are preserved.
-        if (kType == Http2FrameType::Ping && h.stream_id == 0 && h.length == 8 &&
-            !(h.flags & http2_flag::kAck) && !w.room(kLongControlFrame))
-            break;
-        if (kType == Http2FrameType::Settings && h.stream_id == 0 && h.length % 6 == 0 &&
-            !(h.flags & http2_flag::kAck) && !w.room(kFrameHeaderSize))
-            break;
-
         // Legacy body buffering replenishes both the stream and connection
         // windows for nonempty DATA. Keep such a frame unconsumed until both
         // updates can be emitted. Unknown and half-closed streams also need
@@ -1391,13 +1390,14 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                 break;
         }
 
-        const Http2Error kErr = handle_frame(*this, h, in + (cursor + kFrameHeader).index(), w);
+        const FrameResult result = handle_frame(*this, h, in + (cursor + kFrameHeader).index(), w);
+        if (result.wait_for_output) break;
         pos = (range_int(pos) + frame_size).min(range_int(len)).to<u32>();
-        if (kErr != Http2Error::NoError || recv_credit_failed) {
+        if (result.error != Http2Error::NoError || recv_credit_failed) {
             goaway_sent = w.emit<kLongControlFrame>(
                               write_goaway,
                               last_stream_id,
-                              recv_credit_failed ? Http2Error::FlowControlError : kErr) ||
+                              recv_credit_failed ? Http2Error::FlowControlError : result.error) ||
                           goaway_sent;
             *out_written = w.len;
             return {pos, true};
