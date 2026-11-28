@@ -186,7 +186,7 @@ public:
             RUT_TRAP("Buffer::set_len: invalid length (%" PRId64 ", capacity=%" PRId64 ")",
                      n,
                      Length{cap_}.value());
-        len_ = store_length(next);
+        len_ = next;
     }
 
     // Drop the first n already-consumed bytes, shifting the remainder to the front.
@@ -198,7 +198,7 @@ public:
         const auto kRemaining = (current - consumed).max(range_int<0, 1>{});
         if (kRemaining.value())
             __builtin_memmove(ptr_, ptr_ + consumed.index(), kRemaining.to_u64());
-        len_ = store_length(kRemaining);
+        len_ = kRemaining;
     }
 
     // Read-only data pointer for kernel send() / zero-copy forwarding.
@@ -215,7 +215,7 @@ public:
         if (!Length::try_from_i64(cap, &checked_cap))
             RUT_TRAP("Buffer::bind: invalid capacity (%" PRId64 ")", cap);
         ptr_ = ptr;
-        cap_ = store_length(checked_cap);
+        cap_ = checked_cap;
         len_ = {};
         released_ = false;
     }
@@ -239,8 +239,7 @@ private:
     void advance(Length available, Length written) noexcept {
         // Subtract the unwritten tail from capacity so no sum of two unbounded
         // i64 quantities is ever formed. The caller bounds written by available.
-        len_ = store_length(
-            (Length{cap_} - (available - written).max(range_int<0, 1>{})).max(range_int<0, 1>{}));
+        len_ = (Length{cap_} - (available - written).max(range_int<0, 1>{})).max(range_int<0, 1>{});
     }
 
     void copy_prefix(const u8* src, i64 n, Length* copied) noexcept {
@@ -264,18 +263,9 @@ private:
     }
 
     friend struct BasicView<Size>;
-    using StoredLength = std::conditional_t<__is_same(Size, u32), u32, Length>;
-
-    [[nodiscard]] static StoredLength store_length(Length value) noexcept {
-        if constexpr (__is_same(Size, u32))
-            return value.template to<u32>();
-        else
-            return value;
-    }
-
     u8* ptr_ = nullptr;
-    StoredLength cap_{};
-    StoredLength len_{};
+    Length cap_{};
+    Length len_{};
     bool released_ = false;
 };
 
