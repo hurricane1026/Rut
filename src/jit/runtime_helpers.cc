@@ -687,7 +687,10 @@ bool apply_request_body_override(ConnectionBase& conn, Str body) {
     const u32 old_header_end = conn.req_header_end;
     if (conn.req_content_length < 0 || conn.req_content_length > i64{total} - i64{old_header_end})
         return false;
-    const u32 old_body_len = static_cast<u32>(conn.req_content_length);
+    const u32 old_body_len = range_int(conn.req_content_length)
+                                 .max(range_int(u32{0}))
+                                 .min(range_int(UINT32_MAX))
+                                 .to<u32>();
     if (old_header_end > total || old_body_len > total - old_header_end ||
         conn.req_initial_send_len < old_header_end ||
         conn.req_initial_send_len - old_header_end < old_body_len)

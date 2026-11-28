@@ -468,7 +468,10 @@ bool HttpCachePolicy::response_can_buffer(const u8* response, u32 length, u32& t
     if (info.parsed.content_length < 0 ||
         info.parsed.content_length > i64{kMaxBufferedResponse} - i64{parser.header_end})
         return false;
-    const u32 response_size = static_cast<u32>(i64{parser.header_end} + info.parsed.content_length);
+    const u32 response_size = range_int(i64{parser.header_end} + info.parsed.content_length)
+                                  .max(range_int(u32{0}))
+                                  .min(range_int(UINT32_MAX))
+                                  .to<u32>();
     using BufferedLength = range_int<0, kMaxBufferedResponse + 1>;
     BufferedLength checked;
     if (!BufferedLength::try_from_i64(i64{response_size}, &checked)) return false;

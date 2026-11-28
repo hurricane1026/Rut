@@ -65,7 +65,10 @@ inline bool replace_h1_body_in_place(
         return false;
     const i64 available_body = i64{old_total} - i64{old_header_end};
     if (request.content_length < 0 || request.content_length > available_body) return false;
-    const u32 old_body_len = static_cast<u32>(request.content_length);
+    const u32 old_body_len = range_int(request.content_length)
+                                 .max(range_int(u32{0}))
+                                 .min(range_int(UINT32_MAX))
+                                 .to<u32>();
     if (expected_body_len != 0xffffffffu && expected_body_len != old_body_len) return false;
     u32 line_start = 0;
     u32 line_end = 0;
