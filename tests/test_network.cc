@@ -14087,6 +14087,19 @@ TEST(iouring_send, study_direct_vector_keeps_total_bytes_and_flags_after_prefix)
     }
 }
 
+TEST(iouring_send, vector_rejects_a_reversed_second_span_range) {
+    static const u8 first[] = {1, 2};
+    static const u8 second[] = {3, 4};
+    BufferedSendVector vector;
+    REQUIRE(vector.bind(first, sizeof(first), second, sizeof(second)));
+    REQUIRE(vector.advance(sizeof(first)));
+    vector.total_size = 1;
+    CHECK_FALSE(vector.advance(sizeof(second)));
+    CHECK_EQ(vector.message.msg_iovlen, 1u);
+    CHECK_EQ(vector.parts[1].iov_len, sizeof(second));
+    CHECK_EQ(vector.parts[1].iov_base, second);
+}
+
 TEST(iouring_send, vector_resubmits_the_exact_suffix_at_the_span_boundary) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());

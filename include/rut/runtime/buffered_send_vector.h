@@ -51,21 +51,23 @@ struct BufferedSendVector {
     [[nodiscard]] constexpr bool advance(u32 n) {
         while (n && message.msg_iovlen) {
             auto& part = *message.msg_iov;
-            const u32 kStep = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
+            const auto requested = range_int{n};
+            const size_t kStep =
+                part.iov_len < requested.to_u64() ? part.iov_len : requested.to_u64();
             const bool kFirst = &part == parts;
             const u8* source = kFirst ? first_source : second_source;
-            const u32 kSize = kFirst ? first_size
-                                     : (range_int(total_size) - range_int(first_size))
-                                           .max(range_int<0, 1>{})
-                                           .to<u32>();
+            u32 original_size = first_size;
+            if (!kFirst && !(range_int{total_size} - range_int{first_size}).to(&original_size))
+                return false;
             size_t remaining;
             u32 offset;
+            u32 unsent;
             if (sub_overflow(part.iov_len, kStep, &remaining) ||
-                sub_overflow(kSize, remaining, &offset))
+                sub_overflow(original_size, remaining, &offset) || sub_overflow(n, kStep, &unsent))
                 return false;
             part.iov_len = remaining;
-            part.iov_base = const_cast<u8*>(source + range_int(offset).value());
-            n = (range_int(n) - range_int(kStep)).max(range_int<0, 1>{}).to<u32>();
+            part.iov_base = const_cast<u8*>(source + range_int{offset}.index());
+            n = unsent;
             if (part.iov_len == 0) {
                 ++message.msg_iov;
                 --message.msg_iovlen;
