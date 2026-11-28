@@ -1114,7 +1114,7 @@ TEST(HeaderValue, PlusChars) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"++++++++++", 10}));
 }
 
@@ -1127,7 +1127,7 @@ TEST(ContentLength, WithLeadingZeroes) {
     ParsedRequest req;
 
     auto s = parse_one("PUT /url HTTP/1.1\r\nContent-Length: 003\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.content_length, 3u);
 }
 
@@ -1136,7 +1136,7 @@ TEST(ContentLength, Zero) {
     ParsedRequest req;
 
     auto s = parse_one("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.has_content_length);
     CHECK_EQ(req.content_length_count, 1u);
     CHECK_EQ(req.content_length, 0u);
@@ -1148,7 +1148,7 @@ TEST(ContentLength, AbsentHasNeutralFieldIdentity) {
     ParsedRequest req;
 
     const auto s = parse_one("POST / HTTP/1.1\r\nHost: x\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_FALSE(req.has_content_length);
     CHECK_EQ(req.content_length_count, 0u);
     CHECK_EQ(req.content_length, 0u);

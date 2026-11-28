@@ -30163,8 +30163,11 @@ TEST(streaming, negative_content_length_counters_close_before_io) {
     c->req_body_mode = BodyMode::ContentLength;
     c->req_body_remaining = -1;
     c->on_recv = &on_request_body_recvd<SmallLoop>;
+    loop.backend.clear_ops();
     loop.inject_and_dispatch(make_ev(c->id, IoEventType::Recv, 1));
     CHECK_EQ(loop.conns[c->id].fd, -1);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::UpstreamSend), 0u);
 
     SmallLoop response_loop;
     response_loop.setup();
@@ -30175,8 +30178,11 @@ TEST(streaming, negative_content_length_counters_close_before_io) {
     c->resp_body_mode = BodyMode::ContentLength;
     c->resp_body_remaining = -1;
     c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
+    response_loop.backend.clear_ops();
     response_loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamRecv, 1));
     CHECK_EQ(response_loop.conns[c->id].fd, -1);
+    CHECK_EQ(response_loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(response_loop.backend.count_ops(MockOp::UpstreamSend), 0u);
 }
 
 TEST(streaming, response_body_recvd_until_close_eof) {
