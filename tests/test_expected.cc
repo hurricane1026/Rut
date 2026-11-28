@@ -1,5 +1,6 @@
 #include "core/expected.h"
 #include "test.h"
+#include <utility>
 
 #include <stdint.h>
 
@@ -9,16 +10,13 @@ using core::Unexpected;
 
 inline constexpr bool kForwardPreservesLvalue = [] {
     int value = 0;
-    return __is_same(decltype(core::forward<int&>(value)), int&) &&
-           __is_same(decltype(core::forward<int>(value)), int&&) &&
-           &core::forward<int&>(value) == &value;
+    return __is_same(decltype(std::forward<int&>(value)), int&) &&
+           __is_same(decltype(std::forward<int>(value)), int&&) &&
+           &std::forward<int&>(value) == &value;
 }();
 static_assert(kForwardPreservesLvalue);
-static_assert(__is_same(decltype(core::forward<int>(0)), int&&));
-static_assert(__is_same(decltype(core::forward<const int>(0)), const int&&));
-template <typename T>
-concept ForwardsTemporary = requires { core::forward<T>(0); };
-static_assert(!ForwardsTemporary<const int&>);
+static_assert(__is_same(decltype(std::forward<int>(0)), int&&));
+static_assert(__is_same(decltype(std::forward<const int>(0)), const int&&));
 
 // ── Error type ──────────────────────────────────────────────────────
 

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/expected.h"
-#include "core/forward.h"
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/range_int.h"
 #include "rut/common/trap.h"
@@ -35,6 +34,7 @@
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
 #include <atomic>
+#include <utility>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -7402,7 +7402,7 @@ private:
 public:
     template <typename Callback>
     void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
-        drain_response_read_deadline_body_pump_ready(core::forward<Callback>(callback));
+        drain_response_read_deadline_body_pump_ready(std::forward<Callback>(callback));
     }
     void test_close_listen() { close_listen(); }
 #endif

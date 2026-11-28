@@ -192,7 +192,7 @@ def main():
                     '-std=c++23', ROOT / 'scripts/clang/nodiscard_cases.cc'], check=True)
     cast_check = ['-Xclang', '-add-plugin', '-Xclang', 'rut-explicit-cast-style']
     subprocess.run([args.clang, '-fsyntax-only', '-Xclang', '-load', '-Xclang',
-                    str(args.plugin.resolve()), *cast_check, '-Xclang', '-verify', '-I', ROOT / 'include',
+                    str(args.plugin.resolve()), *cast_check, '-Xclang', '-verify',
                     '-std=c++23', ROOT / 'scripts/clang/explicit_cast_style_cases.cc'], check=True)
     cast_changed = changed_source_lines(args.cast_base, cast_scope=True) if args.cast_base else {}
     nodiscard_changed = (changed_source_lines(args.nodiscard_base, check_deleted_attributes=True)

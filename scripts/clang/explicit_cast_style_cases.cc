@@ -1,4 +1,4 @@
-#include "core/forward.h"
+#include <utility>
 
 using Count = unsigned;
 
@@ -42,7 +42,7 @@ Count pasted_macro_user(int n) {
 }
 
 int&& forward_reference(int& value) {
-    return core::forward<int>(value);
+    return std::forward<int>(value);
 }
 
 int&& direct_reference_cast(int& value) {
