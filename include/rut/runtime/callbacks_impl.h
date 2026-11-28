@@ -2267,6 +2267,10 @@ inline bool proxy_body_complete(const Connection& conn) {
 // tls_active before touching conn again.
 template <typename Loop>
 void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly) {
+    if (i64{newly} > INT64_MAX - conn.resp_body_sent) {
+        loop->close_conn(conn);
+        return;
+    }
     conn.resp_body_sent += i64{newly};
     throttle_advance(conn, newly);
     if (conn.tls_send_off < conn.tls_send_len) return;  // remainder still partial

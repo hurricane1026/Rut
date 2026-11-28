@@ -15967,6 +15967,22 @@ TEST(tls_iouring, proxy_stream_defers_raced_cqe_while_tail_parked) {
     CHECK(conn->tls_send_src != nullptr);              // tail still parked for the drain
 }
 
+TEST(tls_iouring, parked_tail_accounting_rejects_signed_overflow) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    conn->resp_body_sent = i64{INT64_MAX};
+    conn->tls_send_len = 1;
+    conn->tls_send_off = 1;
+    static const u8 parked = 0;
+    conn->tls_send_src = &parked;
+    proxy_tls_parked_drained<SmallLoop>(&loop, *conn, 1);
+    CHECK_EQ(loop.conns[conn->id].fd, -1);
+    CHECK_EQ(conn->resp_body_sent, i64{INT64_MAX});
+}
+
 // Round-4 race fix #C (cross-request half): proxy_stream_complete must clear
 // tls_recv_paused_hw at the keep-alive boundary, so a high-watermark pause from
 // one response can't leak into the next request and let the low-watermark resume
