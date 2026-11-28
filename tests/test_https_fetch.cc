@@ -73,8 +73,11 @@ struct TlsOrigin {
             const int fd = accept(self.listener, nullptr, nullptr);
             if (fd < 0) continue;
             timeval timeout{2, 0};
-            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+                close(fd);
+                continue;
+            }
             SSL* ssl = SSL_new(self.context);
             if (ssl && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1) {
                 u32 length = 0;
@@ -169,8 +172,9 @@ TEST(https_fetch, bounded_json_response_framing_fragmentation_and_limits) {
     for (const char* response : invalid) {
         BoundedJsonResponse parser;
         parser.reset();
-        (void)parser.append(text(response));
-        CHECK_EQ(parser.finish(), BoundedJsonResponse::Result::Error);
+        const auto result = parser.append(text(response));
+        if (result != BoundedJsonResponse::Result::Error)
+            CHECK_EQ(parser.finish(), BoundedJsonResponse::Result::Error);
         CHECK(parser.body().ptr == nullptr);
     }
     BoundedJsonResponse parser;

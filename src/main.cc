@@ -1,7 +1,9 @@
 #include "rut/common/shard_limits.h"
 #include "rut/platform/socket.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/format_integer.h"
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_backend.h"
@@ -46,19 +48,18 @@ static constexpr u32 kDefaultDrainSecs = 30;
 
 // Status messages go to stderr to avoid mixing with structured JSON access logs on stdout.
 static void write_str(const char* s) {
-    u32 len = 0;
-    while (s[len]) len++;
-    (void)write(2, s, len);
+    platform::write_diagnostic(s);
 }
 
 static void write_u64(u64 val) {
     char buf[21];
-    i32 n = 0;
+    char* cursor = buf + sizeof(buf);
+    *--cursor = '\0';
     do {
-        buf[n++] = static_cast<char>('0' + val % 10);
+        *--cursor = last_decimal_digit(val);
         val /= 10;
     } while (val);
-    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
+    write_str(cursor);
 }
 
 static void write_u32(u32 val) {

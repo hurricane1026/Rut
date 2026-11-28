@@ -29,21 +29,18 @@
 
 #include "rut/common/types.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/platform/write.h"
 #include "rut/runtime/route_art.h"
 
 #include <llvm-c/Core.h>
-#include <unistd.h>  // write (error logging)
 
 namespace rut::jit {
 
 namespace {
 
-// Tiny error-print helper — matches jit_engine.cc style (no stdlib).
 void log_err(const char* msg) {
-    int len = 0;
-    while (msg[len]) len++;
-    (void)::write(2, msg, len);
-    (void)::write(2, "\n", 1);
+    platform::write_diagnostic(msg);
+    platform::write_diagnostic("\n");
 }
 
 // Per-emission state. The builder is positioned-and-repositioned
