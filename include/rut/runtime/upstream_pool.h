@@ -92,8 +92,8 @@ struct UpstreamPool {
         // The active socket has completed one more clean request at this boundary.
         i32 completed_after = 0;
         if (completed < 0 || max_requests < 0 ||
-            (max_requests && (__builtin_add_overflow(completed, 1, &completed_after) ||
-                              completed_after >= max_requests)))
+            (max_requests &&
+             (add_overflow(completed, 1, &completed_after) || completed_after >= max_requests)))
             return false;
         if (fd < 0 || upstream_id >= RouteConfig::kMaxUpstreams ||
             backend_idx >= UpstreamTarget::kMaxBackends ||
