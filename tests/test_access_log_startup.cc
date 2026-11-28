@@ -470,7 +470,11 @@ bool transact_loopback(u16 port,
         return false;
     }
     trace.request_written = true;
-    (void)shutdown(fd, SHUT_WR);
+    if (shutdown(fd, SHUT_WR) != 0) {
+        trace.read_errno = errno;
+        close(fd);
+        return false;
+    }
     char bytes[512];
     for (u32 attempt = 0; attempt < 50u; attempt++) {
         struct pollfd ready{fd, POLLIN | POLLHUP, 0};
@@ -501,7 +505,7 @@ bool transact_loopback(u16 port,
 
 i64 monotonic_ns() {
     struct timespec now{};
-    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return i64{now.tv_sec} * 1'000'000'000LL + i64{now.tv_nsec};
 }
 
@@ -543,7 +547,8 @@ ProcessResult run_rut(const std::vector<std::string>& args,
     close(output_pipe[1]);
     ProcessResult result{};
     const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
-    if (old_flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK);
+    const bool output_nonblocking =
+        old_flags >= 0 && fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK) == 0;
     char bytes[1024];
     bool reaped = false;
     bool termination_sent = false;
@@ -554,15 +559,13 @@ ProcessResult run_rut(const std::vector<std::string>& args,
     // returns immediately, so a wakeup-count budget could be spent in microseconds
     // and SIGKILL a child that was already exiting 1.
     const i64 deadline_ns = monotonic_ns() + 5'000'000'000LL;
-    while (!reaped) {
+    while (output_nonblocking && !reaped) {
         const i32 wait_ms = poll_wait_ms(deadline_ns);
         if (wait_ms <= 0) break;
-        if (output_eof) {
-            (void)poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5);
-        } else {
-            struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
-            (void)poll(&ready, 1, wait_ms);
-        }
+        struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
+        const int polled =
+            output_eof ? poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5) : poll(&ready, 1, wait_ms);
+        if (polled < 0 && errno != EINTR) break;
         for (;;) {
             const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
             if (n > 0) {
@@ -700,7 +703,11 @@ i32 probe_specific_loopback_bind(u16 port) {
     const i32 fd = rut::test::cloexec_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return errno;
     const i32 one = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+        const i32 error = errno;
+        close(fd);
+        return error;
+    }
     struct sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -849,7 +856,8 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
     std::thread backend;
     bool backend_listener_owned = true;
     const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
-    if (old_flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK);
+    const bool output_nonblocking =
+        old_flags >= 0 && fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK) == 0;
 
     char bytes[1024];
     bool reaped = false;
@@ -859,16 +867,14 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
     bool output_eof = false;
     // Wall-clock budget; see run_rut for why a wakeup-count budget is unsound.
     const i64 deadline_ns = monotonic_ns() + 8'000'000'000LL;
-    while (!reaped) {
+    while (output_nonblocking && !reaped) {
         const i32 wait_ms = poll_wait_ms(deadline_ns);
         if (wait_ms <= 0) break;
         bool backend_joined_this_iteration = false;
-        if (output_eof) {
-            (void)poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5);
-        } else {
-            struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
-            (void)poll(&ready, 1, wait_ms);
-        }
+        struct pollfd ready{output_pipe[0], POLLIN | POLLHUP, 0};
+        const int polled =
+            output_eof ? poll(nullptr, 0, wait_ms < 5 ? wait_ms : 5) : poll(&ready, 1, wait_ms);
+        if (polled < 0 && errno != EINTR) break;
         for (;;) {
             const ssize_t n = read(output_pipe[0], bytes, sizeof(bytes));
             if (n > 0) {

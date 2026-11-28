@@ -164,7 +164,7 @@ private:
     bool drain_event_counter(i32 fd);
     void publish_fatal(SourceLiveAccessLogFatalKind kind, u8 ring_index, i32 system_error);
     void publish_writer_fatal(SourceLiveAccessLogFatalKind kind, u8 ring_index, i32 system_error);
-    bool signal_event(i32 fd, u8 ring_index, bool producer_notification);
+    [[nodiscard]] bool signal_event(i32 fd);
     core::Expected<void, SourceLiveAccessLogStartError> start_impl(
         SourceAccessLogFd&& output,
         const SourceLiveAccessLogRingBinding* bindings,

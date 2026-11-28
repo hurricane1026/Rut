@@ -1,6 +1,7 @@
 #include "rut/runtime/access_log_live_writer.h"
 
 #include "rut/common/checked_arithmetic.h"
+#include "rut/platform/write.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -14,6 +15,12 @@
 namespace rut {
 namespace {
 
+void close_notification(i32 fd) {
+    if (fd >= 0 && ::close(fd) != 0)
+        platform::write_diagnostic(
+            "Failed to close SourceLive access log notification descriptor\n");
+}
+
 // Linux uses a counter fd; macOS uses an atomic, nonblocking pipe wakeup.
 // The ring owns the data; notifications may safely coalesce on saturation.
 i32 create_notification(i32& write_fd) {
@@ -23,8 +30,8 @@ i32 create_notification(i32& write_fd) {
     for (int fd : fds) {
         if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
             const int error = errno;
-            close(fds[0]);
-            close(fds[1]);
+            close_notification(fds[0]);
+            close_notification(fds[1]);
             errno = error;
             return -1;
         }
@@ -54,8 +61,12 @@ SourceLiveAccessLogFatal decode_fatal(u64 encoded) {
 }  // namespace
 
 SourceLiveAccessLogSession::~SourceLiveAccessLogSession() {
-    if (state_.load(std::memory_order_acquire) == State::Running) (void)finish();
-    close_owned();
+    if (state_.load(std::memory_order_acquire) == State::Running) {
+        if (finish().status != SourceLiveAccessLogFinishStatus::Success)
+            platform::write_diagnostic("Failed to finish SourceLive access log session\n");
+    } else {
+        close_owned();
+    }
 }
 
 core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::start(
@@ -174,9 +185,9 @@ core::Expected<void, SourceLiveAccessLogStartError> SourceLiveAccessLogSession::
     const i32 stop_fd = create_notification(stop_signal_fd_);
     if (stop_fd < 0) {
         const i32 saved_errno = errno;
-        if (data_signal_fd_ != data_fd) (void)::close(data_signal_fd_);
+        if (data_signal_fd_ != data_fd) close_notification(data_signal_fd_);
         data_signal_fd_ = -1;
-        (void)::close(data_fd);
+        close_notification(data_fd);
         release_ring_borrows();
         return core::make_unexpected(
             SourceLiveAccessLogStartError{SourceLiveAccessLogStartErrorKind::StopEventCreate,
@@ -233,10 +244,11 @@ SourceLiveAccessLogFinishResult SourceLiveAccessLogSession::finish() {
         return {};
 
     stop_requested_.store(true, std::memory_order_release);
-    if (!signal_event(stop_signal_fd_, kSourceLiveAccessLogNoRing, false)) {
-        // A recorded stop-notification failure still needs a bounded cleanup
-        // wake. The data event is independent and the fatal remains visible.
-        (void)signal_event(data_signal_fd_, kSourceLiveAccessLogNoRing, false);
+    if (!signal_event(stop_signal_fd_)) {
+        // The data event can wake the writer independently of the stop event.
+        if (!signal_event(data_signal_fd_))
+            platform::write_diagnostic(
+                "Failed to wake SourceLive access log writer for shutdown\n");
     }
 
     if (writer_started_) {
@@ -470,8 +482,11 @@ void SourceLiveAccessLogSession::publish_fatal(SourceLiveAccessLogFatalKind kind
                                                i32 system_error) {
     const u64 encoded = encode_fatal(kind, ring_index, system_error);
     u64 expected = 0u;
-    (void)fatal_state_.compare_exchange_strong(
-        expected, encoded, std::memory_order_release, std::memory_order_relaxed);
+    // Retry a spurious failure while the slot is empty. The first fatal wins.
+    while (!fatal_state_.compare_exchange_weak(
+               expected, encoded, std::memory_order_release, std::memory_order_relaxed) &&
+           expected == 0u) {
+    }
 }
 
 void SourceLiveAccessLogSession::publish_writer_fatal(SourceLiveAccessLogFatalKind kind,
@@ -481,7 +496,7 @@ void SourceLiveAccessLogSession::publish_writer_fatal(SourceLiveAccessLogFatalKi
     publish_fatal(kind, ring_index, system_error);
 }
 
-bool SourceLiveAccessLogSession::signal_event(i32 fd, u8 ring_index, bool producer_notification) {
+bool SourceLiveAccessLogSession::signal_event(i32 fd) {
     const u64 one = 1u;
     for (;;) {
         const ssize_t result = ::write(fd, &one, sizeof(one));
@@ -489,25 +504,25 @@ bool SourceLiveAccessLogSession::signal_event(i32 fd, u8 ring_index, bool produc
         if (result < 0 && errno == EINTR) continue;
         if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
         publish_fatal(SourceLiveAccessLogFatalKind::Notify,
-                      producer_notification ? ring_index : kSourceLiveAccessLogNoRing,
+                      kSourceLiveAccessLogNoRing,
                       result < 0 ? errno : 0);
         return false;
     }
 }
 
 void SourceLiveAccessLogSession::close_owned() {
-    if (data_signal_fd_ >= 0 && data_signal_fd_ != data_event_fd_) close(data_signal_fd_);
-    if (stop_signal_fd_ >= 0 && stop_signal_fd_ != stop_event_fd_) close(stop_signal_fd_);
+    if (data_signal_fd_ != data_event_fd_) close_notification(data_signal_fd_);
+    if (stop_signal_fd_ != stop_event_fd_) close_notification(stop_signal_fd_);
     data_signal_fd_ = stop_signal_fd_ = -1;
     if (data_event_fd_ >= 0) {
         const i32 fd = data_event_fd_;
         data_event_fd_ = -1;
-        (void)::close(fd);
+        close_notification(fd);
     }
     if (stop_event_fd_ >= 0) {
         const i32 fd = stop_event_fd_;
         stop_event_fd_ = -1;
-        (void)::close(fd);
+        close_notification(fd);
     }
     output_.reset();
     release_ring_borrows();

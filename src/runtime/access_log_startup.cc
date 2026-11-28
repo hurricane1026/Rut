@@ -1,5 +1,7 @@
 #include "rut/runtime/access_log_startup.h"
 
+#include "rut/platform/write.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -67,7 +69,8 @@ void SourceAccessLogFd::reset() {
     if (fd_ < 0) return;
     const i32 fd = fd_;
     fd_ = -1;
-    (void)::close(fd);
+    if (::close(fd) != 0)
+        platform::write_diagnostic("Failed to close SourceLive access log output\n");
 }
 
 core::Expected<SourceAccessLogFd, SourceAccessLogOpenError> open_source_access_log(
