@@ -648,7 +648,8 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                             ActiveHealthStatuses statuses,
                                             bool require_initial_success,
                                             u32 unhealthy_interval_ms,
-                                            u8 concurrency) {
+                                            u8 concurrency,
+                                            ActiveHealthStatuses unhealthy) {
     if (uid >= upstream_count) return false;
     UpstreamTarget& up = upstreams[uid];
     if ((interval_ms == 0 && (!up.passive_health.valid() || up.http2)) ||
@@ -665,7 +666,8 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
                                    statuses,
                                    unhealthy_interval_ms,
                                    up.passive_health.enabled,
-                                   require_initial_success) ||
+                                   require_initial_success,
+                                   unhealthy) ||
         (up.http2 && type != ActiveHealthType::Tcp))
         return false;
     for (u32 i = 0; i < host.len; ++i) up.hc_host[i] = host.ptr[i];
@@ -679,6 +681,7 @@ bool RouteConfig::set_upstream_health_check(u32 uid,
     up.hc_concurrency = concurrency;
     up.hc_expected_status = status;
     up.hc_healthy_statuses = statuses;
+    up.hc_unhealthy_statuses = unhealthy;
     up.hc_thresholds = thresholds;
     up.hc_type = type;
     up.hc_timeout_ms = timeout_ms;

@@ -102,3 +102,12 @@ claimed by these checks.
 Native artifact ABI 36 carries the concurrency bound. Old artifacts must be
 rebuilt; the source/configuration fingerprint additionally prevents mixing
 compiler and server builds from different source trees.
+
+
+Active HTTP and verified HTTPS probes optionally accept `unhealthy_statuses`, a
+nonempty, duplicate-free 200–599 list disjoint from the effective healthy set.
+When present, listed statuses advance the failure threshold; unlisted final
+statuses are neutral and preserve both streaks and readiness. The singleton
+`status` must then be 200–599. Informational responses other than 101 are
+consumed under the existing probe deadline; 101 is a failure. Omission retains
+the legacy unexpected-status failure behavior. TCP forbids this field.

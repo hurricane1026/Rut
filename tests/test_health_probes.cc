@@ -32,6 +32,7 @@ struct ProbeRig {
     u16 port = 0;
     bool initialized = false;
     ShardMetrics metrics{};
+    u64 upstream_recv_bytes = 0;
 
     bool init() {
         if (!owner.config) return false;
@@ -76,6 +77,8 @@ struct ProbeRig {
         const u32 kCount = loop->backend.wait(events, 32, loop->conns, initialized_slots(), 0);
         u32 kept = 0;
         for (u32 i = 0; i < kCount; ++i) {
+            if (events[i].type == IoEventType::UpstreamRecv && events[i].result > 0)
+                upstream_recv_bytes += static_cast<u32>(events[i].result);
             if (events[i].type != IoEventType::Timeout) events[kept++] = events[i];
         }
         loop->dispatch_batch(events, kept);
@@ -215,6 +218,86 @@ void health_thresholds(rut::test::TestCase* _tc) {
     REQUIRE(respond(false));
     CHECK(backend_ejected(0, 0, ~u64{0}));
     CHECK_EQ(rig.loop->active_count(), 0u);
+}
+
+template <typename Loop>
+void unhealthy_statuses(rut::test::TestCase* _tc) {
+    ProbeRig<Loop> rig;
+    REQUIRE(rig.init());
+    ActiveHealthStatuses unhealthy{};
+    unhealthy.words[(503 - 200) / 64] = u64{1} << ((503 - 200) % 64);
+    REQUIRE(rig.owner.config->set_upstream_health_check(0,
+                                                        "/healthz",
+                                                        8,
+                                                        1000,
+                                                        200,
+                                                        {2, 2},
+                                                        ActiveHealthType::Http,
+                                                        0,
+                                                        {},
+                                                        {},
+                                                        false,
+                                                        0,
+                                                        0,
+                                                        unhealthy));
+    const auto respond = [&](const char* response) {
+        Socket peer;
+        char request[512]{};
+        return start_health_probe(rig.loop, 0, 0) &&
+               rig.receive_request(peer, request, sizeof(request)) && rig.respond(peer, response);
+    };
+    auto* health = backend_health(0, 0);
+    REQUIRE(health);
+    REQUIRE(respond("HTTP/1.1 503 Fail\r\n\r\n"));
+    CHECK_EQ(health->active_failures, 1u);
+    REQUIRE(respond("HTTP/1.1 301 Neutral\r\n\r\n"));
+    CHECK_EQ(health->active_failures, 1u);
+    CHECK_EQ(health->active_successes, 0u);
+    CHECK_FALSE(health->active_initial_success);
+    REQUIRE(respond("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 503 Fail\r\n\r\n"));
+    CHECK(health->active_down);
+    REQUIRE(respond("HTTP/1.1 200 OK\r\n\r\n"));
+    CHECK_EQ(health->active_successes, 1u);
+    REQUIRE(respond("HTTP/1.1 301 Neutral\r\n\r\n"));
+    CHECK_EQ(health->active_successes, 1u);
+    CHECK(health->active_down);
+    REQUIRE(respond("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\n\r\n"));
+    CHECK_FALSE(health->active_down);
+    CHECK(health->active_initial_success);
+    REQUIRE(respond("HTTP/1.1 301 Neutral\r\n\r\n"));
+    CHECK(health->active_initial_success);
+    // Deliver the interim response on its own, then wait for the receive to
+    // be rearmed before delivering the final response.
+    REQUIRE(start_health_probe(rig.loop, 0, 0));
+    Socket split;
+    char request[512]{};
+    REQUIRE(rig.receive_request(split, request, sizeof(request)));
+    const char interim[] = "HTTP/1.1 103 Early Hints\r\n\r\n";
+    REQUIRE_EQ(send(split.fd, interim, sizeof(interim) - 1, MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(interim) - 1));
+    const u64 before_interim = rig.upstream_recv_bytes;
+    REQUIRE(
+        rig.until([&] { return rig.upstream_recv_bytes - before_interim >= sizeof(interim) - 1; }));
+    CHECK(probe_in_flight(0, 0));
+    REQUIRE(rig.probe());
+    CHECK_EQ(rig.probe()->upstream_recv_buf.len(), 0u);
+    REQUIRE(rig.respond(split, "HTTP/1.1 503 Fail\r\n\r\n"));
+    CHECK_EQ(health->active_failures, 1u);
+    REQUIRE(respond("HTTP/1.1 200 OK\r\n\r\n"));
+    REQUIRE(respond("HTTP/1.1 101 Switching Protocols\r\n\r\n"));
+    CHECK_EQ(health->active_failures, 1u);
+    REQUIRE(respond("garbage response\r\n\r\n"));
+    CHECK(health->active_down);
+    // Without the option the first response remains the legacy match target.
+    REQUIRE(rig.owner.config->set_upstream_health_check(0, "/healthz", 8, 1000, 103));
+    REQUIRE(respond("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 503 Fail\r\n\r\n"));
+    CHECK_FALSE(health->active_down);
+}
+TEST(health_probe, epoll_unhealthy_statuses) {
+    unhealthy_statuses<EpollEventLoop>(_tc);
+}
+TEST(health_probe, iouring_unhealthy_statuses) {
+    unhealthy_statuses<IoUringEventLoop>(_tc);
 }
 
 template <typename Loop>
@@ -1125,6 +1208,17 @@ TEST(health_probes, active_status_sets_validate_canonical_bits) {
     CHECK_FALSE(
         valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0, statuses));
     CHECK_FALSE(valid_active_health_check(ActiveHealthType::Http, "/", 1, 1000, 0, {}, 0));
+    ActiveHealthStatuses unhealthy{};
+    unhealthy.words[(503 - 200) / 64] = u64{1} << ((503 - 200) % 64);
+    CHECK(valid_active_health_check(
+        ActiveHealthType::Http, "/", 1, 1000, 200, {}, 0, {}, 0, false, false, unhealthy));
+    CHECK_FALSE(valid_active_health_check(
+        ActiveHealthType::Http, "/", 1, 1000, 503, {}, 0, {}, 0, false, false, unhealthy));
+    CHECK_FALSE(valid_active_health_check(
+        ActiveHealthType::Http, "/", 1, 1000, 103, {}, 0, {}, 0, false, false, unhealthy));
+    unhealthy.words[6] |= u64{1} << 16;
+    CHECK_FALSE(valid_active_health_check(
+        ActiveHealthType::Http, "/", 1, 1000, 200, {}, 0, {}, 0, false, false, unhealthy));
 }
 
 template <typename Loop>

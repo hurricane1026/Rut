@@ -442,6 +442,7 @@ struct AstUpstreamDecl {
     u8 hc_concurrency = 0;         // 0 retains the existing scheduling behavior
     u16 hc_expected_status = 200;  // `status:` IntLit (optional, default 200)
     ActiveHealthStatuses hc_healthy_statuses{};
+    ActiveHealthStatuses hc_unhealthy_statuses{};
     ActiveHealthThresholds hc_thresholds{};
     PassiveHealthPolicy passive_health{};
     bool hc_require_initial_success = false;

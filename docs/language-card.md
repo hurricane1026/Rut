@@ -849,8 +849,14 @@ Linux epoll and io_uring issue periodic HTTP/1 GET probes for plaintext upstream
 A complete response with the expected status counts as success. `status` defaults to
 200 and accepts 100–599. Alternatively, `healthy_statuses: [200, 302]` accepts a
 nonempty, duplicate-free list of codes in 200–599 and matches exactly; it cannot
-be combined with `status`. Connect/read
-errors, malformed responses, unexpected status and timeouts count as failures.
+be combined with `status`. Optional `unhealthy_statuses: [429, 503]` is a
+nonempty, duplicate-free list of 200–599 codes, disjoint from the healthy set
+(or the effective singleton `status`, default 200). With this option `status`
+must be 200–599; listed unhealthy responses count as failures and unlisted
+final statuses leave health and streaks unchanged. Informational responses other
+than 101 are consumed until a final response or the probe deadline; 101 counts
+as a failure. Without the option, unexpected statuses count as failures as
+before. Connect/read errors, malformed responses and timeouts count as failures.
 `failure_threshold` ejects after that many consecutive failures, and
 `success_threshold` restores after that many consecutive successes. Each
 threshold accepts 1–255 and defaults to 1. An opposite result resets the streak,
@@ -877,7 +883,7 @@ upstream greeter {
 ```
 
 `type` defaults to `.http`; `.http` may also be explicit. HTTP mode requires
-`path` and accepts an optional `status` or `healthy_statuses`. TCP mode forbids these fields, including
+`path` and accepts an optional `status` or `healthy_statuses`, and `unhealthy_statuses`. TCP mode forbids these fields, including
 empty paths: a completed TCP connect is success, connection failure/timeout is
 failure. TCP probes send no HTTP request, HTTP/2 preface, TLS handshake or other
 application bytes, and close immediately after recording the connect result.

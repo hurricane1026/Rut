@@ -50713,6 +50713,49 @@ TEST(frontend, active_healthy_statuses_exact_and_invalid) {
         CHECK_FALSE(parse_file_heap(lexed.value()));
     }
 }
+TEST(frontend, active_unhealthy_statuses_validation) {
+    auto tcp = lex(lit(
+        "upstream api { health_check: { type: .tcp interval: 1s unhealthy_statuses: [503] } }"));
+    REQUIRE(tcp);
+    CHECK_FALSE(parse_file_heap(tcp.value()));
+    for (const char* fields : {"unhealthy_statuses: [429, 503]",
+                               "unhealthy_statuses: [503] healthy_statuses: [200, 302]",
+                               "status: 204 unhealthy_statuses: [503]"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/h\" interval: 1s %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        CHECK(ast->items[0].upstream.hc_unhealthy_statuses.contains(503));
+    }
+    for (const char* fields : {"unhealthy_statuses: []",
+                               "unhealthy_statuses: [503, 503]",
+                               "unhealthy_statuses: [199]",
+                               "unhealthy_statuses: [600]",
+                               "unhealthy_statuses: [4294967799]",
+                               "unhealthy_statuses: [200]",
+                               "unhealthy_statuses: [503] unhealthy_statuses: [504]",
+                               "healthy_statuses: [503] unhealthy_statuses: [503]",
+                               "unhealthy_statuses: [503] healthy_statuses: [503]",
+                               "status: 103 unhealthy_statuses: [503]",
+                               "unhealthy_statuses: [503] status: 103",
+                               "status: 503 unhealthy_statuses: [503]",
+                               "unhealthy_statuses: [503] status: 503",
+                               "type: .tcp unhealthy_statuses: [503]"}) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream api { health_check: { path: \"/h\" interval: 1s %s } }",
+                 fields);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK_FALSE(parse_file_heap(tokens.value()));
+    }
+}
 TEST(frontend, upstream_unhealthy_interval_validation) {
     for (const char* fields :
          {"unhealthy_interval: 0s", "unhealthy_interval: 1s unhealthy_interval: 2s"}) {

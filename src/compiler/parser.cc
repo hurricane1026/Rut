@@ -4235,6 +4235,7 @@ struct Parser {
                     bool seen_concurrency = false;
                     bool seen_status = false;
                     bool seen_statuses = false;
+                    bool seen_unhealthy_statuses = false;
                     bool seen_type = false;
                     bool seen_timeout = false;
                     bool seen_failure_threshold = false;
@@ -4427,6 +4428,19 @@ struct Parser {
                                                       span_from(*hc_field.value()),
                                                       hc_key);
                             seen_statuses = true;
+                        } else if (hc_key.eq({"unhealthy_statuses", 18})) {
+                            if (seen_unhealthy_statuses)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            auto& statuses = item.upstream.hc_unhealthy_statuses;
+                            auto parsed = parse_health_status_array(statuses.words, hc_key);
+                            if (!parsed) return core::make_unexpected(parsed.error());
+                            if (statuses.empty())
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*hc_field.value()),
+                                                      hc_key);
+                            seen_unhealthy_statuses = true;
                         } else if (hc_key.eq({"failure_threshold", 17}) ||
                                    hc_key.eq({"success_threshold", 17})) {
                             const bool kFailure = hc_key.eq({"failure_threshold", 17});
@@ -4461,7 +4475,8 @@ struct Parser {
                     if (!hc_rbrace) return core::make_unexpected(hc_rbrace.error());
                     const bool kTcp = item.upstream.hc_type == ActiveHealthType::Tcp;
                     if (!seen_interval || (!kTcp && !seen_path) ||
-                        (kTcp && (seen_path || seen_status || hc_seen_host || seen_statuses))) {
+                        (kTcp && (seen_path || seen_status || hc_seen_host || seen_statuses ||
+                                  seen_unhealthy_statuses))) {
                         const Str kDetail = !seen_interval ? Str{"interval", 8}
                                             : kTcp         ? Str{"type", 4}
                                                            : Str{"path", 4};
@@ -4469,6 +4484,21 @@ struct Parser {
                             FrontendError::UnsupportedSyntax, span_from(*field.value()), kDetail);
                     }
                     if (kTcp || seen_statuses) item.upstream.hc_expected_status = 0;
+                    if (seen_unhealthy_statuses) {
+                        const auto& unhealthy = item.upstream.hc_unhealthy_statuses;
+                        const auto& healthy = item.upstream.hc_healthy_statuses;
+                        if ((!seen_statuses &&
+                             (item.upstream.hc_expected_status < 200 ||
+                              unhealthy.contains(item.upstream.hc_expected_status))))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*field.value()),
+                                                  {"unhealthy_statuses", 18});
+                        for (u32 i = 0; i < ActiveHealthStatuses::kWords; ++i)
+                            if (healthy.words[i] & unhealthy.words[i])
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*field.value()),
+                                                      {"unhealthy_statuses", 18});
+                    }
                     item.upstream.hc_enabled = true;
                 } else {
                     return frontend_error(

@@ -27,6 +27,8 @@ def main():
             if state['stall']:
                 time.sleep(4)
             try:
+                self.wfile.write(b'HTTP/1.1 103 Early Hints\r\n\r\n')
+                self.wfile.flush()
                 self.send_response(state['status'])
                 self.send_header('Content-Length', '0')
                 self.end_headers()
@@ -55,7 +57,7 @@ def main():
                 f'tls: {{ ca: "{ca}", server_name: "{hostname}" }}, '
                 'minimum_healthy_weight_percent: 100, '
                 f'health_check: {{ path: "/health", interval: 1s, timeout: 1s{host}, '
-                'healthy_statuses: [200, 302] } }\n'
+                'healthy_statuses: [200, 302], unhealthy_statuses: [503] } }\n'
                 f'route GET "/{name}" {{ let ev = wait(upstream({name}).connect()) '
                 'if ev.ok { return 204 } else { return 502 } }\n'
                 for name, ca, hostname, host in [('good', cert, 'localhost', ', host: "Tenant.Example:8443"'),
@@ -104,7 +106,15 @@ def main():
                 wait(lambda: request('/wrong') == 503 and request('/untrusted') == 503,
                      'invalid TLS identity or trust did not eject')
                 state['status'] = 301
-                wait(lambda: request('/good') == 503, 'status gap did not eject')
+                before = state['probes']
+                wait(lambda: state['probes'] >= before + 3, 'neutral status was not probed')
+                assert request('/good') == 204, 'neutral status ejected healthy target'
+                state['status'] = 503
+                wait(lambda: request('/good') == 503, 'listed unhealthy status did not eject')
+                state['status'] = 301
+                before = state['probes']
+                wait(lambda: state['probes'] >= before + 3, 'neutral status was not reprobed')
+                assert request('/good') == 503, 'neutral status restored unhealthy target'
                 state['status'] = 200
                 wait(lambda: request('/good') == 204, 'listed status did not recover')
                 state['stall'] = True
