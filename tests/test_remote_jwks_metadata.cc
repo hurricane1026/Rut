@@ -211,6 +211,7 @@ TEST(remote_jwks_metadata, rejects_invalid_configuration_issuer_uris) {
     for (const char* issuer : invalid) CHECK(!valid(issuer));
     CHECK(valid("https://issuer.example/tenant%2Fblue"));
     CHECK(valid("https://issuer.example:443"));
+    CHECK(valid("https://issuer.example:65535"));
 }
 
 TEST(remote_jwks_metadata, separate_discovery_origin_is_explicit_and_bounded) {
