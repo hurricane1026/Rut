@@ -2899,7 +2899,9 @@ template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size) {
     if (resp_size < 0) resp_size = 0;
     const u32 resp_size_u32 =
-        resp_size > i64{UINT32_MAX} ? UINT32_MAX : static_cast<u32>(resp_size);
+        resp_size > i64{UINT32_MAX}
+            ? UINT32_MAX
+            : range_int(resp_size).max(range_int(u32{0})).min(range_int(UINT32_MAX)).to<u32>();
 #if RUT_ENABLE_WEBSOCKET
     // The handshake owner is needed through the response decision. Every ordinary
     // response completion (including a non-101 response) retires it here before
@@ -2930,11 +2932,13 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size_u32;
-        entry.req_size = conn.downstream_req_size < 0
-                             ? 0
-                             : (conn.downstream_req_size > i64{UINT32_MAX}
-                                    ? UINT32_MAX
-                                    : static_cast<u32>(conn.downstream_req_size));
+        entry.req_size = conn.downstream_req_size < 0 ? 0
+                                                      : (conn.downstream_req_size > i64{UINT32_MAX}
+                                                             ? UINT32_MAX
+                                                             : range_int(conn.downstream_req_size)
+                                                                   .max(range_int(u32{0}))
+                                                                   .min(range_int(UINT32_MAX))
+                                                                   .to<u32>());
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -3004,11 +3008,14 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size
         auto* cap = cap_entry;
         __builtin_memset(cap, 0, sizeof(*cap));
         cap->timestamp_us = realtime_us();
-        cap->req_content_length = conn.req_content_length < 0
-                                      ? 0
-                                      : (conn.req_content_length > i64{UINT32_MAX}
-                                             ? UINT32_MAX
-                                             : static_cast<u32>(conn.req_content_length));
+        cap->req_content_length =
+            conn.req_content_length < 0
+                ? 0
+                : (conn.req_content_length > i64{UINT32_MAX} ? UINT32_MAX
+                                                             : range_int(conn.req_content_length)
+                                                                   .max(range_int(u32{0}))
+                                                                   .min(range_int(UINT32_MAX))
+                                                                   .to<u32>());
         cap->resp_content_length = resp_size_u32;
         cap->resp_status = status;
         cap->raw_header_len = conn.capture_header_len;

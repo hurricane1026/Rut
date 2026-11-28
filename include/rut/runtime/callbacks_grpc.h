@@ -715,7 +715,8 @@ void grpc_response_headers(
     if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (end && x->has_response_length &&
         (x->expected_response_bytes < 0 ||
-         x->response_bytes != static_cast<u64>(x->expected_response_bytes)))
+         x->response_bytes !=
+             range_int(x->expected_response_bytes).max(range_int(u32{0})).to_u64()))
         x->failure = 13;
     if (x->response_end && !x->failure && x->upstream && grpc_has_status(hs, n))
         grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
@@ -757,7 +758,8 @@ void grpc_response_trailers(
     if (!grpc_has_status(hs, n)) x->failure = 2;
     if (x->has_response_length &&
         (x->expected_response_bytes < 0 ||
-         x->response_bytes != static_cast<u64>(x->expected_response_bytes)))
+         x->response_bytes !=
+             range_int(x->expected_response_bytes).max(range_int(u32{0})).to_u64()))
         x->failure = 13;
     x->response_status = grpc_observed_status(hs, n);
     x->response_end = true;
@@ -781,7 +783,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     } else if (!grpc_count_bytes(&x->response_bytes, len) ||
                (x->has_response_length &&
                 (x->expected_response_bytes < 0 ||
-                 x->response_bytes > static_cast<u64>(x->expected_response_bytes))) ||
+                 x->response_bytes >
+                     range_int(x->expected_response_bytes).max(range_int(u32{0})).to_u64())) ||
                x->failure == 13) {
         failure = 13;
     }
@@ -804,7 +807,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     if (end) {
         if (x->has_response_length &&
             (x->expected_response_bytes < 0 ||
-             x->response_bytes != static_cast<u64>(x->expected_response_bytes)))
+             x->response_bytes !=
+                 range_int(x->expected_response_bytes).max(range_int(u32{0})).to_u64()))
             x->failure = 13;
         else if (!x->failure && !x->websocket)
             x->failure = 2;
@@ -1665,8 +1669,9 @@ void grpc_request_data(
     if (!kCounted || kBuffered.value() > kCapacity ||
         (x.has_request_length &&
          (x.expected_request_bytes < 0 ||
-          x.request_bytes > static_cast<u64>(x.expected_request_bytes) ||
-          (end && x.request_bytes != static_cast<u64>(x.expected_request_bytes))))) {
+          x.request_bytes > range_int(x.expected_request_bytes).max(range_int(u32{0})).to_u64() ||
+          (end && x.request_bytes !=
+                      range_int(x.expected_request_bytes).max(range_int(u32{0})).to_u64())))) {
         grpc_discard_receive_data(*down.h2, x.downstream_stream, len);
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
