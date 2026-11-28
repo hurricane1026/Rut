@@ -376,17 +376,17 @@ TEST(chunked, missing_crlf) {
     CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Error));
 }
 
-TEST(chunked, overflow) {
+TEST(chunked, accepts_wide_chunk_size) {
     ChunkedParser p;
     p.reset();
 
     const char* raw = "FFFFFFFF1\r\n";
     auto len = str_len(raw);
-    u8 body[256];
-    u32 body_len = 0;
-
-    ChunkStatus s = feed_all(&p, reinterpret_cast<const u8*>(raw), len, body, &body_len);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ChunkStatus::Error));
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    CHECK_EQ(static_cast<u8>(
+                 p.feed(reinterpret_cast<const u8*>(raw), len, &consumed, &out_start, &out_len)),
+             static_cast<u8>(ChunkStatus::NeedMore));
+    CHECK_EQ(p.chunk_remaining, i64{0xFFFF'FFFF1});
 }
 
 // ============================================================================

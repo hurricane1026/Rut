@@ -1543,7 +1543,7 @@ struct ConnectionBase {
 
     // Body streaming state (proxy large body support)
     u32 req_header_end;        // offset past request headers (\r\n\r\n)
-    u32 req_content_length;    // original Content-Length value (for send capping)
+    i64 req_content_length;    // original Content-Length value (for send capping)
     u32 req_initial_send_len;  // max bytes to send in initial upstream forward
     // Idle-reuse retry snapshot length. When a request is forwarded to a REUSED
     // pooled upstream socket, recv_buf is reset at request-sent (so pipelined
@@ -1832,7 +1832,7 @@ struct ConnectionBase {
     bool req_upgrade_is_websocket;   // the request Upgrade list offered "websocket"
     bool resp_upgrade_is_websocket;  // the backend 101 selected "websocket" (gates terminate)
     BodyMode req_body_mode;
-    u32 req_body_remaining;          // bytes left for request body (Content-Length)
+    i64 req_body_remaining;          // bytes left for request body (Content-Length)
     ChunkedParser req_chunk_parser;  // for chunked request body end detection
     // True once any request-body byte has started streaming upstream (recv_buf is
     // reset + refilled with body chunks, so the original headers+body are gone).
@@ -1840,9 +1840,9 @@ struct ConnectionBase {
     // reused-socket retry predicate refuses it. Reset at the per-request boundary.
     bool req_body_streamed;
     BodyMode resp_body_mode;
-    u32 resp_body_remaining;          // bytes left for Content-Length mode
+    i64 resp_body_remaining;          // bytes left for Content-Length mode
     ChunkedParser resp_chunk_parser;  // for chunked mode end detection
-    u32 resp_body_sent;               // total response body bytes sent (for access log)
+    i64 resp_body_sent;               // total response body bytes sent (for access log)
     u32 upstream_send_len;            // bytes from upstream_recv_buf in current client send
 
     // io_uring multishot recv tracking: true while the multishot SQE is
