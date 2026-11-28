@@ -60,13 +60,17 @@ bool response_document(HttpsFetch& fetch, HttpCallReply& reply) {
         if (seen) continue;
         if (!first) out.put(',');
         first = false;
-        char lower[128];
+        u8 lower[128];
         if (name.len > sizeof(lower)) return false;
-        for (u32 j = 0; j < name.len; ++j)
-            lower[j] = name.ptr[j] >= 'A' && name.ptr[j] <= 'Z'
-                           ? static_cast<char>(name.ptr[j] + ('a' - 'A'))
-                           : name.ptr[j];
-        if (!json::quote({lower, name.len}, out)) return false;
+        for (u32 j = 0; j < name.len; ++j) {
+            const u8 byte = byte_value(name.ptr[j]);
+            using Uppercase = range_int<'A', 'Z' + 1>;
+            Uppercase upper;
+            lower[j] = Uppercase::try_from_u64(byte, &upper)
+                           ? (upper + range_int<'a' - 'A', 'a' - 'A' + 1>{}).to<u8>()
+                           : byte;
+        }
+        if (!json::quote({reinterpret_cast<const char*>(lower), name.len}, out)) return false;
         out.text(lit_str(":["));
         bool value_first = true;
         for (u32 j = i; j < response.header_count; ++j) {
@@ -119,16 +123,17 @@ bool http_call_policy(Str configuration, HttpsEndpoint& endpoint) {
         } else if (name.eq(lit_str("port"))) {
             i64 port = 0;
             if ((seen & 16) || doc.nodes[n].kind != json::Kind::Number ||
-                !json::integer(doc.raw(n), port) || port < 1 || port > 65535)
+                !json::integer(doc.raw(n), port) || port == 0 ||
+                !range_int{port}.to(&endpoint.port))
                 return false;
-            endpoint.port = static_cast<u16>(port);
             seen |= 16;
             continue;
         } else
             return false;
         u32 length = 0;
-        if ((seen & bit) ||
-            !decoded(doc, n, value, static_cast<u32>(static_cast<i64>(cap) - 1), length) || !length)
+        u32 value_capacity;
+        if ((seen & bit) || !(range_int{cap} - range_int<1, 2>{}).to(&value_capacity) ||
+            !decoded(doc, n, value, value_capacity, length) || !length)
             return false;
         for (u32 i = 0; i < length; ++i)
             if (!value[i]) return false;
@@ -173,25 +178,25 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
                                lit_str("PATCH"),
                                lit_str("DELETE"),
                                lit_str("OPTIONS")};
-    bool valid = false;
+    const char* verb_text = nullptr;
     for (auto allowed : methods)
-        if (allowed.eq(verb)) valid = true;
-    if (!valid || !(seen & 1)) return false;
+        if (allowed.eq(verb)) verb_text = allowed.ptr;
+    if (!verb_text || !(seen & 1)) return false;
     char port_suffix[7]{};
     if (endpoint.port != 443)
-        snprintf(port_suffix, sizeof(port_suffix), ":%u", unsigned{endpoint.port});
+        snprintf(port_suffix, sizeof(port_suffix), ":%u", range_int{endpoint.port}.to<u32>());
     const int prefix = snprintf(out,
                                 cap,
-                                "%.*s %s HTTP/1.1\r\nHost: %s%s\r\nAccept-Encoding: "
+                                "%s %s HTTP/1.1\r\nHost: %s%s\r\nAccept-Encoding: "
                                 "identity\r\nConnection: close\r\nContent-Length: %u\r\n",
-                                static_cast<int>(method_len),
-                                method,
+                                verb_text,
                                 endpoint.path,
                                 endpoint.tls.server_name,
                                 port_suffix,
                                 body_len);
-    if (prefix <= 0 || static_cast<u32>(prefix) >= cap) return false;
-    json::Writer wire{out, cap, static_cast<u32>(prefix)};
+    u32 prefix_size;
+    if (prefix == 0 || !range_int{prefix}.to(&prefix_size) || prefix_size >= cap) return false;
+    json::Writer wire{out, cap, prefix_size};
     if (headers != json::kNone) {
         char names[16][128]{};
         u32 sizes[16]{}, count = 0;
@@ -226,8 +231,9 @@ bool http_call_request(const HttpsEndpoint& endpoint, Str input, char* out, u32 
 
 core::Expected<void, Error> HttpCallWorker::start() {
     if (started) return core::make_unexpected(Error::make(EALREADY, Error::Source::Thread));
-    const i64 storage_size = i64{sizeof(Slot)} * i64{kCapacity} + 64;
-    auto allocated = storage.init(u64{storage_size});
+    constexpr auto kStorageSize =
+        range_int<sizeof(Slot), sizeof(Slot) + 1>{}.scaled_by<kCapacity>() + range_int<64, 65>{};
+    auto allocated = storage.init(kStorageSize.to_u64());
     if (!allocated) return allocated;
     slots = storage.alloc_array<Slot>(kCapacity);
     if (!slots) {
@@ -288,10 +294,12 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
         else
             cancel(connection, slot.generation);
     }
-    u64 elapsed = 0;
+    using Milliseconds = range_int<0, UINT32_MAX + 1LL>;
+    Milliseconds elapsed_ms;
     if (found) {
+        u64 elapsed;
         if (now < found->started || sub_overflow(now, found->started, &elapsed) ||
-            elapsed >= u64{found->timeout}) {
+            elapsed >= found->timeout || !Milliseconds::try_from_u64(elapsed, &elapsed_ms)) {
             cancel(connection, generation);
             reply.status = -2;
             return reply;
@@ -327,9 +335,9 @@ void HttpCallWorker::cancel(u32 connection, u64 generation) {
         reply.status = -3;
         return reply;
     }
-    reply.status = static_cast<i32>(0x80000000u);
+    reply.status = INT32_MIN;
     // Any existing slot with elapsed >= timeout returned above.
-    const auto kRemaining = range_int(found->timeout) - range_int(static_cast<u32>(elapsed));
+    const auto kRemaining = range_int{found->timeout} - elapsed_ms;
     reply.retry_ms = kRemaining.min(range_int<10, 11>{}).max(range_int<0, 1>{}).to<u32>();
     return reply;
 }
