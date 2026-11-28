@@ -188,14 +188,14 @@ constexpr HuffFsm kFsm = build_fsm();
         return 1;
     }
     // Continuation octets: 7 bits each, low-order first; high bit = "more".
-    i64 acc = kMask;
+    i64 acc = range_int{kMask}.to<i64>();
     i64 shift = 0;
     u32 i = 1;
     while (true) {
         if (i >= len) return 0;  // truncated
         const u8 kB = in[i++];
         // RUT_INTEGER_RANGE: acc <= UINT32_MAX and at most 7 bits are added at shift <= 28.
-        acc += i64{kB & 0x7f} << shift;
+        acc += bounded_remainder<128>(kB).to<i64>() << shift;
         if (acc > 0xffffffffLL) return 0;  // exceeds 32 bits
         if ((kB & 0x80) == 0) break;
         shift += 7;
@@ -210,10 +210,10 @@ constexpr HuffFsm kFsm = build_fsm();
     // RUT_INTEGER_RANGE: the validated prefix is at most one octet.
     const u32 kMask = ~(~u32{0} << prefix_bits);
     if (value < kMask) {
-        out[0] = bounded_remainder<256>(u64{prefix_top} | value).to<u8>();
+        out[0] = bounded_remainder<256>(range_int{prefix_top}.to_u64() | value).to<u8>();
         return 1;
     }
-    out[0] = bounded_remainder<256>(u64{prefix_top} | kMask).to<u8>();
+    out[0] = bounded_remainder<256>(range_int{prefix_top}.to_u64() | kMask).to<u8>();
     const auto kRemainder = range_int(value) - range_int(kMask);
     u32 remainder = kRemainder.max(range_int<0, 1>{}).to<u32>();
     u32 i = 1;
@@ -229,7 +229,7 @@ constexpr HuffFsm kFsm = build_fsm();
     // The longest HPACK code is 30 bits, so the full u32 input range fits in
     // signed 64-bit arithmetic: UINT32_MAX * 30 < INT64_MAX.
     i64 bits = 0;
-    for (u32 i = 0; i < len; i++) bits += static_cast<i64>(kHuff[src[i]].bits);
+    for (u32 i = 0; i < len; i++) bits += range_int{kHuff[src[i]].bits}.to<i64>();
 
     return huffman_encoded_bytes_from_bits(bits);
 }
@@ -241,7 +241,7 @@ constexpr HuffFsm kFsm = build_fsm();
     for (u32 i = 0; i < len; i++) {
         const HuffCode kEntry = kHuff[src[i]];
         acc = (acc << kEntry.bits) | kEntry.code;
-        nbits += static_cast<i64>(kEntry.bits);
+        nbits += range_int{kEntry.bits}.to<i64>();
         while (nbits >= 8) {
             nbits -= 8;
             out[o++] = bounded_remainder<256>(acc >> nbits).to<u8>();
@@ -259,7 +259,7 @@ constexpr HuffFsm kFsm = build_fsm();
 
 [[nodiscard]] i32 huffman_decode(u8* out, u32 cap, const u8* src, u32 len) {
     // The signed result reports -1 on failure and otherwise carries the exact length.
-    const i32 limit = range_int(cap).min(range_int<INT32_MAX, i64{INT32_MAX} + 1>{}).to<i32>();
+    const i32 limit = range_int{cap}.min(range_int<INT32_MAX, INT32_MAX + 1LL>{}).to<i32>();
     i16 node = 0;
     i32 o = 0;
     for (u32 i = 0; i < len; i++) {
@@ -295,7 +295,7 @@ constexpr HuffFsm kFsm = build_fsm();
     if (kHdr == 0) return 0;
     const auto kConsumed = range_int(kHdr) + range_int(slen);
     if (kConsumed.value() > len) return 0;  // truncated payload
-    const u8* data = in + i64{kHdr};
+    const u8* data = in + range_int{kHdr}.index();
     if (kHuffman) {
         const i32 kN = huffman_decode(out, cap, data, slen);
         if (!range_int(kN).to(out_len)) return 0;
@@ -315,9 +315,10 @@ constexpr HuffFsm kFsm = build_fsm();
         const i64 kN = huffman_encode(out + kHdr, src, len);
         return kHdr + kN;
     }
-    const i64 kHdr = encode_integer(out, len, 7, 0x00);  // H=0
-    for (i64 i = 0; i < len; i++) out[kHdr + i] = src[i];
-    return kHdr + i64{len};
+    const auto header = range_int{encode_integer(out, len, 7, 0x00)};  // H=0
+    u8* const data = out + header.index();
+    for (u32 i = 0; i < len; i++) data[i] = src[i];
+    return (header + range_int{len}).to<i64>();
 }
 
 namespace {
@@ -431,7 +432,7 @@ void dyn_clear(DynamicTable& d) {
             dyn_clear(d);
             return false;
         }
-        d.ents[i64{i} - 1] = entry;
+        d.ents[i - 1] = entry;
     }
     __builtin_memmove(d.buf, d.buf + payload.index(), next_used);
     d.byte_used = next_used;
@@ -449,7 +450,7 @@ void dyn_clear(DynamicTable& d) {
 
 // Add (name,value). Caller MUST ensure the source bytes do not alias d.buf.
 [[nodiscard]] bool dyn_add(DynamicTable& d, Str name, Str value) {
-    constexpr auto kByteCap = range_int<DynamicTable::kByteCap, i64{DynamicTable::kByteCap} + 1>{};
+    constexpr auto kByteCap = range_int<DynamicTable::kByteCap, DynamicTable::kByteCap + 1>{};
     const auto payload = range_int(name.len) + range_int(value.len);
     const auto cost = payload + range_int<32, 33>{};
     if (cost.value() > d.max_size || payload.value() > DynamicTable::kByteCap) {
@@ -476,12 +477,12 @@ void dyn_clear(DynamicTable& d) {
 }
 
 [[nodiscard]] bool dyn_get(const DynamicTable& d, u32 i, Str* name, Str* value) {
-    if (i >= d.nent) return false;
-    const i64 kEntry = i64{d.nent} - 1 - i64{i};
-    const DynamicTable::Entry& e = d.ents[kEntry];
-    name->ptr = reinterpret_cast<const char*>(d.buf + i64{e.off});
+    if (d.nent > DynamicTable::kMaxEntries || i >= d.nent) return false;
+    const DynamicTable::Entry& e = d.ents[d.nent - i - 1];
+    const auto offset = range_int{e.off};
+    name->ptr = reinterpret_cast<const char*>(d.buf + offset.index());
     name->len = e.nlen;
-    value->ptr = reinterpret_cast<const char*>(d.buf + i64{e.off} + i64{e.nlen});
+    value->ptr = reinterpret_cast<const char*>(d.buf + (offset + range_int{e.nlen}).index());
     value->len = e.vlen;
     return true;
 }
@@ -489,28 +490,20 @@ void dyn_clear(DynamicTable& d) {
 // Resolve a 1-based HPACK index to (name,value). idx 1..61 = static.
 [[nodiscard]] bool resolve_full(const DynamicTable& d, u32 idx, Str* name, Str* value) {
     if (idx == 0) return false;
-    if (idx <= kStaticCount) {
-        const StaticEntry& e = kStatic[i64{idx} - 1];
+    using StaticIndex = range_int<1, kStaticCount + 1>;
+    StaticIndex index;
+    if (StaticIndex::try_from_u64(idx, &index)) {
+        const StaticEntry& e = (index - range_int<1, 2>{}).at(kStatic);
         *name = {e.name, e.nlen};
         *value = {e.value, e.vlen};
         return true;
     }
-    const auto entry =
-        range_int(idx) - range_int<kStaticCount, i64{kStaticCount} + 1>{} - range_int<1, 2>{};
-    return dyn_get(d, entry.max(range_int<0, 1>{}).to<u32>(), name, value);
+    return dyn_get(d, idx - kStaticCount - 1, name, value);
 }
 
 [[nodiscard]] bool resolve_name(const DynamicTable& d, u32 idx, Str* name) {
     Str value;
-    if (idx <= kStaticCount) {
-        if (idx == 0) return false;
-        const StaticEntry& e = kStatic[i64{idx} - 1];
-        *name = {e.name, e.nlen};
-        return true;
-    }
-    const auto entry =
-        range_int(idx) - range_int<kStaticCount, i64{kStaticCount} + 1>{} - range_int<1, 2>{};
-    return dyn_get(d, entry.max(range_int<0, 1>{}).to<u32>(), name, &value);
+    return resolve_full(d, idx, name, &value);
 }
 
 [[nodiscard]] u32 static_find_full(Str name, Str value) {
@@ -533,19 +526,20 @@ void dyn_clear(DynamicTable& d) {
 }
 
 // The table index starts at the newest dynamic entry, following all static entries.
-constexpr auto kFirstDynamicIndex =
-    range_int<kStaticCount, i64{kStaticCount} + 1>{} + range_int<1, 2>{};
+constexpr auto kFirstDynamicIndex = range_int<kStaticCount, kStaticCount + 1>{} + range_int<1, 2>{};
 constexpr auto kMaxDynamicEntries =
-    range_int<DynamicTable::kMaxEntries, i64{DynamicTable::kMaxEntries} + 1>{};
+    range_int<DynamicTable::kMaxEntries, DynamicTable::kMaxEntries + 1>{};
 
 [[nodiscard]] u32 dyn_find_full(const DynamicTable& d, Str name, Str value) {
     const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
     const u32 end = (kFirstDynamicIndex + entries).to<u32>();
     for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
-        const auto& entry = d.ents[i64{end} - i64{index} - 1];
-        const Str entry_name{reinterpret_cast<const char*>(d.buf + i64{entry.off}), entry.nlen};
+        const auto& entry = d.ents[end - index - 1];
+        const auto offset = range_int{entry.off};
+        const Str entry_name{reinterpret_cast<const char*>(d.buf + offset.index()), entry.nlen};
         const Str entry_value{
-            reinterpret_cast<const char*>(d.buf + i64{entry.off} + i64{entry.nlen}), entry.vlen};
+            reinterpret_cast<const char*>(d.buf + (offset + range_int{entry.nlen}).index()),
+            entry.vlen};
         if (entry_name.eq(name) && entry_value.eq(value)) return index;
     }
     return 0;
@@ -555,8 +549,9 @@ constexpr auto kMaxDynamicEntries =
     const auto entries = range_int(d.nent).min(kMaxDynamicEntries);
     const u32 end = (kFirstDynamicIndex + entries).to<u32>();
     for (u32 index = kFirstDynamicIndex.to<u32>(); index < end; ++index) {
-        const auto& entry = d.ents[i64{end} - i64{index} - 1];
-        const Str entry_name{reinterpret_cast<const char*>(d.buf + i64{entry.off}), entry.nlen};
+        const auto& entry = d.ents[end - index - 1];
+        const Str entry_name{reinterpret_cast<const char*>(d.buf + range_int{entry.off}.index()),
+                             entry.nlen};
         if (entry_name.eq(name)) return index;
     }
     return 0;
@@ -580,19 +575,21 @@ void DynamicTable::init(u32 settings_max) {
                                        Header* headers,
                                        u32 max_headers,
                                        u32* count) {
+    const i64 input_size = range_int{len}.to<i64>();
+    const i64 output_capacity = range_int{out_cap}.to<i64>();
     i64 pos = 0;
     i64 op = 0;  // out_buf write cursor
     u32 hc = 0;
-    while (pos < len) {
+    while (pos < input_size) {
         u32 input_length;
-        if (!range_int(i64{len} - pos).to(&input_length)) return false;
+        if (!range_int{input_size - pos}.to(&input_length)) return false;
         const u8 kByte = in[pos];
         if (kByte & 0x80) {
             // §6.1 Indexed Header Field.
             u32 idx = 0;
             const u32 kC = decode_integer(in + pos, input_length, 7, &idx);
             if (kC == 0 || idx == 0) return false;
-            pos += i64{kC};
+            pos += range_int{kC}.to<i64>();
             Str name, value;
             if (!resolve_full(dyn, idx, &name, &value)) return false;
             if (hc >= max_headers) return false;
@@ -604,7 +601,7 @@ void DynamicTable::init(u32 settings_max) {
             u32 sz = 0;
             const u32 kC = decode_integer(in + pos, input_length, 5, &sz);
             if (kC == 0 || sz > dyn.hard_max) return false;
-            pos += i64{kC};
+            pos += range_int{kC}.to<i64>();
             if (!dyn_set_max_size(dyn, sz)) return false;
             continue;
         }
@@ -615,44 +612,45 @@ void DynamicTable::init(u32 settings_max) {
         u32 nidx = 0;
         const u32 kNc = decode_integer(in + pos, input_length, kPrefix, &nidx);
         if (kNc == 0) return false;
-        pos += i64{kNc};
+        pos += range_int{kNc}.to<i64>();
 
         Str name;
         if (nidx == 0) {
             u32 nlen = 0;
             u32 output_length;
-            if (!range_int(i64{len} - pos).to(&input_length) ||
-                !range_int(i64{out_cap} - op).to(&output_length))
+            if (!range_int{input_size - pos}.to(&input_length) ||
+                !range_int{output_capacity - op}.to(&output_length))
                 return false;
             const u32 kSc =
                 decode_string(in + pos, input_length, out_buf + op, output_length, &nlen);
             if (kSc == 0) return false;
-            pos += i64{kSc};
+            pos += range_int{kSc}.to<i64>();
             name = {reinterpret_cast<const char*>(out_buf + op), nlen};
-            op += i64{nlen};
+            op += range_int{nlen}.to<i64>();
         } else if (!resolve_name(dyn, nidx, &name)) {
             return false;
         }
         // Value is always a literal string.
         u32 vlen = 0;
         u32 output_length;
-        if (!range_int(i64{len} - pos).to(&input_length) ||
-            !range_int(i64{out_cap} - op).to(&output_length))
+        if (!range_int{input_size - pos}.to(&input_length) ||
+            !range_int{output_capacity - op}.to(&output_length))
             return false;
         const u32 kVc = decode_string(in + pos, input_length, out_buf + op, output_length, &vlen);
         if (kVc == 0) return false;
-        pos += i64{kVc};
+        pos += range_int{kVc}.to<i64>();
         Str value = {reinterpret_cast<const char*>(out_buf + op), vlen};
-        op += i64{vlen};
+        op += range_int{vlen}.to<i64>();
 
         if (kIncremental) {
             // The name may alias dyn.buf (table reference); copy it into out_buf
             // so dyn_add's eviction/compaction can't corrupt the source.
             if (nidx != 0) {
-                if (op + i64{name.len} > i64{out_cap}) return false;
+                const i64 next_output = op + range_int{name.len}.to<i64>();
+                if (next_output > output_capacity) return false;
                 __builtin_memcpy(out_buf + op, name.ptr, name.len);
                 name = {reinterpret_cast<const char*>(out_buf + op), name.len};
-                op += i64{name.len};
+                op = next_output;
             }
             if (!dyn_add(dyn, name, value)) return false;
         }
@@ -709,13 +707,14 @@ void DynamicTable::init(u32 settings_max) {
 // dynamic table size update so the next header block tells the peer's decoder the
 // new size in lockstep. Without that the two tables desync and decoding breaks.
 [[nodiscard]] bool Encoder::set_table_size(u32 settings_max) {
-    constexpr auto kCap = range_int<DynamicTable::kHardCap, i64{DynamicTable::kHardCap} + 1>{};
+    constexpr auto kCap = range_int<DynamicTable::kHardCap, DynamicTable::kHardCap + 1>{};
     const auto size = range_int(settings_max).min(kCap);
     const i32 next = size.to<i32>();
     // The size currently in effect for the peer's decoder is the final pending
     // value if one is armed, else our live table limit. No net change → nothing
     // to do (avoids spurious size updates on duplicate SETTINGS).
-    const i64 kCurrent = pending_size_update >= 0 ? pending_size_update : i64{dyn.max_size};
+    const i64 kCurrent =
+        pending_size_update >= 0 ? pending_size_update : range_int{dyn.max_size}.to<i64>();
     if (next == kCurrent) return true;
     if (!dyn_set_max_size(dyn, size.to<u32>())) return false;
     // A shrink-then-grow between header blocks must signal the minimum first
@@ -736,7 +735,7 @@ void DynamicTable::init(u32 settings_max) {
         const auto minimum_size = range_int(pending_min_size).max(range_int<0, 1>{});
         first = encode_integer(out, minimum_size.to<u32>(), 5, 0x20);
     }
-    const u32 final = encode_integer(out + i64{first}, final_size.to<u32>(), 5, 0x20);
+    const u32 final = encode_integer(out + range_int{first}.index(), final_size.to<u32>(), 5, 0x20);
     pending_size_update = -1;
     pending_min_size = -1;
     // A 32-bit prefix integer uses at most six octets, including its first byte.
