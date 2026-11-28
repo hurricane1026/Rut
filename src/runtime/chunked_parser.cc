@@ -33,13 +33,13 @@ ChunkStatus ChunkedParser::feed(
             case State::Size: {
                 HexDigit digit;
                 if (hex_digit(c, &digit)) {
-                    using Prefix = range_int<0, 0x10000000>;
+                    using Prefix = range_int<0, i64{INT64_MAX / 16} + 1>;
                     Prefix prefix;
-                    if (!Prefix::try_from_u64(chunk_remaining, &prefix)) {
+                    if (!Prefix::try_from_i64(chunk_remaining, &prefix)) {
                         *consumed = pos;
                         return ChunkStatus::Error;
                     }
-                    chunk_remaining = (prefix.scaled_by<16>() + digit).to<u32>();
+                    chunk_remaining = (prefix.scaled_by<16>() + digit).to<i64>();
                     has_digits = true;
                     pos++;
                 } else if (c == '\r') {
@@ -88,7 +88,11 @@ ChunkStatus ChunkedParser::feed(
             case State::Data: {
                 // Bulk copy: consume min(remaining input, chunk_remaining).
                 const auto cursor = range_int{pos};
-                const auto remaining = range_int{chunk_remaining};
+                range_int<0, kI64ExclusiveEnd> remaining;
+                if (!decltype(remaining)::try_from_i64(chunk_remaining, &remaining)) {
+                    *consumed = pos;
+                    return ChunkStatus::Error;
+                }
                 auto available = cursor;
                 if (!decltype(available)::try_from_i64((range_int{in_len} - cursor).value(),
                                                        &available)) {
@@ -97,7 +101,7 @@ ChunkStatus ChunkedParser::feed(
                 }
                 const auto taken = available.min(remaining);
                 u32 next;
-                u32 left;
+                i64 left;
                 if (!(cursor + taken).to(&next) || !(remaining - taken).to(&left)) {
                     *consumed = pos;
                     return ChunkStatus::Error;

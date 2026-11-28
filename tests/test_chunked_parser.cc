@@ -86,6 +86,32 @@ TEST(chunked, multiple) {
     CHECK(mem_eq(body, "hello world", 11));
 }
 
+TEST(chunked, accepts_large_chunk_size_incrementally) {
+    ChunkedParser p;
+    p.reset();
+    const u8 header[] = "100000000\r\n";  // 4 GiB, without allocating the body.
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    CHECK_EQ(static_cast<u8>(p.feed(header, sizeof(header) - 1, &consumed, &out_start, &out_len)),
+             static_cast<u8>(ChunkStatus::NeedMore));
+    CHECK_EQ(consumed, sizeof(header) - 1);
+    CHECK_EQ(p.chunk_remaining, i64{0x1'0000'0000});
+
+    const u8 byte = 'x';
+    CHECK_EQ(static_cast<u8>(p.feed(&byte, 1, &consumed, &out_start, &out_len)),
+             static_cast<u8>(ChunkStatus::Data));
+    CHECK_EQ(out_len, 1u);
+    CHECK_EQ(p.chunk_remaining, i64{0xFFFF'FFFF});
+}
+
+TEST(chunked, rejects_chunk_size_over_i64) {
+    ChunkedParser p;
+    p.reset();
+    const u8 input[] = "8000000000000000\r\n";
+    u32 consumed = 0, out_start = 0, out_len = 0;
+    CHECK_EQ(static_cast<u8>(p.feed(input, sizeof(input) - 1, &consumed, &out_start, &out_len)),
+             static_cast<u8>(ChunkStatus::Error));
+}
+
 TEST(chunked, hex_upper) {
     ChunkedParser p;
     p.reset();
