@@ -23,10 +23,12 @@ bool ws_deflate_matches(const WsDeflateCodec& codec, WsDeflateOptions options);
 
 // Wire work has its own bound, so streams made of empty blocks cannot bypass
 // the decoded-message budget. It admits normal incompressible DEFLATE overhead.
-constexpr u32 ws_deflate_wire_limit(u32 decoded_limit) {
-    return static_cast<u32>(static_cast<i64>(decoded_limit) + static_cast<i64>(decoded_limit) / 8 +
-                            1024);
+[[nodiscard]] constexpr auto ws_deflate_wire_limit(u32 decoded_limit) {
+    const auto decoded = range_int{decoded_limit};
+    return decoded + decoded.divided_by<8>() + range_int<1024, 1025>{};
 }
+
+using WsDeflateWireBytes = range_int<0, ws_deflate_wire_limit(UINT32_MAX).value() + 1>;
 
 bool ws_inflate_begin(WsDeflateCodec& codec, u32 decoded_limit);
 // Input may be a fragment or part of a fragment. Final appends RFC 7692's removed

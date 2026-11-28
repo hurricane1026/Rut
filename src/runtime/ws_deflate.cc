@@ -26,7 +26,7 @@ struct WsDeflateCodec {
     u32 used = sizeof(WsDeflateCodec);
     u32 decoded = 0;
     u32 decoded_limit = 0;
-    u32 wire_bytes = 0;
+    WsDeflateWireBytes wire_bytes;
     bool decoding = false;
     bool failed = false;
     u8 scratch[4096]{};
@@ -145,7 +145,7 @@ bool ws_inflate_begin(WsDeflateCodec& codec, u32 decoded_limit) {
     if (codec.options.receive_no_context_takeover && inflateReset(&codec.decoder) != Z_OK)
         return false;
     codec.decoded = 0;
-    codec.wire_bytes = 0;
+    codec.wire_bytes = {};
     codec.decoded_limit = decoded_limit;
     codec.decoding = true;
     return true;
@@ -164,15 +164,13 @@ WsDeflateStatus ws_inflate_chunk(WsDeflateCodec& codec,
     *output_len = 0;
     if (!codec.decoding || !output || capacity < codec.decoded_limit || (!input && length))
         return WsDeflateStatus::Error;
-    const auto wire_end = range_int{codec.wire_bytes} + range_int{length};
-    const auto wire_limit = range_int{ws_deflate_wire_limit(codec.decoded_limit)};
-    auto wire_bytes = range_int{codec.wire_bytes};
-    if (!wire_limit.try_count(wire_end.value(), &wire_bytes)) {
+    const auto wire_end = codec.wire_bytes + range_int{length};
+    const WsDeflateWireBytes wire_limit = ws_deflate_wire_limit(codec.decoded_limit);
+    if (!wire_limit.try_count(wire_end.value(), &codec.wire_bytes)) {
         codec.decoding = false;
         codec.failed = true;
         return WsDeflateStatus::Limit;
     }
-    codec.wire_bytes = wire_bytes.to<u32>();
     bool boundary = false;
     auto cursor = range_int{u32{0}};
     const auto input_size = range_int{length};

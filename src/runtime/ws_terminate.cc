@@ -749,10 +749,12 @@ WsInspectStatus ws_inspect(WsInspector& st,
             if ((h.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented)
                 return WsInspectStatus::Error;
             if (kCompressed) {
-                const auto wire_limit = range_int{ws_deflate_wire_limit(kDecodedLimit)};
-                u32 remaining_wire;
-                if (!st.decoder || !(wire_limit - frame_payload).to(&remaining_wire) ||
-                    st.assembler.accumulated_len > remaining_wire)
+                const auto wire_limit = ws_deflate_wire_limit(kDecodedLimit);
+                WsDeflateWireBytes remaining_wire;
+                if (!st.decoder ||
+                    !WsDeflateWireBytes::try_from_i64((wire_limit - frame_payload).value(),
+                                                      &remaining_wire) ||
+                    st.assembler.accumulated_len > remaining_wire.to_u64())
                     return WsInspectStatus::Error;
             } else {
                 const auto total = st.message_len + frame_payload;
@@ -911,7 +913,7 @@ WsInspectStatus ws_inspect(WsInspector& st,
         const WsMessageStatus kMessageStatus = ws_message_feed(
             st.assembler,
             h,
-            kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : st.max_message_size,
+            kCompressed ? ws_deflate_wire_limit(kDecodedLimit).to_u64() : st.max_message_size,
             &msg_op,
             &total);
         if (kMessageStatus == WsMessageStatus::Error) return WsInspectStatus::Error;
@@ -1171,14 +1173,15 @@ WsClosingRead ws_read_closing(
         if (!ws_decoded_limit(st.max_message_size, kWsMaxMessageCapacity, &decoded_limit))
             return WsClosingRead::Error;
         const u32 kDecodedLimit = decoded_limit.to<u32>();
-        const u32 kLimit = kCompressed ? ws_deflate_wire_limit(kDecodedLimit) : kDecodedLimit;
-        const auto limit = range_int{kLimit};
+        const WsDeflateWireBytes limit =
+            kCompressed ? WsDeflateWireBytes{ws_deflate_wire_limit(kDecodedLimit)}
+                        : WsDeflateWireBytes{decoded_limit};
         WsBufferedBytes frame_payload;
-        u32 remaining_wire;
+        WsDeflateWireBytes remaining_wire;
         if ((header.opcode == WsOpcode::Continuation) != st.assembler.in_fragmented ||
-            !limit.try_count(header.payload_len, &frame_payload) ||
-            !(limit - frame_payload).to(&remaining_wire) ||
-            st.assembler.accumulated_len > remaining_wire)
+            !WsBufferedBytes::try_from_i64(header.payload_len, &frame_payload) ||
+            !WsDeflateWireBytes::try_from_i64((limit - frame_payload).value(), &remaining_wire) ||
+            st.assembler.accumulated_len > remaining_wire.to_u64())
             return WsClosingRead::Error;
         st.compressed_message = kCompressed;
         const u32 kHeaderLen = st.partial_data_frame ? 0 : header.header_len;
@@ -1202,7 +1205,7 @@ WsClosingRead ws_read_closing(
         st.partial_payload_len = {};
         WsOpcode opcode;
         u64 total = 0;
-        if (ws_message_feed(st.assembler, header, kLimit, &opcode, &total) ==
+        if (ws_message_feed(st.assembler, header, limit.to_u64(), &opcode, &total) ==
             WsMessageStatus::Error)
             return WsClosingRead::Error;
         st.message_len = {};  // ignored application bytes never enter reassembly storage
