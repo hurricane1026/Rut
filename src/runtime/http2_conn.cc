@@ -1350,13 +1350,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
         // windows and empty DATA do not emit either pair.
         if (kType == Http2FrameType::Data) {
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
-            const u32 kRequiredControl =
-                h.length == 0 ? kShortControlFrame
-                              : (kEndStream ? kShortControlFrame : 2 * kShortControlFrame);
-            if (!w.room(kRequiredControl)) {
+            if (!w.room(2 * kShortControlFrame)) {
                 const Http2Stream* stream = find_stream(h.stream_id);
                 const bool kClosed = !stream || stream->state == Http2StreamState::HalfClosedRemote;
-                if (kClosed || (h.length > 0 && !stream->manual_window)) break;
+                const u32 kRequiredControl =
+                    kClosed ? (h.length == 0 ? kShortControlFrame : 2 * kShortControlFrame)
+                            : (h.length == 0 || stream->manual_window
+                                   ? 0
+                                   : (kEndStream ? kShortControlFrame : 2 * kShortControlFrame));
+                if (!w.room(kRequiredControl)) break;
             }
         }
 

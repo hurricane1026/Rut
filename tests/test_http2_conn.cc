@@ -2253,6 +2253,31 @@ TEST(http2_conn, data_waits_for_control_window_update_room) {
     CHECK(has_frame(retry_out, retry_written, Http2FrameType::WindowUpdate, 0, 0));
 }
 
+TEST(http2_conn, closed_data_waits_for_rst_and_connection_credit_room) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    const hpack::Header headers[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    u8 frame[256];
+    u32 fn = http2_write_headers(frame, sizeof(frame), 1, headers, 2, true);
+    fn += http2_write_data(frame + fn, 1, reinterpret_cast<const u8*>("x"), 1, true);
+    u8 in[384];
+    const u32 inlen = with_preface(in, frame, fn);
+    u8 out[25]{};
+    u32 ow = 0;
+    const Http2Result first = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(first.close);
+    CHECK_LT(first.consumed, inlen);
+    u8 retry_out[64]{};
+    u32 retry_written = 0;
+    const Http2Result retry = c.process(
+        in + first.consumed, inlen - first.consumed, retry_out, sizeof(retry_out), &retry_written);
+    CHECK_FALSE(retry.close);
+    CHECK_EQ(retry.consumed, inlen - first.consumed);
+    CHECK(has_frame(retry_out, retry_written, Http2FrameType::RstStream, 0, 0));
+    CHECK(has_frame(retry_out, retry_written, Http2FrameType::WindowUpdate, 0, 0));
+}
+
 TEST(http2_conn, data_on_half_closed_stream_rsts) {
     Http2Conn c;
     Capture cap;
