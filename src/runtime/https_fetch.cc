@@ -2,6 +2,7 @@
 
 #include "rut/common/checked_arithmetic.h"
 #include "rut/common/http_header_validation.h"
+#include "rut/common/range_int.h"
 #include "rut/platform/socket.h"
 
 #include <arpa/inet.h>
@@ -18,6 +19,9 @@
 
 namespace rut {
 namespace {
+constexpr u32 kMaxStrongEtagLength = 128;
+using EtagLength = range_int<0, kMaxStrongEtagLength + 1>;
+
 bool terminated(const char* value, u32 capacity) {
     for (u32 i = 0; i < capacity; ++i)
         if (!value[i]) return true;
@@ -33,14 +37,19 @@ bool retry_ssl(SSL* ssl, int result) {
 }  // namespace
 
 [[nodiscard]] u64 jwt_monotonic_ms() {
+    using WholeSeconds = range_int<0, (UINT64_MAX - 999) / 1000 + 1>;
+    using Nanoseconds = range_int<0, 1'000'000'000>;
     timespec now{};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 || now.tv_nsec < 0 ||
-        now.tv_nsec >= 1000000000 || static_cast<u64>(now.tv_sec) > (~u64{0} - 999) / 1000)
+    WholeSeconds seconds;
+    Nanoseconds nanos;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        !WholeSeconds::try_from_i64(now.tv_sec, &seconds) ||
+        !Nanoseconds::try_from_i64(now.tv_nsec, &nanos))
         return 0;
-    u64 seconds_ms = 0;
-    if (mul_overflow(static_cast<u64>(now.tv_sec), u64{1000}, &seconds_ms)) return 0;
     u64 result = 0;
-    return add_overflow(seconds_ms, static_cast<u64>(now.tv_nsec) / 1000000, &result) ? 0 : result;
+    if (mul_overflow(seconds.to_u64(), u64{1000}, &result)) return 0;
+    if (!try_add_to(&result, nanos.divided_by<1'000'000>().to_u64())) return 0;
+    return result;
 }
 
 bool HttpsEndpoint::valid() const {
@@ -52,7 +61,7 @@ bool HttpsEndpoint::valid() const {
         path[0] != '/')
         return false;
     for (u32 i = 0; path[i]; ++i) {
-        const u8 kByte = static_cast<u8>(path[i]);
+        const u8 kByte = byte_value(path[i]);
         if (kByte <= 32 || kByte >= 127 || kByte == '#' || kByte == '\\') return false;
     }
     return true;
@@ -85,27 +94,30 @@ void BoundedJsonResponse::reset_dns() {
 }
 
 bool strong_etag_valid(Str value) {
-    if (!value.ptr || value.len < 2 || value.len > 128 || value.ptr[0] != '"' ||
-        value.ptr[i64{value.len} - 1] != '"')
+    if (!value.ptr || value.len < 2 || value.len > kMaxStrongEtagLength || value.ptr[0] != '"' ||
+        value.ptr[value.len - 1] != '"')
         return false;
-    for (u32 i = 1; i64{i} + 1 < i64{value.len}; ++i) {
-        const auto kByte = static_cast<u8>(value.ptr[i]);
+    for (u32 i = 1; i < value.len - 1; ++i) {
+        const auto kByte = byte_value(value.ptr[i]);
         if (kByte != 0x21 && (kByte < 0x23 || kByte > 0x7e)) return false;
     }
     return true;
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::append(Str bytes) {
+    const auto cursor = range_int{wire_len_};
+    using WireLength = range_int<0, kMaxWire + 1>;
+    WireLength end;
     if (result_ != Result::More || (bytes.len && !bytes.ptr) ||
-        i64{bytes.len} > i64{kMaxWire} - i64{wire_len_})
+        !WireLength::try_from_i64((cursor + range_int{bytes.len}).value(), &end))
         return result_ = Result::Error;
-    if (bytes.len) __builtin_memcpy(wire_ + i64{wire_len_}, bytes.ptr, bytes.len);
-    wire_len_ = static_cast<u32>(static_cast<i64>(wire_len_) + static_cast<i64>(bytes.len));
+    if (bytes.len) __builtin_memcpy(wire_ + cursor.index(), bytes.ptr, bytes.len);
+    wire_len_ = end.to<u32>();
     return result_ = consume();
 }
 
 BoundedJsonResponse::Result BoundedJsonResponse::consume() {
-    const u32 kBodyLimit = dns_ ? kJwksDnsMessageLimit : kMaxBody;
+    const auto body_limit = range_int{dns_ ? kJwksDnsMessageLimit : kMaxBody};
     if (!headers_) {
         HttpResponseParser parser{};
         ParsedResponse response{};
@@ -123,7 +135,7 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
             (authorization_ && !callout_ && response.status_code != 200 &&
              response.status_code != 401 && response.status_code != 403) ||
             response.headers_truncated || response.content_length_count > 1 ||
-            (response.content_length > kBodyLimit &&
+            (response.content_length > body_limit.value() &&
              !((callout_ || conditional_jwks_) && response.status_code == 304)))
             return Result::Error;
         u32 transfer_count = 0, type_count = 0, encoding_count = 0;
@@ -143,9 +155,9 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
                 if (++type_count != 1) return Result::Error;
                 u32 end = 0;
                 while (end < header.value.len && header.value.ptr[end] != ';') ++end;
-                while (end && (header.value.ptr[i64{end} - 1] == ' ' ||
-                               header.value.ptr[i64{end} - 1] == '\t'))
-                    end = static_cast<u32>(static_cast<i64>(end) - 1);
+                while (end &&
+                       (header.value.ptr[end - 1] == ' ' || header.value.ptr[end - 1] == '\t'))
+                    --end;
                 const Str kType{header.value.ptr, end};
                 if (dns_ && !equal_ci(header.value, lit_str("application/dns-message")))
                     return Result::Error;
@@ -170,22 +182,31 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         offset_ = parser.header_end;
         chunks_.reset();
     }
+    const auto wire_size = range_int{wire_len_};
     if (chunked_) {
         // A zero-input step is needed to recognize a just-finished data region.
         for (u32 steps = 0; steps <= kMaxWire; ++steps) {
+            const auto cursor = range_int{offset_};
+            u32 available;
+            if (!(wire_size - cursor).to(&available)) return Result::Error;
+            const char* const input = wire_ + cursor.index();
             u32 consumed = 0, start = 0, length = 0;
             const auto kStatus = chunks_.feed(
-                reinterpret_cast<const u8*>(wire_ + i64{offset_}),
-                static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_)),
-                &consumed,
-                &start,
-                &length);
-            if (i64{length} > i64{kBodyLimit} - i64{body_len_}) return Result::Error;
-            if (length)
-                __builtin_memcpy(body_ + i64{body_len_}, wire_ + i64{offset_} + i64{start}, length);
-            body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(length));
-            offset_ = static_cast<u32>(static_cast<i64>(offset_) + static_cast<i64>(consumed));
+                reinterpret_cast<const u8*>(input), available, &consumed, &start, &length);
             if (kStatus == ChunkStatus::Error) return Result::Error;
+            const auto body_cursor = range_int{body_len_};
+            const auto source_start = range_int{start};
+            const auto copied = range_int{length};
+            auto next_body = body_cursor;
+            auto next_input = cursor;
+            if (!body_limit.try_count((body_cursor + copied).value(), &next_body) ||
+                !wire_size.try_count((cursor + range_int{consumed}).value(), &next_input) ||
+                (length && (source_start + copied).value() > consumed))
+                return Result::Error;
+            if (length)
+                __builtin_memcpy(body_ + body_cursor.index(), input + source_start.index(), length);
+            body_len_ = next_body.to<u32>();
+            offset_ = next_input.to<u32>();
             if (kStatus == ChunkStatus::Done)
                 return offset_ == wire_len_ ? Result::Complete : Result::Error;
             if (kStatus == ChunkStatus::NeedMore) return Result::More;
@@ -193,13 +214,17 @@ BoundedJsonResponse::Result BoundedJsonResponse::consume() {
         }
         return Result::Error;
     }
-    const u32 kAvailable =
-        static_cast<u32>(static_cast<i64>(wire_len_) - static_cast<i64>(offset_));
-    if (i64{kAvailable} > i64{kBodyLimit} - i64{body_len_} ||
-        (sized_ && i64{kAvailable} > i64{expected_} - i64{body_len_}))
+    const auto input_cursor = range_int{offset_};
+    const auto body_cursor = range_int{body_len_};
+    u32 available;
+    if (!(wire_size - input_cursor).to(&available)) return Result::Error;
+    const auto limit = sized_ ? body_limit.min(range_int{expected_}) : body_limit;
+    auto next_body = body_cursor;
+    if (!limit.try_count((body_cursor + range_int{available}).value(), &next_body))
         return Result::Error;
-    if (kAvailable) __builtin_memcpy(body_ + i64{body_len_}, wire_ + i64{offset_}, kAvailable);
-    body_len_ = static_cast<u32>(static_cast<i64>(body_len_) + static_cast<i64>(kAvailable));
+    if (available)
+        __builtin_memcpy(body_ + body_cursor.index(), wire_ + input_cursor.index(), available);
+    body_len_ = next_body.to<u32>();
     offset_ = wire_len_;
     return sized_ && body_len_ == expected_ ? Result::Complete : Result::More;
 }
@@ -276,6 +301,8 @@ bool HttpsFetch::init(const HttpsEndpoint& endpoint, bool retry_after_jwks) {
     return true;
 }
 bool HttpsFetch::prepare_jwks_request(Str entity_tag) {
+    EtagLength tag_length;
+    if (!EtagLength::try_from_u64(entity_tag.len, &tag_length)) return false;
     const int kSize = snprintf(
         request_,
         sizeof(request_),
@@ -283,13 +310,15 @@ bool HttpsFetch::prepare_jwks_request(Str entity_tag) {
         "Accept-Encoding: identity\r\nConnection: close\r\n%s%.*s%s\r\n",
         endpoint_.path,
         endpoint_.tls.server_name,
-        endpoint_.port,
+        range_int{endpoint_.port}.to<u32>(),
         entity_tag.len ? "If-None-Match: " : "",
-        static_cast<int>(entity_tag.len),
+        tag_length.to<i32>(),
         entity_tag.ptr ? entity_tag.ptr : "",
         entity_tag.len ? "\r\n" : "");
-    if (kSize <= 0 || static_cast<u32>(kSize) >= sizeof(request_)) return false;
-    request_len_ = static_cast<u32>(kSize);
+    using FormattedLength = range_int<1, sizeof(request_)>;
+    FormattedLength length;
+    if (!FormattedLength::try_from_i64(kSize, &length)) return false;
+    request_len_ = length.to<u32>();
     return true;
 }
 bool HttpsFetch::set_jwks_condition(Str entity_tag) {
@@ -333,12 +362,17 @@ bool HttpsFetch::set_dns_query(Str query) {
         "Accept-Encoding: identity\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
         endpoint_.path,
         endpoint_.tls.server_name,
-        endpoint_.port,
+        range_int{endpoint_.port}.to<u32>(),
         query.len);
-    const i64 kLength = i64{kHeaderLength} + i64{query.len};
-    if (kHeaderLength <= 0 || kLength > i64{sizeof(request_)}) return false;
-    __builtin_memcpy(request_ + kHeaderLength, query.ptr, query.len);
-    request_len_ = static_cast<u32>(kLength);
+    using HeaderLength = range_int<1, sizeof(request_)>;
+    using RequestLength = range_int<1, sizeof(request_) + 1>;
+    HeaderLength header;
+    RequestLength length;
+    if (!HeaderLength::try_from_i64(kHeaderLength, &header) ||
+        !RequestLength::try_from_i64((header + range_int{query.len}).value(), &length))
+        return false;
+    __builtin_memcpy(request_ + header.index(), query.ptr, query.len);
+    request_len_ = length.to<u32>();
     return true;
 }
 bool HttpsFetch::set_address(Str address) {
@@ -423,23 +457,35 @@ bool HttpsFetch::handshake(HttpsFetch& self) {
     return true;
 }
 bool HttpsFetch::write(HttpsFetch& self) {
+    using RequestLength = range_int<0, sizeof(self.request_) + 1>;
+    RequestLength length;
+    if (!RequestLength::try_from_u64(self.request_len_, &length)) return self.fail();
+    const auto cursor = range_int{self.sent_};
+    RequestLength remaining;
+    if (!RequestLength::try_from_i64((length - cursor).value(), &remaining) ||
+        remaining.value() == 0)
+        return self.fail();
     ERR_clear_error();
-    const int kResult = SSL_write(
-        self.ssl_,
-        self.request_ + i64{self.sent_},
-        static_cast<int>(static_cast<i64>(self.request_len_) - static_cast<i64>(self.sent_)));
+    const int kResult = SSL_write(self.ssl_, self.request_ + cursor.index(), remaining.to<i32>());
     if (kResult <= 0) return retry_ssl(self.ssl_, kResult) ? false : self.fail();
-    self.sent_ = static_cast<u32>(static_cast<i64>(self.sent_) + kResult);
+    const auto end = cursor + range_int{kResult};
+    RequestLength sent;
+    if (!length.try_count(end.value(), &sent)) return self.fail();
+    self.sent_ = sent.to<u32>();
     if (self.sent_ == self.request_len_) self.step_ = read;
     return true;
 }
 bool HttpsFetch::read(HttpsFetch& self) {
     char bytes[4096];
+    constexpr auto kCapacity = range_int<sizeof(bytes), sizeof(bytes) + 1>{};
     ERR_clear_error();
-    const int kResult = SSL_read(self.ssl_, bytes, sizeof(bytes));
+    const int kResult = SSL_read(self.ssl_, bytes, kCapacity.to<i32>());
     BoundedJsonResponse::Result result;
     if (kResult > 0) {
-        result = self.response_.append({bytes, static_cast<u32>(kResult)});
+        using ReadLength = range_int<1, sizeof(bytes) + 1>;
+        ReadLength length;
+        if (!ReadLength::try_from_i64(kResult, &length)) return self.fail();
+        result = self.response_.append({bytes, length.to<u32>()});
     } else {
         const int kError = SSL_get_error(self.ssl_, kResult);
         if (kError == SSL_ERROR_WANT_READ || kError == SSL_ERROR_WANT_WRITE) return false;
