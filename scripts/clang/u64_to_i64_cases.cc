@@ -1,5 +1,6 @@
 #include "rut/common/integer_conversion.h"
 #include "rut/common/range_int.h"
+#include "rut/common/types.h"
 
 #include <limits.h>
 
@@ -319,6 +320,9 @@ u8 bit_cast_enum(ByteTag tag) {
 }
 
 static_assert(byte_value('A') == 65);
+static_assert(byte_value('\xff') == 255);
+static_assert(lit_str("").len == 0);
+static_assert(lit_str("rut").len == 3);
 static_assert(signed_wrapping_value(u64{1} << 63) == INT64_MIN);
 static_assert(signed_wrapping_value(UINT64_MAX) == -1);
 static_assert(signed_wrapping_value(u64{INT64_MAX}) == INT64_MAX);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rut/common/types.h"
+#include "rut/common/integer_types.h"
 
 namespace rut {
 

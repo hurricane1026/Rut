@@ -1,7 +1,6 @@
 #pragma once
 
-#include <stddef.h>
-#include <stdint.h>
+#include "rut/common/range_int.h"
 
 // Compile-time feature switches. WebSocket/Upgrade passthrough is ON by default;
 // build with -DRUT_ENABLE_WEBSOCKET=0 (e.g. a minimal k8s mesh sidecar that never
@@ -20,20 +19,12 @@
 
 namespace rut {
 
-using u8 = uint8_t;
-using u16 = uint16_t;
-using u32 = uint32_t;
-using u64 = uint64_t;
-using i8 = int8_t;
-using i16 = int16_t;
-using i32 = int32_t;
-using i64 = int64_t;
 using f32 = float;
 using f64 = double;
 
 // Interpret a char from a byte stream as an unsigned octet on either char ABI.
 [[nodiscard]] constexpr u8 byte_value(char value) {
-    return static_cast<u8>(value);
+    return bounded_remainder<256>(value).to<u8>();
 }
 
 // Non-owning string view (no stdlib dependency)
@@ -55,14 +46,14 @@ struct Str {
         // Invalid ranges are an empty view; validate before forming the pointer
         // so a malformed parser span cannot create an out-of-bounds address.
         if (ptr == nullptr || start > end || end > len) return {nullptr, 0};
-        return {ptr + i64{start},
-                static_cast<u32>(static_cast<i64>(end) - static_cast<i64>(start))};
+        return {ptr + range_int{start}.index(), range_int{end - start}.to<u32>()};
     }
 };
 
 template <size_t N>
-constexpr Str lit_str(const char (&s)[N]) {
-    return {s, static_cast<u32>(N - 1)};
+    requires(N > 0 && N - 1 <= UINT32_MAX)
+[[nodiscard]] constexpr Str lit_str(const char (&s)[N]) {
+    return {s, range_int<N - 1, N>{}.template to<u32>()};
 }
 
 // Fixed-capacity vector, no heap allocation
@@ -79,7 +70,7 @@ struct FixedVec {
     T& operator[](u32 i) { return data[i]; }
     const T& operator[](u32 i) const { return data[i]; }
     T* begin() { return data; }
-    T* end() { return data + static_cast<i64>(len); }
+    [[nodiscard]] T* end() { return data + range_int{len}.index(); }
     [[nodiscard]] bool full() const { return len >= Cap; }
     [[nodiscard]] bool empty() const { return len == 0; }
 };

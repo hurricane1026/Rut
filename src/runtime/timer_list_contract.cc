@@ -1,4 +1,5 @@
 #include "rut/common/range_int.h"
+#include "rut/common/types.h"
 
 namespace rut {
 namespace {
