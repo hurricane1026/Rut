@@ -195,12 +195,12 @@ TEST(http2_websocket, close_acknowledgements_wait_for_send_completions_and_close
     CHECK(f.x->deadline_us != 0);
     const u64 deadline = f.x->deadline_us;
     u32 length = 0;
-    (void)ws_h2_output(*f.x, true, &length);
+    REQUIRE(ws_h2_output(*f.x, true, &length) != nullptr);
     REQUIRE(ws_h2_consume_output(*f.x, true, length));
     CHECK(!f.x->request_end);
     CHECK(!f.x->ws->callback.ws_close_upstream_sent);
     ws_h2_sent(*f.x, true);
-    (void)ws_h2_output(*f.x, false, &length);
+    REQUIRE(ws_h2_output(*f.x, false, &length) != nullptr);
     REQUIRE(ws_h2_consume_output(*f.x, false, length));
     ws_h2_sent(*f.x, false);
     CHECK(f.x->response_end);
@@ -488,7 +488,7 @@ void on_reset(void* ctx, Http2Conn&, u32 sid, Http2Error err) {
 struct CoalescedHeadLoop {};
 
 void on_coalesced_head_headers(
-    void* ctx, Http2Conn& h2, u32 sid, const hpack::Header* hs, u32 n, bool) {
+    void* ctx, Http2Conn&, u32 sid, const hpack::Header* hs, u32 n, bool) {
     auto* d = static_cast<H2Dispatch<CoalescedHeadLoop>*>(ctx);
     bool is_head = false;
     for (u32 i = 0; i < n; i++)
@@ -502,7 +502,6 @@ void on_coalesced_head_headers(
     } else {
         h2_emit_status(*d, sid, 204);
     }
-    (void)h2;
 }
 
 void setup(Http2Conn& c, Capture& cap) {
@@ -756,7 +755,7 @@ TEST(http2_conn, ping_is_acked) {
     h.type = static_cast<u8>(Http2FrameType::Ping);
     h.flags = 0;
     h.stream_id = 0;
-    (void)write_frame_header(ping, h);
+    REQUIRE_EQ(write_frame_header(ping, h), kFrameHeaderSize);
     for (u32 i = 0; i < 8; i++) ping[kFrameHeaderSize + i] = static_cast<u8>(i + 1);
     u8 in[64];
     u32 inlen = with_preface(in, ping, sizeof(ping));
@@ -952,7 +951,7 @@ TEST(http2_conn, continuation_assembles_header_block) {
     hh.type = static_cast<u8>(Http2FrameType::Headers);
     hh.flags = 0;  // no END_HEADERS, no END_STREAM
     hh.stream_id = 1;
-    (void)write_frame_header(frame + fn, hh);
+    REQUIRE_EQ(write_frame_header(frame + fn, hh), kFrameHeaderSize);
     frame[fn + kFrameHeaderSize] = 0x82;
     fn += kFrameHeaderSize + 1;
     Http2FrameHeader ch;
@@ -960,7 +959,7 @@ TEST(http2_conn, continuation_assembles_header_block) {
     ch.type = static_cast<u8>(Http2FrameType::Continuation);
     ch.flags = http2_flag::kEndHeaders;
     ch.stream_id = 1;
-    (void)write_frame_header(frame + fn, ch);
+    REQUIRE_EQ(write_frame_header(frame + fn, ch), kFrameHeaderSize);
     frame[fn + kFrameHeaderSize] = 0x84;
     fn += kFrameHeaderSize + 1;
     u8 in[128];
@@ -985,7 +984,7 @@ TEST(http2_conn, push_promise_from_client_is_protocol_error) {
     h.type = static_cast<u8>(Http2FrameType::PushPromise);
     h.flags = 0;
     h.stream_id = 1;
-    (void)write_frame_header(pp, h);
+    REQUIRE_EQ(write_frame_header(pp, h), kFrameHeaderSize);
     u8 in[64];
     u32 inlen = with_preface(in, pp, sizeof(pp));
     u8 out[256];
@@ -1319,9 +1318,9 @@ u32 put_frame(u8* out, Http2FrameType type, u8 flags, u32 stream_id, const u8* p
     h.type = static_cast<u8>(type);
     h.flags = flags;
     h.stream_id = stream_id;
-    (void)write_frame_header(out, h);
-    for (u32 i = 0; i < plen; i++) out[kFrameHeaderSize + i] = payload[i];
-    return kFrameHeaderSize + plen;
+    const u32 header_size = write_frame_header(out, h);
+    for (u32 i = 0; i < plen; i++) out[header_size + i] = payload[i];
+    return header_size + plen;
 }
 }  // namespace
 
@@ -1431,7 +1430,7 @@ TEST(http2_conn, oversized_frame_goaway) {
     h.type = static_cast<u8>(Http2FrameType::Data);
     h.flags = 0;
     h.stream_id = 1;
-    (void)write_frame_header(fh, h);
+    REQUIRE_EQ(write_frame_header(fh, h), kFrameHeaderSize);
     u8 in[64];
     u32 inlen = with_preface(in, fh, sizeof(fh));
     u8 out[256];
@@ -3488,7 +3487,7 @@ TEST(h2_serving, partial_frame_promotion_handles_nonzero_sub_frame_tail_capacity
     Http2FrameHeader frame{};
     frame.type = 0xff;
     frame.length = kDefaultMaxFrameSize;
-    (void)write_frame_header(conn.recv_buf.write_ptr(), frame);
+    REQUIRE_EQ(write_frame_header(conn.recv_buf.write_ptr(), frame), kFrameHeaderSize);
     conn.recv_buf.commit(kFrameHeaderSize);
     const u32 filled = conn.recv_buf.len();
     __builtin_memset(conn.recv_buf.write_ptr(), 0x5a, conn.recv_buf.write_avail());
@@ -3522,7 +3521,7 @@ TEST(h2_serving, partial_frame_promotion_failure_preserves_owned_slice) {
     Http2FrameHeader frame{};
     frame.type = 0xff;
     frame.length = kDefaultMaxFrameSize;
-    (void)write_frame_header(partial, frame);
+    REQUIRE_EQ(write_frame_header(partial, frame), kFrameHeaderSize);
     partial[kFrameHeaderSize] = 0x5a;
     conn.recv_buf.write(partial, sizeof(partial));
     u8* original = conn.recv_slice;

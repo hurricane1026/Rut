@@ -217,9 +217,8 @@ TEST(buffer, release_sets_flag) {
     Buffer buf(storage, sizeof(storage));
     buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
     CHECK(!buf.is_released());
-    View view = buf.release();
+    [[maybe_unused]] View view = buf.release();
     CHECK(buf.is_released());
-    (void)view;
 }
 
 // === Full cycle: write → release → read → destroy → write again ===
@@ -391,11 +390,10 @@ TEST(copilot, release_flag_prevents_double) {
     u8 storage[16];
     Buffer buf(storage, sizeof(storage));
     buf.append_prefix(reinterpret_cast<const u8*>("hi"), 2);
-    View view = buf.release();
+    [[maybe_unused]] View view = buf.release();
     CHECK(buf.is_released());
     // Double release would trap; only verify precondition state here
     // buf.release();  // would trap
-    (void)view;
 }
 
 // #4: read is const — can pass const View& and const Buffer&
@@ -432,12 +430,11 @@ TEST(copilot2, dest_released_move_assign_guarded) {
 
     Buffer b2(s2, sizeof(s2));
     b2.append_prefix(reinterpret_cast<const u8*>("bb"), 2);
-    View view = b2.release();
+    [[maybe_unused]] View view = b2.release();
     CHECK(b2.is_released());
     // b2 = static_cast<Buffer&&>(b1);  // would trap — dest is released
     // Can't exercise the trap directly; verify the precondition flag only
     CHECK(b2.is_released());
-    (void)view;
 }
 
 // #2 (round 2): restore_owner resets len — verify documented behavior
@@ -447,8 +444,7 @@ TEST(copilot2, restore_resets_len_documented) {
     buf.append_prefix(reinterpret_cast<const u8*>("hello"), 5);
     CHECK_EQ(buf.len(), 5u);
     {
-        View view = buf.release();
-        (void)view;
+        [[maybe_unused]] View view = buf.release();
     }
     // After View destroyed: len is 0 (documented: data consumed, fresh start)
     CHECK_EQ(buf.len(), 0u);
@@ -585,7 +581,7 @@ TEST(io_boundary, bind_clears_released_state) {
     // where all Views are guaranteed dead. Simulate by scoping the moved View.
     {
         View moved = static_cast<View&&>(view);
-        (void)moved;
+        CHECK(moved.valid());
     }
     // After moved View is destroyed, original is invalidated. Now bind.
     buf.bind(storage, sizeof(storage));

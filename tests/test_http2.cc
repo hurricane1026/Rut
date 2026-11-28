@@ -8,26 +8,23 @@ using namespace rut;
 
 namespace {
 // Round-trip a frame header through write + parse.
-Http2FrameHeader roundtrip(u32 length, Http2FrameType type, u8 flags, u32 stream_id) {
+[[nodiscard]] ParseStatus roundtrip(
+    u32 length, Http2FrameType type, u8 flags, u32 stream_id, Http2FrameHeader* out) {
     u8 buf[kFrameHeaderSize];
     Http2FrameHeader in;
     in.length = length;
     in.type = static_cast<u8>(type);
     in.flags = flags;
     in.stream_id = stream_id;
-    (void)write_frame_header(buf, in);
-    Http2FrameHeader out;
-    out.length = 0;
-    out.type = 0;
-    out.flags = 0;
-    out.stream_id = 0;
-    (void)parse_frame_header(buf, sizeof(buf), &out);
-    return out;
+    const u32 written = write_frame_header(buf, in);
+    return parse_frame_header(buf, written, out);
 }
 }  // namespace
 
 TEST(http2_frame, header_roundtrip) {
-    Http2FrameHeader h = roundtrip(16384, Http2FrameType::Data, http2_flag::kEndStream, 5);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(roundtrip(16384, Http2FrameType::Data, http2_flag::kEndStream, 5, &h),
+               ParseStatus::Complete);
     CHECK_EQ(h.length, 16384u);
     CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Data));
     CHECK_EQ(h.flags, http2_flag::kEndStream);
@@ -36,7 +33,9 @@ TEST(http2_frame, header_roundtrip) {
 
 TEST(http2_frame, header_max_values) {
     // Max 24-bit length, max 31-bit stream id.
-    Http2FrameHeader h = roundtrip(0xffffff, Http2FrameType::Headers, 0xff, 0x7fffffff);
+    Http2FrameHeader h{};
+    REQUIRE_EQ(roundtrip(0xffffff, Http2FrameType::Headers, 0xff, 0x7fffffff, &h),
+               ParseStatus::Complete);
     CHECK_EQ(h.length, 0xffffffu);
     CHECK_EQ(h.stream_id, 0x7fffffffu);
     CHECK_EQ(h.flags, 0xffu);
@@ -64,7 +63,7 @@ TEST(http2_frame, write_truncates_oversized_fields) {
     in.type = static_cast<u8>(Http2FrameType::Ping);
     in.flags = 0;
     in.stream_id = 0xffffffffu;  // -> 0x7fffffff after 31-bit mask
-    (void)write_frame_header(buf, in);
+    REQUIRE_EQ(write_frame_header(buf, in), kFrameHeaderSize);
     Http2FrameHeader out;
     CHECK_EQ(parse_frame_header(buf, sizeof(buf), &out), ParseStatus::Complete);
     CHECK_EQ(out.length, 0x000001u);

@@ -14,19 +14,11 @@ namespace rut {
 //        once the trailing empty run is skipped
 //   P3a: case-sensitive — bytes are preserved verbatim, no tolower
 //
-// Returns the segment count, or kMaxPathSegments + 1 as a sentinel when the
-// path would produce more segments than `out` can hold. The two callers
-// treat the sentinel differently:
-//   - insert() rejects sentinel results at build time (registering a
-//     truncated path would land the route at the wrong depth relative
-//     to what the user wrote).
-//   - match() ignores the sentinel and routes using whatever segment
-//     prefix `out` does hold, so a request that exceeds the cap still
-//     hits the deepest applicable terminal — preserving catchall and
-//     longest-prefix semantics rather than failing-closed on input
-//     length alone (Codex P1 caught the earlier fail-closed match()).
-
-u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out) {
+// Return the number of retained segments. Registration uses a sentinel
+// when storage fills so a truncated path cannot create a route.
+[[nodiscard]] u32 RouteTrie::tokenize_segments(Str path,
+                                               FixedVec<Str, kMaxPathSegments>& out,
+                                               SegmentLimit limit) {
     // Pure segment split — query/fragment stripping is the caller's
     // job. Routes arrive here via RouteConfig::add_* which already
     // rejected inputs containing '?' / '#', so insert() sees a clean
@@ -41,7 +33,7 @@ u32 RouteTrie::tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out)
         if (i > start) {
             if (!out.push(Str{path.ptr + i64{start},
                               static_cast<u32>(static_cast<i64>(i) - static_cast<i64>(start))}))
-                return u32{i64{kMaxPathSegments} + 1};
+                return limit == SegmentLimit::KeepPrefix ? out.len : u32{i64{kMaxPathSegments} + 1};
         }
         start = static_cast<u32>(static_cast<i64>(i) + 1);
     }
@@ -91,7 +83,7 @@ bool RouteTrie::insert(Str path, u8 method_char, u16 route_idx) {
     if (slot == kMethodSlotInvalid) return false;
 
     FixedVec<Str, kMaxPathSegments> segs{};
-    const u32 n = tokenize_segments(path, segs);
+    const u32 n = tokenize_segments(path, segs, SegmentLimit::Reject);
     // Sentinel: a path with more segments than we can hold is rejected
     // at insert time. Silently truncating would create a route
     // registered at the wrong depth relative to what the user wrote.
@@ -275,13 +267,9 @@ u16 RouteTrie::match_key(Str path,
     }
 
     FixedVec<Str, kMaxPathSegments> segs;
-    // Ignore tokenize's return value on overflow: `segs` still holds
-    // the first kMaxPathSegments, and we want to walk the trie as deep
-    // as we have data for. Bailing out on overflow would let a request
-    // that's deeper than cap bypass a '/' catchall or a matching
-    // prefix route — insert() already rejects too-deep route configs,
-    // so the trie never contains a terminal we'd miss.
-    (void)tokenize_segments(path, segs);
+    // On overflow the retained prefix still participates in catchall and
+    // longest-prefix matching. Insert rejects routes beyond this depth.
+    const u32 segment_count = tokenize_segments(path, segs, SegmentLimit::KeepPrefix);
     // Keep only the active DFS path, not a node-pool-sized collection of
     // copied capture arrays. Each pushed frame is initialized before reading.
     struct Frame {
@@ -336,10 +324,10 @@ u16 RouteTrie::match_key(Str path,
                      frame.static_mask);
             // A complete all-literal match has maximal depth and specificity.
             // No parameter sibling can improve it; captures are necessarily empty.
-            if (best.route_idx != TrieNode::kInvalidRoute && best.depth == segs.len &&
+            if (best.route_idx != TrieNode::kInvalidRoute && best.depth == segment_count &&
                 best.static_segments == best.depth)
                 return best.route_idx;
-            if (frame.depth >= segs.len) {
+            if (frame.depth >= segment_count) {
                 stack.len = static_cast<u32>(static_cast<i64>(stack.len) - 1);
                 continue;
             }
