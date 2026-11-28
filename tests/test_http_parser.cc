@@ -1041,7 +1041,7 @@ TEST(HeaderValue, ExtendedChars) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.header_count, 1u);
 }
 
@@ -1057,7 +1057,7 @@ TEST(HeaderValue, Byte0xFF) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK_EQ(req.header_count, 2u);
 }
 
@@ -1071,7 +1071,7 @@ TEST(HeaderValue, TabInValue) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"value", 5}));
 }
 
@@ -1085,7 +1085,7 @@ TEST(HeaderValue, EmptyValue) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"", 0}));
 }
 
@@ -1099,7 +1099,7 @@ TEST(HeaderValue, LeadingTrailingOWS) {
         "\r\n",
         &req,
         &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Complete));
+    CHECK_EQ(s, ParseStatus::Complete);
     CHECK(req.headers[0].value.eq(Str{"example.com", 11}));
 }
 
@@ -1178,7 +1178,7 @@ TEST(ContentLength, Overflow) {
 
     auto s = parse_one(
         "PUT /url HTTP/1.1\r\nContent-Length: 1000000000000000000000\r\n\r\n", &req, &parser);
-    CHECK_EQ(static_cast<u8>(s), static_cast<u8>(ParseStatus::Error));
+    CHECK_EQ(s, ParseStatus::Error);
 }
 
 TEST(ContentLength, MaxU32PlusOne) {
