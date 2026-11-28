@@ -371,7 +371,7 @@ namespace {
     // Room the trailing content-length line needs when there's a body, reserved
     // during the loop so the loop can't fill hblock and then overflow on the CL.
     const bool has_content_length = body_len > 0 || (headers_only && advertised_length >= 0);
-    const i64 cl_value = headers_only ? advertised_length : i64{body_len};
+    const i64 cl_value = headers_only && advertised_length >= 0 ? advertised_length : i64{body_len};
     const i64 kClReserve = has_content_length ? 14 + 19 + hpack_field_overhead(14, 19) : 0;
     for (u32 i = 0; i < nhdrs; i++) {
         const auto field_size = range_int{hdrs[i].name.len} + range_int{hdrs[i].value.len};

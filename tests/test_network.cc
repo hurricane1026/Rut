@@ -90637,7 +90637,9 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
     c->req_method = static_cast<u8>(LogHttpMethod::Get);
     c->request_upload_complete = true;
     c->resp_body_mode = BodyMode::ContentLength;
-    c->resp_body_remaining = 4 * kChunk;
+    c->resp_body_remaining = i64{UINT32_MAX} + 2 * i64{kChunk};
+    c->resp_body_sent = i64{UINT32_MAX} + 17;
+    c->relay_owner.body_bytes = i64{UINT32_MAX} + 9;
     CHECK(g.loop->response_splice_eligible(*c));
     g.loop->backend.active_upstream_episode[c->id] = 2;
     CHECK_FALSE(g.loop->response_splice_eligible(*c));
@@ -90669,15 +90671,16 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
                static_cast<ssize_t>(sizeof(payload)));
     REQUIRE(g.loop->start_response_splice(*c));
     REQUIRE(c->relay_owner.active());
-    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
-    CHECK_EQ(c->resp_body_sent, kChunk);
+    CHECK_EQ(c->resp_body_remaining, i64{UINT32_MAX} + i64{kChunk});
+    CHECK_EQ(c->resp_body_sent, i64{UINT32_MAX} + 17 + kChunk);
+    CHECK_EQ(c->relay_owner.body_bytes, i64{UINT32_MAX} + 9 + kChunk);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
     u8 received[sizeof(payload)];
     REQUIRE_EQ(recv(downstream[1], received, sizeof(received), 0),
                static_cast<ssize_t>(sizeof(received)));
     CHECK_EQ(memcmp(payload, received, sizeof(payload)), 0);
     g.loop->dispatch({c->id, 1, 0, 0, IoEventType::RelayRead, 0, 0, 2});
-    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
+    CHECK_EQ(c->resp_body_remaining, i64{UINT32_MAX} + i64{kChunk});
     CHECK(c->relay_owner.read_armed);
     REQUIRE_EQ(send(upstream[1], payload, sizeof(payload), MSG_NOSIGNAL),
                static_cast<ssize_t>(sizeof(payload)));
@@ -90687,7 +90690,7 @@ TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe
     CHECK_EQ(ready[0].upstream_episode, 1u);
     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
     g.loop->dispatch(ready[0]);
-    CHECK_EQ(c->resp_body_remaining, 2u * kChunk);
+    CHECK_EQ(c->resp_body_remaining, i64{UINT32_MAX});
     REQUIRE_EQ(recv(downstream[1], received, sizeof(received), 0),
                static_cast<ssize_t>(sizeof(received)));
     CHECK_EQ(memcmp(payload, received, sizeof(payload)), 0);

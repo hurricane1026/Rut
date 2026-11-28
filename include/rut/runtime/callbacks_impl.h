@@ -2922,9 +2922,11 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size_u32;
-        entry.req_size = conn.downstream_req_size > i64{UINT32_MAX}
-                             ? UINT32_MAX
-                             : static_cast<u32>(conn.downstream_req_size);
+        entry.req_size = conn.downstream_req_size < 0
+                             ? 0
+                             : (conn.downstream_req_size > i64{UINT32_MAX}
+                                    ? UINT32_MAX
+                                    : static_cast<u32>(conn.downstream_req_size));
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -2994,7 +2996,11 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, i64 resp_size
         auto* cap = cap_entry;
         __builtin_memset(cap, 0, sizeof(*cap));
         cap->timestamp_us = realtime_us();
-        cap->req_content_length = conn.req_content_length;
+        cap->req_content_length = conn.req_content_length < 0
+                                      ? 0
+                                      : (conn.req_content_length > i64{UINT32_MAX}
+                                             ? UINT32_MAX
+                                             : static_cast<u32>(conn.req_content_length));
         cap->resp_content_length = resp_size_u32;
         cap->resp_status = status;
         cap->raw_header_len = conn.capture_header_len;
