@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/checked_arithmetic.h"
+#include "rut/common/range_int.h"
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
@@ -47,7 +48,9 @@ struct SlicePool {
         const long mib = ::strtol(value, &end, 10);
         const bool valid = errno == 0 && end != value && *end == '\0' && (mib == 32 || mib == 64);
         errno = saved_errno;
-        return valid ? static_cast<u32>(mib) * 4u : 64u;
+        if (!valid) return 64u;
+        // The parser admits only 32 and 64 MiB. Each MiB contains four slices.
+        return mib == 32 ? 128u : 256u;
     }
     u32 study_bulk_cache_limit = parse_study_bulk_cache_limit(::getenv("RUT_STUDY_BULK_CACHE_MIB"));
     bool study_adaptive_cache = ::getenv("RUT_STUDY_ADAPTIVE_CACHE") != nullptr;
@@ -63,16 +66,21 @@ struct SlicePool {
     // the remaining bounded body in whole SlicePool nodes. Keep this reserve
     // with the pool sizing contract so every backend accounts for it equally.
     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
+    static constexpr size_t kResponseBodyOverhead = sizeof(void*) + 3 * sizeof(u32);
     static constexpr u32 kResponseBodyPayload =
-        static_cast<u32>(static_cast<i64>(kSliceSize) - static_cast<i64>(sizeof(void*)) -
-                         3 * static_cast<i64>(sizeof(u32)));
-    static constexpr u32 kMaxBufferedResponseSlices = static_cast<u32>(
-        (static_cast<i64>(kMaxBufferedResponseBody) + static_cast<i64>(kResponseBodyPayload) - 1) /
-        static_cast<i64>(kResponseBodyPayload));
+        (range_int<kSliceSize, kSliceSize + 1>{} -
+         range_int<kResponseBodyOverhead, kResponseBodyOverhead + 1>{})
+            .to<u32>();
+    static constexpr u32 kMaxBufferedResponseSlices =
+        (range_int{kMaxBufferedResponseBody} +
+         range_int<kResponseBodyPayload - 1, kResponseBodyPayload>{})
+            .divided_by<kResponseBodyPayload>()
+            .to<u32>();
     static constexpr u32 kOrdinarySlicesPerConnection = 6;
     static constexpr u32 kSlicesPerConnection =
-        static_cast<u32>(static_cast<i64>(kOrdinarySlicesPerConnection) +
-                         static_cast<i64>(kMaxBufferedResponseSlices));
+        (range_int<kOrdinarySlicesPerConnection, kOrdinarySlicesPerConnection + 1>{} +
+         range_int<kMaxBufferedResponseSlices, kMaxBufferedResponseSlices + 1>{})
+            .to<u32>();
 
     // Bulk relay buffers: large buffers a connection borrows only while it
     // relays a large proxied body, so the body moves in 256 KiB steps.
@@ -225,7 +233,8 @@ struct SlicePool {
             }
             bulk_free = static_cast<u32*>(bulk_free_mem);
 
-            const u32 words = static_cast<u32>((static_cast<i64>(bulk_max_count) + 63) / 64);
+            const u32 words =
+                (range_int{bulk_max_count} + range_int<63, 64>{}).divided_by<64>().to<u32>();
             bulk_in_use_size = u64{words} * sizeof(u64);
             void* bulk_in_use_mem = mmap(nullptr,
                                          bulk_in_use_size,
@@ -252,9 +261,9 @@ struct SlicePool {
         if (prealloc > 0) {
             if (prealloc > n) prealloc = n;
             // Round up to kGrowStep for mprotect alignment.
-            u32 steps =
-                static_cast<u32>((static_cast<i64>(prealloc) + static_cast<i64>(kGrowStep) - 1) /
-                                 static_cast<i64>(kGrowStep));
+            const u32 steps = (range_int{prealloc} + range_int<kGrowStep - 1, kGrowStep>{})
+                                  .divided_by<kGrowStep>()
+                                  .to<u32>();
             for (u32 s = 0; s < steps && count < max_count; s++) {
                 if (!grow()) {
                     destroy();
@@ -271,7 +280,7 @@ struct SlicePool {
     u8* alloc() {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
-        u8* ptr = base + i64{idx} * kSliceSize;
+        u8* ptr = base + range_int{idx}.scaled_by<kSliceSize>().index();
         if (cached_count != 0) --cached_count;
         if (in_use_map) in_use_map[idx] = 1;
         return ptr;
@@ -299,8 +308,12 @@ struct SlicePool {
     }
 
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
-        return bulk_base != nullptr && ptr >= bulk_base &&
-               ptr < bulk_base + i64{bulk_max_count} * kBulkSliceSize;
+        if (bulk_base == nullptr || ptr == nullptr) return false;
+        uintptr_t offset;
+        if (sub_overflow(
+                reinterpret_cast<uintptr_t>(ptr), reinterpret_cast<uintptr_t>(bulk_base), &offset))
+            return false;
+        return offset < range_int{bulk_max_count}.scaled_by<kBulkSliceSize>().to_u64();
     }
 
     // Byte capacity of a buffer handed out by alloc() or alloc_bulk().
@@ -321,16 +334,9 @@ struct SlicePool {
             free_bulk(ptr, kBulkSliceSize);
             return;
         }
-        if (!ptr || !base || !free_stack || count == 0) return;
-        if (ptr < base || ptr >= base + i64{count} * kSliceSize) return;
-        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
-        uintptr_t raw_offset = 0;
-        if (sub_overflow(address, begin, &raw_offset)) return;
-        u64 offset = raw_offset;
-        if (offset % kSliceSize != 0) return;  // not slice-aligned
-        if (free_top >= max_count) return;     // overflow guard
-        u32 idx = static_cast<u32>(offset / kSliceSize);
+        if (!free_stack || free_top >= max_count) return;
+        u32 idx;
+        if (!try_slice_index<kSliceSize>(base, count, ptr, &idx)) return;
         if (in_use_map && !in_use_map[idx]) return;  // double-free detection
         if (in_use_map) in_use_map[idx] = 0;
         if (cached_count < cache_limit) {
@@ -351,8 +357,7 @@ struct SlicePool {
 #endif
         // Insert below the cached suffix in O(1). Pushing discarded slices on
         // top would strand the cache after a burst and keep faulting cold pages.
-        const u32 boundary =
-            static_cast<u32>(static_cast<i64>(free_top) - static_cast<i64>(cached_count));
+        const u32 boundary = range_int{free_top - cached_count}.to<u32>();
         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
         free_stack[boundary] = idx;
         ++free_top;
@@ -365,15 +370,9 @@ struct SlicePool {
     // MADV_DONTNEED need not zero the pages. Pure check; touches nothing.
     [[nodiscard]] bool bound_slice_valid([[maybe_unused]] const u8* ptr) const {
 #ifdef __linux__
-        if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
-        if (ptr < base || ptr >= base + i64{count} * kSliceSize) return false;
-        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
-        uintptr_t raw_offset = 0;
-        if (sub_overflow(address, begin, &raw_offset)) return false;
-        const u64 offset = raw_offset;
-        if (offset % kSliceSize != 0) return false;
-        return in_use_map[offset / kSliceSize];
+        u32 idx;
+        return in_use_map && !is_bulk(ptr) && try_slice_index<kSliceSize>(base, count, ptr, &idx) &&
+               in_use_map[idx];
 #else
         return false;
 #endif
@@ -405,10 +404,8 @@ struct SlicePool {
     u32 available() const { return free_top; }
 
     // Number of in-use slices.
-    u32 in_use() const {
-        return count >= free_top
-                   ? static_cast<u32>(static_cast<i64>(count) - static_cast<i64>(free_top))
-                   : 0;
+    [[nodiscard]] u32 in_use() const {
+        return count >= free_top ? range_int{count - free_top}.to<u32>() : 0;
     }
 
     // Release all mmap'd memory.
@@ -453,10 +450,9 @@ struct SlicePool {
     void study_trim_bulk_idle_cache() {
         if (!study_adaptive_cache || study_bulk_borrowed != 0) return;
         for (u32 n = 0; n != 8 && bulk_cached_count > study_bulk_cache_limit; ++n) {
-            const u32 position = static_cast<u32>(static_cast<i64>(bulk_free_top) -
-                                                  static_cast<i64>(bulk_cached_count));
+            const u32 position = range_int{bulk_free_top - bulk_cached_count}.to<u32>();
             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
-            u8* ptr = bulk_base + i64{idx} * kBulkSliceSize;
+            u8* ptr = bulk_base + range_int{idx}.scaled_by<kBulkSliceSize>().index();
 #ifdef __linux__
             if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
                 clear_bulk_bytes(ptr, kBulkSliceSize);
@@ -476,10 +472,28 @@ private:
     static constexpr u32 kDeferredBodyClear = u32{1} << 31;
     static_assert(kMaxBulkSlices < kDeferredBodyClear);
 
+    template <u32 SliceBytes>
+    [[nodiscard]] static bool try_slice_index(const u8* region,
+                                              u32 slices,
+                                              const u8* ptr,
+                                              u32* out) {
+        if (region == nullptr || ptr == nullptr) return false;
+        uintptr_t distance;
+        if (sub_overflow(
+                reinterpret_cast<uintptr_t>(ptr), reinterpret_cast<uintptr_t>(region), &distance) ||
+            distance % SliceBytes != 0)
+            return false;
+        const auto index = bounded_quotient<SliceBytes>(distance);
+        return index.to_u64() < slices && index.to(out);
+    }
+
     void clear_bulk_bytes(u8* ptr, u32 dirty) {
-        if (add_overflow(
-                study_body_bulk_clear_bytes, static_cast<u64>(dirty), &study_body_bulk_clear_bytes))
+        // This diagnostic counter stops counting once full.
+        const u64 bytes = range_int{dirty}.to_u64();
+        if (bytes > UINT64_MAX - study_body_bulk_clear_bytes)
             study_body_bulk_clear_bytes = UINT64_MAX;
+        else
+            study_body_bulk_clear_bytes += bytes;
         __builtin_memset(ptr, 0, dirty);
     }
 
@@ -495,7 +509,7 @@ private:
         if (study_bulk_borrowed > study_bulk_peak_borrowed)
             study_bulk_peak_borrowed = study_bulk_borrowed;
         if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
-        u8* const ptr = bulk_base + i64{idx} * kBulkSliceSize;
+        u8* const ptr = bulk_base + range_int{idx}.scaled_by<kBulkSliceSize>().index();
         if ((entry & kDeferredBodyClear) != 0) {
             u32 dirty = 0;
             __builtin_memcpy(&dirty, ptr, sizeof(dirty));
@@ -549,19 +563,13 @@ private:
         bulk_free_top = 0;
         bulk_cached_count = 0;
         for (u32 i = bulk_max_count; i > 0; --i)
-            bulk_free[bulk_free_top++] = static_cast<u32>(static_cast<i64>(i) - 1);
+            bulk_free[bulk_free_top++] = range_int{i - 1u}.to<u32>();
         return true;
     }
 
     void free_bulk(u8* ptr, u32 dirty, bool defer_body_clear = false) {
-        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(bulk_base);
-        uintptr_t raw_offset = 0;
-        if (sub_overflow(address, begin, &raw_offset)) return;
-        const u64 offset = raw_offset;
-        if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
-        const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
-        if (idx >= bulk_max_count) return;
+        u32 idx;
+        if (!try_slice_index<kBulkSliceSize>(bulk_base, bulk_max_count, ptr, &idx)) return;
         u64& word = bulk_in_use[idx >> 6];
         const u64 bit = u64{1} << (idx & 63u);
         if ((word & bit) == 0) return;  // double-free detection
@@ -597,8 +605,7 @@ private:
 #endif
         // Below the cached suffix, as free() does for slices, so reuse keeps
         // preferring the resident buffers.
-        const u32 boundary =
-            static_cast<u32>(static_cast<i64>(bulk_free_top) - static_cast<i64>(bulk_cached_count));
+        const u32 boundary = range_int{bulk_free_top - bulk_cached_count}.to<u32>();
         if (bulk_cached_count != 0) bulk_free[bulk_free_top] = bulk_free[boundary];
         bulk_free[boundary] = idx;
         ++bulk_free_top;
@@ -609,20 +616,20 @@ private:
     bool grow() {
         if (count >= max_count) return false;
 
-        u32 step = kGrowStep;
-        if (i64{count} + i64{step} > i64{max_count})
-            step = static_cast<u32>(static_cast<i64>(max_count) - static_cast<i64>(count));
+        const auto step = range_int{max_count - count}.min(range_int<kGrowStep, kGrowStep + 1>{});
+        // step <= max_count - count, so the sum remains representable.
+        const u32 next_count = count + step.to<u32>();
 
         // mprotect the next chunk of the reserved VA region
-        u8* chunk = base + i64{count} * kSliceSize;
-        u64 chunk_size = u64{step} * kSliceSize;
+        u8* chunk = base + range_int{count}.scaled_by<kSliceSize>().index();
+        const u64 chunk_size = step.scaled_by<kSliceSize>().to_u64();
         if (mprotect(chunk, chunk_size, PROT_READ | PROT_WRITE) != 0) return false;
 
         // Add new slices to free stack
-        for (u32 i = count; i64{i} < i64{count} + i64{step}; i++) {
+        for (u32 i = count; i < next_count; i++) {
             free_stack[free_top++] = i;
         }
-        count = static_cast<u32>(static_cast<i64>(count) + static_cast<i64>(step));
+        count = next_count;
         return true;
     }
 };
