@@ -3986,6 +3986,44 @@ TEST(response_read_deadline, wide_content_length_capacity_checked_before_sum) {
     CHECK_EQ(out.header_end, 11u);
     CHECK_EQ(out.content_length, 22u);
     CHECK_EQ(out.total_length, 33u);
+
+    static constexpr char kSmallRequest[] =
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\n";
+    conn->recv_buf.reset();
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kSmallRequest), sizeof(kSmallRequest) - 1),
+        sizeof(kSmallRequest) - 1);
+    ResponseReadDeadlineFixedUploadRequest admitted{};
+    REQUIRE(inspect_response_read_deadline_fixed_upload_request(
+        *conn,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        &admitted));
+    CHECK_EQ(admitted.total_length, admitted.header_end + 1);
+
+    const u32 header_end = admitted.header_end;
+    static u8 header_storage[256];
+    __builtin_memcpy(header_storage, conn->recv_buf.data(), header_end);
+    conn->recv_buf.bind(header_storage, header_end + 1);
+    conn->recv_buf.commit(header_end);
+    ResponseReadDeadlineFixedUploadRequest exact_capacity{41, 42, 43};
+    REQUIRE(inspect_response_read_deadline_fixed_upload_request(
+        *conn,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        &exact_capacity));
+    CHECK_EQ(exact_capacity.total_length, header_end + 1);
+    conn->recv_buf.bind(header_storage, header_end);
+    conn->recv_buf.commit(header_end);
+    ResponseReadDeadlineFixedUploadRequest too_small{51, 52, 53};
+    CHECK_FALSE(inspect_response_read_deadline_fixed_upload_request(
+        *conn,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        &too_small));
+    CHECK_EQ(too_small.header_end, 51u);
+    CHECK_EQ(too_small.content_length, 52u);
+    CHECK_EQ(too_small.total_length, 53u);
 }
 
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
