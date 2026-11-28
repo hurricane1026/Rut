@@ -836,11 +836,15 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < 4; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? static_cast<u32>(static_cast<i64>(r.segment_len) -
-                                                        static_cast<i64>(r.segment_sent))
-                                     : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
-                                            ? static_cast<u32>(c.resp_body_remaining)
-                                            : kResponseSpliceChunkSize);
+            if (writing && r.segment_sent > r.segment_len) {
+                this->close_conn(c);
+                return;
+            }
+            const u32 want = writing
+                                 ? (range_int(r.segment_len) - range_int(r.segment_sent)).to<u32>()
+                                 : (c.resp_body_remaining < i64{kResponseSpliceChunkSize}
+                                        ? static_cast<u32>(c.resp_body_remaining)
+                                        : kResponseSpliceChunkSize);
             ssize_t n;
             do {
                 n = writing ? ::splice(r.pipe_read,

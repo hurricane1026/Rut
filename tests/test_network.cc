@@ -3972,7 +3972,7 @@ TEST(response_read_deadline, wide_content_length_capacity_checked_before_sum) {
     Connection* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
     conn->protocol = ConnProtocol::Http11;
-    conn->req_method = u8(LogHttpMethod::Post);
+    conn->req_method = std::to_underlying(LogHttpMethod::Post);
     static constexpr char kRequest[] =
         "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9223372036854775807\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),

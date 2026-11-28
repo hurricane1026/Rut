@@ -469,10 +469,12 @@ void capture_request_metadata(Connection& conn) {
         if (conn.req_body_mode == BodyMode::None) {
             conn.req_initial_send_len = parser.header_end;
         } else if (conn.req_body_mode == BodyMode::ContentLength) {
-            const u32 kBodyInBuf =
-                kLen > parser.header_end
-                    ? static_cast<u32>(static_cast<i64>(kLen) - static_cast<i64>(parser.header_end))
-                    : 0;
+            const u32 kBodyInBuf = kLen > parser.header_end
+                                       ? (range_int(kLen) - range_int(parser.header_end))
+                                             .max(range_int(u32{0}))
+                                             .min(range_int(UINT32_MAX))
+                                             .to<u32>()
+                                       : 0;
             const u32 kBodyInInitial = conn.req_content_length <= i64{kBodyInBuf}
                                            ? range_int(conn.req_content_length)
                                                  .max(range_int(u32{0}))

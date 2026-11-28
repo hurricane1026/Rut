@@ -4467,8 +4467,15 @@ public:
                 return;
             }
             --relay_budget_calls;
+            if (c.resp_body_remaining < 0) {
+                close_conn(c);
+                return;
+            }
             const u32 chunk = c.resp_body_remaining < i64{kResponseSpliceChunkSize}
-                                  ? static_cast<u32>(c.resp_body_remaining)
+                                  ? range_int(c.resp_body_remaining)
+                                        .max(range_int(u32{0}))
+                                        .min(range_int(UINT32_MAX))
+                                        .to<u32>()
                                   : kResponseSpliceChunkSize;
             const u32 want = chunk < relay_budget_bytes / 2 ? chunk : relay_budget_bytes / 2;
             if (study_inside_cq) ++study_cq_splice_calls;

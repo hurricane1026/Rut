@@ -2687,7 +2687,7 @@ TEST(h2_serving, prepared_forward_body_is_rejected_before_pending_clear) {
     REQUIRE(d.resp_len != 0);
     Http2FrameHeader frame;
     REQUIRE(parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete);
-    CHECK_EQ(frame.type, u8(Http2FrameType::Headers));
+    CHECK_EQ(frame.type, std::to_underlying(Http2FrameType::Headers));
     hpack::DynamicTable table;
     table.init(4096);
     hpack::Header decoded[8];

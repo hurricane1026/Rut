@@ -11370,6 +11370,10 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     if (conn.upstream_relay_send_len != 0) return;
 
     const u32 kDataLen = conn.upstream_recv_buf.len();
+    if (conn.resp_body_mode == BodyMode::ContentLength && conn.resp_body_remaining < 0) {
+        loop->close_conn(conn);
+        return;
+    }
     if (conn.response_policy_id != 0 && conn.resp_body_mode == BodyMode::ContentLength &&
         kDataLen > conn.resp_body_remaining) {
         // The strict profile cannot safely recover from bytes beyond its exact
@@ -12133,8 +12137,15 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     const u32 kDataLen = conn.recv_buf.len();
     u32 send_len = kDataLen;
     if (conn.req_body_mode == BodyMode::ContentLength) {
+        if (conn.req_body_remaining < 0) {
+            loop->close_conn(conn);
+            return;
+        }
         const u32 consume = conn.req_body_remaining < i64{kDataLen}
-                                ? static_cast<u32>(conn.req_body_remaining)
+                                ? range_int(conn.req_body_remaining)
+                                      .max(range_int(u32{0}))
+                                      .min(range_int(UINT32_MAX))
+                                      .to<u32>()
                                 : kDataLen;
         conn.req_body_remaining -= i64{consume};
         send_len = consume;
@@ -17088,8 +17099,15 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.resp_body_mode == BodyMode::ContentLength && kInitialBodyLen > 0) {
+        if (conn.resp_body_remaining < 0) {
+            loop->close_conn(conn);
+            return;
+        }
         const u32 consume = conn.resp_body_remaining < i64{kInitialBodyLen}
-                                ? static_cast<u32>(conn.resp_body_remaining)
+                                ? range_int(conn.resp_body_remaining)
+                                      .max(range_int(u32{0}))
+                                      .min(range_int(UINT32_MAX))
+                                      .to<u32>()
                                 : kInitialBodyLen;
         conn.resp_body_remaining -= i64{consume};
     }
