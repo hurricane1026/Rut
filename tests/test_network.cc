@@ -3966,6 +3966,28 @@ TEST(response_buffering, bounded_aliases_complete_content_length_exactly) {
     }
 }
 
+TEST(response_read_deadline, wide_content_length_capacity_checked_before_sum) {
+    SmallLoop loop;
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->protocol = ConnProtocol::Http11;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Post);
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9223372036854775807\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    ResponseReadDeadlineFixedUploadRequest out{11, 22, 33};
+    CHECK_FALSE(inspect_response_read_deadline_fixed_upload_request(
+        *conn,
+        ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero,
+        ForwardResponseBufferingMode::CompleteContentLength,
+        &out));
+    CHECK_EQ(out.header_end, 11u);
+    CHECK_EQ(out.content_length, 22u);
+    CHECK_EQ(out.total_length, 33u);
+}
+
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
     rut::test::RouteConfigFixture duration_owner;
     REQUIRE(duration_owner.config);

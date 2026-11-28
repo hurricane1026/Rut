@@ -903,9 +903,10 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
         return conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
                conn.req_initial_send_len == conn.req_header_end;
     }
-    const i64 exact_end = i64{conn.req_header_end} + i64{conn.req_content_length};
+    if (conn.req_initial_send_len < conn.req_header_end) return false;
+    const i64 received_body = i64{conn.req_initial_send_len} - i64{conn.req_header_end};
     return conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0 &&
-           exact_end == conn.req_initial_send_len;
+           received_body == conn.req_content_length;
 }
 
 // During the initial upstream connect, recv_buf can gain the remainder of the
@@ -1568,10 +1569,13 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
             return false;
         }
     }
-    const i64 total = i64{parser.header_end} + i64{request.content_length};
-    if (host_count != 1 || content_length_count != 1 || total > conn.recv_buf.capacity() ||
-        i64{conn.recv_buf.len()} > total)
+    const i64 capacity = conn.recv_buf.capacity();
+    if (host_count != 1 || content_length_count != 1 || request.content_length < 0 ||
+        i64{parser.header_end} > capacity ||
+        request.content_length > capacity - i64{parser.header_end})
         return false;
+    const i64 total = i64{parser.header_end} + request.content_length;
+    if (i64{conn.recv_buf.len()} > total) return false;
     out->header_end = parser.header_end;
     out->content_length = request.content_length;
     out->total_length = static_cast<u32>(total);
@@ -7032,9 +7036,11 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
                 conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
                 response.status_code == 204 || response.status_code == 205 ||
                 response.status_code == 304;
-            if (response.status_code >= 200 && response.has_content_length && !response_bodyless &&
-                i64{probe_len} < i64{parser.header_end} + i64{response.content_length})
-                break;
+            if (response.status_code >= 200 && response.has_content_length && !response_bodyless) {
+                if (parser.header_end > probe_len ||
+                    response.content_length > i64{probe_len} - i64{parser.header_end})
+                    break;
+            }
             if (response.status_code == 101 || response.status_code >= 200) {
                 complete_early_response = true;
                 upgrade_response_101 = response.status_code == 101;
