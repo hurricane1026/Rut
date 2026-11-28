@@ -458,12 +458,12 @@ struct IoUringBackend {
     // A nonzero monotonic deadline bounds an otherwise blocking wait.
     // conns: connection table — recv completions using provided buffers are
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
-    u32 wait(IoEvent* events,
-             u32 max_events,
-             Connection* conns,
-             u32 max_conns,
-             bool wait_for_event = true,
-             u64 deadline_ns = 0);
+    [[nodiscard]] u32 wait(IoEvent* events,
+                           u32 max_events,
+                           Connection* conns,
+                           u32 max_conns,
+                           bool wait_for_event = true,
+                           u64 deadline_ns = 0);
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 

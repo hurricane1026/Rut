@@ -615,18 +615,16 @@ public:
     const RouteConfig* timer_armed_config = nullptr;
     u64 background_timer_deadline_ns = 0;
 
-    u32 background_timer_wait_ms(u32 limit) const {
+    [[nodiscard]] u32 background_timer_wait_ms(u32 limit) const {
         if (background_timer_deadline_ns == 0) return limit;
-        const u64 now = monotonic_ns();
-        if (background_timer_deadline_ns <= now) return 0;
-        u64 remaining = 0;
-        (void)__builtin_sub_overflow(background_timer_deadline_ns, now, &remaining);
-        const u64 whole_ms = remaining / 1'000'000;
-        // epoll takes a signed millisecond timeout. Saturate before rounding.
-        if (whole_ms >= static_cast<u64>(INT32_MAX))
-            return limit < static_cast<u32>(INT32_MAX) ? limit : static_cast<u32>(INT32_MAX);
-        const i64 ms = static_cast<i64>(whole_ms) + (remaining % 1'000'000 != 0 ? 1 : 0);
-        return ms < static_cast<i64>(limit) ? static_cast<u32>(ms) : limit;
+        u64 remaining;
+        if (sub_overflow(background_timer_deadline_ns, monotonic_ns(), &remaining)) return 0;
+        constexpr u64 kNanosPerMillisecond = 1'000'000;
+        const auto whole = bounded_quotient<kNanosPerMillisecond>(remaining);
+        const auto round = range_int{u8{remaining % kNanosPerMillisecond != 0}};
+        // epoll takes a signed millisecond timeout.
+        constexpr auto kMaxTimeout = range_int<INT32_MAX, i64{INT32_MAX} + 1>{};
+        return (whole + round).min(kMaxTimeout).min(range_int{limit}).to<u32>();
     }
 
     void fire_due_timers() {
@@ -645,14 +643,16 @@ public:
             cfg->timer_count < RouteConfig::kMaxTimers ? cfg->timer_count : RouteConfig::kMaxTimers;
         for (u32 i = 0; i < count; i++) {
             const auto& entry = cfg->timers[i];
-            if (entry.shard >= 0 && static_cast<u32>(entry.shard) != self().shard_id) continue;
+            if (entry.shard >= 0 && entry.shard != range_int{self().shard_id}.template to<i64>())
+                continue;
             if (changed) {
                 timer_deadline_ns[i] = deadline_after(now, entry.interval_ms);
             } else if (now >= timer_deadline_ns[i]) {
                 jit::HandlerCtx ctx{};
                 SliceArena scratch{};
                 if (scratch.init(&self().pool)) {
-                    (void)entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
+                    // Timer bodies use the handler ABI without a request or response.
+                    entry.fn(nullptr, &ctx, nullptr, 0, &scratch);
                     scratch.destroy();
                     timer_fire_count[i]++;
                 }

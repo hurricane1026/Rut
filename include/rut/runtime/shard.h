@@ -107,11 +107,12 @@ struct Shard {
 
     // Initialize shard: mmap EventLoop, init backend + arena.
     // listen_fd must already be created with SO_REUSEPORT.
-    core::Expected<void, Error> init(u32 shard_id,
-                                     i32 lfd,
-                                     u32 pool_prealloc = 0,
-                                     u32 capacity = kDefaultConnectionCapacity,
-                                     u32 upstream_pool_capacity = UpstreamPool::kMaxConns) {
+    [[nodiscard]] core::Expected<void, Error> init(
+        u32 shard_id,
+        i32 lfd,
+        u32 pool_prealloc = 0,
+        u32 capacity = kDefaultConnectionCapacity,
+        u32 upstream_pool_capacity = UpstreamPool::kMaxConns) {
         last_init_failure_detail = IoUringInitFailureDetail::None;
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));

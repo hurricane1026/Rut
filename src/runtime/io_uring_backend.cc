@@ -112,24 +112,23 @@ static i32 io_uring_enter(i32 fd, u32 to_submit, u32 min_complete, u32 flags) {
 
 // Extended enter arguments are supported on kernels with the ring features
 // required by this backend. This deadline adds no SQE or CQE.
-static i32 io_uring_enter_until(i32 fd, u32 to_submit, u32 flags, u64 deadline_ns) {
-    const u64 now = monotonic_ns();
-    if (deadline_ns <= now) return io_uring_enter(fd, to_submit, 0, flags);
-    u64 ns = 0;
-    (void)__builtin_sub_overflow(deadline_ns, now, &ns);
-    IoTimespec timeout{};
-    const u64 seconds = ns / 1'000'000'000;
-    if (seconds > static_cast<u64>(INT64_MAX))
-        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(INT64_MAX);
-    else
-        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(seconds);
-    const i32 nanoseconds = static_cast<i32>(ns % 1'000'000'000);
-    timeout.tv_nsec = nanoseconds;
+[[nodiscard]] static i32 io_uring_enter_until(i32 fd, u32 to_submit, u32 flags, u64 deadline_ns) {
+    u64 ns;
+    if (sub_overflow(deadline_ns, monotonic_ns(), &ns) || ns == 0)
+        return io_uring_enter(fd, to_submit, 0, flags);
+    constexpr u64 kNanosPerSecond = 1'000'000'000;
+    IoTimespec timeout{
+        bounded_quotient<kNanosPerSecond>(ns).to<i64>(),
+        bounded_remainder<kNanosPerSecond>(ns).to<i32>(),
+    };
     io_uring_getevents_arg args{};
-    args.ts = static_cast<decltype(args.ts)>(reinterpret_cast<uintptr_t>(&timeout));
-    const i32 ret = static_cast<i32>(syscall(
-        __NR_io_uring_enter, fd, to_submit, 1u, flags | IORING_ENTER_EXT_ARG, &args, sizeof(args)));
-    return ret >= 0 ? ret : -errno;
+    args.ts = reinterpret_cast<uintptr_t>(&timeout);
+    const i64 result = syscall(
+        __NR_io_uring_enter, fd, to_submit, 1u, flags | IORING_ENTER_EXT_ARG, &args, sizeof(args));
+    if (result < 0) return -errno;
+    i32 submitted;
+    if (!range_int{result}.to(&submitted)) return -EOVERFLOW;
+    return submitted;
 }
 
 static i32 io_uring_register(i32 fd, u32 opcode, const void* arg, u32 nr_args) {
@@ -1321,12 +1320,12 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 
 // --- Wait (submit + harvest) ---
 
-u32 IoUringBackend::wait(IoEvent* events,
-                         u32 max_events,
-                         Connection* conns,
-                         u32 max_conns,
-                         bool wait_for_event,
-                         u64 deadline_ns) {
+[[nodiscard]] u32 IoUringBackend::wait(IoEvent* events,
+                                       u32 max_events,
+                                       Connection* conns,
+                                       u32 max_conns,
+                                       bool wait_for_event,
+                                       u64 deadline_ns) {
     if (failure_code() != 0) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
@@ -1345,7 +1344,10 @@ u32 IoUringBackend::wait(IoEvent* events,
                             ? io_uring_enter_until(ring_fd, pending, flags, deadline_ns)
                             : io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
         if (ret >= 0) {
-            pending = static_cast<u32>(static_cast<i64>(pending) - static_cast<i64>(ret));
+            if (!(range_int{pending} - range_int{ret}).to(&pending)) {
+                record_enter_error(-EPROTO);
+                return 0;
+            }
             break;
         }
         if (ret == -ETIME && timed_wait) break;

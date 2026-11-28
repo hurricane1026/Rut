@@ -771,8 +771,8 @@ public:
                     fetch_busy, kEventCount, this->has_ready_jit_handlers())) {
                 // Advance nonblocking TLS state regularly on an idle shard
                 // without spinning while the fetch socket has no gateway slot.
-                const u32 delay_ms = this->background_timer_wait_ms(10);
-                struct timespec pause = {0, static_cast<long>(delay_ms) * 1'000'000};
+                const auto delay_ms = range_int{this->background_timer_wait_ms(10)};
+                struct timespec pause = {0, delay_ms.template scaled_by<1'000'000>().value()};
                 while (clock_nanosleep(CLOCK_MONOTONIC, 0, &pause, &pause) == EINTR) {
                 }
             }
