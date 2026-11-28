@@ -628,6 +628,31 @@ TEST(http2_conn, peer_settings_gets_ack) {
     CHECK_EQ(c.peer_settings.initial_window_size, 131072u);
 }
 
+TEST(http2_conn, peer_settings_ack_waits_for_output_room) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.preface_seen = true;
+    Http2Settings settings;
+    settings.initial_window_size = 131072;
+    u8 frame[64];
+    const u32 frame_size = write_settings_frame(frame, settings);
+    u8 small[8]{};
+    u32 written = 0;
+    const Http2Result first = c.process(frame, frame_size, small, sizeof(small), &written);
+    CHECK_FALSE(first.close);
+    CHECK_EQ(first.consumed, 0u);
+    CHECK_EQ(written, 0u);
+    CHECK_FALSE(c.peer_settings_seen);
+
+    u8 retry[64]{};
+    const Http2Result second = c.process(frame, frame_size, retry, sizeof(retry), &written);
+    CHECK_FALSE(second.close);
+    CHECK_EQ(second.consumed, frame_size);
+    CHECK_EQ(c.peer_settings.initial_window_size, settings.initial_window_size);
+    CHECK(has_frame(retry, written, Http2FrameType::Settings, http2_flag::kAck, http2_flag::kAck));
+}
+
 TEST(http2_conn, headers_decode_and_deliver) {
     Http2Conn c;
     Capture cap;
@@ -780,6 +805,38 @@ TEST(http2_conn, ping_is_acked) {
     u32 ow = 0;
     CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
     CHECK(has_frame(out, ow, Http2FrameType::Ping, http2_flag::kAck, http2_flag::kAck));
+}
+
+TEST(http2_conn, ping_ack_waits_for_output_room) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.preface_seen = true;
+    constexpr u8 kPayload[]{1, 2, 3, 4, 5, 6, 7, 8};
+    u8 ping[kFrameHeaderSize + sizeof(kPayload)];
+    const Http2FrameHeader h{
+        .length = sizeof(kPayload),
+        .stream_id = 0,
+        .type = std::to_underlying(Http2FrameType::Ping),
+        .flags = 0,
+    };
+    REQUIRE_EQ(write_frame_header(ping, h), kFrameHeaderSize);
+    memcpy(ping + kFrameHeaderSize, kPayload, sizeof(kPayload));
+
+    u8 small[16]{};
+    u32 written = 0;
+    const Http2Result first = c.process(ping, sizeof(ping), small, sizeof(small), &written);
+    CHECK_FALSE(first.close);
+    CHECK_EQ(first.consumed, 0u);
+    CHECK_EQ(written, 0u);
+
+    u8 retry[64]{};
+    const Http2Result second = c.process(ping, sizeof(ping), retry, sizeof(retry), &written);
+    CHECK_FALSE(second.close);
+    CHECK_EQ(second.consumed, sizeof(ping));
+    REQUIRE_EQ(written, sizeof(ping));
+    CHECK(has_frame(retry, written, Http2FrameType::Ping, http2_flag::kAck, http2_flag::kAck));
+    CHECK_EQ(memcmp(retry + kFrameHeaderSize, kPayload, sizeof(kPayload)), 0);
 }
 
 TEST(http2_conn, window_update_grows_send_window) {

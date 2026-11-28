@@ -1343,6 +1343,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                                          (h.flags & http2_flag::kEndHeaders) != 0;
         if ((kNewOwnedConflict || kFinalOwnedConflict) && !w.room(kShortControlFrame)) break;
 
+        // Keep valid peer control frames buffered until their ACK fits. Invalid
+        // frames still reach handle_frame so protocol errors are preserved.
+        if (kType == Http2FrameType::Ping && h.stream_id == 0 && h.length == 8 &&
+            !(h.flags & http2_flag::kAck) && !w.room(kLongControlFrame))
+            break;
+        if (kType == Http2FrameType::Settings && h.stream_id == 0 && h.length % 6 == 0 &&
+            !(h.flags & http2_flag::kAck) && !w.room(kFrameHeaderSize))
+            break;
+
         // Legacy body buffering replenishes both the stream and connection
         // windows for nonempty DATA. Keep such a frame unconsumed until both
         // updates can be emitted. Unknown and half-closed streams also need
