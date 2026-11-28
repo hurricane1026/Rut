@@ -1343,6 +1343,11 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
                                          (h.flags & http2_flag::kEndHeaders) != 0;
         if ((kNewOwnedConflict || kFinalOwnedConflict) && !w.room(kShortControlFrame)) break;
 
+        // Legacy body buffering replenishes both the stream and connection
+        // windows for DATA. Keep the frame unconsumed until both control
+        // updates can be emitted, including on ordinary server connections.
+        if (kType == Http2FrameType::Data && !w.room(2 * kShortControlFrame)) break;
+
         // A serving callback parked a stream (one-at-a-time wait/proxy). We still
         // drain control frames already coalesced in this buffer — above all a
         // RST_STREAM that cancels the parked stream (the client sent HEADERS +

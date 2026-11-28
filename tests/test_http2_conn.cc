@@ -2227,6 +2227,23 @@ TEST(http2_conn, data_without_end_stream_replenishes_stream_window) {
     CHECK_GE(wu, 2u);
 }
 
+TEST(http2_conn, data_waits_for_control_window_update_room) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[256];
+    u32 fn = open_stream1(frame, sizeof(frame));
+    fn += http2_write_data(frame + fn, 1, reinterpret_cast<const u8*>("x"), 1, false);
+    u8 in[384];
+    const u32 inlen = with_preface(in, frame, fn);
+    u8 out[25]{};
+    u32 ow = 0;
+    const Http2Result first = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(first.close);
+    CHECK_LT(first.consumed, inlen);
+    CHECK_EQ(cap.data_len, 0u);
+}
+
 TEST(http2_conn, data_on_half_closed_stream_rsts) {
     Http2Conn c;
     Capture cap;
