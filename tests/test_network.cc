@@ -15967,8 +15967,12 @@ TEST(tls_iouring, proxy_stream_defers_raced_cqe_while_tail_parked) {
     CHECK(conn->tls_send_src != nullptr);              // tail still parked for the drain
 }
 
+struct ParkedTlsCounterLoop : SmallLoop {
+    static constexpr u32 kTlsOutHigh = UINT32_MAX;
+};
+
 TEST(tls_iouring, parked_tail_accounting_rejects_signed_overflow) {
-    SmallLoop loop;
+    ParkedTlsCounterLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
@@ -15978,7 +15982,7 @@ TEST(tls_iouring, parked_tail_accounting_rejects_signed_overflow) {
     conn->tls_send_off = 1;
     static const u8 parked = 0;
     conn->tls_send_src = &parked;
-    proxy_tls_parked_drained<SmallLoop>(&loop, *conn, 1);
+    proxy_tls_parked_drained<ParkedTlsCounterLoop>(&loop, *conn, 1);
     CHECK_EQ(loop.conns[conn->id].fd, -1);
     CHECK_EQ(conn->resp_body_sent, i64{INT64_MAX});
 }
