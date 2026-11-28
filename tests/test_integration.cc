@@ -1761,10 +1761,10 @@ TEST(timer_dsl, timer_before_routes_does_not_consume_http_capacity) {
 
 TEST(timer_dsl, accepts_millisecond_intervals) {
     using namespace rut;
-    const char* source =
+    constexpr char source[] =
         "timer fast, every: 500ms { }\n"
         "timer slow, every: 1500ms { }\n";
-    auto lexed = lex(Str{source, static_cast<u32>(strlen(source))});
+    auto lexed = lex(lit_str(source));
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
@@ -2073,7 +2073,7 @@ static void test_precise_background_timer_on_idle_shard(rut::test::TestCase* _tc
         &thread,
         nullptr,
         [](void* data) -> void* {
-            static_cast<Loop*>(data)->run();
+            reinterpret_cast<Loop*>(data)->run();
             return nullptr;
         },
         loop.get());
@@ -17268,7 +17268,9 @@ TEST(proxy_reuse, configurable_idle_capacity_controls_reuse) {
         RouteConfig cfg{};
         auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
         REQUIRE(uid.has_value());
-        REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+        u16 upstream_id;
+        REQUIRE(range_int{uid.value()}.to(&upstream_id));
+        REQUIRE(cfg.add_proxy("/api", 0, upstream_id));
         const RouteConfig* active = &cfg;
         ScopedProxyLoop proxy;
         REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, nullptr, nullptr, capacity));
